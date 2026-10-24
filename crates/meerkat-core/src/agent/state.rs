@@ -240,6 +240,13 @@ type LlmFailureStepFuture<'a> = std::pin::Pin<
 type LlmFailureStepFuture<'a> =
     std::pin::Pin<Box<dyn std::future::Future<Output = Result<LlmFailureStep, AgentError>> + 'a>>;
 
+#[cfg(not(target_arch = "wasm32"))]
+type TurnEffectsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + Send + 'a>>;
+#[cfg(target_arch = "wasm32")]
+type TurnEffectsFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), AgentError>> + 'a>>;
+
 /// Promote this turn's provider claims into authored evidence, discarding any
 /// claim whose reported identity does not match the active lowering.
 ///
@@ -4364,6 +4371,25 @@ where
         }
     }
 
+    /// [`Self::execute_turn_effects_unboxed`], built and boxed in its own
+    /// frame so neither its construction temporaries nor its 12 KB state
+    /// (the compaction check's summary call) sit in the poll frames that
+    /// await it. Debug builds reserve twice an awaited future's size in the
+    /// awaiting frame, at every await, and the run loop awaits this at each
+    /// boundary and through every terminalization (`terminalize_fatal_error`
+    /// and the steps that wrap it): inline, those awaits took the CLI's
+    /// full-tools spawn past its 2 MiB production worker-stack budget
+    /// (`tools_full_with_explicit_auth_binding_can_spawn_within_production_stack_budget`).
+    #[inline(never)]
+    fn execute_turn_effects<'a>(
+        &'a mut self,
+        transition: &'a TurnExecutionTransition,
+        turn_count: u32,
+        event_tx: &'a Option<mpsc::Sender<AgentEvent>>,
+    ) -> TurnEffectsFuture<'a> {
+        Box::pin(self.execute_turn_effects_unboxed(transition, turn_count, event_tx))
+    }
+
     /// Execute side effects from a transition. Handles CheckCompaction
     /// effects emitted on CallingLlm entry.
     ///
@@ -4373,7 +4399,7 @@ where
     /// terminalized — fail closed by `?`-propagating the rejection as an
     /// `AgentError` (mirroring `apply_turn_input_via_runtime_handle`) instead of
     /// laundering it into a `tracing::warn!` and reporting the effect applied.
-    async fn execute_turn_effects(
+    async fn execute_turn_effects_unboxed(
         &mut self,
         transition: &TurnExecutionTransition,
         // Retained in the signature as the turn context effects execute within;
