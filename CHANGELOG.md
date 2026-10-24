@@ -2859,7 +2859,9 @@ them.
   path (meerkat-live's webrtc feature, used by openai-live), through webrtc
   0.14's dtls; it can expose timing of the per-handshake ECDHE secret.
   Builds without that feature are unaffected. The fix is porting meerkat-live
-  to webrtc 0.20 or later, which is planned as a follow-up.
+  to webrtc 0.20 or later, which is planned as a follow-up. The same optional
+  path also carries the unmaintained audiopus_sys 0.2.2 (RUSTSEC-2026-0150,
+  informational, no patched release).
 
 ### Upgrade notes
 
