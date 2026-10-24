@@ -16112,6 +16112,7 @@ pub mod inputs {
         pub fence_token: Option<FenceToken>,
         pub generation: Option<Generation>,
         pub runtime_epoch_id: Option<RuntimeEpochId>,
+        pub queued_inputs: UnregisterQueuedInputsDisposition,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RuntimeLoopStoppedForUnregister {

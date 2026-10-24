@@ -2,8 +2,10 @@
 # Bounded TLC audit of the Keep disposition: the rollback of a materialization
 # that was refused before it served keeps every input its registration
 # recovered from the store, and still stops an input admitted while the
-# registration stood. Once the registration served live work (an admission,
-# a deduplicated wait or a recycle) its unregister keeps nothing.
+# registration stood. So does the retirement of an executor attachment that
+# never served, while a retire that meets such an attachment still stops.
+# Once the registration served live work (an admission, a deduplicated wait
+# or a recycle) its unregister keeps nothing.
 #
 # usage: materialization_rollback_keep_audit.sh <max-steps> [--mutants] [extra tlc args...]
 #
@@ -17,21 +19,24 @@
 # specs. It checks the whole bounded space once (safety), then reruns it once
 # per reachability witness with that witness's negation as an extra invariant
 # and requires TLC to report exactly that violation, so the invariants are
-# not vacuous. With --mutants it then seeds nine defects into a copy of the
-# generated model and requires TLC to refuse each with the invariant it
-# breaks: the machine without the Keep arm (Keep stops like Stop), a Keep arm
-# that ignores the recovery witness (with admissions that leave no live-work
-# mark), an Abandon arm that overlaps Keep, a
-# Keep arm that ignores the disposition, an unregister begin that records a
-# requested Keep after live work, an admission that leaves a recorded Keep
-# standing, and an admission, a deduplicated wait or a recycle that does not
-# mark the registration as having served live work. An anchor this script
-# expects but cannot find fails the run.
+# not vacuous. With --mutants it then seeds eleven defects into a copy of the
+# generated model, and one into a copy of the audit, and requires TLC to
+# refuse each with the invariant it breaks: the machine without the Keep arm
+# (Keep stops like Stop), a Keep arm that ignores the recovery witness (with
+# admissions that leave no live-work mark), an Abandon arm that overlaps
+# Keep, a Keep arm that ignores the disposition, an unregister begin that
+# records a requested Keep after live work, an admission that leaves a
+# recorded Keep standing, an admission, a deduplicated wait or a recycle that
+# does not mark the registration as having served live work, an
+# unserved-attachment unregister that ignores the requested disposition, one
+# that records a requested Keep after live work, and (in the audit) a retire
+# that meets the unserved attachment and requests Keep. An anchor this
+# script expects but cannot find fails the run.
 set -euo pipefail
 
 usage="usage: materialization_rollback_keep_audit.sh <max-steps> [--mutants] [extra tlc args...]"
 # The deepest witness's model_step_count; a smaller bound cannot reach it.
-deepest_witness_steps=43
+deepest_witness_steps=44
 max_steps="${1:?${usage}}"
 shift
 run_mutants=false
@@ -125,7 +130,8 @@ write_cfg() {
   AuditKeepStopsWhatItAdmitted
   AuditKeepOnlyUnderKeep
   AuditKeptInputSurvivesTheRollback
-  AuditLiveWorkForfeitsKeep${extra}" "${cfg}"
+  AuditLiveWorkForfeitsKeep
+  AuditRetireOverUnservedStops${extra}" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
 }
@@ -169,7 +175,9 @@ fi
 
 for witness in KeptQueuedInputRuns KeptRequeuedInputRuns AdmittedInputStoppedUnderKeep \
   StopRollbackEndsRecoveredInput RecycledAdmittedInputStoppedUnderKeep \
-  DedupedInputStoppedUnderKeep DrainingLiveWorkStopsRecoveredInput; do
+  DedupedInputStoppedUnderKeep DrainingLiveWorkStopsRecoveredInput \
+  UnservedAbortKeepsRecoveredInput UnservedRetireStopsRecoveredInput \
+  UnservedAbortAfterLiveWorkStops; do
   cfg="${work_dir}/witness-${witness}.cfg"
   write_cfg "${cfg}" "
   NotAuditWitness${witness}"
@@ -194,6 +202,8 @@ if [[ "${run_mutants}" == "true" ]]; then
   done
   begin_arms="BeginUnregisterSessionIdle BeginUnregisterSessionAttached BeginUnregisterSessionRunning"
   begin_arms+=" BeginUnregisterSessionRetainsSnapshotRetired BeginUnregisterSessionRetainsSnapshotStopped"
+  unserved_arms="BeginUnregisterUnservedAttachmentIdle BeginUnregisterUnservedAttachmentAttached"
+  unserved_arms+=" BeginUnregisterUnservedAttachmentRunning"
   queue_arms=""
   for arm_phase in Idle Attached Running Retired Stopped; do
     queue_arms+=" QueueAccepted${arm_phase}"
@@ -203,17 +213,19 @@ if [[ "${run_mutants}" == "true" ]]; then
   recycle_arms="RecycleFromIdleOrRetired RecycleFromAttached"
 
   # usage: mutate <name> <expected invariant>; reads a python edit on stdin
-  # that rewrites model.tla in place (MODEL) and must find each anchor it
-  # names. KEEP_ARMS and ABANDON_ARMS name the classifier arms, BEGIN_ARMS
-  # the unregister begin arms, and QUEUE_ARMS, DEDUPE_ARMS and RECYCLE_ARMS
-  # the arms that mark live work; MARK_ARMS names one of those three.
+  # that rewrites model.tla (MODEL) or the audit (AUDIT) in place and must
+  # find each anchor it names. KEEP_ARMS and ABANDON_ARMS name the classifier
+  # arms, BEGIN_ARMS and UNSERVED_ARMS the unregister begin arms, and
+  # QUEUE_ARMS, DEDUPE_ARMS and RECYCLE_ARMS the arms that mark live work;
+  # MARK_ARMS names one of those three.
   mutate() {
     local name="$1" property="$2"
     local dir="${work_dir}/mutant-${name}"
     mkdir -p "${dir}"
     cp "${model_dir}"/*.tla "${dir}/"
-    MODEL="${dir}/model.tla" KEEP_ARMS="${keep_arms}" ABANDON_ARMS="${abandon_arms}" \
-      BEGIN_ARMS="${begin_arms}" QUEUE_ARMS="${queue_arms}" DEDUPE_ARMS="${dedupe_arms}" \
+    MODEL="${dir}/model.tla" AUDIT="${dir}/materialization_rollback_keep_audit.tla" \
+      KEEP_ARMS="${keep_arms}" ABANDON_ARMS="${abandon_arms}" BEGIN_ARMS="${begin_arms}" \
+      UNSERVED_ARMS="${unserved_arms}" QUEUE_ARMS="${queue_arms}" DEDUPE_ARMS="${dedupe_arms}" \
       RECYCLE_ARMS="${recycle_arms}" MARK_ARMS="${mark_arms:-}" PYTHONPATH="${work_dir}" python3 -
     local cfg="${work_dir}/mutant-${name}.cfg"
     write_cfg "${cfg}" ""
@@ -241,6 +253,12 @@ KEEP_GUARD = (
 BEGIN_DOWNGRADE = (
     "unregister_queued_inputs' = IF ((queued_inputs = \"Keep\") /\\ "
     "registration_live_input_seen) THEN \"Stop\" ELSE queued_inputs"
+)
+# The unserved-attachment unregister records the Keep its abort asks for,
+# unless the registration served live work, and Stop otherwise.
+UNSERVED_BEGIN = (
+    "unregister_queued_inputs' = IF ((queued_inputs = \"Keep\") /\\ "
+    "~(registration_live_input_seen)) THEN \"Keep\" ELSE \"Stop\""
 )
 # Live work turns a Keep already recorded into Stop.
 SETTER_DOWNGRADE = (
@@ -368,5 +386,45 @@ open(path, "w").write(text)
 PY
   done
   mark_arms=""
+
+  # The unserved-attachment unregister as it was before the attachment's
+  # abort asked to keep: it stops whatever it is asked for.
+  mutate unserved_unregister_ignores_the_request AuditKeepEndsNoRecoveredInput <<'PY'
+import os
+from keep_mutation import UNSERVED_BEGIN, edit_arm_lines
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm_lines(
+    text, "UNSERVED_ARMS", UNSERVED_BEGIN,
+    lambda line: line.replace(UNSERVED_BEGIN, "unregister_queued_inputs' = \"Stop\""))
+open(path, "w").write(text)
+PY
+
+  # An unserved-attachment unregister that records a requested Keep after
+  # live work.
+  mutate unserved_unregister_keeps_after_live_work keep_unregister_only_without_live_input <<'PY'
+import os
+from keep_mutation import UNSERVED_BEGIN, edit_arm_lines
+path = os.environ["MODEL"]
+text = open(path).read()
+text = edit_arm_lines(
+    text, "UNSERVED_ARMS", UNSERVED_BEGIN,
+    lambda line: line.replace(
+        UNSERVED_BEGIN,
+        "unregister_queued_inputs' = IF (queued_inputs = \"Keep\") THEN \"Keep\" ELSE \"Stop\""))
+open(path, "w").write(text)
+PY
+
+  # A retire that meets the unserved attachment and asks to keep: a
+  # non-abort unregister requesting Keep.
+  mutate retire_requests_keep AuditRetireOverUnservedStops <<'PY'
+import os
+path = os.environ["AUDIT"]
+text = open(path).read()
+anchor = 'RetireDisposition == "Stop"'
+assert text.count(anchor) == 1, f"expected one {anchor!r} in the audit"
+text = text.replace(anchor, 'RetireDisposition == "Keep"')
+open(path, "w").write(text)
+PY
 fi
 echo "materialization-rollback keep audit passed at model_step_count <= ${max_steps}"

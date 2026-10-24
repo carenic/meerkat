@@ -1064,7 +1064,13 @@ pub(super) fn replay_durable_unregister_progress_id(
     };
     let state = authority.state();
     // The recovered convergence replays the disposition the unregister began
-    // with, so it keeps exactly the inputs the uninterrupted stop would.
+    // with. In process, it keeps exactly the inputs the uninterrupted stop
+    // would. After a real restart every non-terminal input comes back
+    // recovered, so a replayed Keep keeps every input still open in the store,
+    // one admitted live before the crash included. That is crash-consistent:
+    // no caller was told its input was refused before the stop committed, and
+    // a registration that served live work before the unregister began
+    // recorded Stop.
     let (queued_inputs, requeue_max_age_ms) = match progress.requeue_max_age_ms() {
         Some(max_age_ms) => (
             crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
@@ -4188,7 +4194,10 @@ impl MeerkatMachine {
     ///
     /// Idempotent preparation of a pre-existing entry does not mint rollback
     /// authority, and a stale binding can never unregister a same-SessionId
-    /// replacement.
+    /// replacement. The rollback keeps every input the registration recovered
+    /// from the store, unless the registration served live work, in which
+    /// case the machine stops every input
+    /// ([`PreparedSessionMaterialization::rollback_now`](super::PreparedSessionMaterialization::rollback_now)).
     pub async fn unregister_session_if_bindings_owned_registration(
         &self,
         bindings: &meerkat_core::SessionRuntimeBindings,
@@ -4266,17 +4275,18 @@ impl MeerkatMachine {
             Some(bindings.epoch_id()),
             Some(&authority.materialization_claim_state),
             turn_finalization_boundary_already_held,
-            UnregisterDisposition::STOP,
+            UnregisterDisposition::KEEP,
         )
         .await
     }
 
     /// Abort the exact materialization claim `claim_id`. A registration this
-    /// claim inserted is unregistered with `queued_inputs`: Stop ends every
-    /// non-terminal input, Keep (a materialization that served nothing and
-    /// admitted no input) keeps every input the registration recovered
-    /// from the store exactly as the store holds it. The machine records a
-    /// requested Keep as Stop once the registration served live work.
+    /// claim inserted is unregistered with `queued_inputs`: Keep (every
+    /// materialization rollback) keeps every input the registration
+    /// recovered from the store exactly as the store holds it, Stop ends
+    /// every non-terminal input. The machine records a requested Keep as
+    /// Stop once the registration served live work. A claim on a registration
+    /// it did not insert only clears the claim, and the disposition is unused.
     pub(super) async fn abort_prepared_session_materialization_claim(
         &self,
         session_id: &SessionId,
@@ -5865,6 +5875,11 @@ impl MeerkatMachine {
     /// coordinator may reacquire B only after the caller releases it, so an
     /// arbitrary or wedged surface cleanup callback cannot retain the caller's
     /// boundary or block startup failure reporting.
+    ///
+    /// The candidate never served, so its unregister asks to keep every input
+    /// the registration recovered from the store, as a pending attachment's
+    /// abort does; the machine grants that only while the registration served
+    /// no live work, and stops every input otherwise.
     async fn cleanup_unserved_executor_attachment(
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
@@ -5872,7 +5887,10 @@ impl MeerkatMachine {
     ) -> Result<bool, RuntimeDriverError> {
         if !turn_finalization_boundary_already_held {
             return self
-                .unregister_executor_attachment_if_current(witness)
+                .unregister_executor_attachment_if_current_with_queued_inputs(
+                    witness,
+                    UnregisterDisposition::KEEP,
+                )
                 .await;
         }
         let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
@@ -5880,7 +5898,10 @@ impl MeerkatMachine {
         let witness = witness.clone();
         cleanup_spawner.spawn(async move {
             if let Err(error) = machine
-                .unregister_executor_attachment_if_current(&witness)
+                .unregister_executor_attachment_if_current_with_queued_inputs(
+                    &witness,
+                    UnregisterDisposition::KEEP,
+                )
                 .await
             {
                 tracing::warn!(
@@ -7335,6 +7356,20 @@ impl MeerkatMachine {
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
     ) -> Result<bool, RuntimeDriverError> {
+        self.unregister_executor_attachment_if_current_with_queued_inputs(
+            witness,
+            UnregisterDisposition::STOP,
+        )
+        .await
+    }
+
+    /// [`Self::unregister_executor_attachment_if_current`], beginning the
+    /// unregister with `queued_inputs` when this call starts it.
+    async fn unregister_executor_attachment_if_current_with_queued_inputs(
+        self: &Arc<Self>,
+        witness: &RuntimeExecutorAttachmentWitness,
+        queued_inputs: UnregisterDisposition,
+    ) -> Result<bool, RuntimeDriverError> {
         if !witness.belongs_to(self) {
             return Ok(false);
         }
@@ -7350,6 +7385,7 @@ impl MeerkatMachine {
             witness.clone(),
             guard,
             cleanup_spawner,
+            queued_inputs,
         )
         .wait()
         .await
@@ -7455,6 +7491,7 @@ impl MeerkatMachine {
         witness: RuntimeExecutorAttachmentWitness,
         mutation_guard: crate::tokio::sync::OwnedMutexGuard<()>,
         cleanup_spawner: super::MachineCleanupTaskSpawner,
+        queued_inputs: UnregisterDisposition,
     ) -> super::RuntimeExecutorAttachmentRetirementCompletion {
         let machine = Arc::clone(self);
         let task_witness = witness;
@@ -7465,6 +7502,7 @@ impl MeerkatMachine {
                     task_witness.clone(),
                     super::RunlessTerminalAnnouncement::default(),
                     mutation_guard,
+                    queued_inputs,
                 )
                 .await;
             if let Err(error) = &result {
@@ -7830,6 +7868,11 @@ impl MeerkatMachine {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Abort the exact pending attachment `witness` names, under its M. The
+    /// attachment never served, so its unregister asks to keep every input
+    /// the registration recovered from the store; the machine grants that
+    /// only while the registration served no live work, and stops every
+    /// input otherwise.
     pub(super) async fn abort_pending_executor_attachment(
         self: &Arc<Self>,
         witness: RuntimeExecutorAttachmentWitness,
@@ -7840,6 +7883,7 @@ impl MeerkatMachine {
             witness,
             runless_terminal,
             mutation_guard,
+            UnregisterDisposition::KEEP,
         )
         .await
         .map(|_| ())
@@ -7852,12 +7896,16 @@ impl MeerkatMachine {
     /// teardown is awaited: post-stop cleanup may take arbitrarily long, and
     /// a terminal that is already readable does not wait for it. It is
     /// declared before `mutation_guard` so that an early return drops M
-    /// first.
+    /// first. `queued_inputs` is the disposition the unregister begins with
+    /// when this call starts it: an attachment that never served (a pending
+    /// attachment's abort, a failed startup's cleanup) asks to keep what the
+    /// registration recovered, every other caller stops.
     pub(super) async fn unregister_executor_attachment_if_current_with_guard(
         self: &Arc<Self>,
         witness: RuntimeExecutorAttachmentWitness,
         runless_terminal: super::RunlessTerminalAnnouncement,
         mutation_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         if !witness.belongs_to(self) {
             drop(mutation_guard);
@@ -7892,7 +7940,7 @@ impl MeerkatMachine {
 
         if registration_phase != dsl::RegistrationPhase::Draining {
             let staged = self
-                .stage_begin_unregister_session_authority(witness.session_id())
+                .stage_begin_unregister_session_authority(witness.session_id(), queued_inputs)
                 .await
                 .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
             self.commit_session_dsl_transition(
@@ -7905,13 +7953,14 @@ impl MeerkatMachine {
         }
         drop(mutation_guard);
         drop(runless_terminal);
-        self.join_or_start_unregister_teardown_with_admission(
+        self.join_or_start_unregister_teardown_with_queued_inputs(
             witness.session_id(),
             Some(witness.epoch_id()),
             UnregisterTeardownCaller::Explicit,
             UnregisterTeardownAdmission::AnyCurrentRegistration,
             None,
             UnregisterTeardownWait::UntilTerminal,
+            queued_inputs,
         )
         .await?;
         Ok(true)
@@ -8743,7 +8792,7 @@ impl MeerkatMachine {
 
         if registration_phase != dsl::RegistrationPhase::Draining {
             let staged = self
-                .stage_begin_unregister_session_authority(session_id)
+                .stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
                 .await
                 .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
             self.commit_session_dsl_transition(
@@ -10460,6 +10509,7 @@ impl MeerkatMachine {
     async fn stage_begin_unregister_session_authority(
         &self,
         session_id: &SessionId,
+        requested: UnregisterDisposition,
     ) -> Result<StagedSessionDslInput, String> {
         let sessions = self.sessions.read().await;
         let entry = sessions.get(session_id).ok_or_else(|| {
@@ -10474,13 +10524,13 @@ impl MeerkatMachine {
         let mechanically_pending_attachment =
             matches!(entry.attachment_slot, RuntimeLoopAttachmentSlot::Pending(_));
         // The disposition of the coordinator that owns this unregister; a
-        // prefix begun without one (the runtime loop's own teardown) stops.
+        // prefix begun without one carries the caller's request (an
+        // attachment that never served asks to keep, the runtime loop's own
+        // teardown stops).
         let (queued_inputs, requeue_max_age_ms) = entry
             .unregister_coordinator
             .as_ref()
-            .map_or(UnregisterDisposition::STOP, |coordinator| {
-                coordinator.queued_inputs
-            })
+            .map_or(requested, |coordinator| coordinator.queued_inputs)
             .dsl_disposition();
         let mut authority = entry
             .dsl_authority
@@ -10513,6 +10563,7 @@ impl MeerkatMachine {
                     fence_token,
                     generation,
                     runtime_epoch_id,
+                    queued_inputs,
                 },
                 "BeginUnregisterUnservedAttachment",
             )
@@ -10783,7 +10834,7 @@ impl MeerkatMachine {
             return Ok(GatedBeginUnregister::WorkPresent);
         }
         match self
-            .stage_begin_unregister_session_authority(session_id)
+            .stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
             .await
         {
             Ok(staged) => {
@@ -11156,7 +11207,7 @@ ControlFlow::Break(()) => return Ok(()),
         // runtime snapshot before the drain can advance lifecycle state.
         tracing::info!(%session_id, "MeerkatMachine::unregister_session_inner_locked_authorized beginning drain window");
         match crate::stack_relief::box_in_own_frame(|| {
-            self.stage_begin_unregister_session_authority(session_id)
+            self.stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
         })
         .await
         {

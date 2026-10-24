@@ -3,10 +3,13 @@
 \* materialization that was refused before it served (a durable tail held for
 \* recovery, a failed agent build) keeps every input its registration
 \* recovered from the store exactly as the store holds it, and still stops an
-\* input admitted while the registration stood. The machine grants the keep
-\* only to a registration that served no live work: once it admitted an
-\* input, waited on a deduplicated resubmission or was recycled, its
-\* unregister records a requested Keep as Stop
+\* input admitted while the registration stood. So does the retirement of an
+\* executor attachment that never served (a pending attachment's abort, a
+\* failed startup's cleanup), through the unserved-attachment unregister,
+\* while a retire or an archive that meets such an attachment still stops.
+\* The machine grants the keep only to a registration that served no live
+\* work: once it admitted an input, waited on a deduplicated resubmission or
+\* was recycled, its unregister records a requested Keep as Stop
 \* (registration_live_input_seen).
 \*
 \* This audit keeps the generated MeerkatMachine model unchanged and explores
@@ -25,8 +28,12 @@
 \* B), or take a host recycle, whose recovery admits every active input to
 \* the recovered witness again, C included. Its materialization is refused
 \* before it serves: the host rolls the registration back with an unregister
-\* that begins with Keep, or, as the control, with Stop; C's admission and
-\* D's resolution may also land between that begin and the stop. The
+\* that begins with Keep, or, as the control, with Stop. Or the host attaches
+\* an executor that never serves (C's admission and D's resolution may land
+\* while it is pending), and the unserved-attachment unregister begins with
+\* the Keep its abort asks for, or with the Stop of a retire that meets it.
+\* C's admission and D's resolution may also land between that begin and
+\* the stop. The
 \* rollback's stop is one driver-lock transaction, as in the shell: it
 \* classifies each non-terminal input before the executor's exit (an input
 \* answered Abandon gets the runless carrier) and again after it, ends the
@@ -51,24 +58,30 @@
 \*   AuditLiveWorkForfeitsKeep: once process 2 served live work (an
 \*     admission, a deduplicated wait or a recycle) before its stop, nothing
 \*     is answered Keep.
+\*   AuditRetireOverUnservedStops: a retire that meets the unserved
+\*     attachment keeps nothing.
 \*
 \* AuditWitness* operators are reachability goals the runner checks as
 \* expected violations, so the invariants are not vacuous. The runner's
-\* --mutants mode seeds nine defects into a copy of the generated model and
-\* requires TLC to refuse each with the invariant it breaks: the machine
-\* without the Keep arm (Keep stops like Stop), a Keep arm that ignores the
-\* recovery witness (with admissions that leave no live-work mark, which on
-\* its own already stops a Keep from reaching an admitted input), an Abandon
-\* arm that overlaps Keep, a Keep arm that ignores the disposition, an
-\* unregister begin that records a requested Keep after live work, an
-\* admission that leaves a recorded Keep standing, and an admission, a
-\* deduplicated wait or a recycle that does not mark the registration as
-\* having served live work.
+\* --mutants mode seeds eleven defects into a copy of the generated model
+\* and one into a copy of this audit, and requires TLC to refuse each with
+\* the invariant it breaks: the machine without the Keep arm (Keep stops
+\* like Stop), a Keep arm that ignores the recovery witness (with admissions
+\* that leave no live-work mark, which on its own already stops a Keep from
+\* reaching an admitted input), an Abandon arm that overlaps Keep, a Keep arm
+\* that ignores the disposition, an unregister begin that records a
+\* requested Keep after live work, an admission that leaves a recorded Keep
+\* standing, an admission, a deduplicated wait or a recycle that does not
+\* mark the registration as having served live work, an unserved-attachment
+\* unregister that ignores the requested disposition (it always stops, as
+\* before the attachment's abort asked to keep), one that records a
+\* requested Keep after live work, and, in this audit, a retire that meets
+\* the unserved attachment and requests Keep.
 \*
 \* The TLC config is DERIVED from the generated ci.cfg on every run by
 \* materialization_rollback_keep_audit.sh. No audit step repeats, so the
 \* reachable space is finite: the lane's bound of 50 steps explores all of it
-\* (16,468 distinct states; a deeper bound finds no new state), and 43 steps
+\* (32,682 distinct states; a deeper bound finds no new state), and 44 steps
 \* reach the deepest witness. Check that by hand with:
 \*   specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh 80
 \*
@@ -77,10 +90,13 @@
 \* (the inputs answered Abandon) and a kept row is the recovered row
 \* unchanged. A recycle's recovery is modelled by its witness step
 \* (RecoverAdmittedInput for every active input); its lifecycle replay
-\* changes no verdict input. The meerkat facade rows pin the shell: a refused
-\* restart keeps the stranded input, the dry run still names it, and the next
-\* start runs it once; after an admission, a recycle or a deduplicated
-\* resubmission the rollback keeps nothing.
+\* changes no verdict input. The unserved-attachment route is driven from
+\* Attached only, and a recycle from Idle only: the unserved arm's Idle and
+\* Running variants and RecycleFromAttached rest on the machine's ci TLC
+\* run. The meerkat facade rows pin the shell: a refused restart keeps the
+\* stranded input, the dry run still names it, and the next start runs it
+\* once; after an admission, a recycle or a deduplicated resubmission the
+\* rollback keeps nothing.
 EXTENDS materialization_rollback_keep_fresh
 
 CONSTANTS AuditMaxSteps
@@ -88,7 +104,8 @@ CONSTANTS AuditMaxSteps
 VARIABLES
     audit_stage,          \* which part of the three-process run this is
     audit_facts,          \* each admitted input's kind and durability
-    audit_disposition,    \* the disposition process 2's rollback began with
+    audit_disposition,    \* the disposition process 2's unregister began with
+    audit_route,          \* how process 2's registration was unregistered
     audit_c_planned,      \* process 2's admission of C was planned
     audit_admitted_p2,    \* inputs admitted while process 2's registration stood
     audit_live_p2,        \* live work process 2 served before its stop opened
@@ -107,7 +124,7 @@ VARIABLES
     audit_recovered_p2,   \* inputs process 2 recovered from the store
     audit_staged_p3       \* inputs staged into a run of process 3
 
-setupVars == <<audit_facts, audit_disposition, audit_c_planned, audit_admitted_p2>>
+setupVars == <<audit_facts, audit_disposition, audit_route, audit_c_planned, audit_admitted_p2>>
 liveVars == <<audit_live_p2, audit_draining_live, audit_recycle_pending, audit_rerecovered>>
 regionVars == <<audit_pending, audit_pre_verdict, audit_post_verdict, audit_abandoned>>
 historyVars == <<audit_kept, audit_carriers, audit_stopped>>
@@ -129,6 +146,11 @@ AuditKey == "key_b"
 AuditOrder == <<AuditC, AuditA, AuditB>>
 AuditInputs == {AuditA, AuditB, AuditC}
 AuditRun == "runid_1"
+\* The dispositions the shell requests for the unserved-attachment
+\* unregister: the attachment's own abort (or a failed startup's cleanup)
+\* asks to keep, a retire or an archive that meets it stops.
+AbortDisposition == "Keep"
+RetireDisposition == "Stop"
 AuditKinds == {"Prompt", "ExternalEvent"}
 TerminalPhases == {"Consumed", "Superseded", "Coalesced", "Abandoned"}
 NoVerdict == [x \in {} |-> "Abandon"]
@@ -185,6 +207,7 @@ AbandonAny(i, reason, n) ==
 
 AdmitPlan(i, kind) ==
     \/ ResolveAdmissionPlanDefaultQueueKindIdle(i, None, None, kind, None, "Ordinary", "InTurnEligible", FALSE, None, FALSE, FALSE, FALSE)
+    \/ ResolveAdmissionPlanDefaultQueueKindAttached(i, None, None, kind, None, "Ordinary", "InTurnEligible", FALSE, None, FALSE, FALSE, FALSE)
     \/ ResolveAdmissionPlanDefaultQueueKindRunning(i, None, None, kind, None, "Ordinary", "InTurnEligible", FALSE, None, TRUE, FALSE, FALSE)
 
 \* The stop classification of input i under its admission facts. A shell
@@ -215,8 +238,8 @@ AuditSetup ==
           /\ \E kind \in AuditKinds, d \in InputDurabilityKindValues :
                 /\ AdmitPlan(AuditB, kind)
                 /\ audit_facts' = audit_facts @@ (AuditB :> [kind |-> kind, durability |-> d])
-          /\ UNCHANGED <<audit_stage, audit_disposition, audit_c_planned, audit_admitted_p2,
-                         liveVars, regionVars, historyVars, restartVars>>
+          /\ UNCHANGED <<audit_stage, audit_disposition, audit_route, audit_c_planned,
+                         audit_admitted_p2, liveVars, regionVars, historyVars, restartVars>>
        \/ model_step_count = 8 /\ QueueAcceptedRunning(AuditB) /\ AuditUnchanged
        \/ model_step_count = 9
           /\ RegisterAcceptedIdempotencyRunning(AuditB, AuditKey)
@@ -320,31 +343,32 @@ LiveWork(kind) ==
     /\ audit_live_p2' = audit_live_p2 \cup {kind}
     /\ audit_draining_live' = (audit_draining_live \/ audit_stage = "P2Draining")
 
-\* A caller plans C while the registration stands, and admits it then or
-\* once the unregister began (once).
+\* A caller plans C while the registration stands (an executor attachment
+\* may be pending), and admits it then or once the unregister began (once).
 AuditAdmitInProcess2 ==
-    \/ /\ audit_stage = "P2Ready"
+    \/ /\ audit_stage \in {"P2Ready", "P2Attached"}
        /\ ~audit_c_planned
        /\ AdmitPlan(AuditC, "Prompt")
        /\ audit_c_planned' = TRUE
-       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_admitted_p2,
-                      liveVars, regionVars, historyVars, restartVars>>
-    \/ /\ audit_stage \in {"P2Ready", "P2Draining"}
+       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_route,
+                      audit_admitted_p2, liveVars, regionVars, historyVars, restartVars>>
+    \/ /\ audit_stage \in {"P2Ready", "P2Attached", "P2Draining"}
        /\ audit_c_planned
        /\ audit_admitted_p2 = {}
-       /\ QueueAcceptedIdle(AuditC)
+       /\ QueueAcceptedIdle(AuditC) \/ QueueAcceptedAttached(AuditC)
        /\ audit_admitted_p2' = {AuditC}
        /\ LiveWork("Admit")
-       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_c_planned,
-                      audit_recycle_pending, audit_rerecovered, regionVars, historyVars,
-                      restartVars>>
+       /\ UNCHANGED <<audit_stage, audit_facts, audit_disposition, audit_route,
+                      audit_c_planned, audit_recycle_pending, audit_rerecovered, regionVars,
+                      historyVars, restartVars>>
 
 \* A caller resubmits B under its key: the machine resolves it as a
 \* duplicate of B, which it then waits on (once).
 AuditDedupeInProcess2 ==
-    /\ audit_stage \in {"P2Ready", "P2Draining"}
+    /\ audit_stage \in {"P2Ready", "P2Attached", "P2Draining"}
     /\ "Dedupe" \notin audit_live_p2
-    /\ ResolveAdmissionIdempotencyDuplicateIdle(AuditD, Some(AuditKey))
+    /\ \/ ResolveAdmissionIdempotencyDuplicateIdle(AuditD, Some(AuditKey))
+       \/ ResolveAdmissionIdempotencyDuplicateAttached(AuditD, Some(AuditKey))
     /\ LiveWork("Dedupe")
     /\ UNCHANGED <<audit_stage, setupVars, audit_recycle_pending, audit_rerecovered,
                    regionVars, historyVars, restartVars>>
@@ -388,6 +412,30 @@ AuditBeginRollback ==
     /\ \E disp \in {"Keep", "Stop"} :
           /\ BeginUnregisterSessionIdle(AuditSession, None, None, None, Some(AuditEpoch), disp, 0)
           /\ audit_disposition' = disp
+    /\ audit_route' = "Rollback"
+    /\ audit_stage' = "P2Draining"
+    /\ UNCHANGED <<audit_facts, audit_c_planned, audit_admitted_p2, liveVars, regionVars,
+                   historyVars, restartVars>>
+
+\* Or the host attaches an executor that never serves: the attachment is
+\* pending (its startup failed or its owner has not committed it).
+AuditAttachUnserved ==
+    /\ audit_stage = "P2Ready"
+    /\ EnsureSessionWithExecutorIdle(AuditSession)
+    /\ audit_stage' = "P2Attached"
+    /\ UNCHANGED <<setupVars, liveVars, regionVars, historyVars, restartVars>>
+
+\* The unserved-attachment unregister: the attachment's abort (or its failed
+\* startup's cleanup) asks to keep, a retire or an archive that meets the
+\* pending attachment stops.
+AuditBeginUnservedUnregister ==
+    /\ audit_stage = "P2Attached"
+    /\ \E route \in {"UnservedAbort", "UnservedRetire"} :
+          LET disp == IF route = "UnservedAbort" THEN AbortDisposition ELSE RetireDisposition IN
+          /\ BeginUnregisterUnservedAttachmentAttached(AuditSession, None, None, None,
+                Some(AuditEpoch), disp)
+          /\ audit_disposition' = disp
+          /\ audit_route' = route
     /\ audit_stage' = "P2Draining"
     /\ UNCHANGED <<audit_facts, audit_c_planned, audit_admitted_p2, liveVars, regionVars,
                    historyVars, restartVars>>
@@ -419,7 +467,7 @@ AuditClassifyForCarriers ==
 AuditStopExit ==
     /\ audit_stage = "PreExit"
     /\ audit_pending = {}
-    /\ RuntimeExecutorExitedFromIdle
+    /\ RuntimeExecutorExitedFromIdle \/ RuntimeExecutorExitedFromAttached
     /\ audit_stage' = "PostExit"
     /\ audit_pending' = NonTerminalInputs
     /\ UNCHANGED <<setupVars, liveVars, audit_pre_verdict, audit_post_verdict, audit_abandoned,
@@ -496,6 +544,8 @@ AuditNext ==
     \/ AuditRecycleRecover
     \/ AuditRecycleDone
     \/ AuditBeginRollback
+    \/ AuditAttachUnserved
+    \/ AuditBeginUnservedUnregister
     \/ AuditOpenStop
     \/ AuditClassifyForCarriers
     \/ AuditStopExit
@@ -513,6 +563,7 @@ AuditInit ==
     /\ audit_facts = (AuditA :> [kind |-> "Prompt", durability |-> "Durable"])
                      @@ (AuditC :> [kind |-> "Prompt", durability |-> "Durable"])
     /\ audit_disposition = "None"
+    /\ audit_route = "None"
     /\ audit_c_planned = FALSE
     /\ audit_admitted_p2 = {}
     /\ audit_live_p2 = {}
@@ -568,6 +619,9 @@ AuditKeptInputSurvivesTheRollback ==
 AuditLiveWorkForfeitsKeep ==
     audit_live_p2 # {} => OpenAnswers("Keep") \cup audit_kept = {}
 
+AuditRetireOverUnservedStops ==
+    audit_route = "UnservedRetire" => OpenAnswers("Keep") \cup audit_kept = {}
+
 \* ---- reachability goals, each checked as an expected violation ----
 
 \* B, queued behind process 1's run and recovered by process 2, is kept by
@@ -611,6 +665,26 @@ AuditWitnessDrainingLiveWorkStopsRecoveredInput ==
     /\ audit_draining_live
     /\ AuditB \in audit_stopped
 
+\* B, recovered by process 2, is kept by the abort of an attachment that
+\* never served and runs in process 3.
+AuditWitnessUnservedAbortKeepsRecoveredInput ==
+    /\ audit_route = "UnservedAbort"
+    /\ AuditB \in audit_kept
+    /\ AuditB \in audit_staged_p3
+\* The control: a retire that meets the pending attachment ends the
+\* recovered B.
+AuditWitnessUnservedRetireStopsRecoveredInput ==
+    /\ audit_route = "UnservedRetire"
+    /\ AuditB \in audit_stopped
+\* Live work before the abort's unregister began (C admitted while the
+\* attachment was pending, for one) turns its Keep into Stop: the recovered
+\* B ends Stopped.
+AuditWitnessUnservedAbortAfterLiveWorkStops ==
+    /\ audit_route = "UnservedAbort"
+    /\ audit_live_p2 # {}
+    /\ ~audit_draining_live
+    /\ AuditB \in audit_stopped
+
 NotAuditWitnessKeptQueuedInputRuns == ~AuditWitnessKeptQueuedInputRuns
 NotAuditWitnessKeptRequeuedInputRuns == ~AuditWitnessKeptRequeuedInputRuns
 NotAuditWitnessAdmittedInputStoppedUnderKeep == ~AuditWitnessAdmittedInputStoppedUnderKeep
@@ -620,4 +694,10 @@ NotAuditWitnessRecycledAdmittedInputStoppedUnderKeep ==
 NotAuditWitnessDedupedInputStoppedUnderKeep == ~AuditWitnessDedupedInputStoppedUnderKeep
 NotAuditWitnessDrainingLiveWorkStopsRecoveredInput ==
     ~AuditWitnessDrainingLiveWorkStopsRecoveredInput
+NotAuditWitnessUnservedAbortKeepsRecoveredInput ==
+    ~AuditWitnessUnservedAbortKeepsRecoveredInput
+NotAuditWitnessUnservedRetireStopsRecoveredInput ==
+    ~AuditWitnessUnservedRetireStopsRecoveredInput
+NotAuditWitnessUnservedAbortAfterLiveWorkStops ==
+    ~AuditWitnessUnservedAbortAfterLiveWorkStops
 ====

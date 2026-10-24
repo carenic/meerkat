@@ -263,8 +263,9 @@ AuditSetup ==
                    audit_wait_answered, resumeVars>>
 
 \* The host begins its unregister, before the stop or after a plain stop. A
-\* host unregister stops or requeues; the Keep disposition is a refused
-\* materialization's rollback (materialization_rollback_keep_audit).
+\* host unregister of a registration that serves stops or requeues; the Keep
+\* disposition is the unregister of a registration refused before it served
+\* (materialization_rollback_keep_audit).
 AuditBeginUnregister ==
     /\ audit_stage \in {"P1", "P1Stopped"}
     /\ audit_disposition = "None"

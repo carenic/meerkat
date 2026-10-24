@@ -2332,7 +2332,7 @@ BeginUnregisterSessionRetainsSnapshotStopped(arg_session_id, agent_runtime_id, f
     /\ UnchangedFrame_0fbd972cc51a009e
 
 
-BeginUnregisterUnservedAttachmentIdle(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id) ==
+BeginUnregisterUnservedAttachmentIdle(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs) ==
     /\ phase = "Idle"
     /\ (session_id = Some(arg_session_id))
     /\ (active_runtime_id = agent_runtime_id)
@@ -2349,12 +2349,12 @@ BeginUnregisterUnservedAttachmentIdle(arg_session_id, agent_runtime_id, fence_to
     /\ unregister_teardown_retains_snapshot' = TRUE
     /\ unregister_runtime_loop_forced_abort' = FALSE
     /\ unregister_comms_drain_forced_abort' = FALSE
-    /\ unregister_queued_inputs' = "Stop"
+    /\ unregister_queued_inputs' = IF ((queued_inputs = "Keep") /\ ~(registration_live_input_seen)) THEN "Keep" ELSE "Stop"
     /\ unregister_requeue_max_age_ms' = 0
     /\ UnchangedFrame_0fbd972cc51a009e
 
 
-BeginUnregisterUnservedAttachmentAttached(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id) ==
+BeginUnregisterUnservedAttachmentAttached(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs) ==
     /\ phase = "Attached"
     /\ (session_id = Some(arg_session_id))
     /\ (active_runtime_id = agent_runtime_id)
@@ -2371,12 +2371,12 @@ BeginUnregisterUnservedAttachmentAttached(arg_session_id, agent_runtime_id, fenc
     /\ unregister_teardown_retains_snapshot' = TRUE
     /\ unregister_runtime_loop_forced_abort' = FALSE
     /\ unregister_comms_drain_forced_abort' = FALSE
-    /\ unregister_queued_inputs' = "Stop"
+    /\ unregister_queued_inputs' = IF ((queued_inputs = "Keep") /\ ~(registration_live_input_seen)) THEN "Keep" ELSE "Stop"
     /\ unregister_requeue_max_age_ms' = 0
     /\ UnchangedFrame_0fbd972cc51a009e
 
 
-BeginUnregisterUnservedAttachmentRunning(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id) ==
+BeginUnregisterUnservedAttachmentRunning(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs) ==
     /\ phase = "Running"
     /\ (session_id = Some(arg_session_id))
     /\ (active_runtime_id = agent_runtime_id)
@@ -2393,7 +2393,7 @@ BeginUnregisterUnservedAttachmentRunning(arg_session_id, agent_runtime_id, fence
     /\ unregister_teardown_retains_snapshot' = TRUE
     /\ unregister_runtime_loop_forced_abort' = FALSE
     /\ unregister_comms_drain_forced_abort' = FALSE
-    /\ unregister_queued_inputs' = "Stop"
+    /\ unregister_queued_inputs' = IF ((queued_inputs = "Keep") /\ ~(registration_live_input_seen)) THEN "Keep" ELSE "Stop"
     /\ unregister_requeue_max_age_ms' = 0
     /\ UnchangedFrame_0fbd972cc51a009e
 
@@ -37657,9 +37657,9 @@ Next ==
     \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : \E requeue_max_age_ms \in 0..2 : BeginUnregisterSessionRunning(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
     \/ (phase = "Retired") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : \E requeue_max_age_ms \in 0..2 : BeginUnregisterSessionRetainsSnapshotRetired(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
     \/ (phase = "Stopped") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : \E requeue_max_age_ms \in 0..2 : BeginUnregisterSessionRetainsSnapshotStopped(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs, requeue_max_age_ms)
-    \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : BeginUnregisterUnservedAttachmentIdle(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
-    \/ (phase = "Attached") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : BeginUnregisterUnservedAttachmentAttached(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
-    \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : BeginUnregisterUnservedAttachmentRunning(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+    \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : BeginUnregisterUnservedAttachmentIdle(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
+    \/ (phase = "Attached") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : BeginUnregisterUnservedAttachmentAttached(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
+    \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E agent_runtime_id \in OptionAgentRuntimeIdValues : \E fence_token \in OptionFenceTokenValues : \E generation \in OptionGenerationValues : \E runtime_epoch_id \in OptionRuntimeEpochIdValues : \E queued_inputs \in UnregisterQueuedInputsDispositionValues : BeginUnregisterUnservedAttachmentRunning(arg_session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
     \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E forced_abort \in BOOLEAN : RuntimeLoopStoppedForUnregisterIdle(arg_session_id, forced_abort)
     \/ (phase = "Attached") /\ \E arg_session_id \in SessionIdValues : \E forced_abort \in BOOLEAN : RuntimeLoopStoppedForUnregisterAttached(arg_session_id, forced_abort)
     \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E forced_abort \in BOOLEAN : RuntimeLoopStoppedForUnregisterRunning(arg_session_id, forced_abort)
