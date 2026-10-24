@@ -666,6 +666,9 @@ impl RpcMobSessionService {
         }
     }
 
+    // Each part is a distinct runtime-owned handle the service shares with
+    // the runtime that composes it; none has a default.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         service: Arc<PersistentSessionService<FactoryAgentBuilder>>,
         staged_sessions: Arc<StagedSessionRegistry>,
