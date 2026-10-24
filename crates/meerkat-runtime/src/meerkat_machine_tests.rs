@@ -60300,6 +60300,81 @@ mod terminal_completion_batch_bound {
             .await;
     }
 
+    /// Fails every archive post-commit obligation it is handed.
+    struct FailingArchiveHook;
+
+    #[async_trait::async_trait]
+    impl crate::meerkat_machine::MachineSessionArchivePostCommitHook for FailingArchiveHook {
+        async fn after_runtime_retire_commit(&self) -> Result<(), RuntimeControlPlaneError> {
+            Err(RuntimeControlPlaneError::Internal(
+                "the archive's post-commit obligation failed".to_string(),
+            ))
+        }
+    }
+
+    /// An archive retire of a session with no runtime loop durably ends its
+    /// pending inputs before its fallible steps (the session's DSL commit, the
+    /// archive's model-routing handoffs, the post-commit hook, the removal of
+    /// a recovered registration). When one fails, the retire answers that
+    /// error and the ended inputs' terminals are still published: every
+    /// waiter is answered, every completion is readable, and the registration
+    /// stays ready (a failed hook retains it for the retry). RED while the
+    /// retire returned at the failed step, before its publication.
+    async fn archive_retire_publishes_its_ended_inputs_when_its_hook_fails(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture
+            .admit_backlog(DROPPED_CALLER_INPUTS, HandlingMode::Queue)
+            .await;
+        let lease = fixture
+            .machine
+            .prepare_session_archive_lease(&fixture.session_id)
+            .await
+            .expect("prepare the archive lease")
+            .expect("the registered session has an archive lease");
+        let retired = tokio::time::timeout(
+            Duration::from_secs(60),
+            fixture
+                .machine
+                .retire_session_with_archive_lease_and_post_commit_hook_before(
+                    lease,
+                    Arc::new(FailingArchiveHook),
+                    meerkat_core::time_compat::Instant::now()
+                        + meerkat_core::time_compat::Duration::from_secs(30),
+                ),
+        )
+        .await
+        .expect("the archive retire returns");
+        assert!(
+            matches!(
+                &retired,
+                Err(RuntimeControlPlaneError::Internal(reason))
+                    if reason.contains("post-commit obligation failed")
+            ),
+            "the failed hook is the retire's answer: {retired:?}"
+        );
+        let outcomes = fixture
+            .settle_within(waiters, "failed archive hook", Duration::from_secs(30))
+            .await;
+        assert_every_runtime_terminated(
+            &outcomes,
+            "retired without runtime loop",
+            "failed archive hook",
+        );
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "failed archive hook",
+            )
+            .await;
+        fixture.assert_ready("after the failed archive hook").await;
+    }
+
     macro_rules! on_every_store {
         ($($row:ident),* $(,)?) => {
             $(
@@ -60341,6 +60416,7 @@ mod terminal_completion_batch_bound {
         retirement_cleanup_publishes_every_directed_batch,
         held_loop_stop_publishes_every_directed_batch,
         directed_input_without_a_runtime_placement_is_refused_at_admission,
+        archive_retire_publishes_its_ended_inputs_when_its_hook_fails,
     );
 
     /// Inputs a dropped-caller row queues.
