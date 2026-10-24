@@ -9638,29 +9638,35 @@ async fn assert_the_open_run_resumes_once_and_completes(
     head_canonical: bool,
     context: &str,
 ) {
+    // While the resumed run's provisional tail stands, a committed read of
+    // the session refuses (HeadCanonical) or reads the boundary before the
+    // run: wait for the run to commit its tail, then read once.
     let deadline = Instant::now() + Duration::from_secs(30);
-    let session = loop {
-        let session = service
-            .load_authoritative_session(&run.w1_sid)
-            .await
-            .unwrap_or_else(|error| panic!("[{context}] read w-1's committed session: {error}"))
-            .unwrap_or_else(|| panic!("[{context}] w-1's session is committed"));
-        let done = session.messages().iter().any(|message| match message {
+    while provisional_tail_run(runtime_store, &run.w1_sid, head_canonical)
+        .await
+        .is_some()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "[{context}] the resumed run did not commit its tail"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let session = service
+        .load_authoritative_session(&run.w1_sid)
+        .await
+        .unwrap_or_else(|error| panic!("[{context}] read w-1's committed session: {error}"))
+        .unwrap_or_else(|| panic!("[{context}] w-1's session is committed"));
+    assert!(
+        session.messages().iter().any(|message| match message {
             meerkat_core::Message::BlockAssistant(assistant) => {
                 assistant.text_blocks().collect::<String>() == "loop done"
             }
             _ => false,
-        });
-        if done {
-            break session;
-        }
-        assert!(
-            Instant::now() < deadline,
-            "[{context}] the resumed run did not complete: {:?}",
-            session.messages().last()
-        );
-        sleep(Duration::from_millis(100)).await;
-    };
+        }),
+        "[{context}] the resumed run completed: {:?}",
+        session.messages().last()
+    );
     // A duplicate resume or a rerun of the input would ask the model again.
     sleep(Duration::from_secs(2)).await;
     assert_eq!(
@@ -9859,10 +9865,16 @@ async fn a_mob_start_over_a_held_member_tail_still_refuses_typed() {
     power_store.hold_durable_tail_recovery(true);
     let client_2 = Arc::new(HoldingToolLoopClient::new(0));
     let service_2 = requeue_service(&paths, runtime_store.clone(), true, client_2.clone());
-    let error = start_again(&paths, service_2.clone(), client_2.clone())
-        .await
-        .err()
-        .expect("a start over a held tail refuses");
+    // The start fails in the mob's actor before it admits a command: the
+    // builder may hand back the handle, whose status then carries the
+    // fail-stop.
+    let error = match start_again(&paths, service_2.clone(), client_2.clone()).await {
+        Err(error) => error,
+        Ok(handle) => handle
+            .status()
+            .await
+            .expect_err("a start over a held tail fail-stops the mob"),
+    };
     assert!(
         is_unprovable_tail_start_failure(&error, &AgentIdentity::from("w-1"), &run.w1_sid),
         "the start refuses with the member's typed unprovable tail: {error:?}"
