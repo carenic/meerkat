@@ -593,6 +593,9 @@ async fn run_runtime_backed_initial_turn_with_machine_boundary_mode<
     result.map_err(|(error, _admission)| SurfaceRuntimeMaterializeError::Session(error))
 }
 
+/// Roll back a prepared registration after its materialization admitted an
+/// input (its initial turn): the registration it inserted stops every
+/// non-terminal input, so a turn its caller saw refused never runs later.
 async fn rollback_prepared_runtime_registration(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
 ) {
@@ -607,6 +610,39 @@ async fn rollback_prepared_runtime_registration(
             %error,
             "failed to roll back exact prepared runtime registration"
         );
+    }
+}
+
+/// Roll back a prepared registration whose materialization admitted no input
+/// (it was refused before it served: a durable tail held for recovery, a
+/// failed agent build). The registration it inserted keeps every input it
+/// recovered from the store exactly as the store holds it, so the refusal
+/// ends nothing a later start would run.
+async fn rollback_prepared_runtime_registration_keeping_recovered_inputs(
+    prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
+) {
+    let session_id = prepared.session_id().clone();
+    // Never under the turn-finalization boundary B, as above (#1814).
+    if let Err(error) = prepared.rollback_now_keeping_recovered_inputs().await {
+        tracing::warn!(
+            %session_id,
+            %error,
+            "failed to roll back exact prepared runtime registration"
+        );
+    }
+}
+
+/// Roll back a prepared registration after its materialization returned: it
+/// keeps the inputs its registration recovered unless the materialization
+/// admitted its initial turn.
+async fn rollback_prepared_runtime_registration_after_materialization(
+    prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
+    admitted_initial_turn: bool,
+) {
+    if admitted_initial_turn {
+        rollback_prepared_runtime_registration(prepared).await;
+    } else {
+        rollback_prepared_runtime_registration_keeping_recovered_inputs(prepared).await;
     }
 }
 
@@ -959,6 +995,7 @@ pub async fn materialize_prepared_session_actor_unattached_with_actor_slot<
     ensure_materialized_session_id_matches(prepared.session_id(), session.id())?;
     require_unattached_session_actor(adapter, session.id()).await?;
 
+    let admitted_initial_turn = request.initial_turn == InitialTurnPolicy::RunImmediately;
     let (result, actor_witness_slot) =
         materialize_prepared_session_actor_transaction_with_admission(
             service,
@@ -973,7 +1010,11 @@ pub async fn materialize_prepared_session_actor_unattached_with_actor_slot<
         .witness()
         .is_some_and(|witness| witness.session_id() == &result.session_id && witness.is_live());
     if !actor_witness_is_exact {
-        rollback_prepared_runtime_registration(prepared).await;
+        rollback_prepared_runtime_registration_after_materialization(
+            prepared,
+            admitted_initial_turn,
+        )
+        .await;
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
             RuntimeDriverError::ValidationFailed {
                 reason: format!(
@@ -1111,6 +1152,7 @@ where
         + Send
         + 'static,
 {
+    let admitted_initial_turn = request.initial_turn == InitialTurnPolicy::RunImmediately;
     let (result, mut prepared, actor_witness_slot) =
         materialize_unique_session_actor_transaction_with_admission(
             service,
@@ -1130,7 +1172,11 @@ where
     {
         Ok(EnsureRuntimeExecutorAttachment::Pending(pending)) => pending,
         Ok(EnsureRuntimeExecutorAttachment::Existing(witness)) => {
-            rollback_prepared_runtime_registration(&mut prepared).await;
+            rollback_prepared_runtime_registration_after_materialization(
+                &mut prepared,
+                admitted_initial_turn,
+            )
+            .await;
             return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(
                 RuntimeDriverError::ValidationFailed {
                     reason: format!(
@@ -1140,7 +1186,11 @@ where
             ));
         }
         Err(error) => {
-            rollback_prepared_runtime_registration(&mut prepared).await;
+            rollback_prepared_runtime_registration_after_materialization(
+                &mut prepared,
+                admitted_initial_turn,
+            )
+            .await;
             return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(error));
         }
     };
@@ -1207,7 +1257,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     )
     .await
     {
-        rollback_prepared_runtime_registration(prepared).await;
+        rollback_prepared_runtime_registration_keeping_recovered_inputs(prepared).await;
         return Err(SurfaceRuntimeMaterializeError::RuntimeDriver(error));
     }
 
@@ -1225,10 +1275,12 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
             &actor_witness_slot,
         )
         .await;
+    // Refused before it admitted anything: the registration keeps every input
+    // it recovered, so a held durable tail stays held with its inputs open.
     let result = match create_result {
         Ok(result) => result,
         Err(error) => {
-            rollback_prepared_runtime_registration(prepared).await;
+            rollback_prepared_runtime_registration_keeping_recovered_inputs(prepared).await;
             return Err(SurfaceRuntimeMaterializeError::Session(error));
         }
     };
@@ -1236,7 +1288,7 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
     if let Err(error) =
         ensure_materialized_session_id_matches(&prepared_session_id, &result.session_id)
     {
-        rollback_prepared_runtime_registration(prepared).await;
+        rollback_prepared_runtime_registration_keeping_recovered_inputs(prepared).await;
         return Err(error);
     }
 

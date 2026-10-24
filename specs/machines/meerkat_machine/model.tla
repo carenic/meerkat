@@ -2221,7 +2221,7 @@ BeginUnregisterSessionIdle(arg_session_id, agent_runtime_id, fence_token, genera
     /\ (active_runtime_generation = generation)
     /\ (active_runtime_epoch_id = runtime_epoch_id)
     /\ (registration_phase # "Draining")
-    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)))
+    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)) THEN TRUE ELSE ((queued_inputs = "Keep") /\ (requeue_max_age_ms = 0))))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ registration_phase' = "Draining"
@@ -2244,7 +2244,7 @@ BeginUnregisterSessionAttached(arg_session_id, agent_runtime_id, fence_token, ge
     /\ (active_runtime_generation = generation)
     /\ (active_runtime_epoch_id = runtime_epoch_id)
     /\ (registration_phase # "Draining")
-    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)))
+    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)) THEN TRUE ELSE ((queued_inputs = "Keep") /\ (requeue_max_age_ms = 0))))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ registration_phase' = "Draining"
@@ -2267,7 +2267,7 @@ BeginUnregisterSessionRunning(arg_session_id, agent_runtime_id, fence_token, gen
     /\ (active_runtime_generation = generation)
     /\ (active_runtime_epoch_id = runtime_epoch_id)
     /\ (registration_phase # "Draining")
-    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)))
+    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)) THEN TRUE ELSE ((queued_inputs = "Keep") /\ (requeue_max_age_ms = 0))))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ registration_phase' = "Draining"
@@ -2290,7 +2290,7 @@ BeginUnregisterSessionRetainsSnapshotRetired(arg_session_id, agent_runtime_id, f
     /\ (active_runtime_generation = generation)
     /\ (active_runtime_epoch_id = runtime_epoch_id)
     /\ (registration_phase # "Draining")
-    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)))
+    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)) THEN TRUE ELSE ((queued_inputs = "Keep") /\ (requeue_max_age_ms = 0))))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ registration_phase' = "Draining"
@@ -2313,7 +2313,7 @@ BeginUnregisterSessionRetainsSnapshotStopped(arg_session_id, agent_runtime_id, f
     /\ (active_runtime_generation = generation)
     /\ (active_runtime_epoch_id = runtime_epoch_id)
     /\ (registration_phase # "Draining")
-    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)))
+    /\ (IF ((queued_inputs = "Stop") /\ (requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((queued_inputs = "Requeue") /\ (requeue_max_age_ms > 0)) THEN TRUE ELSE ((queued_inputs = "Keep") /\ (requeue_max_age_ms = 0))))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ registration_phase' = "Draining"
@@ -37372,6 +37372,7 @@ ClassifyStopInputDispositionAbandonInitializing(input_id, durability, directed, 
     /\ phase = "Initializing"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Initializing"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37381,6 +37382,7 @@ ClassifyStopInputDispositionAbandonIdle(input_id, durability, directed, objectiv
     /\ phase = "Idle"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37390,6 +37392,7 @@ ClassifyStopInputDispositionAbandonAttached(input_id, durability, directed, obje
     /\ phase = "Attached"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37399,6 +37402,7 @@ ClassifyStopInputDispositionAbandonRunning(input_id, durability, directed, objec
     /\ phase = "Running"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37408,6 +37412,7 @@ ClassifyStopInputDispositionAbandonRetired(input_id, durability, directed, objec
     /\ phase = "Retired"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37417,6 +37422,7 @@ ClassifyStopInputDispositionAbandonStopped(input_id, durability, directed, objec
     /\ phase = "Stopped"
     /\ ((IF ~((registration_phase = "Draining")) THEN TRUE ELSE (IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE (input_id \in DOMAIN input_phases)))) /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Requeue") /\ (input_id \in DOMAIN input_phases) /\ ((input_phases)[input_id] = "Queued") /\ ((IF (input_id \in DOMAIN input_lane) THEN Some((IF input_id \in DOMAIN input_lane THEN input_lane[input_id] ELSE "None")) ELSE None) = Some("Queue")) /\ ((IF (input_id \in DOMAIN input_is_prompt) THEN Some((IF input_id \in DOMAIN input_is_prompt THEN input_is_prompt[input_id] ELSE FALSE)) ELSE None) = Some(TRUE)) /\ (directed = FALSE) /\ (objective_bound = FALSE) /\ (durability = "Durable"))))
     /\ ((IF ~((unregister_queued_inputs = "Requeue")) THEN TRUE ELSE (IF ~((resumable_run_id # None)) THEN TRUE ELSE (IF ~(((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id)) THEN TRUE ELSE (IF ~((input_id \in DOMAIN input_phases)) THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE ((input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE (input_id \in DOMAIN input_phases))))))))) /\ ~(((unregister_queued_inputs = "Requeue") /\ (resumable_run_id # None) /\ ((IF (input_id \in DOMAIN input_run_associations) THEN Some((IF input_id \in DOMAIN input_run_associations THEN input_run_associations[input_id] ELSE "None")) ELSE None) = resumable_run_id) /\ (input_id \in DOMAIN input_phases) /\ (IF ((input_phases)[input_id] = "Staged") THEN TRUE ELSE (IF ((input_phases)[input_id] = "Applied") THEN TRUE ELSE ((input_phases)[input_id] = "AppliedPendingConsumption"))) /\ (registration_phase = "Draining"))))
+    /\ ~(((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs)))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -37465,6 +37471,54 @@ ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, fai
 ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, failure) ==
     /\ phase = "Stopped"
     /\ (failure = "RequeuedAcrossStop")
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepInitializing(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Initializing"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepIdle(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Idle"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
+    /\ phase' = "Idle"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepAttached(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Attached"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
+    /\ phase' = "Attached"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepRunning(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Running"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepRetired(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Retired"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_5a9fd47f53c1c03f
+
+
+ClassifyStopInputDispositionKeepStopped(input_id, durability, directed, objective_bound) ==
+    /\ phase = "Stopped"
+    /\ ((registration_phase = "Draining") /\ (unregister_queued_inputs = "Keep") /\ (input_id \in DOMAIN input_phases) /\ (input_id \in recovered_admitted_inputs))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5a9fd47f53c1c03f
@@ -40152,6 +40206,12 @@ Next ==
     \/ (phase = "Running") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRunning(arg_session_id, failure)
     \/ (phase = "Retired") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopRetired(arg_session_id, failure)
     \/ (phase = "Stopped") /\ \E arg_session_id \in SessionIdValues : \E failure \in RuntimeCompletionWaitFailureObservationValues : ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped(arg_session_id, failure)
+    \/ (phase = "Initializing") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepInitializing(input_id, durability, directed, objective_bound)
+    \/ (phase = "Idle") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepIdle(input_id, durability, directed, objective_bound)
+    \/ (phase = "Attached") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepAttached(input_id, durability, directed, objective_bound)
+    \/ (phase = "Running") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepRunning(input_id, durability, directed, objective_bound)
+    \/ (phase = "Retired") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepRetired(input_id, durability, directed, objective_bound)
+    \/ (phase = "Stopped") /\ \E input_id \in StringValues : \E durability \in InputDurabilityKindValues : \E directed \in BOOLEAN : \E objective_bound \in BOOLEAN : ClassifyStopInputDispositionKeepStopped(input_id, durability, directed, objective_bound)
     \/ TerminalStutter
 
 live_delegation_steer_records_are_authorized_and_single == ((DOMAIN live_delegation_steer_digest_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (DOMAIN live_delegation_steer_reconciliation_by_continuation = DOMAIN live_delegation_steer_operation_by_continuation) /\ (\A continuation_id \in DOMAIN live_delegation_steer_delivered_by_continuation : (continuation_id \in DOMAIN live_delegation_steer_operation_by_continuation)))
@@ -40201,7 +40261,7 @@ runtime_binding_identity_is_typed == (IF (active_runtime_id = None) THEN TRUE EL
 running_has_current_run == (IF (phase # "Running") THEN TRUE ELSE (current_run_id # None))
 deferred_stop_requires_active_runtime_phase == (IF (runtime_stop_deferred = FALSE) THEN TRUE ELSE (IF (phase = "Running") THEN TRUE ELSE (phase = "Attached")))
 unregister_drain_obligations_require_draining == (IF (registration_phase = "Draining") THEN TRUE ELSE ((unregister_runtime_loop_drain_pending = FALSE) /\ (unregister_comms_drain_exit_pending = FALSE) /\ (unregister_completion_waiter_drain_pending = FALSE) /\ (unregister_teardown_retains_snapshot = FALSE) /\ (unregister_queued_inputs = "Stop") /\ (unregister_requeue_max_age_ms = 0)))
-unregister_requeue_max_age_matches_disposition == (IF ((unregister_queued_inputs = "Stop") /\ (unregister_requeue_max_age_ms = 0)) THEN TRUE ELSE ((unregister_queued_inputs = "Requeue") /\ (unregister_requeue_max_age_ms > 0)))
+unregister_requeue_max_age_matches_disposition == (IF ((unregister_queued_inputs = "Stop") /\ (unregister_requeue_max_age_ms = 0)) THEN TRUE ELSE (IF ((unregister_queued_inputs = "Requeue") /\ (unregister_requeue_max_age_ms > 0)) THEN TRUE ELSE ((unregister_queued_inputs = "Keep") /\ (unregister_requeue_max_age_ms = 0))))
 current_run_only_while_running_or_retired == (IF (current_run_id = None) THEN TRUE ELSE (IF (phase = "Running") THEN TRUE ELSE (phase = "Retired")))
 current_run_has_pre_run_phase == (IF ((current_run_id = None) /\ (pre_run_phase = None)) THEN TRUE ELSE ((current_run_id # None) /\ (pre_run_phase # None)))
 input_context_targets_are_governed == (\A input_id \in DOMAIN input_context_targets : (input_id \in DOMAIN input_authority_bindings))

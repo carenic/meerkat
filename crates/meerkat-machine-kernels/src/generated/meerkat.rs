@@ -11808,12 +11808,15 @@ pub enum StopInputDisposition {
     Abandon,
     #[serde(rename = "Retain")]
     Retain,
+    #[serde(rename = "Keep")]
+    Keep,
 }
 impl StopInputDisposition {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Abandon => "Abandon",
             Self::Retain => "Retain",
+            Self::Keep => "Keep",
         }
     }
 }
@@ -11823,6 +11826,7 @@ impl std::convert::TryFrom<&str> for StopInputDisposition {
         match value {
             "Abandon" => Ok(Self::Abandon),
             "Retain" => Ok(Self::Retain),
+            "Keep" => Ok(Self::Keep),
             other => Err(format!("invalid StopInputDisposition value `{other}`")),
         }
     }
@@ -13488,12 +13492,15 @@ pub enum UnregisterQueuedInputsDisposition {
     Stop,
     #[serde(rename = "Requeue")]
     Requeue,
+    #[serde(rename = "Keep")]
+    Keep,
 }
 impl UnregisterQueuedInputsDisposition {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Stop => "Stop",
             Self::Requeue => "Requeue",
+            Self::Keep => "Keep",
         }
     }
 }
@@ -13503,6 +13510,7 @@ impl std::convert::TryFrom<&str> for UnregisterQueuedInputsDisposition {
         match value {
             "Stop" => Ok(Self::Stop),
             "Requeue" => Ok(Self::Requeue),
+            "Keep" => Ok(Self::Keep),
             other => Err(format!(
                 "invalid UnregisterQueuedInputsDisposition value `{other}`"
             )),
@@ -25626,6 +25634,12 @@ pub enum TransitionId {
     ClassifyStopInputDispositionAbandonRunning,
     ClassifyStopInputDispositionAbandonRetired,
     ClassifyStopInputDispositionAbandonStopped,
+    ClassifyStopInputDispositionKeepInitializing,
+    ClassifyStopInputDispositionKeepIdle,
+    ClassifyStopInputDispositionKeepAttached,
+    ClassifyStopInputDispositionKeepRunning,
+    ClassifyStopInputDispositionKeepRetired,
+    ClassifyStopInputDispositionKeepStopped,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopInitializing,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopIdle,
     ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopAttached,

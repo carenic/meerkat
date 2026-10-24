@@ -28399,6 +28399,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Initializing`
 
@@ -28408,6 +28409,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Idle`
 
@@ -28417,6 +28419,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Attached`
 
@@ -28426,6 +28429,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Running`
 
@@ -28435,6 +28439,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Retired`
 
@@ -28444,6 +28449,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `not_requeue_eligible`
   - `not_resumable_run_input`
+  - `not_kept_recovered_input`
 - Emits: `StopInputDispositionClassified`
 - To: `Stopped`
 
@@ -28493,6 +28499,54 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `requeued_across_stop`
 - Emits: `RuntimeCompletionWaitFailureResolved`
+- To: `Stopped`
+
+### `ClassifyStopInputDispositionKeepInitializing`
+- From: `Initializing`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
+- To: `Initializing`
+
+### `ClassifyStopInputDispositionKeepIdle`
+- From: `Idle`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
+- To: `Idle`
+
+### `ClassifyStopInputDispositionKeepAttached`
+- From: `Attached`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
+- To: `Attached`
+
+### `ClassifyStopInputDispositionKeepRunning`
+- From: `Running`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
+- To: `Running`
+
+### `ClassifyStopInputDispositionKeepRetired`
+- From: `Retired`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
+- To: `Retired`
+
+### `ClassifyStopInputDispositionKeepStopped`
+- From: `Stopped`
+- On: `ClassifyStopInputDisposition`(input_id, durability, directed, objective_bound)
+- Guards:
+  - `kept_recovered_input`
+- Emits: `StopInputDispositionClassified`
 - To: `Stopped`
 
 ## Coverage

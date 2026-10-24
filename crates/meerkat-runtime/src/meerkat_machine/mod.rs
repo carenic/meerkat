@@ -1536,6 +1536,16 @@ impl UnregisterDisposition {
         requeue_max_age_ms: 0,
     };
 
+    /// Keep every non-terminal input the registration recovered from the
+    /// store exactly as the store holds it, with no requeue mark: the
+    /// rollback of a materialization that never served and admitted no
+    /// input. An input admitted while the registration stood still ends
+    /// as stopped.
+    pub(crate) const KEEP: Self = Self {
+        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Keep,
+        requeue_max_age_ms: 0,
+    };
+
     pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
         (self.queued_inputs, self.requeue_max_age_ms)
     }
@@ -5904,9 +5914,25 @@ impl PreparedSessionMaterialization {
 
     /// Roll back this exact materialization now. A pre-existing runtime entry is
     /// preserved after its exact provisional cleanup; an entry inserted for this
-    /// transaction is fully unregistered.
+    /// transaction is fully unregistered, and its stop ends every non-terminal
+    /// input as stopped.
     pub async fn rollback_now(&mut self) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(false)
+        self.rollback_now_with_turn_finalization_boundary(false, UnregisterDisposition::STOP)
+            .await
+    }
+
+    /// [`Self::rollback_now`] for a materialization that served nothing and
+    /// admitted no input. An entry inserted for this transaction is
+    /// unregistered with the Keep disposition: every non-terminal input its
+    /// registration recovered from the store stays exactly as the store
+    /// holds it, with no requeue mark, for the next registration to recover
+    /// again. A refused materialization (a durable tail held for recovery,
+    /// a failed agent build) so ends nothing a later start would run. An
+    /// input admitted while the registration stood still ends as stopped.
+    pub async fn rollback_now_keeping_recovered_inputs(
+        &mut self,
+    ) -> Result<bool, RuntimeDriverError> {
+        self.rollback_now_with_turn_finalization_boundary(false, UnregisterDisposition::KEEP)
             .await
     }
 
@@ -5921,13 +5947,14 @@ impl PreparedSessionMaterialization {
     pub async fn rollback_now_under_turn_finalization_boundary(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(true)
+        self.rollback_now_with_turn_finalization_boundary(true, UnregisterDisposition::STOP)
             .await
     }
 
     async fn rollback_now_with_turn_finalization_boundary(
         &mut self,
         turn_finalization_boundary_already_held: bool,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         if !self.armed {
             return Ok(false);
@@ -5944,6 +5971,7 @@ impl PreparedSessionMaterialization {
                 Some(self.bindings.epoch_id()),
                 Some(&self.claim_state),
                 turn_finalization_boundary_already_held,
+                queued_inputs,
             )
             .await?;
         self.armed = false;
@@ -5991,6 +6019,7 @@ impl Drop for PreparedSessionMaterialization {
                     Some(&epoch_id),
                     Some(&claim_state),
                     false,
+                    UnregisterDisposition::STOP,
                 )
                 .await
             {
@@ -6083,6 +6112,7 @@ impl Drop for PendingPreparedMaterialization {
                     None,
                     None,
                     false,
+                    UnregisterDisposition::KEEP,
                 )
                 .await
             {

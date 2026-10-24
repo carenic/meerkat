@@ -1539,6 +1539,10 @@ impl PersistentRuntimeDriver {
                         == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue)
                         .then_some(state.unregister_requeue_max_age_ms),
                 )
+                .with_keeps_recovered_inputs(
+                    state.unregister_queued_inputs
+                        == crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep,
+                )
             },
         )
     }

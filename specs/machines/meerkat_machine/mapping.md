@@ -8069,6 +8069,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveRuntimeCompletionWaitFailureRequeuedAcrossStopStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyStopInputDispositionKeepStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `RuntimeBound`

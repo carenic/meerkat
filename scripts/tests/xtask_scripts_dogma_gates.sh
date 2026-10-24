@@ -336,6 +336,9 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # to be reported violated.
 # requeue_across_stop_audit.sh requires each of its eight reachability
 # witnesses to be reported violated.
+# materialization_rollback_keep_audit.sh requires each of its four
+# reachability witnesses violated, and with --mutants each seeded defect's
+# invariant.
 # live_delegation_worker_start_after_close_audit.sh requires its two goals to
 # be reported violated.
 # live_context_result_barrier_audit.sh with --mutants requires its
@@ -395,6 +398,14 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessPlainStopAbandons is violated."' \
   'echo "Error: Invariant NotAuditWitnessRequeuedWaitAnswered is violated."' \
   'echo "Error: Invariant NotAuditWitnessSuspendedRunResumes is violated."' \
+  'echo "Error: Invariant NotAuditWitnessKeptQueuedInputRuns is violated."' \
+  'echo "Error: Invariant NotAuditWitnessKeptRequeuedInputRuns is violated."' \
+  'echo "Error: Invariant NotAuditWitnessAdmittedInputStoppedUnderKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStopRollbackEndsRecoveredInput is violated."' \
+  'echo "Error: Invariant AuditKeepEndsNoRecoveredInput is violated."' \
+  'echo "Error: Invariant AuditKeepStopsWhatItAdmitted is violated."' \
+  'echo "Error: Invariant AuditRollbackVerdictIsAFunction is violated."' \
+  'echo "Error: Invariant AuditKeepOnlyUnderKeep is violated."' \
   'echo "Error: Action property AuditNeverUnregisters is violated."' \
   'echo "Error: Action property AuditNeverUnregistersWithPreparation is violated."' \
   'echo "Error: Invariant AuditNeverCancelsRecovery is violated."' \

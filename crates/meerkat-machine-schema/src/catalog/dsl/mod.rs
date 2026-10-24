@@ -2777,9 +2777,9 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "UnregisterQueuedInputsDisposition",
-                &["Stop", "Requeue"],
+                &["Stop", "Requeue", "Keep"],
             ),
-            NamedTypeBinding::string_enum("StopInputDisposition", &["Abandon", "Retain"]),
+            NamedTypeBinding::string_enum("StopInputDisposition", &["Abandon", "Retain", "Keep"]),
             NamedTypeBinding::string_enum(
                 "RecoveredTerminalCompletionDisposition",
                 &["Recover", "DiscardUnrecoverable", "Blocked"],

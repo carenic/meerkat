@@ -2846,6 +2846,12 @@ pub enum UnregisterQueuedInputsDisposition {
     Stop,
     /// Keep each eligible queued input durably queued for the next start.
     Requeue,
+    /// Keep every non-terminal input the registration recovered from the
+    /// store exactly as the store holds it, with no requeue mark: the
+    /// rollback of a materialization that never served and admitted no
+    /// input. An input admitted while the registration stood still ends
+    /// as stopped.
+    Keep,
 }
 
 /// Generated verdict of a runtime stop for one non-terminal input.
@@ -2856,6 +2862,9 @@ pub enum StopInputDisposition {
     Abandon,
     /// Keep the input durably queued for the next start.
     Retain,
+    /// Keep the input exactly as the store holds it, with no requeue mark:
+    /// the next registration recovers it as an earlier process left it.
+    Keep,
 }
 
 /// Generated disposition for one recovered durable terminal-completion batch.
@@ -10172,12 +10181,14 @@ macro_rules! meerkat_catalog_machine_dsl {
                 && self.unregister_requeue_max_age_ms == 0)
         }
 
-        // A requeue carries a max age; a stop carries none.
+        // A requeue carries a max age; a stop or a keep carries none.
         invariant unregister_requeue_max_age_matches_disposition {
             (self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Stop
                 && self.unregister_requeue_max_age_ms == 0)
             || (self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Requeue
                 && self.unregister_requeue_max_age_ms > 0)
+            || (self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                && self.unregister_requeue_max_age_ms == 0)
         }
 
         invariant current_run_only_while_running_or_retired {
@@ -11962,6 +11973,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 (queued_inputs == UnregisterQueuedInputsDisposition::Stop && requeue_max_age_ms == 0)
                 || (queued_inputs == UnregisterQueuedInputsDisposition::Requeue
                     && requeue_max_age_ms > 0)
+                || (queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                    && requeue_max_age_ms == 0)
             }
             update {
                 self.registration_phase = RegistrationPhase::Draining;
@@ -11993,6 +12006,8 @@ macro_rules! meerkat_catalog_machine_dsl {
                 (queued_inputs == UnregisterQueuedInputsDisposition::Stop && requeue_max_age_ms == 0)
                 || (queued_inputs == UnregisterQueuedInputsDisposition::Requeue
                     && requeue_max_age_ms > 0)
+                || (queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                    && requeue_max_age_ms == 0)
             }
             update {
                 self.registration_phase = RegistrationPhase::Draining;
@@ -39153,9 +39168,11 @@ macro_rules! meerkat_catalog_machine_dsl {
         // objective-bound, as failed when it does not run there), so a kept
         // one would run after a restart that record already settled. Every
         // other input is Abandon, so under the Stop disposition, or outside
-        // an unregister, the verdict is today's blanket abandon. The shell
-        // supplies durability, directedness and the objective binding; the
-        // phase, lane and kind are machine facts.
+        // an unregister, the verdict is today's blanket abandon. Under the
+        // Keep disposition (ClassifyStopInputDispositionKeep, appended last)
+        // an input the registration recovered is Keep and every other input
+        // is Abandon. The shell supplies durability, directedness and the
+        // objective binding; the phase, lane and kind are machine facts.
         transition ClassifyStopInputDispositionRetain {
             per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
             on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
@@ -39232,6 +39249,12 @@ macro_rules! meerkat_catalog_machine_dsl {
                             == InputPhase::AppliedPendingConsumption)
                     && self.registration_phase == RegistrationPhase::Draining)
             }
+            guard "not_kept_recovered_input" {
+                !(self.registration_phase == RegistrationPhase::Draining
+                    && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                    && self.input_phases.contains_key(input_id)
+                    && self.recovered_admitted_inputs.contains(input_id))
+            }
             update {}
             to Idle
             emit StopInputDispositionClassified {
@@ -39262,6 +39285,34 @@ macro_rules! meerkat_catalog_machine_dsl {
                 public_error_class: RuntimeCompletionWaitFailurePublicErrorClass::SessionNotRunning,
                 public_reason: RuntimeCompletionWaitFailurePublicReason::RequeuedAcrossStop,
                 resumable: true
+            }
+        }
+
+        // 26c-stop, appended. A materialization that never served and
+        // admitted no input rolls its registration back with the Keep
+        // disposition. Every non-terminal input the registration recovered
+        // from the store is kept exactly as the store holds it, with no
+        // requeue mark, so a refused restart ends nothing the next
+        // registration recovers: a held durable tail stays held, its
+        // stranded inputs open for the operator's repair. An input admitted
+        // while the registration stood was not recovered: the Abandon arm
+        // ends it as stopped, so a turn its caller saw refused never runs
+        // on a later start.
+        transition ClassifyStopInputDispositionKeep {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ClassifyStopInputDisposition { input_id, durability, directed, objective_bound }
+            guard "kept_recovered_input" {
+                self.registration_phase == RegistrationPhase::Draining
+                && self.unregister_queued_inputs == UnregisterQueuedInputsDisposition::Keep
+                && self.input_phases.contains_key(input_id)
+                && self.recovered_admitted_inputs.contains(input_id)
+            }
+            update {}
+            to Idle
+            emit StopInputDispositionClassified {
+                input_id: input_id,
+                disposition: StopInputDisposition::Keep,
+                requeue_max_age_ms: 0
             }
         }
     }

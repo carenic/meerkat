@@ -4676,10 +4676,10 @@ impl EphemeralRuntimeDriver {
     }
 
     /// The inputs among `input_ids` that the generated stop classifier
-    /// retains now. The stop terminalization asks before the executor's exit,
-    /// to stage the runless carriers for the other inputs only; the exit
-    /// does not change a verdict, and the stop checks that it gives the same
-    /// one ([`Self::stop_non_terminal_inputs`]).
+    /// retains or keeps now. The stop terminalization asks before the
+    /// executor's exit, to stage the runless carriers for the other inputs
+    /// only; the exit does not change a verdict, and the stop checks that it
+    /// gives the same one ([`Self::stop_non_terminal_inputs`]).
     pub(crate) fn stop_retained_input_ids(
         &mut self,
         input_ids: &[InputId],
@@ -4689,7 +4689,13 @@ impl EphemeralRuntimeDriver {
             if !self.input_is_non_terminal_by_authority(id) {
                 continue;
             }
-            if let (mm_dsl::StopInputDisposition::Retain, _) = self.classify_stop_input(id)? {
+            if matches!(
+                self.classify_stop_input(id)?,
+                (
+                    mm_dsl::StopInputDisposition::Retain | mm_dsl::StopInputDisposition::Keep,
+                    _
+                )
+            ) {
                 retained.push(id.clone());
             }
         }
@@ -4702,7 +4708,10 @@ impl EphemeralRuntimeDriver {
     /// queued prompt, or an input of a run marked resumable and not resumed
     /// yet, which stays Staged or Applied and bound to its run) keeps its
     /// phase and payload and is durably marked with the stop's time and max
-    /// age; every other input ends as stopped. Returns the retained inputs.
+    /// age. An input it keeps (the rollback of a materialization that never
+    /// served keeps every input its registration recovered) stays exactly
+    /// as the store holds it, with no mark. Every other input ends as
+    /// stopped. Returns the retained and kept inputs.
     ///
     /// `retained_before_exit` is the set the classifier retained before the
     /// executor's exit, for which no runless carrier was staged. The stop
@@ -4724,7 +4733,12 @@ impl EphemeralRuntimeDriver {
         }
         let retained_now: std::collections::HashSet<&InputId> = verdicts
             .iter()
-            .filter(|(_, (disposition, _))| *disposition == mm_dsl::StopInputDisposition::Retain)
+            .filter(|(_, (disposition, _))| {
+                matches!(
+                    disposition,
+                    mm_dsl::StopInputDisposition::Retain | mm_dsl::StopInputDisposition::Keep
+                )
+            })
             .map(|(id, _)| id)
             .collect();
         let retained_before: std::collections::HashSet<&InputId> =
@@ -4753,6 +4767,9 @@ impl EphemeralRuntimeDriver {
                     state.updated_at = stopped_at;
                     retained.push(id);
                 }
+                // Kept exactly as the store holds it: the next registration
+                // recovers it as an earlier process left it.
+                (mm_dsl::StopInputDisposition::Keep, _) => retained.push(id),
                 (mm_dsl::StopInputDisposition::Abandon, _) => stopped.push(id),
             }
         }
