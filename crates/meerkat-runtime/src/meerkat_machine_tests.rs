@@ -38039,13 +38039,14 @@ async fn persistent_machine_terminal_atomic_failure_publishes_no_durable_termina
 async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_transcript() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
+    // Staged under the id registration recovers, so the recovery below reads
+    // this runtime's terminal truth, not an empty runtime.
+    let session_id = SessionId::new();
+    let canonical_runtime_id = MeerkatMachine::logical_runtime_id(&session_id);
     let (driver, runtime_id, run_id, input_id) =
-        persistent_staged_run_driver(Arc::clone(&store)).await;
+        persistent_staged_run_driver_on(canonical_runtime_id, Arc::clone(&store)).await;
     mark_staged_runtime_turn_machine_failed(&driver, &run_id).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string())
-        .expect("direct driver runtime id should be its session UUID alias");
-    let session_id = owner_session_id.clone();
-    let (session, session_snapshot) = failed_turn_session_snapshot(owner_session_id);
+    let (session, session_snapshot) = failed_turn_session_snapshot(session_id.clone());
 
     commit_machine_terminal_run(
         &driver,
@@ -38101,14 +38102,32 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
             .lifecycle_phase,
         mm_dsl::MeerkatPhase::Idle,
     );
+    // Recovery keeps the consumed input terminal instead of replaying it: no
+    // input of the session is active, and the input reads Consumed under the
+    // run that consumed it. Its row stays inspectable (the durable witness);
+    // while its terminal completion is still pending, recovery also holds it
+    // in live authority as that completion's owner, terminal, so the
+    // completion can still be delivered. An empty runtime (the wrong id)
+    // reads no input at all.
     assert!(
-        recovered
-            .input_state(&session_id, &input_id)
-            .await
-            .expect("read recovered machine-terminal input")
-            .is_none(),
-        "registration recovery must archive the consumed machine-terminal input instead of replaying it"
+        !recovered.session_has_active_inputs(&session_id).await,
+        "registration recovery must not leave the consumed machine-terminal input runnable"
     );
+    let recovered_input = recovered
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read recovered machine-terminal input")
+        .expect("the consumed machine-terminal input remains inspectable after recovery");
+    assert_eq!(
+        recovered_input.seed.phase,
+        crate::input_state::InputLifecycleState::Consumed,
+        "registration recovery must keep the consumed machine-terminal input terminal instead of replaying it"
+    );
+    assert_eq!(
+        recovered_input.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Consumed)
+    );
+    assert_eq!(recovered_input.seed.last_run_id.as_ref(), Some(&run_id));
     let recovered_session: meerkat_core::Session = serde_json::from_slice(
         &inner
             .load_session_snapshot(&runtime_id)
