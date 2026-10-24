@@ -2468,6 +2468,20 @@ them.
   input the settle consumed as stopped. A caller that holds the boundary
   itself (a runtime loop lap's apply) uses the new
   `prepare_cold_attach_under_runtime_turn_boundary`.
+- `meerkat-session`, `meerkat-mob`: the other entries into the same
+  durable-tail recovery also settle a provisional tail only between runtime
+  loop laps: `PersistentSessionService::prepare_committed_boundary_resume`
+  (and so the persistent `MobSessionService::materialize_session_resume_verdict`),
+  `PersistentSessionService::recover_committed_boundary`, and a create that
+  resumes a durable session without holding the session's
+  turn-finalization boundary. Once a tail stands they wait up to one second
+  for that boundary, and a lap that holds it longer refuses them with
+  `SessionError::Busy`, leaving the tail and every row as they were. A
+  caller that holds the boundary itself uses the new
+  `prepare_committed_boundary_resume_under_runtime_turn_boundary`, or the
+  new provided method
+  `MobSessionService::materialize_session_resume_verdict_under_runtime_turn_boundary`,
+  which a wrapper around a persistent service should forward.
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: a HeadCanonical run's
   round commits (see Added, per-round commits) move its durable head over the
   run's compaction rewrites, and the run retires its compaction history to
@@ -3707,11 +3721,15 @@ them.
   revision conflict while the round's tail stands; without the second,
   every resume spawn over a persistent inner service is refused. It should
   forward `settle_durable_tail_before_cold_start`,
-  `settle_durable_tail_before_cold_start_reporting` and
-  `keeps_durable_member_sessions` as well: their defaults settle through a
-  whole resume, report no continued run (so a mob start after a graceful
-  stop with a member's run in flight fails), and answer
-  `supports_persistent_sessions` instead of the inner service's own answer.
+  `settle_durable_tail_before_cold_start_reporting`,
+  `keeps_durable_member_sessions` and
+  `materialize_session_resume_verdict_under_runtime_turn_boundary` as well:
+  their defaults settle through a whole resume, report no continued run (so
+  a mob start after a graceful stop with a member's run in flight fails),
+  answer `supports_persistent_sessions` instead of the inner service's own
+  answer, and make a member host's resume verdict wait for the turn
+  boundary the host holds and refuse with `SessionError::Busy` once a
+  durable tail stands.
 
 - A `RuntimeStore` decorator outside this repository should forward
   `append_service_call_audit` and `read_service_call_audit`. Their defaults

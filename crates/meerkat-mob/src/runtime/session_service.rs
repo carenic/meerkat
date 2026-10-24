@@ -2012,10 +2012,35 @@ pub trait MobSessionService:
     /// converges the durable tail, and refuses with
     /// [`SessionError::ServedElsewhere`] or [`SessionError::HostingUnavailable`]
     /// before any recovery. A wrapper that forwards this method inherits that.
+    ///
+    /// Its convergence commits only between runtime loop laps: once a durable
+    /// tail stands, the persistent preparation waits, at most one second, for
+    /// the session's runtime turn-finalization boundary, and refuses with
+    /// [`SessionError::Busy`] while a lap still holds it. A caller that holds
+    /// the boundary itself uses
+    /// [`Self::materialize_session_resume_verdict_under_runtime_turn_boundary`].
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError>;
+
+    /// [`Self::materialize_session_resume_verdict`] for a caller that holds
+    /// the session's runtime turn-finalization boundary
+    /// ([`Self::acquire_runtime_turn_finalization_guard`]), as a member
+    /// host's materialization does: the persistent service's preparation
+    /// does not wait for the boundary again
+    /// (`PersistentSessionService::prepare_committed_boundary_resume_under_runtime_turn_boundary`).
+    ///
+    /// The default answers [`Self::materialize_session_resume_verdict`]. A
+    /// wrapper around a persistent service should forward this method: that
+    /// service's plain verdict would wait for the boundary its caller holds
+    /// and, once a durable tail stands, refuse with [`SessionError::Busy`].
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        self.materialize_session_resume_verdict(session_id).await
+    }
 
     /// Settle a durable tail ahead of the committed runtime boundary before a
     /// start path reads a session that no live actor of this service hosts:
@@ -3203,6 +3228,81 @@ where
     Ok(Some(session))
 }
 
+/// The resume verdict of a persistent service's committed-boundary resume
+/// preparation.
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_session_resume_verdict(
+    session_id: &SessionId,
+    prepared: meerkat_session::PreparedCommittedBoundaryResume,
+) -> Result<SessionResumeVerdict, SessionError> {
+    match prepared {
+        meerkat_session::PreparedCommittedBoundaryResume::Materializable {
+            session,
+            materialization,
+            observation,
+            preparation,
+        } => {
+            let authority = SessionResumeAuthority {
+                observation: Some(observation),
+            };
+            let load = match materialization {
+                meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active => {
+                    ResumeSessionLoad::Active(session)
+                }
+                meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable => {
+                    ResumeSessionLoad::Revivable(session)
+                }
+            };
+            let preparation =
+                SessionResumePreparationReceipt::from_persistent(session_id, &authority, preparation);
+            SessionResumeVerdict::from_authoritative_load_with_authority(
+                session_id,
+                load,
+                authority,
+                Some(preparation),
+            )
+        }
+        meerkat_session::PreparedCommittedBoundaryResume::Unavailable {
+            unavailable,
+            observation,
+        } => {
+            let authority = SessionResumeAuthority {
+                observation: Some(observation),
+            };
+            let load = match unavailable {
+                meerkat_session::PreparedCommittedBoundaryResumeUnavailable::Absent => {
+                    ResumeSessionLoad::Absent
+                }
+                meerkat_session::PreparedCommittedBoundaryResumeUnavailable::ArchivedNotRevivable {
+                    runtime_state,
+                } => ResumeSessionLoad::ArchivedNotRevivable { runtime_state },
+            };
+            SessionResumeVerdict::from_authoritative_load_with_authority(
+                session_id, load, authority, None,
+            )
+        }
+        meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
+            observation,
+            reason,
+        } => SessionResumeVerdict::committed_boundary_unprovable(
+            session_id,
+            ResumeSessionLoad::Absent,
+            SessionResumeAuthority {
+                observation: Some(observation),
+            },
+            reason,
+        ),
+        meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
+            observation,
+        } => Ok(SessionResumeVerdict::authority_changed_during_materialization(
+            session_id,
+            SessionResumeAuthority {
+                observation: Some(observation),
+            },
+        )),
+    }
+}
+
 #[cfg(not(target_arch = "wasm32"))]
 #[async_trait::async_trait]
 impl<B> MobSessionService for meerkat_session::PersistentSessionService<B>
@@ -3428,78 +3528,21 @@ where
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError> {
-        match self.prepare_committed_boundary_resume(session_id).await? {
-            meerkat_session::PreparedCommittedBoundaryResume::Materializable {
-                session,
-                materialization,
-                observation,
-                preparation,
-            } => {
-                let authority = SessionResumeAuthority {
-                    observation: Some(observation),
-                };
-                let load = match materialization {
-                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active => {
-                        ResumeSessionLoad::Active(session)
-                    }
-                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable => {
-                        ResumeSessionLoad::Revivable(session)
-                    }
-                };
-                let preparation = SessionResumePreparationReceipt::from_persistent(
-                    session_id,
-                    &authority,
-                    preparation,
-                );
-                SessionResumeVerdict::from_authoritative_load_with_authority(
-                    session_id,
-                    load,
-                    authority,
-                    Some(preparation),
-                )
-            }
-            meerkat_session::PreparedCommittedBoundaryResume::Unavailable {
-                unavailable,
-                observation,
-            } => {
-                let authority = SessionResumeAuthority {
-                    observation: Some(observation),
-                };
-                let load = match unavailable {
-                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::Absent => {
-                        ResumeSessionLoad::Absent
-                    }
-                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::ArchivedNotRevivable {
-                        runtime_state,
-                    } => ResumeSessionLoad::ArchivedNotRevivable { runtime_state },
-                };
-                SessionResumeVerdict::from_authoritative_load_with_authority(
-                    session_id,
-                    load,
-                    authority,
-                    None,
-                )
-            }
-            meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
-                observation,
-                reason,
-            } => SessionResumeVerdict::committed_boundary_unprovable(
-                session_id,
-                ResumeSessionLoad::Absent,
-                SessionResumeAuthority {
-                    observation: Some(observation),
-                },
-                reason,
-            ),
-            meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
-                observation,
-            } => Ok(SessionResumeVerdict::authority_changed_during_materialization(
-                session_id,
-                SessionResumeAuthority {
-                    observation: Some(observation),
-                },
-            )),
-        }
+        persistent_session_resume_verdict(
+            session_id,
+            self.prepare_committed_boundary_resume(session_id).await?,
+        )
+    }
+
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        persistent_session_resume_verdict(
+            session_id,
+            self.prepare_committed_boundary_resume_under_runtime_turn_boundary(session_id)
+                .await?,
+        )
     }
 
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(

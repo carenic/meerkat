@@ -1645,6 +1645,17 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::materialize_session_resume_verdict_under_runtime_turn_boundary(
+            &self.service,
+            session_id,
+        )
+        .await
+    }
+
     async fn settle_durable_tail_before_cold_start(
         &self,
         session_id: &SessionId,

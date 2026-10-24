@@ -1903,10 +1903,12 @@ impl HostMemberMaterializer {
                     }
                 })?;
                 let generation_start_seq = generation_start_seq_after(latest_seq)?;
+                // The materialization boundary holds the session's turn
+                // boundary, so the verdict's convergence does not wait for it.
                 match self
                     .substrate
                     .session_service
-                    .materialize_session_resume_verdict(&id)
+                    .materialize_session_resume_verdict_under_runtime_turn_boundary(&id)
                     .await?
                 {
                     crate::runtime::SessionResumeVerdict::ResumeAuthorized {
@@ -2517,10 +2519,12 @@ impl HostMemberMaterializer {
         // quiescent and B excludes same-SessionId actor replacement. Reading
         // earlier can capture a snapshot while the old actor is still
         // committing its final turn, then recreate from stale durable state.
+        // B is the session's turn boundary, so the verdict's convergence does
+        // not wait for it.
         let authorized = self
             .substrate
             .session_service
-            .materialize_session_resume_verdict(&session_id)
+            .materialize_session_resume_verdict_under_runtime_turn_boundary(&session_id)
             .await?
             .into_authorized()
             .map_err(MaterializeServeError::ResumeRejected)?;

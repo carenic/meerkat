@@ -11347,6 +11347,11 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// must cross actor creation without a committed-boundary receipt. A
     /// durable seed carries the complete bracketed resume result whose receipt
     /// the same service later consumes during actor insertion.
+    ///
+    /// The caller holds the session's turn-finalization boundary (the actor
+    /// materialization takes it before the seed), so the durable seed's
+    /// preparation does not wait for it again
+    /// ([`Self::prepare_committed_boundary_resume_under_runtime_turn_boundary`]).
     #[doc(hidden)]
     pub async fn prepare_actor_session_seed(
         &self,
@@ -11368,7 +11373,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                         ))
                     })?;
                 Ok(PreparedActorSessionSeed::DurableCommitted {
-                    resume: self.prepare_committed_boundary_resume(session_id).await?,
+                    resume: self
+                        .prepare_committed_boundary_resume_under_runtime_turn_boundary(session_id)
+                        .await?,
                 })
             }
         }
@@ -16390,8 +16397,16 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 // create below are built in their own frames: at opt-level 0
                 // each awaited future reserved twice its size in this poll
                 // frame.
+                //
+                // The recovery commits only between runtime loop laps: unless
+                // the create's caller holds the session's turn-finalization
+                // boundary, the recovery takes it for itself, bounded, before
+                // the create takes it below.
                 let recovery = meerkat_runtime::stack_relief::box_in_own_frame(|| {
-                    self.recover_committed_boundary_for_actor(resume_session_id)
+                    self.recover_committed_boundary_for_actor(
+                        resume_session_id,
+                        turn_boundary_already_held,
+                    )
                 })
                 .await;
                 continued_run = self
@@ -19833,6 +19848,12 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// [`SessionError::ServedElsewhere`], and one whose claim cannot be taken
     /// with [`SessionError::HostingUnavailable`], before any recovery: the
     /// other owner may still commit the session's durable tail itself.
+    ///
+    /// The recovery commits only between runtime loop laps: once a
+    /// provisional tail stands it waits, at most one second, for the
+    /// session's turn-finalization boundary, and a lap that holds the
+    /// boundary longer refuses the recovery with [`SessionError::Busy`],
+    /// leaving the tail and every row as they were.
     pub async fn recover_committed_boundary(
         &self,
         id: &SessionId,
@@ -19843,6 +19864,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         // store writes too, and refuses at once when another runtime owner
         // hosts the session.
         let hosting = self.grant_session_hosting(id)?;
+        let _turn_finalization_guard = self.durable_tail_recovery_turn_boundary(id, false).await?;
         meerkat_core::session_hosting::with_write_hosting(
             hosting,
             self.recover_committed_boundary_retaining_aligned_body(id),
@@ -19885,17 +19907,81 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
 
     /// [`Self::recover_committed_boundary_for_resume`] under this runtime
     /// owner's hosting claim, as [`Self::recover_committed_boundary`] runs it,
-    /// for an actor's materialization.
+    /// for an actor's materialization, and under the session's
+    /// turn-finalization boundary: the create's own when it holds it
+    /// (`turn_boundary_held`), else taken for the recovery
+    /// ([`Self::durable_tail_recovery_turn_boundary`]).
     async fn recover_committed_boundary_for_actor(
         &self,
         id: &SessionId,
+        turn_boundary_held: bool,
     ) -> Result<ResumeBoundaryRecovery, SessionError> {
         let hosting = self.grant_session_hosting(id)?;
+        let _turn_finalization_guard = self
+            .durable_tail_recovery_turn_boundary(id, turn_boundary_held)
+            .await?;
         meerkat_core::session_hosting::with_write_hosting(
             hosting,
             self.recover_committed_boundary_for_resume(id),
         )
         .await
+    }
+
+    /// The session's turn-finalization boundary for a durable-tail recovery
+    /// that may commit the session's provisional tail, taken unless the
+    /// caller holds it (`turn_boundary_held`).
+    ///
+    /// The recovery commits only between runtime loop laps, as the cold
+    /// attach's settle does: a lap holds the boundary from its top through
+    /// its run and can outlive the live actor, and a commit inside the lap's
+    /// staging window would be written over by its staging commit. So once a
+    /// provisional tail stands, or cannot be observed, the recovery waits for
+    /// the boundary, bounded by [`TAIL_SETTLE_BOUNDARY_BOUND`], and a boundary
+    /// still held after the bound refuses it with [`SessionError::Busy`]:
+    /// the tail and every row stay as they were. Without a tail the recovery
+    /// writes nothing, and a session a live actor hosts is refused busy by
+    /// the recovery at once, so neither waits.
+    async fn durable_tail_recovery_turn_boundary(
+        &self,
+        id: &SessionId,
+        turn_boundary_held: bool,
+    ) -> Result<Option<tokio::sync::OwnedMutexGuard<()>>, SessionError> {
+        if turn_boundary_held || self.inner.has_live_session(id).await? {
+            return Ok(None);
+        }
+        let runtime_id = Self::runtime_id_for_session(id);
+        let tail_stands = match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => self
+                .runtime_store
+                .load_head_canonical_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => self
+                .runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            _ => Ok(false),
+        };
+        if matches!(tail_stands, Ok(false)) {
+            return Ok(None);
+        }
+        let turn_finalization_gate = self.turn_finalization_gate_for_session(id).await;
+        match tokio::time::timeout(
+            TAIL_SETTLE_BOUNDARY_BOUND,
+            turn_finalization_gate.lock_owned(),
+        )
+        .await
+        {
+            Ok(guard) => Ok(Some(guard)),
+            Err(_elapsed) => {
+                tracing::warn!(
+                    session_id = %id,
+                    "a runtime loop lap held the turn boundary past the durable-tail recovery's bound; the recovery refuses busy"
+                );
+                Err(SessionError::Busy { id: id.clone() })
+            }
+        }
     }
 
     /// The run `id`'s runtime registration on this service's machine marks
@@ -20261,9 +20347,38 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// [`SessionError::ServedElsewhere`], and one whose claim cannot be taken
     /// with [`SessionError::HostingUnavailable`], before any recovery: the
     /// other owner may still commit the session's durable tail itself.
+    ///
+    /// The preparation's recovery commits only between runtime loop laps:
+    /// once a provisional tail stands it waits, at most one second, for the
+    /// session's turn-finalization boundary, and a lap that holds the
+    /// boundary longer refuses the preparation with [`SessionError::Busy`],
+    /// leaving the tail and every row as they were. A caller that holds that
+    /// boundary itself uses
+    /// [`Self::prepare_committed_boundary_resume_under_runtime_turn_boundary`].
     pub async fn prepare_committed_boundary_resume(
         &self,
         id: &SessionId,
+    ) -> Result<PreparedCommittedBoundaryResume, SessionError> {
+        self.prepare_committed_boundary_resume_with_turn_boundary(id, false)
+            .await
+    }
+
+    /// [`Self::prepare_committed_boundary_resume`] for a caller that holds
+    /// the session's turn-finalization boundary (an actor materialization
+    /// that took it, or a mob member host's materialization lease): the
+    /// preparation's recovery does not wait for the boundary again.
+    pub async fn prepare_committed_boundary_resume_under_runtime_turn_boundary(
+        &self,
+        id: &SessionId,
+    ) -> Result<PreparedCommittedBoundaryResume, SessionError> {
+        self.prepare_committed_boundary_resume_with_turn_boundary(id, true)
+            .await
+    }
+
+    async fn prepare_committed_boundary_resume_with_turn_boundary(
+        &self,
+        id: &SessionId,
+        turn_boundary_held: bool,
     ) -> Result<PreparedCommittedBoundaryResume, SessionError> {
         // #1813: the preparation's recovery may settle the session's durable
         // tail, a store-only write: the preparation holds the session's
@@ -20273,6 +20388,9 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         // the claim again and re-observes the prepared authority before it
         // consumes the receipt, so a write between the two is refused there.
         let hosting = self.grant_session_hosting(id)?;
+        let _turn_finalization_guard = self
+            .durable_tail_recovery_turn_boundary(id, turn_boundary_held)
+            .await?;
         meerkat_core::session_hosting::with_write_hosting(
             hosting,
             self.prepare_committed_boundary_resume_hosted(id),

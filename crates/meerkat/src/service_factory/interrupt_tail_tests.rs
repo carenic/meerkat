@@ -3188,74 +3188,100 @@ async fn an_observation_never_settles_inside_a_laps_staging_window_head_canonica
     );
 }
 
-/// A cold attach never settles a tail inside a runtime loop lap's staging
-/// window either. A lap can outlive the live actor (a read of a retired
-/// runtime discards the actor while a lap holds the boundary), and a start
-/// or attach then settles the tail on the cold path. As in the observation
-/// row above, run A is interrupted after a round commit that listed a steer,
-/// A's own settle holds the tail beside a row of another run, and the next
-/// lap reads the steer's row and is held right before its staging commit.
-/// There the other run's row ends, the live actor is discarded, and a cold
-/// attach of the session runs: the lap holds the turn-finalization boundary,
-/// so the attach leaves A's tail to a settle between laps instead of
-/// consuming the steer under the lap. RED before: the cold attach's settle
-/// took only the recovery gate, consumed the steer between the lap's read and
-/// its staging commit, and the steer ran a second time.
-#[tokio::test]
-async fn a_cold_attach_never_settles_inside_a_laps_staging_window_head_canonical() {
-    use meerkat_runtime::input_state::InputTerminalOutcome;
+/// A runtime loop lap held right before its staging commit after the live
+/// actor is gone, with A's tail standing: what a row needs to release the
+/// lap and to find the steer after a restart.
+struct LapHeldInItsStagingWindow {
+    run_a: RunId,
+    steer_id: meerkat_core::lifecycle::InputId,
+    steered: tokio::task::JoinHandle<Option<Result<CompletionOutcome, CompletionWaitError>>>,
+    release: tokio::sync::oneshot::Sender<()>,
+}
 
-    let root = TempDir::new().expect("temp");
-    let stores = Stores::new(true, &root);
-    let client = Arc::new(ScriptedModel::new());
-    let (id, steer_id) = {
-        let start = Start::open(&stores, &root, &client);
-        let id = start.materialize(None).await;
-        client.push(Step::Tool);
-        client.push(Step::Tool);
-        client.push(Step::Held);
-        let (turn_a, run_a, steered, steer_id) =
-            a_steer_joins_run_a_at_its_next_model_boundary(&start, &client, &id).await;
-        let other_runs_row = strand_another_runs_row(&start, &id, &run_a, Some(&steer_id)).await;
-        // Run B answers the steer if it calls the model.
-        client.push(Step::Text("steer answer"));
-        let (staging, release) = start
-            .machine
-            .arm_runtime_loop_before_batch_staging_test_hook(id.clone());
+/// Hold a runtime loop lap in its staging window after the live actor is
+/// gone. Run A is interrupted after a round commit that listed a steer, and
+/// A's own settle holds the tail beside a row of another run. The next lap
+/// reads the steer's row and is held right before its staging commit, with
+/// the session's turn-finalization boundary held. There the other run's row
+/// ends, so nothing holds A's tail any more, and the live actor is
+/// discarded, as a read of a retired runtime discards it while a lap runs:
+/// A's tail is now the cold path's to settle.
+async fn a_lap_held_in_its_staging_window_after_the_actor_is_gone(
+    start: &Start,
+    client: &ScriptedModel,
+    id: &SessionId,
+) -> LapHeldInItsStagingWindow {
+    client.push(Step::Tool);
+    client.push(Step::Tool);
+    client.push(Step::Held);
+    let (turn_a, run_a, steered, steer_id) =
+        a_steer_joins_run_a_at_its_next_model_boundary(start, client, id).await;
+    let other_runs_row = strand_another_runs_row(start, id, &run_a, Some(&steer_id)).await;
+    // Run B answers the steer if it calls the model.
+    client.push(Step::Text("steer answer"));
+    let (staging, release) = start
+        .machine
+        .arm_runtime_loop_before_batch_staging_test_hook(id.clone());
 
-        interrupt_run_a(&start, &id, turn_a).await;
-        tokio::time::timeout(DEADLINE, staging)
-            .await
-            .expect("the next lap reaches the steer's staging commit")
-            .expect("the staging hook");
-        assert_eq!(
-            start.tail_run(&id).await,
-            Some(run_a.clone()),
-            "the cancelled run's settle holds A's tail"
-        );
-        end_another_runs_row(&start, &id, other_runs_row).await;
-        start
-            .service
-            .discard_live_session(&id)
-            .await
-            .expect("discard the live actor while the lap runs");
-        tokio::time::timeout(DEADLINE, start.cold_attach(&id))
-            .await
-            .expect("the cold attach answers while the lap is held");
-        let _ = release.send(());
-        let _ = steered.await.expect("steer waiter task");
+    interrupt_run_a(start, id, turn_a).await;
+    tokio::time::timeout(DEADLINE, staging)
+        .await
+        .expect("the next lap reaches the steer's staging commit")
+        .expect("the staging hook");
+    assert_eq!(
+        start.tail_run(id).await,
+        Some(run_a.clone()),
+        "the cancelled run's settle holds A's tail"
+    );
+    end_another_runs_row(start, id, other_runs_row).await;
+    start
+        .service
+        .discard_live_session(id)
+        .await
+        .expect("discard the live actor while the lap runs");
+    LapHeldInItsStagingWindow {
+        run_a,
+        steer_id,
+        steered,
+        release,
+    }
+}
+
+impl LapHeldInItsStagingWindow {
+    /// Release the lap, wait for the steer's own waiter and stop the start.
+    /// Returns the steer's id.
+    async fn release_and_stop(
+        self,
+        start: &Start,
+        client: &ScriptedModel,
+    ) -> meerkat_core::lifecycle::InputId {
+        let _ = self.release.send(());
+        let _ = self.steered.await.expect("steer waiter task");
         start.service.try_shutdown().await.expect("shutdown");
         // Run B's step stays unused where B never called the model.
         client.steps.lock().expect("steps").clear();
-        (id, steer_id)
-    };
+        self.steer_id
+    }
+}
+
+/// The next start's recovery closes A's tail with the steer in it: the
+/// steer's content appears once, the steer is consumed with A, and the model
+/// never sees it again.
+async fn assert_a_restart_consumes_the_steer_once_with_a(
+    stores: &Stores,
+    root: &TempDir,
+    client: &Arc<ScriptedModel>,
+    id: &SessionId,
+    steer_id: &meerkat_core::lifecycle::InputId,
+) {
+    use meerkat_runtime::input_state::InputTerminalOutcome;
 
     let requests_before = client.requests.load(Ordering::SeqCst);
-    let start = Start::open(&stores, &root, &client);
-    start.cold_attach(&id).await;
-    start.materialize(Some(&id)).await;
-    start.wait_runtime_settled(&id).await;
-    let rows = start.committed_rows(&id).await;
+    let start = Start::open(stores, root, client);
+    start.cold_attach(id).await;
+    start.materialize(Some(id)).await;
+    start.wait_runtime_settled(id).await;
+    let rows = start.committed_rows(id).await;
     assert_eq!(
         rows.iter()
             .filter(|row| row.as_str() == "user steered")
@@ -3272,10 +3298,10 @@ async fn a_cold_attach_never_settles_inside_a_laps_staging_window_head_canonical
         requests_before,
         "nothing runs the steer after the restart"
     );
-    let steer_row = input_rows(start.runtime_store.as_ref(), &id)
+    let steer_row = input_rows(start.runtime_store.as_ref(), id)
         .await
         .into_iter()
-        .find(|row| row.state.input_id == steer_id)
+        .find(|row| &row.state.input_id == steer_id)
         .expect("the steer's row");
     assert_eq!(
         steer_row.seed.terminal_outcome,
@@ -3283,6 +3309,149 @@ async fn a_cold_attach_never_settles_inside_a_laps_staging_window_head_canonical
         "the steer is consumed with A: {:?}",
         steer_row.state.history
     );
+}
+
+/// A cold attach never settles a tail inside a runtime loop lap's staging
+/// window either. A lap can outlive the live actor (a read of a retired
+/// runtime discards the actor while a lap holds the boundary), and a start
+/// or attach then settles the tail on the cold path. With a lap held in its
+/// staging window after the actor is gone
+/// (`a_lap_held_in_its_staging_window_after_the_actor_is_gone`), a cold
+/// attach of the session runs: the lap holds the turn-finalization boundary,
+/// so the attach leaves A's tail to a settle between laps instead of
+/// consuming the steer under the lap. RED before: the cold attach's settle
+/// took only the recovery gate and committed A's tail with the steer between
+/// the lap's read and its staging commit; the staging commit then wrote the
+/// steer staged over its consumed row, so the steer ended stopped
+/// (`Abandoned(Stopped)`) although its content was in A's committed history.
+#[tokio::test]
+async fn a_cold_attach_never_settles_inside_a_laps_staging_window_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let (id, steer_id) = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        let lap =
+            a_lap_held_in_its_staging_window_after_the_actor_is_gone(&start, &client, &id).await;
+        tokio::time::timeout(DEADLINE, start.cold_attach(&id))
+            .await
+            .expect("the cold attach answers while the lap is held");
+        (id, lap.release_and_stop(&start, &client).await)
+    };
+    assert_a_restart_consumes_the_steer_once_with_a(&stores, &root, &client, &id, &steer_id).await;
+}
+
+/// A committed-boundary resume preparation, which a mob's resume verdict
+/// runs (`prepare_committed_boundary_resume`), never settles a tail inside a
+/// runtime loop lap's staging window either. With a lap held in its staging
+/// window after the actor is gone, the preparation waits for the lap's
+/// turn-finalization boundary, bounded, and refuses busy once the bound
+/// passes, so A's tail is left to a settle between laps. RED before: the
+/// preparation's recovery took only the recovery gate and committed A's tail
+/// with the steer under the lap.
+#[tokio::test]
+async fn a_resume_preparation_never_settles_inside_a_laps_staging_window_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let (id, steer_id) = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        let lap =
+            a_lap_held_in_its_staging_window_after_the_actor_is_gone(&start, &client, &id).await;
+        let prepared = tokio::time::timeout(
+            DEADLINE,
+            start.service.prepare_committed_boundary_resume(&id),
+        )
+        .await
+        .expect("the preparation answers while the lap is held");
+        assert_eq!(
+            start.tail_run(&id).await,
+            Some(lap.run_a.clone()),
+            "nothing settles A's tail inside the lap"
+        );
+        assert!(
+            matches!(prepared, Err(SessionError::Busy { .. })),
+            "the preparation refuses busy while the lap holds the boundary: {prepared:?}"
+        );
+        (id, lap.release_and_stop(&start, &client).await)
+    };
+    assert_a_restart_consumes_the_steer_once_with_a(&stores, &root, &client, &id, &steer_id).await;
+}
+
+/// A create that materializes a durable session never settles a tail inside
+/// a runtime loop lap's staging window. A realtime open's recovery reads the
+/// committed session strictly and lowers it to a create request with the
+/// session's local runtime bindings, and a run can start after that read,
+/// be interrupted with its settle held, and leave a lap that outlives the
+/// live actor. Here the session is read and its bindings are prepared before
+/// run A, a lap is held in its staging window after the actor is gone, and
+/// the create runs: its durable-tail recovery waits for the lap's
+/// turn-finalization boundary, bounded, and the create refuses busy once the
+/// bound passes, so A's tail is left to a settle between laps. RED before:
+/// the create's recovery ran before the create took the boundary and
+/// committed A's tail with the steer under the lap.
+#[tokio::test]
+async fn a_create_never_settles_inside_a_laps_staging_window_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let (id, steer_id) = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        let committed = start
+            .service
+            .load_authoritative_session(&id)
+            .await
+            .expect("the strict read")
+            .expect("the session is committed");
+        let bindings = start
+            .machine
+            .prepare_local_session_bindings(id.clone())
+            .await
+            .expect("the session's local runtime bindings");
+        let lap =
+            a_lap_held_in_its_staging_window_after_the_actor_is_gone(&start, &client, &id).await;
+        let mut request = deferred_create_request();
+        request.build = Some(meerkat_core::service::SessionBuildOptions {
+            resume_session: Some(committed),
+            runtime_build_mode: meerkat_core::RuntimeBuildMode::SessionOwned(bindings),
+            ..Default::default()
+        });
+        let create = {
+            let service = start.service.clone();
+            tokio::spawn(async move {
+                let admission = service.reserve_create_session_admission().await?;
+                service
+                    .create_session_with_reserved_admission(request, admission)
+                    .await
+                    .map(|_| ())
+            })
+        };
+        // The create cannot finish while the lap holds the boundary unless
+        // it refuses: wait for its answer, or for a settle of A's tail.
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        while !create.is_finished() && start.tail_run(&id).await.is_some() {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the create never answered while the lap is held"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            start.tail_run(&id).await,
+            Some(lap.run_a.clone()),
+            "nothing settles A's tail inside the lap"
+        );
+        let created = create.await.expect("create task");
+        assert!(
+            matches!(created, Err(SessionError::Busy { .. })),
+            "the create refuses busy while the lap holds the boundary: {created:?}"
+        );
+        (id, lap.release_and_stop(&start, &client).await)
+    };
+    assert_a_restart_consumes_the_steer_once_with_a(&stores, &root, &client, &id, &steer_id).await;
 }
 
 /// A held turn-finalization boundary defers an observation's settle of the
@@ -3522,6 +3691,63 @@ async fn a_strict_read_after_the_lap_settles_the_tail_an_observation_deferred_he
 
     let read = start.service.load_authoritative_session(&id).await;
     assert_the_strict_read_closed_a(&start, &id, read).await;
+}
+
+/// A committed-boundary resume preparation waits for the session's
+/// turn-finalization boundary only when its caller does not hold it. Run A's
+/// tail stands after an observation deferred its settle under the held
+/// boundary, and the live actor is discarded. While the boundary stays held,
+/// the plain preparation refuses busy once its bound passes and leaves A's
+/// tail, and the preparation of a caller that holds the boundary
+/// (`prepare_committed_boundary_resume_under_runtime_turn_boundary`) answers
+/// at once and settles A's tail under that boundary.
+#[tokio::test]
+async fn a_boundary_holders_resume_preparation_does_not_wait_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let (id, run_a, boundary) = a_tail_deferred_under_a_held_boundary(&start, &client).await;
+    start
+        .service
+        .discard_live_session(&id)
+        .await
+        .expect("discard the live actor under the held boundary");
+
+    let refused = tokio::time::timeout(
+        DEADLINE,
+        start.service.prepare_committed_boundary_resume(&id),
+    )
+    .await
+    .expect("the plain preparation answers within its bound");
+    assert!(
+        matches!(refused, Err(SessionError::Busy { .. })),
+        "the plain preparation refuses busy under the held boundary: {refused:?}"
+    );
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a),
+        "the refused preparation leaves A's tail"
+    );
+
+    let prepared = tokio::time::timeout(
+        Duration::from_millis(500),
+        start
+            .service
+            .prepare_committed_boundary_resume_under_runtime_turn_boundary(&id),
+    )
+    .await
+    .expect("the boundary holder's preparation does not wait for the boundary");
+    assert!(
+        prepared.is_ok(),
+        "the boundary holder's preparation succeeds: {prepared:?}"
+    );
+    assert_eq!(
+        start.tail_run(&id).await,
+        None,
+        "A's tail is settled under the caller's boundary"
+    );
+    drop(boundary);
 }
 
 /// Wait until `input_id` is bound to `run_id`: the steer joined the run.
