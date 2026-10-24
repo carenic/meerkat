@@ -2088,12 +2088,20 @@ them.
   restart. The same refusal covers external events, runtime inputs, a
   session create or resume (`create_or_resume_session_without_turn`, and
   governed cold recovery through it) and the other paths that register a
-  session. The shutdown also closes the mob state's admission, so its mobs
-  refuse new members (`MobError::AdmissionClosed`, reason `StandDown`), and
-  the mob session service registers no member session (`runtime_shutting_down`
-  in the session error's data). A registration already under way when the
-  shutdown begins finishes first, so the shutdown tears it down with the
-  rest. The schedule firing host is not armed again after the shutdown.
+  session. The shutdown also closes the mob state's admission. The refusal a
+  host gets depends on the surface it calls:
+  - the runtime's own ingress and registration paths answer `-32032` with
+    `data.kind` `runtime_shutting_down`;
+  - a mob of its mob state refuses a new member, work, a flow or a resume
+    with the mob's own typed `MobError::AdmissionClosed`, reason `StandDown`,
+    as for any mob stand-down (no new close reason was added);
+  - the mob session service, which registers member sessions, refuses with a
+    `SessionError::FailedWithData` whose data carries `kind`
+    `runtime_shutting_down`.
+
+  A registration already under way when the shutdown begins finishes first,
+  so the shutdown tears it down with the rest. The schedule firing host is
+  not armed again after the shutdown.
 
 - RPC callback tools accept typed content blocks from SDK handlers, which
   released 0.9.3 and 0.9.4 rejected as non-string results. Mixed text and image
