@@ -3428,6 +3428,17 @@ them.
   its profile, as a spawn of that profile does. The rebuild offered none of
   the bundles' tools.
 
+- `meerkat-runtime`: `MeerkatMachine::with_admitted_original`,
+  `MeerkatMachine::durable_admitted_original` and `verify_exact_replay` prove
+  a keyed governed peer original, not only a prompt, so a source owner
+  recovers custody of a governed peer after the payload is retired. A peer
+  matches only under its exact input id and qualified key, with one own
+  contributor of the same association and that contributor's canonical replay
+  digest. An ungoverned peer, a key alone and a retained resume still refuse.
+  Before, every peer was refused as a conflict
+  (`crates/meerkat-runtime/src/meerkat_machine/admitted_original.rs:238` and
+  `crates/meerkat-runtime/src/input_state.rs:1829` at v0.9.4).
+
 ### Security
 
 - tokio is updated to 1.53.3 in Meerkat's lockfile for RUSTSEC-2026-0386.
