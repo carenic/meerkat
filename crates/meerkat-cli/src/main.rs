@@ -13245,6 +13245,11 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         true
     }
 
+    fn keeps_durable_member_sessions(&self) -> bool {
+        // The wrapped ephemeral service's sessions die with the process.
+        false
+    }
+
     fn acquire_runtime_adapter(
         &self,
         explicit: Option<std::sync::Arc<meerkat_runtime::MeerkatMachine>>,
@@ -34245,6 +34250,21 @@ default_model = "gpt-5.4"
             Err(meerkat_core::service::SessionError::Agent(_))
         ));
         assert!(events.next().now_or_never().is_none());
+    }
+
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn run_mob_session_service_keeps_no_durable_member_sessions() {
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .builtins(false)
+            .shell(false);
+        let inner = Arc::new(build_cli_service(factory, Config::default(), None));
+        let wrapper = RunMobSessionService::new(inner);
+        // `rkat run` keeps the mob contract for the one process execution,
+        // but its sessions die with the process: a durable profile is refused.
+        assert!(meerkat_mob::MobSessionService::supports_persistent_sessions(&wrapper));
+        assert!(!meerkat_mob::MobSessionService::keeps_durable_member_sessions(&wrapper));
     }
 
     #[cfg(feature = "mob")]

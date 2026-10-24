@@ -32057,6 +32057,49 @@ async fn a_durable_policy_auto_spawn_without_persistent_sessions_is_refused_type
     assert_eq!(service.active_session_count().await, 0);
 }
 
+/// A policy auto-spawn of a durable profile on a service that keeps the
+/// persistent-session contract, but whose member sessions do not outlive the
+/// process, is refused the same way as the explicit spawn: the auto-spawn
+/// check reads `keeps_durable_member_sessions` too.
+#[tokio::test]
+async fn a_durable_policy_auto_spawn_on_member_sessions_kept_in_memory_is_refused_typed() {
+    let service = Arc::new(MockSessionService::new());
+    service.keep_member_sessions_in_memory();
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(durable_worker_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create a mob whose member sessions live in memory");
+    handle
+        .set_spawn_policy(Some(Arc::new(StaticWorkerSpawnPolicy)))
+        .await
+        .expect("set spawn policy");
+    let target = AgentIdentity::from("auto-durable-worker");
+    let result = handle
+        .submit_work(
+            AgentRuntimeId::initial(target.clone()),
+            FenceToken::new(0),
+            WorkRef::new(),
+            WorkSpec::new(
+                "work for a durable worker".to_string(),
+                WorkOrigin::External,
+            ),
+        )
+        .await;
+    assert!(
+        matches!(
+            &result,
+            Err(MobError::NonDurableService { member_id, profile })
+                if member_id == &target && profile.as_str() == "worker"
+        ),
+        "{result:?}"
+    );
+    assert!(handle.get_member(&target).await.expect("read").is_none());
+    assert_eq!(service.recorded_create_requests().await.len(), 0);
+    assert_eq!(service.active_session_count().await, 0);
+}
+
 /// Lets every durable worker's run resume.
 #[cfg(feature = "runtime-adapter")]
 struct ContinueResumeGate;
