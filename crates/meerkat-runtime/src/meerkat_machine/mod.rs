@@ -1642,6 +1642,10 @@ pub enum StoppedRegistrationTakeover {
     /// runtime included), it is claimed, or it needs a durability reload.
     /// Nothing changed.
     NotStoppedResidue,
+    /// A stop cleanup on the exact registration was still in flight when
+    /// the caller's bound on joining it ran out. Nothing was decided and
+    /// nothing changed; the cleanup goes on, owned by the runtime.
+    StopCleanupPending,
 }
 
 /// Where a detached registration's machine-owned unregister stands.

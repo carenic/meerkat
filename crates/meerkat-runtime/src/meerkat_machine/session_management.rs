@@ -7149,8 +7149,11 @@ impl MeerkatMachine {
     /// terminal completion, which consumes those handles as its inputs.
     ///
     /// A stop cleanup still in flight on this exact registration is joined
-    /// first, and the decision is made on its result: the decision reads
-    /// facts, never a deadline. The decision and the coordinator installation
+    /// first, for at most `stop_cleanup_join_bound`, and the decision is made
+    /// on its result: the decision reads facts, never a deadline. A cleanup
+    /// still running at the bound is answered
+    /// [`StoppedRegistrationTakeover::StopCleanupPending`], with nothing
+    /// decided or changed; the runtime keeps owning that cleanup. The decision and the coordinator installation
     /// are one atomic admission under the stable registration transaction and
     /// the witness's exact mutation gate. Anything else is answered typed and
     /// changes nothing: [`StoppedRegistrationTakeover::NotCurrent`] for a
@@ -7162,6 +7165,7 @@ impl MeerkatMachine {
     pub async fn take_over_stopped_attachment_registration_if_current(
         &self,
         witness: &RuntimeSessionRegistrationWitness,
+        stop_cleanup_join_bound: std::time::Duration,
     ) -> Result<StoppedRegistrationTakeover, RuntimeDriverError> {
         if !witness.belongs_to(self) {
             return Ok(StoppedRegistrationTakeover::NotCurrent);
@@ -7186,14 +7190,21 @@ impl MeerkatMachine {
         if let Some(mut result_rx) = in_flight_stop_cleanup {
             // The admission below reads the coordinator's own result: a
             // failed cleanup is not completed residue and is refused there.
-            if let Err(error) =
-                wait_for_runtime_stop_cleanup_result(&mut result_rx, witness.session_id()).await
+            match crate::tokio::time::timeout(
+                stop_cleanup_join_bound,
+                wait_for_runtime_stop_cleanup_result(&mut result_rx, witness.session_id()),
+            )
+            .await
             {
-                tracing::debug!(
-                    session_id = %witness.session_id(),
-                    %error,
-                    "the joined stop cleanup failed; the takeover admission refuses its residue"
-                );
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        session_id = %witness.session_id(),
+                        %error,
+                        "the joined stop cleanup failed; the takeover admission refuses its residue"
+                    );
+                }
+                Err(_) => return Ok(StoppedRegistrationTakeover::StopCleanupPending),
             }
         }
         match self

@@ -921,10 +921,11 @@ them.
   completed residue of a stopped attachment: Stopped (not Retired),
   unattached, durability-ready, with the attachment's stop cleanup and
   post-stop callback completed. A stop cleanup still in flight on that
-  registration is joined first, and the decision and the canonical unregister
-  start are one atomic admission. The answer is the new `#[non_exhaustive]`
-  `StoppedRegistrationTakeover` (`Unregistered`, `NotCurrent`,
-  `NotStoppedResidue`); anything that is not such residue changes nothing.
+  registration is joined first, for at most the caller's bound, and the
+  decision and the canonical unregister start are one atomic admission. The
+  answer is the new `#[non_exhaustive]` `StoppedRegistrationTakeover`
+  (`Unregistered`, `NotCurrent`, `NotStoppedResidue`, `StopCleanupPending`);
+  anything that is not such residue changes nothing.
 - `meerkat-runtime`: a durable session whose process stopped inside a run
   resumes the same run from its last committed round. Durable-tail recovery
   classifies a provisional tail whose run cursor agrees with it, and whose
@@ -2123,7 +2124,8 @@ them.
   serves the member instead of stopping. The stopped runtime keeps its
   registration until it is unregistered, and the restore refused it, so the
   whole mob entered Stopped. The restore now takes such a registration over
-  once (unregistering it after any stop cleanup still running finishes),
+  once (after a stop cleanup still running finishes; it waits for one within
+  a bound, past which the restore goes on as before),
   revives the member right after the start, and runs the member's readiness
   then, its host loop included for an autonomous member. A member whose
   revival fails is recorded Broken with the reason; any other registration a

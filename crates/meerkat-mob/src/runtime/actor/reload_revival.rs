@@ -146,9 +146,13 @@ impl MobActor {
         // concurrent revivals of one session would race their
         // materializations, and the loser would fail for no cause of its own.
         let missing_live = scope.is_missing_live();
+        // A revival whose work was dropped without answering closed its
+        // channel unsettled: it ended too, so it is not joined, and this
+        // request starts a revival of its own in its place.
         if missing_live
             && let Some(in_flight) = self.member_live_revivals_in_flight.get(&identity)
             && !*in_flight.borrow()
+            && in_flight.has_changed().is_ok()
         {
             let mut settled = in_flight.clone();
             let command_tx = self.command_tx.clone();

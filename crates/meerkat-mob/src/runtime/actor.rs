@@ -3447,6 +3447,15 @@ enum ResumeLifecyclePhase {
     },
 }
 
+/// How long a Running start joins a member's stop cleanup still in flight
+/// before it decides without it: past it the member is not taken over and
+/// the restore goes on as before. A start never waits on a cleanup that does
+/// not finish.
+#[cfg(not(test))]
+const STARTUP_STOP_CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const STARTUP_STOP_CLEANUP_JOIN_BOUND: Duration = Duration::from_secs(1);
+
 /// Per-member bound for one readiness step in the explicit-Resume fan-out.
 /// The steps run concurrently, so the fan-out as a whole is bounded by this
 /// value rather than by member count.
@@ -32198,7 +32207,10 @@ impl MobActor {
         // late completion after a cancelled start is harmless.
         let takeover = meerkat_runtime::stack_relief::relieve_caller_stack(move || async move {
             adapter
-                .take_over_stopped_attachment_registration_if_current(&registration)
+                .take_over_stopped_attachment_registration_if_current(
+                    &registration,
+                    STARTUP_STOP_CLEANUP_JOIN_BOUND,
+                )
                 .await
         })
         .await
@@ -32220,6 +32232,15 @@ impl MobActor {
                 Ok(Some(StartupRegistrationTakeover {
                     session_id: session_id.clone(),
                 }))
+            }
+            meerkat_runtime::StoppedRegistrationTakeover::StopCleanupPending => {
+                tracing::warn!(
+                    mob_id = %io.mob_id,
+                    member = %agent_identity,
+                    session_id = %session_id,
+                    "the mob start did not take over a member whose stop cleanup was still running at its bound; the restore goes on as before"
+                );
+                Ok(None)
             }
             // Not the completed residue of a stopped attachment, or no longer
             // current: nothing changed, and the ordinary restore decides.
