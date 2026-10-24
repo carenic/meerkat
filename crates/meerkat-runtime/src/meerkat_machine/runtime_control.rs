@@ -17390,6 +17390,81 @@ impl MeerkatMachine {
         )
     }
 
+    /// Admit one governed peer delivery the installed host bound
+    /// (`NativeWorkAuthorizationHost::bind_peer_ingress`), under the same
+    /// key-only replay contract and member-residency fence as the delivery's
+    /// unbound path, with the host's custody of the original it enrolled
+    /// settled by native admission exactly once.
+    pub(crate) async fn accept_governed_peer_input(
+        &self,
+        session_id: &SessionId,
+        input: Input,
+        member_residency: MemberResidencyExpectation,
+        custody: Option<crate::input_admission_custody::NativeInputAdmissionGuard>,
+    ) -> Result<(AcceptOutcome, Option<crate::completion::CompletionHandle>), RuntimeDriverError>
+    {
+        match self
+            .execute_meerkat_machine_ingress_command_with_custody(
+                MeerkatMachineCommand::AcceptWithCompletion {
+                    session_id: session_id.clone(),
+                    input,
+                    register_completion: true,
+                    replay_policy: crate::accept::InputReplayPolicy::KeyOnly,
+                    admission_requirement: crate::accept::AdmissionRequirement::Any,
+                    member_residency,
+                    expected_attachment: None,
+                },
+                custody,
+            )
+            .await?
+        {
+            MeerkatMachineCommandResult::AcceptWithCompletion {
+                outcome,
+                handle,
+                admission_signal: _,
+            } => Ok((outcome, handle)),
+            other => Err(RuntimeDriverError::Internal(format!(
+                "unexpected governed peer accept result: {other:?}"
+            ))),
+        }
+    }
+
+    /// [`Self::accept_governed_peer_input`] for a durable peer-ingress claim,
+    /// finalized as the claim's runtime receipt. A replay conflict (the
+    /// delivery's key or id already admitted under another binding) is a
+    /// definite refusal of this delivery: the claim ends `Rejected` instead
+    /// of staying the session's FIFO head. A fenced residency mismatch ends
+    /// it `Rejected` too, as on the unbound fenced path.
+    pub(crate) async fn accept_governed_peer_ingress_with_completion(
+        &self,
+        facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
+        session_id: &SessionId,
+        input: Input,
+        member_residency: MemberResidencyExpectation,
+        custody: Option<crate::input_admission_custody::NativeInputAdmissionGuard>,
+    ) -> super::PeerIngressAcceptFinalization {
+        let submitted_input_id = input.id().clone();
+        let fenced = matches!(member_residency, MemberResidencyExpectation::Placed(_));
+        let result = match self
+            .accept_governed_peer_input(session_id, input, member_residency, custody)
+            .await
+        {
+            Err(RuntimeDriverError::InputIdempotencyConflict { existing_id }) => {
+                Err(RuntimeDriverError::ValidationFailed {
+                    reason: format!(
+                        "governed peer delivery replay conflict: input {existing_id} was \
+                         admitted for this delivery under another binding"
+                    ),
+                })
+            }
+            Err(RuntimeDriverError::StaleAuthority { reason }) if fenced => {
+                Err(RuntimeDriverError::ValidationFailed { reason })
+            }
+            other => other,
+        };
+        self.finalize_peer_ingress_accept(facts, submitted_input_id, result)
+    }
+
     fn finalize_peer_ingress_accept(
         &self,
         facts: meerkat_core::interaction::PeerIngressClaimCommitFacts,
@@ -17671,6 +17746,37 @@ impl MeerkatMachine {
         }
     }
 
+    /// The runtime row of the tracked delivery its payload input id names, as
+    /// [`crate::service_ext::SessionServiceRuntimeExt::input_state`] reads it,
+    /// live or from the store. A supervisor-bridge delivery keeps its payload
+    /// input id as its input id and as the key it is submitted under, so the
+    /// row is read by that id and is the delivery's only when it was admitted
+    /// under that key
+    /// ([`crate::input_state::StoredInputState::admitted_under_idempotency_key`]:
+    /// the id itself, or a governed delivery's qualification of it). Another
+    /// input that merely carries the id as its key is never it. `Ok(None)`
+    /// when no such delivery was admitted.
+    ///
+    /// # Errors
+    /// `ValidationFailed` when `payload_input_id` is not a canonical input
+    /// id; otherwise the read's own errors.
+    pub async fn tracked_delivery_input_state(
+        &self,
+        session_id: &SessionId,
+        payload_input_id: &str,
+    ) -> Result<Option<crate::input_state::StoredInputState>, RuntimeDriverError> {
+        let input_id = crate::input_authority::tracked_delivery_input_id(payload_input_id)
+            .ok_or_else(|| RuntimeDriverError::ValidationFailed {
+                reason: format!(
+                    "tracked delivery input id '{payload_input_id}' is not a canonical input id"
+                ),
+            })?;
+        let stored =
+            crate::service_ext::SessionServiceRuntimeExt::input_state(self, session_id, &input_id)
+                .await?;
+        Ok(stored.filter(|stored| stored.admitted_under_idempotency_key(payload_input_id)))
+    }
+
     /// Converge one exact durable tracked input to a runtime terminal under a
     /// full member-residency fence. Queued work is abandoned directly and
     /// persisted; staged/applied work is cancelled only through its exact run
@@ -17679,6 +17785,13 @@ impl MeerkatMachine {
     /// The host installs its durable `Cancelling` receipt before calling this
     /// method. Consequently a transient error is safe to retry and no delayed
     /// delivery can re-enter while runtime quiescence is incomplete.
+    ///
+    /// A tracked delivery is named by its payload input id, which is its input
+    /// id: `idempotency_key` in canonical input id form names the delivery
+    /// with that id, only when it was admitted under that key (a governed
+    /// delivery under the key's qualification), and never another input that
+    /// merely carries the id as its key. Any other key names the input its
+    /// machine binding names.
     pub async fn cancel_tracked_input_for_member_incarnation(
         &self,
         session_id: &SessionId,
@@ -17740,9 +17853,10 @@ impl MeerkatMachine {
                 // Subscribed under the driver before the read: a lifecycle
                 // step committed after it is a change on this receiver.
                 let input_transitions = driver_guard.subscribe_input_transitions();
-                let input_id = driver_guard
-                    .as_driver()
-                    .input_id_for_idempotency_key(idempotency_key);
+                let input_id = crate::input_authority::tracked_input_id_for_key(
+                    driver_guard.as_driver(),
+                    idempotency_key,
+                );
                 let action = match input_id {
                     None => Action::Done,
                     Some(input_id) => {
