@@ -426,7 +426,8 @@ fi
 # arms its domains enable without spawning, under every generated invariant
 # plus action properties (a member's recorded observation time never
 # decreases; a new incarnation keeps no predecessor's health or failure
-# record; the mob is Destroyed only through a destroy it admitted) and two
+# record; a member runtime destroyed removes only that runtime; the mob is
+# Destroyed only through a destroy it admitted) and two
 # invariants that check why the remaining member arms cannot fire. It
 # explores the whole reachable space, with no step bound: its TLC VIEW
 # leaves out the two counters the model never reads
@@ -441,19 +442,18 @@ fi
 # detach is pending, the stale-incarnation Retired replay with its old
 # guard, which prunes the Retiring runtime of an identity held for a
 # respawn, a roster recovery that keeps its predecessor's execution health,
-# and the runtime destroy observation without its destroy-admitted guard,
-# which ends the mob over a member runtime destroyed outside it.
+# and a runtime destroy observation that ends the mob, and one that leaves its
+# runtime live.
 # A second run of the same audit drops the progress observations, adds the
-# mob's completion and destruction (DestroyMob, and the destroy admission
-# after which a member runtime destroyed ends the mob), and drives every
+# mob's completion and destruction (DestroyMob, and the destroy admission,
+# after which a member runtime destroyed still removes only that runtime),
+# and drives every
 # RetireAtScope verdict arm over every scope its domains name. It checks
 # that exactly one verdict arm is enabled for every scope, and that a
 # Current verdict names the identity's current runtime and fence and admits
 # a Retire of that incarnation; it requires two more witnesses and refuses
-# three more defects: the Current arm without its runtime and fence guards,
-# the StaleFenceToken arm overlapping NoCurrentIncarnation, and the admitted
-# runtime destroy observation with its old teardown, which keeps the
-# identity and pending respawn of a member held for a respawn.
+# two more defects: the Current arm without its runtime and fence guards,
+# and the StaleFenceToken arm overlapping NoCurrentIncarnation.
 member_lifecycle_audit="${workspace_root}/specs/machines/mob_machine/member_lifecycle_audit.sh"
 if [[ ! -x "${member_lifecycle_audit}" ]]; then
   echo "error: member lifecycle audit runner is missing from workspace runfiles: ${member_lifecycle_audit}" >&2

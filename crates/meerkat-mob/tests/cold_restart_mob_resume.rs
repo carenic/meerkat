@@ -1493,6 +1493,78 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
 /// Destruction must fit the same worker stack as ordinary mob operation.
 /// The parent-owned child operations make archive disposal inspect the real
 /// operation registry beneath the actor's complete destroy call chain.
+/// A host that destroys one member's session runtime outside the mob
+/// (`RuntimeControlPlane::destroy` on the real session service's machine)
+/// leaves a mob it can still destroy. The mob removes only that runtime and
+/// keeps running; its own destroy then retires and archives every member,
+/// the one whose runtime is gone included (the archive finds no runtime to
+/// retire), and ends Destroyed. Before, the destroy stopped at that member,
+/// on every attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_mob_destroy_after_a_member_runtime_destroyed_outside_completes_on_a_real_service() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let (service, _store) = persistent_service(&paths, runtime_store.clone());
+    let adapter = service
+        .acquire_runtime_adapter(None)
+        .expect("acquire runtime authority")
+        .expect("real session runtime");
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.orchestrator = None;
+    definition.wiring.auto_wire_orchestrator = false;
+    let handle = MobBuilder::new(
+        definition,
+        MobStorage::persistent(&paths.mob_db_path).expect("mob storage"),
+    )
+    .with_session_service(service.clone())
+    .create()
+    .await
+    .expect("create a mob on the real session service");
+    for member in ["kept", "gone"] {
+        handle
+            .spawn_spec(SpawnMemberSpec::host_root("worker", member))
+            .await
+            .expect("spawn a real member session");
+    }
+    let gone_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("gone"))
+        .await
+        .expect("the gone member's bridge session");
+
+    meerkat_runtime::RuntimeControlPlane::destroy(
+        adapter.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&gone_session),
+    )
+    .await
+    .expect("destroy the member's runtime outside the mob");
+    // The routed observation is queued ahead of this command.
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        meerkat_mob::MobState::Running,
+        "a member runtime destroyed outside the mob leaves the mob running"
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(30), handle.destroy())
+        .await
+        .expect("the destroy answers")
+        .unwrap_or_else(|error| {
+            panic!(
+                "the destroy completes after a member runtime destroyed outside the mob: {error:?}"
+            )
+        });
+    assert!(
+        report.errors.is_empty(),
+        "the destroy reports no cleanup error: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        meerkat_mob::MobState::Destroyed
+    );
+}
+
 #[test]
 fn mob_destroy_session_children_within_production_stack_budget() {
     let thread = std::thread::Builder::new()

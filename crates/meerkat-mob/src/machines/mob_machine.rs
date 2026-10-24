@@ -5635,7 +5635,11 @@ mod tests {
                 error: None,
             }
         );
-        assert_eq!(authority.state().active_run_count, 0);
+        assert_eq!(
+            authority.state().active_run_count,
+            1,
+            "a member runtime retired leaves the mob's run active"
+        );
 
         authority
             .apply_signal(MobMachineSignal::ObserveMemberRetirementArchived {
@@ -9384,11 +9388,12 @@ mod tests {
         assert!(!authority.state().live_runtime_ids.contains(&destroyed));
     }
 
-    /// The mob's own destroy is unchanged: once AdmitDestroyCleanup admitted
-    /// it, a destroyed member runtime clears every member and the mob is
-    /// Destroyed.
+    /// A member runtime destroyed while the mob's own destroy is admitted
+    /// removes only that runtime, as one destroyed outside the mob does: the
+    /// mob stays Running with its destroy admitted, its other member stays
+    /// live, and only the Destroy input ends the mob.
     #[test]
-    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_ends_the_mob() {
+    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_removes_only_that_runtime() {
         let mut authority = MobMachineAuthority::new();
         let destroyed = AgentRuntimeId::from("destroyed-member:0");
         let other = AgentRuntimeId::from("other-member:0");
@@ -9409,34 +9414,107 @@ mod tests {
 
         authority
             .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
-                agent_runtime_id: destroyed,
+                agent_runtime_id: destroyed.clone(),
                 fence_token,
             })
             .expect("the destroying mob observes a member runtime destroyed");
 
-        assert_eq!(authority.state().lifecycle_phase, MobPhase::Destroyed);
-        assert!(authority.state().live_runtime_ids.is_empty());
-        assert!(authority.state().runtime_fence_tokens.is_empty());
+        let state = authority.state();
+        assert_eq!(state.lifecycle_phase, MobPhase::Running);
+        assert!(state.destroy_admitted);
+        assert!(!state.live_runtime_ids.contains(&destroyed));
+        assert!(!state.runtime_fence_tokens.contains_key(&destroyed));
+        assert!(state.live_runtime_ids.contains(&other));
+    }
+
+    /// A member runtime destroyed while the mob's own destroy is admitted but
+    /// not finished (an earlier destroy attempt returned incomplete) leaves
+    /// every fact the destroy still has to drain: a bound host stays tracked,
+    /// so the Destroy input is refused until RevokeHost revokes the host, and
+    /// only then ends the mob. Before, the observation ended the mob without
+    /// the destroy's drains, and a bound host was never revoked.
+    #[test]
+    fn a_member_runtime_destroyed_during_an_incomplete_destroy_keeps_the_destroy_and_its_host() {
+        let mut authority = MobMachineAuthority::new();
+        let identity = AgentIdentity::from("destroyed-member");
+        let destroyed = AgentRuntimeId::from("destroyed-member:0");
+        seed_live_member(&mut authority, &identity, &destroyed);
+        let host = HostId::from("bound-host");
+        authority
+            .apply_signal(MobMachineSignal::RecoverHostBinding {
+                host_id: host.clone(),
+                pubkey: PeerSigningKey([9; 32]),
+                endpoint: PeerAddress("tcp://bound-host.test:4100".to_string()),
+                epoch: 1,
+                binding_generation: 1,
+                protocol_min: 4,
+                protocol_max: 4,
+                engine_version: "bound-host-engine".to_string(),
+                durable_sessions: true,
+                autonomous_members: true,
+                hard_cancel_member: true,
+                tracked_input_cancel: true,
+                memory_store: true,
+                mcp: true,
+                resolvable_providers: std::collections::BTreeSet::from(["anthropic".to_string()]),
+                approval_forwarding: false,
+                live_endpoint: None,
+            })
+            .expect("bind a host");
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+        let fence_token = live_fence(&authority, &destroyed);
+
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+                agent_runtime_id: destroyed.clone(),
+                fence_token,
+            })
+            .expect("the destroying mob observes a member runtime destroyed");
+
+        let state = authority.state();
+        assert_eq!(state.lifecycle_phase, MobPhase::Running);
+        assert!(state.destroy_admitted);
+        assert!(!state.live_runtime_ids.contains(&destroyed));
+        assert_eq!(state.identity_to_runtime.get(&identity), Some(&destroyed));
+        assert!(state.mob_hosts.contains(&host));
+        assert!(
+            MobMachineMutator::apply(&mut authority, MobMachineInput::Destroy).is_err(),
+            "the Destroy input waits for the bound host's revoke"
+        );
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::RevokeHost {
+                host_id: host.clone(),
+                binding_generation: 1,
+            },
+        )
+        .expect("the destroying mob revokes its bound host");
+        assert!(authority.state().mob_hosts.is_empty());
     }
 
     /// The mob's own destroy over a member held for a respawn: the member's
     /// retirement preserves its topology for the respawn (it is Retiring, its
     /// identity still maps to the runtime, and its wiring waits in the
     /// pending respawn topology) when AdmitDestroyCleanup admits the destroy,
-    /// and the member's runtime is then destroyed. The mob is Destroyed and
-    /// keeps no member: the observation clears every member fact DestroyMob
-    /// clears, so no identity keeps a current runtime or a pending respawn
-    /// (the generated pending_respawn_topology_has_no_current_runtime). The
-    /// old teardown cleared the Retiring marker and kept the identity's
-    /// runtime and its pending respawn.
+    /// and the member's runtime is then destroyed. Only that runtime is
+    /// removed: the identity, its binding, its pending respawn topology and
+    /// its edges stay for the destroy to drain, the member stays Retiring,
+    /// and the generated invariants hold
+    /// (pending_respawn_topology_has_no_current_runtime among them).
     #[test]
-    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_clears_a_member_held_for_a_respawn() {
+    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_keeps_a_member_held_for_a_respawn() {
         let (
             mut authority,
             identity,
             runtime_id,
             fence_token,
-            _session_id,
+            session_id,
             member_edge,
             external_edge,
             external_key,
@@ -9446,10 +9524,6 @@ mod tests {
                 .state()
                 .pending_respawn_topology
                 .contains(&identity)
-        );
-        assert_eq!(
-            authority.state().member_state_markers.get(&runtime_id),
-            Some(&MobMemberState::Retiring)
         );
         begin_completion_lifecycle_quiesce(
             &mut authority,
@@ -9461,20 +9535,168 @@ mod tests {
 
         authority
             .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
-                agent_runtime_id: runtime_id,
+                agent_runtime_id: runtime_id.clone(),
                 fence_token,
             })
             .expect("the destroying mob observes the held member's runtime destroyed");
 
         let state = authority.state();
-        assert_eq!(state.lifecycle_phase, MobPhase::Destroyed);
-        assert!(state.pending_respawn_topology.is_empty());
-        assert!(state.identity_to_runtime.is_empty());
-        assert!(state.member_session_bindings.is_empty());
-        assert!(state.member_state_markers.is_empty());
-        assert!(state.live_runtime_ids.is_empty());
-        assert!(!state.wiring_edges.contains(&member_edge));
-        assert!(!state.external_peer_edges.contains(&external_edge));
-        assert!(!state.external_peer_edges_by_key.contains_key(&external_key));
+        assert_eq!(state.lifecycle_phase, MobPhase::Running);
+        assert!(!state.live_runtime_ids.contains(&runtime_id));
+        assert!(state.pending_respawn_topology.contains(&identity));
+        assert_eq!(state.identity_to_runtime.get(&identity), Some(&runtime_id));
+        assert_eq!(
+            state.member_session_bindings.get(&identity),
+            Some(&session_id)
+        );
+        assert_eq!(
+            state.member_state_markers.get(&runtime_id),
+            Some(&MobMemberState::Retiring)
+        );
+        assert!(state.wiring_edges.contains(&member_edge));
+        assert!(state.external_peer_edges.contains(&external_edge));
+        assert!(state.external_peer_edges_by_key.contains_key(&external_key));
+    }
+
+    /// A member runtime ended outside the mob (retired or destroyed) removes
+    /// only that runtime: a run the mob has active keeps its count, so the
+    /// mob cannot stop or complete under it. Both observations used to zero
+    /// the mob-wide count.
+    #[test]
+    fn a_member_runtime_ended_outside_the_mob_keeps_the_mobs_active_runs() {
+        for destroyed in [false, true] {
+            let mut authority = MobMachineAuthority::new();
+            let ended = AgentRuntimeId::from("ended-member:0");
+            seed_live_member(&mut authority, &AgentIdentity::from("ended-member"), &ended);
+            authority
+                .apply_signal(MobMachineSignal::CreateRun)
+                .expect("the mob starts a run");
+            assert_eq!(authority.state().active_run_count, 1);
+            let fence_token = live_fence(&authority, &ended);
+            let signal = if destroyed {
+                MobMachineSignal::ObserveRuntimeDestroyed {
+                    agent_runtime_id: ended.clone(),
+                    fence_token,
+                }
+            } else {
+                MobMachineSignal::ObserveRuntimeRetired {
+                    agent_runtime_id: ended.clone(),
+                    fence_token,
+                }
+            };
+
+            authority
+                .apply_signal(signal)
+                .expect("the mob observes the member runtime ended outside it");
+
+            assert!(!authority.state().live_runtime_ids.contains(&ended));
+            assert_eq!(
+                authority.state().active_run_count,
+                1,
+                "the mob's run stays active (destroyed: {destroyed})"
+            );
+        }
+    }
+
+    /// The mob's destroy admits the retirement of a member whose runtime
+    /// ended outside the mob (retired or destroyed by a host) while its
+    /// identity is still bound: the member turns Retiring with its retirement
+    /// session and its session ingress detach, and no runtime retire is
+    /// requested, since no runtime is left to retire. The destroy then
+    /// archives it through the Retired archive arm. Before, no admission arm
+    /// matched such a member, and every destroy attempt stopped at it.
+    #[test]
+    fn the_destroy_admits_a_member_whose_runtime_ended_outside_the_mob() {
+        for destroyed in [false, true] {
+            let mut authority = MobMachineAuthority::new();
+            let identity = AgentIdentity::from("ended-member");
+            let runtime_id = AgentRuntimeId::from("ended-member:0");
+            let session_id = seed_live_member(&mut authority, &identity, &runtime_id);
+            let fence_token = live_fence(&authority, &runtime_id);
+            let ended = if destroyed {
+                MobMachineSignal::ObserveRuntimeDestroyed {
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                }
+            } else {
+                MobMachineSignal::ObserveRuntimeRetired {
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                }
+            };
+            authority
+                .apply_signal(ended)
+                .expect("the member runtime ends outside the mob");
+            begin_completion_lifecycle_quiesce(
+                &mut authority,
+                PlacedCompletionLifecycleIntentKind::Destroy,
+            );
+            authority
+                .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+                .expect("the mob admits its destroy");
+
+            let admitted = authority
+                .apply_signal(MobMachineSignal::AdmitDestroyMemberRetire {
+                    mob_id: MobId::from("test-mob"),
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation: Generation(0),
+                    session_id: Some(session_id.clone()),
+                })
+                .unwrap_or_else(|error| {
+                    panic!("the destroy admits the member (destroyed: {destroyed}): {error}")
+                });
+            let state = authority.state();
+            assert_eq!(
+                state.member_state_markers.get(&runtime_id),
+                Some(&MobMemberState::Retiring)
+            );
+            assert_eq!(
+                state.runtime_retire_pending_sessions.get(&runtime_id),
+                Some(&session_id)
+            );
+            assert!(
+                state
+                    .pending_session_ingress_detach_runtime_ids
+                    .contains(&runtime_id)
+            );
+            assert!(admitted.effects().iter().any(|effect| matches!(
+                effect,
+                MobMachineEffect::RequestSessionIngressDetachForMobDestroy { .. }
+            )));
+            assert!(
+                !admitted
+                    .effects()
+                    .iter()
+                    .any(|effect| matches!(effect, MobMachineEffect::RequestRuntimeRetire { .. })),
+                "no runtime is left to retire"
+            );
+
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::SessionIngressDetachedForMobDestroy {
+                    mob_id: MobId::from("test-mob"),
+                    agent_runtime_id: runtime_id.clone(),
+                },
+            )
+            .expect("the destroy closes the member's session ingress detach");
+            authority
+                .apply_signal(MobMachineSignal::ObserveDestroyMemberRetirementArchived {
+                    agent_identity: identity.clone(),
+                    agent_runtime_id: runtime_id.clone(),
+                    fence_token,
+                    generation: Generation(0),
+                    session_id: Some(session_id.clone()),
+                    disposal: MemberSessionDisposal::Archived,
+                })
+                .expect("the destroy archives the member");
+            assert!(
+                !authority
+                    .state()
+                    .identity_to_runtime
+                    .contains_key(&identity)
+            );
+        }
     }
 }

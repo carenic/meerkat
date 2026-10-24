@@ -16,7 +16,7 @@
 # - the lifecycle run (AuditSpec) with its four action properties and the two
 #   invariants that check the reasons of its not-covered list;
 # - the scope run (AuditScopeSpec) with its two RetireAtScope invariants and
-#   the destroy action property.
+#   the two destroy action properties.
 # Each run must finish without an error, reach at least its floor of distinct
 # states (so a guard that silently disables arms fails the lane instead of
 # shrinking the space), and fire every action of its covered list (TLC
@@ -41,12 +41,8 @@
 # mapped guard, which then overlaps NoCurrentIncarnation
 # (AuditRetireAtScopeExactlyOne); the roster recovery keeping the
 # predecessor's execution-health entries (AuditMintClearsExecutionHealth);
-# the runtime destroy observation without its destroy-admitted guard,
-# which then ends the mob over a member runtime destroyed outside it
-# (AuditDestroyedOnlyThroughAnAdmittedDestroy); and the admitted runtime
-# destroy observation with its old teardown, which keeps the identities and
-# the respawn topology DestroyMob clears
-# (pending_respawn_topology_has_no_current_runtime, in the scope run).
+# a runtime destroy observation that ends the mob, and one that leaves its
+# runtime live (AuditRuntimeDestroyedRemovesOnlyItsRuntime).
 # An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
@@ -104,8 +100,8 @@ covered_actions=(
   RecoverRosterMemberAddressabilityRunning
   ObserveRuntimeRetired
   ObserveRuntimeRetiredStopped
-  ObserveRuntimeDestroyedOutsideTheMobRunning
-  ObserveRuntimeDestroyedOutsideTheMobStopped
+  ObserveRuntimeDestroyed
+  ObserveRuntimeDestroyedStopped
   ObserveMemberRetirementArchivedLive
   ObserveMemberRetirementArchivedRetired
   ObserveMemberRetirementArchivedLiveStopped
@@ -123,12 +119,12 @@ covered_actions=(
 
 # Every RetireAtScope verdict arm, the completion and destruction arms that
 # reach the not-running verdict, the runtime destroy observation of a
-# completed mob, and the destroy admission with the runtime destroy
-# observation that ends the mob after it; each must fire in the scope run.
+# completed mob, and the destroy admission with a runtime destroy
+# observation after it; each must fire in the scope run.
 scope_covered_actions=(
   BeginPlacedCompletionLifecycleQuiesceFresh
   MarkCompleted
-  ObserveRuntimeDestroyedOutsideTheMobCompleted
+  ObserveRuntimeDestroyedCompleted
   AdmitDestroyCleanup
   ObserveRuntimeDestroyed
   DestroyMob
@@ -209,7 +205,7 @@ epoch_index="${view_positions#* }"
 
 # usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
 # where <run> is lifecycle (AuditSpec and its action properties) or scope
-# (AuditScopeSpec, its two invariants and the destroy action property).
+# (AuditScopeSpec, its two invariants and the two destroy action properties).
 write_cfg() {
   local run="$1" cfg="$2" invariants="$3" properties="$4"
   cp "${ci_cfg}" "${cfg}"
@@ -230,6 +226,7 @@ write_cfg() {
   AuditObservationMonotonic
   AuditMintClearsExecutionHealth
   AuditMintClearsFailureRecords
+  AuditRuntimeDestroyedRemovesOnlyItsRuntime
   AuditDestroyedOnlyThroughAnAdmittedDestroy${properties}
 INVARIANTS
   AuditPlacementAbsent
@@ -238,6 +235,7 @@ INVARIANTS
     scope)
       replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditScopeSpec" "${cfg}"
       replace_exact_line "INVARIANTS" "PROPERTIES
+  AuditRuntimeDestroyedRemovesOnlyItsRuntime
   AuditDestroyedOnlyThroughAnAdmittedDestroy
 INVARIANTS
   AuditRetireAtScopeCoherent
@@ -522,42 +520,36 @@ text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY
 
-  mutate lifecycle destroy_unadmitted_ends_the_mob "Error: Action property AuditDestroyedOnlyThroughAnAdmittedDestroy is violated" "$@" <<'PY'
-import os, re
-path = os.environ["MODEL"]
-text = open(path).read()
-block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
-assert block, "ObserveRuntimeDestroyed not found"
-lines = block.group(0).split("\n")
-guard = [i for i, line in enumerate(lines) if line == "    /\\ (destroy_admitted = TRUE)"]
-assert len(guard) == 1, "expected one mob_destroy_admitted guard in ObserveRuntimeDestroyed"
-del lines[guard[0]]
-text = text[: block.start()] + "\n".join(lines) + text[block.end():]
-open(path, "w").write(text)
-PY
-
-  mutate scope destroy_keeps_member_identities "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated" "$@" <<'PY'
+  # A runtime destroy observation that ends the mob, and one that leaves its
+  # runtime live and fenced.
+  mutate lifecycle destroyed_runtime_ends_the_mob "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
 import os, re
 path = os.environ["MODEL"]
 text = open(path).read()
 block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
 assert block, "ObserveRuntimeDestroyed not found"
 body = block.group(0)
-# The member facts the old teardown kept: every one DestroyMob clears but
-# the live runtimes and their fences, the member markers, the restore and
-# retire facts, the revival set and the spawn-exec phases.
-for field in (
-    "externally_addressable_runtime_ids", "wiring_edges", "pending_respawn_topology",
-    "abandoned_respawn_topology", "external_peer_edges", "external_peer_edges_by_key",
-    "identity_to_runtime", "identity_runtime_generations", "identity_generation_highwater",
-    "identity_runtime_fence_tokens", "member_session_bindings", "member_profile_names",
-    "member_runtime_modes", "member_peer_ids", "member_peer_endpoints",
-    "member_prior_peer_endpoints", "member_startup_binding_requested",
-    "member_startup_runtime_ready", "member_startup_ready",
+old = "    /\\ phase' = \"Running\""
+assert body.count(old) == 1, "expected one phase update in ObserveRuntimeDestroyed"
+body = body.replace(old, "    /\\ phase' = \"Destroyed\"")
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle destroyed_runtime_left_live "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+for field, removal in (
+    ("live_runtime_ids", "(live_runtime_ids \\ {agent_runtime_id})"),
+    ("runtime_fence_tokens", "MapRemove(runtime_fence_tokens, agent_runtime_id)"),
 ):
-    clear = re.findall(r"^    /\\ " + field + r"' = .*$", body, re.M)
-    assert len(clear) == 1, f"expected one {field} update in ObserveRuntimeDestroyed, found {len(clear)}"
-    body = body.replace(clear[0], "    /\\ " + field + "' = " + field)
+    old = "    /\\ " + field + "' = " + removal
+    assert body.count(old) == 1, f"expected one {field} removal in ObserveRuntimeDestroyed"
+    body = body.replace(old, "    /\\ " + field + "' = " + field)
 text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY

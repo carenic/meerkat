@@ -11208,7 +11208,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(agent_runtime_id);
                 self.member_startup_runtime_ready.remove(agent_runtime_id);
                 self.member_startup_ready.remove(agent_runtime_id);
-                self.active_run_count = 0;
             }
             to Running
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
@@ -11226,7 +11225,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(agent_runtime_id);
                 self.member_startup_runtime_ready.remove(agent_runtime_id);
                 self.member_startup_ready.remove(agent_runtime_id);
-                self.active_run_count = 0;
             }
             to Stopped
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
@@ -12768,63 +12766,34 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestRuntimeDestroy { session_id: session_id }
         }
 
-        // A member runtime destroyed during the mob's own destroy (admitted by
-        // AdmitDestroyCleanup or DestroyMob) ends the mob: the mob is
-        // Destroyed and its update clears every member fact DestroyMob's
-        // teardown clears (identities, bindings, respawn topology, wiring,
-        // peer and startup facts), plus the pending spawns, so no member of
-        // the destroyed mob keeps a current runtime or a pending respawn.
+        // A member runtime destroyed (a host destroying one runtime through the
+        // runtime control plane, before or during the mob's own destroy)
+        // removes only that runtime, as a runtime retired outside the mob
+        // does: the mob keeps its phase, its other members, its active runs
+        // and every fact its own destroy has to drain (hosts, placed members,
+        // kickoffs, remote turns, pending spawns), so only the Destroy input,
+        // behind those drains, ends the mob. The member reads Broken at its
+        // next start. ObserveRuntimeDestroyedStopped and
+        // ObserveRuntimeDestroyedCompleted are the same in those phases.
         transition ObserveRuntimeDestroyed {
             on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
-            guard {
-                self.lifecycle_phase == Phase::Running
-                || self.lifecycle_phase == Phase::Stopped
-                || self.lifecycle_phase == Phase::Completed
-                || self.lifecycle_phase == Phase::Destroyed
-            }
-            guard "mob_destroy_admitted" { self.destroy_admitted == true }
-            guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
+            guard { self.lifecycle_phase == Phase::Running }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             update {
-                self.live_runtime_ids = EmptySet;
-                self.externally_addressable_runtime_ids = EmptySet;
-                self.runtime_fence_tokens = EmptyMap;
-                self.wiring_edges = EmptySet;
-                self.pending_respawn_topology = EmptySet;
-                self.abandoned_respawn_topology = EmptyMap;
-                self.external_peer_edges = EmptySet;
-                self.external_peer_edges_by_key = EmptyMap;
-                self.identity_to_runtime = EmptyMap;
-                self.identity_runtime_generations = EmptyMap;
-                self.identity_generation_highwater = EmptyMap;
-                self.identity_runtime_fence_tokens = EmptyMap;
-                self.member_session_bindings = EmptyMap;
-                self.member_profile_names = EmptyMap;
-                self.member_runtime_modes = EmptyMap;
-                self.member_peer_ids = EmptyMap;
-                self.member_peer_endpoints = EmptyMap;
-                self.member_prior_peer_endpoints = EmptyMap;
-                self.member_startup_binding_requested = EmptySet;
-                self.member_startup_runtime_ready = EmptySet;
-                self.member_startup_ready = EmptySet;
-                self.member_state_markers = EmptyMap;
-                self.member_restore_failures = EmptyMap;
-                self.member_restore_failure_codes = EmptyMap;
-                self.runtime_retire_refusal_codes = EmptyMap;
-                self.runtime_retire_refusal_reasons = EmptyMap;
-                self.runtime_retire_pending_sessions = EmptyMap;
-                self.remote_runtime_retired_ids = EmptySet;
-                self.remote_supervisor_revoked_ids = EmptySet;
-                self.member_revival_pending = EmptySet;
-                // Spawn-exec phase ladder: total teardown (see DestroyMob).
-                self.spawn_exec_phase = EmptyMap;
-                self.active_run_count = 0;
-                self.pending_spawn_count = 0;
-                self.pending_spawn_sessions = EmptyMap;
-                self.coordinator_bound = false;
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                // Trust eligibility just changed: the member has no runtime.
+                // Advance the canonical topology epoch so every generated
+                // trust permission minted against the previous eligibility
+                // is stale on use.
+                self.topology_epoch += 1;
             }
-            to Destroyed
+            to Running
             emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
         }
 
@@ -22592,15 +22561,10 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // A member runtime destroyed outside the mob's own destroy (a host
-        // destroying one runtime through the runtime control plane) removes
-        // only that runtime, as a runtime retired outside the mob does: the
-        // mob keeps its phase and its other members, and the member reads
-        // Broken at its next start.
-        transition ObserveRuntimeDestroyedOutsideTheMob {
-            per_phase [Running, Stopped, Completed]
+        // ObserveRuntimeDestroyed in a Stopped mob: only that runtime is removed.
+        transition ObserveRuntimeDestroyedStopped {
             on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
-            guard "mob_destroy_not_admitted" { self.destroy_admitted == false }
+            guard { self.lifecycle_phase == Phase::Stopped }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             update {
@@ -22610,10 +22574,85 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(agent_runtime_id);
                 self.member_startup_runtime_ready.remove(agent_runtime_id);
                 self.member_startup_ready.remove(agent_runtime_id);
-                self.active_run_count = 0;
+                // Trust eligibility just changed: the member has no runtime.
+                // Advance the canonical topology epoch so every generated
+                // trust permission minted against the previous eligibility
+                // is stale on use.
+                self.topology_epoch += 1;
+            }
+            to Stopped
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
+        }
+
+        // ObserveRuntimeDestroyed in a Completed mob: only that runtime is removed.
+        transition ObserveRuntimeDestroyedCompleted {
+            on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
+            guard { self.lifecycle_phase == Phase::Completed }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            update {
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                // Trust eligibility just changed: the member has no runtime.
+                // Advance the canonical topology epoch so every generated
+                // trust permission minted against the previous eligibility
+                // is stale on use.
+                self.topology_epoch += 1;
+            }
+            to Completed
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
+        }
+
+        // The mob's destroy admits the retirement of a member whose runtime
+        // already ended outside the mob (a host retired or destroyed it
+        // through the runtime control plane) while its identity is still
+        // bound. The member is marked Retiring with its retirement session,
+        // and its session ingress detach is requested, as for a live member;
+        // no runtime retire is requested, since no runtime is left to retire.
+        // The destroy then archives it through the Retired archive arms.
+        transition AdmitDestroyMemberRetireRuntimeEnded {
+            per_phase [Running, Stopped]
+            on signal AdmitDestroyMemberRetire { mob_id, agent_identity, agent_runtime_id, fence_token, generation, session_id }
+            guard "destroy_admitted" { self.destroy_admitted == true }
+            guard "placement_absent" { self.member_placement.contains_key(agent_identity) == false }
+            guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "runtime_not_live" { self.live_runtime_ids.contains(agent_runtime_id) == false }
+            guard "fence_token_matches_history" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token) }
+            guard "generation_matches" { self.identity_runtime_generations.get_copied(agent_identity) == Some(generation) }
+            guard "member_not_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring) }
+            guard "session_ingress_detach_absent" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
+            guard "retirement_session_absent" { self.runtime_retire_pending_sessions.contains_key(agent_runtime_id) == false }
+            guard "retire_refusal_absent" {
+                self.runtime_retire_refusal_codes.contains_key(agent_runtime_id) == false
+                && self.runtime_retire_refusal_reasons.contains_key(agent_runtime_id) == false
+            }
+            guard "session_present" { session_id != None }
+            guard "session_binding_matches" { self.member_session_bindings.get_cloned(agent_identity) == session_id }
+            update {
+                self.member_state_markers.insert(agent_runtime_id, MobMemberState::Retiring);
+                // Trust eligibility just changed: a Retiring member may not be
+                // re-wired or re-overlaid. Advance the canonical topology
+                // epoch so every generated trust permission minted against
+                // the previous eligibility is stale on use.
+                self.topology_epoch += 1;
+                self.runtime_retire_pending_sessions.insert(agent_runtime_id, session_id.get("value"));
+                self.pending_session_ingress_detach_runtime_ids.insert(agent_runtime_id);
             }
             to Running
-            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
+            emit AppendLifecycleJournal {
+                kind: MobLifecycleJournalKind::MemberRetirementStartedPreservingBinding,
+                agent_identity: Some(agent_identity),
+                agent_runtime_id: Some(agent_runtime_id),
+                fence_token: None,
+                generation: Some(generation),
+                session_id: session_id
+            }
+            emit RequestSessionIngressDetachForMobDestroy { mob_id: mob_id, agent_runtime_id: agent_runtime_id }
+            emit RequestKickoffQuiesce { member_id: agent_identity }
         }
     }
         }

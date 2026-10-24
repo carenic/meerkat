@@ -8001,15 +8001,13 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - To: `Destroyed`
 
 ### `ObserveRuntimeDestroyed`
-- From: `Running`, `Stopped`, `Completed`, `Destroyed`
+- From: `Running`
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
 - Guards:
-  - `mob_destroy_admitted`
-  - `session_ingress_detaches_closed`
   - `current_binding_matches`
   - `fence_token_matches`
 - Emits: `EmitMemberLifecycleNotice`
-- To: `Destroyed`
+- To: `Running`
 
 ### `RecordOperatorActionProvenanceRunning`
 - From: `Running`
@@ -15367,35 +15365,61 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Emits: `AutonomousShutdownMemberActionResolved`
 - To: `Completed`
 
-### `ObserveRuntimeDestroyedOutsideTheMobRunning`
-- From: `Running`
-- On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
-- Guards:
-  - `mob_destroy_not_admitted`
-  - `current_binding_matches`
-  - `fence_token_matches`
-- Emits: `EmitMemberLifecycleNotice`
-- To: `Running`
-
-### `ObserveRuntimeDestroyedOutsideTheMobStopped`
+### `ObserveRuntimeDestroyedStopped`
 - From: `Stopped`
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
 - Guards:
-  - `mob_destroy_not_admitted`
   - `current_binding_matches`
   - `fence_token_matches`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Stopped`
 
-### `ObserveRuntimeDestroyedOutsideTheMobCompleted`
+### `ObserveRuntimeDestroyedCompleted`
 - From: `Completed`
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
 - Guards:
-  - `mob_destroy_not_admitted`
   - `current_binding_matches`
   - `fence_token_matches`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Completed`
+
+### `AdmitDestroyMemberRetireRuntimeEndedRunning`
+- From: `Running`
+- On: `AdmitDestroyMemberRetire`(mob_id, agent_identity, agent_runtime_id, fence_token, generation, session_id)
+- Guards:
+  - `destroy_admitted`
+  - `placement_absent`
+  - `identity_binding_matches`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_not_retiring`
+  - `session_ingress_detach_absent`
+  - `retirement_session_absent`
+  - `retire_refusal_absent`
+  - `session_present`
+  - `session_binding_matches`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
+- To: `Running`
+
+### `AdmitDestroyMemberRetireRuntimeEndedStopped`
+- From: `Stopped`
+- On: `AdmitDestroyMemberRetire`(mob_id, agent_identity, agent_runtime_id, fence_token, generation, session_id)
+- Guards:
+  - `destroy_admitted`
+  - `placement_absent`
+  - `identity_binding_matches`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_not_retiring`
+  - `session_ingress_detach_absent`
+  - `retirement_session_absent`
+  - `retire_refusal_absent`
+  - `session_present`
+  - `session_binding_matches`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
+- To: `Stopped`
 
 ## Coverage
 ### Code Anchors
