@@ -5015,6 +5015,17 @@ async fn physical_head_token(
         .expect("the physical head has a canonical token")
 }
 
+/// A session's durable tail compared byte for byte across an attempt:
+/// [`ActiveMemberTail::durable_tail_snapshot`].
+#[cfg(feature = "test-support")]
+#[derive(Debug, PartialEq)]
+struct DurableTailSnapshot {
+    committed_head_token: String,
+    physical_head_token: String,
+    provisional_tail: Option<meerkat_runtime::store::HeadCanonicalProvisionalTailAuthority>,
+    physical_messages: Vec<meerkat_core::Message>,
+}
+
 #[cfg(feature = "test-support")]
 impl ActiveMemberTail {
     async fn committed_token_now(&self) -> String {
@@ -5033,6 +5044,32 @@ impl ActiveMemberTail {
             .await
             .expect("load the provisional tail")
             .is_some()
+    }
+
+    /// The session's durable tail as the store holds it now: the committed
+    /// and physical head digests, the store-issued provisional tail and the
+    /// physical transcript under it.
+    async fn durable_tail_snapshot(&self, store: &SqliteSessionStore) -> DurableTailSnapshot {
+        DurableTailSnapshot {
+            committed_head_token: self.committed_token_now().await,
+            physical_head_token: self.physical_token_now(store).await,
+            provisional_tail: self
+                .runtime_store
+                .load_head_canonical_provisional_tail(
+                    &meerkat_runtime::LogicalRuntimeId::for_session(&self.session_id),
+                )
+                .await
+                .expect("load the provisional tail"),
+            physical_messages: meerkat_core::session_store::SessionStore::load(
+                store,
+                &self.session_id,
+            )
+            .await
+            .expect("load the physical session")
+            .expect("the physical session exists")
+            .messages()
+            .to_vec(),
+        }
     }
 
     /// Another runtime owner on the realm (another process, here a second
@@ -6465,6 +6502,7 @@ async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
         .await
         .expect("spawn the second mob's lead");
     let adopter = AgentIdentity::from("w-adopt");
+    let tail_before = tail.durable_tail_snapshot(&store).await;
     let spawned = tokio::time::timeout(
         Duration::from_secs(60),
         handle.spawn_spec(
@@ -6477,6 +6515,11 @@ async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
     eprintln!(
         "[foreign-tail-spawn] spawn => {:?}",
         spawned.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        tail.durable_tail_snapshot(&store).await,
+        tail_before,
+        "a refused adoption must leave the session's head digests, provisional tail and physical transcript byte-identical"
     );
     assert_eq!(
         tail.committed_token_now().await,

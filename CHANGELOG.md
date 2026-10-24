@@ -2192,19 +2192,20 @@ them.
 ### Fixed
 
 - `meerkat-mob`, `meerkat-rpc`, `meerkat-rest`: identity adoption refuses a
-  mob whose runtime has no persistent store. Reconciliation realizes an
-  adoption by retiring the attached member and resuming its exact session
-  from the runtime's durable lifecycle record, which only a runtime with a
-  persistent store keeps. On a store-less runtime (`MeerkatMachine::ephemeral()`,
-  the runtime of every mob on an `EphemeralSessionService`) the member was
-  retired and the identity then stayed `RepairBlocked`: the member was gone
-  for the rest of the process. `adopt_member_identity_declaration` now
-  refuses such a mob before anything is recorded, with
+  mob whose runtime has no store. Reconciliation realizes an adoption by
+  retiring the attached member and resuming its exact session from the
+  lifecycle record in the runtime's store, which a store-less runtime does
+  not keep. On such a runtime (`MeerkatMachine::ephemeral()`, the runtime of
+  every mob on an `EphemeralSessionService`) the member was retired and the
+  identity then stayed `RepairBlocked`: the member was gone for the rest of
+  the process. `adopt_member_identity_declaration` now refuses such a mob
+  before anything is recorded, with
   `MobError::IdentityAdoptionRequiresPersistentRuntime`
   (`CAPABILITY_UNAVAILABLE`: `-32020` over JSON-RPC, HTTP 501 over REST;
   `data.kind` `mob_identity_adoption_requires_persistent_runtime`), and the
-  member stays attached and serving. Run the mob on a persistent realm to
-  adopt its members.
+  member stays attached and serving. Build the mob over the persistent
+  session service to adopt its members: a mob in any realm, `memory`
+  included, can.
 
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first

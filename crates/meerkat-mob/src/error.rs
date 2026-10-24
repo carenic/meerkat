@@ -1860,15 +1860,16 @@ pub enum MobError {
     },
 
     /// An identity adoption of member `member_id` on a mob whose runtime has
-    /// no persistent store. Identity reconciliation realizes an adoption by
-    /// replacing the attached member: it retires the member and resumes its
-    /// exact session from the runtime's durable lifecycle record. A runtime
-    /// without a persistent store keeps no such record, so the member would
-    /// be retired and never resumed. The adoption is refused before anything
-    /// is recorded, and the member stays as it was. Run the mob on a
-    /// persistent realm.
+    /// no store. Identity reconciliation realizes an adoption by replacing
+    /// the attached member: it retires the member and resumes its exact
+    /// session from the lifecycle record in the runtime's store. A runtime
+    /// without a store keeps no such record, so the member would be retired
+    /// and never resumed. The adoption is refused before anything is
+    /// recorded, and the member stays as it was. Build the mob over the
+    /// persistent session service, whatever its stores (a memory realm
+    /// works).
     #[error(
-        "identity adoption of member {member_id} needs a mob runtime with a persistent store: reconciliation would retire the member and could not resume its session; run the mob on a persistent realm"
+        "identity adoption of member {member_id} needs a mob runtime with a store: reconciliation would retire the member and could not resume its session; build the mob over the persistent session service (a memory realm works)"
     )]
     IdentityAdoptionRequiresPersistentRuntime { member_id: AgentIdentity },
 }
@@ -4150,7 +4151,9 @@ mod tests {
         assert_eq!(data["retryable"], false);
         let rendered = error.to_string();
         assert!(
-            rendered.contains("w-1") && rendered.contains("persistent store"),
+            rendered.contains("w-1")
+                && rendered.contains("a mob runtime with a store")
+                && rendered.contains("a memory realm works"),
             "{rendered}"
         );
     }

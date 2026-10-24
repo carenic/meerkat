@@ -307,6 +307,24 @@ set `durable = true` only on mobs over persistent sessions, once every host
 that reads the profile runs 0.9.5. See
 [Mobs: durable workers](/guides/mobs#durable-workers).
 
+#### Identity adoption needs a persistent runtime
+
+`adopt_member_identity_declaration` (`MobHandle`, `mob/adopt_member_identity_declaration`
+and REST `POST /mob/{id}/members/{agent_identity}/identity-adoption`) refuses a
+mob whose runtime has no runtime store (an in-memory store counts) with the new
+`MobError::IdentityAdoptionRequiresPersistentRuntime { member_id }` (wire
+code `CAPABILITY_UNAVAILABLE`, `-32020` over JSON-RPC and `501` over REST,
+data kind `mob_identity_adoption_requires_persistent_runtime`), before
+anything is recorded. Before 0.9.5 such an adoption was accepted, and
+reconciliation then retired the member and could not resume it: the identity
+stayed `RepairBlocked`. Every mob on an `EphemeralSessionService` runs on such
+a runtime.
+
+**Do:** adopt members only on mobs over the persistent session service,
+whatever its stores (a `memory` realm works), and handle the new refusal where
+you call adoption. See
+[Mobs: cold resume and cancellation](/guides/mobs#cold-resume-and-cancellation).
+
 #### Dedupe key on pending callback calls
 
 A pending callback call carries the call's dedupe key (see Other behaviour
@@ -516,7 +534,8 @@ struct literal, and treat an advisory you do not know as informational.
 9. Handle the `run_resumed` event, and pass the new fields of the recovery
    and runtime machine inputs.
 10. Pass `durable` where you build `Profile` or its wire forms, and handle
-    `MobError::NonDurableService`.
+    `MobError::NonDurableService` and
+    `MobError::IdentityAdoptionRequiresPersistentRuntime`.
 11. Name `dedupe_key` where you build pending callback calls, and pass the
     key to `WireCallbackPending::single`.
 12. Handle `ClosedOrphanedDrain` where you match

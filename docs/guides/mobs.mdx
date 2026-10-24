@@ -1220,6 +1220,22 @@ it). A restart in the same process, a restart while another process holds the
 lock, a lease taken without the lock, and a store without a file wait for the
 earlier lease to expire (up to 30 s), as before 0.9.5.
 
+Identity adoption (`mob/adopt_member_identity_declaration`, REST
+`POST /mob/{id}/members/{agent_identity}/identity-adoption`, or
+`MobHandle::adopt_member_identity_declaration`) needs a mob whose runtime has
+a runtime store. Reconciliation realizes an adoption by retiring the attached
+member and resuming its exact session from the lifecycle record in the
+runtime's store, and a runtime without a store keeps no such record: every
+mob on an `EphemeralSessionService` runs on one. Since 0.9.5 such a mob
+refuses the adoption with `IdentityAdoptionRequiresPersistentRuntime` (error
+code `CAPABILITY_UNAVAILABLE`: JSON-RPC `-32020`, REST `501`; structured data
+kind `mob_identity_adoption_requires_persistent_runtime`) before anything
+changes: no intent is recorded, and the member stays attached and serving.
+Build the mob over the persistent session service to adopt its members. Its
+runtime has a store whatever the realm backend, so unlike a durable worker an
+adopted member does not need sessions that outlive the process: a mob in a
+`memory` realm can adopt its members.
+
 ### Durable workers
 
 Since 0.9.5 a profile can make its members durable workers:
