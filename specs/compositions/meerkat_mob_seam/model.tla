@@ -5028,7 +5028,7 @@ meerkat_BeginUnregisterSessionRetainsSnapshotStopped(arg_session_id, arg_agent_r
        /\ model_step_count' = model_step_count + 1
 
 
-meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id) ==
+meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "meerkat"
        /\ packet.variant = "BeginUnregisterUnservedAttachment"
@@ -5037,6 +5037,7 @@ meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_
        /\ packet.payload.fence_token = arg_fence_token
        /\ packet.payload.generation = arg_generation
        /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
+       /\ packet.payload.queued_inputs = arg_queued_inputs
        /\ ~HigherPriorityReady("meerkat_kernel")
        /\ meerkat_phase = "Idle"
        /\ (meerkat_session_id = Some(packet.payload.session_id))
@@ -5053,7 +5054,7 @@ meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_
        /\ meerkat_unregister_teardown_retains_snapshot' = TRUE
        /\ meerkat_unregister_runtime_loop_forced_abort' = FALSE
        /\ meerkat_unregister_comms_drain_forced_abort' = FALSE
-       /\ meerkat_unregister_queued_inputs' = "Stop"
+       /\ meerkat_unregister_queued_inputs' = IF ((packet.payload.queued_inputs = "Keep") /\ ~(meerkat_registration_live_input_seen)) THEN "Keep" ELSE "Stop"
        /\ meerkat_unregister_requeue_max_age_ms' = 0
        /\ UnchangedFrame_6bbbcc38b0e60f6d
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -5066,7 +5067,7 @@ meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_
        /\ model_step_count' = model_step_count + 1
 
 
-meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id) ==
+meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "meerkat"
        /\ packet.variant = "BeginUnregisterUnservedAttachment"
@@ -5075,6 +5076,7 @@ meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runt
        /\ packet.payload.fence_token = arg_fence_token
        /\ packet.payload.generation = arg_generation
        /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
+       /\ packet.payload.queued_inputs = arg_queued_inputs
        /\ ~HigherPriorityReady("meerkat_kernel")
        /\ meerkat_phase = "Attached"
        /\ (meerkat_session_id = Some(packet.payload.session_id))
@@ -5091,7 +5093,7 @@ meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runt
        /\ meerkat_unregister_teardown_retains_snapshot' = TRUE
        /\ meerkat_unregister_runtime_loop_forced_abort' = FALSE
        /\ meerkat_unregister_comms_drain_forced_abort' = FALSE
-       /\ meerkat_unregister_queued_inputs' = "Stop"
+       /\ meerkat_unregister_queued_inputs' = IF ((packet.payload.queued_inputs = "Keep") /\ ~(meerkat_registration_live_input_seen)) THEN "Keep" ELSE "Stop"
        /\ meerkat_unregister_requeue_max_age_ms' = 0
        /\ UnchangedFrame_6bbbcc38b0e60f6d
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -5104,7 +5106,7 @@ meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runt
        /\ model_step_count' = model_step_count + 1
 
 
-meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id) ==
+meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "meerkat"
        /\ packet.variant = "BeginUnregisterUnservedAttachment"
@@ -5113,6 +5115,7 @@ meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runti
        /\ packet.payload.fence_token = arg_fence_token
        /\ packet.payload.generation = arg_generation
        /\ packet.payload.runtime_epoch_id = arg_runtime_epoch_id
+       /\ packet.payload.queued_inputs = arg_queued_inputs
        /\ ~HigherPriorityReady("meerkat_kernel")
        /\ meerkat_phase = "Running"
        /\ (meerkat_session_id = Some(packet.payload.session_id))
@@ -5129,7 +5132,7 @@ meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runti
        /\ meerkat_unregister_teardown_retains_snapshot' = TRUE
        /\ meerkat_unregister_runtime_loop_forced_abort' = FALSE
        /\ meerkat_unregister_comms_drain_forced_abort' = FALSE
-       /\ meerkat_unregister_queued_inputs' = "Stop"
+       /\ meerkat_unregister_queued_inputs' = IF ((packet.payload.queued_inputs = "Keep") /\ ~(meerkat_registration_live_input_seen)) THEN "Keep" ELSE "Stop"
        /\ meerkat_unregister_requeue_max_age_ms' = 0
        /\ UnchangedFrame_6bbbcc38b0e60f6d
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -124808,9 +124811,9 @@ CoreNext ==
     \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : \E arg_requeue_max_age_ms \in 0..2 : meerkat_BeginUnregisterSessionRunning(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs, arg_requeue_max_age_ms)
     \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : \E arg_requeue_max_age_ms \in 0..2 : meerkat_BeginUnregisterSessionRetainsSnapshotRetired(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs, arg_requeue_max_age_ms)
     \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : \E arg_requeue_max_age_ms \in 0..2 : meerkat_BeginUnregisterSessionRetainsSnapshotStopped(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs, arg_requeue_max_age_ms)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id)
-    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : meerkat_BeginUnregisterUnservedAttachmentIdle(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : meerkat_BeginUnregisterUnservedAttachmentAttached(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs)
+    \/ \E arg_session_id \in SessionIdValues : \E arg_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_fence_token \in OptionFenceTokenValues : \E arg_generation \in OptionGenerationValues : \E arg_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_queued_inputs \in UnregisterQueuedInputsDispositionValues : meerkat_BeginUnregisterUnservedAttachmentRunning(arg_session_id, arg_agent_runtime_id, arg_fence_token, arg_generation, arg_runtime_epoch_id, arg_queued_inputs)
     \/ \E arg_session_id \in SessionIdValues : \E arg_forced_abort \in BOOLEAN : meerkat_RuntimeLoopStoppedForUnregisterIdle(arg_session_id, arg_forced_abort)
     \/ \E arg_session_id \in SessionIdValues : \E arg_forced_abort \in BOOLEAN : meerkat_RuntimeLoopStoppedForUnregisterAttached(arg_session_id, arg_forced_abort)
     \/ \E arg_session_id \in SessionIdValues : \E arg_forced_abort \in BOOLEAN : meerkat_RuntimeLoopStoppedForUnregisterRunning(arg_session_id, arg_forced_abort)

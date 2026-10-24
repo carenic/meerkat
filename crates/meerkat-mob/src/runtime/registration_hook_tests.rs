@@ -1501,14 +1501,14 @@ async fn each_refusing_hook_call_removes_the_restored_registration() {
     }
 }
 
-/// The control for a boot restore's held input (it holds without the typed
-/// refusal too): the boot restore inserts the member's registration from the
-/// session's durable runtime state, and the host's refusal rolls that
-/// registration back through the canonical unregister, so an input the
-/// session held across the crash ends abandoned as Stopped. The boot
-/// restore's refusal is typed.
+/// A boot restore inserts the member's registration from the session's
+/// durable runtime state, and the host's refusal rolls that registration back
+/// with the keep: an input the session held across the crash is kept as the
+/// store holds it (queued, not ended, no requeue mark) for the next start.
+/// The boot restore's refusal is typed. RED before: the rollback stopped the
+/// held input.
 #[tokio::test]
-async fn a_boot_restore_its_host_refuses_stops_the_input_its_session_held() {
+async fn a_boot_restore_its_host_refuses_keeps_the_input_its_session_held() {
     let store: Arc<dyn meerkat_runtime::RuntimeStore> =
         Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
     let service = Arc::new(MockSessionService::new());
@@ -1590,18 +1590,128 @@ async fn a_boot_restore_its_host_refuses_stops_the_input_its_session_held() {
         .find(|row| row.state.input_id == held)
         .expect("the held input's durable row");
     assert_eq!(
-        row.seed.phase,
-        meerkat_runtime::InputLifecycleState::Abandoned
+        (row.seed.phase, &row.seed.terminal_outcome),
+        (meerkat_runtime::InputLifecycleState::Queued, &None),
+        "the held input stays queued for the next start: {:?}",
+        row.state.history
     );
     assert!(
+        row.state.stop_requeue.is_none(),
+        "the held input is kept as the store holds it, with no requeue mark"
+    );
+}
+
+/// A host refusal of a restored member whose registration recovered an input
+/// from the session's durable runtime state keeps that input for the next
+/// start. The restore's owner binding registered the member on the next boot,
+/// recovering the input the session held across the crash, and the refusal
+/// removes that registration with the keep, which stands because the
+/// registration served no live work. RED before: the refusal's unregister
+/// stopped the recovered input.
+#[tokio::test]
+async fn a_refused_restored_registration_keeps_the_input_it_recovered() {
+    let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let service = Arc::new(MockSessionService::new());
+    service.decide_tool_surface_at_create();
+    let first_boot = Arc::new(
+        MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the first boot's runtime"),
+    );
+    service.set_runtime_adapter(Arc::clone(&first_boot));
+    let session = Session::new();
+    let id = session.id().clone();
+    SessionBackend::new(service.clone(), Some(Arc::clone(&first_boot)), None)
+        .provision_member(fresh_request(session))
+        .await
+        .expect("the member is provisioned before the crash");
+    service.discard_live_session(&id).await.unwrap();
+    first_boot.unregister_session(&id).await.unwrap();
+    first_boot
+        .prepare_local_session_bindings(id.clone())
+        .await
+        .expect("the restore registers the member again");
+    let (accepted, _) = first_boot
+        .accept_input_with_completion(
+            &id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "held across the crash",
+                None,
+            )),
+        )
+        .await
+        .expect("the restored registration holds the input");
+    let meerkat_runtime::AcceptOutcome::Accepted { input_id: held, .. } = accepted else {
+        panic!("the restored registration accepts the input, got {accepted:?}");
+    };
+    // The next boot's restore prepares the member's registration from the
+    // same durable state, outside any revival transaction, and binds its
+    // operation owner.
+    let second_boot = Arc::new(
+        MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the next boot's runtime"),
+    );
+    service.set_runtime_adapter(Arc::clone(&second_boot));
+    let bindings = second_boot
+        .prepare_local_session_bindings(id.clone())
+        .await
+        .expect("the restore prepares the member's registration");
+    let hooked = SessionBackend::new(service.clone(), Some(Arc::clone(&second_boot)), None)
+        .with_member_runtime_registration_hook(SelectingHost::new(false, true));
+    hooked
+        .bind_member_owner_context(
+            &MemberRef::from_bridge_session_id(id.clone()),
+            id.clone(),
+            Arc::clone(bindings.ops_lifecycle()),
+        )
+        .await
+        .expect("the restore binds the member's operation owner");
+    let mut revival = retained_resume_request(&service, &id).await;
+    stamp_identity(&mut revival);
+    revival.runtime_revival_intent = RuntimeRevivalIntent::MissingLiveMaterialization;
+
+    let error = hooked
+        .provision_member(revival)
+        .await
+        .expect_err("the host refused the restored member");
+
+    assert!(
         matches!(
-            &row.seed.terminal_outcome,
-            Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
-                reason: meerkat_runtime::InputAbandonReason::Stopped
-            })
+            &error,
+            MobError::MemberRegistrationRefused {
+                call: crate::MemberRegistrationHookCall::SelectDestination,
+                session_id: Some(session),
+                ..
+            } if session == &id
         ),
-        "the held input ends Stopped, got {:?}",
-        row.seed.terminal_outcome
+        "the refusal of the restored registration is typed, got {error:?}"
+    );
+    assert!(
+        second_boot
+            .current_session_registration_witness(&id)
+            .await
+            .is_none(),
+        "the refusal removes the restored registration"
+    );
+    let rows = meerkat_runtime::store::load_input_states_for_recovery(
+        store.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&id),
+    )
+    .await
+    .expect("the session's durable inputs");
+    let row = rows
+        .iter()
+        .find(|row| row.state.input_id == held)
+        .expect("the recovered input's durable row");
+    assert_eq!(
+        (row.seed.phase, &row.seed.terminal_outcome),
+        (meerkat_runtime::InputLifecycleState::Queued, &None),
+        "the recovered input stays queued for the next start: {:?}",
+        row.state.history
+    );
+    assert!(
+        row.state.stop_requeue.is_none(),
+        "the recovered input is kept as the store holds it, with no requeue mark"
     );
 }
 

@@ -255,20 +255,25 @@ fi
 # tail held for recovery, a failed agent build) rolls its registration back
 # with an unregister that keeps every input the registration recovered from
 # the store, exactly as the store holds it, and still stops an input admitted
-# while the registration stood; once the registration served live work (an
-# admission, a deduplicated wait or a recycle) its unregister keeps nothing.
-# A hand-written audit over the same generated model runs three processes:
-# the first crashes with one input staged and one queued under a key, the
-# second recovers both through the generated recovery arms, may admit a
-# third, resolve a resubmission as a duplicate or take a recycle, and rolls
-# back with Keep (or, as the control, Stop), and the third recovers and
-# serves. It checks that exactly one verdict arm answers each input, that
-# Keep stops no recovered input and keeps no admitted one, that only Keep
-# keeps, that a kept input survives the rollback, and that live work
-# forfeits the keep, and requires seven witnesses reached; its --mutants
-# mode refuses nine seeded defects, the machine without the Keep arm and an
-# unregister begin that keeps after live work among them. 43 steps reach the
-# deepest witness, and 50 the whole reachable space.
+# while the registration stood; so does the retirement of an executor
+# attachment that never served, while a retire that meets one still stops;
+# once the registration served live work (an admission, a deduplicated wait
+# or a recycle) its unregister keeps nothing. A hand-written audit over the
+# same generated model runs three processes: the first crashes with one
+# input staged and one queued under a key, the second recovers both through
+# the generated recovery arms, may admit a third, resolve a resubmission as a
+# duplicate or take a recycle, and rolls back with Keep (or, as the control,
+# Stop), or attaches an executor that never serves and unregisters it
+# through the unserved-attachment arm with its abort's Keep or a retire's
+# Stop, and the third recovers and serves. It checks that exactly one
+# verdict arm answers each input, that Keep stops no recovered input and
+# keeps no admitted one, that only Keep keeps, that a kept input survives
+# the rollback, that live work forfeits the keep and that a retire over the
+# unserved attachment keeps nothing, and requires ten witnesses reached; its
+# --mutants mode refuses twelve seeded defects, the machine without the Keep
+# arm, an unregister begin that keeps after live work and a retire that
+# requests Keep among them. 44 steps reach the deepest witness, and 50 the
+# whole reachable space.
 materialization_rollback_keep_audit="${workspace_root}/specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh"
 if [[ ! -x "${materialization_rollback_keep_audit}" ]]; then
   echo "error: materialization-rollback keep audit runner is missing from workspace runfiles: ${materialization_rollback_keep_audit}" >&2

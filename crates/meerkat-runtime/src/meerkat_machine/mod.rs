@@ -1442,6 +1442,10 @@ pub enum RuntimeSessionUnregisterAdmission {
 /// which runs it unless it is older than `max_age` by then. Its waiter is
 /// answered
 /// [`CompletionWaitError::RequeuedAcrossStop`](crate::completion::CompletionWaitError::RequeuedAcrossStop).
+/// [`Self::Keep`] keeps every non-terminal input the registration recovered
+/// from the store exactly as the store holds it, for the next registration
+/// to recover again, while the registration served no live work; once it did,
+/// the unregister stops every input, as [`Self::Stop`] does.
 /// An unregister already in progress keeps the disposition it began with.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[non_exhaustive]
@@ -1455,6 +1459,12 @@ pub enum UnregisterQueuedInputs {
         /// a kept input as expired instead of running it.
         max_age: std::time::Duration,
     },
+    /// Keep every input the registration recovered from the store, exactly
+    /// as the store holds it, unless the registration served live work (an
+    /// admission, a deduplicated resubmission or a recycle): an unregister
+    /// of a registration a host refused before it served, so the refusal
+    /// ends nothing a later start would run.
+    Keep,
 }
 
 impl UnregisterQueuedInputs {
@@ -1483,6 +1493,7 @@ impl UnregisterQueuedInputs {
     pub(crate) fn recorded(self) -> Result<UnregisterDisposition, UnregisterQueuedInputsError> {
         match self {
             Self::Stop => Ok(UnregisterDisposition::STOP),
+            Self::Keep => Ok(UnregisterDisposition::KEEP),
             Self::Requeue { max_age } => {
                 if max_age > Self::MAX_AGE_CAP {
                     return Err(UnregisterQueuedInputsError::MaxAgeOverCap {
@@ -1537,12 +1548,15 @@ impl UnregisterDisposition {
     };
 
     /// Keep every non-terminal input the registration recovered from the
-    /// store exactly as the store holds it, with no requeue mark: the
-    /// rollback of a materialization that never served and admitted no
-    /// input. An input admitted while the registration stood still ends
-    /// as stopped. The machine grants the keep only to a registration that
-    /// served no live work: after an admission, a deduplicated resubmission
-    /// or a recycle it records the unregister as Stop.
+    /// store exactly as the store holds it, with no requeue mark: every
+    /// materialization rollback, the retirement of an attachment that never
+    /// served (a pending attachment's abort, a failed startup's cleanup), and
+    /// a host's refusal of a restored registration
+    /// ([`UnregisterQueuedInputs::Keep`]).
+    /// An input admitted while the registration stood still ends as stopped.
+    /// The machine grants the keep only to a registration that served no
+    /// live work: after an admission, a deduplicated resubmission or a recycle
+    /// it records the unregister as Stop.
     pub(crate) const KEEP: Self = Self {
         queued_inputs: dsl::UnregisterQueuedInputsDisposition::Keep,
         requeue_max_age_ms: 0,
@@ -3663,6 +3677,7 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 guard,
                 self.cleanup_spawner.clone(),
+                UnregisterDisposition::STOP,
             );
         self.armed = false;
         Ok(completion)
@@ -3689,6 +3704,7 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 RunlessTerminalAnnouncement::default(),
                 guard,
+                UnregisterDisposition::STOP,
             )
             .await
     }
@@ -3708,6 +3724,7 @@ impl Drop for PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 guard,
                 self.cleanup_spawner.clone(),
+                UnregisterDisposition::STOP,
             );
         self.armed = false;
     }
@@ -5025,6 +5042,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness.clone(),
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await;
             if let Err(error) = &retired {
@@ -5063,6 +5081,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness,
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await
         });
@@ -5093,6 +5112,7 @@ impl Drop for CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness.clone(),
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await;
             if let Err(error) = retired {
@@ -5916,31 +5936,21 @@ impl PreparedSessionMaterialization {
 
     /// Roll back this exact materialization now. A pre-existing runtime entry is
     /// preserved after its exact provisional cleanup; an entry inserted for this
-    /// transaction is fully unregistered, and its stop ends every non-terminal
-    /// input as stopped.
-    pub async fn rollback_now(&mut self) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(false, UnregisterDisposition::STOP)
-            .await
-    }
-
-    /// [`Self::rollback_now`] for a materialization that served nothing and
-    /// admitted no input. An entry inserted for this transaction is
-    /// unregistered with the Keep disposition: every non-terminal input its
-    /// registration recovered from the store stays exactly as the store
-    /// holds it, with no requeue mark, for the next registration to recover
-    /// again. A refused materialization (a durable tail held for recovery,
-    /// a failed agent build) so ends nothing a later start would run. An
-    /// input admitted while the registration stood still ends as stopped.
+    /// transaction is fully unregistered with the Keep disposition: every
+    /// non-terminal input its registration recovered from the store stays
+    /// exactly as the store holds it, with no requeue mark, for the next
+    /// registration to recover again. A refused materialization (a durable tail
+    /// held for recovery, a failed agent build) so ends nothing a later start
+    /// would run. An input admitted while the registration stood still ends as
+    /// stopped.
     ///
     /// The machine decides whether the keep stands: a registration that
     /// served live work (an input admitted to it, a resubmission
     /// deduplicated onto an input it holds, or a host's recycle, whose
     /// recovery mixes live inputs into the recovered ones) unregisters with
-    /// Stop instead, as [`Self::rollback_now`] does, so a turn whose caller
+    /// Stop instead and ends every non-terminal input, so a turn whose caller
     /// saw the materialization refused never runs on a later start.
-    pub async fn rollback_now_keeping_recovered_inputs(
-        &mut self,
-    ) -> Result<bool, RuntimeDriverError> {
+    pub async fn rollback_now(&mut self) -> Result<bool, RuntimeDriverError> {
         self.rollback_now_with_turn_finalization_boundary(false, UnregisterDisposition::KEEP)
             .await
     }
@@ -5956,7 +5966,7 @@ impl PreparedSessionMaterialization {
     pub async fn rollback_now_under_turn_finalization_boundary(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(true, UnregisterDisposition::STOP)
+        self.rollback_now_with_turn_finalization_boundary(true, UnregisterDisposition::KEEP)
             .await
     }
 
@@ -6028,7 +6038,9 @@ impl Drop for PreparedSessionMaterialization {
                     Some(&epoch_id),
                     Some(&claim_state),
                     false,
-                    UnregisterDisposition::STOP,
+                    // As rollback_now: the machine stops every input instead
+                    // once the registration served live work.
+                    UnregisterDisposition::KEEP,
                 )
                 .await
             {

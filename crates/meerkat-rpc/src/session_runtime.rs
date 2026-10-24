@@ -1067,6 +1067,11 @@ impl SessionService for RpcMobSessionService {
             ));
         }
         let session_id = Self::ensure_create_session_id(&mut req);
+        // This create admits no input (an eager create is refused above), so
+        // every rollback of the registration it prepares keeps the inputs
+        // that registration recovered from the store (rollback_now): a
+        // refused resume of a durable member session ends nothing a later
+        // start would run.
         // A member session is a registration on this runtime: none is made
         // once the runtime's shutdown began. The gate is held until the
         // registration below is in place (or, for bindings a mob prepared,
@@ -10497,6 +10502,10 @@ impl SessionRuntime {
                         Ok(id.clone())
                     }
                     error => {
+                        // Nothing was admitted (a no-turn materialization),
+                        // so the rollback keeps every input the registration
+                        // recovered (rollback_now): a refused resume ends
+                        // nothing a later start would run.
                         let rollback = prepared.rollback_now().await;
                         #[cfg(feature = "mcp")]
                         runtime.mcp_sessions.write().await.remove(&id);
@@ -29713,6 +29722,92 @@ mod tests {
             .create_session(mock_build_config(), None, None, Vec::new())
             .await
             .expect("failed direct create should release admission capacity");
+    }
+
+    /// A direct create that resumes a durable session and is refused by its
+    /// agent build rolls the registration it prepared back with the keep: a
+    /// prompt an earlier process left queued in the session's durable
+    /// runtime state, which the registration recovered, stays queued for the
+    /// next start, not ended and with no requeue mark. RED before: the
+    /// rollback stopped it.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_session_service_refused_resume_keeps_a_recovered_prompt() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 2);
+        let service = runtime.session_service();
+        let session = Session::new();
+        let session_id = session.id().clone();
+        commit_runtime_session_authority(runtime.as_ref(), &session).await;
+        let store = runtime.service.runtime_store();
+        // An earlier process registered the session and accepted a prompt no
+        // executor ran, so the store holds the prompt queued.
+        let earlier = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+                .expect("the earlier process's runtime"),
+        );
+        earlier
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("the earlier process registers the session");
+        let (accepted, _) = earlier
+            .accept_input_with_completion(
+                &session_id,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                    "queued when the process stopped",
+                    None,
+                )),
+            )
+            .await
+            .expect("the registration holds the prompt");
+        let meerkat_runtime::AcceptOutcome::Accepted {
+            input_id: queued, ..
+        } = accepted
+        else {
+            panic!("the registration accepts the prompt, got {accepted:?}");
+        };
+        let mut request = service_create_request(
+            AgentBuildConfig {
+                max_inline_peer_notifications: Some(-2),
+                ..mock_build_config()
+            },
+            InitialTurnPolicy::Defer,
+        );
+        request
+            .build
+            .as_mut()
+            .expect("direct create request build options")
+            .resume_session = Some(session);
+
+        let refused = service.create_session(request).await;
+        assert!(
+            refused.as_ref().err().is_some_and(|error| error
+                .to_string()
+                .contains("max_inline_peer_notifications=-2")),
+            "the agent build refuses the resume: {refused:?}"
+        );
+        assert!(
+            !runtime.runtime_adapter.contains_session(&session_id).await,
+            "the refused resume rolls its registration back"
+        );
+        let row = store
+            .load_input_state(
+                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+                &queued,
+            )
+            .await
+            .expect("load the prompt's row")
+            .expect("the prompt's row stays durable");
+        assert_eq!(
+            (row.seed.phase, &row.seed.terminal_outcome),
+            (meerkat_runtime::InputLifecycleState::Queued, &None),
+            "the recovered prompt stays queued for the next start: {:?}",
+            row.state.history
+        );
+        assert!(
+            row.state.stop_requeue.is_none(),
+            "the prompt is kept as the store holds it, with no requeue mark"
+        );
     }
 
     #[cfg(feature = "mob")]

@@ -697,19 +697,20 @@ them.
   input fields (`MeerkatMachineInput::BeginUnregisterSession` gains
   `queued_inputs` and `requeue_max_age_ms`).
 
-- `meerkat-machine-kernels` (`generated::meerkat`) and
-  `meerkat-machine-schema` (`catalog::dsl::meerkat_machine`): the runtime
-  machine gains the keep of a refused materialization's rollback (see Fixed,
-  a refused restart keeps the inputs it recovered).
-  `UnregisterQueuedInputsDisposition` and `StopInputDisposition` gain `Keep`,
-  appended last, and `TransitionId` gains
+- `meerkat-machine-kernels` (`generated::meerkat`): the runtime machine's
+  `TransitionId` gains the keep of a refused materialization's rollback (see
+  Fixed, a refused restart keeps the inputs it recovered):
   `ClassifyStopInputDispositionKeepInitializing`,
   `ClassifyStopInputDispositionKeepIdle`,
   `ClassifyStopInputDispositionKeepAttached`,
   `ClassifyStopInputDispositionKeepRunning`,
   `ClassifyStopInputDispositionKeepRetired` and
-  `ClassifyStopInputDispositionKeepStopped`. The enums are exhaustive, so a
-  `match` outside the crate needs the arms.
+  `ClassifyStopInputDispositionKeepStopped`. `TransitionId` is exhaustive, so
+  a `match` outside the crate needs the arms. The enums the Keep arm reads
+  and answers, `UnregisterQueuedInputsDisposition` and `StopInputDisposition`
+  (new in this release, in the kernel and in `meerkat-machine-schema`'s
+  `catalog::dsl::meerkat_machine`), gain `Keep`, appended last; that is no
+  break against 0.9.4.
 
 - `meerkat-runtime`: `MeerkatMachineRuntimeInternalInput` gains
   `ClassifyStopInputDisposition`, `MarkRunResumable`, `ResumeRun`,
@@ -737,6 +738,15 @@ them.
   (see Fixed, a refused restart keeps the inputs it recovered). Code that
   builds either with a struct literal must set it (`false` for a
   registration that served none).
+
+- `meerkat-machine-kernels` (`generated::meerkat`), `meerkat-machine-schema`
+  (`catalog::dsl::meerkat_machine`) and `meerkat-runtime`
+  (`meerkat_machine::dsl`): the input `BeginUnregisterUnservedAttachment`
+  (the kernel input struct and the `MeerkatMachineInput` variant) gains
+  `queued_inputs`, the disposition the unregister of an executor attachment
+  that never served asks for (see Fixed, a refused restart keeps the inputs
+  it recovered). Struct literals and exhaustive patterns need the field;
+  `UnregisterQueuedInputsDisposition::Stop` keeps the 0.9.4 behaviour.
 
 - `meerkat-rest`: `ApiError` gains `SessionNotRunningWithData { message,
   details }` (`409` `SESSION_NOT_RUNNING`), appended last. The enum is
@@ -2293,29 +2303,34 @@ them.
   `SessionError::DurableTailHeldForRecovery` or
   `SessionError::DurableTailRecoveryRefused`.
 
-- `meerkat`, `meerkat-runtime`: a restart refused before the session serves
-  keeps the inputs it recovered. A materialization refused after its runtime
+- `meerkat`, `meerkat-runtime`, `meerkat-mob`, `meerkat-rpc`,
+  `meerkat-mcp-server`: a restart refused before the session serves keeps the
+  inputs it recovered. A materialization refused after its runtime
   registration recovered the session's inputs from the store (a durable tail
-  held for recovery, a refused recovery, a failed agent build) rolled the
-  registration back with an unregister that stopped every non-terminal
-  input. A held tail's stranded input was ended as stopped, the hold went
-  with it, and the next start ran without the input, so the operator's
-  `resolve-held-tail` had nothing left to requeue. The rollback now
-  unregisters with the generated Keep disposition: every input the
-  registration recovered stays exactly as the store holds it, so the hold
-  stands and a later start or the operator's repair runs the input once. An
-  input admitted while the registration stood still ends as stopped. A
-  refused preparation, and a cancelled one, keep the same way.
-  `PreparedSessionMaterialization::rollback_now_keeping_recovered_inputs` is
-  the rollback for a materialization that admitted no input; `rollback_now`
-  still stops every input. The keep is recorded with the unregister's
-  progress (machine lifecycle record version 6), so a crash during the
-  rollback keeps the same inputs. The machine grants the keep only to a
-  registration that served no live work: after an admission, a resubmission
-  deduplicated onto an input it holds, or a host's recycle (whose recovery
-  mixes live inputs into the recovered ones), the unregister records Stop
-  and stops every input, so a turn whose caller saw the materialization
-  refused never runs on a later start.
+  held for recovery, a refused recovery, a failed agent build, a mob host's
+  refusal) rolled the registration back with an unregister that stopped
+  every non-terminal input. A held tail's stranded input was ended as
+  stopped, the hold went with it, and the next start ran without the input,
+  so the operator's `resolve-held-tail` had nothing left to requeue. Every
+  materialization rollback now unregisters with the generated Keep
+  disposition: `PreparedSessionMaterialization::rollback_now` and
+  `rollback_now_under_turn_finalization_boundary`, a prepared materialization
+  dropped before it committed, and a refused or cancelled preparation. So do
+  the retirement of an executor attachment that never served (a pending
+  attachment's abort, the cleanup of a failed startup) and a mob host's
+  refusal of a restored member's registration, through the new
+  `UnregisterQueuedInputs::Keep`. Every input the registration recovered
+  stays exactly as the store holds it, so the hold stands and a later start
+  or the operator's repair runs the input once. The machine grants the keep
+  only to a registration that served no live work: after an admission, a
+  resubmission deduplicated onto an input it holds, or a host's recycle
+  (whose recovery mixes live inputs into the recovered ones), the unregister
+  records Stop and stops every input, so a turn whose caller saw the
+  materialization refused never runs on a later start. A retire or an
+  archive that meets an unserved attachment still stops every input. The
+  keep is recorded with the unregister's progress (machine lifecycle record
+  version 6), so a crash during the rollback replays it, and the next start
+  keeps every input the store still holds open.
 
 - `meerkat-gemini`: preserve provider-issued `functionCall.id` through
   streamed tool calls, saved transcripts, assistant replay and matching

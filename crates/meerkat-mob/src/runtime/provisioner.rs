@@ -8471,11 +8471,13 @@ struct AskedRegistration {
 /// One it did not insert (the restore prepared it) was outside the abort's
 /// authority: remove exactly that registration through the canonical
 /// unregister, by the witness the host was asked about, and release the owner
-/// context the restore bound to it. `Ok(false)` means a successor already
-/// replaced the registration: the successor, and the operation binding it
-/// owns, are left alone. The answer is the typed refusal. A failed abort,
-/// removal or release is reported as cleanup uncertainty, never as a clean
-/// refusal.
+/// context the restore bound to it. The unregister keeps every input the
+/// registration recovered from the store for the next start, as a refused
+/// materialization's rollback does (stopped instead once it served live
+/// work). `Ok(false)` means a successor already replaced the registration:
+/// the successor, and the operation binding it owns, are left alone. The
+/// answer is the typed refusal. A failed abort, removal or release is
+/// reported as cleanup uncertainty, never as a clean refusal.
 #[cfg(feature = "runtime-adapter")]
 async fn settle_restored_member_refusal(
     restored: RestoredMemberRefusalCleanup,
@@ -8497,9 +8499,16 @@ async fn settle_restored_member_refusal(
     if asked.inserted_by_this_transaction {
         return (refused, Ok(()));
     }
+    // The host refused the restored registration before it served: its
+    // unregister keeps every input the registration recovered from the store
+    // for the next start, unless it served live work, when the machine stops
+    // every input instead.
     let removed = match asked
         .machine
-        .unregister_session_registration_until_terminal_if_current(&asked.registration)
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &asked.registration,
+            meerkat_runtime::UnregisterQueuedInputs::Keep,
+        )
         .await
     {
         Ok(removed) => removed,

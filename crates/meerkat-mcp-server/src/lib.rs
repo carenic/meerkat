@@ -257,6 +257,8 @@ async fn prepare_mcp_actor_materialization_claim(
     )
     .await
     {
+        // Nothing was admitted: the rollback keeps every input the
+        // registration recovered from the store.
         let rollback = prepared.rollback_now().await.err();
         let rollback = rollback
             .map(|error| format!("; exact rollback also failed: {error}"))
@@ -277,7 +279,10 @@ async fn prepare_mcp_actor_materialization_claim(
 /// Exact rollback removes only the provisional machine registration and the
 /// actor incarnation published through this transaction's witness slot. The
 /// durable session document remains discoverable, and the explicit resume
-/// seam can reconstruct a fresh actor/executor incarnation.
+/// seam can reconstruct a fresh actor/executor incarnation. The rollback
+/// keeps every input the registration recovered from the store; once the
+/// registration served live work (its initial turn ran), the machine stops
+/// every input instead, so a turn its caller saw refused never runs later.
 async fn release_mcp_actor_materialization(
     prepared: &mut Option<McpPreparedActorMaterialization>,
     session_id: &meerkat::SessionId,
@@ -10385,6 +10390,99 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             .await
             .expect("failed actor create must retain exact rollback authority");
         assert!(!state.runtime_adapter.contains_session(&session_id).await);
+    }
+
+    /// An explicit resume refused by its agent build rolls the registration
+    /// its transaction prepared back with the keep: a prompt an earlier
+    /// process left queued in the session's durable runtime state, which the
+    /// registration recovered, stays queued for the next start, not ended
+    /// and with no requeue mark. RED before: the rollback stopped it.
+    #[tokio::test]
+    async fn refused_explicit_resume_keeps_a_recovered_prompt() {
+        let (state, session_id) = state_with_persisted_session().await;
+        let session_id = meerkat::SessionId::parse(&session_id).expect("session id");
+        let store = state.service.runtime_store();
+        // An earlier process registered the session and accepted a prompt no
+        // executor ran, so the store holds the prompt queued.
+        let earlier = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+                .expect("the earlier process's runtime"),
+        );
+        earlier
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("the earlier process registers the session");
+        let (accepted, _) = earlier
+            .accept_input_with_completion(
+                &session_id,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                    "queued when the process stopped",
+                    None,
+                )),
+            )
+            .await
+            .expect("the registration holds the prompt");
+        let meerkat_runtime::AcceptOutcome::Accepted {
+            input_id: queued, ..
+        } = accepted
+        else {
+            panic!("the registration accepts the prompt, got {accepted:?}");
+        };
+        let session = state
+            .service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load the persisted session")
+            .expect("the session is persisted");
+        let ingress = state.runtime_ingress_context();
+
+        let outcome = materialize_mcp_actor_transaction(
+            &state.service,
+            &state.runtime_adapter,
+            &ingress,
+            &session_id,
+            McpActorMaterializationMode::Resume,
+            None,
+            move |bindings, _config| {
+                std::future::ready(Ok::<_, ToolCallError>(McpActorMaterializationPlan {
+                    request: mock_deferred_materialization_request(session, bindings, Some(-2)),
+                    callback_config: runtime_ingress::McpCallbackConfig::Preserve,
+                    router_to_publish: None,
+                }))
+            },
+        )
+        .await
+        .expect("the refused resume reports");
+        assert!(!outcome.committed, "the refused resume commits nothing");
+        let refusal = outcome.result.as_ref().err();
+        assert!(
+            refusal.is_some_and(|error| error
+                .to_string()
+                .contains("max_inline_peer_notifications=-2")),
+            "the agent build refuses the resume: {refusal:?}"
+        );
+        assert!(
+            !state.runtime_adapter.contains_session(&session_id).await,
+            "the refused resume rolls its registration back"
+        );
+        let row = store
+            .load_input_state(
+                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+                &queued,
+            )
+            .await
+            .expect("load the prompt's row")
+            .expect("the prompt's row stays durable");
+        assert_eq!(
+            (row.seed.phase, &row.seed.terminal_outcome),
+            (meerkat_runtime::InputLifecycleState::Queued, &None),
+            "the recovered prompt stays queued for the next start: {:?}",
+            row.state.history
+        );
+        assert!(
+            row.state.stop_requeue.is_none(),
+            "the prompt is kept as the store holds it, with no requeue mark"
+        );
     }
 
     #[tokio::test]

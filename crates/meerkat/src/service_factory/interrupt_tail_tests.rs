@@ -1853,7 +1853,7 @@ async fn a_keeping_rollback_after_an_admission_keeps_nothing(head_canonical: boo
             .await
             .expect("the registration admits the prompt");
         prepared
-            .rollback_now_keeping_recovered_inputs()
+            .rollback_now()
             .await
             .expect("roll the registration back");
         start.service.try_shutdown().await.expect("shutdown");
@@ -1914,7 +1914,7 @@ async fn a_keeping_rollback_after_a_recycle_stops_the_admitted_input(head_canoni
         .await
         .expect("a host recycles the runtime in the prepared window");
         prepared
-            .rollback_now_keeping_recovered_inputs()
+            .rollback_now()
             .await
             .expect("roll the registration back");
         start.service.try_shutdown().await.expect("shutdown");
@@ -1977,7 +1977,7 @@ async fn a_keeping_rollback_after_a_deduplicated_resubmission_keeps_nothing(head
             "the resubmission waits on the recovered prompt: {outcome:?}"
         );
         prepared
-            .rollback_now_keeping_recovered_inputs()
+            .rollback_now()
             .await
             .expect("roll the registration back");
         start.service.try_shutdown().await.expect("shutdown");

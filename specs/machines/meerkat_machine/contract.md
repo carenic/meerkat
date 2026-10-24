@@ -541,7 +541,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `AuthorizeDurableTailRecovery`(session_id: SessionId, candidate_id: String, candidate_run_id: RunId, class: DurableTailRecoveryClass, observed_lifecycle: DurableRecoveryObservedLifecycle, observed_current_run: DurableRecoveryObservedRun, last_committed_sequence: u64, prior_commit: DurableRecoveryPriorCommit, input_evidence: DurableRecoveryInputEvidence)
 - `PrepareTerminalSupervisorCleanupBindings`(session_id: SessionId)
 - `BeginUnregisterSession`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, queued_inputs: UnregisterQueuedInputsDisposition, requeue_max_age_ms: u64)
-- `BeginUnregisterUnservedAttachment`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>)
+- `BeginUnregisterUnservedAttachment`(session_id: SessionId, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, queued_inputs: UnregisterQueuedInputsDisposition)
 - `RuntimeLoopStoppedForUnregister`(session_id: SessionId, forced_abort: Bool)
 - `CommsDrainExitedForUnregister`(session_id: SessionId, forced_abort: Bool)
 - `CompletionWaitersResolvedForUnregister`(session_id: SessionId)
@@ -2420,7 +2420,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginUnregisterUnservedAttachmentIdle`
 - From: `Idle`
-- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2433,7 +2433,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginUnregisterUnservedAttachmentAttached`
 - From: `Attached`
-- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`
@@ -2446,7 +2446,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `BeginUnregisterUnservedAttachmentRunning`
 - From: `Running`
-- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id)
+- On: `BeginUnregisterUnservedAttachment`(session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs)
 - Guards:
   - `session_matches_current`
   - `runtime_binding_matches_observation`

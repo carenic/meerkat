@@ -58647,3 +58647,298 @@ fn interrupted_request_identity_is_the_one_its_run_stamped() {
         "a row without stored semantics keeps the prompt's own metadata"
     );
 }
+
+/// An executor that serves nothing: every run applies empty, and its stop and
+/// cancel answer at once. With `reject_startup` it refuses the startup
+/// projection reconciliation every attachment runs, so its attachment fails
+/// before it serves.
+struct KeepRowExecutor {
+    reject_startup: bool,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for KeepRowExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Ok(CoreApplyOutput::with_untyped_snapshot(
+            RunBoundaryReceiptDraft {
+                run_id,
+                boundary: primitive.apply_boundary(),
+                contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                conversation_digest: None,
+                message_count: 0,
+            },
+            None,
+            None,
+        ))
+    }
+
+    async fn reconcile_committed_compaction_projections(
+        &mut self,
+        _intents: &[meerkat_core::CompactionProjectionIntent],
+    ) -> Result<(), CoreExecutorError> {
+        if self.reject_startup {
+            return Err(CoreExecutorError::Internal(
+                "the executor refuses its startup projection recovery".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// The durable runtime state a crashed process leaves: its runtime registered
+/// the session and accepted a prompt no executor ran, so the prompt stays
+/// queued in the store. The returned runtime is that process's; a later
+/// runtime over the same store recovers the prompt when it registers the
+/// session.
+async fn a_crash_leaving_a_queued_prompt(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+) -> (Arc<MeerkatMachine>, InputId) {
+    let crashed = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(store), memory_blob_store())
+            .expect("the crashed process's runtime"),
+    );
+    crashed
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the crashed process registers the session");
+    let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+        "queued when the process stopped",
+        None,
+    ));
+    let prompt_id = prompt.id().clone();
+    let (accepted, _) = crashed
+        .accept_input_with_completion(session_id, prompt)
+        .await
+        .expect("the registration holds the prompt");
+    assert!(accepted.is_accepted(), "{accepted:?}");
+    (crashed, prompt_id)
+}
+
+/// Wait until `machine` no longer registers `session_id`: the rollback or
+/// abort under test finished its unregister.
+async fn wait_unregistered(machine: &MeerkatMachine, session_id: &SessionId) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while machine.contains_session(session_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the registration is unregistered");
+}
+
+/// The prompt's durable row is still queued with no terminal outcome and no
+/// requeue mark, exactly as the crash left it.
+async fn assert_prompt_kept(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+    prompt_id: &InputId,
+) {
+    let row = store
+        .load_input_state(&runtime_id_for_session(session_id), prompt_id)
+        .await
+        .expect("load the prompt's row")
+        .expect("the prompt's row stays durable");
+    assert_eq!(
+        (row.seed.phase, row.seed.terminal_outcome.clone()),
+        (crate::input_state::InputLifecycleState::Queued, None),
+        "the prompt the registration recovered stays queued for the next start: {:?}",
+        row.state.history
+    );
+    assert!(
+        row.state.stop_requeue.is_none(),
+        "kept as the store holds it, with no requeue mark"
+    );
+}
+
+/// A prepared materialization dropped while it still holds its registration
+/// (every `?` exit between preparation and commit) rolls the registration
+/// back with the keep: the prompt the registration recovered from the store
+/// stays queued for the next start. RED before: the drop's rollback stopped
+/// it.
+#[tokio::test]
+async fn a_dropped_prepared_materialization_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    let prepared = machine
+        .prepare_session_materialization(session_id.clone())
+        .await
+        .expect("the next start prepares the session");
+    drop(prepared);
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// A pending executor attachment aborted before it served unregisters with
+/// the keep its abort asks for: the prompt the registration recovered stays
+/// queued for the next start. RED before: an unserved attachment's
+/// unregister always stopped it.
+#[tokio::test]
+async fn an_aborted_pending_attachment_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let pending = match machine
+        .ensure_session_with_executor_factory(session_id.clone(), |_witness| {
+            Box::new(KeepRowExecutor {
+                reject_startup: false,
+            }) as Box<dyn CoreExecutor>
+        })
+        .await
+        .expect("the attachment is prepared")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("a fresh registration found a committed attachment {witness:?}")
+        }
+    };
+    pending
+        .abort()
+        .await
+        .expect("the pending attachment aborts");
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// An executor whose startup fails (it refuses the startup projection
+/// recovery) never serves: its startup owner aborts the attachment, which
+/// keeps the prompt the registration recovered for the next start. RED
+/// before: that abort stopped it.
+#[tokio::test]
+async fn a_failed_executor_startup_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let refused = machine
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(KeepRowExecutor {
+                reject_startup: true,
+            }),
+        )
+        .await
+        .expect_err("the executor's startup fails");
+    assert!(
+        refused
+            .to_string()
+            .contains("the executor refuses its startup projection recovery"),
+        "{refused}"
+    );
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// The control: a retire that meets a pending attachment still stops the
+/// inputs the registration recovered. Only the attachment's own abort or
+/// cleanup asks to keep them; the retire takes the registration's mutation
+/// gate in the window after the attachment's startup released it and before
+/// the attachment took it back, so it begins the unregister over the pending
+/// attachment with its own Stop.
+#[tokio::test]
+async fn a_retire_over_a_pending_attachment_still_stops_the_recovered_inputs() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let (regate_reached_tx, regate_reached) = tokio::sync::oneshot::channel();
+    let (release_regate, release_regate_rx) = tokio::sync::oneshot::channel();
+    *machine
+        .test_pending_attachment_before_regate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((regate_reached_tx, release_regate_rx));
+    let ensure = tokio::spawn({
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .ensure_session_with_executor_factory(session_id, |_witness| {
+                    Box::new(KeepRowExecutor {
+                        reject_startup: false,
+                    }) as Box<dyn CoreExecutor>
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), regate_reached)
+        .await
+        .expect("the attachment's startup releases the registration gate")
+        .expect("the regate hook reports");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.unregister_session(&session_id),
+    )
+    .await
+    .expect("the retire settles while the attachment is pending")
+    .expect("the retire unregisters the session");
+    let _ = release_regate.send(());
+    let ensured = tokio::time::timeout(Duration::from_secs(10), ensure)
+        .await
+        .expect("the attachment's owner returns")
+        .expect("the attachment's owner task joins");
+    assert!(
+        ensured.is_err(),
+        "the retired registration has no attachment to commit"
+    );
+    let row = store
+        .load_input_state(&runtime_id_for_session(&session_id), &prompt_id)
+        .await
+        .expect("load the prompt's row")
+        .expect("the prompt's row stays durable");
+    assert_eq!(
+        row.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Stopped
+        }),
+        "a retire over a pending attachment stops the recovered prompt: {:?}",
+        row.state.history
+    );
+}

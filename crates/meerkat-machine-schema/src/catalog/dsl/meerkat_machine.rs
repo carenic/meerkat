@@ -4075,7 +4075,11 @@ macro_rules! meerkat_catalog_machine_dsl {
             // unregister keeps nothing: BeginUnregisterSession records a
             // requested Keep as Stop, and each setter turns a Keep already
             // recorded into Stop. Never cleared, like the witness it
-            // qualifies; a driver starts with both empty.
+            // qualifies; a driver starts with both empty. The unregister's
+            // durable progress follows the turn at the next lifecycle commit:
+            // a crash before it replays the Keep, which then also keeps an
+            // input admitted after the unregister began, whose caller was
+            // told it was accepted, never refused.
             registration_live_input_seen: bool,
 
             // --- Ops lifecycle substate ---
@@ -5209,6 +5213,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 fence_token: Option<FenceToken>,
                 generation: Option<Generation>,
                 runtime_epoch_id: Option<RuntimeEpochId>,
+                queued_inputs: Enum<UnregisterQueuedInputsDisposition>,
             },
             RuntimeLoopStoppedForUnregister { session_id: SessionId, forced_abort: bool },
             CommsDrainExitedForUnregister { session_id: SessionId, forced_abort: bool },
@@ -12070,9 +12075,15 @@ macro_rules! meerkat_catalog_machine_dsl {
         // exact owner on the next attachment. This transition deliberately
         // does not predict RuntimeExecutorExited; the owned drain observes
         // and joins the actual loop exit after the serving gate is closed.
+        // The attachment's abort, and its startup owner's cleanup after a
+        // failed startup, ask to keep what the registration recovered
+        // (`queued_inputs` Keep); the keep stands only while the registration
+        // served no live work, as for BeginUnregisterSession. Any other
+        // unregister that meets the unserved attachment (a retire, an archive,
+        // a graceful stop) records Stop, so it still ends every input.
         transition BeginUnregisterUnservedAttachment {
             per_phase [Idle, Attached, Running]
-            on input BeginUnregisterUnservedAttachment { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
+            on input BeginUnregisterUnservedAttachment { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id, queued_inputs }
             guard "session_matches_current" { self.session_id == Some(session_id) }
             guard "runtime_binding_matches_observation" { self.active_runtime_id == agent_runtime_id }
             guard "fence_binding_matches_observation" { self.active_fence_token == fence_token }
@@ -12088,8 +12099,14 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.unregister_runtime_loop_forced_abort = false;
                 self.unregister_comms_drain_forced_abort = false;
                 // An attachment that never served has no queued work of its
-                // own to keep: its unregister always stops.
-                self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                // own: its unregister keeps what the registration recovered
+                // only when the abort asked to and no live work was served,
+                // and otherwise stops.
+                if queued_inputs == UnregisterQueuedInputsDisposition::Keep && !self.registration_live_input_seen {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Keep;
+                } else {
+                    self.unregister_queued_inputs = UnregisterQueuedInputsDisposition::Stop;
+                }
                 self.unregister_requeue_max_age_ms = 0;
             }
             to Idle
