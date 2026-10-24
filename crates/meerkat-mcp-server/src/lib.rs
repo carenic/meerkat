@@ -9559,7 +9559,7 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             &arguments,
         )
         .expect("valid dedupe key");
-        for dedupe_key in [Some(key.clone()), None] {
+        for dedupe_key in [Some(key), None] {
             let payload = format_agent_result(
                 Err(SessionError::Agent(meerkat::AgentError::CallbackPending {
                     tool_use_id: "callback-a".to_string(),

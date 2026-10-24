@@ -2313,7 +2313,11 @@ pub async fn restart(
                 // The stop or retire settles the resumable run while the
                 // gate holds the resume; then the gate answers.
                 let _ = incarnation
-                    .wait_terminal(&session, &killed.input, PARK - Duration::from_secs(1))
+                    .wait_terminal(
+                        &session,
+                        &killed.input,
+                        PARK.saturating_sub(Duration::from_secs(1)),
+                    )
                     .await;
                 gate.release();
                 match tokio::time::timeout(STEP, action).await {
@@ -2620,7 +2624,7 @@ pub async fn restart_workers(
     for (member, killed) in workers {
         let tag = worker_tag(member);
         restarted.push(DeployRestart {
-            member: *member,
+            member,
             report: report_for(&incarnation, tag, &killed.session, killed, fence_leases).await?,
             terminal: incarnation
                 .input_terminal(&killed.session, &killed.input)

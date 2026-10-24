@@ -1147,7 +1147,7 @@ async fn a_resumed_runs_stop_marks_do_not_expire_it_later(backend: Backend) {
     // first stop.
     let waited = stopped_at.elapsed();
     if waited < bound + Duration::from_secs(1) {
-        tokio::time::sleep(bound + Duration::from_secs(1) - waited).await;
+        tokio::time::sleep((bound + Duration::from_secs(1)).saturating_sub(waited)).await;
     }
     let restarted = restart_deploy(&row.store, second, &row.workers, backend == Backend::Host)
         .await
