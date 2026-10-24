@@ -1166,6 +1166,16 @@ impl meerkat_core::agent::AgentToolDispatcher for ScriptedTools {
         Arc::clone(&self.defs)
     }
 
+    /// The catalog is exact: it carries the detached tool's execution
+    /// contract, which a composing gateway reads only from an exact catalog
+    /// (it lists the tools of any other dispatcher with the default contract).
+    fn tool_catalog_capabilities(&self) -> meerkat_core::ToolCatalogCapabilities {
+        meerkat_core::ToolCatalogCapabilities {
+            exact_catalog: true,
+            may_require_catalog_control_plane: false,
+        }
+    }
+
     fn tool_catalog(&self) -> Arc<[meerkat_core::ToolCatalogEntry]> {
         Arc::clone(&self.catalog)
     }
