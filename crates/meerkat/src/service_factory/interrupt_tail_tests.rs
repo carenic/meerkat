@@ -3693,6 +3693,63 @@ async fn a_strict_read_after_the_lap_settles_the_tail_an_observation_deferred_he
     assert_the_strict_read_closed_a(&start, &id, read).await;
 }
 
+/// A committed-boundary resume preparation waits for the session's
+/// turn-finalization boundary only when its caller does not hold it. Run A's
+/// tail stands after an observation deferred its settle under the held
+/// boundary, and the live actor is discarded. While the boundary stays held,
+/// the plain preparation refuses busy once its bound passes and leaves A's
+/// tail, and the preparation of a caller that holds the boundary
+/// (`prepare_committed_boundary_resume_under_runtime_turn_boundary`) answers
+/// at once and settles A's tail under that boundary.
+#[tokio::test]
+async fn a_boundary_holders_resume_preparation_does_not_wait_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let (id, run_a, boundary) = a_tail_deferred_under_a_held_boundary(&start, &client).await;
+    start
+        .service
+        .discard_live_session(&id)
+        .await
+        .expect("discard the live actor under the held boundary");
+
+    let refused = tokio::time::timeout(
+        DEADLINE,
+        start.service.prepare_committed_boundary_resume(&id),
+    )
+    .await
+    .expect("the plain preparation answers within its bound");
+    assert!(
+        matches!(refused, Err(SessionError::Busy { .. })),
+        "the plain preparation refuses busy under the held boundary: {refused:?}"
+    );
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a),
+        "the refused preparation leaves A's tail"
+    );
+
+    let prepared = tokio::time::timeout(
+        Duration::from_millis(500),
+        start
+            .service
+            .prepare_committed_boundary_resume_under_runtime_turn_boundary(&id),
+    )
+    .await
+    .expect("the boundary holder's preparation does not wait for the boundary");
+    assert!(
+        prepared.is_ok(),
+        "the boundary holder's preparation succeeds: {prepared:?}"
+    );
+    assert_eq!(
+        start.tail_run(&id).await,
+        None,
+        "A's tail is settled under the caller's boundary"
+    );
+    drop(boundary);
+}
+
 /// Wait until `input_id` is bound to `run_id`: the steer joined the run.
 async fn wait_for_input_run(
     start: &Start,

@@ -1067,6 +1067,15 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
             .await
     }
 
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<meerkat_mob::SessionResumeVerdict, meerkat_core::service::SessionError> {
+        self.inner
+            .materialize_session_resume_verdict_under_runtime_turn_boundary(session_id)
+            .await
+    }
+
     async fn settle_durable_tail_before_cold_start(
         &self,
         session_id: &meerkat_core::SessionId,
