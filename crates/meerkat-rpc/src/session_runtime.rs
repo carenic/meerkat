@@ -1922,6 +1922,15 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    /// The persistent service's read-only presence check of a provisional
+    /// durable tail, which a resume spawn asks before anything could settle
+    /// one. Forwarded: this service reports persistent sessions, so the
+    /// trait default refuses.
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        meerkat_mob::MobSessionService::provisional_tail_stands(self.service.as_ref(), session_id)
+            .await
+    }
+
     async fn load_retained_session_metadata(
         &self,
         session_id: &SessionId,

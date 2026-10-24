@@ -13370,6 +13370,16 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    /// In-memory sessions hold no provisional durable tail. Answered here
+    /// because this service reports persistent sessions, which makes the
+    /// trait default refuse.
+    async fn provisional_tail_stands(
+        &self,
+        _session_id: &SessionId,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        Ok(false)
+    }
+
     async fn load_retained_session_metadata(
         &self,
         session_id: &SessionId,
@@ -17335,6 +17345,20 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         session_id: &SessionId,
     ) -> Result<Option<Session>, meerkat_core::service::SessionError> {
         <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::load_persisted_session_tolerating_tail(
+            &self.inner,
+            session_id,
+        )
+        .await
+    }
+
+    /// The wrapped persistent service's read-only presence check of a
+    /// provisional durable tail. Forwarded: this service reports persistent
+    /// sessions, so the trait default refuses.
+    async fn provisional_tail_stands(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::provisional_tail_stands(
             &self.inner,
             session_id,
         )

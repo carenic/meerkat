@@ -5708,6 +5708,14 @@ mod tests {
             self.reports_persistent_sessions.load(Ordering::Relaxed)
         }
 
+        /// This fake records no provisional durable tail.
+        async fn provisional_tail_stands(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<bool, SessionError> {
+            Ok(false)
+        }
+
         async fn load_persisted_session_metadata(
             &self,
             session_id: &SessionId,

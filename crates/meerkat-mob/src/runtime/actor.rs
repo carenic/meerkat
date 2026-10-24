@@ -33562,6 +33562,30 @@ impl MobActor {
                     return Err(MobError::SessionError(error));
                 }
 
+                // A durable tail the strict read does not name (a WholeBlob
+                // committed read never refuses) on a session no live actor
+                // hosts: the resume's verdict would complete it. The presence
+                // read writes nothing and never waits on a turn. A service
+                // that reports persistent sessions but does not forward it
+                // refuses here, visibly, instead of skipping the check. A
+                // session a live actor hosts keeps its path: the verdict
+                // answers Busy and nothing settles a WholeBlob tail on read.
+                if preparation_context
+                    .session_service
+                    .provisional_tail_stands(&resume_id)
+                    .await?
+                    && !preparation_context
+                        .session_service
+                        .live_session_actor_registered(&resume_id)
+                        .await?
+                {
+                    return Err(MobError::SessionError(
+                        meerkat_core::service::SessionError::DurableTailHeldForRecovery {
+                            id: resume_id,
+                        },
+                    ));
+                }
+
                 // A role migration is a cold, one-shot restamp of durable
                 // identity. Never let it reuse or race an exact live actor,
                 // even when that actor is idle and `SessionInfo::is_active`
