@@ -5053,6 +5053,53 @@ pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
 static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// One armed hold of a mob's next start, right before its startup readiness
+/// pass: the start signals the first sender on arrival and waits for the
+/// receiver to be released.
+#[cfg(test)]
+type StartupReadinessTestGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+/// Armed startup readiness holds, keyed by mob, so concurrently running
+/// tests each hold only their own mob's start.
+#[cfg(test)]
+static STARTUP_READINESS_TEST_GATE: std::sync::Mutex<
+    std::collections::BTreeMap<MobId, StartupReadinessTestGate>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Hold the next start of `mob_id` right before its startup readiness pass.
+/// The returned receiver fires when the start arrives there; sending on (or
+/// dropping) the returned sender releases it.
+#[cfg(test)]
+pub(super) fn arm_startup_readiness_test_gate(
+    mob_id: MobId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    STARTUP_READINESS_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id, (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn run_startup_readiness_test_gate(mob_id: &MobId) {
+    let armed = STARTUP_READINESS_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(mob_id);
+    if let Some((entered_tx, release_rx)) = armed {
+        let _ = entered_tx.send(());
+        let _ = release_rx.await;
+    }
+}
+
 /// Test-support seam: the next actor start of the mob `mob_id` fail-stops in
 /// its durable recovery, before it admits a command, as a real startup
 /// recovery failure does. The seam fires once, for that mob only.
@@ -30843,6 +30890,8 @@ impl MobActor {
                 .await;
         }
         if matches!(self.state(), MobState::Running) {
+            #[cfg(test)]
+            run_startup_readiness_test_gate(&self.definition.id).await;
             if let Err(error) = self
                 .ensure_autonomous_runtimes_from_roster(false, None)
                 .await
