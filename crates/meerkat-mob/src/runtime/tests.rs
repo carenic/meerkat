@@ -37682,6 +37682,85 @@ async fn a_running_start_keeps_the_refusal_when_the_members_stop_cleanup_fails()
     );
 }
 
+/// A missing-live revival does not belong to the caller that asked first.
+/// Its first requester leaves while the revival is in flight (the session's
+/// creation is parked), a second request arrives meanwhile, and a third one
+/// leaves too: the one revival still finishes, the request that stayed is
+/// answered once it did, and the session is materialized once.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_live_revival_finishes_for_a_waiter_when_its_first_requester_leaves() {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let worker = AgentIdentity::from("revived-once");
+    let session = handle
+        .spawn_with_options(
+            ProfileName::from("worker"),
+            worker.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        )
+        .await
+        .expect("spawn the member")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member");
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the idle live session");
+    machine
+        .unregister_session(&session)
+        .await
+        .expect("the runtime unregisters the idle executor");
+    let builds_before = member_build_count(&service, &worker).await;
+    let creation = service.park_session_creation(session.clone()).await;
+    let ask = |handle: MobHandle, worker: AgentIdentity| {
+        tokio::spawn(async move { handle.ensure_member_live(&worker).await })
+    };
+
+    let leader = ask(handle.clone(), worker.clone());
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while creation.boundary_calls.load(Ordering::Acquire) == 0 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the revival reaches the session's creation");
+    let waiter = ask(handle.clone(), worker.clone());
+    let leaving_waiter = ask(handle.clone(), worker.clone());
+    // Both requests reach the actor while the revival is still in flight.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    leader.abort();
+    leaving_waiter.abort();
+    let _ = leader.await;
+    let _ = leaving_waiter.await;
+    creation.release_all();
+
+    tokio::time::timeout(Duration::from_secs(10), waiter)
+        .await
+        .expect("the request that stayed is answered")
+        .expect("waiter task")
+        .expect("the member is live");
+    assert!(
+        service
+            .live_session_actor_registered(&session)
+            .await
+            .expect("live lookup"),
+        "the revival finished although its first requester left"
+    );
+    assert_eq!(
+        member_build_count(&service, &worker).await,
+        builds_before + 1,
+        "the session is materialized once"
+    );
+}
+
 /// A member runtime retired outside the mob in the same window is not
 /// stopped residue: a retired runtime is not served again, so the start
 /// neither takes its registration over nor revives the member.
