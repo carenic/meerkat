@@ -35,9 +35,10 @@ use std::time::{Duration, Instant};
 use long_run_support::{
     ChildRace, DeployConfig, DeployRestart, FollowUp, HarnessGate, HostRace, Incarnation,
     KillSwitch, KilledState, OpenOptions, ROOT_ENV, RaceHook, Restarted, SHUTDOWN_BUDGET, STEP,
-    Store, WORKER, await_supervisor_route_release, discard_provisional_tail, fail_model_call,
-    fresh_root, other_writer, read_killed, read_killed_member, read_plan, restart, restart_deploy,
-    restart_workers, run_resumed_until_killed, run_until_killed, wait_converged, write_plan,
+    Store, WHOLE_BLOB, WORKER, await_supervisor_route_release, discard_provisional_tail,
+    fail_model_call, fresh_root, other_writer, read_killed, read_killed_member, read_plan, restart,
+    restart_deploy, restart_workers, run_resumed_until_killed, run_until_killed, wait_converged,
+    write_plan,
 };
 use meerkat_core::types::SessionId;
 use meerkat_store_conformance::{
@@ -477,26 +478,32 @@ async fn a_killed_identity_first_worker_reclaims_its_lease_and_resumes_at_once()
     incarnation.shut_down().await;
 }
 
+/// The discarded-tail rows' plan: the process is killed during the tools of
+/// a round after two committed rounds.
+const DISCARDED_TAIL_PLAN: LongRunPlan = LongRunPlan {
+    rounds: 4,
+    calls_per_round: 1,
+    kill_round: 2,
+    kill_point: KillPoint::DuringTools,
+    compactions: RoundSet::EMPTY,
+    image_rounds: RoundSet::EMPTY,
+    before_resume: BeforeResume::Nothing,
+};
+
 /// A run's inputs, once its provisional tail is discarded, run again
 /// exactly once: the state a crash leaves after a failed resumed run's tail
 /// is discarded and before the runtime requeues its inputs. The process is
 /// killed after the run committed rounds, the tail is discarded with no
 /// runtime running, and the restart finds nothing to resume: the input runs
 /// as a new run, its prompt is in the transcript once, it has one receipt,
-/// and no provisional tail of the killed run remains.
+/// and no provisional tail of the killed run remains. Only a whole-blob
+/// store discards a tail; on a head-canonical one the row below holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_discarded_tail_replays_its_input_exactly_once() {
     let harness = Harness::new(Backend::Sqlite);
-    let plan = LongRunPlan {
-        rounds: 4,
-        calls_per_round: 1,
-        kill_round: 2,
-        kill_point: KillPoint::DuringTools,
-        compactions: RoundSet::EMPTY,
-        image_rounds: RoundSet::EMPTY,
-        before_resume: BeforeResume::Nothing,
-    };
+    let plan = DISCARDED_TAIL_PLAN;
     let root = fresh_root(harness.base.path(), &harness.rows);
+    std::fs::write(root.join(WHOLE_BLOB), "whole-blob").expect("ask for a whole-blob realm");
     let store = Store::Sqlite { root: root.clone() };
     if let Err(failure) = Harness::kill_child(&store, &plan).await {
         panic!("{failure}");
@@ -538,6 +545,56 @@ async fn a_discarded_tail_replays_its_input_exactly_once() {
         restarted.provisional_tail_run.as_ref(),
         Some(&killed.run.run_id),
         "no provisional tail of the killed run remains"
+    );
+}
+
+/// The head-canonical side of the row above: each round commit applies the
+/// run's tail to the physical head, so the store refuses to discard it, and
+/// the restart's durable-tail recovery takes the killed run over from its
+/// last committed round instead: the input runs exactly once, its prompt is
+/// in the transcript once, it has one receipt, and no tail remains.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_applied_tail_is_not_discarded_and_its_input_runs_once() {
+    let harness = Harness::new(Backend::Sqlite);
+    let plan = DISCARDED_TAIL_PLAN;
+    let root = fresh_root(harness.base.path(), &harness.rows);
+    let store = Store::Sqlite { root: root.clone() };
+    if let Err(failure) = Harness::kill_child(&store, &plan).await {
+        panic!("{failure}");
+    }
+    let killed = read_killed(&root).expect("what the killed child left");
+    let refusal = discard_provisional_tail(&store, &killed.session)
+        .await
+        .expect_err("the store refuses to discard the applied tail");
+    assert!(
+        refusal.contains("already-applied"),
+        "the refusal names the applied tail: {refusal}"
+    );
+    let restarted = restart(
+        &store,
+        plan,
+        Some(HarnessGate::new(ResumeGate::Continue, true)),
+        &killed,
+        false,
+    )
+    .await
+    .expect("the restart runs the input");
+    let report = &restarted.report;
+    assert_eq!(
+        report.resumed.as_ref().map(|resumed| &resumed.run_id),
+        Some(&killed.run.run_id),
+        "the killed run resumes over its kept tail"
+    );
+    assert_eq!(report.runs.len(), 1, "{:?}", report.runs);
+    assert_eq!(
+        restarted.main_prompts, 1,
+        "the prompt is in the transcript once"
+    );
+    assert_eq!(report.receipts, 1, "the input has one receipt");
+    assert!(report.inputs_settled);
+    assert_eq!(
+        restarted.provisional_tail_run, None,
+        "no provisional tail remains"
     );
 }
 
