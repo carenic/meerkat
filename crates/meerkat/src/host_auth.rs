@@ -1999,8 +1999,14 @@ mod tests {
     /// reads a status after an unsettled commit.
     #[tokio::test]
     async fn the_facade_settles_the_credential_work_this_process_started() {
+        // The settle waits on one process-global counter of in-flight
+        // credential work, by design: a host settles all of it at shutdown.
+        // This row starts none, but a shared-process harness (libtest, Bazel)
+        // runs other tests' credential work in the same process, so the
+        // bound absorbs that work. The settle returns as soon as the counter
+        // reaches zero; work that never finishes still fails at the bound.
         assert_eq!(
-            crate::settle_in_flight_credential_mutations(std::time::Duration::ZERO).await,
+            crate::settle_in_flight_credential_mutations(std::time::Duration::from_secs(30)).await,
             crate::CredentialSettlement::Settled
         );
     }
