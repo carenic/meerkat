@@ -1059,7 +1059,7 @@ impl MobRuntimeMetadataStore for SpiMobRuntimeMetadataStore {
 // ---------------------------------------------------------------------------
 
 /// [`MobIdentityStore`] over the storage's identity scope, and the built-in
-/// identity member transaction ([`MobIdentityMemberStore`]) over the mob and
+/// identity member transaction (`MobIdentityMemberStore`) over the mob and
 /// identity scopes in one batch.
 #[derive(Debug, Clone)]
 pub struct SpiMobIdentityStore {

@@ -1242,7 +1242,7 @@ impl ScheduleTargetDelivery for SharedScheduleTargetAdapter {
     /// dispatch. Nothing is materialized or created first: an on-demand
     /// session target the occurrence holds unbound is looked for only where an
     /// earlier attempt could have admitted it
-    /// ([`Self::deliver_existing_unbound_session`]). A session target's
+    /// (`Self::deliver_existing_unbound_session`). A session target's
     /// runtime admission may only deduplicate against the earlier input (the
     /// runtime's deduplicate-only admission, decided where it decides
     /// deduplication); mob targets and mob-owned identities go to the mob

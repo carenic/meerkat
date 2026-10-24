@@ -69,7 +69,7 @@ use crate::store::{
 
 /// One runtime: a session scope. Its head pins the catalog entry, the
 /// machine lifecycle, the delivery authority and the boot facts; its rows
-/// carry the rest (see [`journal_image`]).
+/// carry the rest (see `journal_image`).
 pub const RUNTIME_FAMILY: ScopeFamily = ScopeFamily {
     tag: "rt",
     kind: ScopeKind::Session,
