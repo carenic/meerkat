@@ -4852,6 +4852,40 @@ fn interrupted_round(
     round
 }
 
+/// [`interrupted_round`] whose run cursor is stale: it still stages the
+/// round's assistant message at `ToolsPending`, though the round's second
+/// commit already wrote that message and its result into the transcript. The
+/// classifier finds the staged message in the tail, so the cursor disagrees
+/// and the tail is ambiguous.
+fn stale_tools_pending_round(
+    committed: &meerkat_core::Session,
+    run_id: &RunId,
+    cursor_inputs: Vec<InputId>,
+) -> meerkat_core::Session {
+    use meerkat_core::types::Message;
+    let mut round = interrupted_round(committed, run_id, cursor_inputs.clone());
+    let staged = round
+        .messages()
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            Message::BlockAssistant(assistant) => Some(assistant.clone()),
+            _ => None,
+        })
+        .expect("the round's assistant message");
+    round
+        .set_run_cursor(&meerkat_core::SessionRunCursor::new(
+            run_id.clone(),
+            cursor_inputs,
+            0,
+            meerkat_core::RunResumePoint::ToolsPending {
+                assistant_message: staged,
+            },
+        ))
+        .unwrap();
+    round
+}
+
 /// The store a restart reads, on either durable profile.
 enum TailStore {
     WholeBlob(InMemoryRuntimeStore),
@@ -4892,6 +4926,19 @@ impl TailStore {
         cursor_inputs: Vec<InputId>,
         rows: Vec<StoredInputState>,
     ) -> SessionId {
+        self.cursor_tail(interrupted_round, run_id, cursor_inputs, rows)
+            .await
+    }
+
+    /// [`Self::interrupted_cursor_tail`] with the run's last round built by
+    /// `round` over the committed base.
+    async fn cursor_tail(
+        &self,
+        round: fn(&meerkat_core::Session, &RunId, Vec<InputId>) -> meerkat_core::Session,
+        run_id: &RunId,
+        cursor_inputs: Vec<InputId>,
+        rows: Vec<StoredInputState>,
+    ) -> SessionId {
         use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
         use meerkat_core::types::{Message, UserMessage};
 
@@ -4914,7 +4961,7 @@ impl TailStore {
                     .and_then(|authority| authority.whole_blob())
                     .cloned()
                     .expect("the committed base has a WholeBlob authority");
-                let round = interrupted_round(&committed, run_id, cursor_inputs);
+                let round = round(&committed, run_id, cursor_inputs);
                 store
                     .write_prepared_whole_blob_provisional_tail(
                         &runtime_id,
@@ -4955,7 +5002,7 @@ impl TailStore {
                     .await
                     .unwrap()
                     .expect("the committed base materializes");
-                let round = interrupted_round(&committed, run_id, cursor_inputs);
+                let round = round(&committed, run_id, cursor_inputs);
                 let observed_head = sessions
                     .load_head(&session_id)
                     .await
@@ -4991,6 +5038,110 @@ impl TailStore {
         }
         session_id
     }
+}
+
+/// An operator's repair of a tail whose run cursor disagrees with it
+/// consumes, with the tail, an input that names the tail's run though the
+/// cursor does not bind it.
+///
+/// Run A's last round wrote its assistant message and its result into the
+/// transcript, but the tail's cursor still stages that message: the cursor is
+/// stale, so the classifier judges it to disagree, and the tail is held as
+/// ambiguous. A stale cursor does not show which inputs the tail holds: an
+/// input beside it that names run A (a join appended after the cursor was
+/// written) may have its content in the tail. So the attribution keeps the
+/// run association there, and the operator's repair consumes that input with
+/// the tail, once, instead of leaving it to run again. RED before the cursor
+/// gate: the stale cursor's bound set attributed only the run's own input,
+/// and the repair left the other one queued for redelivery.
+async fn an_operator_repair_beside_a_disagreeing_cursor_consumes_the_runs_inputs(tails: TailStore) {
+    use meerkat_core::types::HandlingMode;
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryOutcome, HeldTailRepairVerdict, HeldTailResolution,
+        recover_durable_tail, resolve_held_durable_tail,
+    };
+
+    let run_id = RunId::new();
+    let own = make_prompt("run A's own input");
+    let joined = make_prompt("a join the stale cursor does not list");
+    let session_id = tails
+        .cursor_tail(
+            stale_tools_pending_round,
+            &run_id,
+            vec![own.id().clone()],
+            vec![
+                applied_pending_state(&own, &run_id, 1),
+                queued_state(&joined, Some(&run_id), HandlingMode::Steer),
+            ],
+        )
+        .await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+
+    assert!(
+        matches!(
+            recover_durable_tail(tails.store(), &session_id)
+                .await
+                .unwrap(),
+            DurableTailRecoveryOutcome::Held
+        ),
+        "a tail whose cursor disagrees with it is held"
+    );
+    let HeldTailResolution::Ambiguous(plan) =
+        resolve_held_durable_tail(tails.store(), &session_id, false)
+            .await
+            .expect("the dry run reads the held tail")
+    else {
+        panic!("a tail whose cursor disagrees with it is held as ambiguous");
+    };
+    assert_eq!(plan.verdict, HeldTailRepairVerdict::WouldRepair);
+    assert_eq!(
+        sorted_id_strings(plan.terminalized_inputs.clone()),
+        sorted_id_strings([own.id().clone(), joined.id().clone()]),
+        "the repair consumes both inputs that name the run"
+    );
+    let HeldTailResolution::Ambiguous(applied) =
+        resolve_held_durable_tail(tails.store(), &session_id, true)
+            .await
+            .expect("the repair applies")
+    else {
+        panic!("the held tail is still ambiguous when applied");
+    };
+    assert!(
+        matches!(applied.verdict, HeldTailRepairVerdict::Repaired { .. }),
+        "{:?}",
+        applied.verdict
+    );
+    for input in [&own, &joined] {
+        let stored = tails
+            .store()
+            .load_input_state(&runtime_id, input.id())
+            .await
+            .unwrap()
+            .expect("the row stays inspectable");
+        assert_eq!(
+            stored.seed.terminal_outcome,
+            Some(InputTerminalOutcome::Consumed),
+            "{}: consumed with the tail, never redelivered",
+            input.id()
+        );
+    }
+}
+
+#[tokio::test]
+async fn whole_blob_operator_repair_beside_a_disagreeing_cursor_consumes_the_runs_inputs() {
+    an_operator_repair_beside_a_disagreeing_cursor_consumes_the_runs_inputs(TailStore::WholeBlob(
+        InMemoryRuntimeStore::new(),
+    ))
+    .await;
+}
+
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn head_canonical_operator_repair_beside_a_disagreeing_cursor_consumes_the_runs_inputs() {
+    an_operator_repair_beside_a_disagreeing_cursor_consumes_the_runs_inputs(
+        TailStore::head_canonical(),
+    )
+    .await;
 }
 
 /// One content row beside a cancelled run's interrupted tail, and what a

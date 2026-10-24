@@ -472,7 +472,9 @@ struct literal, and treat an advisory you do not know as informational.
   the default; applied, it commits the tail as interrupted with every row
   kept and each call without a result answered `outcome_uncertain`, once
   every host of the session is stopped. 0.9.4 had no path out of such a
-  hold. See
+  hold. The same command resolves an interrupted tail held beside inputs
+  another run left staged or queued (a shape only pre-release builds of
+  0.9.5, or a store fault, leave): it requeues those inputs. See
   [Storage Operations](/guides/storage-operations#resolve-a-durable-tail-held-for-recovery).
 - **Host stores:** a host can keep a realm's durable state in its own
   database through the host store SPI (`meerkat_core::host_store`), checked
