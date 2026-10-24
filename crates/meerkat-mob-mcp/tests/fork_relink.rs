@@ -781,6 +781,102 @@ async fn relink_past_max_run_delivers_a_child_that_finished_within_its_limit() {
     fixture.teardown().await;
 }
 
+/// A child whose job is past its limit at the restart, and whose durable
+/// reply cannot be read there, is not settled on an absence nobody observed:
+/// the re-link delivers `restart_interrupted` and keeps the child seated,
+/// instead of reporting `max_run_elapsed` and retiring a child that may have
+/// replied. The record carries no turn delivery identity (an older host, or
+/// one without a runtime, wrote it), so the reply is read from the child's
+/// transcript, the read that fails here. RED before: the failed read was
+/// taken for "no reply", so the limit settled the job and retired the child.
+#[tokio::test]
+async fn relink_past_max_run_with_an_unreadable_reply_keeps_the_child_seated() {
+    let store = Arc::new(support::commit_gate::CommitGateRuntimeStore::new());
+    let fixture = CouncilFixture::new_with_runtime_store(
+        |_| ScriptedTurn::Text(CHILD_REPLY.to_string()),
+        store.clone(),
+    );
+    fixture.seed_source_mob(&["forker"]).await;
+    let owner = forker_session(&fixture).await;
+    let handle = fixture
+        .state
+        .handle_for(&fixture.source_mob_id())
+        .await
+        .unwrap();
+    let job_id = "job-unreadable-reply".to_string();
+    let child = AgentIdentity::from("relink-unreadable-child");
+
+    let (_fork, run) = handle
+        .fork_member_then_run_detached(
+            &AgentIdentity::from("forker"),
+            child_spec(child.as_str()),
+            None,
+            "fork_off_result",
+            16 * 1024,
+            meerkat_core::DurableForkSourceAdmission::Quiescent,
+            None,
+            Some(ForkJobBinding {
+                job_id: job_id.clone(),
+                owner_session_id: owner.clone(),
+                retained_work: None,
+            }),
+        )
+        .await
+        .expect("fork");
+    assert!(matches!(
+        run.outcome().await,
+        Some(ForkChildRunOutcome::Completed(_))
+    ));
+    let mut job = handle
+        .roster()
+        .await
+        .get_by_identity(&child)
+        .and_then(|entry| entry.fork_job.clone())
+        .expect("durable fork job record");
+    assert!(job.turn_delivery.is_some());
+    // The record as an older host wrote it: settled from the transcript.
+    job.turn_delivery = None;
+    job.max_run_ms = Some(now_ms().saturating_sub(job.started_at_ms).max(1));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(now_ms() > job.started_at_ms + job.max_run_ms.unwrap());
+
+    // The child's session cannot be read at the restart.
+    let child_session = handle
+        .resolve_bridge_session_id(&child)
+        .await
+        .expect("child session");
+    store.fail_session_reads(meerkat_runtime::LogicalRuntimeId::for_session(
+        &child_session,
+    ));
+    let outcome = meerkat_mob_mcp::fork_relink::relink_child(
+        fixture.state.session_service(),
+        &relink_delivery(&fixture),
+        &fixture.source_mob_id(),
+        &handle,
+        &child,
+        &job,
+    )
+    .await;
+    store.restore_session_reads();
+    assert_eq!(outcome.action, ForkRelinkAction::Delivered);
+    assert_eq!(
+        outcome.child_retirement,
+        ChildRetirement::NotRequired,
+        "an unreadable reply retires no child"
+    );
+    await_completion_record(&fixture, &owner, &job_id).await;
+    let record = completion_record_text(&fixture, &owner, &job_id).await;
+    assert!(
+        record.contains("restart_interrupted") && !record.contains("max_run_elapsed"),
+        "an unreadable reply is inconclusive, never the limit's verdict: {record}"
+    );
+    assert!(
+        handle.get_member(&child).await.unwrap().is_some(),
+        "the child stays seated for its forker"
+    );
+    fixture.teardown().await;
+}
+
 /// A child genuinely still running when the restart lands past its max_run
 /// has no reply to deliver: the limit applies at once, the child (and its
 /// descendants) is retired and max_run_elapsed is delivered.
