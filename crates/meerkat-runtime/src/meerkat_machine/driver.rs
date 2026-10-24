@@ -1766,8 +1766,6 @@ impl DriverEntry {
         Ok(directed)
     }
 
-    /// Complete a preparation whose durable commit landed, and hand back
-    /// every batch it staged for publication.
     /// Prepare the runless termination of one input: its one
     /// terminal-completion batch and, when the input is directed, that
     /// batch's interaction terminal outbox. A split into any other number of
@@ -1808,6 +1806,8 @@ impl DriverEntry {
         self.rollback_prepared_runless_interaction_terminal_outboxes(prepared.prepared);
     }
 
+    /// Complete a preparation whose durable commit landed, and hand back
+    /// every batch it staged for publication.
     pub(crate) fn commit_prepared_runless_interaction_terminal_outboxes(
         prepared: PreparedRunlessInteractionTerminalOutboxes,
     ) -> Vec<RunlessTerminalBatch> {

@@ -2107,10 +2107,13 @@ pub struct MachineSessionArchiveLease {
 pub trait MachineSessionArchivePostCommitHook: Send + Sync {
     /// Run only after the runtime lifecycle is durably Retired and before the
     /// exact recovered archive registration is removed. The hook must be
-    /// idempotent: failure or cancellation retains that registration, and an
+    /// idempotent and bounded: failure retains that registration, and an
     /// `AlreadyArchived` retry invokes the same obligation again. Higher
     /// layers may persist a typed receipt in their hook state and return `Ok`
-    /// only once that receipt makes a repeated invocation convergent.
+    /// only once that receipt makes a repeated invocation convergent. No
+    /// caller can cancel it: the retire runs in its own task while it holds
+    /// the session's mutation gate, so a hook that never returns holds that
+    /// gate until it does.
     async fn after_runtime_retire_commit(&self) -> Result<(), RuntimeControlPlaneError>;
 }
 
