@@ -43394,6 +43394,97 @@ impl meerkat_core::tool_process::InterruptedToolEvidence for OneOwedNoticeEviden
     }
 }
 
+/// Interrupted-run evidence that records every run it is told resumes.
+#[derive(Default)]
+struct ResumeRecordingEvidence {
+    resumed: StdMutex<Vec<RunId>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::tool_process::InterruptedToolEvidence for ResumeRecordingEvidence {
+    async fn interrupted_calls(
+        &self,
+    ) -> Result<
+        Vec<meerkat_core::tool_process::InterruptedToolCall>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        Ok(Vec::new())
+    }
+
+    async fn mark_inputs_settled(
+        &self,
+        _entry_ids: &[uuid::Uuid],
+        _inputs: &meerkat_core::tool_process::InterruptedRunInputs,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn acknowledge(
+        &self,
+        _entry_ids: &[uuid::Uuid],
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn run_ended(
+        &self,
+        _run_id: &RunId,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn run_resumes(
+        &self,
+        run_id: &RunId,
+    ) -> Result<
+        Vec<meerkat_core::tool_process::InterruptedToolCall>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        self.resumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(run_id.clone());
+        Ok(Vec::new())
+    }
+}
+
+/// The resumed round's read of its run's custody evidence settles only the
+/// run the registration resumes, the session's current run: a run id that is
+/// not current here fails the read and tells the evidence nothing, so no
+/// record of a run that does not resume here is ever taken as evidence.
+#[tokio::test]
+async fn a_resumed_runs_evidence_read_settles_nothing_for_a_run_that_is_not_current() {
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    let bindings = machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("prepare the session's bindings");
+    let evidence = Arc::new(ResumeRecordingEvidence::default());
+    bindings.interrupted_tool_evidence().install(
+        Arc::clone(&evidence) as Arc<dyn meerkat_core::tool_process::InterruptedToolEvidence>
+    );
+    assert_eq!(machine.current_run(&session_id).await, None);
+
+    let error = machine
+        .resumed_run_interrupted_tool_calls(&session_id, &RunId::new())
+        .await
+        .expect_err("a run that is not current does not resume here");
+
+    assert!(
+        error.to_string().contains("is not the current run"),
+        "{error}"
+    );
+    assert!(
+        evidence
+            .resumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the evidence was told no run resumes"
+    );
+}
+
 /// Hands one owed notice's evidence to the session's first settlement only,
 /// so a later attachment of the same session owes nothing.
 struct OnceOwedNoticeSource {

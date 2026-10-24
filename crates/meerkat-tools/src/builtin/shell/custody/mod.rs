@@ -28,6 +28,18 @@
 //!    exit notification (pidfd on Linux, kqueue `EVFILT_PROC` on macOS).
 //!    [`ProcessCustody`] handles can only be obtained through that recovery,
 //!    so holding one is the proof that the scope's earlier tools have ceased.
+//! 6. **Resume** - a run can also resume in the process that ran it: a stop
+//!    or a teardown ends the session's registration while the run stays open,
+//!    and a later registration in the same process continues it. Recovery
+//!    leaves this incarnation's records alone, so the resumption settles the
+//!    run's own records itself
+//!    ([`InterruptedToolEvidence::run_resumes`]), exactly as recovery settles
+//!    an earlier incarnation's: an `Exited` marker or a group whose owner let
+//!    go becomes interrupted-run evidence (a group still running is killed
+//!    first), so the resumed round never runs a started call again. A call
+//!    whose process an owner in this process still runs means the run still
+//!    executes here, and the resumption is refused with nothing settled; a
+//!    background job the run started stays with its live owner.
 //!
 //! **Multi-process model.** Several host processes may share a custody root
 //! (a realm served by more than one process, or a sweep in one process while
@@ -329,7 +341,9 @@ enum ExitWaitOutcome {
 }
 
 /// One lifetime of this host process. Custody records written by the current
-/// incarnation are live-owned by in-process guards and are never recovered.
+/// incarnation are live-owned by in-process guards and are never recovered;
+/// only a run that resumes in this process settles its own records
+/// ([`InterruptedToolEvidence::run_resumes`]).
 #[derive(Debug)]
 struct CustodyIncarnation {
     id: Uuid,
@@ -399,6 +413,37 @@ fn release_live_group(pgid: i32, leader_start: Option<ProcessStartStamp>) {
     let mut groups = live_groups();
     if groups.get(&pgid) == Some(&leader_start) {
         groups.remove(&pgid);
+    }
+}
+
+/// Custody entries of this incarnation whose owner still holds them: from
+/// just before the record is reserved until its owner settles it, hands it
+/// to an exit watcher, or drops it. A held entry belongs to a call this
+/// process is still running (or still settling), or to a background job its
+/// owner still runs, so a resumption of its run never settles it
+/// ([`InterruptedToolEvidence::run_resumes`]).
+static HELD_ENTRIES: Mutex<BTreeSet<Uuid>> = Mutex::new(BTreeSet::new());
+
+fn held_entries() -> std::sync::MutexGuard<'static, BTreeSet<Uuid>> {
+    HELD_ENTRIES.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// An owner's hold of one custody entry, registered in `HELD_ENTRIES` for
+/// as long as it lives, however its owner ends (settled, retained, dropped,
+/// or cancelled while its record is still being written).
+#[derive(Debug)]
+struct HeldEntry(Uuid);
+
+impl HeldEntry {
+    fn hold(entry_id: Uuid) -> Self {
+        held_entries().insert(entry_id);
+        Self(entry_id)
+    }
+}
+
+impl Drop for HeldEntry {
+    fn drop(&mut self) {
+        held_entries().remove(&self.0);
     }
 }
 
@@ -627,7 +672,9 @@ fn run_spawn_finished(dir: &Path, run_id: &meerkat_core::RunId) -> bool {
 /// ran, when `ran` is false). Remove the record, or keep an `Exited` marker
 /// for a process that ran inside a run that has not ended yet. Holds the
 /// in-process scope lock so it serializes with
-/// [`InterruptedToolEvidence::run_ended`].
+/// [`InterruptedToolEvidence::run_ended`] and
+/// [`InterruptedToolEvidence::run_resumes`]: a record a resumption of its run
+/// already settled stays as that resumption left it.
 fn finish_record_blocking(
     dir: &Path,
     path: &Path,
@@ -640,6 +687,9 @@ fn finish_record_blocking(
         return remove_record(path);
     };
     let ended = run_spawn_finished(dir, run_id);
+    if settled_by_resumption(path)? {
+        return Ok(());
+    }
     if ended || !ran {
         return remove_record(path);
     }
@@ -648,6 +698,21 @@ fn finish_record_blocking(
     let bytes = serde_json::to_vec(&marker).map_err(std::io::Error::other)?;
     let temp = temp_path(dir, marker.entry_id, marker.incarnation);
     write_record_blocking(dir, path, &temp, &bytes)
+}
+
+/// Whether a resumption of the record's run already settled this record of
+/// a run that resumes in this process: it is the run's interrupted-run
+/// evidence now, or gone (acknowledged, or removed as never started). Only a
+/// resumption rewrites or removes a record of this incarnation that its
+/// owner has not finished.
+fn settled_by_resumption(path: &Path) -> std::io::Result<bool> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error),
+    };
+    Ok(serde_json::from_slice::<CustodyRecord>(&bytes)
+        .is_ok_and(|record| matches!(record.phase, CustodyPhase::Interrupted { .. })))
 }
 
 /// Incarnation locks this process holds, per custody root, for its lifetime.
@@ -963,9 +1028,10 @@ enum CustodyPhase {
         session_leader: i32,
     },
     /// Settled by a later incarnation's recovery while its run may still have
-    /// been in flight. Kept as durable interrupted-run evidence until the
-    /// runtime settles the run's inputs and tells the model; no process is
-    /// associated with it any more.
+    /// been in flight, or by this incarnation when the run resumes in this
+    /// process after its execution here ended. Kept as durable interrupted-run
+    /// evidence until the runtime settles the run's inputs and tells the
+    /// model; no process is associated with it any more.
     Interrupted {
         cessation: ToolProcessCessation,
         settlement: InterruptedToolSettlement,
@@ -1164,6 +1230,9 @@ impl ProcessCustody {
             phase: CustodyPhase::Reserved,
         };
         let path = record_path(&self.dir, record.entry_id);
+        // Held before the record can exist, so a resumption of its run never
+        // takes this live reservation for one its owner let go.
+        let held = HeldEntry::hold(record.entry_id);
         write_record(&self.dir, &path, &record).await?;
         if let Some(run_id) = record.run_id.as_ref() {
             run_spawn_started(&self.dir, run_id);
@@ -1172,6 +1241,7 @@ impl ProcessCustody {
             path: Some(path),
             dir: self.dir.clone(),
             record,
+            _held: held,
         })
     }
 }
@@ -1324,12 +1394,16 @@ fn temp_incarnation(path: &Path) -> Option<Uuid> {
 /// Dropping a reservation that never reached [`Self::record_spawned`] removes
 /// its record: the spawn gate it guarded was never released, so no command
 /// ran. Once spawned, only [`Self::settle`] (after containment is proven)
-/// removes the record; otherwise the next incarnation recovers it.
+/// removes the record; otherwise the next incarnation recovers it. While the
+/// reservation lives, its entry is held (`HELD_ENTRIES`).
 #[derive(Debug)]
 pub(super) struct CustodyReservation {
     path: Option<PathBuf>,
     dir: PathBuf,
     record: CustodyRecord,
+    /// Released after this reservation's own `Drop` has run: by then the
+    /// record is settled, or handed to an exit watcher.
+    _held: HeldEntry,
 }
 
 impl CustodyReservation {
@@ -2008,6 +2082,150 @@ fn interrupted_call(record: &CustodyRecord) -> Option<InterruptedToolCall> {
     })
 }
 
+/// Settle the records this incarnation wrote for `run_id`, which resumes in
+/// this process, and return the run's interrupted calls (see
+/// [`InterruptedToolEvidence::run_resumes`]).
+///
+/// The run's earlier execution here ended without the run ending, so each
+/// of its records is settled as [`recover_scope_blocking`] settles an
+/// earlier incarnation's record whose host is gone: a reservation whose owner
+/// let go of it never released its gate and is removed; an `Exited` marker
+/// is a process that ran; a spawned group whose owner let go of it is
+/// stopped (killed and awaited if it still runs). Every one that may have
+/// run becomes `Interrupted` evidence of the run, written before the call
+/// returns. A call's process an owner in this process still holds means the
+/// run still executes here: the call fails before anything is settled. A
+/// background job or monitor its owner still holds runs past its call by
+/// design and stays with that owner. Records of other runs and other
+/// incarnations, and evidence already settled, stay as they are, so a second
+/// call settles nothing more and returns the same evidence.
+fn settle_resumed_run_blocking(
+    dir: &Path,
+    incarnation: &CustodyIncarnation,
+    run_id: &meerkat_core::RunId,
+    deadline: Instant,
+) -> Result<Vec<InterruptedToolCall>, ProcessCustodyError> {
+    let lock = scope_lock(dir);
+    let _serialized = lock.lock().unwrap_or_else(PoisonError::into_inner);
+    let Some(_dir_lock) = lock_scope_dir(dir)
+        .map_err(|error| ProcessCustodyError::io("lock custody scope", error))?
+    else {
+        return Ok(Vec::new());
+    };
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(ProcessCustodyError::io("list custody records", error)),
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        let path = entry
+            .map_err(|error| ProcessCustodyError::io("list custody records", error))?
+            .path();
+        if path.extension().and_then(|extension| extension.to_str()) == Some(RECORD_EXTENSION) {
+            paths.push(path);
+        }
+    }
+    paths.sort();
+    // The run's own records left to settle. Every one is checked before any
+    // is touched, so a held record refuses the whole resumption.
+    let mut own = Vec::new();
+    for path in paths {
+        let ListedRecord::Current(record) = read_listed_record(&path)? else {
+            continue;
+        };
+        if record.incarnation != incarnation.id
+            || record.run_id.as_ref() != Some(run_id)
+            || matches!(record.phase, CustodyPhase::Interrupted { .. })
+        {
+            continue;
+        }
+        if held_entries().contains(&record.entry_id) {
+            match record.spawner {
+                // A background job or monitor runs under its job's owner
+                // past the call that started it, by design: it is not the
+                // run's execution, and its live owner keeps it. Its starting
+                // call stays out of the evidence: the resumed round dispatches
+                // it again, and the job's submission key dedupes that dispatch
+                // to this job.
+                ToolProcessSpawner::BackgroundJob { .. } | ToolProcessSpawner::Monitor { .. } => {
+                    continue;
+                }
+                // A call's own process (a shell call, a hook) is held only
+                // while the call runs: the run still executes here.
+                _ => {
+                    return Err(ProcessCustodyError::ResumedRunStillOwned {
+                        entry_id: record.entry_id,
+                        run_id: run_id.clone(),
+                    });
+                }
+            }
+        }
+        own.push((path, record));
+    }
+    for (path, record) in own {
+        let cessation = match &record.phase {
+            // Only its owner could have released the gate, and it let go.
+            CustodyPhase::Reserved => ToolProcessCessation::NeverStarted,
+            CustodyPhase::Exited => ToolProcessCessation::ExitedBeforeCommit,
+            CustodyPhase::Spawned {
+                leader,
+                session_leader,
+            } => settle_released_own_group(record.entry_id, leader, *session_leader, deadline)?,
+            CustodyPhase::Interrupted { .. } => continue,
+        };
+        if !cessation.may_have_run() {
+            remove_record(&path).map_err(|error| {
+                ProcessCustodyError::io("remove never-started custody record", error)
+            })?;
+            continue;
+        }
+        let mut evidence = record;
+        evidence.phase = CustodyPhase::Interrupted {
+            cessation,
+            settlement: InterruptedToolSettlement::Pending,
+        };
+        let bytes = serde_json::to_vec(&evidence).map_err(|error| {
+            ProcessCustodyError::io(
+                "encode interrupted-run evidence",
+                std::io::Error::other(error),
+            )
+        })?;
+        let temp = temp_path(dir, evidence.entry_id, incarnation.id);
+        write_record_blocking(dir, &path, &temp, &bytes)
+            .map_err(|error| ProcessCustodyError::io("record interrupted-run evidence", error))?;
+    }
+    Ok(interrupted_records(dir)?
+        .iter()
+        .filter_map(|(_, record)| interrupted_call(record))
+        .filter(|call| &call.run_id == run_id)
+        .collect())
+}
+
+/// Stop the group of a record this incarnation spawned and its owner let go
+/// of, as [`settle_phase`] stops an earlier incarnation's group. The group
+/// stays registered as live until its exit watcher sees it gone, so that
+/// registration (this very group's) is not read as a reassigned id here.
+fn settle_released_own_group(
+    entry_id: Uuid,
+    leader: &ProcessIdentity,
+    session_leader: i32,
+    deadline: Instant,
+) -> Result<ToolProcessCessation, ProcessCustodyError> {
+    let members = match owned_members(leader, session_leader)
+        .map_err(|error| ProcessCustodyError::io("inspect tool process group", error))?
+    {
+        GroupOwnership::Reassigned => return Ok(ToolProcessCessation::GroupReassigned),
+        GroupOwnership::Owned(members) => members,
+    };
+    // Members that already exited (unreaped zombies of this process
+    // included) ran and ended: nothing is left to stop.
+    if members.is_empty() || all_exited(&members)? {
+        return Ok(ToolProcessCessation::AlreadyExited);
+    }
+    kill_group_and_await_exit(entry_id, leader.pid, members, deadline)
+}
+
 #[async_trait::async_trait]
 impl InterruptedToolEvidence for ProcessCustody {
     async fn interrupted_calls(
@@ -2139,6 +2357,26 @@ impl InterruptedToolEvidence for ProcessCustody {
                 }
             }
             Ok::<(), ProcessCustodyError>(())
+        })
+        .await
+        .map_err(evidence_error)?
+        .map_err(evidence_error)
+    }
+
+    async fn run_resumes(
+        &self,
+        run_id: &meerkat_core::RunId,
+    ) -> Result<Vec<InterruptedToolCall>, InterruptedToolEvidenceError> {
+        let dir = self.dir.clone();
+        let run_id = run_id.clone();
+        let incarnation = self.incarnation;
+        tokio::task::spawn_blocking(move || {
+            settle_resumed_run_blocking(
+                &dir,
+                incarnation,
+                &run_id,
+                Instant::now() + CESSATION_DEADLINE,
+            )
         })
         .await
         .map_err(evidence_error)?
