@@ -1858,6 +1858,19 @@ pub enum MobError {
         member_id: AgentIdentity,
         profile: ProfileName,
     },
+
+    /// An identity adoption of member `member_id` on a mob whose runtime has
+    /// no persistent store. Identity reconciliation realizes an adoption by
+    /// replacing the attached member: it retires the member and resumes its
+    /// exact session from the runtime's durable lifecycle record. A runtime
+    /// without a persistent store keeps no such record, so the member would
+    /// be retired and never resumed. The adoption is refused before anything
+    /// is recorded, and the member stays as it was. Run the mob on a
+    /// persistent realm.
+    #[error(
+        "identity adoption of member {member_id} needs a mob runtime with a persistent store: reconciliation would retire the member and could not resume its session; run the mob on a persistent realm"
+    )]
+    IdentityAdoptionRequiresPersistentRuntime { member_id: AgentIdentity },
 }
 
 /// Why a member's operator authority ceiling was refused
@@ -2570,6 +2583,13 @@ impl MobError {
                 "profile": profile.as_str(),
                 "retryable": false,
             })),
+            Self::IdentityAdoptionRequiresPersistentRuntime { member_id } => {
+                Some(serde_json::json!({
+                    "kind": "mob_identity_adoption_requires_persistent_runtime",
+                    "member_id": member_id.as_str(),
+                    "retryable": false,
+                }))
+            }
             Self::MemberRegistrationRefused {
                 member_id,
                 session_id,
@@ -2860,6 +2880,11 @@ impl MobError {
                 // A durable profile needs persistent sessions, a capability
                 // the mob's session service does not have.
                 Self::NonDurableService { .. } => {
+                    Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+                }
+                // An identity adoption needs a runtime with a persistent
+                // store, a capability the mob's runtime does not have.
+                Self::IdentityAdoptionRequiresPersistentRuntime { .. } => {
                     Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
                 }
                 error if error.is_held_before_activation() => {
@@ -4102,6 +4127,34 @@ mod tests {
         );
     }
 
+    /// An identity adoption on a mob whose runtime has no persistent store
+    /// is refused typed: a closed refusal under the existing
+    /// `CAPABILITY_UNAVAILABLE` code, naming the member, never retryable as
+    /// is.
+    #[test]
+    fn an_identity_adoption_on_a_runtime_without_a_persistent_store_is_a_typed_refusal() {
+        let error = MobError::IdentityAdoptionRequiresPersistentRuntime {
+            member_id: AgentIdentity::from("w-1"),
+        };
+        assert_eq!(
+            error.wire_error_code(),
+            Some(meerkat_contracts::ErrorCode::CapabilityUnavailable)
+        );
+        assert_eq!(error.failure_class(), MobFailureClass::MobRejected);
+        let data = error.structured_data().expect("structured data");
+        assert_eq!(
+            data["kind"],
+            "mob_identity_adoption_requires_persistent_runtime"
+        );
+        assert_eq!(data["member_id"], "w-1");
+        assert_eq!(data["retryable"], false);
+        let rendered = error.to_string();
+        assert!(
+            rendered.contains("w-1") && rendered.contains("persistent store"),
+            "{rendered}"
+        );
+    }
+
     #[test]
     fn test_all_variants_exist() {
         // Ensures all variants are constructible.
@@ -4191,6 +4244,9 @@ mod tests {
             MobError::NonDurableService {
                 member_id: AgentIdentity::from("m"),
                 profile: ProfileName::from("worker"),
+            },
+            MobError::IdentityAdoptionRequiresPersistentRuntime {
+                member_id: AgentIdentity::from("m"),
             },
             MobError::MemberReloadTimedOut {
                 session_id: meerkat_core::types::SessionId::new(),
