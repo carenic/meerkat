@@ -353,11 +353,12 @@ audited in the runtime store's service-call audit log: its decision is
 written before the call is sent, and a call whose record cannot be written
 is refused unsent; its outcome is written after it returns, and a failure
 there is reported with the call's result. A call whose record ends at its
-entry, with no outcome after it, has an unknown outcome: it entered, then
-was cancelled or its record was lost, and it may have taken effect. The
-host reads an occurrence's record back with
-`RuntimeStore::read_service_call_audit` under the request's `audit_key`. The schedule and occurrence identities the request
-carries are audit data the host asserts, not authority. An ungoverned
+entry, with no outcome after it, has an unknown outcome: it was cancelled
+or its record was lost after its entry was written, and it may have been
+sent and taken effect. The host reads an occurrence's record back with
+`RuntimeStore::read_service_call_audit` under the request's `audit_key`.
+The schedule and occurrence identities the request carries are audit data
+the host asserts, not authority. An ungoverned
 runtime, a runtime without a store, a store without the audit log, or a
 host whose composition does not enroll service originals, refuses.
 

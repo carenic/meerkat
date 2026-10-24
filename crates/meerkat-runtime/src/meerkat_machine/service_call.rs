@@ -140,12 +140,12 @@ impl ServiceCall {
     /// is in the store, since whether that append landed is unknown. The
     /// occurrence can prepare a new request.
     ///
-    /// A call whose rows end at its entry, with no outcome row, entered its
-    /// dispatcher and was then dropped, or its `ServiceCall` was dropped or
-    /// its process stopped, before its outcome was appended (or that append
-    /// failed): its outcome is unknown and it may have taken effect, the
-    /// meaning `ToolError::OutcomeUncertain` gives an interrupted run's
-    /// call. Nothing is appended for it later.
+    /// A call whose rows end at its entry, with no outcome row, may have
+    /// entered its dispatcher: it was dropped, or its `ServiceCall` was
+    /// dropped or its process stopped, before its outcome (or refusal) was
+    /// appended, or that append failed. Its outcome is unknown and it may
+    /// have taken effect, the meaning `ToolError::OutcomeUncertain` gives an
+    /// interrupted run's call. Nothing is appended for it later.
     ///
     /// Calls on one `ServiceCall` append one at a time: a call waits for an
     /// append in progress, so that its own decision is durable before it

@@ -1647,9 +1647,9 @@ them.
   result (`ServiceCallOutcome::audit`), and the `ServiceCall` then refuses
   every later call before it is sent; so does a call dropped while one of
   its appends is in the store. An operation whose rows end at its entry,
-  with no outcome row, was cancelled or lost after it entered: its outcome
-  is unknown, as `ToolError::OutcomeUncertain` means for an interrupted
-  run's call. A store's append must not wait without bound, since the
+  with no outcome row, was cancelled or lost after its entry was written:
+  its outcome is unknown, as `ToolError::OutcomeUncertain` means for an
+  interrupted run's call. A store's append must not wait without bound, since the
   call waits for it before it is sent. Rows are
   `StoredAuthorizationAuditObservation`s keyed by the service original's
   identity digest, the occurrence and a store-assigned sequence

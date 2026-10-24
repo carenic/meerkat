@@ -9896,7 +9896,8 @@ pub trait RuntimeStore: Send + Sync {
     /// implementation must not wait without bound: it fails instead (on a
     /// held maintenance fence, or past its busy timeout behind another
     /// writer). The SQLite store fails at once under another holder's
-    /// maintenance fence and waits at most its connection's busy timeout.
+    /// maintenance fence and waits at most its connection's busy timeout for
+    /// each lock it takes.
     ///
     /// The default answers `Unsupported`, so a store without the log still
     /// compiles and Core refuses every service call over it before the call
@@ -9917,11 +9918,12 @@ pub trait RuntimeStore: Send + Sync {
     /// trusted host. No surface projects these rows. A key with no rows
     /// reads as empty. The default answers `Unsupported`.
     ///
-    /// An operation's rows end with its outcome. An operation whose rows end
-    /// at its entry, with no outcome row, entered its dispatcher and was then
-    /// cancelled or lost before its outcome was appended (or that append
-    /// failed): its outcome is unknown and it may have taken effect, the
-    /// meaning `ToolError::OutcomeUncertain` gives an interrupted run's call.
+    /// An operation's rows end with its outcome, or its refusal. An operation
+    /// whose rows end at its entry, with no outcome row, may have entered its
+    /// dispatcher; it was cancelled or lost before its outcome (or refusal)
+    /// was appended, or that append failed. Its outcome is unknown and it may
+    /// have taken effect, the meaning `ToolError::OutcomeUncertain` gives an
+    /// interrupted run's call.
     async fn read_service_call_audit(
         &self,
         key: &ServiceCallAuditKey,
