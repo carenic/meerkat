@@ -191,6 +191,16 @@ impl SessionRuntime {
         }
 
         let mut slot = self.schedule_host.lock().await;
+        // A runtime whose shutdown began has stopped its firing host for
+        // good: a firing would admit work into a runtime that is stopping.
+        // Read under the slot, so an arming that waited on the shutdown's
+        // stop of the host does not start another one after it.
+        if self
+            .runtime_registration_closing
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return Ok(());
+        }
         if slot.as_ref().is_some_and(|handle| handle.is_running()) {
             return Ok(());
         }

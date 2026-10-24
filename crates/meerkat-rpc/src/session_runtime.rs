@@ -84,6 +84,15 @@ const MOB_STATE_STAND_DOWN_GRACE: Duration = Duration::from_secs(10);
 /// How long shutdown waits for the delivery owner's task to stop.
 const DELIVERY_OWNER_RETIREMENT_GRACE: Duration = Duration::from_secs(10);
 
+/// How long shutdown waits for the runtime registrations already under way
+/// when it closes registration.
+const RUNTIME_REGISTRATION_CLOSE_GRACE: Duration = Duration::from_secs(10);
+
+/// `data.kind` of the refusal a runtime gives work that reaches admission or
+/// registration after its shutdown began (see
+/// [`SessionRuntime::refuse_admission_after_shutdown`]).
+pub(crate) const RUNTIME_SHUTTING_DOWN_KIND: &str = "runtime_shutting_down";
+
 /// Shutdown could not confirm the retirement of every wire-admitted MCP
 /// login attempt. The unresolved work stays with its existing native owner
 /// (a flow record may no longer exist for it); the attempts are named by
@@ -2666,6 +2675,15 @@ pub struct SessionRuntime {
     /// new value from then on, so a composition racing the shutdown cannot
     /// refill what it releases.
     mob_composition_closed: AtomicBool,
+    /// Set when shutdown starts, before it waits for the registration gate:
+    /// from then on no request is admitted and no session is registered on
+    /// this runtime (see [`SessionRuntime::refuse_admission_after_shutdown`]).
+    runtime_registration_closing: AtomicBool,
+    /// Runtime registration gate. A path that registers a session holds it
+    /// shared across the registration; shutdown takes it exclusively and
+    /// closes it before its registration teardown takes its snapshot, so no
+    /// registration lands after that snapshot.
+    runtime_registration_admission: RwLock<bool>,
     /// Request handlers a connection aborted at its drain bound. Work they
     /// handed off may still be running, so an attempt the sweep finds absent
     /// is unresolved, not retired.
@@ -3540,6 +3558,9 @@ impl SessionRuntime {
             None
         };
         self.refuse_cold_help_session(session_id).await?;
+        // The turn boundary above waits for a running turn, so a shutdown may
+        // have begun meanwhile: the input is refused before its admission.
+        self.refuse_admission_after_shutdown(session_id)?;
         Ok(rematerialization_hosting)
     }
 
@@ -3722,6 +3743,8 @@ impl SessionRuntime {
             mcp_attempt_admission: Arc::new(RwLock::new(false)),
             mcp_shutting_down: Arc::new(AtomicBool::new(false)),
             mob_composition_closed: AtomicBool::new(false),
+            runtime_registration_closing: AtomicBool::new(false),
+            runtime_registration_admission: RwLock::new(false),
             unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
@@ -3897,6 +3920,8 @@ impl SessionRuntime {
             mcp_attempt_admission: Arc::new(RwLock::new(false)),
             mcp_shutting_down: Arc::new(AtomicBool::new(false)),
             mob_composition_closed: AtomicBool::new(false),
+            runtime_registration_closing: AtomicBool::new(false),
+            runtime_registration_admission: RwLock::new(false),
             unsettled_requests: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
             default_callback_route: StdRwLock::new(None),
             session_callback_routes: StdRwLock::new(HashMap::new()),
@@ -6744,6 +6769,7 @@ impl SessionRuntime {
             Err(error) => return Err(session_error_to_rpc(error)),
         };
         if !self.runtime_adapter.contains_session(session_id).await && live_session_exists {
+            let _registration_admission = self.admit_runtime_registration(session_id).await?;
             self.runtime_adapter
                 .prepare_bindings(session_id.clone())
                 .await
@@ -7786,6 +7812,85 @@ impl SessionRuntime {
             .await
     }
 
+    /// The typed refusal of work that reaches admission or registration
+    /// after this runtime's shutdown began: `-32032` (session runtime
+    /// unavailable) with `data.kind` `runtime_shutting_down`. Nothing of the
+    /// request was registered or admitted, so none of it runs in this
+    /// process.
+    fn runtime_shutting_down_rpc(session_id: &SessionId) -> RpcError {
+        RpcError {
+            code: meerkat_contracts::ErrorCode::SessionRuntimeUnavailable.jsonrpc_code(),
+            message: format!(
+                "the session runtime is shutting down and admits no work for session {session_id}"
+            ),
+            data: Some(serde_json::json!({
+                "kind": RUNTIME_SHUTTING_DOWN_KIND,
+                "session_id": session_id.to_string(),
+            })),
+        }
+    }
+
+    /// Refuse a request that reaches admission after this runtime's shutdown
+    /// began ([`Self::runtime_shutting_down_rpc`]).
+    ///
+    /// A request can wait before its admission for as long as a turn runs:
+    /// its staleness check waits on the turn boundary the running turn
+    /// holds. The shutdown's registration teardown neither keeps nor answers
+    /// such a request, because nothing of it is in the runtime yet, so it
+    /// must not be admitted once the shutdown began: it would register its
+    /// session again on a runtime that has stopped, and run there. Ingress
+    /// asks this after the waits that come before its admission.
+    pub(crate) fn refuse_admission_after_shutdown(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RpcError> {
+        if self.runtime_registration_closing.load(Ordering::Acquire) {
+            return Err(Self::runtime_shutting_down_rpc(session_id));
+        }
+        Ok(())
+    }
+
+    /// Admit one new runtime registration of `session_id`, or refuse it once
+    /// this runtime's shutdown began. The returned guard holds the
+    /// registration gate shared: hold it until the registration is in place,
+    /// so the shutdown, which closes the gate exclusively before its
+    /// registration teardown takes its snapshot, either waits for this
+    /// registration and tears it down, or makes this path refuse.
+    async fn admit_runtime_registration(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<tokio::sync::RwLockReadGuard<'_, bool>, RpcError> {
+        self.refuse_admission_after_shutdown(session_id)?;
+        let gate = self.runtime_registration_admission.read().await;
+        if *gate || self.runtime_registration_closing.load(Ordering::Acquire) {
+            return Err(Self::runtime_shutting_down_rpc(session_id));
+        }
+        Ok(gate)
+    }
+
+    /// Close runtime registration for the shutdown: refuse every later
+    /// admission and registration, then wait, within
+    /// [`RUNTIME_REGISTRATION_CLOSE_GRACE`], for the registrations already
+    /// under way, so the registration teardown's snapshot includes them. A
+    /// registration still under way at the bound is logged; nothing new is
+    /// admitted either way.
+    async fn close_runtime_registration(&self) {
+        self.runtime_registration_closing
+            .store(true, Ordering::Release);
+        match tokio::time::timeout(
+            RUNTIME_REGISTRATION_CLOSE_GRACE,
+            self.runtime_registration_admission.write(),
+        )
+        .await
+        {
+            Ok(mut closed) => *closed = true,
+            Err(_) => tracing::warn!(
+                "a runtime registration under way when the shutdown began did not finish within \
+                 its bound; the registration teardown may not include it"
+            ),
+        }
+    }
+
     pub(crate) fn runtime_actor_witness_slot(
         &self,
         session_id: &SessionId,
@@ -8199,6 +8304,18 @@ impl SessionRuntime {
         adapter: &Arc<MeerkatMachine>,
         session_id: &SessionId,
     ) -> Result<(), RpcError> {
+        // A runtime whose shutdown began registers no session: refuse before
+        // any attach work (see `refuse_admission_after_shutdown`). A session
+        // it still serves keeps its executor, so the work that executor is
+        // applying can still reach it until the registration teardown.
+        if self.runtime_registration_closing.load(Ordering::Acquire)
+            && !adapter
+                .session_has_executor(session_id)
+                .await
+                .map_err(runtime_driver_error_to_rpc)?
+        {
+            return Err(Self::runtime_shutting_down_rpc(session_id));
+        }
         // An executor means agent work can run, and agent work can author
         // schedules against this runtime's store — the firing host must be
         // live in the same process (see arm_schedule_host_for_agent_tools).
@@ -8287,6 +8404,11 @@ impl SessionRuntime {
             return Ok(());
         }
 
+        // The registration below is admitted through the registration gate
+        // and holds it until the attachment is in place: a shutdown that
+        // began meanwhile refuses it here, and one that begins later waits
+        // for it and tears it down with the rest.
+        let _registration_admission = self.admit_runtime_registration(session_id).await?;
         let actor_authority = self.runtime_executor_actor_authority(session_id).await?;
         let runtime = Arc::clone(self);
         let executor_session_id = session_id.clone();
@@ -8518,6 +8640,10 @@ impl SessionRuntime {
         // A help session continues only on its live session: refuse to
         // rebuild it from storage before the turn is admitted.
         self.refuse_cold_help_session(session_id).await?;
+        // The staleness check above waits on a running turn's boundary, so a
+        // shutdown may have begun meanwhile: such a turn is refused here,
+        // before it registers or reserves anything.
+        self.refuse_admission_after_shutdown(session_id)?;
 
         let runtime_registration_lock = self.runtime_registration_lock(session_id);
         let runtime_registration_guard = runtime_registration_lock.mutex().lock().await;
@@ -8997,6 +9123,10 @@ impl SessionRuntime {
             None
         };
         self.refuse_cold_help_session(session_id).await?;
+        // The staleness check above waits on a running turn's boundary, so a
+        // shutdown may have begun meanwhile: the event is refused here,
+        // before its admission.
+        self.refuse_admission_after_shutdown(session_id)?;
         if let Err(primary) = self.ensure_runtime_executor(session_id).await {
             return Err(self
                 .unregister_new_runtime_registration_after_rpc_error(
@@ -10393,6 +10523,7 @@ impl SessionRuntime {
             .map_err(session_error_to_rpc)?;
 
         // Inject the pre-created session so the agent builder will reuse this ID.
+        let registration_admission = self.admit_runtime_registration(&session_id).await?;
         let bindings = self
             .runtime_adapter
             .prepare_bindings(session_id.clone())
@@ -10404,6 +10535,7 @@ impl SessionRuntime {
                 ),
                 data: None,
             })?;
+        drop(registration_admission);
 
         // The seed is a machine-created generation-zero session (see above):
         // the build mints it under its pre-assigned id.
@@ -12453,6 +12585,7 @@ impl SessionRuntime {
             .service
             .grant_session_hosting(session_id)
             .map_err(session_error_to_rpc)?;
+        let _registration_admission = self.admit_runtime_registration(session_id).await?;
         self.runtime_adapter
             .prepare_bindings(session_id.clone())
             .await
@@ -12847,6 +12980,14 @@ impl SessionRuntime {
         // From here no composition refills the mob slots this shutdown
         // releases.
         self.mob_composition_closed.store(true, Ordering::SeqCst);
+
+        // From here no request is admitted and no session is registered on
+        // this runtime: a request that still waits before its admission (on a
+        // running turn's boundary, for example) is refused typed when it gets
+        // there, instead of registering its session again after the
+        // registration teardown below. A registration already under way
+        // finishes first, so that teardown includes it.
+        self.close_runtime_registration().await;
 
         // Close MCP login admission, then retire every wire-admitted attempt
         // still pending. The caller's request drains reported their outcome
