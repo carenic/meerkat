@@ -9308,4 +9308,173 @@ mod tests {
             "completed lifecycle must block definition mutation"
         );
     }
+
+    /// The fence `runtime_id` holds in `authority`.
+    fn live_fence(authority: &MobMachineAuthority, runtime_id: &AgentRuntimeId) -> FenceToken {
+        *authority
+            .state()
+            .runtime_fence_tokens
+            .get(runtime_id)
+            .expect("the runtime is fenced")
+    }
+
+    /// A member runtime destroyed outside the mob's own destroy (a host
+    /// destroying one runtime through the runtime control plane) removes only
+    /// that runtime, as a runtime retired outside the mob does: the mob stays
+    /// Running and its other member stays live. Before the fix this ended
+    /// the whole mob Destroyed.
+    #[test]
+    fn a_member_runtime_destroyed_outside_the_mob_removes_only_that_runtime() {
+        let mut authority = MobMachineAuthority::new();
+        let destroyed = AgentRuntimeId::from("destroyed-member:0");
+        let kept = AgentRuntimeId::from("kept-member:0");
+        seed_live_member(
+            &mut authority,
+            &AgentIdentity::from("destroyed-member"),
+            &destroyed,
+        );
+        seed_live_member(&mut authority, &AgentIdentity::from("kept-member"), &kept);
+        let fence_token = live_fence(&authority, &destroyed);
+
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+                agent_runtime_id: destroyed.clone(),
+                fence_token,
+            })
+            .expect("the mob observes the member runtime destroyed outside it");
+
+        assert_eq!(authority.state().lifecycle_phase, MobPhase::Running);
+        assert!(!authority.state().destroy_admitted);
+        assert!(!authority.state().live_runtime_ids.contains(&destroyed));
+        assert!(
+            !authority
+                .state()
+                .runtime_fence_tokens
+                .contains_key(&destroyed)
+        );
+        assert!(authority.state().live_runtime_ids.contains(&kept));
+        assert!(authority.state().runtime_fence_tokens.contains_key(&kept));
+    }
+
+    /// The same in a Stopped mob: it stays Stopped.
+    #[test]
+    fn a_member_runtime_destroyed_outside_a_stopped_mob_keeps_it_stopped() {
+        let mut authority = MobMachineAuthority::new();
+        let destroyed = AgentRuntimeId::from("destroyed-member:0");
+        seed_live_member(
+            &mut authority,
+            &AgentIdentity::from("destroyed-member"),
+            &destroyed,
+        );
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Stop,
+        );
+        MobMachineMutator::apply(&mut authority, MobMachineInput::Stop).expect("stop");
+        let fence_token = live_fence(&authority, &destroyed);
+
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+                agent_runtime_id: destroyed.clone(),
+                fence_token,
+            })
+            .expect("the stopped mob observes the member runtime destroyed outside it");
+
+        assert_eq!(authority.state().lifecycle_phase, MobPhase::Stopped);
+        assert!(!authority.state().live_runtime_ids.contains(&destroyed));
+    }
+
+    /// The mob's own destroy is unchanged: once AdmitDestroyCleanup admitted
+    /// it, a destroyed member runtime clears every member and the mob is
+    /// Destroyed.
+    #[test]
+    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_ends_the_mob() {
+        let mut authority = MobMachineAuthority::new();
+        let destroyed = AgentRuntimeId::from("destroyed-member:0");
+        let other = AgentRuntimeId::from("other-member:0");
+        seed_live_member(
+            &mut authority,
+            &AgentIdentity::from("destroyed-member"),
+            &destroyed,
+        );
+        seed_live_member(&mut authority, &AgentIdentity::from("other-member"), &other);
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+        let fence_token = live_fence(&authority, &destroyed);
+
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+                agent_runtime_id: destroyed,
+                fence_token,
+            })
+            .expect("the destroying mob observes a member runtime destroyed");
+
+        assert_eq!(authority.state().lifecycle_phase, MobPhase::Destroyed);
+        assert!(authority.state().live_runtime_ids.is_empty());
+        assert!(authority.state().runtime_fence_tokens.is_empty());
+    }
+
+    /// The mob's own destroy over a member held for a respawn: the member's
+    /// retirement preserves its topology for the respawn (it is Retiring, its
+    /// identity still maps to the runtime, and its wiring waits in the
+    /// pending respawn topology) when AdmitDestroyCleanup admits the destroy,
+    /// and the member's runtime is then destroyed. The mob is Destroyed and
+    /// keeps no member: the observation clears every member fact DestroyMob
+    /// clears, so no identity keeps a current runtime or a pending respawn
+    /// (the generated pending_respawn_topology_has_no_current_runtime). The
+    /// old teardown cleared the Retiring marker and kept the identity's
+    /// runtime and its pending respawn.
+    #[test]
+    fn a_member_runtime_destroyed_during_the_mobs_own_destroy_clears_a_member_held_for_a_respawn() {
+        let (
+            mut authority,
+            identity,
+            runtime_id,
+            fence_token,
+            _session_id,
+            member_edge,
+            external_edge,
+            external_key,
+        ) = seed_preserving_retirement_with_topology();
+        assert!(
+            authority
+                .state()
+                .pending_respawn_topology
+                .contains(&identity)
+        );
+        assert_eq!(
+            authority.state().member_state_markers.get(&runtime_id),
+            Some(&MobMemberState::Retiring)
+        );
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+                agent_runtime_id: runtime_id,
+                fence_token,
+            })
+            .expect("the destroying mob observes the held member's runtime destroyed");
+
+        let state = authority.state();
+        assert_eq!(state.lifecycle_phase, MobPhase::Destroyed);
+        assert!(state.pending_respawn_topology.is_empty());
+        assert!(state.identity_to_runtime.is_empty());
+        assert!(state.member_session_bindings.is_empty());
+        assert!(state.member_state_markers.is_empty());
+        assert!(state.live_runtime_ids.is_empty());
+        assert!(!state.wiring_edges.contains(&member_edge));
+        assert!(!state.external_peer_edges.contains(&external_edge));
+        assert!(!state.external_peer_edges_by_key.contains_key(&external_key));
+    }
 }

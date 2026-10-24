@@ -13,9 +13,10 @@
 # fails otherwise. With the counters left out the reachable space is finite,
 # so each run explores all of it, with no step bound. It checks two runs over
 # their whole space with TLC coverage:
-# - the lifecycle run (AuditSpec) with its three action properties and the two
+# - the lifecycle run (AuditSpec) with its four action properties and the two
 #   invariants that check the reasons of its not-covered list;
-# - the scope run (AuditScopeSpec) with its two RetireAtScope invariants.
+# - the scope run (AuditScopeSpec) with its two RetireAtScope invariants and
+#   the destroy action property.
 # Each run must finish without an error, reach at least its floor of distinct
 # states (so a guard that silently disables arms fails the lane instead of
 # shrinking the space), and fire every action of its covered list (TLC
@@ -23,7 +24,7 @@
 # space once per reachability witness, with that witness's negation as an
 # extra invariant (a state goal) or action property (a step goal), and
 # requires TLC to report exactly that violation, so the properties are not
-# vacuous. With --mutants it then seeds seven defects into a copy of the
+# vacuous. With --mutants it then seeds nine defects into a copy of the
 # generated model and requires TLC to refuse each: a progress arm without its
 # observation_monotonic guard (AuditObservationMonotonic); the same guard
 # rendered as a plain `<=` between option records, which TLC cannot evaluate
@@ -38,8 +39,14 @@
 # RetireAtScope Current arm without its runtime and fence guards
 # (AuditRetireAtScopeCoherent); and the StaleFenceToken arm without its
 # mapped guard, which then overlaps NoCurrentIncarnation
-# (AuditRetireAtScopeExactlyOne); and the roster recovery keeping the
-# predecessor's execution-health entries (AuditMintClearsExecutionHealth).
+# (AuditRetireAtScopeExactlyOne); the roster recovery keeping the
+# predecessor's execution-health entries (AuditMintClearsExecutionHealth);
+# the runtime destroy observation without its destroy-admitted guard,
+# which then ends the mob over a member runtime destroyed outside it
+# (AuditDestroyedOnlyThroughAnAdmittedDestroy); and the admitted runtime
+# destroy observation with its old teardown, which keeps the identities and
+# the respawn topology DestroyMob clears
+# (pending_respawn_topology_has_no_current_runtime, in the scope run).
 # An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
@@ -55,7 +62,7 @@ fi
 # run found, so a guard that silently disables arms fails the lane.
 lifecycle_states=59607
 min_distinct_states=$(( lifecycle_states * 9 / 10 ))
-scope_states=3223
+scope_states=3760
 min_scope_distinct_states=$(( scope_states * 9 / 10 ))
 
 # Every lifecycle-run arm the audit's domains can enable; each must fire.
@@ -97,6 +104,8 @@ covered_actions=(
   RecoverRosterMemberAddressabilityRunning
   ObserveRuntimeRetired
   ObserveRuntimeRetiredStopped
+  ObserveRuntimeDestroyedOutsideTheMobRunning
+  ObserveRuntimeDestroyedOutsideTheMobStopped
   ObserveMemberRetirementArchivedLive
   ObserveMemberRetirementArchivedRetired
   ObserveMemberRetirementArchivedLiveStopped
@@ -112,11 +121,16 @@ covered_actions=(
   ResumeStopped
 )
 
-# Every RetireAtScope verdict arm, and the completion and destruction arms
-# that reach the not-running verdict; each must fire in the scope run.
+# Every RetireAtScope verdict arm, the completion and destruction arms that
+# reach the not-running verdict, the runtime destroy observation of a
+# completed mob, and the destroy admission with the runtime destroy
+# observation that ends the mob after it; each must fire in the scope run.
 scope_covered_actions=(
   BeginPlacedCompletionLifecycleQuiesceFresh
   MarkCompleted
+  ObserveRuntimeDestroyedOutsideTheMobCompleted
+  AdmitDestroyCleanup
+  ObserveRuntimeDestroyed
   DestroyMob
   RetireAtScopeCurrentRunning
   RetireAtScopeCurrentStopped
@@ -195,7 +209,7 @@ epoch_index="${view_positions#* }"
 
 # usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
 # where <run> is lifecycle (AuditSpec and its action properties) or scope
-# (AuditScopeSpec and its two invariants).
+# (AuditScopeSpec, its two invariants and the destroy action property).
 write_cfg() {
   local run="$1" cfg="$2" invariants="$3" properties="$4"
   cp "${ci_cfg}" "${cfg}"
@@ -215,14 +229,17 @@ write_cfg() {
       replace_exact_line "INVARIANTS" "PROPERTIES
   AuditObservationMonotonic
   AuditMintClearsExecutionHealth
-  AuditMintClearsFailureRecords${properties}
+  AuditMintClearsFailureRecords
+  AuditDestroyedOnlyThroughAnAdmittedDestroy${properties}
 INVARIANTS
   AuditPlacementAbsent
   AuditRetiringRuntimeMapped${invariants}" "${cfg}"
       ;;
     scope)
       replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditScopeSpec" "${cfg}"
-      replace_exact_line "INVARIANTS" "INVARIANTS
+      replace_exact_line "INVARIANTS" "PROPERTIES
+  AuditDestroyedOnlyThroughAnAdmittedDestroy
+INVARIANTS
   AuditRetireAtScopeCoherent
   AuditRetireAtScopeExactlyOne${invariants}" "${cfg}"
       if [[ -n "${properties}" ]]; then
@@ -501,6 +518,46 @@ for field in ("member_run_open", "member_in_flight_work", "member_progress_token
     clear = "    /\\ " + field + "' = MapRemove(" + field + ", agent_identity)"
     assert body.count(clear) == 1, "expected one clear of " + field + " in RecoverRosterMemberRunning"
     body = body.replace(clear, "    /\\ " + field + "' = " + field)
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle destroy_unadmitted_ends_the_mob "Error: Action property AuditDestroyedOnlyThroughAnAdmittedDestroy is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+lines = block.group(0).split("\n")
+guard = [i for i, line in enumerate(lines) if line == "    /\\ (destroy_admitted = TRUE)"]
+assert len(guard) == 1, "expected one mob_destroy_admitted guard in ObserveRuntimeDestroyed"
+del lines[guard[0]]
+text = text[: block.start()] + "\n".join(lines) + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate scope destroy_keeps_member_identities "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+# The member facts the old teardown kept: every one DestroyMob clears but
+# the live runtimes and their fences, the member markers, the restore and
+# retire facts, the revival set and the spawn-exec phases.
+for field in (
+    "externally_addressable_runtime_ids", "wiring_edges", "pending_respawn_topology",
+    "abandoned_respawn_topology", "external_peer_edges", "external_peer_edges_by_key",
+    "identity_to_runtime", "identity_runtime_generations", "identity_generation_highwater",
+    "identity_runtime_fence_tokens", "member_session_bindings", "member_profile_names",
+    "member_runtime_modes", "member_peer_ids", "member_peer_endpoints",
+    "member_prior_peer_endpoints", "member_startup_binding_requested",
+    "member_startup_runtime_ready", "member_startup_ready",
+):
+    clear = re.findall(r"^    /\\ " + field + r"' = .*$", body, re.M)
+    assert len(clear) == 1, f"expected one {field} update in ObserveRuntimeDestroyed, found {len(clear)}"
+    body = body.replace(clear[0], "    /\\ " + field + "' = " + field)
 text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY

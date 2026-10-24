@@ -152,6 +152,13 @@ them.
   last, so no existing implicit discriminant changes (see the default
   graceful Shutdown of a durable member, below).
 
+- `meerkat-machine-kernels`: the kernel `generated::mob::TransitionId` gains
+  `ObserveRuntimeDestroyedOutsideTheMobRunning`,
+  `ObserveRuntimeDestroyedOutsideTheMobStopped` and
+  `ObserveRuntimeDestroyedOutsideTheMobCompleted`, appended last, so no
+  existing implicit discriminant changes (see Fixed, a member runtime
+  destroyed outside the mob).
+
 - `meerkat-core`: `AgentEvent` gains the variant `RunResumed { session_id,
   run_id, round, resume_point }`, wire type `run_resumed`, with the new enum
   `RunResumePointKind` (`tools_pending`, `awaiting_model`; non-exhaustive).
@@ -2434,14 +2441,35 @@ them.
   already failed, is deferred instead (see the entries above).
 
 - `meerkat-mob`: a mob start no longer stops over a member whose session
-  runtime was retired outside the mob, by a host's direct
-  `retire_runtime_control_plane` rather than the mob's own retire flow. The
-  start's readiness pass still targeted the member, found its comms runtime
-  gone with the retire, and stopped the whole mob
+  runtime was retired or destroyed outside the mob, by a host's direct
+  `retire_runtime_control_plane` or `RuntimeControlPlane::destroy` rather
+  than the mob's own retire flow. The start's readiness pass still targeted
+  the member, found its comms runtime gone with it, and stopped the whole mob
   (`MobError::MissingMemberCapability`). The pass now leaves that member out
-  and records it Broken with a typed restore failure that says its runtime
-  was retired outside the mob and to respawn the member; the mob serves its
-  other members. Only the runtime's own `Retired` state leaves a member out.
+  and records it Broken with a typed restore failure that says how its
+  runtime ended outside the mob and to respawn the member; the mob serves its
+  other members. Only the runtime's own `Retired` or `Destroyed` state leaves
+  a member out.
+
+- `meerkat-mob`, `meerkat-machine-schema`, `meerkat-machine-kernels`:
+  destroying one member's session runtime outside the mob
+  (`RuntimeControlPlane::destroy` on the member's runtime id) no longer
+  destroys the whole mob. The runtime's `RuntimeDestroyed` reaches the mob as
+  `ObserveRuntimeDestroyed`, and MobMachine cleared every member and moved
+  the mob to Destroyed for any live, fence-matched member runtime. Outside
+  the mob's own destroy (no destroy admitted by `AdmitDestroyCleanup` or
+  `DestroyMob`), the new `ObserveRuntimeDestroyedOutsideTheMob` arms
+  (Running, Stopped, Completed) remove only that runtime, as a runtime
+  retired outside the mob is removed, and the mob keeps its phase; the
+  member is Broken at its next start (see the entry above). Inside the mob's
+  own destroy, `ObserveRuntimeDestroyed` still ends the mob, and now clears
+  every member fact `DestroyMob` clears: its old teardown kept the
+  identities' runtimes, their session bindings and a respawn-held member's
+  pending respawn topology in the Destroyed mob, which broke the generated
+  invariant `pending_respawn_topology_has_no_current_runtime` (see Breaking
+  for the new `TransitionId` values). The member lifecycle TLC audit
+  (`specs/machines/mob_machine/member_lifecycle_audit.sh`) now checks the
+  destroy admission and that observation, and refuses the old teardown.
 
 - `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
   member's run in flight no longer fails on a HeadCanonical store. A host's

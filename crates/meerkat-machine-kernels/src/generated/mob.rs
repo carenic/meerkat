@@ -12552,6 +12552,9 @@ pub enum TransitionId {
     ResolveAutonomousShutdownMemberActionKeepForResumeRunning,
     ResolveAutonomousShutdownMemberActionKeepForResumeStopped,
     ResolveAutonomousShutdownMemberActionKeepForResumeCompleted,
+    ObserveRuntimeDestroyedOutsideTheMobRunning,
+    ObserveRuntimeDestroyedOutsideTheMobStopped,
+    ObserveRuntimeDestroyedOutsideTheMobCompleted,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

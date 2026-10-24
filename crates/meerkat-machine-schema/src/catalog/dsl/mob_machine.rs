@@ -12768,6 +12768,12 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestRuntimeDestroy { session_id: session_id }
         }
 
+        // A member runtime destroyed during the mob's own destroy (admitted by
+        // AdmitDestroyCleanup or DestroyMob) ends the mob: the mob is
+        // Destroyed and its update clears every member fact DestroyMob's
+        // teardown clears (identities, bindings, respawn topology, wiring,
+        // peer and startup facts), plus the pending spawns, so no member of
+        // the destroyed mob keeps a current runtime or a pending respawn.
         transition ObserveRuntimeDestroyed {
             on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
             guard {
@@ -12776,12 +12782,32 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.lifecycle_phase == Phase::Completed
                 || self.lifecycle_phase == Phase::Destroyed
             }
+            guard "mob_destroy_admitted" { self.destroy_admitted == true }
             guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
             update {
                 self.live_runtime_ids = EmptySet;
+                self.externally_addressable_runtime_ids = EmptySet;
                 self.runtime_fence_tokens = EmptyMap;
+                self.wiring_edges = EmptySet;
+                self.pending_respawn_topology = EmptySet;
+                self.abandoned_respawn_topology = EmptyMap;
+                self.external_peer_edges = EmptySet;
+                self.external_peer_edges_by_key = EmptyMap;
+                self.identity_to_runtime = EmptyMap;
+                self.identity_runtime_generations = EmptyMap;
+                self.identity_generation_highwater = EmptyMap;
+                self.identity_runtime_fence_tokens = EmptyMap;
+                self.member_session_bindings = EmptyMap;
+                self.member_profile_names = EmptyMap;
+                self.member_runtime_modes = EmptyMap;
+                self.member_peer_ids = EmptyMap;
+                self.member_peer_endpoints = EmptyMap;
+                self.member_prior_peer_endpoints = EmptyMap;
+                self.member_startup_binding_requested = EmptySet;
+                self.member_startup_runtime_ready = EmptySet;
+                self.member_startup_ready = EmptySet;
                 self.member_state_markers = EmptyMap;
                 self.member_restore_failures = EmptyMap;
                 self.member_restore_failure_codes = EmptyMap;
@@ -22566,6 +22592,29 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
+        // A member runtime destroyed outside the mob's own destroy (a host
+        // destroying one runtime through the runtime control plane) removes
+        // only that runtime, as a runtime retired outside the mob does: the
+        // mob keeps its phase and its other members, and the member reads
+        // Broken at its next start.
+        transition ObserveRuntimeDestroyedOutsideTheMob {
+            per_phase [Running, Stopped, Completed]
+            on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
+            guard "mob_destroy_not_admitted" { self.destroy_admitted == false }
+            guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            update {
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.active_run_count = 0;
+            }
+            to Running
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Destroyed }
+        }
     }
         }
 

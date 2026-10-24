@@ -35436,6 +35436,75 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_destroyed_outs
     .await;
 }
 
+/// The mob's own destroy still destroys every member. With two autonomous
+/// members live, a destroy through the mob handle ends the mob Destroyed and
+/// ends every member's session runtime: the mob admits its destroy before
+/// any member runtime ends, so a destroyed member runtime ends the mob there,
+/// while one destroyed outside the mob removes only that member (the rows
+/// above).
+#[tokio::test]
+async fn test_the_mobs_own_destroy_still_destroys_every_member() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let members = [
+        AgentIdentity::from("own-destroy-a"),
+        AgentIdentity::from("own-destroy-b"),
+    ];
+    for member in &members {
+        handle
+            .spawn(ProfileName::from("worker"), member.clone(), None)
+            .await
+            .expect("spawn autonomous member");
+    }
+    handle
+        .wait_for_members_ready(&members, Some(Duration::from_secs(2)))
+        .await
+        .expect("members reach startup readiness");
+    let mut sessions = Vec::new();
+    for member in &members {
+        sessions.push(
+            handle
+                .get_member(member)
+                .await
+                .expect("member lookup")
+                .expect("member roster entry")
+                .member_ref
+                .bridge_session_id()
+                .cloned()
+                .expect("the member is session-backed"),
+        );
+    }
+
+    let report = handle.destroy().await.expect("destroy");
+    assert!(
+        report.errors.is_empty(),
+        "the mob's own destroy reports no cleanup error: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        MobState::Destroyed
+    );
+    for session in &sessions {
+        let state = adapter.runtime_state(session).await;
+        assert!(
+            !matches!(
+                state,
+                Ok(meerkat_runtime::RuntimeState::Idle
+                    | meerkat_runtime::RuntimeState::Attached
+                    | meerkat_runtime::RuntimeState::Running)
+            ),
+            "every member's session runtime ends with the mob: {session} reads {state:?}"
+        );
+    }
+}
+
 async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
     ended: RuntimeEndedOutsideTheMob,
 ) {

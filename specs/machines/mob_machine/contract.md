@@ -8004,6 +8004,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`, `Stopped`, `Completed`, `Destroyed`
 - On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
 - Guards:
+  - `mob_destroy_admitted`
   - `session_ingress_detaches_closed`
   - `current_binding_matches`
   - `fence_token_matches`
@@ -15364,6 +15365,36 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `kept_for_resume`
   - `member_not_retiring`
 - Emits: `AutonomousShutdownMemberActionResolved`
+- To: `Completed`
+
+### `ObserveRuntimeDestroyedOutsideTheMobRunning`
+- From: `Running`
+- On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
+- Guards:
+  - `mob_destroy_not_admitted`
+  - `current_binding_matches`
+  - `fence_token_matches`
+- Emits: `EmitMemberLifecycleNotice`
+- To: `Running`
+
+### `ObserveRuntimeDestroyedOutsideTheMobStopped`
+- From: `Stopped`
+- On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
+- Guards:
+  - `mob_destroy_not_admitted`
+  - `current_binding_matches`
+  - `fence_token_matches`
+- Emits: `EmitMemberLifecycleNotice`
+- To: `Stopped`
+
+### `ObserveRuntimeDestroyedOutsideTheMobCompleted`
+- From: `Completed`
+- On: `ObserveRuntimeDestroyed`(agent_runtime_id, fence_token)
+- Guards:
+  - `mob_destroy_not_admitted`
+  - `current_binding_matches`
+  - `fence_token_matches`
+- Emits: `EmitMemberLifecycleNotice`
 - To: `Completed`
 
 ## Coverage
