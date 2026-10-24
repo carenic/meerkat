@@ -7794,35 +7794,81 @@ mod tests {
         }
     }
 
+    /// A mid-run checkpoint request of `receipt` for `session_id`.
+    fn run_checkpoint_request(
+        receipt: RunBoundaryReceipt,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> super::super::PreparedRuntimeSessionCommit {
+        super::super::PreparedRuntimeSessionCommit::run_checkpoint(
+            receipt,
+            Vec::new(),
+            session_id.clone(),
+        )
+        .expect("a mid-run checkpoint receipt")
+    }
+
+    /// An ordinary receipt-only success request of `receipt` for `session_id`.
+    fn receipt_only_request(
+        receipt: RunBoundaryReceipt,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> super::super::PreparedRuntimeSessionCommit {
+        super::super::PreparedRuntimeSessionCommit::success(
+            None,
+            receipt,
+            Vec::new(),
+            Some(session_id.clone()),
+        )
+    }
+
+    /// Commit `request` beside the standing tail and expect the store to
+    /// refuse it with nothing written: no receipt, the same tail.
+    async fn assert_refused_beside_tail(
+        store: &InMemoryRuntimeStore,
+        runtime_id: &LogicalRuntimeId,
+        tail: &WholeBlobProvisionalTailAuthority,
+        request: super::super::PreparedRuntimeSessionCommit,
+    ) {
+        let receipt = request.receipt().cloned().expect("a receipt");
+        let error = store
+            .commit_prepared_session_boundary(runtime_id, request)
+            .await
+            .expect_err("this receipt-only boundary would bypass the candidate");
+        assert!(
+            matches!(
+                error,
+                RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+            ),
+            "{error:?}"
+        );
+        assert_eq!(
+            store
+                .load_boundary_receipt(runtime_id, &receipt.run_id, receipt.sequence)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            store
+                .load_whole_blob_provisional_tail(runtime_id)
+                .await
+                .unwrap()
+                .map(|loaded| loaded.authority().clone())
+                .as_ref(),
+            Some(tail)
+        );
+    }
+
     /// A run's round commits leave its provisional tail standing until its
     /// terminal boundary, so every checkpoint receipt the run commits before
     /// that boundary commits beside the tail
     /// (`PreparedRuntimeSessionCommit::run_checkpoint`): the owner-contribution
     /// receipt of a steer delivered into the running turn, and the context
     /// receipt of a steer input the turn took. They commit receipt-only and
-    /// leave the tail for the terminal promotion. Another run's checkpoint and
-    /// every ordinary receipt-only boundary (a run's end, which would bypass
-    /// the candidate, even one shaped like a checkpoint) are still refused.
+    /// leave the tail for the terminal promotion.
     #[tokio::test]
     async fn a_mid_run_receipt_commits_beside_its_runs_provisional_tail() {
         let store = InMemoryRuntimeStore::new();
         let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
-        let run_checkpoint = |receipt: RunBoundaryReceipt| {
-            super::super::PreparedRuntimeSessionCommit::run_checkpoint(
-                receipt,
-                Vec::new(),
-                live.id().clone(),
-            )
-            .expect("a mid-run checkpoint receipt")
-        };
-        let receipt_only = |receipt: RunBoundaryReceipt| {
-            super::super::PreparedRuntimeSessionCommit::success(
-                None,
-                receipt,
-                Vec::new(),
-                Some(live.id().clone()),
-            )
-        };
         let owner = mid_run_checkpoint_receipt(&run_id, 1);
         let mut input = mid_run_checkpoint_receipt(&run_id, 2);
         input.owner_contributions.clear();
@@ -7830,7 +7876,10 @@ mod tests {
         for receipt in [owner, input] {
             assert_eq!(
                 store
-                    .commit_prepared_session_boundary(&runtime_id, run_checkpoint(receipt.clone()))
+                    .commit_prepared_session_boundary(
+                        &runtime_id,
+                        run_checkpoint_request(receipt.clone(), live.id())
+                    )
                     .await
                     .expect("a mid-run receipt commits beside its run's tail"),
                 PreparedRuntimeSessionCommitResult::receipt_only(
@@ -7854,8 +7903,34 @@ mod tests {
             Some(tail),
             "the tail stands for the run's terminal promotion"
         );
+    }
 
-        let mut terminal = mid_run_checkpoint_receipt(&run_id, 3);
+    /// The store admits a checkpoint beside a tail only for the tail's own
+    /// run: a checkpoint receipt of any other run is refused with nothing
+    /// written, whether or not that run ever committed here.
+    #[tokio::test]
+    async fn a_foreign_runs_checkpoint_never_commits_beside_a_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, _run_id, _base, tail) = rebase_run_with_tail(&store).await;
+        let foreign = mid_run_checkpoint_receipt(&RunId::new(), 1);
+        assert_refused_beside_tail(
+            &store,
+            &runtime_id,
+            &tail,
+            run_checkpoint_request(foreign, live.id()),
+        )
+        .await;
+    }
+
+    /// A receipt-only success (a run's end) never commits beside a standing
+    /// tail, even with the run's own checkpoint-shaped receipt: it would end
+    /// the run without promoting the candidate. A receipt that counts the
+    /// transcript is no mid-run checkpoint.
+    #[tokio::test]
+    async fn a_receipt_only_success_never_commits_beside_a_tail() {
+        let store = InMemoryRuntimeStore::new();
+        let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
+        let mut terminal = mid_run_checkpoint_receipt(&run_id, 1);
         terminal.owner_contributions.clear();
         terminal.boundary = RunApplyBoundary::RunStart;
         terminal.conversation_digest = Some(live.transcript_content_digest().unwrap());
@@ -7869,30 +7944,14 @@ mod tests {
             .is_err(),
             "a receipt that counts the transcript is no mid-run checkpoint"
         );
-        for refused in [
-            receipt_only(terminal),
-            receipt_only(mid_run_checkpoint_receipt(&run_id, 3)),
-            run_checkpoint(mid_run_checkpoint_receipt(&RunId::new(), 1)),
-        ] {
-            let receipt = refused.receipt().cloned().expect("a receipt");
-            let error = store
-                .commit_prepared_session_boundary(&runtime_id, refused)
-                .await
-                .expect_err("this receipt-only boundary would bypass the candidate");
-            assert!(
-                matches!(
-                    error,
-                    RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
-                ),
-                "{error:?}"
-            );
-            assert_eq!(
-                store
-                    .load_boundary_receipt(&runtime_id, &receipt.run_id, receipt.sequence)
-                    .await
-                    .unwrap(),
-                None
-            );
+        for receipt in [terminal, mid_run_checkpoint_receipt(&run_id, 1)] {
+            assert_refused_beside_tail(
+                &store,
+                &runtime_id,
+                &tail,
+                receipt_only_request(receipt, live.id()),
+            )
+            .await;
         }
     }
 

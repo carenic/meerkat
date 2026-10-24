@@ -30074,27 +30074,74 @@ ORDER BY runtime_id";
             }
         }
 
+        /// A mid-run checkpoint request of `receipt` for `session_id`.
+        fn run_checkpoint_request(
+            receipt: RunBoundaryReceipt,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> PreparedRuntimeSessionCommit {
+            PreparedRuntimeSessionCommit::run_checkpoint(receipt, Vec::new(), session_id.clone())
+                .expect("a mid-run checkpoint receipt")
+        }
+
+        /// An ordinary receipt-only success request of `receipt` for
+        /// `session_id`.
+        fn receipt_only_request(
+            receipt: RunBoundaryReceipt,
+            session_id: &meerkat_core::types::SessionId,
+        ) -> PreparedRuntimeSessionCommit {
+            PreparedRuntimeSessionCommit::success(
+                None,
+                receipt,
+                Vec::new(),
+                Some(session_id.clone()),
+            )
+        }
+
+        /// Commit `request` beside the standing WholeBlob tail and expect the
+        /// store to refuse it with nothing written: no receipt, the same tail.
+        async fn assert_refused_beside_whole_blob_tail(
+            store: &SqliteRuntimeStore,
+            runtime_id: &LogicalRuntimeId,
+            tail: &WholeBlobProvisionalTailAuthority,
+            request: PreparedRuntimeSessionCommit,
+        ) {
+            let receipt = request.receipt().cloned().expect("a receipt");
+            let error = store
+                .commit_prepared_session_boundary(runtime_id, request)
+                .await
+                .expect_err("this receipt-only boundary would bypass the candidate");
+            assert!(
+                matches!(
+                    error,
+                    RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                store
+                    .load_boundary_receipt(runtime_id, &receipt.run_id, receipt.sequence)
+                    .await
+                    .unwrap(),
+                None
+            );
+            assert_eq!(
+                store
+                    .load_whole_blob_provisional_tail(runtime_id)
+                    .await
+                    .unwrap()
+                    .map(|loaded| loaded.authority().clone())
+                    .as_ref(),
+                Some(tail)
+            );
+        }
+
         /// The SQLite twin of the in-memory row: a run's mid-run checkpoint
         /// receipts commit receipt-only beside its standing WholeBlob
-        /// provisional tail and leave the tail for the terminal promotion;
-        /// another run's checkpoint and every ordinary receipt-only boundary
-        /// still cannot bypass the candidate.
+        /// provisional tail and leave the tail for the terminal promotion.
         #[tokio::test]
         async fn sqlite_mid_run_receipt_commits_beside_its_runs_provisional_tail() {
             let (_dir, store) = temp_store();
             let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
-            let run_checkpoint = |receipt: RunBoundaryReceipt| {
-                PreparedRuntimeSessionCommit::run_checkpoint(receipt, Vec::new(), live.id().clone())
-                    .expect("a mid-run checkpoint receipt")
-            };
-            let receipt_only = |receipt: RunBoundaryReceipt| {
-                PreparedRuntimeSessionCommit::success(
-                    None,
-                    receipt,
-                    Vec::new(),
-                    Some(live.id().clone()),
-                )
-            };
             let owner = mid_run_checkpoint_receipt(&run_id, 1);
             let mut input = mid_run_checkpoint_receipt(&run_id, 2);
             input.owner_contributions.clear();
@@ -30104,7 +30151,7 @@ ORDER BY runtime_id";
                     store
                         .commit_prepared_session_boundary(
                             &runtime_id,
-                            run_checkpoint(receipt.clone())
+                            run_checkpoint_request(receipt.clone(), live.id())
                         )
                         .await
                         .expect("a mid-run receipt commits beside its run's tail"),
@@ -30129,37 +30176,140 @@ ORDER BY runtime_id";
                 Some(tail),
                 "the tail stands for the run's terminal promotion"
             );
+        }
 
-            let mut terminal = mid_run_checkpoint_receipt(&run_id, 3);
+        /// The SQLite twin: a checkpoint receipt of a run other than the
+        /// tail's never commits beside the tail.
+        #[tokio::test]
+        async fn sqlite_a_foreign_runs_checkpoint_never_commits_beside_a_tail() {
+            let (_dir, store) = temp_store();
+            let (runtime_id, live, _run_id, _base, tail) = rebase_run_with_tail(&store).await;
+            let foreign = mid_run_checkpoint_receipt(&RunId::new(), 1);
+            assert_refused_beside_whole_blob_tail(
+                &store,
+                &runtime_id,
+                &tail,
+                run_checkpoint_request(foreign, live.id()),
+            )
+            .await;
+        }
+
+        /// The SQLite twin: a receipt-only success never commits beside a
+        /// standing WholeBlob tail, even with the run's own checkpoint-shaped
+        /// receipt.
+        #[tokio::test]
+        async fn sqlite_a_receipt_only_success_never_commits_beside_a_tail() {
+            let (_dir, store) = temp_store();
+            let (runtime_id, live, run_id, _base, tail) = rebase_run_with_tail(&store).await;
+            let mut terminal = mid_run_checkpoint_receipt(&run_id, 1);
             terminal.owner_contributions.clear();
             terminal.boundary = RunApplyBoundary::RunStart;
             terminal.conversation_digest = Some(live.transcript_content_digest().unwrap());
             terminal.message_count = live.messages().len();
-            for refused in [
-                receipt_only(terminal),
-                receipt_only(mid_run_checkpoint_receipt(&run_id, 3)),
-                run_checkpoint(mid_run_checkpoint_receipt(&RunId::new(), 1)),
-            ] {
-                let receipt = refused.receipt().cloned().expect("a receipt");
-                let error = store
-                    .commit_prepared_session_boundary(&runtime_id, refused)
-                    .await
-                    .expect_err("this receipt-only boundary would bypass the candidate");
-                assert!(
-                    matches!(
-                        error,
-                        RuntimeStoreError::SessionPersistenceAuthorityConflict { .. }
+            for receipt in [terminal, mid_run_checkpoint_receipt(&run_id, 1)] {
+                assert_refused_beside_whole_blob_tail(
+                    &store,
+                    &runtime_id,
+                    &tail,
+                    receipt_only_request(receipt, live.id()),
+                )
+                .await;
+            }
+        }
+
+        /// HeadCanonical control for the WholeBlob rows above: a HeadCanonical
+        /// store never refused a receipt-only boundary beside its provisional
+        /// tail, and it commits a run checkpoint exactly like a receipt-only
+        /// success there, leaving the tail as it stands.
+        #[tokio::test]
+        async fn head_canonical_commits_a_run_checkpoint_beside_its_tail_like_a_receipt_only_success()
+         {
+            let dir = TempDir::new().unwrap();
+            let path = dir.path().join("hc-run-checkpoint.sqlite3");
+            let store = SqliteRuntimeStore::new_head_canonical(&path).unwrap();
+            let physical_store = SqliteSessionStore::open(path.clone()).unwrap();
+            let session = session_with_user("the committed base");
+            let session_id = session.id().clone();
+            let runtime_id = LogicalRuntimeId::for_session(&session_id);
+            let root = PreparedHeadCanonicalMutation::prepare(&session, None).unwrap();
+            let committed = store
+                .commit_prepared_session_boundary(
+                    &runtime_id,
+                    PreparedRuntimeSessionCommit::snapshot_only(
+                        BoundSessionCommit::head_canonical_from_session(&session, root).unwrap(),
                     ),
-                    "{error:?}"
+                )
+                .await
+                .unwrap()
+                .authority()
+                .and_then(RuntimeSessionAuthority::head_canonical)
+                .expect("root HeadCanonical authority")
+                .clone();
+            let observed_head = physical_store
+                .load_head(&session_id)
+                .await
+                .unwrap()
+                .expect("root physical head");
+            let mut resumed = physical_store
+                .load(&session_id)
+                .await
+                .unwrap()
+                .expect("root physical session");
+            resumed.push(Message::User(UserMessage::text("the run's first round")));
+            let round =
+                PreparedHeadCanonicalMutation::prepare(&resumed, Some(observed_head)).unwrap();
+            let run_id = RunId::new();
+            let provisional = store
+                .write_prepared_head_canonical_provisional_tail(
+                    &runtime_id,
+                    PreparedHeadCanonicalProvisionalTail::prepare(
+                        committed,
+                        run_id.clone(),
+                        round.successor_head(),
+                        round.successor_head_token(),
+                        &resumed,
+                    )
+                    .unwrap(),
+                )
+                .await
+                .unwrap();
+            let checkpoint = mid_run_checkpoint_receipt(&run_id, 1);
+            let receipt_only = mid_run_checkpoint_receipt(&run_id, 2);
+            for (receipt, request) in [
+                (
+                    checkpoint.clone(),
+                    run_checkpoint_request(checkpoint, &session_id),
+                ),
+                (
+                    receipt_only.clone(),
+                    receipt_only_request(receipt_only, &session_id),
+                ),
+            ] {
+                assert_eq!(
+                    store
+                        .commit_prepared_session_boundary(&runtime_id, request)
+                        .await
+                        .expect("HeadCanonical commits the receipt beside its tail"),
+                    PreparedRuntimeSessionCommitResult::receipt_only(
+                        RuntimeSessionPersistenceProfile::HeadCanonicalV1
+                    )
                 );
                 assert_eq!(
                     store
-                        .load_boundary_receipt(&runtime_id, &receipt.run_id, receipt.sequence)
+                        .load_boundary_receipt(&runtime_id, &run_id, receipt.sequence)
                         .await
                         .unwrap(),
-                    None
+                    Some(receipt)
                 );
             }
+            assert_eq!(
+                store
+                    .load_head_canonical_provisional_tail(&runtime_id)
+                    .await
+                    .unwrap(),
+                Some(provisional),
+                "the HeadCanonical tail stands"
+            );
         }
 
         #[tokio::test]
