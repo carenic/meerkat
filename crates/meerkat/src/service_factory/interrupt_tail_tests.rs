@@ -2628,6 +2628,171 @@ async fn an_observation_defers_its_settle_past_a_held_turn_boundary_head_canonic
     );
 }
 
+/// Run A's tail, standing after an observation deferred its settle under
+/// a held turn-finalization boundary: run A is interrupted after a round
+/// commit, its own settle holds the tail beside a row of another run, that
+/// row ends, and a read of the session under the boundary (held here as a
+/// runtime loop lap holds it) leaves the tail to a later settle. The live
+/// actor is still hosted. Returns the session, run A and the held boundary.
+async fn a_tail_deferred_under_a_held_boundary(
+    start: &Start,
+    client: &ScriptedModel,
+) -> (SessionId, RunId, tokio::sync::OwnedMutexGuard<()>) {
+    let id = start.materialize(None).await;
+    client.push(Step::Tool);
+    client.push(Step::Held);
+    let turn_a = start.admit(&id, "first").await;
+    tokio::time::timeout(DEADLINE, client.entered.acquire())
+        .await
+        .expect("run A holds at its model call after its tool round")
+        .expect("model gate")
+        .forget();
+    let run_a = start
+        .tail_run(&id)
+        .await
+        .expect("run A's round commit stands as the provisional tail");
+    let other_runs_row = strand_another_runs_row(start, &id, &run_a, None).await;
+    interrupt_run_a(start, &id, turn_a).await;
+    end_another_runs_row(start, &id, other_runs_row).await;
+    let boundary = start
+        .service
+        .acquire_runtime_turn_finalization_guard(&id)
+        .await;
+    observe_hosted_session(start, &id).await;
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a.clone()),
+        "a read under the held boundary leaves A's tail to a later settle"
+    );
+    (id, run_a, boundary)
+}
+
+/// Retire the session's runtime while the boundary is held, as a retire
+/// lands while a lap holds it, and read the session the way a host's start
+/// does next: the read of a retired runtime discards the live actor whose
+/// settle it deferred, so no later observation can settle A's tail.
+async fn retire_and_discard_the_actor_under_the_boundary(start: &Start, id: &SessionId) {
+    tokio::time::timeout(
+        DEADLINE,
+        start
+            .machine
+            .retire_runtime_control_plane(&LogicalRuntimeId::for_session(id)),
+    )
+    .await
+    .expect("the retire answers under the held boundary")
+    .expect("the retire");
+    let live = tokio::time::timeout(
+        DEADLINE,
+        meerkat_core::service::SessionService::has_live_session(start.service.as_ref(), id),
+    )
+    .await
+    .expect("the read answers at once")
+    .expect("the read");
+    assert!(!live, "the read of the retired runtime discards the live actor");
+    assert!(
+        start.service.live_session_actor_witness(id).await.is_none(),
+        "no live actor is hosted any more"
+    );
+}
+
+/// The strict read of a session, and A's tail closed as interrupted under
+/// it: the prompt committed once and the interrupted-run notice last.
+async fn assert_the_strict_read_closed_a(
+    start: &Start,
+    id: &SessionId,
+    read: Result<Option<meerkat_core::Session>, meerkat_core::service::SessionError>,
+) {
+    let session = read
+        .expect("the strict read succeeds: no standing tail refuses it")
+        .expect("the session is committed");
+    assert_eq!(start.tail_run(id).await, None, "A's tail is settled");
+    let rows = transcript_rows(&session);
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.as_str() == "user first")
+            .count(),
+        1,
+        "A's prompt is committed once: {rows:?}"
+    );
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some("notice Generic"),
+        "A is closed as interrupted: {rows:?}"
+    );
+}
+
+/// A settle an observation deferred under a held turn boundary survives the
+/// discard of the live actor. A retire lands while the lap holds the
+/// boundary, and the read of the retired runtime discards the actor before
+/// the lap ends, so no observation settles A's tail any more. Once the lap
+/// ends, a strict authoritative read of the session settles the tail and
+/// reads the committed session. RED before: the deferred settle was dropped
+/// with the actor, and the strict read refused the boundary with the typed
+/// transcript revision conflict until a later start settled the tail.
+#[tokio::test]
+async fn a_strict_read_settles_the_tail_a_discarded_actor_left_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let (id, _run_a, boundary) = a_tail_deferred_under_a_held_boundary(&start, &client).await;
+    retire_and_discard_the_actor_under_the_boundary(&start, &id).await;
+    drop(boundary);
+
+    let read = start.service.load_authoritative_session(&id).await;
+    assert_the_strict_read_closed_a(&start, &id, read).await;
+}
+
+/// A strict read while the lap still holds the boundary waits for the lap
+/// (bounded) and then settles the tail the discarded actor left: it never
+/// settles inside the lap, and it never refuses the boundary because the
+/// settle has not run yet. RED before: the read refused at once.
+#[tokio::test]
+async fn a_strict_read_under_a_held_boundary_settles_the_tail_after_the_lap_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let (id, run_a, boundary) = a_tail_deferred_under_a_held_boundary(&start, &client).await;
+    retire_and_discard_the_actor_under_the_boundary(&start, &id).await;
+
+    let read = {
+        let service = start.service.clone();
+        let id = id.clone();
+        tokio::spawn(async move { service.load_authoritative_session(&id).await })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a),
+        "nothing settles the tail inside the lap"
+    );
+    drop(boundary);
+    let read = tokio::time::timeout(DEADLINE, read)
+        .await
+        .expect("the strict read answers once the lap ends")
+        .expect("strict read task");
+    assert_the_strict_read_closed_a(&start, &id, read).await;
+}
+
+/// A strict read after the lap settles the tail an observation deferred
+/// while the live actor is still hosted: it is the first observation after
+/// the lap the deferral names, so no other read has to come first. RED
+/// before: only an observation settled the tail, and the strict read
+/// refused the boundary.
+#[tokio::test]
+async fn a_strict_read_after_the_lap_settles_the_tail_an_observation_deferred_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let (id, _run_a, boundary) = a_tail_deferred_under_a_held_boundary(&start, &client).await;
+    drop(boundary);
+
+    let read = start.service.load_authoritative_session(&id).await;
+    assert_the_strict_read_closed_a(&start, &id, read).await;
+}
+
 /// Wait until `input_id` is bound to `run_id`: the steer joined the run.
 async fn wait_for_input_run(
     start: &Start,
