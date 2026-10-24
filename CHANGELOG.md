@@ -1621,7 +1621,8 @@ them.
   dispatch, Domain-scoped and runless, for MCP server operations only.
   Every operation is prepared from the current enrollment, the operator's
   grant, the connector approval it records and the operation owner, and is
-  audited to the request's own sink. No review composition is attached,
+  audited in the runtime store's service-call audit log (next entry). No
+  review composition is attached,
   so an operation that needs review is refused, and the connector owner
   still checks the slot's credential at the call. A scoped composition's
   admitted-work owner reaches the record through the new defaulted
@@ -1629,7 +1630,47 @@ them.
   keeps the default, so the seam is unavailable outside scoped
   compositions and on ungoverned machines. The `ServiceOccurrence` a
   request carries is host-asserted audit data, not authority. Additive:
-  no wire, contract or persistence change.
+  no wire or contract change.
+
+- `meerkat-runtime`: the service-call audit log, the native owner of a
+  governed service call's audit. No input row's commit can hold the
+  observations of a call that no input carries, so the machine builds the
+  request's sink itself (`ServiceCallRequest::from_trusted_host` takes no
+  sink): it stages each observation in process, and the machine's store
+  makes them durable with the new `RuntimeStore::append_service_call_audit`.
+  Each call's decision and root entry are appended through the fenced
+  dispatch's observation barrier (next entry), after the call is prepared
+  and staged at its root entry and before any dispatcher code runs; a
+  failed append refuses the call with `operation_observation_unavailable`
+  and nothing is sent. What the call stages after that (its outcome) is
+  appended once it returns; a failure there is reported beside the call's
+  result (`ServiceCallOutcome::audit`), and the `ServiceCall` then refuses
+  every later call before it is sent. Rows are
+  `StoredAuthorizationAuditObservation`s keyed by the service original's
+  identity digest, the occurrence and a store-assigned sequence
+  (`ServiceCallAuditKey`, `ServiceCallRequest::audit_key`), and
+  `RuntimeStore::read_service_call_audit` is their protected native read.
+  The SQLite and in-memory stores implement both. Every other store, the
+  host store SPI's runtime store included, keeps the provided defaults,
+  which answer `Unsupported`: it compiles, and refuses every service call
+  before it is sent. A decorator forwards both. A machine without a store
+  admits no service call. In SQLite the log is its own
+  schema domain, `runtime-service-call-audit`, provisioned by the first
+  append; a binary without the domain leaves it alone and still opens the
+  file.
+
+- `meerkat-core`: `authorization::OperationObservationBarrier` and
+  `ToolDispatchContext::with_observation_barrier`. A fenced dispatch whose
+  context carries a barrier awaits it after the call's decision is
+  prepared, any review admitted and the root entry staged, and before any
+  dispatcher code runs, then checks the decision again. A decision
+  prepared again during the wait (an owner change) is staged with a new
+  root entry and the barrier is awaited once more, at most three times
+  before the call is refused as `ReprepareRequired`, so what the barrier
+  made durable carries the decision the call enters with. A barrier error
+  refuses the call with `operation_observation_unavailable`, unsent. Only
+  the native runtime installs one, for a governed service call; a context
+  without one is dispatched exactly as before. Additive.
 
 - `meerkat-mob`: `MobLifecycleObservation`, a mob's lifecycle as its
   handles observe it without asking its actor: the last phase the actor

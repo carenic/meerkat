@@ -578,15 +578,19 @@ secret_env = ["SEARCH_API_KEY"]
   go through `MeerkatMachine::prepare_service_call` under a service original
   the host enrolled. The operator's grant for exactly that MCP server, the
   connector approval it records and the operation owner decide each call,
-  Domain-scoped, runless and audited. The occurrence identities are audit
-  data, not authority; an ungoverned runtime refuses.
+  Domain-scoped and runless. Each call is audited in the runtime store's
+  service-call audit log before it is sent (a failed write refuses it
+  unsent). The occurrence identities are audit data, not authority; an
+  ungoverned runtime, or one without a store or the log, refuses.
 
 ## Audit and security events
 
 - Governed work records protected audit observations (prepared and refused
   decisions, outcomes, withheld mandatory-hook operations) in the work's native
-  input row in the runtime store. There is no separate audit log and no CLI or
-  RPC method to read it. A failed required observation is
+  input row in the runtime store; a governed service call, which no input
+  carries, records them in the runtime store's service-call audit log
+  (`RuntimeStore::read_service_call_audit`, Rust only). There is no CLI or
+  RPC method to read either. A failed required observation is
   `operation_observation_unavailable`, never shown as a denial; an optional
   event exporter is not the authoritative record. A missing record after a crash
   does not prove no effect happened.

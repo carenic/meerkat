@@ -3033,6 +3033,54 @@ END";
             retired_objects: &[],
         };
 
+    /// The service-call audit log: the observations of governed service
+    /// calls, which no runtime input carries, keyed by the enrolled service
+    /// original's identity digest, the occurrence and the row's sequence.
+    /// Append-only.
+    const CREATE_RUNTIME_SERVICE_CALL_AUDIT_SCHEMA_SQL: &str = r"
+CREATE TABLE runtime_service_call_audit (
+    original_digest TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    sequence INTEGER NOT NULL CHECK (sequence >= 0),
+    observation_json BLOB NOT NULL,
+    PRIMARY KEY (original_digest, occurrence_id, sequence)
+)";
+
+    fn migration_0001_runtime_service_call_audit(
+        tx: &rusqlite::Transaction<'_>,
+    ) -> Result<(), rusqlite::Error> {
+        tx.execute_batch(CREATE_RUNTIME_SERVICE_CALL_AUDIT_SCHEMA_SQL)
+    }
+
+    /// The service-call audit log's own schema domain, beside
+    /// [`RUNTIME_STORE_DOMAIN`] in the runtime store's file.
+    ///
+    /// Like [`RUNTIME_DELIVERY_DOMAIN`], it is NOT applied by
+    /// [`open_runtime_connection`]: the first audit append provisions it
+    /// ([`open_runtime_service_call_audit_write_connection`]), so only a
+    /// file where a governed service call was audited carries the domain
+    /// row and its table. A binary that does not know the domain leaves it
+    /// alone as a foreign co-tenant: the runtime store's own domain is
+    /// unchanged, and such a binary still opens the file.
+    pub const RUNTIME_SERVICE_CALL_AUDIT_DOMAIN: meerkat_sqlite::SchemaDomain =
+        meerkat_sqlite::SchemaDomain {
+            name: "runtime-service-call-audit",
+            migrations: &[meerkat_sqlite::Migration {
+                version: 1,
+                name: "service-call-audit-log",
+                apply: migration_0001_runtime_service_call_audit,
+            }],
+            initialize_current: migration_0001_runtime_service_call_audit,
+            allowed_existing_versions: &[1],
+            bridge_recoverable_versions: &[],
+            released_predecessors: &[],
+            owned_objects: &[meerkat_sqlite::SchemaObject {
+                kind: meerkat_sqlite::SchemaObjectKind::Table,
+                name: "runtime_service_call_audit",
+            }],
+            retired_objects: &[],
+        };
+
     #[cfg(test)]
     mod schema_floor_tests {
         use super::*;
@@ -5346,6 +5394,68 @@ END";
         )
         .map_err(map_shared_sqlite_error)?;
         meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_DELIVERY_DOMAIN)
+            .map_err(map_shared_sqlite_error)?;
+        Ok(RuntimeConn {
+            conn,
+            _guard: guard,
+        })
+    }
+
+    /// Service-call audit read connection: `None` when the store's file or
+    /// the audit domain is absent, since a store where no governed service
+    /// call was audited holds no rows. Like the delivery read connection, it
+    /// never creates the store or provisions the domain.
+    fn open_runtime_service_call_audit_read_connection(
+        path: &Path,
+    ) -> Result<Option<RuntimeConn>, RuntimeStoreError> {
+        if runtime_database_absent(path) {
+            meerkat_sqlite::OperationGuard::admit_missing_database(path)
+                .map_err(map_shared_sqlite_error)?;
+            return Ok(None);
+        }
+        let guard =
+            meerkat_sqlite::OperationGuard::for_database(path).map_err(map_shared_sqlite_error)?;
+        let conn = match meerkat_sqlite::open_with(
+            path,
+            meerkat_sqlite::ConnectionProfile::Primary { create: false },
+            meerkat_sqlite::OpenOptions {
+                schema_preflight: &[&RUNTIME_SERVICE_CALL_AUDIT_DOMAIN],
+                ..meerkat_sqlite::OpenOptions::default()
+            },
+        ) {
+            Ok(conn) => conn,
+            // Removed between the check and the open: still no rows.
+            Err(_) if runtime_database_absent(path) => return Ok(None),
+            Err(error) => return Err(map_shared_sqlite_error(error)),
+        };
+        let version =
+            meerkat_sqlite::preflight_domain_version(&conn, &RUNTIME_SERVICE_CALL_AUDIT_DOMAIN)
+                .map_err(map_shared_sqlite_error)?;
+        Ok(version.map(|_| RuntimeConn {
+            conn,
+            _guard: guard,
+        }))
+    }
+
+    /// Service-call audit write connection: provisions the audit domain on
+    /// first use. This is the ONLY place the `runtime-service-call-audit`
+    /// ledger row is stamped: auditing a governed service call marks the
+    /// file, opening a realm does not.
+    fn open_runtime_service_call_audit_write_connection(
+        path: &Path,
+    ) -> Result<RuntimeConn, RuntimeStoreError> {
+        let guard =
+            meerkat_sqlite::OperationGuard::for_database(path).map_err(map_shared_sqlite_error)?;
+        let mut conn = meerkat_sqlite::open_with(
+            path,
+            meerkat_sqlite::ConnectionProfile::PRIMARY,
+            meerkat_sqlite::OpenOptions {
+                schema_preflight: &[&RUNTIME_SERVICE_CALL_AUDIT_DOMAIN],
+                ..meerkat_sqlite::OpenOptions::default()
+            },
+        )
+        .map_err(map_shared_sqlite_error)?;
+        meerkat_sqlite::apply_domain_migrations(&mut conn, &RUNTIME_SERVICE_CALL_AUDIT_DOMAIN)
             .map_err(map_shared_sqlite_error)?;
         Ok(RuntimeConn {
             conn,
@@ -16051,6 +16161,118 @@ ORDER BY runtime_id";
 
         fn supports_compaction_projection_outbox(&self) -> bool {
             true
+        }
+
+        async fn append_service_call_audit(
+            &self,
+            batch: crate::store::ServiceCallAuditBatch,
+        ) -> Result<(), RuntimeStoreError> {
+            if batch.observations.is_empty() {
+                return Ok(());
+            }
+            let rows = batch
+                .observations
+                .iter()
+                .map(|observation| {
+                    serde_json::to_vec(observation).map_err(|error| {
+                        RuntimeStoreError::WriteFailed(format!(
+                            "service call audit observation does not encode: {error}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let path = self.path.clone();
+            let key = batch.key;
+            spawn_blocking_holding_claim(move || {
+                let mut conn = open_runtime_service_call_audit_write_connection(&path)?;
+                let tx = begin_runtime_transaction(&mut conn)?;
+                // The key's next sequence, read in the batch's own
+                // transaction: rows follow every row the key holds, whichever
+                // call or process appended them.
+                let next: i64 = tx
+                    .query_row(
+                        r"
+                        SELECT COALESCE(MAX(sequence) + 1, 0)
+                          FROM runtime_service_call_audit
+                         WHERE original_digest = ?1 AND occurrence_id = ?2
+                        ",
+                        params![key.original_digest(), key.occurrence()],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                for (sequence, observation_json) in (next..).zip(rows) {
+                    tx.execute(
+                        r"
+                        INSERT INTO runtime_service_call_audit
+                            (original_digest, occurrence_id, sequence, observation_json)
+                        VALUES (?1, ?2, ?3, ?4)
+                        ",
+                        params![
+                            key.original_digest(),
+                            key.occurrence(),
+                            sequence,
+                            observation_json,
+                        ],
+                    )
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+                }
+                tx.commit()
+                    .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
+        async fn read_service_call_audit(
+            &self,
+            key: &crate::store::ServiceCallAuditKey,
+        ) -> Result<Vec<crate::store::ServiceCallAuditRecord>, RuntimeStoreError> {
+            let path = self.path.clone();
+            let key = key.clone();
+            spawn_blocking_holding_claim(move || {
+                let Some(conn) = open_runtime_service_call_audit_read_connection(&path)? else {
+                    return Ok(Vec::new());
+                };
+                let read_failed =
+                    |error: rusqlite::Error| RuntimeStoreError::ReadFailed(error.to_string());
+                let mut statement = conn
+                    .prepare(
+                        r"
+                        SELECT sequence, observation_json
+                          FROM runtime_service_call_audit
+                         WHERE original_digest = ?1 AND occurrence_id = ?2
+                         ORDER BY sequence
+                        ",
+                    )
+                    .map_err(read_failed)?;
+                let rows = statement
+                    .query_map(params![key.original_digest(), key.occurrence()], |row| {
+                        Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(read_failed)?;
+                let mut records = Vec::new();
+                for row in rows {
+                    let (sequence, observation_json) = row.map_err(read_failed)?;
+                    let sequence = u64::try_from(sequence).map_err(|_| {
+                        RuntimeStoreError::ReadFailed(format!(
+                            "service call audit row has the negative sequence {sequence}"
+                        ))
+                    })?;
+                    let observation =
+                        serde_json::from_slice(&observation_json).map_err(|error| {
+                            RuntimeStoreError::ReadFailed(format!(
+                                "service call audit row {sequence} does not decode: {error}"
+                            ))
+                        })?;
+                    records.push(crate::store::ServiceCallAuditRecord::new(
+                        sequence,
+                        observation,
+                    ));
+                }
+                Ok(records)
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
         }
 
         async fn load_runtime_delivery_authority(

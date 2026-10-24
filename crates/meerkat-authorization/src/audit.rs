@@ -1,7 +1,9 @@
 //! Protected observations from the actual grant-backed work compiler.
 //!
-//! The sink belongs to the native input row. This module has no audit registry,
-//! permission lookup, replay reducer, durability claim, or exporter fallback.
+//! The sink belongs to the work's native audit owner: the native input row,
+//! or for a governed service call the machine's service-call audit log. This
+//! module has no audit registry, permission lookup, replay reducer,
+//! durability claim, or exporter fallback.
 
 use std::sync::Arc;
 
@@ -27,7 +29,8 @@ use crate::publication::{LocalAuthorizationPublication, PublicationError};
 use crate::work::LocalAuthorizationClock;
 
 /// Only the grant-backed factory builds this adapter after selecting the real
-/// compiler and the native row-bound sink. All authority still lives in `inner`.
+/// compiler and the work's native sink (row-bound, or the service-call audit
+/// log's). All authority still lives in `inner`.
 pub(crate) struct AuditedWorkAuthorization {
     pub(crate) inner: Arc<dyn WorkAuthorization>,
     pub(crate) associations: Arc<[InputAuthorityAssociation]>,

@@ -625,6 +625,39 @@ impl Default for OpsLifecycleState {
     }
 }
 
+/// The in-memory service-call audit log: each key's observations, oldest
+/// first.
+type ServiceCallAuditLog = BTreeMap<
+    super::ServiceCallAuditKey,
+    Vec<meerkat_authorization_contracts::audit::StoredAuthorizationAuditObservation>,
+>;
+
+/// An observer of every service-call audit append a store is asked for
+/// (test support).
+#[cfg(any(test, feature = "test-support"))]
+pub type ServiceCallAuditAppendObserver = Arc<dyn Fn(&super::ServiceCallAuditBatch) + Send + Sync>;
+
+/// Test support: what the next service-call audit appends do.
+#[cfg(any(test, feature = "test-support"))]
+#[derive(Default)]
+struct ServiceCallAuditFaults {
+    /// Each append first calls this, with the batch it was asked to write.
+    observer: Option<ServiceCallAuditAppendObserver>,
+    /// The next appends to refuse, and the error they answer; nothing is
+    /// written for a refused append.
+    refuse: Option<(usize, RuntimeStoreError)>,
+    /// The next append for this key signals the first notify, then waits
+    /// for the second before it does anything else.
+    block: Option<(super::ServiceCallAuditKey, InputStateBatchCasTestBlock)>,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl std::fmt::Debug for ServiceCallAuditFaults {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ServiceCallAuditFaults")
+    }
+}
+
 /// In-memory runtime store. Thread-safe via `tokio::sync::Mutex`, except the
 /// ops lifecycle state, which is behind its own std mutex (see
 /// `OpsLifecycleState`).
@@ -636,6 +669,12 @@ pub struct InMemoryRuntimeStore {
     inner: Arc<Mutex<Inner>>,
     ops_lifecycle: Arc<StdMutex<OpsLifecycleState>>,
     auth_oauth_flow_snapshot: Arc<StdMutex<Option<Vec<u8>>>>,
+    /// The service-call audit log: each key's rows, oldest first, so a
+    /// row's sequence is its index. Append-only.
+    service_call_audit: Arc<StdMutex<ServiceCallAuditLog>>,
+    /// Test support: scripted outcomes of service-call audit appends.
+    #[cfg(any(test, feature = "test-support"))]
+    service_call_audit_faults: Arc<StdMutex<ServiceCallAuditFaults>>,
     #[cfg(test)]
     auth_oauth_flow_store_calls: Arc<AtomicUsize>,
     #[cfg(test)]
@@ -681,6 +720,89 @@ pub struct InMemoryRuntimeStore {
 }
 
 impl InMemoryRuntimeStore {
+    /// Test support: call `observer` with every service-call audit batch
+    /// this store is asked to append, before the append is decided.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn observe_service_call_audit_appends_for_test(
+        &self,
+        observer: ServiceCallAuditAppendObserver,
+    ) {
+        if let Ok(mut faults) = self.service_call_audit_faults.lock() {
+            faults.observer = Some(observer);
+        }
+    }
+
+    /// Test support: refuse the next `appends` service-call audit appends
+    /// with `error`, writing nothing for them (`Unsupported` stands for a
+    /// store without the log).
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn refuse_service_call_audit_appends_for_test(
+        &self,
+        appends: usize,
+        error: RuntimeStoreError,
+    ) {
+        if let Ok(mut faults) = self.service_call_audit_faults.lock() {
+            faults.refuse = (appends > 0).then_some((appends, error));
+        }
+    }
+
+    /// Test support: the next service-call audit append for `key` signals
+    /// `entered`, then waits for `release` before it is decided or written.
+    /// Appends for other keys go on meanwhile.
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn block_next_service_call_audit_append_for_test(
+        &self,
+        key: super::ServiceCallAuditKey,
+        entered: Arc<crate::tokio::sync::Notify>,
+        release: Arc<crate::tokio::sync::Notify>,
+    ) {
+        if let Ok(mut faults) = self.service_call_audit_faults.lock() {
+            faults.block = Some((key, (entered, release)));
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn take_service_call_audit_block(
+        &self,
+        key: &super::ServiceCallAuditKey,
+    ) -> Option<InputStateBatchCasTestBlock> {
+        let mut faults = self.service_call_audit_faults.lock().ok()?;
+        if faults
+            .block
+            .as_ref()
+            .is_some_and(|(blocked, _)| blocked == key)
+        {
+            return faults.block.take().map(|(_, block)| block);
+        }
+        None
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    fn scripted_service_call_audit_append(
+        &self,
+        batch: &super::ServiceCallAuditBatch,
+    ) -> Result<(), RuntimeStoreError> {
+        let (observer, refusal) = {
+            let mut faults = self.service_call_audit_faults.lock().map_err(|_| {
+                RuntimeStoreError::WriteFailed("service call audit faults poisoned".into())
+            })?;
+            let refusal = match faults.refuse.take() {
+                Some((remaining, error)) => {
+                    if remaining > 1 {
+                        faults.refuse = Some((remaining - 1, error.clone()));
+                    }
+                    Some(error)
+                }
+                None => None,
+            };
+            (faults.observer.clone(), refusal)
+        };
+        if let Some(observer) = observer {
+            observer(batch);
+        }
+        refusal.map_or(Ok(()), Err)
+    }
+
     #[cfg(test)]
     pub(crate) fn auth_oauth_flow_store_calls(&self) -> usize {
         self.auth_oauth_flow_store_calls.load(Ordering::Acquire)
@@ -789,6 +911,9 @@ impl InMemoryRuntimeStore {
             inner: Arc::new(Mutex::new(Inner::default())),
             ops_lifecycle: Arc::new(StdMutex::new(OpsLifecycleState::default())),
             auth_oauth_flow_snapshot: Arc::new(StdMutex::new(None)),
+            service_call_audit: Arc::new(StdMutex::new(ServiceCallAuditLog::new())),
+            #[cfg(any(test, feature = "test-support"))]
+            service_call_audit_faults: Arc::new(StdMutex::new(ServiceCallAuditFaults::default())),
             #[cfg(test)]
             auth_oauth_flow_store_calls: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
@@ -2797,6 +2922,51 @@ impl RuntimeStore for InMemoryRuntimeStore {
             replacement,
             inserted_delivery,
         )
+    }
+
+    async fn append_service_call_audit(
+        &self,
+        batch: super::ServiceCallAuditBatch,
+    ) -> Result<(), RuntimeStoreError> {
+        if batch.observations.is_empty() {
+            return Ok(());
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        if let Some((entered, release)) = self.take_service_call_audit_block(&batch.key) {
+            entered.notify_one();
+            release.notified().await;
+        }
+        #[cfg(any(test, feature = "test-support"))]
+        self.scripted_service_call_audit_append(&batch)?;
+        let mut log = self.service_call_audit.lock().map_err(|_| {
+            RuntimeStoreError::WriteFailed("service call audit log poisoned".into())
+        })?;
+        let rows = log.entry(batch.key).or_default();
+        rows.try_reserve(batch.observations.len())
+            .map_err(|error| RuntimeStoreError::WriteFailed(error.to_string()))?;
+        rows.extend(batch.observations);
+        Ok(())
+    }
+
+    async fn read_service_call_audit(
+        &self,
+        key: &super::ServiceCallAuditKey,
+    ) -> Result<Vec<super::ServiceCallAuditRecord>, RuntimeStoreError> {
+        let log = self
+            .service_call_audit
+            .lock()
+            .map_err(|_| RuntimeStoreError::ReadFailed("service call audit log poisoned".into()))?;
+        Ok(log
+            .get(key)
+            .map(|rows| {
+                rows.iter()
+                    .zip(0_u64..)
+                    .map(|(observation, sequence)| {
+                        super::ServiceCallAuditRecord::new(sequence, observation.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default())
     }
 
     async fn load_continuation_key_binding(
