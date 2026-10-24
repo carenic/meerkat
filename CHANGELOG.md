@@ -1773,13 +1773,14 @@ them.
   exempt route are never offered and keep today's refusal, as does a runtime
   without a binder; an ungoverned runtime is unchanged. A governed input
   whose id names a stored row admitted under another association is refused
-  as a replay conflict. The by-key input reads (`input_state_by_idempotency_key`,
-  the durable-only read, and interaction terminal status and receipts by
-  key) also find a governed row named by its own input id, when the row's
-  own retained association qualifies the key to its admission key, so a
-  member host's tracked deliveries, completions and cancels reach governed
-  rows. New `StoredInputState::admitted_under_idempotency_key` says whether a
-  row was admitted under a key, a governed row's qualification included.
+  as a replay conflict. A member host reads a tracked delivery by its
+  payload input id with the new `MeerkatMachine::tracked_delivery_input_state`,
+  and the tracked cancel resolves a payload id the same way: the row with
+  that id, kept only when it was admitted under that id as its key (the new
+  `StoredInputState::admitted_under_idempotency_key`: the id itself, or a
+  governed delivery's qualification of it). So tracked completions and
+  cancels reach governed deliveries, and never another input that merely
+  carries the id as its key.
 
 - `meerkat-mob`: a controlling host can narrow the operator authority it
   records for a placed member. `SpawnMemberSpec::with_operator_authority_ceiling`
