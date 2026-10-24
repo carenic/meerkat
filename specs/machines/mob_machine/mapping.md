@@ -4353,6 +4353,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveAutonomousShutdownMemberActionKeepForResumeCompleted`
   - anchors: `mob_actor_authority`
   - scenarios: (unclaimed)
+- `ObserveRuntimeDestroyedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ObserveRuntimeDestroyedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitDestroyMemberRetireRuntimeEndedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitDestroyMemberRetireRuntimeEndedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`

@@ -5342,6 +5342,25 @@ pub(super) fn render_member_comms_name(
     Ok(meerkat_core::MemberCommsName::new(mob_id, role, member)?.to_string())
 }
 
+/// How a member's session runtime ended outside the mob, as the runtime
+/// reports its state at a start's readiness pass.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberRuntimeEnded {
+    Retired,
+    Destroyed,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl MemberRuntimeEnded {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Retired => "retired",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
 fn observed_runtime_id(signal: &mob_dsl::MobMachineSignal) -> Option<&mob_dsl::AgentRuntimeId> {
     match signal {
         mob_dsl::MobMachineSignal::ObserveRuntimeReady {
@@ -21657,7 +21676,9 @@ impl MobActor {
             return Ok(());
         };
         #[cfg(feature = "runtime-adapter")]
-        let targets = self.break_members_retired_outside_the_mob(targets).await;
+        let targets = self
+            .break_members_whose_runtime_ended_outside_the_mob(targets)
+            .await;
         let expected = member_readiness_expectations(&targets);
         let readiness = self.spawn_member_readiness_tasks(targets, progress.cloned());
         let outcomes =
@@ -21666,13 +21687,13 @@ impl MobActor {
     }
 
     /// The startup readiness targets without the members whose session
-    /// runtime the runtime reports `Retired`. The mob's own retire flow keeps
-    /// its members out of the targets already (`runtime_retire_pending_sessions`),
-    /// so such a runtime was retired outside it: there is no runtime to make
-    /// ready, and the member is recorded Broken, typed, while the mob keeps
-    /// serving the others.
+    /// runtime the runtime reports `Retired` or `Destroyed`. The mob's own
+    /// retire flow keeps its members out of the targets already
+    /// (`runtime_retire_pending_sessions`), so such a runtime was retired or
+    /// destroyed outside it: there is no runtime to make ready, and the member
+    /// is recorded Broken, typed, while the mob keeps serving the others.
     #[cfg(feature = "runtime-adapter")]
-    async fn break_members_retired_outside_the_mob(
+    async fn break_members_whose_runtime_ended_outside_the_mob(
         &mut self,
         targets: Vec<MemberReadinessTarget>,
     ) -> Vec<MemberReadinessTarget> {
@@ -21682,21 +21703,26 @@ impl MobActor {
         };
         let mut kept = Vec::with_capacity(targets.len());
         for target in targets {
-            let retired_session = match target.entry.member_ref.bridge_session_id() {
-                Some(session_id)
-                    if matches!(
-                        adapter.runtime_state(session_id).await,
-                        Ok(meerkat_runtime::RuntimeState::Retired)
-                    ) =>
-                {
-                    Some(session_id.clone())
-                }
-                _ => None,
+            let ended = match target.entry.member_ref.bridge_session_id() {
+                Some(session_id) => match adapter.runtime_state(session_id).await {
+                    Ok(meerkat_runtime::RuntimeState::Retired) => {
+                        Some((session_id.clone(), MemberRuntimeEnded::Retired))
+                    }
+                    Ok(meerkat_runtime::RuntimeState::Destroyed) => {
+                        Some((session_id.clone(), MemberRuntimeEnded::Destroyed))
+                    }
+                    _ => None,
+                },
+                None => None,
             };
-            match retired_session {
-                Some(session_id) => {
-                    self.record_member_runtime_retired(&target.entry, &session_id)
-                        .await;
+            match ended {
+                Some((session_id, ended)) => {
+                    self.record_member_runtime_ended_outside_the_mob(
+                        &target.entry,
+                        &session_id,
+                        ended,
+                    )
+                    .await;
                 }
                 None => kept.push(target),
             }
@@ -21704,34 +21730,41 @@ impl MobActor {
         kept
     }
 
-    /// Record `entry` Broken because its session runtime was retired outside
-    /// the mob: the typed MobMachine restore failure plus the handle
-    /// diagnostic, with the projected comms identity cleared.
+    /// Record `entry` Broken because its session runtime `ended` (retired or
+    /// destroyed) outside the mob: the typed MobMachine restore failure plus
+    /// the handle diagnostic, with the projected comms identity cleared.
     #[cfg(feature = "runtime-adapter")]
-    async fn record_member_runtime_retired(&mut self, entry: &RosterEntry, session_id: &SessionId) {
+    async fn record_member_runtime_ended_outside_the_mob(
+        &mut self,
+        entry: &RosterEntry,
+        session_id: &SessionId,
+        ended: MemberRuntimeEnded,
+    ) {
         let reason = format!(
-            "member '{}' runtime for session {session_id} was retired outside the mob; respawn the member",
-            entry.agent_identity
+            "member '{}' runtime for session {session_id} was {} outside the mob; respawn the member",
+            entry.agent_identity,
+            ended.as_str()
         );
         if let Err(error) = self.apply_dsl_signal(
             mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
                 agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
                 reason: reason.clone(),
             },
-            "member_runtime_retired_outside_the_mob",
+            "member_runtime_ended_outside_the_mob",
         ) {
             tracing::error!(
                 mob_id = %self.definition.id,
                 agent_identity = %entry.agent_identity,
                 %error,
-                "MobMachine rejected the retired member runtime restore failure"
+                "MobMachine rejected the restore failure of a member runtime ended outside the mob"
             );
         }
         tracing::warn!(
             mob_id = %self.definition.id,
             agent_identity = %entry.agent_identity,
             session_id = %session_id,
-            "member runtime was retired outside the mob; marked member broken"
+            ended = ended.as_str(),
+            "member runtime ended outside the mob; marked member broken"
         );
         self.record_member_restore_failure(
             &entry.agent_identity,
@@ -59945,6 +59978,7 @@ impl MobActor {
                             &detail,
                             "external_delivery_terminal_pending_run",
                             "external_delivery_terminal_complete_flow",
+                            "external_delivery_terminal_finish_run",
                         )
                         .await
                     {
@@ -60186,6 +60220,7 @@ impl MobActor {
                 detail,
                 "external_delivery_pre_realization_failure",
                 "external_delivery_recovery_complete_flow",
+                "external_delivery_recovery_finish_run",
             )
             .await
         {
@@ -60263,6 +60298,7 @@ impl MobActor {
         detail: &str,
         terminalization_context: &'static str,
         completion_context: &'static str,
+        finish_context: &'static str,
     ) -> Result<(), MobError> {
         self.terminalize_failed_in_actor(
             run_id.clone(),
@@ -60273,7 +60309,11 @@ impl MobActor {
             terminalization_context,
         )
         .await?;
+        // The compensation started the run (RunFlow, StartRun), so it ends
+        // it as every other run end does: CompleteFlow and FinishRun. No task,
+        // token or stream exists for this run to finish it later.
         self.apply_dsl_signal(mob_dsl::MobMachineSignal::CompleteFlow, completion_context)?;
+        self.apply_dsl_signal(mob_dsl::MobMachineSignal::FinishRun, finish_context)?;
         Ok(())
     }
 

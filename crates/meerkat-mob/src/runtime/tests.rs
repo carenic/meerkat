@@ -2634,6 +2634,29 @@ impl MockSessionService {
         *self.runtime_adapter.lock().expect("runtime_adapter mutex") = Some(adapter);
     }
 
+    /// Whether `id`'s runtime was destroyed. PersistentSessionService reads a
+    /// session whose runtime is Destroyed as archived by authority
+    /// (`session_archived_by_authority`): it is neither live nor loadable, so
+    /// a member's disposal finds its archive already complete.
+    async fn runtime_destroyed(&self, id: &SessionId) -> bool {
+        let adapter = self
+            .runtime_adapter
+            .lock()
+            .expect("runtime_adapter mutex")
+            .clone();
+        match adapter {
+            Some(adapter) => matches!(
+                meerkat_runtime::RuntimeControlPlane::runtime_state(
+                    adapter.as_ref(),
+                    &meerkat_runtime::LogicalRuntimeId::for_session(id),
+                )
+                .await,
+                Ok(meerkat_runtime::RuntimeState::Destroyed)
+            ),
+            None => false,
+        }
+    }
+
     async fn set_comms_identity_seed(&self, session_id: &SessionId, seed: impl Into<String>) {
         self.comms_identity_seeds
             .write()
@@ -4720,6 +4743,9 @@ impl SessionService for MockSessionService {
     }
 
     async fn has_live_session(&self, id: &SessionId) -> Result<bool, SessionError> {
+        if self.runtime_destroyed(id).await {
+            return Ok(false);
+        }
         Ok(self.sessions.read().await.contains_key(id))
     }
 
@@ -5989,9 +6015,12 @@ impl MobSessionService for MockSessionService {
             return Err(refusal.error(session_id));
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
-        // Mirror PersistentSessionService: archived sessions have no loadable
-        // durable snapshot (archive is terminal).
-        let persisted = if self.archived_session_ids.read().await.contains(session_id) {
+        // Mirror PersistentSessionService: archived sessions, and sessions
+        // whose runtime was destroyed (archived by authority), have no
+        // loadable durable snapshot (archive is terminal).
+        let persisted = if self.archived_session_ids.read().await.contains(session_id)
+            || self.runtime_destroyed(session_id).await
+        {
             None
         } else {
             self.persisted_session_clone(session_id).await
@@ -35857,6 +35886,23 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     );
 }
 
+/// How a host ends a member's session runtime outside the mob's own retire
+/// flow, through the runtime control plane.
+#[derive(Clone, Copy, Debug)]
+enum RuntimeEndedOutsideTheMob {
+    Retired,
+    Destroyed,
+}
+
+impl RuntimeEndedOutsideTheMob {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Retired => "retired",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
 /// A member whose session runtime is retired outside the mob before a cold
 /// start's readiness pass (the runtime reads Retired, and its live comms
 /// runtime is gone with it) is recorded Broken with the typed reason. The
@@ -35864,6 +35910,318 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
 /// stopping the whole mob over a runtime nothing can make ready.
 #[tokio::test]
 async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outside_the_mob() {
+    cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+        RuntimeEndedOutsideTheMob::Retired,
+    )
+    .await;
+}
+
+/// The same for a runtime a host destroys outside the mob
+/// (`RuntimeControlPlane::destroy` on the member's runtime id): only that
+/// member ends Broken, with a typed reason that says its runtime was
+/// destroyed outside the mob, and the mob keeps serving the other member.
+/// RED today: the runtime's `RuntimeDestroyed` reaches the mob as
+/// `ObserveRuntimeDestroyed`, and MobMachine moves the whole mob to
+/// Destroyed for any live member runtime, so the start ends with the mob
+/// Destroyed.
+#[tokio::test]
+async fn test_cold_start_breaks_only_the_member_whose_runtime_was_destroyed_outside_the_mob() {
+    cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+        RuntimeEndedOutsideTheMob::Destroyed,
+    )
+    .await;
+}
+
+/// The mob's own destroy still destroys every member. With two autonomous
+/// members live, a destroy through the mob handle ends the mob Destroyed and
+/// ends every member's session runtime: the mob admits its destroy before
+/// any member runtime ends, so a destroyed member runtime ends the mob there,
+/// while one destroyed outside the mob removes only that member (the rows
+/// above).
+#[tokio::test]
+async fn test_the_mobs_own_destroy_still_destroys_every_member() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let members = [
+        AgentIdentity::from("own-destroy-a"),
+        AgentIdentity::from("own-destroy-b"),
+    ];
+    for member in &members {
+        handle
+            .spawn(ProfileName::from("worker"), member.clone(), None)
+            .await
+            .expect("spawn autonomous member");
+    }
+    handle
+        .wait_for_members_ready(&members, Some(Duration::from_secs(2)))
+        .await
+        .expect("members reach startup readiness");
+    let mut sessions = Vec::new();
+    for member in &members {
+        sessions.push(
+            handle
+                .get_member(member)
+                .await
+                .expect("member lookup")
+                .expect("member roster entry")
+                .member_ref
+                .bridge_session_id()
+                .cloned()
+                .expect("the member is session-backed"),
+        );
+    }
+
+    let report = handle.destroy().await.expect("destroy");
+    assert!(
+        report.errors.is_empty(),
+        "the mob's own destroy reports no cleanup error: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        MobState::Destroyed
+    );
+    for session in &sessions {
+        let state = adapter.runtime_state(session).await;
+        assert!(
+            !matches!(
+                state,
+                Ok(meerkat_runtime::RuntimeState::Idle
+                    | meerkat_runtime::RuntimeState::Attached
+                    | meerkat_runtime::RuntimeState::Running)
+            ),
+            "every member's session runtime ends with the mob: {session} reads {state:?}"
+        );
+    }
+}
+
+/// A mob whose member's session runtime ended outside it (a host retired or
+/// destroyed the runtime through the runtime control plane) can still be
+/// destroyed: once the mob has removed that runtime, its own destroy retires
+/// and archives every member, the one whose runtime is gone included, and the
+/// mob ends Destroyed.
+async fn a_mob_destroy_after_a_member_runtime_ended_outside_completes(
+    ended: RuntimeEndedOutsideTheMob,
+) {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(sample_definition(), MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let kept = AgentIdentity::from(format!("destroy-after-{}-kept", ended.word()));
+    let gone = AgentIdentity::from(format!("destroy-after-{}-gone", ended.word()));
+    for member in [&kept, &gone] {
+        handle
+            .spawn(ProfileName::from("worker"), member.clone(), None)
+            .await
+            .expect("spawn autonomous member");
+    }
+    handle
+        .wait_for_members_ready(&[kept.clone(), gone.clone()], Some(Duration::from_secs(2)))
+        .await
+        .expect("members reach startup readiness");
+    let entry = handle
+        .get_member(&gone)
+        .await
+        .expect("member lookup")
+        .expect("member roster entry");
+    let session = entry
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("the member is session-backed");
+    let machine_runtime =
+        crate::machines::mob_machine::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
+
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session);
+    match ended {
+        RuntimeEndedOutsideTheMob::Retired => {
+            adapter
+                .retire_runtime_control_plane(&runtime_id)
+                .await
+                .expect("retire the member's runtime outside the mob");
+        }
+        RuntimeEndedOutsideTheMob::Destroyed => {
+            meerkat_runtime::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
+                .await
+                .expect("destroy the member's runtime outside the mob");
+        }
+    }
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while handle
+        .query_machine_state()
+        .await
+        .expect("machine state")
+        .live_runtime_ids
+        .contains(&machine_runtime)
+    {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the mob removes the runtime {} outside it",
+            ended.word()
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        MobState::Running,
+        "a member runtime {} outside the mob leaves the mob running",
+        ended.word()
+    );
+
+    let report = tokio::time::timeout(Duration::from_secs(20), handle.destroy())
+        .await
+        .expect("the destroy answers")
+        .unwrap_or_else(|error| {
+            panic!(
+                "the mob's destroy completes after a member runtime {} outside it: {error:?}",
+                ended.word()
+            )
+        });
+    assert!(
+        report.errors.is_empty(),
+        "the destroy reports no cleanup error: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        handle.status().await.expect("mob status"),
+        MobState::Destroyed
+    );
+}
+
+#[tokio::test]
+async fn test_a_mob_destroy_after_a_member_runtime_retired_outside_completes() {
+    a_mob_destroy_after_a_member_runtime_ended_outside_completes(
+        RuntimeEndedOutsideTheMob::Retired,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_a_mob_destroy_after_a_member_runtime_destroyed_outside_completes() {
+    a_mob_destroy_after_a_member_runtime_ended_outside_completes(
+        RuntimeEndedOutsideTheMob::Destroyed,
+    )
+    .await;
+}
+
+/// An admitted destroy that returned incomplete, then a member runtime
+/// destroyed outside the mob (an operator unsticking the destroy), then the
+/// destroy's retry. The first attempt fails at the first member's retirement
+/// start, so no member is retiring yet. The outside destroy removes only that
+/// runtime: the mob keeps its admitted destroy and everything the destroy has
+/// to drain, and the retry drives every member through its retirement and
+/// archive and ends the mob through its Destroy input. Before, the
+/// observation ended the mob without the destroy's drains, and the retry
+/// skipped the retire admissions, the host revokes and the Destroy input.
+#[tokio::test]
+async fn test_an_incomplete_destroy_retried_after_a_member_runtime_destroyed_outside_completes() {
+    let definition = with_unique_mob_id(sample_definition(), "destroy-retry-after-outside-destroy");
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, service) = create_test_mob_with_events(definition, events.clone()).await;
+    let adapter = service.enable_runtime_adapter();
+    let members = [
+        AgentIdentity::from("retry-after-outside-a"),
+        AgentIdentity::from("retry-after-outside-b"),
+    ];
+    for member in &members {
+        handle
+            .spawn(ProfileName::from("worker"), member.clone(), None)
+            .await
+            .expect("spawn autonomous member");
+    }
+    handle
+        .wait_for_members_ready(&members, Some(Duration::from_secs(2)))
+        .await
+        .expect("members reach startup readiness");
+
+    events.fail_appends_for("MemberRetirementStarted").await;
+    match handle.destroy().await {
+        Err(crate::runtime::handle::MobDestroyError::Incomplete { .. }) => {}
+        other => panic!("the first attempt stops at a member's retirement start: {other:?}"),
+    }
+    let state = handle.query_machine_state().await.expect("machine state");
+    assert!(
+        state.destroy_admitted,
+        "the first attempt admitted the destroy"
+    );
+    assert_eq!(
+        state.lifecycle_phase,
+        crate::machines::mob_machine::MobPhase::Running
+    );
+
+    // An operator destroys one member's still-live runtime outside the mob.
+    let entry = handle
+        .get_member(&members[1])
+        .await
+        .expect("member lookup")
+        .expect("member roster entry");
+    let machine_runtime =
+        crate::machines::mob_machine::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
+    assert!(state.live_runtime_ids.contains(&machine_runtime));
+    let session = entry
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("the member is session-backed");
+    meerkat_runtime::RuntimeControlPlane::destroy(
+        adapter.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&session),
+    )
+    .await
+    .expect("destroy the member's runtime outside the mob");
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let state = handle.query_machine_state().await.expect("machine state");
+        if !state.live_runtime_ids.contains(&machine_runtime)
+            || state.lifecycle_phase != crate::machines::mob_machine::MobPhase::Running
+        {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the mob observes the runtime destroyed outside it"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let state = handle.query_machine_state().await.expect("machine state");
+    assert_eq!(
+        state.lifecycle_phase,
+        crate::machines::mob_machine::MobPhase::Running,
+        "the outside destroy leaves the admitted destroy to finish"
+    );
+
+    events.allow_appends_for("MemberRetirementStarted").await;
+    let report = tokio::time::timeout(Duration::from_secs(20), handle.destroy())
+        .await
+        .expect("the retry answers")
+        .expect("the retry completes the destroy");
+    assert!(
+        report.errors.is_empty(),
+        "the retry reports no cleanup error: {:?}",
+        report.errors
+    );
+    assert_eq!(
+        handle
+            .query_machine_state()
+            .await
+            .expect("machine state")
+            .lifecycle_phase,
+        crate::machines::mob_machine::MobPhase::Destroyed
+    );
+}
+
+async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+    ended: RuntimeEndedOutsideTheMob,
+) {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -35881,8 +36239,8 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         .create()
         .await
         .expect("create mob");
-    let kept = AgentIdentity::from("cold-retired-runtime-kept");
-    let retired = AgentIdentity::from("cold-retired-runtime");
+    let kept = AgentIdentity::from(format!("cold-{}-runtime-kept", ended.word()));
+    let retired = AgentIdentity::from(format!("cold-{}-runtime", ended.word()));
     for member in [&kept, &retired] {
         handle
             .spawn(ProfileName::from("worker"), member.clone(), None)
@@ -35937,14 +36295,22 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         .await
         .expect("the cold start reaches its readiness pass")
         .expect("startup readiness gate");
-    // A host retires the member's runtime directly, outside the mob's own
+    // A host ends the member's runtime directly, outside the mob's own
     // retire flow; the member's live comms runtime goes with it.
-    adapter
-        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(
-            &retired_session,
-        ))
-        .await
-        .expect("retire the member's runtime outside the mob");
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&retired_session);
+    match ended {
+        RuntimeEndedOutsideTheMob::Retired => {
+            adapter
+                .retire_runtime_control_plane(&runtime_id)
+                .await
+                .expect("retire the member's runtime outside the mob");
+        }
+        RuntimeEndedOutsideTheMob::Destroyed => {
+            meerkat_runtime::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
+                .await
+                .expect("destroy the member's runtime outside the mob");
+        }
+    }
     restarted_service
         .set_missing_comms_runtime(&retired_session)
         .await;
@@ -35958,7 +36324,8 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
     assert_eq!(
         resumed.status().await.expect("mob status"),
         MobState::Running,
-        "a member runtime retired outside the mob does not stop the mob"
+        "a member runtime {} outside the mob does not stop the mob",
+        ended.word()
     );
     assert_eq!(
         resumed
@@ -35977,9 +36344,12 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         }) => {
             assert_eq!(member_id, retired);
             assert_eq!(session_id, Some(retired_session));
-            assert!(reason.contains("retired outside the mob"), "{reason}");
+            assert!(
+                reason.contains(&format!("{} outside the mob", ended.word())),
+                "{reason}"
+            );
         }
-        Ok(_) => panic!("the retired member is Broken, not usable"),
+        Ok(_) => panic!("the member is Broken, not usable"),
         Err(other) => panic!("expected the typed restore failure, got {other:?}"),
     }
     let ready = resumed
@@ -57353,6 +57723,73 @@ async fn test_stop_rejects_active_flow_and_schema_requires_no_active_runs() {
     );
 }
 
+/// Another member's retirement does not end the mob's runs: with a flow run
+/// active on the worker, the lead is retired (its retirement archived), the
+/// run stays counted, and a stop is still refused until the run ends. Before,
+/// the member's retirement archive reset the mob-wide run count, and the stop
+/// was admitted while the flow kept running.
+#[tokio::test]
+async fn test_stop_still_rejects_an_active_flow_after_another_member_retires() {
+    let (handle, service) =
+        create_test_mob(sample_definition_with_single_step_flow(60_000, 8)).await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn worker");
+    handle
+        .spawn(ProfileName::from("lead"), AgentIdentity::from("l-1"), None)
+        .await
+        .expect("spawn lead");
+    service.set_flow_turn_never_terminal(true);
+
+    let run_id = handle
+        .run_flow(FlowId::from("demo"), serde_json::json!({}))
+        .await
+        .expect("run flow");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    handle
+        .retire(AgentIdentity::from("l-1"))
+        .await
+        .expect("retire the lead while the flow runs");
+    assert!(
+        handle
+            .get_member(&AgentIdentity::from("l-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the lead's retirement is archived"
+    );
+
+    let error = handle
+        .stop()
+        .await
+        .expect_err("the stop still rejects the active flow");
+    assert!(matches!(
+        error,
+        MobError::InvalidTransition {
+            from: MobState::Running,
+            to: MobState::Stopped,
+        }
+    ));
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+
+    handle
+        .cancel_flow(run_id.clone())
+        .await
+        .expect("cancel flow after the rejected stop");
+    let terminal = wait_for_run_terminal(&handle, &run_id, Duration::from_secs(8)).await;
+    assert_eq!(terminal.status, MobRunStatus::Canceled);
+    handle
+        .stop()
+        .await
+        .expect("the stop is admitted once the run ended");
+}
+
 #[tokio::test]
 async fn test_failed_spawn_clears_pending_spawn_count_and_failed_roster_entry() {
     let (handle, service) = create_test_mob(sample_definition_with_auto_wire()).await;
@@ -57688,6 +58125,78 @@ async fn external_delivery_claim_failure_compensates_pending_run_and_delivery() 
         .status()
         .await
         .expect("proven Begun compensation must not fail-stop the actor");
+}
+
+/// An external delivery whose Flow admission fails after the run started
+/// (here the realization claim fails, and the delivery is compensated as
+/// failed) leaves the mob stoppable: the compensation ends the run the way
+/// every other run end does, so the mob's active run count drops back to
+/// zero. Before, the compensation finished the Flow (CompleteFlow) but not the
+/// run (FinishRun), so the count stayed at one and the stop was refused with
+/// InvalidTransition until a cancel-all, force cancel, shutdown or destroy.
+/// The delivery that turns terminal between its check and its claim takes the
+/// same compensation.
+#[tokio::test]
+async fn external_delivery_compensation_leaves_the_mob_stoppable() {
+    let definition = with_unique_mob_id(
+        sample_definition_with_single_step_flow(2_000, 8),
+        "external-delivery-compensation-stop",
+    );
+    let mob_id = definition.id.clone();
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, _service, runs, _specs, _runtime_metadata, _identity, _identity_status) =
+        create_test_mob_with_recoverable_fault_events(definition, events.clone()).await;
+    let identity = crate::store::MobExternalDeliveryIdentity::new(
+        "binding-compensation-stop",
+        Uuid::new_v4().to_string(),
+    )
+    .expect("external delivery identity");
+    let intent = crate::store::MobExternalDeliveryIntent::new(
+        mob_id.clone(),
+        identity.clone(),
+        crate::store::MobExternalDeliveryTargetKind::Flow,
+        b"flow:demo",
+    )
+    .expect("external delivery intent");
+    handle
+        .begin_external_delivery(&intent)
+        .await
+        .expect("begin external delivery");
+    events.fail_next_external_delivery_claim();
+
+    let outcome = handle
+        .run_flow_with_external_delivery(
+            FlowId::from("demo"),
+            serde_json::json!({ "case": "compensation-stop" }),
+            &intent,
+        )
+        .await
+        .expect("claim failure must converge to an observable terminal delivery");
+    assert!(
+        matches!(
+            &outcome,
+            crate::store::MobExternalFlowLaunchOutcome::ExistingTerminal(
+                crate::store::MobExternalDeliveryTerminal::Failed { .. }
+            )
+        ),
+        "claim compensation returned {outcome:?}"
+    );
+    let run_id =
+        RunId::for_external_delivery(&mob_id, &FlowId::from("demo"), &identity.idempotency_key);
+    assert_eq!(
+        runs.get_run(&run_id)
+            .await
+            .expect("read compensated run")
+            .expect("compensated run must remain durable")
+            .status,
+        MobRunStatus::Failed
+    );
+
+    handle
+        .stop()
+        .await
+        .unwrap_or_else(|error| panic!("the mob stops after the compensated delivery: {error:?}"));
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
 }
 
 #[tokio::test]

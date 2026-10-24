@@ -450,37 +450,45 @@ fi
 
 # The MobMachine member lifecycle (roster recovery and reset, session
 # binding, progress observations, the local Retire arms, RetireMember, the
-# session ingress detach, the runtime retirement and archive observations,
-# the resume path's replay arms, stop and resume) is empty in the MobMachine
-# ci sweep, whose AgentIdentityValues are {}, and deep.cfg, which has
-# identities, does not finish within the per-run cap: the spawn arms'
+# session ingress detach, the runtime retirement, destroy and archive
+# observations, the resume path's replay arms, stop and resume) is empty in
+# the MobMachine ci sweep, whose AgentIdentityValues are {}, and deep.cfg,
+# which has identities, does not finish within the per-run cap: the spawn arms'
 # parameters give a state millions of successors. A hand-written audit over
 # the same generated model gives one identity two runtime ids, two fence
 # tokens, generations 0..1 and two sessions, and drives every one of those
 # arms its domains enable without spawning, under every generated invariant
-# plus an action property (a member's recorded observation time never
-# decreases) and two invariants that check why the remaining member arms
-# cannot fire. It explores the whole reachable space, with no step bound: its
-# TLC VIEW leaves out the two counters the model never reads
+# plus action properties (a member's recorded observation time never
+# decreases; a new incarnation keeps no predecessor's health or failure
+# record; a member runtime destroyed removes only that runtime; the mob is
+# Destroyed only through a destroy it admitted) and two
+# invariants that check why the remaining member arms cannot fire. It
+# explores the whole reachable space, with no step bound: its TLC VIEW
+# leaves out the two counters the model never reads
 # (model_step_count, topology_epoch), which it checks first. It runs with
 # TLC coverage and requires every listed arm to fire and a floor of distinct
 # states, requires its six witnesses reached (one recovers an archived
 # identity's next incarnation, one replays a delayed final of an older
-# generation), and refuses four seeded defects (--mutants): a progress arm
+# generation), and refuses eight seeded defects (--mutants): a progress arm
 # without its observation guard, that guard rendered as a plain `<=` between
 # option records, which TLC cannot evaluate, a peer-only retirement-start
 # replay that drops a releasing retirement's session while its ingress
-# detach is pending, and the stale-incarnation Retired replay with its old
+# detach is pending, the stale-incarnation Retired replay with its old
 # guard, which prunes the Retiring runtime of an identity held for a
-# respawn.
+# respawn, a roster recovery that keeps its predecessor's execution health,
+# and a runtime destroy observation that ends the mob, one that leaves its
+# runtime live, and one that resets the mob's run count (the audit also starts
+# and finishes one mob-level run, so the count is not always zero).
 # A second run of the same audit drops the progress observations, adds the
-# mob's completion and destruction, and drives every RetireAtScope verdict
-# arm over every scope its domains name. It checks that exactly one verdict
-# arm is enabled for every scope, and that a Current verdict names the
-# identity's current runtime and fence and admits a Retire of that
-# incarnation; it requires two more witnesses and refuses two more defects:
-# the Current arm without its runtime and fence guards, and the
-# StaleFenceToken arm overlapping NoCurrentIncarnation.
+# mob's completion and destruction (DestroyMob, and the destroy admission,
+# after which a member runtime destroyed still removes only that runtime),
+# and drives every
+# RetireAtScope verdict arm over every scope its domains name. It checks
+# that exactly one verdict arm is enabled for every scope, and that a
+# Current verdict names the identity's current runtime and fence and admits
+# a Retire of that incarnation; it requires two more witnesses and refuses
+# two more defects: the Current arm without its runtime and fence guards,
+# and the StaleFenceToken arm overlapping NoCurrentIncarnation.
 member_lifecycle_audit="${workspace_root}/specs/machines/mob_machine/member_lifecycle_audit.sh"
 if [[ ! -x "${member_lifecycle_audit}" ]]; then
   echo "error: member lifecycle audit runner is missing from workspace runfiles: ${member_lifecycle_audit}" >&2
