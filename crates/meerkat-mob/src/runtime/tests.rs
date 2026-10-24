@@ -35390,6 +35390,139 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     );
 }
 
+/// A member whose session runtime is retired outside the mob before a cold
+/// start's readiness pass (the runtime reads Retired, and its live comms
+/// runtime is gone with it) is recorded Broken with the typed reason. The
+/// start keeps the mob Running and readies the other member, instead of
+/// stopping the whole mob over a runtime nothing can make ready.
+#[tokio::test]
+async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outside_the_mob() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runs = storage.runs.clone();
+    let specs = storage.specs.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let identity = storage.identity.clone();
+    let identity_member = storage.identity_member.clone();
+    let identity_status = storage.identity_status.clone();
+    let realm_profiles = storage.realm_profiles.clone();
+    let forked_participants = storage.forked_participants.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let kept = AgentIdentity::from("cold-retired-runtime-kept");
+    let retired = AgentIdentity::from("cold-retired-runtime");
+    for member in [&kept, &retired] {
+        handle
+            .spawn(ProfileName::from("worker"), member.clone(), None)
+            .await
+            .expect("spawn autonomous member");
+    }
+    handle
+        .wait_for_members_ready(
+            &[kept.clone(), retired.clone()],
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("fresh members reach startup readiness");
+    wait_for_keep_alive_start_turn_count(service.as_ref(), 2).await;
+    let retired_session = handle
+        .get_member(&retired)
+        .await
+        .expect("member lookup")
+        .expect("member roster entry")
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("the member is session-backed");
+    let mob_id = handle.mob_id().clone();
+
+    let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let adapter = restarted_service.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    let (entered, release) = super::actor::arm_startup_readiness_test_gate(mob_id);
+    let resume = tokio::spawn(
+        MobBuilder::for_resume(MobStorage {
+            events,
+            runs,
+            specs,
+            definition_projection_composition:
+                crate::storage::DefinitionProjectionComposition::Independent,
+            runtime_metadata,
+            identity,
+            identity_member,
+            identity_status,
+            identity_status_projection_order: Default::default(),
+            realm_profiles,
+            forked_participants,
+        })
+        .with_session_service(restarted_service.clone())
+        .notify_orchestrator_on_resume(false)
+        .resume(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("the cold start reaches its readiness pass")
+        .expect("startup readiness gate");
+    // A host retires the member's runtime directly, outside the mob's own
+    // retire flow; the member's live comms runtime goes with it.
+    adapter
+        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(
+            &retired_session,
+        ))
+        .await
+        .expect("retire the member's runtime outside the mob");
+    restarted_service
+        .set_missing_comms_runtime(&retired_session)
+        .await;
+    let _ = release.send(());
+    let resumed = tokio::time::timeout(Duration::from_secs(10), resume)
+        .await
+        .expect("the cold start answers")
+        .expect("resume task")
+        .expect("the cold start returns its handle");
+
+    assert_eq!(
+        resumed.status().await.expect("mob status"),
+        MobState::Running,
+        "a member runtime retired outside the mob does not stop the mob"
+    );
+    assert_eq!(
+        resumed
+            .member_status(&retired)
+            .await
+            .expect("retired member status")
+            .status,
+        MobMemberStatus::Broken
+    );
+    match resumed.member(&retired).await {
+        Err(MobError::MemberRestoreFailed {
+            member_id,
+            session_id,
+            reason,
+            ..
+        }) => {
+            assert_eq!(member_id, retired);
+            assert_eq!(session_id, Some(retired_session));
+            assert!(reason.contains("retired outside the mob"), "{reason}");
+        }
+        Ok(_) => panic!("the retired member is Broken, not usable"),
+        Err(other) => panic!("expected the typed restore failure, got {other:?}"),
+    }
+    let ready = resumed
+        .wait_for_members_ready(std::slice::from_ref(&kept), Some(Duration::from_secs(2)))
+        .await
+        .expect("the other member becomes startup-ready");
+    assert_eq!(ready.len(), 1);
+    assert_eq!(ready[0].1.status, MobMemberStatus::Active);
+}
+
 #[derive(Clone, Copy)]
 enum ColdLocalReadinessFault {
     RuntimeAdapter,

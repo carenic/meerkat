@@ -2433,6 +2433,16 @@ them.
   that typed cause is what it reports; a retiring member, or one whose restore
   already failed, is deferred instead (see the entries above).
 
+- `meerkat-mob`: a mob start no longer stops over a member whose session
+  runtime was retired outside the mob, by a host's direct
+  `retire_runtime_control_plane` rather than the mob's own retire flow. The
+  start's readiness pass still targeted the member, found its comms runtime
+  gone with the retire, and stopped the whole mob
+  (`MobError::MissingMemberCapability`). The pass now leaves that member out
+  and records it Broken with a typed restore failure that says its runtime
+  was retired outside the mob and to respawn the member; the mob serves its
+  other members. Only the runtime's own `Retired` state leaves a member out.
+
 - `meerkat-session`, `meerkat-mob`: a mob start after a graceful stop with a
   member's run in flight no longer fails on a HeadCanonical store. A host's
   graceful shutdown leaves the mob Stopped and suspends a member's run that

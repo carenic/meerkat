@@ -5053,6 +5053,53 @@ pub(super) fn fail_next_shutdown_drain_for_test(mob_id: &MobId) {
 static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
     std::sync::Mutex::new(std::collections::BTreeSet::new());
 
+/// One armed hold of a mob's next start, right before its startup readiness
+/// pass: the start signals the first sender on arrival and waits for the
+/// receiver to be released.
+#[cfg(test)]
+type StartupReadinessTestGate = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Receiver<()>,
+);
+
+/// Armed startup readiness holds, keyed by mob, so concurrently running
+/// tests each hold only their own mob's start.
+#[cfg(test)]
+static STARTUP_READINESS_TEST_GATE: std::sync::Mutex<
+    std::collections::BTreeMap<MobId, StartupReadinessTestGate>,
+> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Hold the next start of `mob_id` right before its startup readiness pass.
+/// The returned receiver fires when the start arrives there; sending on (or
+/// dropping) the returned sender releases it.
+#[cfg(test)]
+pub(super) fn arm_startup_readiness_test_gate(
+    mob_id: MobId,
+) -> (
+    tokio::sync::oneshot::Receiver<()>,
+    tokio::sync::oneshot::Sender<()>,
+) {
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+    STARTUP_READINESS_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id, (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn run_startup_readiness_test_gate(mob_id: &MobId) {
+    let armed = STARTUP_READINESS_TEST_GATE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(mob_id);
+    if let Some((entered_tx, release_rx)) = armed {
+        let _ = entered_tx.send(());
+        let _ = release_rx.await;
+    }
+}
+
 /// Test-support seam: the next actor start of the mob `mob_id` fail-stops in
 /// its durable recovery, before it admits a command, as a real startup
 /// recovery failure does. The seam fires once, for that mob only.
@@ -21341,11 +21388,93 @@ impl MobActor {
         else {
             return Ok(());
         };
+        #[cfg(feature = "runtime-adapter")]
+        let targets = self.break_members_retired_outside_the_mob(targets).await;
         let expected = member_readiness_expectations(&targets);
         let readiness = self.spawn_member_readiness_tasks(targets, progress.cloned());
         let outcomes =
             collect_member_readiness_outcomes(readiness, expected, &self.definition.id).await;
         self.apply_member_readiness_outcomes(outcomes).await
+    }
+
+    /// The startup readiness targets without the members whose session
+    /// runtime the runtime reports `Retired`. The mob's own retire flow keeps
+    /// its members out of the targets already (`runtime_retire_pending_sessions`),
+    /// so such a runtime was retired outside it: there is no runtime to make
+    /// ready, and the member is recorded Broken, typed, while the mob keeps
+    /// serving the others.
+    #[cfg(feature = "runtime-adapter")]
+    async fn break_members_retired_outside_the_mob(
+        &mut self,
+        targets: Vec<MemberReadinessTarget>,
+    ) -> Vec<MemberReadinessTarget> {
+        use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+        let Some(adapter) = self.runtime_adapter.clone() else {
+            return targets;
+        };
+        let mut kept = Vec::with_capacity(targets.len());
+        for target in targets {
+            let retired_session = match target.entry.member_ref.bridge_session_id() {
+                Some(session_id)
+                    if matches!(
+                        adapter.runtime_state(session_id).await,
+                        Ok(meerkat_runtime::RuntimeState::Retired)
+                    ) =>
+                {
+                    Some(session_id.clone())
+                }
+                _ => None,
+            };
+            match retired_session {
+                Some(session_id) => {
+                    self.record_member_runtime_retired(&target.entry, &session_id)
+                        .await;
+                }
+                None => kept.push(target),
+            }
+        }
+        kept
+    }
+
+    /// Record `entry` Broken because its session runtime was retired outside
+    /// the mob: the typed MobMachine restore failure plus the handle
+    /// diagnostic, with the projected comms identity cleared.
+    #[cfg(feature = "runtime-adapter")]
+    async fn record_member_runtime_retired(&mut self, entry: &RosterEntry, session_id: &SessionId) {
+        let reason = format!(
+            "member '{}' runtime for session {session_id} was retired outside the mob; respawn the member",
+            entry.agent_identity
+        );
+        if let Err(error) = self.apply_dsl_signal(
+            mob_dsl::MobMachineSignal::RecoverMemberRestoreFailure {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
+                reason: reason.clone(),
+            },
+            "member_runtime_retired_outside_the_mob",
+        ) {
+            tracing::error!(
+                mob_id = %self.definition.id,
+                agent_identity = %entry.agent_identity,
+                %error,
+                "MobMachine rejected the retired member runtime restore failure"
+            );
+        }
+        tracing::warn!(
+            mob_id = %self.definition.id,
+            agent_identity = %entry.agent_identity,
+            session_id = %session_id,
+            "member runtime was retired outside the mob; marked member broken"
+        );
+        self.record_member_restore_failure(
+            &entry.agent_identity,
+            super::handle::RestoreFailureDiagnostic {
+                bridge_session_id: Some(session_id.clone()),
+                reason,
+                hold: None,
+                registration_refusal: None,
+            },
+        )
+        .await;
     }
 
     /// Resolve which local members need a readiness step and which step.
@@ -30843,6 +30972,8 @@ impl MobActor {
                 .await;
         }
         if matches!(self.state(), MobState::Running) {
+            #[cfg(test)]
+            run_startup_readiness_test_gate(&self.definition.id).await;
             if let Err(error) = self
                 .ensure_autonomous_runtimes_from_roster(false, None)
                 .await
