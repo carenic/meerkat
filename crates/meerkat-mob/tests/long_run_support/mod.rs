@@ -2313,6 +2313,9 @@ pub async fn restart(
     .await;
     let session = killed.session.clone();
     let mut queued = None;
+    // A stop or retire before the resume ends the live session; its events
+    // are subscribed to while the gate still holds the resume.
+    let mut held_events = None;
     if let Some(gate) = &gate {
         match plan.before_resume {
             BeforeResume::Nothing => gate.release(),
@@ -2326,6 +2329,16 @@ pub async fn restart(
                 if !gate.wait_asked(STEP).await {
                     return Err("the runtime never asked before resuming the run".to_string());
                 }
+                held_events = Some(
+                    incarnation
+                        .service
+                        .subscribe_session_events_from(
+                            &session,
+                            meerkat_core::SessionEventCursor::Earliest,
+                        )
+                        .await
+                        .map_err(|error| format!("subscribe to the session's events: {error}"))?,
+                );
                 let machine = Arc::clone(&incarnation.machine);
                 let target = session.clone();
                 let retire = plan.before_resume == BeforeResume::Retire;
@@ -2398,7 +2411,15 @@ pub async fn restart(
         ));
     }
     let refused = incarnation.input_refused(&session, &killed.input).await;
-    let report = report(&incarnation, &session, killed, fence_leases).await?;
+    let report = report_from(
+        &incarnation,
+        MAIN,
+        &session,
+        killed,
+        fence_leases,
+        held_events,
+    )
+    .await?;
     let main_prompts = incarnation.prompts_in_transcript(&session, MAIN).await?;
     let provisional_tail_run =
         provisional_tail_run(incarnation.runtime_store.as_ref(), &session).await?;
@@ -2458,12 +2479,28 @@ pub async fn report_for(
     killed: &KilledState,
     fence_leases: bool,
 ) -> Result<RestartReport, String> {
+    report_from(incarnation, tag, session, killed, fence_leases, None).await
+}
+
+/// [`report_for`], reading the session's events from `held_events` when the
+/// restart subscribed to them before its session stopped being live.
+async fn report_from(
+    incarnation: &Incarnation,
+    tag: &str,
+    session: &SessionId,
+    killed: &KilledState,
+    fence_leases: bool,
+    held_events: Option<meerkat_core::comms::SessionEventSubscription>,
+) -> Result<RestartReport, String> {
     // The runs, from the events the session retains.
-    let subscription = incarnation
-        .service
-        .subscribe_session_events_from(session, meerkat_core::SessionEventCursor::Earliest)
-        .await
-        .map_err(|error| format!("replay the session's events: {error}"))?;
+    let subscription = match held_events {
+        Some(subscription) => subscription,
+        None => incarnation
+            .service
+            .subscribe_session_events_from(session, meerkat_core::SessionEventCursor::Earliest)
+            .await
+            .map_err(|error| format!("replay the session's events: {error}"))?,
+    };
     let mut stream = subscription.stream;
     let mut resumed = None;
     let mut runs: Vec<RunId> = Vec::new();
