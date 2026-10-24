@@ -5061,6 +5061,64 @@ static FAIL_STOP_ACTOR_START_FOR_MOB: MobSeamForTest =
 pub fn fail_stop_next_actor_start_for_test(mob_id: &MobId) {
     arm_mob_seam_for_test(&FAIL_STOP_ACTOR_START_FOR_MOB, mob_id);
 }
+
+/// One armed startup pause: the start reports reaching it, then waits for
+/// its release.
+#[cfg(test)]
+type StartupBindingRestorePause = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+#[cfg(test)]
+static PAUSE_BEFORE_STARTUP_BINDING_RESTORE_FOR_MOB: std::sync::LazyLock<
+    std::sync::Mutex<HashMap<MobId, StartupBindingRestorePause>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(HashMap::new()));
+
+/// Test seam: the next actor start of `mob_id` pauses right before its
+/// Running startup binding restore. The receiver resolves once the start
+/// reached the pause; sending on, or dropping, the sender releases it.
+#[cfg(test)]
+pub(super) fn pause_before_startup_binding_restore_for_test(
+    mob_id: &MobId,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    if let Ok(mut armed) = PAUSE_BEFORE_STARTUP_BINDING_RESTORE_FOR_MOB.lock() {
+        armed.insert(mob_id.clone(), (entered_tx, release_rx));
+    }
+    (entered_rx, release_tx)
+}
+
+#[cfg(test)]
+async fn pause_before_startup_binding_restore_if_armed(mob_id: &MobId) {
+    let pause = PAUSE_BEFORE_STARTUP_BINDING_RESTORE_FOR_MOB
+        .lock()
+        .ok()
+        .and_then(|mut armed| armed.remove(mob_id));
+    if let Some((entered, release)) = pause {
+        let _ = entered.send(());
+        let _ = release.await;
+    }
+}
+
+/// How many times a startup restore took each member's stopped registration
+/// over, per mob.
+#[cfg(test)]
+static STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), u64>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Test read: how many times a startup restore of `mob_id` took `member`'s
+/// stopped registration over.
+#[cfg(test)]
+pub(super) fn startup_registration_takeovers_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> u64 {
+    STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|counts| counts.get(&(mob_id.clone(), member.clone())).copied())
+        .unwrap_or_default()
+}
 #[cfg(test)]
 static FAIL_AFTER_DESTROY_MEMBER_ARCHIVE_FOR_IDENTITY: std::sync::Mutex<Option<AgentIdentity>> =
     std::sync::Mutex::new(None);
@@ -30790,6 +30848,8 @@ impl MobActor {
             self.quiesce_volatile_producers_after_fail_stop().await;
             return Err(error);
         }
+        #[cfg(test)]
+        pause_before_startup_binding_restore_if_armed(&self.definition.id).await;
         if matches!(self.dsl_state(), MobState::Running) {
             if let Err(error) = self.restore_generated_member_operation_bindings().await {
                 tracing::error!(
