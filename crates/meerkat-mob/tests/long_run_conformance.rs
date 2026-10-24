@@ -87,6 +87,17 @@ struct Harness {
     current: Mutex<Option<(Store, KilledState)>>,
 }
 
+/// A child incarnation, killed with SIGKILL and reaped however the row
+/// that spawned it ends: at its kill point, on a failure, or by a panic.
+struct ChildIncarnation(std::process::Child);
+
+impl Drop for ChildIncarnation {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn harness_failure(step: &str, detail: impl std::fmt::Display) -> ConformanceFailure {
     ConformanceFailure::new("core_long_run_harness", step, detail.to_string())
 }
@@ -132,18 +143,20 @@ impl Harness {
         write_plan(&root, plan);
         let log = std::fs::File::create(root.join("child.log"))
             .map_err(|error| harness_failure("child_log", error))?;
-        let mut child = std::process::Command::new(
-            std::env::current_exe().map_err(|error| harness_failure("current_exe", error))?,
-        )
-        .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
-        .env(ROOT_ENV, &root)
-        .stdout(
-            log.try_clone()
-                .map_err(|error| harness_failure("child_log", error))?,
-        )
-        .stderr(log)
-        .spawn()
-        .map_err(|error| harness_failure("spawn_child", error))?;
+        let mut child = ChildIncarnation(
+            std::process::Command::new(
+                std::env::current_exe().map_err(|error| harness_failure("current_exe", error))?,
+            )
+            .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
+            .env(ROOT_ENV, &root)
+            .stdout(
+                log.try_clone()
+                    .map_err(|error| harness_failure("child_log", error))?,
+            )
+            .stderr(log)
+            .spawn()
+            .map_err(|error| harness_failure("spawn_child", error))?,
+        );
         // A deploy row's child gets SIGTERM once every worker is in flight,
         // as the host's pod does, and runs its graceful shutdown.
         let deploy = DeployConfig::read(&root);
@@ -160,7 +173,7 @@ impl Harness {
             }
             if deploy.is_some() && !terminated && root.join("in-flight").exists() {
                 let _ = std::process::Command::new("kill")
-                    .args(["-TERM", &child.id().to_string()])
+                    .args(["-TERM", &child.0.id().to_string()])
                     .status();
                 terminated = true;
             }
@@ -177,7 +190,7 @@ impl Harness {
                     None => break Err("the raced child never recorded its session".to_string()),
                 }
             }
-            match child.try_wait() {
+            match child.0.try_wait() {
                 // A deploy row's child may end on its own right after its
                 // stop.
                 Ok(Some(_)) if root.join("killed").exists() => break Ok(()),
@@ -198,8 +211,8 @@ impl Harness {
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         };
-        let _ = child.kill();
-        let _ = child.wait();
+        // SIGKILL: the incarnation ends without any shutdown or cancellation.
+        drop(child);
         outcome.map_err(|error| harness_failure("kill_child", error))
     }
 
