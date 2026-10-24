@@ -4753,6 +4753,158 @@ mod durable_tests {
         );
     }
 
+    /// Live processes whose command line carries `marker`, read from the
+    /// process table.
+    #[cfg(target_os = "linux")]
+    fn live_processes_carrying(marker: &str) -> usize {
+        std::fs::read_dir("/proc")
+            .expect("read the process table")
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.bytes().all(|byte| byte.is_ascii_digit()))
+            })
+            .filter_map(|entry| std::fs::read(entry.path().join("cmdline")).ok())
+            .filter(|cmdline| String::from_utf8_lossy(cmdline).contains(marker))
+            .count()
+    }
+
+    /// A run that resumes in the process that ran it dispatches the call that
+    /// started a background job again: the resumption leaves the job, which
+    /// outlives that call, to its live owner and out of the run's
+    /// interrupted-run evidence. Only the job's submission key (its session
+    /// and call id) dedupes the re-dispatch: it returns the running job's id,
+    /// the job keeps its one attempt, and the job's one process is the only
+    /// one that ran.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn a_resumed_runs_re_dispatch_of_a_held_jobs_starting_call_joins_the_running_job() {
+        use crate::builtin::shell::{ProcessCustody, ProcessCustodyScope};
+        use meerkat_core::tool_process::InterruptedToolEvidence;
+
+        let temp = TempDir::new().expect("tempdir");
+        let session_id = SessionId::new();
+        let (runtime, job_store, config) = durable_fixture(&temp, session_id.clone());
+        let custody_root = temp.path().join("custody");
+        let scope = ProcessCustodyScope::session(&session_id);
+        let (custody, _) = ProcessCustody::recover_and_open(&custody_root, scope.clone())
+            .await
+            .expect("open custody");
+        let owner = JobManager::new(config.clone())
+            .bind_canonical_async_ops(
+                session_id.clone(),
+                Arc::new(RuntimeOpsLifecycleRegistry::new()),
+            )
+            .with_durable_job_runtime(runtime.clone());
+        owner
+            .bind_process_custody(custody.clone())
+            .expect("bind custody");
+        let run_id = meerkat_core::RunId::new();
+        let call_id = "call-that-starts-the-job";
+        // The process table is read for this marker. The shell waits on its
+        // `sleep`, so every start of the command stays one live process.
+        let marker = format!(
+            "held-job-{}",
+            meerkat_core::time_compat::new_uuid_v7().simple()
+        );
+        let command = format!("sleep 60; : {marker}");
+
+        let job_id = owner
+            .spawn_job_for_call_in_run(&command, None, 60, call_id, Some(&run_id))
+            .await
+            .expect("the run starts the job");
+        #[cfg(target_os = "linux")]
+        assert_eq!(live_processes_carrying(&marker), 1, "the job runs");
+
+        // The run resumes in this process while its job runs on.
+        let evidence = custody.run_resumes(&run_id).await.expect("the run resumes");
+        assert!(
+            evidence.is_empty(),
+            "the job's starting call is not interrupted-run evidence: {evidence:?}"
+        );
+
+        // The resumed round dispatches the call again, through the session's
+        // new manager over the same stores and the same open custody scope.
+        let (reopened, _) = ProcessCustody::recover_and_open(&custody_root, scope)
+            .await
+            .expect("reopen custody");
+        let resumed = JobManager::new(config)
+            .bind_canonical_async_ops(
+                session_id.clone(),
+                Arc::new(RuntimeOpsLifecycleRegistry::new()),
+            )
+            .with_durable_job_runtime(runtime);
+        resumed
+            .bind_process_custody(reopened)
+            .expect("bind custody");
+        let redispatched = resumed
+            .spawn_job_for_call_in_run(&command, None, 60, call_id, Some(&run_id))
+            .await
+            .expect("the re-dispatch joins the job");
+
+        assert_eq!(
+            redispatched, job_id,
+            "the re-dispatch returns the running job"
+        );
+        let jobs = job_store
+            .list_for_origin("test-realm", &session_id, 10)
+            .await
+            .expect("list jobs");
+        assert_eq!(jobs.len(), 1, "one job for the call");
+        assert_eq!(jobs[0].machine_state.lifecycle_phase, JobPhase::Running);
+        assert_eq!(
+            jobs[0].machine_state.attempt_count, 1,
+            "the job was claimed once"
+        );
+        #[cfg(target_os = "linux")]
+        assert_eq!(
+            live_processes_carrying(&marker),
+            1,
+            "the job's one process is the only one that ran"
+        );
+        let records: Vec<serde_json::Value> =
+            std::fs::read_dir(custody_root.join(session_id.to_string()))
+                .expect("list custody records")
+                .filter_map(Result::ok)
+                .filter(|entry| entry.path().extension().and_then(|e| e.to_str()) == Some("json"))
+                .map(|entry| {
+                    serde_json::from_slice(&std::fs::read(entry.path()).expect("read record"))
+                        .expect("custody record")
+                })
+                .collect();
+        assert_eq!(records.len(), 1, "one custody record: {records:?}");
+        assert_eq!(
+            records[0]["phase"], "spawned",
+            "the job's custody record stays with its owner: {records:?}"
+        );
+
+        owner.cancel_job(&job_id).await.expect("cancel the job");
+        let domain_job_id = meerkat_jobs::JobId::new(job_id.to_string()).expect("domain job id");
+        let service = DetachedJobService::new(job_store);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while service
+                .get(&domain_job_id)
+                .await
+                .expect("read")
+                .is_none_or(|snapshot| snapshot.terminal_result.is_none())
+            {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job ends");
+        #[cfg(target_os = "linux")]
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while live_processes_carrying(&marker) > 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the job's process ends");
+    }
+
     /// Every file the durable blob store wrote under `root`.
     fn blob_files(root: &std::path::Path) -> usize {
         let Ok(entries) = std::fs::read_dir(root) else {
