@@ -39504,13 +39504,29 @@ mod tests {
         Arc<InMemoryRuntimeStore>,
         SessionId,
     ) {
+        let (service, runtime_store, _sessions, session_id) =
+            whole_blob_session_and_stores_with_a_tail_the_actor_does_not_continue(run_id).await;
+        (service, runtime_store, session_id)
+    }
+
+    /// [`whole_blob_session_with_a_tail_the_actor_does_not_continue`], with
+    /// the session store a later start opens again.
+    async fn whole_blob_session_and_stores_with_a_tail_the_actor_does_not_continue(
+        run_id: &RunId,
+    ) -> (
+        PersistentSessionService<CheckpointerHoldingBuilder<FailingRunBuilder>>,
+        Arc<InMemoryRuntimeStore>,
+        Arc<MemoryStore>,
+        SessionId,
+    ) {
         use meerkat_core::SessionCheckpointer as _;
 
         let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let sessions = Arc::new(MemoryStore::new());
         let service = PersistentSessionService::new(
             CheckpointerHoldingBuilder::new(FailingRunBuilder),
             4,
-            Arc::new(MemoryStore::new()),
+            sessions.clone(),
             runtime_store.clone(),
             memory_blob_store(),
         );
@@ -39547,7 +39563,7 @@ mod tests {
             .await
             .expect("the round checkpoints")
             .expect("a durable session writes a provisional tail");
-        (service, runtime_store, created.session_id)
+        (service, runtime_store, sessions, created.session_id)
     }
 
     async fn whole_blob_tail_run(
@@ -39596,6 +39612,94 @@ mod tests {
             whole_blob_tail_run(&runtime_store, &session_id).await,
             Some(run_id),
             "the resumed run's tail is kept for the next start to repair"
+        );
+    }
+
+    /// The next start after a resumed run's refused dispatch kept its
+    /// WholeBlob tail repairs the run from that tail as interrupted, which is
+    /// what makes keeping the tail safe. The tail's run has no open bound
+    /// input (the executor stop ends the run's inputs), so it is no
+    /// continuable run: the recovery commits it with the run's rows kept and
+    /// the interrupted notice appended, and the tail is gone. Nothing of the
+    /// run is lost, and nothing is replayed. RED before the resumed-run rule:
+    /// the failure discarded the tail, so the next start found nothing to
+    /// repair and the run's rows were gone.
+    #[tokio::test]
+    async fn the_next_start_repairs_a_kept_resumed_run_as_interrupted_whole_blob() {
+        let run_id = RunId::new();
+        let (service, runtime_store, sessions, session_id) =
+            whole_blob_session_and_stores_with_a_tail_the_actor_does_not_continue(&run_id).await;
+        let runtime_id =
+            PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&session_id);
+        let refused = service
+            .apply_runtime_turn(
+                &session_id,
+                run_id.clone(),
+                runtime_turn_request_of_kind(
+                    "the resumed run's prompt",
+                    meerkat_core::lifecycle::RuntimeExecutionKind::ResumeRun,
+                ),
+                RunApplyBoundary::RunStart,
+                vec![meerkat_core::lifecycle::InputId::new()],
+            )
+            .await
+            .expect_err("the resume is refused before anything runs");
+        assert!(
+            refused.requests_runtime_executor_stop(),
+            "the refused resume stops the executor: {refused}"
+        );
+        let kept_rows =
+            RuntimeStore::load_whole_blob_provisional_tail(runtime_store.as_ref(), &runtime_id)
+                .await
+                .expect("read the provisional tail")
+                .map(|tail| {
+                    Session::decode_whole_blob_document(tail.candidate_bytes())
+                        .expect("the kept tail decodes")
+                        .session()
+                        .messages()
+                        .to_vec()
+                })
+                .expect("the resumed run's tail is kept");
+
+        // The next start: a new session service over the same stores.
+        let restarted = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            sessions,
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let recovery = restarted
+            .recover_committed_boundary(&session_id)
+            .await
+            .expect("the kept tail recovers");
+        assert_eq!(
+            recovery,
+            CommittedBoundaryRecovery::Recovered {
+                message_count: kept_rows.len() + 1,
+            },
+            "the run is repaired as interrupted"
+        );
+        let recovered =
+            RuntimeStore::load_committed_whole_blob_snapshot(runtime_store.as_ref(), &runtime_id)
+                .await
+                .expect("read the committed boundary")
+                .expect("the recovered boundary");
+        let messages = recovered.session().messages();
+        assert_eq!(
+            &messages[..kept_rows.len()],
+            kept_rows.as_slice(),
+            "the run's rows are kept"
+        );
+        assert!(
+            matches!(messages.last(), Some(Message::SystemNotice(_))),
+            "the interrupted notice closes the run: {:?}",
+            messages.last()
+        );
+        assert_eq!(
+            whole_blob_tail_run(&runtime_store, &session_id).await,
+            None,
+            "the repair consumes the tail"
         );
     }
 
