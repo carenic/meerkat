@@ -8102,6 +8102,119 @@ async fn a_direct_turn_after_a_read_settled_a_stopped_turn_acknowledges_its_fall
     let _ = stopped.handle.shutdown().await;
 }
 
+/// A resume spawn onto another mob's member session that a live actor of the
+/// same session service still hosts, whose turn stopped between its
+/// end-of-run checkpoint and its runtime boundary commit, refuses, typed, as
+/// the transcript revision conflict, and leaves the tail as the turn left
+/// it. One presence read of that session settles the tail (the row above),
+/// so the spawn decides the tail on the strict committed read before it reads
+/// the session's presence or activity. The member keeps its live actor, and
+/// a read afterwards still settles the tail, so nothing but the spawn's own
+/// refusal kept it.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_spawn_onto_a_hosted_foreign_session_tail_refuses_typed() {
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(tracing_subscriber::EnvFilter::new(
+            "warn,meerkat_runtime::recovery=info,meerkat_session::persistent=info",
+        ))
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let stopped =
+        a_hosted_member_whose_turn_stopped_before_its_boundary_commit(&paths, "hosted-foreign")
+            .await;
+    let session_id = stopped.tail.session_id.clone();
+    let adopting_mob_db_path = temp.path().join("adopting-mob.db");
+    let adopting = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&adopting_mob_db_path).expect("second mob storage"),
+    )
+    .with_session_service(stopped.service.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create a second mob over the same session service");
+    adopting
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-2")))
+        .await
+        .expect("spawn the second mob's lead");
+    let adopter = AgentIdentity::from("w-adopt");
+    // The store-owned recovery may settle the tail from here on: one read of
+    // the session would.
+    stopped.power_store.hold_durable_tail_recovery(false);
+    let tail_before = stopped.tail.durable_tail_snapshot(&stopped.store).await;
+    let spawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        adopting.spawn_spec(
+            SpawnMemberSpec::new("worker", adopter.clone())
+                .with_resume_bridge_session_id(session_id.clone()),
+        ),
+    )
+    .await
+    .expect("the resume spawn settles");
+    eprintln!(
+        "[hosted-foreign-tail-spawn] spawn => {:?}",
+        spawned.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        stopped.tail.durable_tail_snapshot(&stopped.store).await,
+        tail_before,
+        "a refused adoption of a hosted session must leave its head digests, provisional tail \
+         and physical transcript byte-identical"
+    );
+    match &spawned {
+        Err(meerkat_mob::MobError::SessionError(meerkat_core::service::SessionError::Store(
+            error,
+        ))) if error
+            .downcast_ref::<meerkat_core::SessionStoreError>()
+            .is_some_and(|error| {
+                matches!(
+                    error,
+                    meerkat_core::SessionStoreError::TranscriptRevisionConflict { id, .. }
+                        if *id == session_id
+                )
+            }) => {}
+        other => panic!(
+            "the resume spawn must refuse, typed, as the session's transcript revision \
+             conflict: {:?}",
+            other.as_ref().err().map(ToString::to_string)
+        ),
+    }
+    assert!(
+        stopped
+            .service
+            .live_session_actor_registered(&session_id)
+            .await,
+        "the first mob's member keeps its live actor"
+    );
+    let status = adopting.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a refused spawn leaves the mob running: {status:?}"
+    );
+    assert!(
+        adopting
+            .get_member(&adopter)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the refused spawn rosters no member"
+    );
+    // Control: the tail the refusal kept is one a read settles.
+    let live = meerkat_core::service::SessionService::has_live_session(
+        stopped.service.as_ref(),
+        &session_id,
+    )
+    .await
+    .expect("the read answers");
+    assert!(live, "the member's live actor is still hosted");
+    stopped.assert_tail_settled("hosted-foreign").await;
+    let _ = adopting.shutdown().await;
+    let _ = stopped.handle.shutdown().await;
+}
+
 /// A retire over a durable tail the store-owned recovery holds ends typed and
 /// keeps the tail. As in the row above, the member's turn stopped before its
 /// boundary commit and its live actor is gone, but the recovery holds the
