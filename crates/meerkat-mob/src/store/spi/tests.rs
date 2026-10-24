@@ -994,3 +994,27 @@ async fn a_reopen_keeps_every_replay_only_event_field() {
         "a reopen replays every replay-only field of the stored events"
     );
 }
+
+/// An event entry a pre-release build of this storage wrote in the public
+/// event form, without the stored codec's schema version, is refused with an
+/// error that names that form and asks for the mob to be recreated: it lacks
+/// the fields a restart needs, so it is never read without them.
+#[test]
+fn a_pre_release_event_entry_is_refused_as_such() {
+    let event = MobEvent {
+        cursor: 1,
+        timestamp: Utc::now(),
+        mob_id: MobId::from("mob"),
+        kind: MobEventKind::MobCompleted,
+    };
+    let entry = encode_single(&event).expect("encode the public event form");
+    let error = decode_event(&event_name(1), &entry).expect_err("the public form is refused");
+    let MobStoreError::ReadFailed(message) = &error else {
+        panic!("a read failure: {error:?}");
+    };
+    assert!(
+        message.contains("written by a pre-release 0.9.5 build")
+            && message.contains("recreate the mob"),
+        "{message}"
+    );
+}
