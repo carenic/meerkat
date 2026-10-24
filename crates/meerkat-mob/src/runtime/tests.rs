@@ -35390,6 +35390,23 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     );
 }
 
+/// How a host ends a member's session runtime outside the mob's own retire
+/// flow, through the runtime control plane.
+#[derive(Clone, Copy, Debug)]
+enum RuntimeEndedOutsideTheMob {
+    Retired,
+    Destroyed,
+}
+
+impl RuntimeEndedOutsideTheMob {
+    fn word(self) -> &'static str {
+        match self {
+            Self::Retired => "retired",
+            Self::Destroyed => "destroyed",
+        }
+    }
+}
+
 /// A member whose session runtime is retired outside the mob before a cold
 /// start's readiness pass (the runtime reads Retired, and its live comms
 /// runtime is gone with it) is recorded Broken with the typed reason. The
@@ -35397,6 +35414,31 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
 /// stopping the whole mob over a runtime nothing can make ready.
 #[tokio::test]
 async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outside_the_mob() {
+    cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+        RuntimeEndedOutsideTheMob::Retired,
+    )
+    .await;
+}
+
+/// The same for a runtime a host destroys outside the mob
+/// (`RuntimeControlPlane::destroy` on the member's runtime id): only that
+/// member ends Broken, with a typed reason that says its runtime was
+/// destroyed outside the mob, and the mob keeps serving the other member.
+/// RED today: the runtime's `RuntimeDestroyed` reaches the mob as
+/// `ObserveRuntimeDestroyed`, and MobMachine moves the whole mob to
+/// Destroyed for any live member runtime, so the start ends with the mob
+/// Destroyed.
+#[tokio::test]
+async fn test_cold_start_breaks_only_the_member_whose_runtime_was_destroyed_outside_the_mob() {
+    cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+        RuntimeEndedOutsideTheMob::Destroyed,
+    )
+    .await;
+}
+
+async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
+    ended: RuntimeEndedOutsideTheMob,
+) {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -35414,8 +35456,8 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         .create()
         .await
         .expect("create mob");
-    let kept = AgentIdentity::from("cold-retired-runtime-kept");
-    let retired = AgentIdentity::from("cold-retired-runtime");
+    let kept = AgentIdentity::from(format!("cold-{}-runtime-kept", ended.word()));
+    let retired = AgentIdentity::from(format!("cold-{}-runtime", ended.word()));
     for member in [&kept, &retired] {
         handle
             .spawn(ProfileName::from("worker"), member.clone(), None)
@@ -35470,14 +35512,22 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         .await
         .expect("the cold start reaches its readiness pass")
         .expect("startup readiness gate");
-    // A host retires the member's runtime directly, outside the mob's own
+    // A host ends the member's runtime directly, outside the mob's own
     // retire flow; the member's live comms runtime goes with it.
-    adapter
-        .retire_runtime_control_plane(&meerkat_runtime::LogicalRuntimeId::for_session(
-            &retired_session,
-        ))
-        .await
-        .expect("retire the member's runtime outside the mob");
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&retired_session);
+    match ended {
+        RuntimeEndedOutsideTheMob::Retired => {
+            adapter
+                .retire_runtime_control_plane(&runtime_id)
+                .await
+                .expect("retire the member's runtime outside the mob");
+        }
+        RuntimeEndedOutsideTheMob::Destroyed => {
+            meerkat_runtime::RuntimeControlPlane::destroy(adapter.as_ref(), &runtime_id)
+                .await
+                .expect("destroy the member's runtime outside the mob");
+        }
+    }
     restarted_service
         .set_missing_comms_runtime(&retired_session)
         .await;
@@ -35491,7 +35541,8 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
     assert_eq!(
         resumed.status().await.expect("mob status"),
         MobState::Running,
-        "a member runtime retired outside the mob does not stop the mob"
+        "a member runtime {} outside the mob does not stop the mob",
+        ended.word()
     );
     assert_eq!(
         resumed
@@ -35510,9 +35561,12 @@ async fn test_cold_start_breaks_only_the_member_whose_runtime_was_retired_outsid
         }) => {
             assert_eq!(member_id, retired);
             assert_eq!(session_id, Some(retired_session));
-            assert!(reason.contains("retired outside the mob"), "{reason}");
+            assert!(
+                reason.contains(&format!("{} outside the mob", ended.word())),
+                "{reason}"
+            );
         }
-        Ok(_) => panic!("the retired member is Broken, not usable"),
+        Ok(_) => panic!("the member is Broken, not usable"),
         Err(other) => panic!("expected the typed restore failure, got {other:?}"),
     }
     let ready = resumed
