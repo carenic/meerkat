@@ -5915,8 +5915,8 @@ impl DriverEntry {
         }
     }
 
-    /// Reload the `Consumed` terminals a store-owned durable-tail recovery
-    /// committed for inputs this driver still holds as non-terminal
+    /// Reload the terminals a store-owned durable-tail recovery committed for
+    /// inputs this driver still holds as non-terminal
     /// (`PersistentRuntimeDriver::adopt_durable_consumed_inputs`). Every sweep
     /// of the pending inputs (retire, reset, destroy, stop, the queued-input
     /// cancel point, a replaced attachment's predecessor work) runs it before
@@ -5932,6 +5932,32 @@ impl DriverEntry {
         let adopted = match self {
             DriverEntry::Ephemeral(_) => return Ok(Vec::new()),
             DriverEntry::Persistent(driver) => driver.adopt_durable_consumed_inputs().await?,
+        };
+        if !adopted.is_empty()
+            && let Some(completions) = completions
+        {
+            completions.lock().await.fail_inputs(
+                adopted.iter().cloned(),
+                Self::consumed_by_outside_recovery(),
+            );
+        }
+        Ok(adopted)
+    }
+
+    /// [`Self::adopt_durable_consumed_inputs`] for exactly `input_ids`, the
+    /// inputs a run start is about to stage
+    /// (`PersistentRuntimeDriver::adopt_durable_terminals_of`): an input the
+    /// store already ended outside this runtime is adopted, never staged again
+    /// from this driver's row. The adopted inputs' waiters fail as that
+    /// adoption fails them.
+    pub(crate) async fn adopt_durable_terminals_of(
+        &mut self,
+        input_ids: &[InputId],
+        completions: Option<&SharedCompletionRegistry>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let adopted = match self {
+            DriverEntry::Ephemeral(_) => return Ok(Vec::new()),
+            DriverEntry::Persistent(driver) => driver.adopt_durable_terminals_of(input_ids).await?,
         };
         if !adopted.is_empty()
             && let Some(completions) = completions

@@ -7764,6 +7764,35 @@ async fn process_queue(
             let fresh_steer_batch = prebound_run_id.is_none()
                 && batch.source() == crate::meerkat_machine::driver::RuntimeLoopBatchSource::Steer;
 
+            // An input of this batch that the store already ended outside this
+            // driver (a store-owned recovery's consumption: an observation's
+            // settle of a hosted session, or a materialization's recovery) is
+            // adopted, never staged again from this driver's row: no run may
+            // write over a terminal row or run its content a second time. The
+            // lap then plans again without it.
+            match d
+                .adopt_durable_terminals_of(batch.input_ids(), completions)
+                .await
+            {
+                Ok(adopted) if adopted.is_empty() => {}
+                Ok(adopted) => {
+                    tracing::info!(
+                        session_id = %authority_binding.session_id,
+                        inputs = adopted.len(),
+                        "adopted the store's terminals of a batch's inputs instead of staging them"
+                    );
+                    continue 'lap;
+                }
+                Err(error) => {
+                    break 'dequeue RuntimeLoopDequeueOutcome::AuthorityMismatch {
+                        input_ids: batch.input_ids().to_vec(),
+                        reason: format!(
+                            "the runtime loop could not read its batch's durable rows: {error}"
+                        ),
+                    };
+                }
+            }
+
             // Validate the machine-selected lane prefix and hydrate its payloads
             // from the ledger. Staging below is the only operation that removes
             // machine-owned lane membership.

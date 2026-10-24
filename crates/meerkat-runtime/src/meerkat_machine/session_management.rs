@@ -5720,6 +5720,12 @@ impl MeerkatMachine {
         // source, which first proves the session's earlier-incarnation tool
         // processes stopped. A failure drops the pending attachment, which
         // rolls it back.
+        //
+        // First, the terminals a recovery wrote after this registration
+        // recovered its inputs (a materialization's own durable-tail
+        // recovery) are adopted, so nothing below or after ends or stages an
+        // input the store already ended.
+        pending.adopt_recovered_input_terminals().await?;
         if let Some(evidence) = self.session_interrupted_tool_evidence(&session_id).await? {
             pending.settle_interrupted_tool_evidence(evidence).await?;
         }

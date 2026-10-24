@@ -3900,6 +3900,40 @@ impl PendingRuntimeExecutorAttachment {
         Ok(abandoned)
     }
 
+    /// Adopt, before this attachment can serve, the terminals a store-owned
+    /// recovery wrote outside this registration's driver after the driver
+    /// recovered its inputs at registration
+    /// (`DriverEntry::adopt_durable_consumed_inputs`). A materialization's own
+    /// durable-tail recovery runs between the two: it closes the tail it
+    /// finds and consumes the inputs the tail's run cursor binds, in the
+    /// store. On WholeBlob nothing settles the tail before registration, so
+    /// the driver still holds such an input as it recovered it (a staged input
+    /// rolled back to its queue), and without this its first lap would stage
+    /// the input again from that row, write over the terminal row, and run its
+    /// content a second time. Runs before every other settlement here, which
+    /// would otherwise end an input the store already ended. Returns the
+    /// adopted inputs.
+    pub(crate) async fn adopt_recovered_input_terminals(
+        &mut self,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let (driver, completions) = self
+            .exact_pending_driver("recovered input terminal adoption")
+            .await?;
+        let adopted = driver
+            .lock()
+            .await
+            .adopt_durable_consumed_inputs(Some(&completions))
+            .await?;
+        if !adopted.is_empty() {
+            tracing::info!(
+                session_id = %self.witness.session_id(),
+                inputs = adopted.len(),
+                "adopted the input terminals a recovery wrote after registration"
+            );
+        }
+        Ok(adopted)
+    }
+
     /// End, before this attachment can serve, every input an earlier
     /// graceful stop kept queued that is now older than that stop's max age
     /// (`crate::input_state::stop_requeue_expired` at `now`). Each is

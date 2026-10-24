@@ -2109,6 +2109,17 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a steer delivered just before a restart could run twice
+  on WholeBlob. When a restart's recovery closed an interrupted run's tail
+  and consumed a steer that the run's round commit had listed, the runtime
+  had already put that steer back in its queue while it recovered its
+  inputs, and its first run took the steer again: the model saw its content
+  a second time, the committed history held it twice, and the consumed input
+  row was overwritten. An attachment now adopts the input terminals a
+  recovery wrote after registration before it serves, and a run start reads
+  its batch's input rows again and adopts any the store already ended
+  instead of running it.
+
 - `meerkat`, `meerkat-rpc`: a graceful stop that keeps queued work keeps a
   session's first turn as well. When the stop suspended the run of a first
   turn that was materializing its session (a session created without a

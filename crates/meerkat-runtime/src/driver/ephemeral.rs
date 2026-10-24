@@ -3822,21 +3822,26 @@ impl EphemeralRuntimeDriver {
         Ok(())
     }
 
-    /// Adopt the `Consumed` terminal of `stored`, a durable row this driver
-    /// still holds as non-terminal: a store-owned durable-tail recovery
-    /// consumed it outside this driver, with the run whose tail it committed.
-    /// The generated authority consumes the input in memory, and its payload
-    /// follows the stored row; nothing is persisted, because the store already
-    /// holds the terminal. Returns whether the input was adopted: a row that
-    /// is not `Consumed`, or an input this driver does not hold as
-    /// non-terminal, is left alone.
-    pub(crate) fn adopt_durable_consumed_input(
+    /// Adopt the terminal of `stored`, a durable row this driver still holds
+    /// as non-terminal: a writer outside this driver (a store-owned
+    /// durable-tail recovery) ended the input in the store. The generated
+    /// authority ends the input in memory exactly as the store holds it, and
+    /// its payload follows the stored row; nothing is persisted, because the
+    /// store already holds the terminal.
+    /// - `Consumed`: consumed with the run whose tail the recovery committed.
+    /// - `Abandoned`: abandoned with the reason the row holds.
+    ///
+    /// Returns whether the input was adopted: a row that is not terminal, or
+    /// an input this driver does not hold as non-terminal, is left alone.
+    ///
+    /// # Errors
+    /// A `Superseded` or `Coalesced` row for an input this driver holds as
+    /// non-terminal: no writer outside this driver ends an input that way, so
+    /// the driver cannot reconcile it, and its caller requires a reload.
+    pub(crate) fn adopt_durable_terminal_input(
         &mut self,
         stored: &StoredInputState,
     ) -> Result<bool, RuntimeDriverError> {
-        if stored.seed.phase != InputLifecycleState::Consumed {
-            return Ok(false);
-        }
         let input_id = &stored.state.input_id;
         let Some(from_phase) = self.input_phase(input_id) else {
             return Ok(false);
@@ -3850,31 +3855,78 @@ impl EphemeralRuntimeDriver {
         ) {
             return Ok(false);
         }
-        self.dsl_apply(
-            mm_dsl::MeerkatMachineInput::ConsumeInput {
-                input_id: Self::dsl_key(input_id),
-            },
-            "ConsumeInput(DurableRecovery)",
-        )?;
-        self.sync_terminal_projection_from_machine(
-            input_id,
-            from_phase,
-            InputLifecycleState::Consumed,
-            "ConsumeDurableRecovery",
-        )?;
-        if let Some(state) = self.ledger.get_mut(input_id) {
-            state.persisted_input = stored.state.persisted_input.clone();
-        }
-        if let Some(run_id) = stored.seed.last_run_id.clone() {
-            self.events
-                .push(self.make_envelope(RuntimeEvent::InputLifecycle(
-                    InputLifecycleEvent::Consumed {
-                        input_id: input_id.clone(),
-                        run_id,
+        match stored.seed.phase {
+            InputLifecycleState::Consumed => {
+                self.dsl_apply(
+                    mm_dsl::MeerkatMachineInput::ConsumeInput {
+                        input_id: Self::dsl_key(input_id),
                     },
-                )));
+                    "ConsumeInput(DurableRecovery)",
+                )?;
+                self.sync_terminal_projection_from_machine(
+                    input_id,
+                    from_phase,
+                    InputLifecycleState::Consumed,
+                    "ConsumeDurableRecovery",
+                )?;
+                if let Some(state) = self.ledger.get_mut(input_id) {
+                    state.persisted_input = stored.state.persisted_input.clone();
+                }
+                if let Some(run_id) = stored.seed.last_run_id.clone() {
+                    self.events
+                        .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                            InputLifecycleEvent::Consumed {
+                                input_id: input_id.clone(),
+                                run_id,
+                            },
+                        )));
+                }
+                Ok(true)
+            }
+            InputLifecycleState::Abandoned => {
+                let Some(crate::input_state::InputTerminalOutcome::Abandoned { reason }) =
+                    stored.seed.terminal_outcome.clone()
+                else {
+                    return Err(RuntimeDriverError::Internal(format!(
+                        "input {input_id} is abandoned in the store without its abandon reason"
+                    )));
+                };
+                let attempt_count = u64::from(self.input_attempt_count(input_id));
+                self.dsl_apply(
+                    mm_dsl::MeerkatMachineInput::AbandonInput {
+                        input_id: Self::dsl_key(input_id),
+                        reason: mm_dsl::InputAbandonReason::from(&reason),
+                        attempt_count,
+                    },
+                    "AbandonInput(DurableRecovery)",
+                )?;
+                self.sync_terminal_projection_from_machine(
+                    input_id,
+                    from_phase,
+                    InputLifecycleState::Abandoned,
+                    "AbandonDurableRecovery",
+                )?;
+                if let Some(state) = self.ledger.get_mut(input_id) {
+                    state.persisted_input = stored.state.persisted_input.clone();
+                }
+                self.events
+                    .push(self.make_envelope(RuntimeEvent::InputLifecycle(
+                        InputLifecycleEvent::Abandoned {
+                            input_id: input_id.clone(),
+                            reason,
+                        },
+                    )));
+                Ok(true)
+            }
+            InputLifecycleState::Superseded | InputLifecycleState::Coalesced => {
+                Err(RuntimeDriverError::Internal(format!(
+                    "input {input_id} ended {:?} outside this driver, which no outside writer \
+                     does; the driver cannot adopt it",
+                    stored.seed.phase
+                )))
+            }
+            _ => Ok(false),
         }
-        Ok(true)
     }
 
     pub(crate) fn machine_normalize_live_boundary_unavailable(

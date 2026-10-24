@@ -2626,30 +2626,43 @@ impl PersistentRuntimeDriver {
         Ok(abandoned)
     }
 
-    /// Reload from the store the `Consumed` terminals a store-owned
-    /// durable-tail recovery committed for inputs this driver still holds as
-    /// non-terminal. The recovery consumes the rows bound to the run whose
-    /// tail it commits, outside this driver (an archive's settle, or an
-    /// observation's settle of a hosted session); each such input is adopted
-    /// in memory through the generated authority. Only the inputs this driver
-    /// holds as active are read, one row each: the set every sweep names.
-    /// Nothing is written, because the store already holds the terminal rows.
-    /// Returns the adopted inputs. Every sweep of the pending inputs runs this
-    /// first, so no sweep names a consumed input in its batch or writes over
-    /// its row.
+    /// Reload from the store the terminals a store-owned durable-tail
+    /// recovery committed for inputs this driver still holds as non-terminal.
+    /// The recovery consumes the rows bound to the run whose tail it commits,
+    /// outside this driver (an archive's settle, an observation's settle of a
+    /// hosted session, or a materialization's recovery after this
+    /// registration recovered its inputs); each such input is adopted in
+    /// memory through the generated authority
+    /// ([`EphemeralRuntimeDriver::adopt_durable_terminal_input`]). Only the
+    /// inputs this driver holds as active are read, one row each: the set
+    /// every sweep names. Nothing is written, because the store already holds
+    /// the terminal rows. Returns the adopted inputs. Every sweep of the
+    /// pending inputs runs this first, so no sweep names an ended input in its
+    /// batch or writes over its row.
     ///
     /// A reload that fails leaves this driver's view of those rows unknown, so
     /// it requires a registration-authorized cold reload: no later mutation
-    /// through this driver can write over the consumed rows.
+    /// through this driver can write over the ended rows.
     pub(crate) async fn adopt_durable_consumed_inputs(
         &mut self,
     ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let active = self.inner.active_input_ids();
+        self.adopt_durable_terminals_of(&active).await
+    }
+
+    /// [`Self::adopt_durable_consumed_inputs`] for exactly `input_ids`: the
+    /// inputs a run start is about to stage, read again so that no run stages
+    /// an input from this driver's row after the store ended it.
+    pub(crate) async fn adopt_durable_terminals_of(
+        &mut self,
+        input_ids: &[InputId],
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
         const OPERATION: &str = "reload of durable-tail recovery terminals";
         let mut adopted = Vec::new();
-        for input_id in self.inner.active_input_ids() {
+        for input_id in input_ids {
             let stored = match self
                 .store
-                .load_input_state(&self.runtime_id, &input_id)
+                .load_input_state(&self.runtime_id, input_id)
                 .await
             {
                 Ok(Some(stored)) => stored,
@@ -2658,8 +2671,8 @@ impl PersistentRuntimeDriver {
                     return Err(self.mark_durability_reload_required(OPERATION, error.to_string()));
                 }
             };
-            match self.inner.adopt_durable_consumed_input(&stored) {
-                Ok(true) => adopted.push(input_id),
+            match self.inner.adopt_durable_terminal_input(&stored) {
+                Ok(true) => adopted.push(input_id.clone()),
                 Ok(false) => {}
                 Err(error) => {
                     return Err(self.mark_durability_reload_required(OPERATION, error.to_string()));
