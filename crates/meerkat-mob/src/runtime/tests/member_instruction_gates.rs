@@ -3440,6 +3440,9 @@ impl MobSessionService for NonForwardingDecorator {
     fn supports_persistent_sessions(&self) -> bool {
         <Service as MobSessionService>::supports_persistent_sessions(&self.inner)
     }
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        <Service as MobSessionService>::provisional_tail_stands(&self.inner, session_id).await
+    }
     fn persisted_session_authority_read_cost(&self) -> PersistedSessionAuthorityReadCost {
         <Service as MobSessionService>::persisted_session_authority_read_cost(&self.inner)
     }

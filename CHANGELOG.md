@@ -2938,7 +2938,13 @@ them.
   (another mob's member session, say), now refuses with that typed
   transcript revision conflict (`SessionError::Store`) instead of an
   internal "resume bridge session check failed" error. The spawn does not
-  settle the tail; it stays as it was.
+  settle the tail; it stays as it was. On a WholeBlob store, whose committed
+  read never refuses under a tail, a session no live actor hosts is refused
+  with `SessionError::DurableTailHeldForRecovery` instead, decided by the new
+  `MobSessionService::provisional_tail_stands`. A session-service wrapper
+  around a persistent service must forward it: its default refuses with
+  `SessionError::Unsupported` for a service that reports persistent
+  sessions, so the spawn refuses rather than skipping the check.
 - `meerkat-mob`, `meerkat-schedule`, `meerkat-mob-mcp`: a bounded helper or
   bounded fork child with runtime mode `autonomous_host` is now refused with
   `UnsupportedForMode` before anything is spawned. This covers `spawn_helper`

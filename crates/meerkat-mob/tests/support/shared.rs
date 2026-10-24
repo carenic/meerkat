@@ -1282,6 +1282,13 @@ impl meerkat_mob::MobSessionService for FailingOnceSessionService {
         self.inner.supports_persistent_sessions()
     }
 
+    async fn provisional_tail_stands(
+        &self,
+        session_id: &meerkat_core::SessionId,
+    ) -> Result<bool, meerkat_core::service::SessionError> {
+        self.inner.provisional_tail_stands(session_id).await
+    }
+
     fn acquire_runtime_adapter(
         &self,
         explicit: Option<std::sync::Arc<meerkat_runtime::MeerkatMachine>>,

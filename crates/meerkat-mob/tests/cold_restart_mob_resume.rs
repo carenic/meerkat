@@ -2082,6 +2082,15 @@ impl PowerCutRuntimeStore {
         )
     }
 
+    /// [`Self::new`] over a WholeBlob runtime store.
+    #[cfg(feature = "test-support")]
+    fn new_whole_blob(path: &Path) -> Self {
+        Self::over(
+            meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(path)
+                .expect("open WholeBlob runtime store"),
+        )
+    }
+
     /// [`Self::new`] over a store whose sessions are hosted across processes
     /// with OS-locked claims under `hosting_root`, laid out as a realm lays
     /// them out. The store reports that capability once
@@ -6650,6 +6659,257 @@ async fn a_resume_spawn_onto_a_foreign_session_tail_refuses_typed() {
         other => panic!(
             "the resume spawn must refuse, typed, as the session's transcript revision \
              conflict: {:?}",
+            other.as_ref().err().map(ToString::to_string)
+        ),
+    }
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "a refused spawn leaves the mob running: {status:?}"
+    );
+    assert!(
+        handle
+            .get_member(&adopter)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the refused spawn rosters no member"
+    );
+    let _ = handle.shutdown().await;
+}
+
+/// What [`crash_with_a_whole_blob_member_tail`] left: member `w-1`'s
+/// session, whose run left a WholeBlob provisional tail when its process
+/// died.
+#[cfg(feature = "test-support")]
+struct WholeBlobMemberTail {
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    session_id: meerkat_core::types::SessionId,
+}
+
+/// The WholeBlob durable facts a refused resume spawn must leave alone: the
+/// store's resume observation (committed authority, catalog entry,
+/// lifecycle) and its provisional tail (authority and candidate bytes).
+#[cfg(feature = "test-support")]
+#[derive(Debug, PartialEq)]
+struct WholeBlobTailSnapshot {
+    observation: meerkat_runtime::store::RuntimeSessionResumeObservation,
+    provisional_tail: Option<(meerkat_core::WholeBlobProvisionalTailAuthority, Vec<u8>)>,
+}
+
+#[cfg(feature = "test-support")]
+impl WholeBlobMemberTail {
+    async fn snapshot(&self) -> WholeBlobTailSnapshot {
+        let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&self.session_id);
+        WholeBlobTailSnapshot {
+            observation: self
+                .runtime_store
+                .load_session_resume_observation(&runtime_id)
+                .await
+                .expect("observe the resume authority"),
+            provisional_tail: self
+                .runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .expect("read the provisional tail")
+                .map(|tail| (tail.authority().clone(), tail.candidate_bytes().to_vec())),
+        }
+    }
+}
+
+/// Whether the store records a WholeBlob provisional tail for `runtime_id`.
+#[cfg(feature = "test-support")]
+async fn whole_blob_tail_stands(
+    runtime_store: &dyn meerkat_runtime::RuntimeStore,
+    runtime_id: &meerkat_runtime::LogicalRuntimeId,
+) -> bool {
+    runtime_store
+        .load_whole_blob_provisional_tail(runtime_id)
+        .await
+        .expect("read the provisional tail")
+        .is_some()
+}
+
+/// Crash a mob led by `lead-1` over a WholeBlob store, with member `w-1`
+/// after one committed turn and a second turn whose provisional tail is
+/// written while its runtime boundary commit is not. The committed read of a
+/// WholeBlob store never refuses under that tail.
+#[cfg(feature = "test-support")]
+async fn crash_with_a_whole_blob_member_tail(paths: &Paths) -> WholeBlobMemberTail {
+    let power_store = Arc::new(PowerCutRuntimeStore::new_whole_blob(&paths.realm_db_path));
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
+    let (service_1, store_1) = persistent_service(paths, runtime_store.clone());
+    let handle_1 = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service_1.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_CUT_TAIL_TURN token-alpha",
+        "whole-blob-tail-lifetime1",
+    )
+    .await;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while whole_blob_tail_stands(runtime_store.as_ref(), &runtime_id).await {
+        assert!(
+            Instant::now() < deadline,
+            "the first turn's boundary commits and leaves no provisional tail"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // The next turn's provisional tail lands; its runtime boundary commit
+    // does not.
+    power_store.set_cut(true);
+    let send_result = tokio::time::timeout(Duration::from_secs(30), async {
+        handle_1
+            .member(&identity)
+            .await
+            .expect("member handle")
+            .send(
+                "POST_CUT_TAIL_TURN token-omega".to_string(),
+                HandlingMode::Queue,
+            )
+            .await
+    })
+    .await;
+    eprintln!("[whole-blob-tail] send during cut => {send_result:?}");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        power_store.wait_for_prepared_boundary_commit_rejection(),
+    )
+    .await
+    .expect("the cut refuses the second turn's runtime boundary commit");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !whole_blob_tail_stands(runtime_store.as_ref(), &runtime_id).await {
+        assert!(
+            Instant::now() < deadline,
+            "the second turn leaves its WholeBlob provisional tail"
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+
+    // The process dies with the member's tail in place.
+    handle_1
+        .crash_stop_preserving_durable_work_for_test()
+        .await
+        .expect("crash-stop lifetime-1 actor");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(handle_1);
+    drop(service_1);
+    drop(store_1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before lifetime 2");
+    power_store.set_cut(false);
+    WholeBlobMemberTail {
+        runtime_store,
+        session_id: w1_sid,
+    }
+}
+
+/// The WholeBlob counterpart of the row above: a resume spawn onto another
+/// mob's member session whose run left a WholeBlob provisional tail when its
+/// process died refuses, typed, as a tail held for recovery, and leaves the
+/// tail as it was. A WholeBlob committed read never refuses under such a
+/// tail, so the spawn decides it on the store's tail record: the resume's
+/// verdict would promote it before the build refuses the foreign identity.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resume_spawn_onto_a_foreign_whole_blob_session_tail_refuses_typed() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let tail = crash_with_a_whole_blob_member_tail(&paths).await;
+    let (service, _store) = persistent_service(&paths, tail.runtime_store.clone());
+    let adopting_mob_db_path = temp.path().join("adopting-mob.db");
+    let handle = MobBuilder::new(
+        mob_definition(MobRuntimeMode::TurnDriven),
+        MobStorage::persistent(&adopting_mob_db_path).expect("second mob storage"),
+    )
+    .with_session_service(service.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create a second mob on the realm");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-2")))
+        .await
+        .expect("spawn the second mob's lead");
+    let adopter = AgentIdentity::from("w-adopt");
+    let tail_before = tail.snapshot().await;
+    assert!(
+        tail_before.provisional_tail.is_some(),
+        "the crash left the run's WholeBlob provisional tail"
+    );
+    let spawned = tokio::time::timeout(
+        Duration::from_secs(60),
+        handle.spawn_spec(
+            SpawnMemberSpec::new("worker", adopter.clone())
+                .with_resume_bridge_session_id(tail.session_id.clone()),
+        ),
+    )
+    .await
+    .expect("the resume spawn settles");
+    eprintln!(
+        "[foreign-whole-blob-tail-spawn] spawn => {:?}",
+        spawned.as_ref().err().map(ToString::to_string)
+    );
+    assert_eq!(
+        tail.snapshot().await,
+        tail_before,
+        "a refused adoption must leave the session's committed authority, catalog, lifecycle \
+         and WholeBlob provisional tail byte-identical"
+    );
+    match &spawned {
+        Err(meerkat_mob::MobError::SessionError(
+            meerkat_core::service::SessionError::DurableTailHeldForRecovery { id },
+        )) if *id == tail.session_id => {}
+        other => panic!(
+            "the resume spawn must refuse, typed, as a durable tail held for recovery: {:?}",
             other.as_ref().err().map(ToString::to_string)
         ),
     }

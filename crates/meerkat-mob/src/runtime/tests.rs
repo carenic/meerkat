@@ -2306,6 +2306,10 @@ struct MockSessionService {
     /// the persistent-session contract, but its member sessions do not
     /// outlive the process.
     member_sessions_outlive_process: AtomicBool,
+    /// Cleared by [`Self::stop_forwarding_provisional_tail_check`]: the
+    /// service then answers the durable tail presence check as the trait
+    /// default does, like a persistent wrapper that does not forward it.
+    forwards_provisional_tail_check: AtomicBool,
 }
 
 impl MockSessionService {
@@ -2478,12 +2482,20 @@ impl MockSessionService {
             runtime_boundary_acknowledgements: RwLock::new(Vec::new()),
             keeps_durable_sessions: AtomicBool::new(true),
             member_sessions_outlive_process: AtomicBool::new(true),
+            forwards_provisional_tail_check: AtomicBool::new(true),
         }
     }
 
     /// Report, from now on, that this service keeps no durable sessions.
     fn keep_no_durable_sessions(&self) {
         self.keeps_durable_sessions.store(false, Ordering::SeqCst);
+    }
+
+    /// Answer the durable tail presence check from now on as a service that
+    /// does not forward it (the trait default).
+    fn stop_forwarding_provisional_tail_check(&self) {
+        self.forwards_provisional_tail_check
+            .store(false, Ordering::SeqCst);
     }
 
     /// Report, from now on, that this service's member sessions do not
@@ -5588,6 +5600,18 @@ impl MobSessionService for MockSessionService {
 
     fn supports_persistent_sessions(&self) -> bool {
         self.keeps_durable_sessions.load(Ordering::SeqCst)
+    }
+
+    /// The mock records no provisional durable tail. With the check no longer
+    /// forwarded it answers as the trait default does.
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        if !self.forwards_provisional_tail_check.load(Ordering::SeqCst) {
+            return crate::runtime::session_service::provisional_tail_stands_unforwarded(
+                self.supports_persistent_sessions(),
+                session_id,
+            );
+        }
+        Ok(false)
     }
 
     fn keeps_durable_member_sessions(&self) -> bool {
@@ -14201,6 +14225,10 @@ impl MobSessionService for PersistedListingSessionService {
         self.inner.supports_persistent_sessions()
     }
 
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        self.inner.provisional_tail_stands(session_id).await
+    }
+
     fn supports_runtime_turn_apply(&self) -> bool {
         self.inner.supports_runtime_turn_apply()
     }
@@ -14632,6 +14660,10 @@ impl MobSessionService for InactiveReadSessionService {
 
     fn supports_persistent_sessions(&self) -> bool {
         self.inner.supports_persistent_sessions()
+    }
+
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        self.inner.provisional_tail_stands(session_id).await
     }
 
     fn supports_runtime_turn_apply(&self) -> bool {
@@ -66792,6 +66824,11 @@ impl MobSessionService for RealCommsSessionService {
         true
     }
 
+    /// This fake records no provisional durable tail.
+    async fn provisional_tail_stands(&self, _session_id: &SessionId) -> Result<bool, SessionError> {
+        Ok(false)
+    }
+
     async fn live_session_actor_registered(
         &self,
         session_id: &SessionId,
@@ -95532,6 +95569,9 @@ mod member_instruction_gates;
 /// signals, concurrently and off the actor loop.
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod owned_retirement;
+/// The durable tail presence check a resume spawn asks fails closed.
+#[cfg(not(target_arch = "wasm32"))]
+mod provisional_tail_check;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod resume_bind_custody;
 /// `MobHandle::retire_at_scope` retires the incarnation its delivery scope

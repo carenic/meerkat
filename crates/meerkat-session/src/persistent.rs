@@ -13480,6 +13480,39 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .contains(id)
     }
 
+    /// Whether the store records a provisional durable tail for `id`: round
+    /// commits of a run whose runtime boundary has not committed, standing
+    /// ahead of the committed snapshot (the HeadCanonical provisional tail,
+    /// or the WholeBlob tail candidate; other profiles hold none).
+    ///
+    /// It reads the store's tail record and nothing else: it writes and
+    /// settles nothing, and takes no turn boundary, recovery gate or hosting
+    /// claim, so it never waits on a running turn. A caller that must not
+    /// complete another owner's tail asks it before anything that could
+    /// settle one. A WholeBlob tail never makes the strict committed read
+    /// refuse, so this is how such a caller sees it.
+    pub async fn provisional_tail_stands(&self, id: &SessionId) -> Result<bool, SessionError> {
+        let runtime_id = Self::runtime_id_for_session(id);
+        match self.runtime_store.session_persistence_profile() {
+            RuntimeSessionPersistenceProfile::HeadCanonicalV1 => self
+                .runtime_store
+                .load_head_canonical_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            RuntimeSessionPersistenceProfile::WholeBlobV1 => self
+                .runtime_store
+                .load_whole_blob_provisional_tail(&runtime_id)
+                .await
+                .map(|tail| tail.is_some()),
+            _ => Ok(false),
+        }
+        .map_err(|error| {
+            SessionError::Agent(AgentError::InternalError(format!(
+                "failed to observe whether a provisional tail stands for session {id}: {error}"
+            )))
+        })
+    }
+
     /// Whether this service's live actor of `id` continues the store's
     /// standing provisional tail of a run the runtime holds open.
     ///
@@ -35257,6 +35290,151 @@ mod tests {
             .await
             .expect("the running turn's round commit")
             .expect("a provisional successor");
+    }
+
+    /// `provisional_tail_stands` answers from the store's provisional-tail
+    /// record, on HeadCanonical and on WholeBlob: no tail before a running
+    /// turn's round commit, a standing one after it. It writes nothing: the
+    /// store's resume observation and the tail record read the same before
+    /// and after it answers.
+    #[tokio::test]
+    async fn provisional_tail_stands_reads_the_tail_record_on_both_formats_and_writes_nothing() {
+        use meerkat_core::SessionCheckpointer as _;
+
+        // HeadCanonical: a running turn's round commit over the committed
+        // snapshot.
+        let (_directory, service, checkpointer, committed) =
+            caller_turn_fork_source_fixture(false).await;
+        let id = committed.id().clone();
+        let runtime_id = PersistentSessionService::<DummyBuilder>::runtime_id_for_session(&id);
+        assert!(
+            !service
+                .provisional_tail_stands(&id)
+                .await
+                .expect("the presence read answers"),
+            "[head-canonical] no tail stands before the round commit"
+        );
+        let run_id = RunId::new();
+        let mut running = committed.clone();
+        commit_running_turn_round(&checkpointer, &mut running, &run_id).await;
+        let observe = service
+            .runtime_store
+            .load_session_resume_observation(&runtime_id)
+            .await
+            .expect("observe the resume authority");
+        let tail = service
+            .runtime_store
+            .load_head_canonical_provisional_tail(&runtime_id)
+            .await
+            .expect("read the provisional tail");
+        assert!(
+            tail.is_some(),
+            "[head-canonical] the round commit records its tail"
+        );
+        assert!(
+            service
+                .provisional_tail_stands(&id)
+                .await
+                .expect("the presence read answers"),
+            "[head-canonical] the round commit's tail stands"
+        );
+        assert_eq!(
+            (
+                service
+                    .runtime_store
+                    .load_session_resume_observation(&runtime_id)
+                    .await
+                    .expect("observe the resume authority"),
+                service
+                    .runtime_store
+                    .load_head_canonical_provisional_tail(&runtime_id)
+                    .await
+                    .expect("read the provisional tail"),
+            ),
+            (observe, tail),
+            "[head-canonical] the presence read writes nothing"
+        );
+
+        // WholeBlob: a run's round commit, as a provisional tail candidate.
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let service = PersistentSessionService::new(
+            CheckpointerHoldingBuilder::new(DummyBuilder),
+            4,
+            Arc::new(MemoryStore::new()),
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let created = service
+            .create_session(create_request("seed", InitialTurnPolicy::Defer))
+            .await
+            .expect("create_session should succeed");
+        let id = created.session_id;
+        let runtime_id =
+            PersistentSessionService::<CheckpointerHoldingBuilder<DummyBuilder>>::runtime_id_for_session(&id);
+        assert!(
+            !service
+                .provisional_tail_stands(&id)
+                .await
+                .expect("the presence read answers"),
+            "[whole-blob] no tail stands before the round commit"
+        );
+        let checkpointer = service
+            .live_checkpointers
+            .lock()
+            .await
+            .get(&id)
+            .cloned()
+            .and_then(|checkpointer| checkpointer.upgrade())
+            .expect("the created actor registers its checkpointer");
+        let run_id = RunId::new();
+        let mut round = service
+            .inner
+            .export_session(&id)
+            .await
+            .expect("the created actor exports its session");
+        round.push(Message::User(UserMessage::text(
+            "the run's prompt".to_string(),
+        )));
+        checkpointer
+            .checkpoint_run(&mut round, &run_id, None)
+            .await
+            .expect("the round checkpoints")
+            .expect("a durable session writes a provisional tail");
+        let observe = runtime_store
+            .load_session_resume_observation(&runtime_id)
+            .await
+            .expect("observe the resume authority");
+        let tail = runtime_store
+            .load_whole_blob_provisional_tail(&runtime_id)
+            .await
+            .expect("read the provisional tail")
+            .map(|tail| (tail.authority().clone(), tail.candidate_bytes().to_vec()));
+        assert!(
+            tail.is_some(),
+            "[whole-blob] the round commit records its tail"
+        );
+        assert!(
+            service
+                .provisional_tail_stands(&id)
+                .await
+                .expect("the presence read answers"),
+            "[whole-blob] the round commit's tail stands"
+        );
+        assert_eq!(
+            (
+                runtime_store
+                    .load_session_resume_observation(&runtime_id)
+                    .await
+                    .expect("observe the resume authority"),
+                runtime_store
+                    .load_whole_blob_provisional_tail(&runtime_id)
+                    .await
+                    .expect("read the provisional tail")
+                    .map(|tail| (tail.authority().clone(), tail.candidate_bytes().to_vec())),
+            ),
+            (observe, tail),
+            "[whole-blob] the presence read writes nothing"
+        );
     }
 
     /// The child of a caller-turn fork holds exactly the committed snapshot:

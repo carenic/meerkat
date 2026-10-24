@@ -1219,6 +1219,23 @@ impl ControllerRouteObservation {
     }
 }
 
+/// What [`MobSessionService::provisional_tail_stands`] answers by default: a
+/// service that keeps no durable sessions holds no tail, and one that reports
+/// persistent sessions without forwarding the check refuses it.
+pub(crate) fn provisional_tail_stands_unforwarded(
+    supports_persistent_sessions: bool,
+    session_id: &SessionId,
+) -> Result<bool, SessionError> {
+    if !supports_persistent_sessions {
+        return Ok(false);
+    }
+    Err(SessionError::Unsupported(format!(
+        "session {session_id}: this session service keeps durable sessions but does not \
+         forward the durable tail presence check (MobSessionService::provisional_tail_stands), \
+         so a resume spawn cannot tell whether a provisional tail stands"
+    )))
+}
+
 /// Extension trait for session services used by the mob runtime.
 ///
 /// Builds on `SessionServiceCommsExt` from core so mob orchestration can use
@@ -1844,6 +1861,27 @@ pub trait MobSessionService:
         session_id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
         self.load_persisted_session(session_id).await
+    }
+
+    /// Whether a provisional durable tail stands for `session_id`: round
+    /// commits of a run whose runtime boundary has not committed, ahead of
+    /// the committed snapshot. Read without writing or settling anything and
+    /// without waiting on a running turn
+    /// (`PersistentSessionService::provisional_tail_stands`).
+    ///
+    /// A resume spawn asks it before anything that could complete such a
+    /// tail on a session no live actor hosts: the resume's verdict would. A
+    /// WholeBlob tail never makes the strict [`Self::load_persisted_session`]
+    /// refuse, so this is how the spawn sees one.
+    ///
+    /// Default: a service that keeps no durable sessions holds no tail
+    /// (`Ok(false)`). A service that reports persistent sessions
+    /// ([`Self::supports_persistent_sessions`]) without overriding this
+    /// refuses with [`SessionError::Unsupported`], so a wrapper around a
+    /// persistent service that does not forward it refuses the resume spawn
+    /// visibly instead of skipping the check. Such a wrapper must forward it.
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        provisional_tail_stands_unforwarded(self.supports_persistent_sessions(), session_id)
     }
 
     /// Persist a transcript fork for a concrete new mob identity.
@@ -3712,6 +3750,11 @@ where
             .load_committed_session_tolerating_tail(session_id)
             .await?;
         hide_archived_persisted_session(self, session_id, session).await
+    }
+
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::provisional_tail_stands(self, session_id)
+            .await
     }
 
     async fn observe_live_durable_source(
