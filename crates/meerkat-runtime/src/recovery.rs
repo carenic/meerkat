@@ -1968,6 +1968,57 @@ pub async fn observe_resumable_run(
     }))
 }
 
+/// The session's last committed snapshot while a HeadCanonical provisional
+/// tail sits ahead of it.
+///
+/// A durable run's round commits apply its provisional tail to the physical
+/// head, so from the run's first tool round on the physical head is past the
+/// runtime boundary, and a committed read that materializes the boundary as
+/// the current head refuses with `TranscriptRevisionConflict`. The store
+/// retains the boundary for recovery: this reads it through the store-owned
+/// durable-tail source, which verifies the boundary head from its own anchor,
+/// rows and runtime-boundary metadata in the one transaction that also proves
+/// the provisional tail binds that boundary and the physical head. The
+/// snapshot is the boundary's exact content and metadata, whether the run
+/// appended to it or rewrote it, and carries nothing of the run.
+///
+/// `Ok(None)` when the profile is not HeadCanonical, the store keeps no
+/// durable-tail source, or no applied provisional tail sits on the boundary:
+/// the caller's refusal then stands. It only reads.
+///
+/// The session service reads its fork source through it when the fork comes
+/// from the source's own running turn
+/// ([`meerkat_core::DurableForkSourceAdmission::CallerTurn`]).
+#[doc(hidden)]
+pub async fn load_committed_snapshot_under_provisional_tail(
+    store: &dyn RuntimeStore,
+    session_id: &SessionId,
+) -> Result<Option<Session>, DurableTailRecoveryError> {
+    if store.session_persistence_profile() != RuntimeSessionPersistenceProfile::HeadCanonicalV1 {
+        return Ok(None);
+    }
+    let runtime_id = LogicalRuntimeId::for_session(session_id);
+    let source = match store.load_durable_tail_recovery_source(&runtime_id).await {
+        Ok(Some(source)) => source,
+        Ok(None)
+        | Err(
+            RuntimeStoreError::Unsupported(_)
+            | RuntimeStoreError::PreparedRecoveryRequiresAtomicPhysicalHeadCas { .. },
+        ) => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    if source.runtime_authority().session_id() != session_id {
+        return Err(DurableTailRecoveryError::InvalidEvidence(format!(
+            "store-owned durable-tail source belongs to session {}, not requested {session_id}",
+            source.runtime_authority().session_id()
+        )));
+    }
+    if source.provisional_authority().is_none() || !source.provisional_target_applied() {
+        return Ok(None);
+    }
+    Ok(Some(source.committed_session().as_ref().clone()))
+}
+
 /// Typed error: authorization/commit mechanics failed (as opposed to the
 /// machine refusing, which is an [`DurableTailRecoveryOutcome`]).
 #[derive(Debug, thiserror::Error)]

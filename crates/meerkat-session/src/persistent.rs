@@ -6871,13 +6871,45 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// active source (its turn is the caller) and never persists a replayed
     /// projection back onto the running session: a fork is read-only on the
     /// source, and the running turn owns the next durable write.
+    ///
+    /// Once the running turn has committed a round, its HeadCanonical
+    /// provisional tail sits ahead of the committed snapshot and the
+    /// committed read refuses the boundary with `TranscriptRevisionConflict`.
+    /// The branch is cut at that snapshot, so it is then read whole through
+    /// the tail (`meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail`):
+    /// the boundary's exact rows and metadata, never the running turn's.
+    /// Without an applied provisional tail on the boundary the conflict
+    /// stands.
     async fn source_session_for_caller_turn_fork_locked(
         &self,
         id: &SessionId,
     ) -> Result<Session, SessionError> {
-        let mut replay = self
+        let mut replay = match self
             .load_authoritative_session_base_with_replay_info(id)
-            .await?;
+            .await
+        {
+            Ok(replay) => replay,
+            Err(conflict) if Self::is_transcript_revision_conflict_error(&conflict) => {
+                let committed =
+                    meerkat_runtime::recovery::load_committed_snapshot_under_provisional_tail(
+                        self.runtime_store.as_ref(),
+                        id,
+                    )
+                    .await
+                    .map_err(|error| {
+                        SessionError::Agent(AgentError::InternalError(format!(
+                            "failed to read the committed snapshot of session {id} under its \
+                             running turn's durable tail: {error}"
+                        )))
+                    })?;
+                let Some(committed) = committed else {
+                    return Err(conflict);
+                };
+                self.apply_transcript_rewrite_replay(id, Some(committed))
+                    .await?
+            }
+            Err(error) => return Err(error),
+        };
         let session = match replay.session.take() {
             Some(session) => {
                 // The caller's turn is appending to this session's event log
@@ -34223,6 +34255,247 @@ mod tests {
             ),
             "{recovery:?}"
         );
+    }
+
+    /// A HeadCanonical durable fork source as a turn start leaves it: a
+    /// committed snapshot (the previous turn's end) with the canonical
+    /// metadata and build state a targeted fork copies, and the actor
+    /// checkpointer that writes the running turn's round commits over it.
+    async fn caller_turn_fork_source_fixture() -> (
+        tempfile::TempDir,
+        PersistentSessionService<DummyBuilder>,
+        StoreCheckpointer,
+        Session,
+    ) {
+        let directory = tempfile::Builder::new()
+            .prefix(".caller-turn-fork-")
+            .tempdir_in(".")
+            .unwrap();
+        let database_path = directory.path().join("runtime.sqlite3");
+        let runtime_store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new_head_canonical(&database_path).unwrap(),
+        );
+        let store = Arc::new(meerkat_store::SqliteSessionStore::open(&database_path).unwrap());
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            store,
+            runtime_store.clone(),
+            memory_blob_store(),
+        );
+        let mut source = recoverable_store_row();
+        source
+            .set_build_state(meerkat_core::SessionBuildState {
+                app_context: Some(serde_json::json!({"domain": "fork-source"})),
+                ..meerkat_core::SessionBuildState::default()
+            })
+            .expect("seed the source build state");
+        source.push(user_message("the previous turn's question"));
+        source.push(Message::BlockAssistant(
+            meerkat_core::BlockAssistantMessage::new(
+                vec![meerkat_core::AssistantBlock::Text {
+                    text: "the previous turn's answer".to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            ),
+        ));
+        let committed = service
+            .persist_detached_head_canonical_session(source, "previous turn end")
+            .await
+            .unwrap();
+        let checkpointer = StoreCheckpointer {
+            runtime_store,
+            incremental: service.incremental.clone(),
+            blob_store: memory_blob_store(),
+            gate: Arc::new(CheckpointerGate {
+                cancelled: Mutex::new(false),
+            }),
+            whole_blob_base_authority: std::sync::Mutex::new(None),
+            latest_run_checkpoint_receipt: Mutex::new(None),
+            latest_run_transcript_retirement: std::sync::Mutex::new(None),
+            live_deferred_turn_state: std::sync::OnceLock::new(),
+            unattached_deferred_checkpoint_warned: std::sync::atomic::AtomicBool::new(false),
+            rebased_run: std::sync::Mutex::new(None),
+            latest_run_checkpoint_cursor: std::sync::Mutex::new(None),
+            rebase_outcome_unknown: std::sync::Mutex::new(None),
+            rewrite_audit: None,
+        };
+        (directory, service, checkpointer, committed)
+    }
+
+    fn caller_turn_fork_target() -> meerkat_core::DurableSessionForkTarget {
+        meerkat_core::DurableSessionForkTarget {
+            member_binding: meerkat_core::MobMemberBinding {
+                mob_id: "mob".to_string(),
+                role: "role".to_string(),
+                member: "child".to_string(),
+            },
+            cache_identity: None,
+            source_admission: meerkat_core::DurableForkSourceAdmission::CallerTurn,
+            inherited_instructions: meerkat_core::ForkInstructionPolicy::default(),
+            declared_instructions: meerkat_core::ForkInstructionPolicy::default(),
+        }
+    }
+
+    /// The running turn's input and its first tool round, and the round
+    /// commit that writes them as the run's provisional tail.
+    async fn commit_running_turn_round(
+        checkpointer: &StoreCheckpointer,
+        running: &mut Session,
+        run_id: &RunId,
+    ) {
+        running.push(user_message("the running turn's input"));
+        running.push(run_stamped_assistant(
+            run_id,
+            vec![meerkat_core::AssistantBlock::ToolUse {
+                id: "call-in-turn".to_string(),
+                name: "probe".into(),
+                args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                meta: None,
+            }],
+            StopReason::ToolUse,
+        ));
+        running.push(Message::ToolResults {
+            results: vec![ToolResult::new(
+                "call-in-turn".to_string(),
+                "ok".to_string(),
+                false,
+            )],
+            created_at: std::time::SystemTime::now().into(),
+        });
+        meerkat_core::SessionCheckpointer::checkpoint_run(checkpointer, running, run_id, None)
+            .await
+            .expect("the running turn's round commit")
+            .expect("a provisional successor");
+    }
+
+    /// The child of a caller-turn fork holds exactly the committed snapshot:
+    /// its rows and its build state, and nothing of the running turn.
+    async fn assert_fork_child_is_the_committed_snapshot(
+        service: &PersistentSessionService<DummyBuilder>,
+        forked: &SessionForkResult,
+        committed: &Session,
+    ) {
+        assert_eq!(
+            forked.message_count,
+            committed.messages().len(),
+            "the branch ends at the committed snapshot, not inside the running turn"
+        );
+        let child = service
+            .load_committed_runtime_session_for_body(&forked.session_id, "fork child")
+            .await
+            .unwrap()
+            .expect("the committed child");
+        assert_eq!(
+            meerkat_core::transcript_messages_digest(child.messages()).unwrap(),
+            meerkat_core::transcript_messages_digest(committed.messages()).unwrap(),
+            "the child holds exactly the committed snapshot's rows"
+        );
+        assert!(
+            child.try_run_cursor().unwrap().is_none(),
+            "no run cursor of the running turn reaches the child"
+        );
+        assert_eq!(
+            child
+                .try_build_state()
+                .unwrap()
+                .and_then(|state| state.app_context),
+            Some(serde_json::json!({"domain": "fork-source"})),
+            "the child carries the snapshot's build state"
+        );
+    }
+
+    /// `fork_off` runs inside the source's own turn. Once that turn has
+    /// committed a round, the round's HeadCanonical provisional tail sits
+    /// ahead of the committed snapshot and the committed read refuses the
+    /// boundary with `TranscriptRevisionConflict`. The caller-turn fork reads
+    /// the snapshot whole through the tail and branches there; it writes
+    /// nothing to the source, and an explicit count past the committed end
+    /// is still refused.
+    #[tokio::test]
+    async fn a_caller_turn_fork_branches_at_the_committed_snapshot_under_a_round_commit() {
+        let (_directory, service, checkpointer, committed) =
+            caller_turn_fork_source_fixture().await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let mut running = committed.clone();
+        commit_running_turn_round(&checkpointer, &mut running, &run_id).await;
+        assert!(
+            PersistentSessionService::<DummyBuilder>::is_transcript_revision_conflict(
+                &service.load_authoritative_session_base(&id).await
+            ),
+            "the committed read refuses the boundary while the round's tail is ahead of it"
+        );
+
+        let forked = service
+            .fork_durable_session(&id, None, None, Some(caller_turn_fork_target()))
+            .await
+            .expect("a caller-turn fork branches at the committed snapshot under the round's tail");
+        assert_fork_child_is_the_committed_snapshot(&service, &forked, &committed).await;
+        assert!(
+            PersistentSessionService::<DummyBuilder>::is_transcript_revision_conflict(
+                &service.load_authoritative_session_base(&id).await
+            ),
+            "the fork wrote nothing to the source: the round's tail is still ahead"
+        );
+
+        let past = service
+            .fork_durable_session(
+                &id,
+                Some(committed.messages().len() + 1),
+                None,
+                Some(caller_turn_fork_target()),
+            )
+            .await;
+        assert!(
+            matches!(
+                past,
+                Err(SessionError::Agent(AgentError::ConfigError(ref message)))
+                    if message.contains("out of bounds")
+            ),
+            "a count past the committed end reaches into the running turn: {past:?}"
+        );
+    }
+
+    /// A round that compacts rewrites rows the committed snapshot holds, so
+    /// the round's tail keeps no prefix of the snapshot. The caller-turn fork
+    /// still branches at the snapshot's own rows, read whole from the store,
+    /// never at a prefix of the rewritten tail.
+    #[tokio::test]
+    async fn a_caller_turn_fork_after_a_compacting_round_branches_at_the_committed_snapshot() {
+        let (_directory, service, checkpointer, committed) =
+            caller_turn_fork_source_fixture().await;
+        let id = committed.id().clone();
+        let run_id = RunId::new();
+        let mut running = committed.clone();
+        compact_and_retire(
+            &mut running,
+            0,
+            meerkat_core::TranscriptHistoryRetention::from_count(4).unwrap(),
+        );
+        commit_running_turn_round(&checkpointer, &mut running, &run_id).await;
+        assert_eq!(
+            physical_rewrite_count(&service, &id).await,
+            1,
+            "the round's tail carries the compaction"
+        );
+        assert_ne!(
+            meerkat_core::transcript_messages_digest(
+                &running.messages()[..committed.messages().len()]
+            )
+            .unwrap(),
+            meerkat_core::transcript_messages_digest(committed.messages()).unwrap(),
+            "the tail's leading rows are not the committed snapshot's"
+        );
+
+        let forked = service
+            .fork_durable_session(&id, None, None, Some(caller_turn_fork_target()))
+            .await
+            .expect(
+                "a caller-turn fork branches at the committed snapshot under a compacting round",
+            );
+        assert_fork_child_is_the_committed_snapshot(&service, &forked, &committed).await;
     }
 
     /// A session whose committed boundary already carries a compaction, and

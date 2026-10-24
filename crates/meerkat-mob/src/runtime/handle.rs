@@ -94,6 +94,17 @@ fn agent_event_subscription_error(
     }
 }
 
+/// Where a durable member fork reads its source's application context from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ForkSourceAppContextRead {
+    /// The source session's durable build state, read before the fork.
+    SourceSession,
+    /// The committed child's durable build state, read after the fork: a
+    /// fork from the source's own running turn never reads the running
+    /// source's durable body.
+    ForkChild,
+}
+
 /// Type a durable member fork's session failure. A fork refused because of
 /// inherited instruction activations names its source member; everything else
 /// keeps its session error.
@@ -16948,8 +16959,12 @@ impl MobHandle {
                 });
             }
         }
-        self.resolve_fork_build_inheritance(source_identity, source_session_id)
-            .await
+        self.resolve_fork_build_inheritance(
+            source_identity,
+            source_session_id,
+            ForkSourceAppContextRead::SourceSession,
+        )
+        .await
     }
 
     /// Resolve the source's build inheritance from this mob's own records:
@@ -16964,10 +16979,15 @@ impl MobHandle {
     /// (`fork_off`), that read would wait for the very turn that is waiting on
     /// the fork. A durable service reads the build state from its store and
     /// never waits on the session task or the turn.
+    ///
+    /// With [`ForkSourceAppContextRead::ForkChild`] the source session is not
+    /// read at all and the inheritance carries no application context: the
+    /// caller reads it back from the committed child.
     async fn resolve_fork_build_inheritance(
         &self,
         source_identity: &AgentIdentity,
         source_session_id: &meerkat_core::SessionId,
+        app_context_read: ForkSourceAppContextRead,
     ) -> Result<super::ForkBuildInheritance, MobError> {
         if !self.session_service.supports_persistent_sessions() {
             return Err(MobError::from(
@@ -16992,11 +17012,15 @@ impl MobHandle {
         // its current build ran with (the factory persists it at every build).
         // A source with no loadable durable session has no persisted context;
         // whether such a source can be forked at all is the fork owner's call.
-        let app_context = match self
-            .session_service
-            .load_persisted_session(source_session_id)
-            .await?
-        {
+        let source_session = match app_context_read {
+            ForkSourceAppContextRead::SourceSession => {
+                self.session_service
+                    .load_persisted_session(source_session_id)
+                    .await?
+            }
+            ForkSourceAppContextRead::ForkChild => None,
+        };
+        let app_context = match source_session {
             Some(session) => session
                 .try_build_state()
                 .map_err(|error| {
@@ -17214,10 +17238,26 @@ impl MobHandle {
             self.refuse_fork_source_with_admitted_work(source_identity, &source_session_id)
                 .await?;
         }
-        self.resolve_fork_build_inheritance(source_identity, &source_session_id)
+        // A fork from the source's own running turn never reads the running
+        // source's durable body: once that turn has committed a round, its
+        // provisional tail sits ahead of the committed snapshot and a
+        // committed read of the source refuses. The session service cuts the
+        // branch at that snapshot and gives the child the snapshot's build
+        // state (`fork_child_projection` keeps `app_context` verbatim), so the
+        // application context is read back from the committed child, under
+        // the same rule: a context the request states wins.
+        let caller_turn = source_admission == meerkat_core::DurableForkSourceAdmission::CallerTurn;
+        let app_context_read = if caller_turn {
+            ForkSourceAppContextRead::ForkChild
+        } else {
+            ForkSourceAppContextRead::SourceSession
+        };
+        let context_requested = member.context.is_some();
+        self.resolve_fork_build_inheritance(source_identity, &source_session_id, app_context_read)
             .await?
             .apply_to(member);
-        self.session_service
+        let fork = self
+            .session_service
             .fork_persisted_session(
                 &source_session_id,
                 message_count,
@@ -17231,7 +17271,35 @@ impl MobHandle {
                     cause: crate::error::ForkSourceUnavailableCause::Running,
                 },
                 error => fork_session_error(source_identity, error),
-            })
+            })?;
+        if caller_turn && !context_requested {
+            member.context = self.fork_child_app_context(&fork.session_id).await?;
+        }
+        Ok(fork)
+    }
+
+    /// The application context of a committed fork child's durable build
+    /// state: its source's, carried verbatim by the fork.
+    async fn fork_child_app_context(
+        &self,
+        child_session_id: &meerkat_core::SessionId,
+    ) -> Result<Option<serde_json::Value>, MobError> {
+        let Some(child) = self
+            .session_service
+            .load_persisted_session(child_session_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        Ok(child
+            .try_build_state()
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "fork child session '{child_session_id}' has a corrupt durable build \
+                     state: {error}"
+                ))
+            })?
+            .and_then(|state| state.app_context))
     }
 
     /// Persist a real transcript fork, provision its child member, and run the
