@@ -311,7 +311,7 @@ that reads the profile runs 0.9.5. See
 
 `adopt_member_identity_declaration` (`MobHandle`, `mob/adopt_member_identity_declaration`
 and REST `POST /mob/{id}/members/{agent_identity}/identity-adoption`) refuses a
-mob whose runtime has no persistent store with the new
+mob whose runtime has no runtime store (an in-memory store counts) with the new
 `MobError::IdentityAdoptionRequiresPersistentRuntime { member_id }` (wire
 code `CAPABILITY_UNAVAILABLE`, `-32020` over JSON-RPC and `501` over REST,
 data kind `mob_identity_adoption_requires_persistent_runtime`), before
@@ -320,8 +320,9 @@ reconciliation then retired the member and could not resume it: the identity
 stayed `RepairBlocked`. Every mob on an `EphemeralSessionService` runs on such
 a runtime.
 
-**Do:** adopt members only on mobs over a persistent realm, and handle the new
-refusal where you call adoption. See
+**Do:** adopt members only on mobs over the persistent session service,
+whatever its stores (a `memory` realm works), and handle the new refusal where
+you call adoption. See
 [Mobs: cold resume and cancellation](/guides/mobs#cold-resume-and-cancellation).
 
 #### Dedupe key on pending callback calls
