@@ -2400,6 +2400,234 @@ async fn a_listed_steer_beside_a_held_settle_is_committed_once_by_the_operator_h
     .await;
 }
 
+/// The other run's row the held-settle fixtures strand beside A's tail,
+/// written into the store while run A is held.
+async fn strand_another_runs_row(
+    start: &Start,
+    id: &SessionId,
+    run_a: &RunId,
+    steer_id: Option<&meerkat_core::lifecycle::InputId>,
+) -> StoredInputState {
+    let rows = input_rows(start.runtime_store.as_ref(), id).await;
+    let run_a_row = rows
+        .iter()
+        .find(|row| {
+            row.seed.last_run_id.as_ref() == Some(run_a) && Some(&row.state.input_id) != steer_id
+        })
+        .expect("run A's own input row")
+        .clone();
+    let mut other_runs_row = stranded_row(
+        &run_a_row,
+        &Input::Prompt(PromptInput::new("another run's", None)),
+        Some(RunId::new()),
+    );
+    other_runs_row.seed.admission_sequence = rows
+        .iter()
+        .filter_map(|row| row.seed.admission_sequence)
+        .max()
+        .map(|sequence| sequence + 1);
+    write_input_row(start.runtime_store.as_ref(), id, other_runs_row.clone()).await;
+    other_runs_row
+}
+
+/// End the stranded row of another run (an operator's part: the fixture
+/// writes its terminal row), so nothing holds A's tail any more.
+async fn end_another_runs_row(start: &Start, id: &SessionId, mut row: StoredInputState) {
+    use meerkat_runtime::input_state::{
+        InputAbandonReason, InputLifecycleState as Phase, InputStateHistoryEntry,
+        InputTerminalOutcome,
+    };
+    row.state.history.push(InputStateHistoryEntry {
+        timestamp: chrono::Utc::now(),
+        from: Phase::Staged,
+        to: Phase::Abandoned,
+        reason: Some("Abandon".to_string()),
+    });
+    row.seed.phase = Phase::Abandoned;
+    row.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+        reason: InputAbandonReason::Cancelled,
+    });
+    row.seed.recovery_lane = None;
+    write_input_row(start.runtime_store.as_ref(), id, row).await;
+}
+
+/// A read of the hosted session, through the observation path that settles
+/// the tail of an ended turn.
+async fn observe_hosted_session(start: &Start, id: &SessionId) {
+    let live = tokio::time::timeout(
+        DEADLINE,
+        meerkat_core::service::SessionService::has_live_session(start.service.as_ref(), id),
+    )
+    .await
+    .expect("the read answers at once")
+    .expect("the read");
+    assert!(live, "the session's live actor is still hosted");
+}
+
+/// An observation of a hosted session settles the tail a cancelled run left
+/// only between the runtime loop's laps, never between a lap's read of its
+/// batch's rows and the batch's staging commit.
+///
+/// Run A is interrupted after a round commit that listed a steer. A's own
+/// settle holds the tail beside a row of another run, and the cancel requeues
+/// the steer. The next lap reads the steer's row, still queued, and is held
+/// right before its staging commit. There the other run's row ends, and a
+/// read of the session observes it: the lap holds the turn-finalization
+/// boundary, so the read leaves A's tail to a later settle instead of
+/// consuming the steer under the lap. The lap stages the steer for run B,
+/// which the standing tail refuses before its model call, and the next
+/// start's recovery closes A's tail with the steer in it: the steer's content
+/// appears once, and the model never sees it again. RED before: the read's
+/// settle consumed the steer between the lap's read and its staging commit,
+/// the staging commit wrote the steer staged over its consumed row, and run B
+/// ran it again, so the model saw it twice and the history held it twice.
+#[tokio::test]
+async fn an_observation_never_settles_inside_a_laps_staging_window_head_canonical() {
+    use meerkat_runtime::input_state::InputTerminalOutcome;
+
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let (id, steer_id) = {
+        let start = Start::open(&stores, &root, &client);
+        let id = start.materialize(None).await;
+        client.push(Step::Tool);
+        client.push(Step::Tool);
+        client.push(Step::Held);
+        let (turn_a, run_a, steered, steer_id) =
+            a_steer_joins_run_a_at_its_next_model_boundary(&start, &client, &id).await;
+        let other_runs_row = strand_another_runs_row(&start, &id, &run_a, Some(&steer_id)).await;
+        // Run B answers the steer if it calls the model.
+        client.push(Step::Text("steer answer"));
+        let (staging, release) = start
+            .machine
+            .arm_runtime_loop_before_batch_staging_test_hook(id.clone());
+
+        interrupt_run_a(&start, &id, turn_a).await;
+        tokio::time::timeout(DEADLINE, staging)
+            .await
+            .expect("the next lap reaches the steer's staging commit")
+            .expect("the staging hook");
+        assert_eq!(
+            start.tail_run(&id).await,
+            Some(run_a.clone()),
+            "the cancelled run's settle holds A's tail"
+        );
+        end_another_runs_row(&start, &id, other_runs_row).await;
+        observe_hosted_session(&start, &id).await;
+        let _ = release.send(());
+        let _ = steered.await.expect("steer waiter task");
+        start.service.try_shutdown().await.expect("shutdown");
+        // Run B's step stays unused where B never called the model.
+        client.steps.lock().expect("steps").clear();
+        (id, steer_id)
+    };
+
+    let requests_before = client.requests.load(Ordering::SeqCst);
+    let start = Start::open(&stores, &root, &client);
+    start.cold_attach(&id).await;
+    start.materialize(Some(&id)).await;
+    start.wait_runtime_settled(&id).await;
+    let rows = start.committed_rows(&id).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.as_str() == "user steered")
+            .count(),
+        1,
+        "the steer's content appears once: {rows:?}"
+    );
+    assert_eq!(
+        requests_before, 3,
+        "only run A's three model calls: the model never sees the steer again"
+    );
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        requests_before,
+        "nothing runs the steer after the restart"
+    );
+    let steer_row = input_rows(start.runtime_store.as_ref(), &id)
+        .await
+        .into_iter()
+        .find(|row| row.state.input_id == steer_id)
+        .expect("the steer's row");
+    assert_eq!(
+        steer_row.seed.terminal_outcome,
+        Some(InputTerminalOutcome::Consumed),
+        "the steer is consumed with A"
+    );
+}
+
+/// A held turn-finalization boundary defers an observation's settle of the
+/// tail a cancelled run left, and never drops it: the first read after the
+/// boundary is released settles the tail.
+///
+/// Run A is interrupted after a round commit, and its own settle holds the
+/// tail beside a row of another run; that row then ends. While the boundary
+/// is held, as a runtime loop lap or a turn holds it, a read of the session
+/// answers at once and A's tail stands. Once it is released, the next read
+/// closes A's tail as interrupted. RED before: the read settled the tail
+/// under the held boundary.
+#[tokio::test]
+async fn an_observation_defers_its_settle_past_a_held_turn_boundary_head_canonical() {
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(true, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let id = start.materialize(None).await;
+    client.push(Step::Tool);
+    client.push(Step::Held);
+    let turn_a = start.admit(&id, "first").await;
+    tokio::time::timeout(DEADLINE, client.entered.acquire())
+        .await
+        .expect("run A holds at its model call after its tool round")
+        .expect("model gate")
+        .forget();
+    let run_a = start
+        .tail_run(&id)
+        .await
+        .expect("run A's round commit stands as the provisional tail");
+    let other_runs_row = strand_another_runs_row(&start, &id, &run_a, None).await;
+    interrupt_run_a(&start, &id, turn_a).await;
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a.clone()),
+        "the cancelled run's settle holds A's tail"
+    );
+    end_another_runs_row(&start, &id, other_runs_row).await;
+
+    let boundary = start
+        .service
+        .acquire_runtime_turn_finalization_guard(&id)
+        .await;
+    observe_hosted_session(&start, &id).await;
+    assert_eq!(
+        start.tail_run(&id).await,
+        Some(run_a.clone()),
+        "a read under the held boundary leaves A's tail to a later settle"
+    );
+    drop(boundary);
+
+    observe_hosted_session(&start, &id).await;
+    assert_eq!(
+        start.tail_run(&id).await,
+        None,
+        "the first read after the boundary is released settles A's tail"
+    );
+    let rows = start.committed_rows(&id).await;
+    assert_eq!(
+        rows.iter()
+            .filter(|row| row.as_str() == "user first")
+            .count(),
+        1,
+        "A's prompt is committed once: {rows:?}"
+    );
+    assert_eq!(
+        rows.last().map(String::as_str),
+        Some("notice Generic"),
+        "A is closed as interrupted: {rows:?}"
+    );
+}
+
 /// Wait until `input_id` is bound to `run_id`: the steer joined the run.
 async fn wait_for_input_run(
     start: &Start,

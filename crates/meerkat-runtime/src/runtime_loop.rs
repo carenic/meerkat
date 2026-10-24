@@ -5494,6 +5494,15 @@ impl RuntimeLoopAuthorityBinding {
     }
 
     #[cfg(any(test, feature = "test-support"))]
+    async fn run_before_batch_staging_test_hook(&self) {
+        if let Some(machine) = self.machine.upgrade() {
+            machine
+                .run_runtime_loop_before_batch_staging_test_hook(&self.session_id)
+                .await;
+        }
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
     async fn run_before_queue_authority_test_hook(&self) {
         if let Some(machine) = self.machine.upgrade() {
             machine
@@ -7913,6 +7922,8 @@ async fn process_queue(
                 // A resumed run was begun at dequeue, without staging; an
                 // ordinary batch starts and stages here.
                 if let Some(batch) = batch {
+                    #[cfg(any(test, feature = "test-support"))]
+                    authority_binding.run_before_batch_staging_test_hook().await;
                     match crate::meerkat_machine::prepare_runtime_loop_batch_start(
                         driver,
                         run_id.clone(),
