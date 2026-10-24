@@ -37777,6 +37777,137 @@ async fn a_live_revival_finishes_for_a_waiter_when_its_first_requester_leaves() 
     );
 }
 
+/// A stop cleanup that never finishes does not hold the start: the start
+/// joins it for a bounded wait only, then decides on what it sees (not
+/// completed residue), takes nothing over, and ends in the restore's
+/// refusal as before.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_running_start_does_not_wait_forever_on_a_stop_cleanup_that_never_finishes() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("cleanup-never-finishes");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    service.park_exact_actor_discards();
+    let mut parked = service.parked_exact_actor_discard_entries();
+    let stop = {
+        let adapter = Arc::clone(&adapter);
+        let registration = paused.registration.clone();
+        tokio::spawn(async move {
+            adapter
+                .stop_runtime_executor_until_terminal_if_current(
+                    &registration,
+                    "a host stops the member while the start restores it",
+                )
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        parked.wait_for(|entries| *entries > 0),
+    )
+    .await
+    .expect("the stop's post-stop cleanup parks")
+    .expect("the park counter stays open");
+    paused.release.send(()).expect("release the start");
+
+    // The cleanup stays parked; the start still settles, refused as before.
+    let status = tokio::time::timeout(Duration::from_secs(10), paused.resumed.status())
+        .await
+        .expect("the start settles while the stop cleanup never finishes")
+        .expect("mob status");
+    assert_eq!(
+        status,
+        MobState::Stopped,
+        "the start ends in the restore's refusal"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        0,
+        "nothing is taken over while its stop cleanup has not finished"
+    );
+    service.release_parked_exact_actor_discards();
+    let _ = tokio::time::timeout(Duration::from_secs(10), stop).await;
+}
+
+/// A stopped registration admits no input before the start takes it over:
+/// an input offered to it then is refused typed, so the takeover's
+/// unregister ends nothing a caller handed in, and the member serves work
+/// after its revival.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_stopped_registration_admits_no_input_before_the_start_takes_it_over() {
+    use meerkat_runtime::service_ext::SessionServiceRuntimeExt as _;
+
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("offered-input-while-stopped");
+    let paused = paused_running_start(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+    )
+    .await;
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the member before the start restores it",
+            )
+            .await
+            .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    let offered = adapter
+        .accept_input_with_completion(
+            &paused.session_id,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "offered to the stopped registration",
+                None,
+            )),
+        )
+        .await;
+    assert!(
+        offered.is_err(),
+        "a stopped registration refuses the input typed: {:?}",
+        offered.as_ref().map(|(outcome, _)| outcome)
+    );
+    assert!(
+        adapter
+            .list_active_inputs(&paused.session_id)
+            .await
+            .expect("list the stopped registration's inputs")
+            .is_empty(),
+        "nothing is queued on the stopped registration"
+    );
+    paused.release.send(()).expect("release the start");
+
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the stopped registration over"
+    );
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after the takeover")
+        .await
+        .expect("the revived member serves a turn");
+}
+
 /// A member runtime retired outside the mob in the same window is not
 /// stopped residue: a retired runtime is not served again, so the start
 /// neither takes its registration over nor revives the member.
@@ -37820,6 +37951,24 @@ async fn a_running_start_does_not_take_over_a_member_runtime_retired_outside_the
     );
 }
 
+/// A persistent runtime adapter for the mock service: its registrations
+/// track durability, so one can need a durability reload.
+#[cfg(feature = "runtime-adapter")]
+fn persistent_runtime_adapter(
+    service: &MockSessionService,
+) -> Arc<meerkat_runtime::MeerkatMachine> {
+    let runtime_store: Arc<dyn meerkat_runtime::store::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let adapter = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent(runtime_store, blob_store)
+            .expect("construct runtime authority"),
+    );
+    service.set_runtime_adapter(Arc::clone(&adapter));
+    adapter
+}
+
 /// Mark the member's current registration reload-required through the
 /// runtime's own seam, in the window the paused start leaves.
 #[cfg(feature = "runtime-adapter")]
@@ -37848,7 +37997,7 @@ async fn mark_reload_required(
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_start_reloads_a_member_whose_registration_needs_a_reload() {
     let service = Arc::new(MockSessionService::new());
-    let adapter = service.enable_runtime_adapter();
+    let adapter = persistent_runtime_adapter(&service);
     let degraded = AgentIdentity::from("reload-required-at-start");
     let healthy = AgentIdentity::from("healthy-beside-a-reload");
     let paused = paused_running_start(
@@ -37920,7 +38069,7 @@ async fn a_running_start_reloads_a_member_whose_registration_needs_a_reload() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_running_start_records_a_member_broken_when_its_reload_fails() {
     let service = Arc::new(MockSessionService::new());
-    let adapter = service.enable_runtime_adapter();
+    let adapter = persistent_runtime_adapter(&service);
     let degraded = AgentIdentity::from("reload-fails-at-start");
     let healthy = AgentIdentity::from("healthy-beside-a-failed-reload");
     let paused = paused_running_start(
@@ -37987,7 +38136,7 @@ async fn a_running_start_records_a_member_broken_when_its_reload_fails() {
 #[tokio::test(flavor = "multi_thread")]
 async fn a_delivery_during_a_start_reload_waits_for_it_or_is_refused_typed() {
     let service = Arc::new(MockSessionService::new());
-    let adapter = service.enable_runtime_adapter();
+    let adapter = persistent_runtime_adapter(&service);
     let degraded = AgentIdentity::from("delivered-to-during-its-reload");
     let paused = paused_running_start(
         &service,
