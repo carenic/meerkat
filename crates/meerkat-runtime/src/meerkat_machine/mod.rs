@@ -7805,6 +7805,57 @@ impl MeerkatMachine {
         (entered_rx, release_tx)
     }
 
+    /// Deterministically pause the runtime loop's next lap that stages a
+    /// fresh batch after it read the batch's durable rows and before its
+    /// staging commit. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_runtime_loop_before_batch_staging_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_runtime_loop_before_batch_staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "runtime-loop batch-staging test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_runtime_loop_before_batch_staging_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_runtime_loop_before_batch_staging
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn run_runtime_loop_before_executor_apply_test_hook(
         &self,
@@ -11129,6 +11180,18 @@ pub struct MeerkatMachineShared {
             crate::tokio::sync::oneshot::Receiver<()>,
         )>,
     >,
+    /// One-shot deterministic gate between a runtime loop lap's read of its
+    /// fresh batch's durable rows and the batch's staging commit: the lap
+    /// holds the turn-finalization boundary and its queue authority, not the
+    /// driver.
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_loop_before_batch_staging: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
     /// One-shot deterministic gate in a scoped context binding, immediately
     /// before its driver takes the session document's machine authority:
     /// its registration, mutation gate and driver are held, and its binder's
@@ -12995,6 +13058,8 @@ impl MeerkatMachine {
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_before_batch_staging: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
                 test_scoped_binding_before_machine_authority: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_run_start_held_parks: crate::tokio::sync::watch::Sender::new(0),
@@ -13246,6 +13311,8 @@ impl MeerkatMachine {
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_before_batch_staging: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_scoped_binding_before_machine_authority: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
