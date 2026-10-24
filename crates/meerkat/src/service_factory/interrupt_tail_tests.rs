@@ -502,6 +502,49 @@ impl Start {
         transcript_rows(&session)
     }
 
+    /// Wait until the runtime of `id` runs nothing and holds no input it has
+    /// not ended, in its own ledger and in the store: whatever this start
+    /// still held to run has run to its end, so a second run of an input
+    /// shows in the committed history.
+    async fn wait_runtime_settled(&self, id: &SessionId) {
+        use meerkat_runtime::SessionServiceRuntimeExt as _;
+        let deadline = tokio::time::Instant::now() + DEADLINE;
+        loop {
+            let state = self
+                .machine
+                .runtime_state(id)
+                .await
+                .expect("read the runtime state");
+            let mut open = Vec::new();
+            for row in input_rows(self.runtime_store.as_ref(), id).await {
+                let live = self
+                    .machine
+                    .input_state(id, &row.state.input_id)
+                    .await
+                    .expect("read an input's live state");
+                let ended_live = live
+                    .as_ref()
+                    .is_none_or(|live| live.seed.terminal_outcome.is_some());
+                if !ended_live || row.seed.terminal_outcome.is_none() {
+                    open.push((row.state.input_id.clone(), row.seed.phase));
+                }
+            }
+            if open.is_empty()
+                && matches!(
+                    state,
+                    meerkat_runtime::RuntimeState::Idle | meerkat_runtime::RuntimeState::Attached
+                )
+            {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the runtime never settled: {state:?}, open inputs {open:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
     /// The committed transcript once `last` is its last row. A run that
     /// commits while this polls makes a committed read conflict for a moment
     /// (a HeadCanonical end-of-run save lands before its boundary), so a read
@@ -2090,7 +2133,12 @@ enum HeldSettleRepair {
 /// model call, `AuthorityUnavailable`. After the repair the next start's
 /// recovery (or the operator's) closes A's tail as interrupted and consumes
 /// the steer with it, because A's cursor lists it: its content appears
-/// exactly once in history, and nothing runs it again.
+/// exactly once in history, and nothing runs it again, which the row reads
+/// only once the restarted runtime runs nothing and holds no open input. On
+/// WholeBlob the restart's registration recovers its inputs (the steer
+/// rolled back to its queue) before the materialization's recovery consumes
+/// the steer; the attach adopts that terminal, so the runtime never stages
+/// the steer again from its own row.
 async fn a_listed_steer_beside_a_held_settle_is_committed_once_after_the_repair(
     head_canonical: bool,
     repair: HeldSettleRepair,
@@ -2280,10 +2328,14 @@ async fn a_listed_steer_beside_a_held_settle_is_committed_once_after_the_repair(
         expected.push("user another run's".to_string());
         expected.push("assistant another run's answer".to_string());
     }
-    let rows = start
+    start
         .committed_rows_ending_with(&id, expected.last().expect("a last row"))
         .await;
     assert_eq!(start.tail_run(&id).await, None, "no tail stands");
+    // Whatever this start still held to run runs now: once nothing runs and
+    // no input is left open, a second run of the steer is in the history.
+    start.wait_runtime_settled(&id).await;
+    let rows = start.committed_rows(&id).await;
     assert_eq!(
         rows.iter()
             .filter(|row| row.as_str() == "user steered")
