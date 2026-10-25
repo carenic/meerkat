@@ -35,11 +35,6 @@ const ALLOWED: &[(&str, &str, Reason)] = &[
     ("MobMachine", "DestroyFromAny", Reason::LifecycleExit),
     ("MobMachine", "DestroyMob", Reason::LifecycleExit),
     ("MobMachine", "MarkCompleted", Reason::LifecycleExit),
-    (
-        "MobMachine",
-        "ObserveRuntimeDestroyed",
-        Reason::LifecycleExit,
-    ),
     // Reset restarts the mob from any settled phase; from Stopped it also
     // emits ReleaseMemberRunStarts.
     ("MobMachine", "ResetToRunning", Reason::Restart),
