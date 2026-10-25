@@ -5792,12 +5792,15 @@ const SESSION_CREATE_STACK_CHILD_TEST: &str = "session_create_on_a_sized_worker_
 /// The worker stack, 1.125 MiB, that the stack-budget tests give their
 /// child processes. It is below the 2 MiB an embedding host gives its tokio
 /// runtime (Tokio's default), so the paths they cover keep headroom under
-/// that limit. In a debug build these scenarios needed 1,228,800 bytes of
-/// worker stack before their deepest paths built their large futures in
-/// their own frames (1,212,416 overflowed), and need 851,968 since. This
-/// budget fails the former and leaves about 38% over the latter, so a
-/// regression that eats that headroom fails here long before it nears a
-/// host's 2 MiB.
+/// that limit. In a debug build the restart re-link scenario needed 1,228,800
+/// bytes of worker stack (1,212,416 overflowed) while its resume path built
+/// the resume preparation's hosted body and recovery inline. With those built
+/// in their own frames the resume path reaches 861,512 bytes, and the
+/// scenario needs 999,424 (983,040 overflows), set by its runtime delivery
+/// owner's continuation admission; session creation needs 901,120. This
+/// budget fails the 1,228,800 need and leaves about 18% (180,224 bytes) over
+/// the 999,424 one, so a regression that eats that headroom fails here long
+/// before it nears a host's 2 MiB.
 const WORKER_STACK_BUDGET: usize = 1_179_648;
 /// The stack of a child's driver thread, which builds the fixture and waits
 /// on the scenario: the debug test-thread budget `.cargo/config.toml` sets.
