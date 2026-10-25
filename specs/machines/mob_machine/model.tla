@@ -10210,6 +10210,7 @@ ObserveRuntimeDestroyed(agent_runtime_id, fence_token) ==
     /\ phase = "Running"
     /\ (agent_runtime_id \in live_runtime_ids)
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ ((agent_runtime_id \in pending_session_ingress_detach_runtime_ids) = FALSE)
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
@@ -19078,6 +19079,7 @@ ObserveRuntimeDestroyedStopped(agent_runtime_id, fence_token) ==
     /\ phase = "Stopped"
     /\ (agent_runtime_id \in live_runtime_ids)
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ ((agent_runtime_id \in pending_session_ingress_detach_runtime_ids) = FALSE)
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})
@@ -19094,6 +19096,7 @@ ObserveRuntimeDestroyedCompleted(agent_runtime_id, fence_token) ==
     /\ phase = "Completed"
     /\ (agent_runtime_id \in live_runtime_ids)
     /\ ((IF (agent_runtime_id \in DOMAIN runtime_fence_tokens) THEN Some((IF agent_runtime_id \in DOMAIN runtime_fence_tokens THEN runtime_fence_tokens[agent_runtime_id] ELSE "None")) ELSE None) = Some(fence_token))
+    /\ ((agent_runtime_id \in pending_session_ingress_detach_runtime_ids) = FALSE)
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ live_runtime_ids' = (live_runtime_ids \ {agent_runtime_id})

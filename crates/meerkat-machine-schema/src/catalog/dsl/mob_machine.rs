@@ -12765,13 +12765,18 @@ macro_rules! mob_catalog_machine_dsl {
         // and every fact its own destroy has to drain (hosts, placed members,
         // kickoffs, remote turns, pending spawns), so only the Destroy input,
         // behind those drains, ends the mob. The member reads Broken at its
-        // next start. ObserveRuntimeDestroyedStopped and
-        // ObserveRuntimeDestroyedCompleted are the same in those phases.
+        // next start. While that runtime's session ingress detach is pending
+        // (its member's retirement is detaching it), the observation is
+        // refused: the retirement closes the detach and settles the member.
+        // Another member's pending detach does not hold it.
+        // ObserveRuntimeDestroyedStopped and ObserveRuntimeDestroyedCompleted
+        // are the same in those phases.
         transition ObserveRuntimeDestroyed {
             on signal ObserveRuntimeDestroyed { agent_runtime_id, fence_token }
             guard { self.lifecycle_phase == Phase::Running }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            guard "session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
             update {
                 self.live_runtime_ids.remove(agent_runtime_id);
                 self.externally_addressable_runtime_ids.remove(agent_runtime_id);
@@ -22559,6 +22564,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard { self.lifecycle_phase == Phase::Stopped }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            guard "session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
             update {
                 self.live_runtime_ids.remove(agent_runtime_id);
                 self.externally_addressable_runtime_ids.remove(agent_runtime_id);
@@ -22582,6 +22588,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard { self.lifecycle_phase == Phase::Completed }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
             guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            guard "session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
             update {
                 self.live_runtime_ids.remove(agent_runtime_id);
                 self.externally_addressable_runtime_ids.remove(agent_runtime_id);
