@@ -8006,6 +8006,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `current_binding_matches`
   - `fence_token_matches`
+  - `session_ingress_detach_closed`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Running`
 
@@ -15371,6 +15372,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `current_binding_matches`
   - `fence_token_matches`
+  - `session_ingress_detach_closed`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Stopped`
 
@@ -15380,6 +15382,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `current_binding_matches`
   - `fence_token_matches`
+  - `session_ingress_detach_closed`
 - Emits: `EmitMemberLifecycleNotice`
 - To: `Completed`
 

@@ -390,6 +390,36 @@ fn runtime_destroyed_cannot_bypass_pending_session_ingress_detach() {
 }
 
 #[test]
+fn another_members_pending_session_ingress_detach_does_not_block_runtime_destroyed() {
+    let mut authority = MobMachineAuthority::new();
+    spawn_member(&mut authority, "alpha", "bridge-a");
+    spawn_member(&mut authority, "beta", "bridge-b");
+    MobMachineMutator::apply(&mut authority, retire_input("alpha", "bridge-a"))
+        .expect("retirement accepted");
+    assert!(
+        authority
+            .state()
+            .pending_session_ingress_detach_runtime_ids
+            .contains(&runtime_id("alpha", 0)),
+        "the retirement opens the retiring member's detach obligation"
+    );
+    authority
+        .apply_signal(MobMachineSignal::ObserveRuntimeDestroyed {
+            agent_runtime_id: runtime_id("beta", 0),
+            fence_token: FenceToken(1),
+        })
+        .expect("another member's pending detach does not hold this runtime's destruction");
+    let state = authority.state();
+    assert!(!state.live_runtime_ids.contains(&runtime_id("beta", 0)));
+    assert!(
+        state
+            .pending_session_ingress_detach_runtime_ids
+            .contains(&runtime_id("alpha", 0)),
+        "the retiring member's detach obligation stays open"
+    );
+}
+
+#[test]
 fn kickoff_quiesced_is_total_for_idle_and_terminal_kickoffs() {
     let mut authority = MobMachineAuthority::new();
     spawn_member(&mut authority, "alpha", "bridge-a");
