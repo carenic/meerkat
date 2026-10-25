@@ -143,10 +143,15 @@
 // The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
 // surrogate packing cap and not a measured timing. It is 20, since the
 // runtime lane models 18.3 minutes at 8ef2d8b939 (17.1 when the cap became
-// 18) while its measured runs took 6-12 minutes (pull-request runs
-// 39337274765, 39360046041, 39388235216 and 39394366439: 684, 693, 715 and
-// 359 s). The cap sits above the gate's 18-minute execution budget because it
-// is a model threshold; the gate itself is unchanged.
+// 18). Measured, the runtime lane alone took 790 and 839 s on the last two
+// green release pull-request runs (40055499505 and 40073579948), about 0.78
+// of its modelled time at a model of about 18 minutes; earlier pull-request
+// runs took 359-715 s (39337274765, 39360046041, 39388235216 and
+// 39394366439). At that ratio the heaviest lane the 20-minute cap packs at
+// 8ef2d8b939 (runtime+3, modelled 19.5) projects to about 915-945 s of
+// execution path, under the gate's 1080 s. The cap sits above the gate's
+// 18-minute execution budget because it is a model threshold; the gate
+// itself is unchanged.
 // The enforced limits are the CI gate's: 1080 s of lane execution and 1200 s
 // push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
 // CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
