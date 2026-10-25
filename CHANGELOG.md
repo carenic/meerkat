@@ -2432,11 +2432,13 @@ them.
 
 ### Changed
 
-- `meerkat`: a GPT Live close whose provider never confirms now retires the
-  transport locally after 10 s instead of 15 s
-  (`LIVE_CLOSE_CONFIRMATION_BOUND`), so `mob/member_live_close` of a
-  gpt-live-1 member channel converges inside the mob's 15 s member live
-  close timeout instead of timing out on its first request.
+- `meerkat`: a GPT Live close (a session channel's `live/close` or a member
+  channel's `mob/member_live_close`) whose provider never confirms now
+  retires the transport locally after 10 s instead of 15 s: the public
+  `meerkat::experimental_gpt_live::LIVE_CLOSE_CONFIRMATION_BOUND` (public
+  since v0.9.4) is now 10 s, down from 15 s. A gpt-live-1 member channel's
+  `mob/member_live_close` therefore converges inside the mob's 15 s member
+  live close timeout instead of timing out on its first request.
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: stopping a durable
   run (for example with `MeerkatMachine::stop_run`) keeps the rounds it has
