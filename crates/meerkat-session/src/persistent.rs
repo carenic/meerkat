@@ -4463,7 +4463,8 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         ))
     }
 
-    /// Body-free durable-source observation for live readiness.
+    /// Body-free durable-source observation for live readiness and the live
+    /// open's source check.
     ///
     /// Reads one RuntimeStore snapshot of the session authority row, the
     /// catalog entry, and the machine lifecycle row, and applies the archive
@@ -4472,8 +4473,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// session body, never takes the recovery gate, and never waits for the
     /// turn-finalization boundary, so a member mid-turn, a held recovery, or a
     /// large body cannot stall it. A lifecycle row this build cannot decode is
-    /// a fault, never availability. The live open validates the body itself;
-    /// this observation only says whether a committed source exists.
+    /// a fault, never availability. This observation only says whether a
+    /// committed source exists; the live path reads the body where it loads a
+    /// session that has no live actor, and that strict load refuses a body it
+    /// cannot read.
     pub async fn observe_live_durable_source(
         &self,
         id: &SessionId,

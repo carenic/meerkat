@@ -1724,7 +1724,7 @@ pub trait MobSessionService:
     ) -> Result<MemberStatusSessionView, SessionError>;
 
     /// Body-free observation of this session's durable transcript source,
-    /// for live readiness.
+    /// for live readiness and the live open's source check.
     ///
     /// Answered from the session authority row, the catalog entry, and the
     /// lifecycle row only: no body read or decode, no recovery gate, no

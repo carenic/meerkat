@@ -11386,7 +11386,8 @@ impl MobHandle {
     /// therefore cannot delay it.
     ///
     /// This is readiness, not admission: the live open still runs the
-    /// actor-validated durable check, including the body load, through
+    /// actor-validated durable check (the actor's roster and binding checks,
+    /// then this observation) through
     /// [`MemberHandle::validate_live_durable_source_availability`].
     #[cfg(feature = "openai-live")]
     pub async fn observe_live_durable_source_readiness(

@@ -12785,7 +12785,8 @@ mod tests {
     }
 
     /// Binding authority that separates the open's full durable check (the
-    /// body load) from the readiness observation, and counts both.
+    /// actor-validated source check) from the readiness observation, and
+    /// counts both.
     struct ReadinessSplitBindingAuthority {
         inner: ExactAllowBindingAuthority,
         full_validations: Arc<AtomicUsize>,

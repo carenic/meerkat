@@ -2189,7 +2189,10 @@ struct MockSessionService {
     load_persisted_session_delay_ms: AtomicU64,
     load_persisted_session_started: tokio::sync::Notify,
     live_durable_source_observations: AtomicUsize,
-    fail_load_persisted_session: AtomicBool,
+    /// Delay and failure of the body-free durable-source observation, the
+    /// store read the live open's source check makes.
+    live_durable_source_observation_delay_ms: AtomicU64,
+    fail_live_durable_source_observation: AtomicBool,
     /// Sessions whose every durable read refuses, and how.
     persisted_session_read_refusals_for:
         std::sync::Mutex<HashMap<SessionId, PersistedSessionReadRefusal>>,
@@ -2427,7 +2430,8 @@ impl MockSessionService {
             load_persisted_session_delay_ms: AtomicU64::new(0),
             load_persisted_session_started: tokio::sync::Notify::new(),
             live_durable_source_observations: AtomicUsize::new(0),
-            fail_load_persisted_session: AtomicBool::new(false),
+            live_durable_source_observation_delay_ms: AtomicU64::new(0),
+            fail_live_durable_source_observation: AtomicBool::new(false),
             persisted_session_read_refusals_for: std::sync::Mutex::new(HashMap::new()),
             fork_carries_source_build_state: AtomicBool::new(false),
             load_persisted_session_calls: AtomicU64::new(0),
@@ -3213,6 +3217,11 @@ impl MockSessionService {
 
     fn set_load_persisted_session_delay_ms(&self, delay_ms: u64) {
         self.load_persisted_session_delay_ms
+            .store(delay_ms, Ordering::Relaxed);
+    }
+
+    fn set_live_durable_source_observation_delay_ms(&self, delay_ms: u64) {
+        self.live_durable_source_observation_delay_ms
             .store(delay_ms, Ordering::Relaxed);
     }
 
@@ -5279,8 +5288,25 @@ impl MobSessionService for MockSessionService {
     ) -> Result<crate::LiveDurableSourceObservation, SessionError> {
         // Body-free: the persisted map and archive set only. Never touches the
         // load delay, the resume-authority gate, or `load_persisted_session`.
+        // Its own delay and failure stand in for a slow or failing store.
         self.live_durable_source_observations
             .fetch_add(1, Ordering::Relaxed);
+        let delay_ms = self
+            .live_durable_source_observation_delay_ms
+            .load(Ordering::Relaxed);
+        if delay_ms > 0 {
+            tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+        }
+        if self
+            .fail_live_durable_source_observation
+            .load(Ordering::Relaxed)
+        {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(
+                    "durable source observation failed".to_string(),
+                ),
+            ));
+        }
         if self.archived_session_ids.read().await.contains(session_id) {
             return Ok(crate::LiveDurableSourceObservation::Archived);
         }
@@ -5997,13 +6023,6 @@ impl MobSessionService for MockSessionService {
         let delay_ms = self.load_persisted_session_delay_ms.load(Ordering::Relaxed);
         if delay_ms > 0 {
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
-        }
-        if self.fail_load_persisted_session.load(Ordering::Relaxed) {
-            return Err(SessionError::Agent(
-                meerkat_core::error::AgentError::InternalError(
-                    "durable source body failed typed restore".to_string(),
-                ),
-            ));
         }
         let refusal = self
             .persisted_session_read_refusals_for
@@ -11083,11 +11102,11 @@ async fn callback_bearing_member_is_available_as_durable_fork_source_but_not_dir
 
 #[cfg(feature = "openai-live")]
 #[tokio::test]
-async fn live_durable_source_validation_loads_the_source_body_off_the_mob_actor() {
-    // The durable-source body load is store I/O that took seconds on large
-    // members. Run inline it queued every later mob command behind one voice
-    // status poll; the actor must stay free while the body loads, and the
-    // reply contract must be unchanged.
+async fn live_durable_source_validation_checks_the_source_off_the_mob_actor() {
+    // The durable-source check is store I/O, and a store can stall. Run
+    // inline it queued every later mob command behind one voice status poll;
+    // the actor must stay free while the check runs, and the reply contract
+    // must be unchanged.
     let definition = with_unique_mob_id(sample_definition(), "live-durable-source-off-actor");
     let (handle, service) = create_test_mob(definition).await;
     let identity = AgentIdentity::from("slow-durable-source");
@@ -11102,13 +11121,26 @@ async fn live_durable_source_validation_loads_the_source_body_off_the_mob_actor(
         .await
         .expect("current durable source member");
 
-    service.set_load_persisted_session_delay_ms(1_500);
+    service.set_live_durable_source_observation_delay_ms(1_500);
+    let checks_before = service
+        .live_durable_source_observations
+        .load(Ordering::Relaxed);
     let validation =
         tokio::spawn(async move { member.validate_live_durable_source_availability().await });
-    service.load_persisted_session_started.notified().await;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed)
+            == checks_before
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the open's source check starts");
     let listed = tokio::time::timeout(Duration::from_millis(500), handle.list_members())
         .await
-        .expect("an ordinary mob command completes while the durable source body is still loading");
+        .expect("an ordinary mob command completes while the source check is still running");
     assert!(
         listed.iter().any(|entry| entry.agent_identity == identity),
         "the validated member is listed"
@@ -11116,7 +11148,7 @@ async fn live_durable_source_validation_loads_the_source_body_off_the_mob_actor(
     validation
         .await
         .expect("validation task")
-        .expect("the reply arrives once the body has loaded");
+        .expect("the reply arrives once the check has finished");
 
     handle.shutdown().await.expect("shutdown test mob");
 }
@@ -11301,15 +11333,17 @@ async fn live_durable_source_readiness_fails_closed_with_typed_refusals() {
 
 #[cfg(feature = "openai-live")]
 #[tokio::test]
-async fn live_open_durable_source_body_load_is_single_flight_per_session() {
+async fn live_open_durable_source_check_is_single_flight_per_session() {
     let (handle, service, identity, _session_id) =
         spawn_live_durable_source_member("live-open-single-flight", "voice-member").await;
     let member = handle.member(&identity).await.expect("member handle");
 
-    service.set_load_persisted_session_delay_ms(400);
-    let loads_before = service.load_persisted_session_calls.load(Ordering::Relaxed);
+    service.set_live_durable_source_observation_delay_ms(400);
+    let checks_before = service
+        .live_durable_source_observations
+        .load(Ordering::Relaxed);
 
-    // A caller that gives up leaves its load running for the next caller.
+    // A caller that gives up leaves its check running for the next caller.
     assert!(
         tokio::time::timeout(
             Duration::from_millis(50),
@@ -11317,7 +11351,7 @@ async fn live_open_durable_source_body_load_is_single_flight_per_session() {
         )
         .await
         .is_err(),
-        "the impatient caller times out while the body loads"
+        "the impatient caller times out while the source check runs"
     );
     let opens = (0..8)
         .map(|_| {
@@ -11328,60 +11362,91 @@ async fn live_open_durable_source_body_load_is_single_flight_per_session() {
     for open in opens {
         open.await
             .expect("open validation task")
-            .expect("the shared load validates the source");
+            .expect("the shared check validates the source");
     }
     assert_eq!(
-        service.load_persisted_session_calls.load(Ordering::Relaxed) - loads_before,
+        service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed)
+            - checks_before,
         1,
-        "concurrent opens, including an abandoned one, share one body load"
+        "concurrent opens, including an abandoned one, share one source check"
     );
 
-    // The slot is released once the load settles: a later open loads anew.
-    service.set_load_persisted_session_delay_ms(0);
+    // The slot is released once the check settles: a later open checks anew.
+    service.set_live_durable_source_observation_delay_ms(0);
     member
         .validate_live_durable_source_availability()
         .await
         .expect("later open validates");
     assert_eq!(
-        service.load_persisted_session_calls.load(Ordering::Relaxed) - loads_before,
+        service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed)
+            - checks_before,
         2
     );
 
     handle.shutdown().await.expect("shutdown test mob");
 }
 
+/// The live open's source check refuses, typed, a source that is not a
+/// committed, unarchived session: an archived source and an absent one both
+/// end the open as `Rejected`, from the body-free observation.
+///
+/// The check reads no session body, so a body that cannot be read is not seen
+/// here. The live path first reads the body where the host loads a member
+/// whose session is not live: a strict `load_authoritative_session`, which
+/// ends the open typed as `MemberLiveError::Internal` and then `MobError`. A
+/// member whose session is live reads no store body on the live path; a body
+/// that cannot be read surfaces, typed, at the member's next cold read.
 #[cfg(feature = "openai-live")]
 #[tokio::test]
-async fn live_open_still_fails_a_corrupt_or_absent_body_with_a_typed_error() {
+async fn live_open_fails_an_absent_or_archived_source_with_a_typed_error() {
     let (handle, service, identity, session_id) =
-        spawn_live_durable_source_member("live-open-body-validation", "voice-member").await;
+        spawn_live_durable_source_member("live-open-source-validation", "voice-member").await;
     let member = handle.member(&identity).await.expect("member handle");
+    member
+        .validate_live_durable_source_availability()
+        .await
+        .expect("control: the committed source validates");
 
     service
-        .fail_load_persisted_session
-        .store(true, Ordering::Relaxed);
+        .archived_session_ids
+        .write()
+        .await
+        .insert(session_id.clone());
     assert_eq!(
         member.validate_live_durable_source_availability().await,
         Err(super::LiveBridgeOperationStartError::Rejected),
-        "a body that fails to restore refuses the open"
-    );
-    assert_eq!(
-        handle
-            .observe_live_durable_source_readiness(&identity, &session_id)
-            .await,
-        Ok(()),
-        "readiness is body-free by design; the open is where the body is validated"
+        "an archived source refuses the open"
     );
     service
-        .fail_load_persisted_session
-        .store(false, Ordering::Relaxed);
+        .archived_session_ids
+        .write()
+        .await
+        .remove(&session_id);
 
-    service.persisted_sessions.write().await.remove(&session_id);
+    let persisted = service
+        .persisted_sessions
+        .write()
+        .await
+        .remove(&session_id)
+        .expect("spawned member has a persisted source");
     assert_eq!(
         member.validate_live_durable_source_availability().await,
         Err(super::LiveBridgeOperationStartError::Rejected),
-        "an absent body refuses the open"
+        "an absent source refuses the open"
     );
+    service
+        .persisted_sessions
+        .write()
+        .await
+        .insert(session_id.clone(), persisted);
+    member
+        .validate_live_durable_source_availability()
+        .await
+        .expect("the restored source validates again");
 
     handle.shutdown().await.expect("shutdown test mob");
 }
@@ -11553,23 +11618,25 @@ async fn live_durable_source_readiness_answers_while_the_member_is_stuck_in_a_tu
     handle.shutdown().await.expect("shutdown test mob");
 }
 
-/// A shared body load that fails reaches every caller that joined it, and
-/// its slot is released: the next open starts a fresh load (#1246).
+/// A shared source check that fails reaches every caller that joined it, and
+/// its slot is released: the next open starts a fresh check.
 ///
-/// Time is paused, so the mock load's delay elapses only once every caller
-/// has been admitted and is waiting: all eight join the one load.
+/// Time is paused, so the mock check's delay elapses only once every caller
+/// has been admitted and is waiting: all eight join the one check.
 #[cfg(feature = "openai-live")]
 #[tokio::test(start_paused = true)]
-async fn live_open_failed_shared_load_reaches_all_waiters_and_releases_its_slot() {
+async fn live_open_failed_shared_check_reaches_all_waiters_and_releases_its_slot() {
     let (handle, service, identity, _session_id) =
         spawn_live_durable_source_member("live-open-shared-failure", "voice-member").await;
     let member = handle.member(&identity).await.expect("member handle");
 
-    service.set_load_persisted_session_delay_ms(300);
+    service.set_live_durable_source_observation_delay_ms(300);
     service
-        .fail_load_persisted_session
+        .fail_live_durable_source_observation
         .store(true, Ordering::Relaxed);
-    let loads_before = service.load_persisted_session_calls.load(Ordering::Relaxed);
+    let checks_before = service
+        .live_durable_source_observations
+        .load(Ordering::Relaxed);
     let opens = (0..8)
         .map(|_| {
             let member = member.clone();
@@ -11580,44 +11647,51 @@ async fn live_open_failed_shared_load_reaches_all_waiters_and_releases_its_slot(
         assert_eq!(
             open.await.expect("open validation task"),
             Err(super::LiveBridgeOperationStartError::Rejected),
-            "every joined caller receives the one failed load's typed error"
+            "every joined caller receives the one failed check's typed error"
         );
     }
     assert_eq!(
-        service.load_persisted_session_calls.load(Ordering::Relaxed) - loads_before,
+        service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed)
+            - checks_before,
         1,
-        "the failing load was shared, not repeated per caller"
+        "the failing check was shared, not repeated per caller"
     );
 
-    // The failed load released its slot: a later open loads anew and succeeds.
+    // The failed check released its slot: a later open checks anew and
+    // succeeds.
     service
-        .fail_load_persisted_session
+        .fail_live_durable_source_observation
         .store(false, Ordering::Relaxed);
-    service.set_load_persisted_session_delay_ms(0);
+    service.set_live_durable_source_observation_delay_ms(0);
     member
         .validate_live_durable_source_availability()
         .await
-        .expect("an open after the failure loads anew");
+        .expect("an open after the failure checks anew");
     assert_eq!(
-        service.load_persisted_session_calls.load(Ordering::Relaxed) - loads_before,
+        service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed)
+            - checks_before,
         2
     );
 
     handle.shutdown().await.expect("shutdown test mob");
 }
 
-/// A body load still running at the 30 s ceiling is abandoned as
+/// A source check still running at the 30 s ceiling is abandoned as
 /// temporarily unavailable for every waiter, no earlier, and its slot is
-/// released (#1246).
+/// released.
 #[cfg(feature = "openai-live")]
 #[tokio::test(start_paused = true)]
-async fn live_durable_source_load_is_abandoned_at_its_ceiling_and_releases_its_slot() {
+async fn live_durable_source_check_is_abandoned_at_its_ceiling_and_releases_its_slot() {
     use super::actor::live_durable_source_loads::{
         LIVE_DURABLE_SOURCE_LOAD_CEILING, LiveDurableSourceLoads,
     };
 
     let service = Arc::new(MockSessionService::new());
-    service.set_load_persisted_session_delay_ms(3_600_000);
+    service.set_live_durable_source_observation_delay_ms(3_600_000);
     let loads = LiveDurableSourceLoads::default();
     let session_id = SessionId::new();
     let started = tokio::time::Instant::now();
@@ -11632,26 +11706,32 @@ async fn live_durable_source_load_is_abandoned_at_its_ceiling_and_releases_its_s
             reply_rx
         })
         .collect::<Vec<_>>();
-    assert_eq!(loads.in_flight(), 1, "the three callers share one load");
+    assert_eq!(loads.in_flight(), 1, "the three callers share one check");
 
     for reply in replies {
         assert_eq!(
             reply.await.expect("ceiling reply"),
             Err(super::LiveBridgeOperationStartError::TemporarilyUnavailable),
-            "a hung body load is temporarily unavailable at its ceiling"
+            "a hung source check is temporarily unavailable at its ceiling"
         );
     }
     let elapsed = started.elapsed();
     assert!(
         elapsed >= LIVE_DURABLE_SOURCE_LOAD_CEILING
             && elapsed < LIVE_DURABLE_SOURCE_LOAD_CEILING + Duration::from_secs(1),
-        "the load is abandoned at the ceiling, not before or long after: {elapsed:?}"
+        "the check is abandoned at the ceiling, not before or long after: {elapsed:?}"
     );
     assert_eq!(
-        service.load_persisted_session_calls.load(Ordering::Relaxed),
+        service
+            .live_durable_source_observations
+            .load(Ordering::Relaxed),
         1
     );
-    assert_eq!(loads.in_flight(), 0, "the abandoned load released its slot");
+    assert_eq!(
+        loads.in_flight(),
+        0,
+        "the abandoned check released its slot"
+    );
 }
 
 #[cfg(feature = "openai-live")]
