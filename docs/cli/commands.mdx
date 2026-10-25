@@ -782,12 +782,15 @@ Multi-host notes:
   live URL and single-use token — to **stdout only**; stderr carries a
   token-free note. The socket it names is the input plane: there is no
   `live send` verb.
-- Member live channels are WebSocket-only in the current runtime. The shared
-  CLI transport enum accepts `--transport webrtc`, but the member host rejects
-  that selection. Session-scoped JSON-RPC `live/open` plus
-  `live/webrtc/answer` supports WebRTC only when the caller can address the
-  owning session directly. Controller `session/*` methods do not proxy a
-  placed member's host-local session in multi-host v1.
+- `--transport` is the member's own live host's to serve or refuse. A member
+  host started by `rkat mob host` serves WebSocket only, so it refuses
+  `--transport webrtc` (`LiveTransportUnsupported`), and the one-shot CLI
+  composes no live host for a member it runs itself. WebRTC to a member goes
+  through JSON-RPC `mob/member_live_open` with `transport: "webrtc"` and
+  `live/webrtc/answer` on the same server.
+  Session-scoped `live/open` refuses a mob member's session, and controller
+  `session/*` methods do not proxy a placed member's host-local session in
+  multi-host v1.
 - Mob verbs exit with typed codes: scope denied `45`, host unavailable
   `46`, stale cursor `47`, stale fence `48`, and stale delivery scope `56`
   (the member's session rotated under a still-current fence; capture the

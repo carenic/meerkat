@@ -617,28 +617,146 @@ async fn live_incapable_host_rejects_typed_with_zero_bridge_traffic() {
 }
 
 // ==========================================================================
-// T-C7 — webrtc: typed LiveTransportUnsupported at the verb family,
-// REGARDLESS of placement (DEC-P6B-C4 / ADJ-P6B-12); zero dispatch
+// T-C7: webrtc is the owning member live host's to serve or refuse, on
+// both placements (0.9.5; previously a placement-blind reject at the verb
+// family, DEC-P6B-C4). A host that serves no WebRTC refuses it typed
+// `LiveTransportUnsupported` before any provider effect, so the placement
+// still does not show through the behavior.
 // ==========================================================================
 
+/// Local gateway serving WebSocket only: it records each requested open
+/// transport and refuses WebRTC as a host without WebRTC state does. It
+/// keeps the trait's default execution-identity refusal.
+#[derive(Default)]
+struct WebsocketOnlyMemberLiveHost {
+    transports: StdMutex<Vec<Option<LiveOpenTransport>>>,
+}
+
+impl WebsocketOnlyMemberLiveHost {
+    fn transports(&self) -> Vec<Option<LiveOpenTransport>> {
+        self.transports.lock().expect("transport log lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_runtime::member_live::MemberLiveHost for WebsocketOnlyMemberLiveHost {
+    async fn open(
+        &self,
+        _session: &meerkat_core::SessionId,
+        _turning_mode: Option<meerkat_contracts::wire::RealtimeTurningMode>,
+        transport: Option<LiveOpenTransport>,
+    ) -> Result<LiveOpenResult, meerkat_runtime::member_live::MemberLiveError> {
+        self.transports
+            .lock()
+            .expect("transport log lock")
+            .push(transport);
+        if transport == Some(LiveOpenTransport::Webrtc) {
+            return Err(
+                meerkat_runtime::member_live::MemberLiveError::TransportUnsupported {
+                    requested: "webrtc".to_string(),
+                },
+            );
+        }
+        Ok(ScriptedMemberLiveHost::dummy_open_result())
+    }
+
+    async fn close(
+        &self,
+        _session: &meerkat_core::SessionId,
+        _channel_id: &str,
+    ) -> Result<LiveCloseStatus, meerkat_runtime::member_live::MemberLiveError> {
+        Ok(LiveCloseStatus::Closed)
+    }
+
+    async fn status(
+        &self,
+        _session: &meerkat_core::SessionId,
+        _channel_id: Option<String>,
+    ) -> Result<
+        meerkat_runtime::member_live::MemberLiveStatus,
+        meerkat_runtime::member_live::MemberLiveError,
+    > {
+        Err(meerkat_runtime::member_live::MemberLiveError::ChannelNotFound)
+    }
+
+    async fn control(
+        &self,
+        _session: &meerkat_core::SessionId,
+        _channel_id: &str,
+        _verb: BridgeLiveControlVerb,
+    ) -> Result<BridgeLiveControlOutcome, meerkat_runtime::member_live::MemberLiveError> {
+        Err(meerkat_runtime::member_live::MemberLiveError::ChannelNotFound)
+    }
+}
+
+fn webrtc_unsupported() -> BridgeRejectionCause {
+    BridgeRejectionCause::LiveTransportUnsupported {
+        requested: "webrtc".to_string(),
+    }
+}
+
 #[tokio::test(flavor = "multi_thread")]
-async fn webrtc_rejects_typed_with_zero_dispatch_on_both_placements() {
+async fn webrtc_is_served_or_refused_by_the_owning_member_live_host() {
     let _guard = REAL_COMMS_TEST_LOCK.lock().await;
-    let mut opts = HostFixtureOptions::named("xhl-t7-host-b").with_member_build();
-    // Live-CAPABLE bind fact (the reject must come from the transport gate,
-    // not the capability gate); no serving plane is needed pre-dispatch.
-    opts.live_endpoint = Some("wss://live.example.test:8443".to_string());
-    opts.member_llm_client = Some(scripted_member_client_completing("t7-done"));
-    let fixture = spawn_host_daemon_fixture(opts)
-        .await
-        .expect("spawn live-capable host fixture");
-    let controlling = create_controlling_mob("xhl-t7").await;
+
+    // Placed: the member host is the `rkat mob host` live composition,
+    // which serves WebSocket only.
+    let (fixture, plane) = live_host_fixture(
+        "xhl-t7-host-b",
+        None,
+        live_support::scripted_realtime_factory(),
+    )
+    .await;
+    let controlling =
+        create_controlling_mob_with_definition("xhl-t7", add_realtime_worker_profile).await;
     let report = controlling.bind_fixture(&fixture).await;
     controlling
-        .spawn_placed("worker", "placed-c7", &report.host_id)
+        .spawn_placed("rt-worker", "placed-c7", &report.host_id)
         .await
-        .expect("worker materializes on host B");
-    controlling
+        .expect("realtime member materializes on host B");
+    expect_rejected_cause(
+        controlling
+            .handle
+            .member_live_open(
+                MobControlPrincipal::Owner,
+                identity("placed-c7"),
+                None,
+                Some(LiveOpenTransport::Webrtc),
+            )
+            .await,
+        &webrtc_unsupported(),
+        "webrtc open for a member on a WebSocket-only host",
+    );
+    assert_eq!(
+        fixture.live_commands_served(),
+        1,
+        "the webrtc open reached the owning host"
+    );
+    assert_eq!(
+        plane.factory.open_count(),
+        0,
+        "the owning host refused before any provider effect"
+    );
+    let open = controlling
+        .handle
+        .member_live_open(
+            MobControlPrincipal::Owner,
+            identity("placed-c7"),
+            None,
+            Some(LiveOpenTransport::Websocket),
+        )
+        .await
+        .expect("the refused webrtc open left no channel behind");
+    websocket_bootstrap(&open);
+
+    // Local: the controlling host's own member live host decides alike.
+    let gateway = Arc::new(WebsocketOnlyMemberLiveHost::default());
+    let local = create_controlling_mob_with_member_live_host(
+        "xhl-t7-local",
+        Arc::clone(&gateway) as Arc<dyn meerkat_runtime::member_live::MemberLiveHost>,
+    )
+    .await;
+    local
         .handle
         .spawn_spec(
             meerkat_mob::SpawnMemberSpec::new("worker", "local-c7")
@@ -646,34 +764,109 @@ async fn webrtc_rejects_typed_with_zero_dispatch_on_both_placements() {
         )
         .await
         .expect("local member spawns");
-
-    for member in ["placed-c7", "local-c7"] {
-        match controlling
+    expect_rejected_cause(
+        local
             .handle
             .member_live_open(
                 MobControlPrincipal::Owner,
-                identity(member),
+                identity("local-c7"),
                 None,
                 Some(LiveOpenTransport::Webrtc),
             )
-            .await
-        {
-            Err(MobError::BridgeCommandRejected {
-                cause: BridgeRejectionCause::LiveTransportUnsupported { requested },
-                ..
-            }) => {
-                assert_eq!(requested, "webrtc", "the reject names the transport");
-            }
-            other => panic!(
-                "webrtc open for {member} must reject LiveTransportUnsupported, got {other:?}"
-            ),
-        }
-    }
+            .await,
+        &webrtc_unsupported(),
+        "webrtc open for a local member on a WebSocket-only host",
+    );
+    assert_eq!(
+        gateway.transports(),
+        vec![Some(LiveOpenTransport::Webrtc)],
+        "the local webrtc open reached the member live host"
+    );
 
+    fixture.shutdown().await;
+}
+
+// ==========================================================================
+// T-C7b: a channel-scoped execution identity (gpt-live-1) is served by a
+// local member's live host only: the supervisor bridge does not carry one,
+// so a placed member refuses it typed `Unsupported` with ZERO dispatch, and
+// a local host composed without an execution-identity authority refuses it
+// typed through the trait default.
+// ==========================================================================
+
+#[tokio::test(flavor = "multi_thread")]
+async fn execution_identity_open_refuses_typed_on_a_placed_member_with_zero_dispatch() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let execution_identity = || meerkat_contracts::WireLiveExecutionIdentityOverrideV1 {
+        version: meerkat_contracts::WireLiveExecutionIdentityVersion::V1,
+        profile_id: "openai.gpt-live-1.client-context.v1".to_string(),
+    };
+
+    let (fixture, plane) = live_host_fixture(
+        "xhl-t7b-host-b",
+        None,
+        live_support::scripted_realtime_factory(),
+    )
+    .await;
+    let controlling =
+        create_controlling_mob_with_definition("xhl-t7b", add_realtime_worker_profile).await;
+    let report = controlling.bind_fixture(&fixture).await;
+    controlling
+        .spawn_placed("rt-worker", "placed-c7b", &report.host_id)
+        .await
+        .expect("realtime member materializes on host B");
+    expect_rejected_cause(
+        controlling
+            .handle
+            .member_live_open_with_execution_identity(
+                MobControlPrincipal::Owner,
+                identity("placed-c7b"),
+                execution_identity(),
+                None,
+                Some(LiveOpenTransport::Webrtc),
+            )
+            .await,
+        &BridgeRejectionCause::Unsupported,
+        "execution-identity open for a placed member",
+    );
     assert_eq!(
         fixture.live_commands_served(),
         0,
-        "the placement-blind webrtc gate dispatched NOTHING (S3b pin)"
+        "the placed refusal dispatched NOTHING"
+    );
+    assert_eq!(plane.factory.open_count(), 0);
+
+    let gateway = Arc::new(WebsocketOnlyMemberLiveHost::default());
+    let local = create_controlling_mob_with_member_live_host(
+        "xhl-t7b-local",
+        Arc::clone(&gateway) as Arc<dyn meerkat_runtime::member_live::MemberLiveHost>,
+    )
+    .await;
+    local
+        .handle
+        .spawn_spec(
+            meerkat_mob::SpawnMemberSpec::new("worker", "local-c7b")
+                .with_backend(meerkat_mob::MobBackendKind::Session),
+        )
+        .await
+        .expect("local member spawns");
+    expect_rejected_cause(
+        local
+            .handle
+            .member_live_open_with_execution_identity(
+                MobControlPrincipal::Owner,
+                identity("local-c7b"),
+                execution_identity(),
+                None,
+                Some(LiveOpenTransport::Webrtc),
+            )
+            .await,
+        &BridgeRejectionCause::Unavailable,
+        "execution-identity open on a local host without an execution-identity authority",
+    );
+    assert!(
+        gateway.transports().is_empty(),
+        "no stock open ran in place of the execution-identity open"
     );
 
     fixture.shutdown().await;

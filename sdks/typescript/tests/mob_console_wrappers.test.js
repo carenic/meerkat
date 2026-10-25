@@ -504,6 +504,23 @@ describe("Mob console wrappers (phase 7)", () => {
       );
     });
 
+    it("memberLiveOpen carries the execution identity", async () => {
+      const { client, calls } = cannedClient();
+      const mob = new Mob(client, "mob-1");
+      const executionIdentity = {
+        version: "v1",
+        profile_id: "openai.gpt-live-1.client-context.v1",
+      };
+      await mob.memberLiveOpen("worker", { transport: "webrtc", executionIdentity });
+      assert.equal(calls[0].method, "mob/member_live_open");
+      assert.deepEqual(calls[0].params, {
+        mob_id: "mob-1",
+        agent_identity: "worker",
+        transport: "webrtc",
+        execution_identity: executionIdentity,
+      });
+    });
+
     it("memberLiveClose / memberLiveStatus / memberLiveControl issue exact literals", async () => {
       const { client, calls } = cannedClient();
       const mob = new Mob(client, "mob-1");

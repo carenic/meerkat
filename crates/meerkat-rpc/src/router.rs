@@ -1886,6 +1886,13 @@ impl MethodRouter {
             Some(state) => live_host.with_webrtc_cleanup_state(Arc::clone(state)),
             None => live_host,
         };
+        // A member's channel opened under an execution identity goes through
+        // the same authority as a strict `live/open` (and closes through it).
+        #[cfg(feature = "openai-live")]
+        let live_host = match self.experimental_live_open_authority.as_ref() {
+            Some(authority) => live_host.with_execution_identity_authority(Arc::clone(authority)),
+            None => live_host,
+        };
         let live_host = Arc::new(live_host);
         #[cfg(all(feature = "openai-live", feature = "mob", feature = "live-webrtc"))]
         if let Some(authority) = self.experimental_live_open_authority.as_ref() {
@@ -3255,6 +3262,40 @@ impl MethodRouter {
             }
             #[cfg(feature = "mob")]
             "mob/member_live_open" => {
+                // With an execution identity the member's channel is a strict
+                // one: this connection keeps its playback custody and its
+                // publication is cleaned up if the response is never
+                // delivered, exactly as for a strict `live/open`.
+                #[cfg(all(feature = "openai-live", feature = "live-webrtc"))]
+                {
+                    let handlers::live::LiveOpenHandlerResult {
+                        response,
+                        experimental_publication,
+                    } = routed_arm(|| {
+                        handlers::mob::handle_member_live_open_routed(
+                            id,
+                            params,
+                            &self.mob_state,
+                            &self.runtime,
+                            self.experimental_live_open_authority.as_ref(),
+                            &self.live_adapter_host,
+                            &self.experimental_live_playback_custodies,
+                        )
+                    })
+                    .await;
+                    let custody = experimental_publication.map(|publication| {
+                        ExperimentalLiveOpenDeliveryCustody::new(
+                            Arc::clone(&self.runtime),
+                            Arc::clone(&self.live_adapter_host),
+                            publication,
+                            Arc::clone(&self.experimental_live_playback_custodies),
+                        )
+                    });
+                    return Some(RoutedRpcResponse::with_experimental_live_open(
+                        response, custody,
+                    ));
+                }
+                #[cfg(not(all(feature = "openai-live", feature = "live-webrtc")))]
                 routed_arm(|| handlers::mob::handle_member_live_open(id, params, &self.mob_state))
                     .await
             }
@@ -19502,6 +19543,423 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
             transport.calls.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "strict answer must validate playback custody before provider IO"
+        );
+    }
+
+    /// A WebRTC-capable RPC host whose member live host is composed (a live
+    /// session factory is attached); `transport` answers the offers.
+    #[cfg(all(feature = "mob", feature = "live-webrtc", feature = "comms"))]
+    async fn member_live_webrtc_router(
+        transport: Arc<TestRemoteAnswerTransport>,
+    ) -> (MethodRouter, mpsc::Receiver<RpcNotification>) {
+        let (router, notifications) = test_openai_live_router().await;
+        let host = Arc::new(meerkat_live::LiveAdapterHost::new(Arc::new(
+            meerkat_live::NoOpProjectionSink,
+        )));
+        let feedback = Arc::new(
+            crate::live_projection_sink::SessionServiceProjectionSink::new(Arc::clone(
+                &router.runtime,
+            )),
+        );
+        let router = router
+            .with_live_webrtc(Arc::new(meerkat_live::LiveWebrtcState::new(
+                host,
+                Arc::clone(&feedback) as Arc<dyn meerkat_live::LiveChannelCloseFeedback>,
+                feedback as Arc<dyn meerkat_live::LiveChannelStatusFeedback>,
+            )))
+            .with_live_webrtc_answer_transport(transport)
+            .with_live_session_factory(Arc::new(RecordingLiveFactory {
+                log: Arc::new(tokio::sync::Mutex::new(Vec::new())),
+            }));
+        (router, notifications)
+    }
+
+    /// Create `mob_id` with one realtime member, `voice-1`, and spawn it.
+    #[cfg(all(feature = "mob", feature = "live-webrtc", feature = "comms"))]
+    async fn spawn_realtime_voice_member(router: &MethodRouter, mob_id: &str) {
+        let created = router
+            .dispatch(make_request(
+                "mob/create",
+                serde_json::json!({
+                    "definition": {
+                        "id": mob_id,
+                        "profiles": {
+                            "voice": {
+                                "model": "gpt-realtime-2",
+                                "provider": "openai",
+                                "external_addressable": true,
+                                "tools": { "comms": true }
+                            }
+                        }
+                    }
+                }),
+            ))
+            .await
+            .expect("mob/create response");
+        assert!(created.error.is_none(), "mob/create failed: {created:?}");
+        let spawned = router
+            .dispatch(make_request(
+                "mob/spawn",
+                serde_json::json!({
+                    "mob_id": mob_id,
+                    "profile": "voice",
+                    "agent_identity": "voice-1",
+                    "runtime_mode": "turn_driven"
+                }),
+            ))
+            .await
+            .expect("mob/spawn response");
+        assert!(spawned.error.is_none(), "mob/spawn failed: {spawned:?}");
+    }
+
+    /// The refusal kind of a session-scoped `live/open` on a member session.
+    #[cfg(all(feature = "mob", feature = "live-webrtc", feature = "comms"))]
+    fn assert_member_session_refused_by_id(response: &RpcResponse) {
+        assert_eq!(error_code(response), error::INVALID_PARAMS, "{response:?}");
+        let data = response
+            .error
+            .as_ref()
+            .and_then(|error| error.data.as_ref())
+            .expect("the refusal keeps its data");
+        assert_eq!(
+            data["kind"],
+            meerkat_core::SessionError::MOB_MEMBER_SESSION_ADDRESSED_BY_ID_KIND,
+            "{response:?}"
+        );
+    }
+
+    /// `mob/member_live_open` with transport `webrtc` opens the member's
+    /// channel through its mob and the member live host, and
+    /// `live/webrtc/answer` completes the offer on that channel (signaling
+    /// only). The session-scoped `live/open` by the member's session id stays
+    /// refused, WebRTC included.
+    #[cfg(all(feature = "mob", feature = "live-webrtc", feature = "comms"))]
+    #[tokio::test]
+    async fn a_mob_member_webrtc_open_answers_through_the_member_live_host() {
+        let _projection_guard = crate::session_runtime::realtime_open_projection_test_guard().await;
+        let transport = Arc::new(TestRemoteAnswerTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            provider_offers: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let (router, _notifications) = member_live_webrtc_router(Arc::clone(&transport)).await;
+        spawn_realtime_voice_member(&router, "voice-webrtc-mob").await;
+        let session_id = SessionId::parse(
+            &resolve_mob_bridge_session_id(&router, "voice-webrtc-mob", "voice-1").await,
+        )
+        .expect("member session id");
+
+        let by_id = router
+            .dispatch(make_request(
+                "live/open",
+                serde_json::json!({
+                    "session_id": session_id.to_string(),
+                    "transport": "webrtc"
+                }),
+            ))
+            .await
+            .expect("session-scoped live/open response");
+        assert_member_session_refused_by_id(&by_id);
+        assert!(router.live_adapter_host.active_channels().await.is_empty());
+
+        let opened = router
+            .dispatch(make_request(
+                "mob/member_live_open",
+                serde_json::json!({
+                    "mob_id": "voice-webrtc-mob",
+                    "agent_identity": "voice-1",
+                    "transport": "webrtc"
+                }),
+            ))
+            .await
+            .expect("mob/member_live_open response");
+        assert!(
+            opened.error.is_none(),
+            "a member WebRTC open goes through the member live host: {opened:?}"
+        );
+        let open = result_value(&opened);
+        assert_eq!(open["transport"]["transport"], "webrtc", "{open}");
+        assert_eq!(
+            open["transport"]["answer_method"], "live/webrtc/answer",
+            "{open}"
+        );
+        let channel_id =
+            meerkat_live::LiveChannelId::new(open["channel_id"].as_str().expect("channel_id"));
+        let token = open["transport"]["token"]
+            .as_str()
+            .expect("WebRTC token")
+            .to_string();
+        assert_eq!(
+            router
+                .runtime_adapter
+                .live_session_for_active_channel(&channel_id)
+                .await,
+            Some(session_id.clone()),
+            "the channel is the member session's"
+        );
+
+        let answered = router
+            .dispatch(make_request(
+                "live/webrtc/answer",
+                serde_json::json!({
+                    "channel_id": channel_id.to_string(),
+                    "token": token,
+                    "offer_sdp": "member-offer"
+                }),
+            ))
+            .await
+            .expect("live/webrtc/answer response");
+        assert!(
+            answered.error.is_none(),
+            "the member channel's offer is answered: {answered:?}"
+        );
+        assert_eq!(result_value(&answered)["answer_sdp"], "remote-answer");
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(
+            transport
+                .provider_offers
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+
+        let closed = router
+            .dispatch(make_request(
+                "mob/member_live_close",
+                serde_json::json!({
+                    "mob_id": "voice-webrtc-mob",
+                    "agent_identity": "voice-1",
+                    "channel_id": channel_id.to_string()
+                }),
+            ))
+            .await
+            .expect("mob/member_live_close response");
+        assert!(closed.error.is_none(), "member close failed: {closed:?}");
+        assert!(
+            router
+                .runtime_adapter
+                .live_session_for_active_channel(&channel_id)
+                .await
+                .is_none()
+        );
+    }
+
+    /// A gpt-live-1-shaped member open: `mob/member_live_open` with an
+    /// execution identity opens through the member's mob and the RPC host's
+    /// execution-identity authority, keeps the connection's playback custody
+    /// like a strict `live/open`, completes the offer on the same
+    /// connection (signaling only), and `mob/member_live_close` closes the
+    /// channel through the authority. The strict `live/open` by the member's
+    /// session id stays refused before the authority runs.
+    #[cfg(all(feature = "openai-live", feature = "comms"))]
+    #[tokio::test]
+    async fn a_mob_member_execution_identity_open_answers_and_closes_through_the_authority() {
+        let _effect_test_guard = STRICT_LIVE_OPEN_EFFECT_TEST_LOCK.lock().await;
+        let transport = Arc::new(TestRemoteAnswerTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            provider_offers: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let authority = Arc::new(ExperimentalAuthorityTestProvider {
+            log: Arc::clone(&log),
+            deny: false,
+        });
+        let (router, _notifications) = member_live_webrtc_router(Arc::clone(&transport)).await;
+        let router = router.with_experimental_live_open_authority(authority);
+        spawn_realtime_voice_member(&router, "voice-gpt-live-mob").await;
+        let session_id = SessionId::parse(
+            &resolve_mob_bridge_session_id(&router, "voice-gpt-live-mob", "voice-1").await,
+        )
+        .expect("member session id");
+
+        let by_id = router
+            .dispatch(experimental_open_request(&session_id))
+            .await
+            .expect("strict live/open response");
+        assert_member_session_refused_by_id(&by_id);
+        assert!(
+            log.lock().await.is_empty(),
+            "the by-id refusal comes before the authority"
+        );
+
+        let opened = router
+            .dispatch(make_request(
+                "mob/member_live_open",
+                serde_json::json!({
+                    "mob_id": "voice-gpt-live-mob",
+                    "agent_identity": "voice-1",
+                    "transport": "webrtc",
+                    "execution_identity": {
+                        "version": "v1",
+                        "profile_id": meerkat::GPT_LIVE_CLIENT_CONTEXT_PROFILE_ID
+                    }
+                }),
+            ))
+            .await
+            .expect("mob/member_live_open response");
+        assert!(
+            opened.error.is_none(),
+            "a member execution-identity open goes through the authority: {opened:?}"
+        );
+        assert_eq!(*log.lock().await, vec!["prepare", "factory", "bind"]);
+        let open = result_value(&opened);
+        assert_eq!(open["transport"]["transport"], "webrtc", "{open}");
+        let channel_id =
+            meerkat_live::LiveChannelId::new(open["channel_id"].as_str().expect("channel_id"));
+        let token = open["transport"]["token"]
+            .as_str()
+            .expect("WebRTC token")
+            .to_string();
+        let custody = router
+            .experimental_live_playback_custodies
+            .lock()
+            .await
+            .get(&channel_id)
+            .cloned()
+            .expect("the member open keeps connection-local playback custody");
+        assert_eq!(custody.session_id, session_id);
+        router
+            .runtime_adapter
+            .validate_live_playback_owner_readiness(
+                &session_id,
+                &channel_id,
+                &custody.pending_receipt,
+                &custody.readiness_receipt,
+            )
+            .await
+            .expect("the member open registers exact playback-owner readiness");
+        let bound = router
+            .runtime_adapter
+            .live_channel_bound_llm_identity(&session_id, &channel_id)
+            .await
+            .expect("generated bound identity")
+            .expect("bound identity present");
+        assert_eq!(bound.model, "gpt-realtime-2");
+
+        let answered = router
+            .dispatch(make_request(
+                "live/webrtc/answer",
+                serde_json::json!({
+                    "channel_id": channel_id.to_string(),
+                    "token": token,
+                    "offer_sdp": "member-offer"
+                }),
+            ))
+            .await
+            .expect("live/webrtc/answer response");
+        assert!(
+            answered.error.is_none(),
+            "the member channel's offer is answered: {answered:?}"
+        );
+        assert_eq!(result_value(&answered)["answer_sdp"], "remote-answer");
+        assert_eq!(transport.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let closed = router
+            .dispatch(make_request(
+                "mob/member_live_close",
+                serde_json::json!({
+                    "mob_id": "voice-gpt-live-mob",
+                    "agent_identity": "voice-1",
+                    "channel_id": channel_id.to_string()
+                }),
+            ))
+            .await
+            .expect("mob/member_live_close response");
+        assert!(closed.error.is_none(), "member close failed: {closed:?}");
+        assert_eq!(
+            *log.lock().await,
+            vec!["prepare", "factory", "bind", "physical_close", "unbind"],
+            "the member close goes through the authority, as a strict live/close does"
+        );
+        assert!(
+            router
+                .runtime_adapter
+                .live_session_for_active_channel(&channel_id)
+                .await
+                .is_none()
+        );
+    }
+
+    /// An execution-identity member open whose response never reaches the
+    /// client is retired exactly as an undelivered strict `live/open` is:
+    /// the authority's binding, the channel and the connection's playback
+    /// custody all go.
+    #[cfg(all(feature = "openai-live", feature = "comms"))]
+    #[tokio::test]
+    async fn an_undelivered_mob_member_execution_identity_open_is_retired_like_a_strict_open() {
+        let _effect_test_guard = STRICT_LIVE_OPEN_EFFECT_TEST_LOCK.lock().await;
+        let transport = Arc::new(TestRemoteAnswerTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            provider_offers: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let authority = Arc::new(ExperimentalAuthorityTestProvider {
+            log: Arc::clone(&log),
+            deny: false,
+        });
+        let (router, _notifications) = member_live_webrtc_router(transport).await;
+        let router = router.with_experimental_live_open_authority(authority);
+        spawn_realtime_voice_member(&router, "voice-undelivered-mob").await;
+
+        let mut routed = router
+            .dispatch_for_transport(make_request(
+                "mob/member_live_open",
+                serde_json::json!({
+                    "mob_id": "voice-undelivered-mob",
+                    "agent_identity": "voice-1",
+                    "transport": "webrtc",
+                    "execution_identity": {
+                        "version": "v1",
+                        "profile_id": meerkat::GPT_LIVE_CLIENT_CONTEXT_PROFILE_ID
+                    }
+                }),
+            ))
+            .await
+            .expect("routed mob/member_live_open response");
+        assert!(
+            routed.response.error.is_none(),
+            "a member execution-identity open goes through the authority: {:?}",
+            routed.response
+        );
+        assert_eq!(*log.lock().await, vec!["prepare", "factory", "bind"]);
+        let channel_id = meerkat_live::LiveChannelId::new(
+            result_value(&routed.response)["channel_id"]
+                .as_str()
+                .expect("channel_id"),
+        );
+        assert_eq!(
+            router
+                .experimental_live_playback_custodies
+                .lock()
+                .await
+                .len(),
+            1
+        );
+
+        routed
+            .settle_delivery(false)
+            .await
+            .expect("publication rejection cleanup");
+
+        assert_eq!(
+            *log.lock().await,
+            vec!["prepare", "factory", "bind", "unbind"]
+        );
+        assert!(
+            router
+                .runtime_adapter
+                .live_session_for_active_channel(&channel_id)
+                .await
+                .is_none()
+        );
+        assert!(
+            router
+                .experimental_live_playback_custodies
+                .lock()
+                .await
+                .is_empty(),
+            "publication rejection drops the connection's playback custody"
         );
     }
 

@@ -2035,13 +2035,26 @@ scope grants, hard cancel, placed member history, and member live-channel
 control. Check `runtime/capabilities.features.multi_host_mobs` rather than
 inferring support from generic `mobs` or the server version.
 
-`mob/member_live_open` supports WebSocket transport only for both local and
-placed members. A request for `transport: "webrtc"` is rejected, and the
-session-scoped `live/open` and `live/webrtc/answer` flow below refuses a
-member's session, so WebRTC to a mob member is not available in 0.9.5:
-`mob/member_live_open` over WebSocket is the route. In multi-host v1,
-controller `session/*` methods do not proxy a placed member's host-local
-session either.
+`mob/member_live_open` opens a member's live channel through its mob, for
+local and placed members alike: the mob checks the member, then the member's
+own live host serves the requested `transport` or refuses it typed. With
+`transport: "webrtc"` the result is a WebRTC bootstrap whose offer is answered
+with `live/webrtc/answer` on this server. A host that serves no WebRTC refuses
+it (`INVALID_PARAMS`, cause `LiveTransportUnsupported`) before it connects a
+provider; a member host started by `rkat mob host` serves WebSocket only.
+
+The optional `execution_identity` selects a channel-scoped execution profile
+exactly as on `live/open`, for example gpt-live-1 with
+`{"version": "v1", "profile_id": "openai.gpt-live-1.client-context.v1"}`. It
+requires `transport: "webrtc"` (`INVALID_PARAMS` otherwise) and a server
+composed with an execution-identity authority (`-32020`, capability
+unavailable, otherwise), and it is served for a member local to this server
+only: a placed member refuses it (`INVALID_PARAMS`, cause `Unsupported`) with
+nothing dispatched to its host. The connection that opened the channel keeps
+its playback custody and answers its offer with `live/webrtc/answer`, as for
+a strict `live/open`; `mob/member_live_close` closes it through the same
+authority. In multi-host v1, controller `session/*` methods do not proxy a
+placed member's host-local session.
 
 The session-scoped `live/open` opens no live channel on a mob member's
 session, live or not, and never restores one from storage: the member's mob

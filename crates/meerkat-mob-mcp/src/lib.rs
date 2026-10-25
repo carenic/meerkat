@@ -7584,9 +7584,9 @@ impl MobMcpState {
 
     /// Open a live realtime channel on a member (§16.4). The returned
     /// [`meerkat_contracts::wire::LiveOpenResult`] carries the owning
-    /// host's URL + single-use token VERBATIM (DEC-P6B-C7/C8): never
-    /// logged, Debug-formatted, or retained here. `Live`-gated at
-    /// chokepoint (a).
+    /// host's bootstrap (a URL + single-use token, or a WebRTC token)
+    /// VERBATIM (DEC-P6B-C7/C8): never logged, Debug-formatted, or retained
+    /// here. `Live`-gated at chokepoint (a).
     pub async fn mob_member_live_open(
         &self,
         mob_id: &MobId,
@@ -7599,6 +7599,33 @@ impl MobMcpState {
             .member_live_open(
                 self.console_principal.clone(),
                 identity,
+                turning_mode,
+                transport,
+            )
+            .await
+    }
+
+    /// [`Self::mob_member_live_open`] under a channel-scoped execution
+    /// identity (`live.execution_identity.v1`, for example `gpt-live-1`),
+    /// served by a local member's live host through its execution-identity
+    /// authority. The result's pending receipt is what the surface answering
+    /// the channel's WebRTC offer registers its playback owner against; like
+    /// the bootstrap token it is never logged or retained here. `Live`-gated
+    /// at chokepoint (a).
+    pub async fn mob_member_live_open_with_execution_identity(
+        &self,
+        mob_id: &MobId,
+        identity: AgentIdentity,
+        execution_identity: meerkat_contracts::WireLiveExecutionIdentityOverrideV1,
+        turning_mode: Option<meerkat_contracts::wire::RealtimeTurningMode>,
+        transport: Option<meerkat_contracts::wire::LiveOpenTransport>,
+    ) -> Result<meerkat_runtime::member_live::MemberLiveExecutionOpen, MobError> {
+        self.handle_for(mob_id)
+            .await?
+            .member_live_open_with_execution_identity(
+                self.console_principal.clone(),
+                identity,
+                execution_identity,
                 turning_mode,
                 transport,
             )

@@ -435,7 +435,10 @@ export class Mob {
 
   /**
    * Open a live realtime channel on a member. The result carries the
-   * owning host's WS URL + single-use token VERBATIM — treat it as opaque.
+   * owning host's bootstrap (a WebSocket URL and token, or a WebRTC token
+   * whose offer is answered with `liveWebrtcAnswer`) VERBATIM; treat it as
+   * opaque. `executionIdentity` selects a channel-scoped execution profile
+   * such as gpt-live-1; see `MeerkatClient.openMobMemberLive`.
    */
   async memberLiveOpen(
     agentIdentity: string,

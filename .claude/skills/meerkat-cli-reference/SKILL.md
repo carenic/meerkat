@@ -484,11 +484,13 @@ and pack overlays (budget, models, `max_tokens`, compaction, `--model`) apply
 there too, as defaults: an explicit `session/create` or mob spawn parameter
 replaces them.
 
-The parser accepts `--transport websocket|webrtc` on `rkat mob live open`, but
-the current member-live family rejects WebRTC for both local and placed
-members; use `websocket`. Generic JSON-RPC `live/*` can negotiate WebRTC only
-for a controller-local session. It cannot proxy a placed member's remote
-session through the controller.
+`rkat mob live open --transport websocket|webrtc` leaves the transport to the
+member's own live host. The one-shot CLI composes no live listener and a
+member host started by `rkat mob host` serves WebSocket only, so use
+`websocket` here; WebRTC to a member goes through JSON-RPC
+`mob/member_live_open` plus `live/webrtc/answer` on the same server. Generic
+JSON-RPC `live/open` refuses a mob member's session, and nothing proxies a
+placed member's remote session through the controller.
 
 `grant`/`revoke-grant` scopes: `list`, `read_history`, `subscribe_events`,
 `send_command`, `cancel`, `retire`, `wire_topology`, `live`, `admin_host`,

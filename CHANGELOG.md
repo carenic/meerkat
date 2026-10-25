@@ -866,11 +866,17 @@ them.
   builds it with a struct literal sets it. A surface that opens live channels
   by session id passes `SessionScoped`; the member live host passes
   `MobMember` (see Fixed).
-- `meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
-  session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
-  member's session with `INVALID_PARAMS` and data kind
-  `mob_member_session_addressed_by_id` (see Fixed), and
-  `mob/member_live_open`, the route for a member, is WebSocket only.
+- `meerkat-rpc`: the session-scoped `live/open` refuses a mob member's
+  session, WebRTC included, with `INVALID_PARAMS` and data kind
+  `mob_member_session_addressed_by_id` (see Fixed). Open a member's channel,
+  WebSocket or WebRTC, with `mob/member_live_open`, which checks the member
+  first; for a gpt-live-1 voice channel pass the same `execution_identity`
+  there (see Added).
+- `meerkat-contracts`: `MobMemberLiveOpenParams` gains the field
+  `execution_identity: Option<WireLiveExecutionIdentityOverrideV1>` (see
+  Added), so code that builds it with a struct literal sets
+  `execution_identity: None`. The wire stays additive: the field is left out
+  when absent.
 - `meerkat-contracts`: `LiveOpenResult` gains the field
   `advisories: Vec<WireLiveOpenAdvisory>`, what a successful `live/open` went
   ahead without (today `staged_prompt_refused`: a run-start hook refused the
@@ -2402,6 +2408,28 @@ them.
   runtime's current run or the run its registration keeps resumable. Such an
   actor is not stale.
 
+- `meerkat-rpc`, `meerkat-mob`, `meerkat-mob-mcp`, `meerkat-runtime`,
+  `meerkat`: a mob member's live channel opens over WebRTC through its mob.
+  `mob/member_live_open` with `transport: "webrtc"` runs the mob's member
+  checks (not retiring, in cleanup or revoke, and restored), then the
+  member's own live host serves it: the result is a WebRTC bootstrap whose
+  offer `live/webrtc/answer` answers on the same JSON-RPC server. A host that
+  serves no WebRTC refuses it typed (`LiveTransportUnsupported`) before it
+  connects a provider. The optional `execution_identity` (for gpt-live-1,
+  `{"version": "v1", "profile_id": "openai.gpt-live-1.client-context.v1"}`)
+  opens the member's channel through the server's execution-identity
+  authority, the one behind the strict `live/open`: the connection keeps the
+  channel's playback custody and answers its offer, and
+  `mob/member_live_close` closes the channel through that authority. Rust
+  embedders get `MobHandle::member_live_open_with_execution_identity`,
+  `MobMcpState::mob_member_live_open_with_execution_identity`,
+  `MemberLiveHost::open_with_execution_identity` (by default a typed
+  `Unavailable` refusal), `MemberLiveHost::close_explicit` (the mob's own
+  closes; by default `close`), `MemberLiveExecutionOpen` and
+  `ServiceMemberLiveHost::with_execution_identity_authority`. The Python
+  (`execution_identity=`) and TypeScript (`executionIdentity`) member live
+  helpers take the selector too.
+
 ### Changed
 
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: stopping a durable
@@ -3433,7 +3461,7 @@ them.
   refused with `INVALID_PARAMS` (-32602) and data kind
   `mob_member_session_addressed_by_id` (with the session, mob and member):
   nothing is opened or restored, and `mob/member_live_open` opens the member
-  through its mob. A member therefore has no WebRTC channel (see Breaking).
+  through its mob, WebRTC included (see Breaking and Added).
   The reads behind a channel that already exists find a live member session
   as before.
   `SessionError::mob_member_session_addressed_by_id` and
@@ -3648,6 +3676,13 @@ them.
   `stream_lagged` marker, and a typed SDK error when the stream ends with the
   gap open) but does not refill it. Take a run's token accounting from its
   run result, not from the streamed events.
+
+- `meerkat-rpc`, `meerkat-mob`: a channel-scoped `execution_identity`
+  (gpt-live-1) is served for a mob member local to the JSON-RPC server only.
+  A placed member refuses it typed (`BridgeCommandRejected` with cause
+  `Unsupported`, nothing dispatched to its host): the supervisor bridge does
+  not carry an execution identity, and a member host started by
+  `rkat mob host` serves WebSocket only. The 0.9.6 line extends the bridge.
 
 ## [0.9.4] - 2026-10-20
 

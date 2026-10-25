@@ -381,14 +381,18 @@ nothing, do not treat `ClosedOrphanedDrain` as `Closed`.
 
 #### WebRTC to mob members
 
-`meerkat-rpc`: WebRTC to a mob member is not available in 0.9.5. The
-session-scoped `live/open` and `live/webrtc/answer` flow refuses a mob
-member's session with `INVALID_PARAMS` (-32602) and data kind
-`mob_member_session_addressed_by_id`, and `mob/member_live_open`, the route
-for a member, is WebSocket only.
+`meerkat-rpc`: the session-scoped `live/open` refuses a mob member's session
+with `INVALID_PARAMS` (-32602) and data kind
+`mob_member_session_addressed_by_id`. A member's channel, WebRTC included,
+opens through its mob with `mob/member_live_open`: the mob checks the member
+first, and the member's own live host serves the transport or refuses it
+typed. With `transport: "webrtc"`, answer the offer with `live/webrtc/answer`
+on the same server. For a gpt-live-1 voice channel, pass the same
+`execution_identity` as on `live/open` (the member must be local to the
+server).
 
-**Do:** open a member's live channel with `mob/member_live_open` over
-WebSocket, and keep WebRTC for sessions that are not mob members.
+**Do:** open a member's live channel, WebSocket or WebRTC, with
+`mob/member_live_open` instead of `live/open` by the member's session id.
 
 #### Live open advisories
 

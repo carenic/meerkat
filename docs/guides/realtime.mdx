@@ -600,13 +600,20 @@ comms = true
 Mob member construction requires `tools.comms = true` independently of whether
 the profile's model is live-capable.
 
-Open a live channel against the member's session after the member is spawned.
-The dedicated CLI and RPC member-live controls are currently WebSocket-only,
-for both local and placed members. Session-scoped `live/open` plus
-`live/webrtc/answer` works only when the caller can address the owning session
-directly, such as a controller-local member. Controller `session/*` methods do
-not proxy a placed member's host-local session in multi-host v1, and
-`mob/member_live_open` rejects WebRTC.
+Open a member's live channel through its mob after the member is spawned:
+`mob/member_live_open` over JSON-RPC, `rkat mob live open`, Python
+`Mob.member_live_open` or TypeScript `Mob.memberLiveOpen`. The mob checks the
+member first (not retiring, in cleanup or revoke, and restored), then the
+member's own live host serves the requested transport or refuses it typed.
+A WebSocket bootstrap names the owning host's advertised URL. With
+`transport: "webrtc"` the result is a WebRTC bootstrap: post the browser's
+offer with `live/webrtc/answer` on the same JSON-RPC server, as for a session
+channel. A host that serves no WebRTC refuses it with
+`LiveTransportUnsupported` before it connects a provider; a member host
+started by `rkat mob host` serves WebSocket only, so a placed member's channel
+is WebSocket. The session-scoped `live/open` refuses a mob member's session
+(data kind `mob_member_session_addressed_by_id`), and controller `session/*`
+methods do not proxy a placed member's host-local session in multi-host v1.
 
 ## GPT Live (public OpenAI Live API)
 
@@ -653,6 +660,25 @@ answer in the peer. The browser must not send `session.start`; the server
 already started the session. Capability atoms are `live.execution_identity.v1`
 and `live.execution.client_context.v1`, exactly as for the deprecated
 experimental profile.
+
+A mob member's voice channel opens through its mob with the same selector,
+after the mob's member checks:
+
+```json
+{"method":"mob/member_live_open","params":{
+  "mob_id":"...",
+  "agent_identity":"...",
+  "transport":"webrtc",
+  "execution_identity":{"version":"v1","profile_id":"openai.gpt-live-1.client-context.v1"}
+}}
+```
+
+Post the offer with `live/webrtc/answer` on the same connection, as above.
+The server's execution-identity authority serves it exactly as it serves
+`live/open`, and `mob/member_live_close` closes the channel through that
+authority. The member must be local to the JSON-RPC server: a placed member
+refuses `execution_identity` with `Unsupported` in 0.9.5, before anything
+reaches its host.
 
 Public Live has no authoritative turn identifiers, completed-turn events, or
 delegation task text. Meerkat synthesizes turns from transcript role

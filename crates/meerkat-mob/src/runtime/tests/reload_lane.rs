@@ -1506,6 +1506,62 @@ async fn reload_carries_the_audited_endpoint_divergence_typed() {
     // registration reload stays refused typed until then.
 }
 
+/// A Broken member refuses a WebRTC live open exactly as it refuses a
+/// WebSocket one: the member checks run before the member's live host sees
+/// the requested transport, so the member WebRTC route opens nothing on a
+/// member whose restore failed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_broken_member_refuses_a_webrtc_live_open_as_it_refuses_a_websocket_one() {
+    let mob = create_isolation_mob(2).await;
+    mob.degrade_member(0).await;
+    mob.store.fail_commit(mob.session(0), false);
+    mob.service
+        .set_resume_verdict_divergence(mob.session(0))
+        .await;
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        mob.handle.reload_member_registration(mob.member(0)),
+    )
+    .await
+    .expect("a refused document settles the reload")
+    .expect_err("a refused document cannot be reloaded");
+    assert_eq!(
+        mob.handle
+            .member_status(mob.member(0))
+            .await
+            .expect("member status")
+            .status,
+        crate::runtime::handle::MobMemberStatus::Broken
+    );
+
+    let open = |transport| {
+        mob.handle.member_live_open(
+            crate::control_policy::MobControlPrincipal::Owner,
+            mob.member(0).clone(),
+            None,
+            Some(transport),
+        )
+    };
+    let websocket = open(crate::runtime::bridge_protocol::LiveOpenTransport::Websocket)
+        .await
+        .expect_err("a Broken member refuses a WebSocket live open");
+    let webrtc = open(crate::runtime::bridge_protocol::LiveOpenTransport::Webrtc)
+        .await
+        .expect_err("a Broken member refuses a WebRTC live open");
+    assert_eq!(
+        webrtc.durable_resume_hold(),
+        Some(meerkat_core::service::DurableResumeHold::AuditedEndpointDivergence),
+        "the WebRTC open is refused by the member's recorded restore failure: {webrtc:?}"
+    );
+    assert_eq!(
+        std::mem::discriminant(&webrtc),
+        std::mem::discriminant(&websocket),
+        "{webrtc:?} vs {websocket:?}"
+    );
+    assert_eq!(webrtc.to_string(), websocket.to_string());
+    assert_eq!(webrtc.wire_error_code(), websocket.wire_error_code());
+}
+
 /// #1248 (production): a staged run whose consumer never begins
 /// executing trips the execution-start bound, the runtime loop begins
 /// unregister and hands its executor off, and the watcher-owned unregister

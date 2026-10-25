@@ -33003,6 +33003,31 @@
           "explicit_commit"
         ],
         "type": "string"
+      },
+      "WireLiveExecutionIdentityOverrideV1": {
+        "additionalProperties": false,
+        "description": "Strict, versioned channel-scoped profile selector for live execution.",
+        "properties": {
+          "profile_id": {
+            "description": "Stable host-registered execution profile selected for this channel.\n\nThe host-owned profile definition owns the full LLM identity, provider\nmode, auth binding, capability atoms, and approved session instructions.\nCallers select only this catalog identity.",
+            "type": "string"
+          },
+          "version": {
+            "$ref": "#/$defs/WireLiveExecutionIdentityVersion"
+          }
+        },
+        "required": [
+          "version",
+          "profile_id"
+        ],
+        "type": "object"
+      },
+      "WireLiveExecutionIdentityVersion": {
+        "description": "Version discriminator for [`WireLiveExecutionIdentityOverrideV1`].",
+        "enum": [
+          "v1"
+        ],
+        "type": "string"
       }
     },
     "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -33011,6 +33036,17 @@
     "properties": {
       "agent_identity": {
         "type": "string"
+      },
+      "execution_identity": {
+        "anyOf": [
+          {
+            "$ref": "#/$defs/WireLiveExecutionIdentityOverrideV1"
+          },
+          {
+            "type": "null"
+          }
+        ],
+        "description": "Channel-scoped execution profile selection for the member's channel,\nas on `live/open` (for example `gpt-live-1`): the host owns the full\nexecution identity, and the member's durable session identity does\nnot change. Requires transport `webrtc`, negotiated\n[`super::live::LIVE_EXECUTION_IDENTITY_V1_CAPABILITY`] support, and a\nmember local to the host that serves the request."
       },
       "mob_id": {
         "type": "string"

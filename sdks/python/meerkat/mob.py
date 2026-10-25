@@ -613,17 +613,22 @@ class Mob:
         *,
         turning_mode: RealtimeTurningMode | None = None,
         transport: MobMemberLiveTransport | None = None,
+        execution_identity: dict[str, Any] | None = None,
     ) -> LiveOpenResult:
         """Open a live realtime channel on a member.
 
-        The result carries the owning host's WS URL + single-use token
-        VERBATIM — treat it as opaque.
+        The result carries the owning host's bootstrap (a WebSocket URL and
+        token, or a WebRTC token whose offer is answered with
+        ``live_webrtc_answer``) VERBATIM; treat it as opaque.
+        ``execution_identity`` selects a channel-scoped execution profile
+        such as gpt-live-1; see ``MeerkatClient.open_mob_member_live``.
         """
         return await self._client.open_mob_member_live(
             self.id,
             agent_identity,
             turning_mode=turning_mode,
             transport=transport,
+            execution_identity=execution_identity,
         )
 
     async def member_live_close(
