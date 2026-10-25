@@ -7,6 +7,9 @@
 
 #![allow(dead_code, unused_imports, clippy::expect_used, clippy::large_futures)]
 
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod resumed_run_tests;
 mod runtime_ingress;
 mod schedule_host;
 
@@ -254,6 +257,8 @@ async fn prepare_mcp_actor_materialization_claim(
     )
     .await
     {
+        // Nothing was admitted: the rollback keeps every input the
+        // registration recovered from the store.
         let rollback = prepared.rollback_now().await.err();
         let rollback = rollback
             .map(|error| format!("; exact rollback also failed: {error}"))
@@ -274,7 +279,12 @@ async fn prepare_mcp_actor_materialization_claim(
 /// Exact rollback removes only the provisional machine registration and the
 /// actor incarnation published through this transaction's witness slot. The
 /// durable session document remains discoverable, and the explicit resume
-/// seam can reconstruct a fresh actor/executor incarnation.
+/// seam can reconstruct a fresh actor/executor incarnation. The rollback
+/// keeps every input the registration recovered from the store; once the
+/// registration admitted live work (an admission, a deduplicated
+/// resubmission, a recycle), the machine stops every input instead, so a
+/// turn its caller saw refused never runs later. A direct initial turn
+/// leaves no input to keep or stop.
 async fn release_mcp_actor_materialization(
     prepared: &mut Option<McpPreparedActorMaterialization>,
     session_id: &meerkat::SessionId,
@@ -972,12 +982,18 @@ impl ToolCallError {
 /// owner hosts keeps its typed wire form (session busy, with
 /// `kind = "session_served_elsewhere"`; #1813), as does one whose hosting
 /// claim is unavailable (runtime unavailable, with
-/// `kind = "session_hosting_unavailable"`); anything else is internal.
+/// `kind = "session_hosting_unavailable"`), and one whose durable tail is
+/// withheld from resume (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` and the
+/// other durable holds, with the typed `durable_resume_hold` payload; the
+/// content is retained); anything else is internal.
 fn prepare_session_tool_error(error: SessionError) -> ToolCallError {
+    // A hosting refusal, and a session whose durable tail is withheld from
+    // resume (its content retained), keep their typed wire form.
     if matches!(
         error,
         SessionError::ServedElsewhere { .. } | SessionError::HostingUnavailable { .. }
-    ) {
+    ) || error.durable_resume_hold().is_some()
+    {
         let wire = meerkat_contracts::WireError::from(error);
         return ToolCallError::new(wire.code.jsonrpc_code(), wire.message, wire.details);
     }
@@ -1979,9 +1995,9 @@ impl MeerkatMcpState {
         &self,
         session_id: &meerkat::SessionId,
     ) -> Result<runtime_ingress::McpLiveRouterLease, ToolCallError> {
-        if self
-            .service
-            .load_authoritative_session(session_id)
+        // Presence only, read body-free: a running session's provisional
+        // tail must not refuse a live MCP change.
+        if runtime_ingress::committed_source_archived(&self.service, session_id)
             .await
             .map_err(|error| {
                 runtime_ingress::session_error_to_tool_error(
@@ -2524,6 +2540,7 @@ fn format_agent_result(
             tool_use_id,
             tool_name,
             args,
+            dedupe_key,
         })) => {
             // Pending state is a typed terminal-control fact, not a success
             // envelope. Serialize the canonical `WireCallbackPending` contract
@@ -2539,6 +2556,7 @@ fn format_agent_result(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key.map(|key| *key),
             );
             let mut payload = serde_json::to_value(&pending)
                 .map_err(|err| format!("Failed to serialize callback pending contract: {err}"))?;
@@ -2568,6 +2586,7 @@ fn format_agent_result(
                         tool_name: call.tool_name,
                         args: call.args,
                         settlement_failures: call.settlement_failures,
+                        dedupe_key: call.dedupe_key,
                     })
                     .collect(),
             );
@@ -2699,7 +2718,7 @@ const DEFAULT_STREAM_READ_TIMEOUT_MS: u64 = 5_000;
 /// its wire `name`, the human-readable `description`, the `input_schema`
 /// builder, and — co-located here rather than in a separate string-keyed
 /// catalog — its [`RequestLifecycle`] classification. The rendered
-/// `tools/list` JSON (see [`base_tools_list`]) and the lifecycle lookup (see
+/// `tools/list` JSON (see `base_tools_list`) and the lifecycle lookup (see
 /// [`mcp_tool_request_lifecycle`]) are both read-only projections of this
 /// single typed table, so a tool's lifecycle can never drift from where its
 /// name/description/schema are declared.
@@ -2908,7 +2927,7 @@ fn contributed_tool_lifecycles() -> Vec<(Vec<String>, RequestLifecycle)> {
 /// classification straight off the typed [`BaseToolDescriptor`] co-located
 /// with the tool's name/description/schema; contributed tools read the
 /// lifecycle their owning surface declares in
-/// [`contributed_tool_lifecycles`]. Unknown names resolve to `None` — the
+/// `contributed_tool_lifecycles`. Unknown names resolve to `None` - the
 /// caller must fail closed (reject the call as an unknown tool) instead of
 /// classifying an unadvertised name under a default lifecycle.
 pub fn mcp_tool_request_lifecycle(tool_name: &str) -> Option<RequestLifecycle> {
@@ -4647,6 +4666,7 @@ async fn handle_meerkat_run_with_help_tools(
                 max_inline_peer_notifications: None,
                 app_context: input.app_context.clone(),
                 fork_source: None,
+                prompt_context_fork_source: None,
                 additional_instructions: input.additional_instructions.clone(),
                 // The help marker makes every rebuild of a help session from
                 // storage refuse it.
@@ -4807,9 +4827,12 @@ async fn handle_meerkat_resume(
         .prepare_cold_attach(&session_id, claim)
         .await
         .map_err(prepare_session_tool_error)?;
+    // A resume of a running session queues behind its durable run, whose
+    // provisional tail stands ahead of the committed snapshot: the archive and
+    // help checks and the stored settings read that snapshot.
     let session = state
         .service
-        .load_authoritative_session(&session_id)
+        .load_committed_session_tolerating_tail(&session_id)
         .await
         .map_err(|e| ToolCallError::internal(format!("Failed to load session: {e}")))?
         .ok_or_else(|| {
@@ -5126,6 +5149,7 @@ async fn handle_meerkat_resume(
             max_inline_peer_notifications: None,
             app_context: None,
             fork_source: None,
+            prompt_context_fork_source: None,
             additional_instructions: input.additional_instructions.clone(),
             initial_metadata_entries: std::collections::BTreeMap::new(),
             initial_tool_filter: None,
@@ -5395,40 +5419,31 @@ async fn handle_meerkat_resume(
             Err((other, _admission)) => Err(other),
         }
     };
-    let session_exists = match state.service.load_authoritative_session(&session_id).await {
-        Ok(Some(session)) => match state
-            .service
-            .session_archived_by_authority(&session_id, &session)
-            .await
-        {
-            Ok(true) => {
-                state
-                    .cleanup_archived_session_runtime(&session_id)
-                    .await
-                    .map_err(archive_session_error_to_tool_error)?;
-                false
-            }
-            Ok(false) => true,
-            Err(err) => {
-                tracing::warn!(
-                    session_id = %session_id,
-                    error = %err,
-                    "failed to load machine archive state during MCP session existence check"
-                );
-                return Err(ToolCallError::internal(format!(
-                    "failed to load machine archive state during MCP session existence check for {session_id}: {err}"
-                )));
-            }
-        },
+    // Presence and archive state, read body-free: a run still going on the
+    // session (this resume queued behind it) holds a provisional tail.
+    let session_exists = match runtime_ingress::committed_source_archived(
+        &state.service,
+        &session_id,
+    )
+    .await
+    {
+        Ok(Some(true)) => {
+            state
+                .cleanup_archived_session_runtime(&session_id)
+                .await
+                .map_err(archive_session_error_to_tool_error)?;
+            false
+        }
+        Ok(Some(false)) => true,
         Ok(None) => false,
         Err(err) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %err,
-                "failed to load authoritative session after MCP resume attempt"
+                "failed to load machine archive state during MCP session existence check"
             );
             return Err(ToolCallError::internal(format!(
-                "failed to load authoritative session after MCP resume attempt for {session_id}: {err}"
+                "failed to load machine archive state during MCP session existence check for {session_id}: {err}"
             )));
         }
     };
@@ -5677,6 +5692,8 @@ mod tests {
     use super::*;
     use futures::stream;
     use meerkat::Session;
+
+    pub(crate) mod committed_reads_tests;
     use meerkat::surface::{
         CancelActionInstallOutcome, SurfaceRequestExecutor, noop_request_action,
     };
@@ -5686,6 +5703,36 @@ mod tests {
     use std::pin::Pin;
     use std::sync::atomic::{AtomicBool, Ordering};
     use tokio::time::{Duration, timeout};
+
+    /// `meerkat_resume` of a session whose durable tail is withheld from
+    /// resume refuses with the hold's own wire code and its typed
+    /// `durable_resume_hold` payload (the content is retained), not with an
+    /// internal tool error.
+    #[test]
+    fn a_withheld_durable_tail_refuses_the_mcp_resume_typed() {
+        use meerkat_core::service::DurableResumeHold;
+        let id = meerkat_core::SessionId::new();
+        for (held, hold) in [
+            (
+                DurableResumeHold::TailHeldForRecovery,
+                "tail_held_for_recovery",
+            ),
+            (DurableResumeHold::RecoveryRefused, "recovery_refused"),
+            (
+                DurableResumeHold::EvidenceQuarantined,
+                "evidence_quarantined",
+            ),
+        ] {
+            let wire = meerkat_contracts::WireError::from(held.session_error(id.clone()));
+            let tool_error = prepare_session_tool_error(held.session_error(id.clone()));
+            assert_eq!(tool_error.code, wire.code.jsonrpc_code(), "{hold}");
+            assert_ne!(tool_error.code, -32603, "{hold}: not an internal error");
+            let data = tool_error.data.expect("the typed hold payload");
+            assert_eq!(data["durable_resume_hold"], hold);
+            assert_eq!(data["content_retained"], true);
+            assert_eq!(data["session_id"], id.to_string());
+        }
+    }
 
     /// The head config store for the reserved `global` realm routes to the
     /// injected user-global document: an explicit state root must not shadow
@@ -8294,6 +8341,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let owner_session_id =
@@ -8348,6 +8396,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let handle = meerkat_mob::MobBuilder::new(definition, meerkat_mob::MobStorage::in_memory())
@@ -9492,12 +9541,14 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                     physical_outcome: meerkat_core::LiveBridgeEffectOutcome::Unknown,
                     failure_kind: meerkat_core::ToolDispatchTerminalErrorKind::Unavailable,
                 }],
+                dedupe_key: None,
             },
             meerkat_core::error::PendingCallbackToolCall {
                 tool_use_id: "callback-b".to_string(),
                 tool_name: "ask_b".to_string(),
                 args: json!({"question": "b"}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             },
         ];
         let payload = format_agent_result(
@@ -9532,6 +9583,49 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
                 .is_none(),
             "tool_use_id must not be smuggled into callback args"
         );
+    }
+
+    /// The `pending_tool_calls` of a single pending callback call carry its
+    /// dedupe key unchanged, and a call without one omits the field. (Unrun
+    /// until the candidate's validation.)
+    #[test]
+    fn test_format_agent_result_carries_the_callback_dedupe_key() {
+        let session_id = meerkat::SessionId::new();
+        let arguments = serde_json::value::RawValue::from_string(r#"{"question":"a"}"#.into())
+            .expect("valid arguments");
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            0,
+            "callback-a",
+            "ask_a",
+            &arguments,
+        )
+        .expect("valid dedupe key");
+        for dedupe_key in [Some(key), None] {
+            let payload = format_agent_result(
+                Err(SessionError::Agent(meerkat::AgentError::CallbackPending {
+                    tool_use_id: "callback-a".to_string(),
+                    tool_name: "ask_a".to_string(),
+                    args: json!({"question": "a"}),
+                    dedupe_key: dedupe_key.clone().map(Box::new),
+                })),
+                &session_id,
+            )
+            .expect("a pending callback call stays a resumable MCP result");
+            let raw = payload["content"][0]["text"]
+                .as_str()
+                .expect("wrapped MCP payload text");
+            let decoded: Value = serde_json::from_str(raw).expect("valid wrapped JSON");
+            assert_eq!(decoded["status"], "pending_tool_call");
+            let call = &decoded["pending_tool_calls"][0];
+            match &dedupe_key {
+                Some(key) => assert_eq!(
+                    call["dedupe_key"],
+                    serde_json::to_value(key).expect("key serializes")
+                ),
+                None => assert!(call.get("dedupe_key").is_none(), "{call}"),
+            }
+        }
     }
 
     #[test]
@@ -10334,6 +10428,99 @@ requirement = { baseline = "command_runtime_v1", read = { kind = "paths", paths 
             .await
             .expect("failed actor create must retain exact rollback authority");
         assert!(!state.runtime_adapter.contains_session(&session_id).await);
+    }
+
+    /// An explicit resume refused by its agent build rolls the registration
+    /// its transaction prepared back with the keep: a prompt an earlier
+    /// process left queued in the session's durable runtime state, which the
+    /// registration recovered, stays queued for the next start, not ended
+    /// and with no requeue mark. RED before: the rollback stopped it.
+    #[tokio::test]
+    async fn refused_explicit_resume_keeps_a_recovered_prompt() {
+        let (state, session_id) = state_with_persisted_session().await;
+        let session_id = meerkat::SessionId::parse(&session_id).expect("session id");
+        let store = state.service.runtime_store();
+        // An earlier process registered the session and accepted a prompt no
+        // executor ran, so the store holds the prompt queued.
+        let earlier = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+                .expect("the earlier process's runtime"),
+        );
+        earlier
+            .prepare_bindings(session_id.clone())
+            .await
+            .expect("the earlier process registers the session");
+        let (accepted, _) = earlier
+            .accept_input_with_completion(
+                &session_id,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                    "queued when the process stopped",
+                    None,
+                )),
+            )
+            .await
+            .expect("the registration holds the prompt");
+        let meerkat_runtime::AcceptOutcome::Accepted {
+            input_id: queued, ..
+        } = accepted
+        else {
+            panic!("the registration accepts the prompt, got {accepted:?}");
+        };
+        let session = state
+            .service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("load the persisted session")
+            .expect("the session is persisted");
+        let ingress = state.runtime_ingress_context();
+
+        let outcome = materialize_mcp_actor_transaction(
+            &state.service,
+            &state.runtime_adapter,
+            &ingress,
+            &session_id,
+            McpActorMaterializationMode::Resume,
+            None,
+            move |bindings, _config| {
+                std::future::ready(Ok::<_, ToolCallError>(McpActorMaterializationPlan {
+                    request: mock_deferred_materialization_request(session, bindings, Some(-2)),
+                    callback_config: runtime_ingress::McpCallbackConfig::Preserve,
+                    router_to_publish: None,
+                }))
+            },
+        )
+        .await
+        .expect("the refused resume reports");
+        assert!(!outcome.committed, "the refused resume commits nothing");
+        let refusal = outcome.result.as_ref().err();
+        assert!(
+            refusal.is_some_and(|error| error
+                .to_string()
+                .contains("max_inline_peer_notifications=-2")),
+            "the agent build refuses the resume: {refusal:?}"
+        );
+        assert!(
+            !state.runtime_adapter.contains_session(&session_id).await,
+            "the refused resume rolls its registration back"
+        );
+        let row = store
+            .load_input_state(
+                &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+                &queued,
+            )
+            .await
+            .expect("load the prompt's row")
+            .expect("the prompt's row stays durable");
+        assert_eq!(
+            (row.seed.phase, &row.seed.terminal_outcome),
+            (meerkat_runtime::InputLifecycleState::Queued, &None),
+            "the recovered prompt stays queued for the next start: {:?}",
+            row.state.history
+        );
+        assert!(
+            row.state.stop_requeue.is_none(),
+            "the prompt is kept as the store holds it, with no requeue mark"
+        );
     }
 
     #[tokio::test]

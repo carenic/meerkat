@@ -352,7 +352,8 @@ pub trait ExperimentalLiveSessionBindingAuthority: Send + Sync {
     /// [`Self::validate_live_durable_source_availability`].
     ///
     /// The default delegates to that full validation, which is correct but
-    /// slow; hosts override it.
+    /// goes through the actor's queue, so it waits while the member is busy;
+    /// hosts override it.
     async fn observe_live_durable_source_readiness(
         &self,
         canonical_session_id: &meerkat_core::SessionId,
@@ -12784,7 +12785,8 @@ mod tests {
     }
 
     /// Binding authority that separates the open's full durable check (the
-    /// body load) from the readiness observation, and counts both.
+    /// actor-validated source check) from the readiness observation, and
+    /// counts both.
     struct ReadinessSplitBindingAuthority {
         inner: ExactAllowBindingAuthority,
         full_validations: Arc<AtomicUsize>,
@@ -21884,8 +21886,9 @@ mod tests {
                         );
                     }
                     expected_rows.extend(segments);
-                    let context = serde_json::to_string(&observed.messages_for_model_boundary())
-                        .expect("project retained dialogue");
+                    let context =
+                        serde_json::to_string(&observed.messages_for_model_boundary().unwrap())
+                            .expect("project retained dialogue");
                     assert!(context.contains("First spoken checkpoint."));
                     assert!(context.contains("spoken_unmeasured"));
                     last_turn = assistant;
@@ -22008,14 +22011,14 @@ mod tests {
                     caption_items, committed_items,
                     "every provisional caption key names exactly one committed row"
                 );
-                let voice_context = original_context.messages_for_model_boundary();
+                let voice_context = original_context.messages_for_model_boundary().unwrap();
                 let rendered = serde_json::to_string(&voice_context).expect("live context");
                 assert!(rendered.contains("First spoken checkpoint."));
                 assert!(rendered.contains("Interrupted by the close mid-turn."));
                 assert!(rendered.contains("spoken_unmeasured"));
                 assert_eq!(
                     voice_context,
-                    original_context.messages_for_model_boundary(),
+                    original_context.messages_for_model_boundary().unwrap(),
                     "observation projection is deterministic for summary equality"
                 );
                 assert!(

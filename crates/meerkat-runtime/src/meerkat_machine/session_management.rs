@@ -18,6 +18,12 @@ enum UnregisterTeardownAdmission {
     /// the expected epoch and `RuntimeSessionRegistrationWitness` arguments.
     AnyCurrentRegistration,
     ExactTerminalUnattachedRegistration,
+    /// [`Self::ExactTerminalUnattachedRegistration`] narrowed to the completed
+    /// residue of a stopped machine-managed attachment, durability-ready.
+    /// Any other registration is answered with the typed
+    /// [`UnregisterTeardownWaitOutcome::NotStoppedResidue`], never an error,
+    /// so the caller decides from that exact fact.
+    StoppedAttachmentResidue,
     /// [`Self::AnyCurrentRegistration`] for an exact registration whose use
     /// must still be this one: the decision to start or join a coordinator
     /// answers `UseChanged` instead when anyone has adopted the registration
@@ -53,6 +59,9 @@ enum UnregisterTeardownWaitOutcome {
     /// `UnchangedRegistrationUse`: the registration was adopted since its
     /// use was read. Nothing was started or joined.
     UseChanged,
+    /// `StoppedAttachmentResidue`: the exact registration is not a stopped
+    /// attachment's completed residue. Nothing was started or joined.
+    NotStoppedResidue,
     /// `ReturnCallerGrace`: the joined result, still to be awaited until the
     /// caller's deadline.
     Joined(
@@ -70,6 +79,10 @@ impl UnregisterTeardownWaitOutcome {
             )),
             Self::UseChanged => Err(RuntimeDriverError::Internal(
                 "a use-gated unregister refusal reached a caller that gave no expected use"
+                    .to_string(),
+            )),
+            Self::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "a stopped-residue unregister refusal reached a caller that did not ask for one"
                     .to_string(),
             )),
         }
@@ -749,6 +762,15 @@ impl meerkat_core::lifecycle::CoreExecutor for MachineManagedPostStopExecutor {
             .await
     }
 
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        self.inner
+            .acknowledge_compaction_finalization(authority)
+            .await
+    }
+
     async fn abort_uncommitted_compaction_projections(
         &mut self,
     ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
@@ -1041,12 +1063,36 @@ pub(super) fn replay_durable_unregister_progress_id(
         return Ok(());
     };
     let state = authority.state();
+    // The recovered convergence replays the disposition the unregister began
+    // with. In process, it keeps exactly the inputs the uninterrupted stop
+    // would. After a real restart every non-terminal input comes back
+    // recovered, so a replayed Keep keeps every input still open in the store,
+    // one admitted live before the crash included. That is crash-consistent:
+    // no caller was told its input was refused before the stop committed, and
+    // a registration that served live work before the unregister began
+    // recorded Stop.
+    let (queued_inputs, requeue_max_age_ms) = match progress.requeue_max_age_ms() {
+        Some(max_age_ms) => (
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
+            max_age_ms,
+        ),
+        None if progress.keeps_recovered_inputs() => (
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Keep,
+            0,
+        ),
+        None => (
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
+            0,
+        ),
+    };
     let begin = crate::meerkat_machine::dsl::MeerkatMachineInput::BeginUnregisterSession {
         session_id: session_id.clone(),
         agent_runtime_id: state.active_runtime_id.clone(),
         fence_token: state.active_fence_token,
         generation: state.active_runtime_generation,
         runtime_epoch_id: state.active_runtime_epoch_id.clone(),
+        queued_inputs,
+        requeue_max_age_ms,
     };
     crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(authority, begin).map_err(
         |error| RuntimeDriverError::RecoveryCorruption {
@@ -1123,6 +1169,135 @@ mod unregister_progress_recovery_tests {
         assert!(!state.unregister_completion_waiter_drain_pending);
         assert!(state.unregister_runtime_loop_forced_abort);
         assert!(!state.unregister_comms_drain_forced_abort);
+    }
+
+    /// A crash after an unregister began with the requeue disposition, and
+    /// before its stop committed, leaves the disposition in the unregister's
+    /// progress record. The recovered convergence replays it, so its stop
+    /// keeps the eligible queued prompt, marked with the same max age, as the
+    /// uninterrupted stop would. A progress record without it replays the
+    /// stop disposition, which keeps nothing.
+    #[tokio::test]
+    async fn a_recovered_unregister_keeps_what_the_interrupted_one_would() {
+        use crate::traits::RuntimeDriver as _;
+
+        for (recorded_max_age_ms, expect_kept) in [(Some(900_000), true), (None, false)] {
+            let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+                crate::identifiers::LogicalRuntimeId::new("recovered-requeue-unregister"),
+            );
+            driver
+                .ensure_contract_session_authority()
+                .expect("contract session authority");
+            let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+                "queued when the process stopped",
+                None,
+            ));
+            let prompt_id = prompt.id().clone();
+            assert!(driver.accept_input(prompt).await.unwrap().is_accepted());
+            let progress = crate::store::MachineUnregisterProgressSnapshot::new(
+                true, true, true, false, false,
+            )
+            .with_requeue_max_age_ms(recorded_max_age_ms);
+            {
+                let authority = driver.shared_dsl_authority();
+                let mut authority = authority
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let session_id = authority
+                    .state()
+                    .session_id
+                    .clone()
+                    .expect("the contract session is registered");
+                replay_durable_unregister_progress_id(&mut authority, &session_id, Some(&progress))
+                    .expect("the recovered convergence replays the unregister");
+            }
+
+            let active = driver.active_input_ids();
+            let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+            let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+
+            let state = driver.input_state(&prompt_id).expect("the prompt's row");
+            if expect_kept {
+                assert_eq!(retained, vec![prompt_id.clone()]);
+                assert_eq!(
+                    state.stop_requeue.map(|mark| mark.max_age_ms),
+                    Some(900_000)
+                );
+                assert_eq!(
+                    driver.input_phase(&prompt_id),
+                    Some(crate::input_state::InputLifecycleState::Queued)
+                );
+            } else {
+                assert!(retained.is_empty());
+                assert!(state.stop_requeue.is_none());
+                assert_eq!(
+                    driver.input_terminal_outcome(&prompt_id),
+                    Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                        reason: crate::input_state::InputAbandonReason::Stopped
+                    })
+                );
+            }
+        }
+    }
+
+    /// The machine grants a keep only to a registration that served no live
+    /// work. A keep unregister begun after an input was admitted live to the
+    /// registration (here, replayed from a progress record that carries the
+    /// keep) records Stop: its stop ends the admitted input as stopped and
+    /// keeps nothing. A crash recovery replays the keep before anything is
+    /// admitted, so its keep stands
+    /// (`a_replayed_keep_unregister_keeps_what_the_new_process_recovered`).
+    #[tokio::test]
+    async fn a_keep_unregister_after_a_live_admission_begins_as_stop() {
+        use crate::traits::RuntimeDriver as _;
+
+        let mut driver = crate::driver::ephemeral::EphemeralRuntimeDriver::new(
+            crate::identifiers::LogicalRuntimeId::new("recovered-keep-unregister"),
+        );
+        driver
+            .ensure_contract_session_authority()
+            .expect("contract session authority");
+        let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+            "admitted while the registration stood",
+            None,
+        ));
+        let prompt_id = prompt.id().clone();
+        assert!(driver.accept_input(prompt).await.unwrap().is_accepted());
+        let progress =
+            crate::store::MachineUnregisterProgressSnapshot::new(true, true, true, false, false)
+                .with_keeps_recovered_inputs(true);
+        {
+            let authority = driver.shared_dsl_authority();
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let session_id = authority
+                .state()
+                .session_id
+                .clone()
+                .expect("the contract session is registered");
+            replay_durable_unregister_progress_id(&mut authority, &session_id, Some(&progress))
+                .expect("the unregister begins");
+            assert_eq!(
+                authority.state().unregister_queued_inputs,
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Stop,
+                "a registration that served live work keeps nothing"
+            );
+            assert_eq!(authority.state().unregister_requeue_max_age_ms, 0);
+        }
+
+        let active = driver.active_input_ids();
+        let before_exit = driver.stop_retained_input_ids(&active).unwrap();
+        let retained = driver.stop_non_terminal_inputs(&before_exit).unwrap();
+        assert!(retained.is_empty(), "an admitted input is not kept");
+        let state = driver.input_state(&prompt_id).expect("the prompt's row");
+        assert!(state.stop_requeue.is_none());
+        assert_eq!(
+            driver.input_terminal_outcome(&prompt_id),
+            Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                reason: crate::input_state::InputAbandonReason::Stopped
+            })
+        );
     }
 
     #[test]
@@ -2115,7 +2290,7 @@ impl MeerkatMachine {
         // reservation stay here until an attempt publishes them, and a
         // registration dropped at an await has published nothing.
         let mut pending = Some((session_entry, owner_loss));
-        let mut retry = crate::store::FenceBackoffRetry::default();
+        let mut retry = crate::store::FenceBackoffRetry::for_fence(Some(write_fence.as_ref()));
         let publication = loop {
             let mut sessions = self.sessions.write().await;
             if sessions.contains_key(&session_id) {
@@ -2403,6 +2578,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: self.grant_registration_hosting(session_id)?,
@@ -2579,6 +2755,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: self.grant_registration_hosting(&session_id)?,
@@ -2889,6 +3066,16 @@ impl MeerkatMachine {
             %runtime_id,
             "MeerkatMachine::register_session_inner recovering driver"
         );
+        // A run the durable session left open keeps its inputs bound: the
+        // persistent recovery marks it resumable on this registration's live
+        // authority before it normalizes them.
+        let resumable_run = match &entry {
+            super::driver::DriverEntry::Persistent(_) => {
+                self.observe_resumable_run_for_registration(session_id)
+                    .await?
+            }
+            super::driver::DriverEntry::Ephemeral(_) => None,
+        };
         let recover_result = match &mut entry {
             super::driver::DriverEntry::Ephemeral(driver) => {
                 crate::traits::RuntimeDriver::recover(driver).await
@@ -2900,12 +3087,14 @@ impl MeerkatMachine {
                         .recover_inputs_after_runtime_authority_with_fence(
                             recovered_unregister_progress.as_ref(),
                             write_fence,
+                            resumable_run.as_ref(),
                         )
                         .await
                 } else {
                     driver
                         .recover_inputs_after_runtime_authority(
                             recovered_unregister_progress.as_ref(),
+                            resumable_run.as_ref(),
                         )
                         .await
                 }
@@ -2946,6 +3135,7 @@ impl MeerkatMachine {
             registration_use: std::sync::atomic::AtomicU64::new(self.next_registration_use()),
             agent_binding: super::agent_mandate::SessionAgentBinding::default(),
             tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+            resumed_run_admission: Default::default(),
             mcp_observation: meerkat_core::McpObservationSlot::default(),
             runtime_id: runtime_id.clone(),
             _hosting_claim: hosting_claim,
@@ -4004,7 +4194,10 @@ impl MeerkatMachine {
     ///
     /// Idempotent preparation of a pre-existing entry does not mint rollback
     /// authority, and a stale binding can never unregister a same-SessionId
-    /// replacement.
+    /// replacement. The rollback keeps every input the registration recovered
+    /// from the store, unless the registration served live work, in which
+    /// case the machine stops every input
+    /// ([`PreparedSessionMaterialization::rollback_now`](super::PreparedSessionMaterialization::rollback_now)).
     pub async fn unregister_session_if_bindings_owned_registration(
         &self,
         bindings: &meerkat_core::SessionRuntimeBindings,
@@ -4082,10 +4275,18 @@ impl MeerkatMachine {
             Some(bindings.epoch_id()),
             Some(&authority.materialization_claim_state),
             turn_finalization_boundary_already_held,
+            UnregisterDisposition::KEEP,
         )
         .await
     }
 
+    /// Abort the exact materialization claim `claim_id`. A registration this
+    /// claim inserted is unregistered with `queued_inputs`: Keep (every
+    /// materialization rollback) keeps every input the registration
+    /// recovered from the store exactly as the store holds it, Stop ends
+    /// every non-terminal input. The machine records a requested Keep as
+    /// Stop once the registration served live work. A claim on a registration
+    /// it did not insert only clears the claim, and the disposition is unused.
     pub(super) async fn abort_prepared_session_materialization_claim(
         &self,
         session_id: &SessionId,
@@ -4095,6 +4296,7 @@ impl MeerkatMachine {
             &Arc<std::sync::Mutex<crate::RuntimeActorMaterializationClaimState>>,
         >,
         turn_finalization_boundary_already_held: bool,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         let Some(gate_guard) = self
             .lock_current_settled_session_mutation_gate(session_id, SettledGateWait::PreInstall)
@@ -4223,13 +4425,14 @@ impl MeerkatMachine {
             // default, and committed Mob retirement drops B before joining. A
             // handle that gains a real exit wait must not be paired with a
             // boundary-held rollback on this path.
-            self.join_or_start_unregister_teardown_with_admission(
+            self.join_or_start_unregister_teardown_with_queued_inputs(
                 session_id,
                 expected_epoch,
                 UnregisterTeardownCaller::Explicit,
                 UnregisterTeardownAdmission::AnyCurrentRegistration,
                 None,
                 UnregisterTeardownWait::UntilTerminal,
+                queued_inputs,
             )
             .await?
             .require_completed()?;
@@ -4888,6 +5091,15 @@ impl MeerkatMachine {
                     durability_health.clone(),
                 )?;
                 recovered_entry.set_consent_hosting(hosting_claim.clone());
+                // As in the prepared registration: a run the durable session
+                // left open keeps its inputs bound.
+                let resumable_run = match &recovered_entry {
+                    super::driver::DriverEntry::Persistent(_) => {
+                        self.observe_resumable_run_for_registration(&session_id)
+                            .await?
+                    }
+                    super::driver::DriverEntry::Ephemeral(_) => None,
+                };
                 let recover_result = match &mut recovered_entry {
                     super::driver::DriverEntry::Ephemeral(driver) => {
                         crate::traits::RuntimeDriver::recover(driver).await
@@ -4896,6 +5108,7 @@ impl MeerkatMachine {
                         driver
                             .recover_inputs_after_runtime_authority(
                                 recovery.unregister_progress.as_ref(),
+                                resumable_run.as_ref(),
                             )
                             .await
                     }
@@ -4949,6 +5162,7 @@ impl MeerkatMachine {
                         ),
                         agent_binding: super::agent_mandate::SessionAgentBinding::default(),
                         tool_surface_gate: meerkat_core::ToolSurfaceGateSlot::default(),
+                        resumed_run_admission: Default::default(),
                         mcp_observation: meerkat_core::McpObservationSlot::default(),
                         runtime_id,
                         _hosting_claim: hosting_claim,
@@ -5238,8 +5452,11 @@ impl MeerkatMachine {
                         "runtime driver registration was repaired by generated executor authority; publishing attachment"
                     );
                 }
+                // A run marked resumable wakes the loop at commit too, so it
+                // resumes without waiting for new input.
                 (
-                    !driver_guard.as_driver().active_input_ids().is_empty(),
+                    !driver_guard.as_driver().active_input_ids().is_empty()
+                        || driver_guard.resumable_run_id().is_some(),
                     driver_guard.runtime_loop_commit_deadline(),
                 )
             };
@@ -5546,13 +5763,11 @@ impl MeerkatMachine {
         // it had no wake sender. Re-read the queue now that the gate is held
         // through commit, or that input stays queued until something else
         // wakes the loop (#1482).
-        let should_wake = should_wake
-            || !driver
-                .lock()
-                .await
-                .as_driver()
-                .active_input_ids()
-                .is_empty();
+        let should_wake = should_wake || {
+            let driver_guard = driver.lock().await;
+            !driver_guard.as_driver().active_input_ids().is_empty()
+                || driver_guard.resumable_run_id().is_some()
+        };
         let exact_pending_is_current = {
             let sessions = self.sessions.read().await;
             sessions.get(&session_id).is_some_and(|entry| {
@@ -5601,9 +5816,20 @@ impl MeerkatMachine {
         // source, which first proves the session's earlier-incarnation tool
         // processes stopped. A failure drops the pending attachment, which
         // rolls it back.
+        //
+        // First, the terminals a recovery wrote after this registration
+        // recovered its inputs (a materialization's own durable-tail
+        // recovery) are adopted, so nothing below or after ends or stages an
+        // input the store already ended.
+        pending.adopt_recovered_input_terminals().await?;
         if let Some(evidence) = self.session_interrupted_tool_evidence(&session_id).await? {
             pending.settle_interrupted_tool_evidence(evidence).await?;
         }
+        // Likewise, an input a graceful stop kept queued is checked against
+        // its stop's max age before anything can serve it.
+        pending
+            .settle_expired_stop_requeued_inputs(chrono::Utc::now())
+            .await?;
         Ok(EnsureRuntimeExecutorAttachment::Pending(pending))
     }
 
@@ -5649,6 +5875,11 @@ impl MeerkatMachine {
     /// coordinator may reacquire B only after the caller releases it, so an
     /// arbitrary or wedged surface cleanup callback cannot retain the caller's
     /// boundary or block startup failure reporting.
+    ///
+    /// The candidate never served, so its unregister asks to keep every input
+    /// the registration recovered from the store, as a pending attachment's
+    /// abort does; the machine grants that only while the registration served
+    /// no live work, and stops every input otherwise.
     async fn cleanup_unserved_executor_attachment(
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
@@ -5656,7 +5887,10 @@ impl MeerkatMachine {
     ) -> Result<bool, RuntimeDriverError> {
         if !turn_finalization_boundary_already_held {
             return self
-                .unregister_executor_attachment_if_current(witness)
+                .unregister_executor_attachment_if_current_with_queued_inputs(
+                    witness,
+                    UnregisterDisposition::KEEP,
+                )
                 .await;
         }
         let cleanup_spawner = super::MachineCleanupTaskSpawner::acquire()?;
@@ -5664,7 +5898,10 @@ impl MeerkatMachine {
         let witness = witness.clone();
         cleanup_spawner.spawn(async move {
             if let Err(error) = machine
-                .unregister_executor_attachment_if_current(&witness)
+                .unregister_executor_attachment_if_current_with_queued_inputs(
+                    &witness,
+                    UnregisterDisposition::KEEP,
+                )
                 .await
             {
                 tracing::warn!(
@@ -6733,6 +6970,10 @@ impl MeerkatMachine {
                 })? {
                 crate::recovery::DurableTailRecoveryOutcome::Committed { .. }
                 | crate::recovery::DurableTailRecoveryOutcome::AlreadyAligned { .. } => {}
+                // The tail is a durable session's open run at a committed
+                // round. Continuing writes nothing: the cold registration
+                // below observes the same tail and keeps the run resumable.
+                crate::recovery::DurableTailRecoveryOutcome::Continue { .. } => {}
                 crate::recovery::DurableTailRecoveryOutcome::Held => {
                     return Err(RuntimeDriverError::RecoveryRepairBlocked {
                         evidence_digest: None,
@@ -6997,6 +7238,108 @@ impl MeerkatMachine {
         .require_completed()
     }
 
+    /// Take over `witness`'s exact registration when, and only when, it is
+    /// the completed residue of a stopped machine-managed attachment: the
+    /// attachment stopped, its stop cleanup and post-stop callback completed,
+    /// no executor, claim or provisional owner remains, and the registration
+    /// is `Stopped` (not `Retired`) and durability-ready. Such a
+    /// registration still holds that attachment's retained publication and
+    /// cleanup handles, so no new materialization may claim it; this
+    /// unregisters it through the canonical unregister saga, awaited to
+    /// terminal completion, which consumes those handles as its inputs.
+    ///
+    /// A stop cleanup still in flight on this exact registration is joined
+    /// first, for at most `stop_cleanup_join_bound`, and the decision is made
+    /// on its result: the decision reads facts, never a deadline. A cleanup
+    /// still running at the bound is answered
+    /// [`StoppedRegistrationTakeover::StopCleanupPending`], with nothing
+    /// decided or changed; the runtime keeps owning that cleanup. The
+    /// decision and the coordinator installation are one atomic admission
+    /// under the stable registration transaction and the witness's exact
+    /// mutation gate. Anything else is answered typed and
+    /// changes nothing: [`StoppedRegistrationTakeover::NotCurrent`] for a
+    /// stale witness (a same-`SessionId` replacement is never touched), and
+    /// [`StoppedRegistrationTakeover::NotStoppedResidue`] for a registration
+    /// that is attached, still or unsuccessfully cleaning up, claimed, never
+    /// attached, not Stopped (a Retired runtime included), or
+    /// reload-required.
+    pub async fn take_over_stopped_attachment_registration_if_current(
+        &self,
+        witness: &RuntimeSessionRegistrationWitness,
+        stop_cleanup_join_bound: std::time::Duration,
+    ) -> Result<StoppedRegistrationTakeover, RuntimeDriverError> {
+        if !witness.belongs_to(self) {
+            return Ok(StoppedRegistrationTakeover::NotCurrent);
+        }
+        let in_flight_stop_cleanup = {
+            let sessions = self.sessions.read().await;
+            let Some(entry) = sessions.get(witness.session_id()) else {
+                return Ok(StoppedRegistrationTakeover::NotCurrent);
+            };
+            if entry.epoch_id != witness.epoch_id || !witness.matches_entry(entry) {
+                return Ok(StoppedRegistrationTakeover::NotCurrent);
+            }
+            entry
+                .runtime_stop_cleanup_coordinator
+                .as_ref()
+                .filter(|coordinator| {
+                    coordinator.epoch_id == entry.epoch_id
+                        && coordinator.result_rx.borrow().is_none()
+                })
+                .map(|coordinator| coordinator.result_rx.clone())
+        };
+        if let Some(mut result_rx) = in_flight_stop_cleanup {
+            // The admission below reads the coordinator's own result: a
+            // failed cleanup is not completed residue and is refused there.
+            match crate::tokio::time::timeout(
+                stop_cleanup_join_bound,
+                wait_for_runtime_stop_cleanup_result(&mut result_rx, witness.session_id()),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    tracing::debug!(
+                        session_id = %witness.session_id(),
+                        %error,
+                        "the joined stop cleanup failed; the takeover admission refuses its residue"
+                    );
+                }
+                Err(_) => return Ok(StoppedRegistrationTakeover::StopCleanupPending),
+            }
+        }
+        match self
+            .join_or_start_unregister_teardown_with_admission(
+                witness.session_id(),
+                Some(witness.epoch_id()),
+                UnregisterTeardownCaller::Explicit,
+                UnregisterTeardownAdmission::StoppedAttachmentResidue,
+                Some(witness),
+                UnregisterTeardownWait::UntilTerminal,
+            )
+            .await?
+        {
+            UnregisterTeardownWaitOutcome::Completed(true) => {
+                Ok(StoppedRegistrationTakeover::Unregistered)
+            }
+            UnregisterTeardownWaitOutcome::Completed(false) => {
+                Ok(StoppedRegistrationTakeover::NotCurrent)
+            }
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => {
+                Ok(StoppedRegistrationTakeover::NotStoppedResidue)
+            }
+            outcome @ (UnregisterTeardownWaitOutcome::Pending(_)
+            | UnregisterTeardownWaitOutcome::UseChanged
+            | UnregisterTeardownWaitOutcome::Joined(..)) => {
+                outcome.require_completed()?;
+                Err(RuntimeDriverError::Internal(format!(
+                    "stopped-registration takeover for session {} escaped its terminal wait",
+                    witness.session_id()
+                )))
+            }
+        }
+    }
+
     /// Check the issuer of an attachment witness. This says nothing about
     /// whether the attachment is still current or its retirement has finished.
     pub fn owns_executor_attachment_witness(
@@ -7013,6 +7356,20 @@ impl MeerkatMachine {
         self: &Arc<Self>,
         witness: &RuntimeExecutorAttachmentWitness,
     ) -> Result<bool, RuntimeDriverError> {
+        self.unregister_executor_attachment_if_current_with_queued_inputs(
+            witness,
+            UnregisterDisposition::STOP,
+        )
+        .await
+    }
+
+    /// [`Self::unregister_executor_attachment_if_current`], beginning the
+    /// unregister with `queued_inputs` when this call starts it.
+    async fn unregister_executor_attachment_if_current_with_queued_inputs(
+        self: &Arc<Self>,
+        witness: &RuntimeExecutorAttachmentWitness,
+        queued_inputs: UnregisterDisposition,
+    ) -> Result<bool, RuntimeDriverError> {
         if !witness.belongs_to(self) {
             return Ok(false);
         }
@@ -7028,6 +7385,7 @@ impl MeerkatMachine {
             witness.clone(),
             guard,
             cleanup_spawner,
+            queued_inputs,
         )
         .wait()
         .await
@@ -7133,6 +7491,7 @@ impl MeerkatMachine {
         witness: RuntimeExecutorAttachmentWitness,
         mutation_guard: crate::tokio::sync::OwnedMutexGuard<()>,
         cleanup_spawner: super::MachineCleanupTaskSpawner,
+        queued_inputs: UnregisterDisposition,
     ) -> super::RuntimeExecutorAttachmentRetirementCompletion {
         let machine = Arc::clone(self);
         let task_witness = witness;
@@ -7143,6 +7502,7 @@ impl MeerkatMachine {
                     task_witness.clone(),
                     super::RunlessTerminalAnnouncement::default(),
                     mutation_guard,
+                    queued_inputs,
                 )
                 .await;
             if let Err(error) = &result {
@@ -7508,6 +7868,11 @@ impl MeerkatMachine {
             .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
+    /// Abort the exact pending attachment `witness` names, under its M. The
+    /// attachment never served, so its unregister asks to keep every input
+    /// the registration recovered from the store; the machine grants that
+    /// only while the registration served no live work, and stops every
+    /// input otherwise.
     pub(super) async fn abort_pending_executor_attachment(
         self: &Arc<Self>,
         witness: RuntimeExecutorAttachmentWitness,
@@ -7518,6 +7883,7 @@ impl MeerkatMachine {
             witness,
             runless_terminal,
             mutation_guard,
+            UnregisterDisposition::KEEP,
         )
         .await
         .map(|_| ())
@@ -7530,12 +7896,16 @@ impl MeerkatMachine {
     /// teardown is awaited: post-stop cleanup may take arbitrarily long, and
     /// a terminal that is already readable does not wait for it. It is
     /// declared before `mutation_guard` so that an early return drops M
-    /// first.
+    /// first. `queued_inputs` is the disposition the unregister begins with
+    /// when this call starts it: an attachment that never served (a pending
+    /// attachment's abort, a failed startup's cleanup) asks to keep what the
+    /// registration recovered, every other caller stops.
     pub(super) async fn unregister_executor_attachment_if_current_with_guard(
         self: &Arc<Self>,
         witness: RuntimeExecutorAttachmentWitness,
         runless_terminal: super::RunlessTerminalAnnouncement,
         mutation_guard: crate::tokio::sync::OwnedMutexGuard<()>,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         if !witness.belongs_to(self) {
             drop(mutation_guard);
@@ -7570,7 +7940,7 @@ impl MeerkatMachine {
 
         if registration_phase != dsl::RegistrationPhase::Draining {
             let staged = self
-                .stage_begin_unregister_session_authority(witness.session_id())
+                .stage_begin_unregister_session_authority(witness.session_id(), queued_inputs)
                 .await
                 .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
             self.commit_session_dsl_transition(
@@ -7583,13 +7953,14 @@ impl MeerkatMachine {
         }
         drop(mutation_guard);
         drop(runless_terminal);
-        self.join_or_start_unregister_teardown_with_admission(
+        self.join_or_start_unregister_teardown_with_queued_inputs(
             witness.session_id(),
             Some(witness.epoch_id()),
             UnregisterTeardownCaller::Explicit,
             UnregisterTeardownAdmission::AnyCurrentRegistration,
             None,
             UnregisterTeardownWait::UntilTerminal,
+            queued_inputs,
         )
         .await?;
         Ok(true)
@@ -7665,8 +8036,39 @@ impl MeerkatMachine {
         .require_completed()
     }
 
-    /// Close one exact current registration only while it is quiescent, then
-    /// await its owned teardown saga to terminal completion.
+    /// [`Self::unregister_session_registration_until_terminal_if_current`]
+    /// with the unregister's disposition for the run in flight and the inputs
+    /// queued behind it ([`UnregisterQueuedInputs`]), recorded as
+    /// [`Self::observe_unregister_session_registration_with_queued_inputs_if_current`]
+    /// records it: a call that joins an unregister already in progress keeps
+    /// the disposition that unregister began with. A graceful process
+    /// shutdown passes [`MeerkatMachine::graceful_shutdown_queued_inputs`].
+    pub async fn unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<bool, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
+        if !registration.belongs_to(self) {
+            return Ok(false);
+        }
+        self.join_or_start_unregister_teardown_with_queued_inputs(
+            registration.session_id(),
+            Some(registration.epoch_id()),
+            UnregisterTeardownCaller::Explicit,
+            UnregisterTeardownAdmission::AnyCurrentRegistration,
+            Some(registration),
+            UnregisterTeardownWait::UntilTerminal,
+            queued_inputs,
+        )
+        .await?
+        .require_completed()
+    }
+
+    /// Close one exact current registration while it is quiescent, or finish
+    /// its orphaned drain, then await its owned teardown to terminal completion.
     ///
     /// This is the close admission for a caller that must never interrupt
     /// the session's own work (an administrative close, for example). It
@@ -7694,7 +8096,11 @@ impl MeerkatMachine {
     /// canonical saga rather than reported as closing, unless a run is still
     /// in flight. Like any unregister, that saga abandons every input the
     /// drain still holds (reason `Stopped`) and resolves its completion as
-    /// runtime-terminated. A registration whose coordinator is installed
+    /// runtime-terminated. Successful completion of this recovery answers
+    /// [`RuntimeSessionQuiescentClose::ClosedOrphanedDrain`], even when the
+    /// drain held no inputs; only a quiescent admission answers
+    /// [`RuntimeSessionQuiescentClose::Closed`]. A registration whose
+    /// coordinator is installed
     /// answers [`RuntimeSessionQuiescentClose::AlreadyClosing`] from a
     /// read-only check, made before the registration transaction and again
     /// before the mutation gate, so this close never waits behind another
@@ -7789,7 +8195,7 @@ impl MeerkatMachine {
                 .await?
                 .require_completed()?;
             return Ok(if closed {
-                RuntimeSessionQuiescentClose::Closed
+                RuntimeSessionQuiescentClose::ClosedOrphanedDrain
             } else {
                 RuntimeSessionQuiescentClose::NotCurrent
             });
@@ -7846,6 +8252,7 @@ impl MeerkatMachine {
                 epoch_id: epoch_id.clone(),
                 coordinator_id,
                 result_rx: result_rx.clone(),
+                queued_inputs: UnregisterDisposition::STOP,
             });
             (
                 epoch_id,
@@ -7915,36 +8322,11 @@ impl MeerkatMachine {
         &self,
         registration: &RuntimeSessionRegistrationWitness,
     ) -> Result<RuntimeSessionUnregisterAdmission, RuntimeDriverError> {
-        if !registration.belongs_to(self) {
-            return Ok(RuntimeSessionUnregisterAdmission::NotCurrent);
-        }
-        match self
-            .join_or_start_unregister_teardown_with_admission(
-                registration.session_id(),
-                Some(registration.epoch_id()),
-                UnregisterTeardownCaller::Explicit,
-                UnregisterTeardownAdmission::AnyCurrentRegistration,
-                Some(registration),
-                UnregisterTeardownWait::ReturnObserver,
-            )
-            .await?
-        {
-            UnregisterTeardownWaitOutcome::Completed(true) => {
-                Ok(RuntimeSessionUnregisterAdmission::Completed)
-            }
-            UnregisterTeardownWaitOutcome::Completed(false) => {
-                Ok(RuntimeSessionUnregisterAdmission::NotCurrent)
-            }
-            UnregisterTeardownWaitOutcome::Pending(observer) => {
-                Ok(RuntimeSessionUnregisterAdmission::Pending(observer))
-            }
-            UnregisterTeardownWaitOutcome::Joined(..) => Err(RuntimeDriverError::Internal(
-                "unregister observer admission returned a caller-grace wait".to_string(),
-            )),
-            UnregisterTeardownWaitOutcome::UseChanged => Err(RuntimeDriverError::Internal(
-                "an ungated unregister observer admission answered a use change".to_string(),
-            )),
-        }
+        self.observe_unregister_session_registration_with_queued_inputs_if_current(
+            registration,
+            UnregisterQueuedInputs::Stop,
+        )
+        .await
     }
 
     /// [`Self::observe_unregister_session_registration_if_current`] for a
@@ -7969,19 +8351,92 @@ impl MeerkatMachine {
         registration: &RuntimeSessionRegistrationWitness,
         expected_use: RuntimeSessionRegistrationUse,
     ) -> Result<RuntimeSessionUnregisterUseAdmission, RuntimeDriverError> {
+        self.observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+            registration,
+            expected_use,
+            UnregisterQueuedInputs::Stop,
+        )
+        .await
+    }
+
+    /// [`Self::observe_unregister_session_registration_if_current`] with the
+    /// unregister's disposition for inputs still queued behind the running
+    /// turn ([`UnregisterQueuedInputs`]). The disposition is recorded with the
+    /// unregister's durable progress when this call starts the unregister, so
+    /// a convergence recovered after a crash applies the same one. A call
+    /// that joins an unregister already in progress keeps the disposition
+    /// that unregister began with, whatever this call passes.
+    pub async fn observe_unregister_session_registration_with_queued_inputs_if_current(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<RuntimeSessionUnregisterAdmission, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
+        if !registration.belongs_to(self) {
+            return Ok(RuntimeSessionUnregisterAdmission::NotCurrent);
+        }
+        match self
+            .join_or_start_unregister_teardown_with_queued_inputs(
+                registration.session_id(),
+                Some(registration.epoch_id()),
+                UnregisterTeardownCaller::Explicit,
+                UnregisterTeardownAdmission::AnyCurrentRegistration,
+                Some(registration),
+                UnregisterTeardownWait::ReturnObserver,
+                queued_inputs,
+            )
+            .await?
+        {
+            UnregisterTeardownWaitOutcome::Completed(true) => {
+                Ok(RuntimeSessionUnregisterAdmission::Completed)
+            }
+            UnregisterTeardownWaitOutcome::Completed(false) => {
+                Ok(RuntimeSessionUnregisterAdmission::NotCurrent)
+            }
+            UnregisterTeardownWaitOutcome::Pending(observer) => {
+                Ok(RuntimeSessionUnregisterAdmission::Pending(observer))
+            }
+            UnregisterTeardownWaitOutcome::Joined(..) => Err(RuntimeDriverError::Internal(
+                "unregister observer admission returned a caller-grace wait".to_string(),
+            )),
+            UnregisterTeardownWaitOutcome::UseChanged => Err(RuntimeDriverError::Internal(
+                "an ungated unregister observer admission answered a use change".to_string(),
+            )),
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "an unregister observer admission answered a stopped-residue refusal".to_string(),
+            )),
+        }
+    }
+
+    /// [`Self::observe_unregister_session_registration_if_use_unchanged`] with
+    /// the unregister's disposition for queued inputs, as
+    /// [`Self::observe_unregister_session_registration_with_queued_inputs_if_current`]
+    /// records it. `Changed` starts and joins nothing, so it records nothing.
+    pub async fn observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+        &self,
+        registration: &RuntimeSessionRegistrationWitness,
+        expected_use: RuntimeSessionRegistrationUse,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<RuntimeSessionUnregisterUseAdmission, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
         if !registration.belongs_to(self) {
             return Ok(RuntimeSessionUnregisterUseAdmission::Admitted(
                 RuntimeSessionUnregisterAdmission::NotCurrent,
             ));
         }
         let admission = match self
-            .join_or_start_unregister_teardown_with_admission(
+            .join_or_start_unregister_teardown_with_queued_inputs(
                 registration.session_id(),
                 Some(registration.epoch_id()),
                 UnregisterTeardownCaller::Explicit,
                 UnregisterTeardownAdmission::UnchangedRegistrationUse(expected_use),
                 Some(registration),
                 UnregisterTeardownWait::ReturnObserver,
+                queued_inputs,
             )
             .await?
         {
@@ -8000,6 +8455,12 @@ impl MeerkatMachine {
             UnregisterTeardownWaitOutcome::Joined(..) => {
                 return Err(RuntimeDriverError::Internal(
                     "use-gated unregister observer admission returned a caller-grace wait"
+                        .to_string(),
+                ));
+            }
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => {
+                return Err(RuntimeDriverError::Internal(
+                    "use-gated unregister observer admission answered a stopped-residue refusal"
                         .to_string(),
                 ));
             }
@@ -8180,6 +8641,7 @@ impl MeerkatMachine {
             preinstalled_stop_coordinator,
             reload_required,
             driver,
+            completions,
         ) = {
             let sessions = self.sessions.read().await;
             let Some(entry) = sessions.get(session_id) else {
@@ -8205,9 +8667,22 @@ impl MeerkatMachine {
                 entry.runtime_stop_cleanup_coordinator.is_some(),
                 entry.require_durability_ready().err(),
                 Arc::clone(&entry.driver),
+                Arc::clone(&entry.completions),
             )
         };
         if let Some(reload_required) = reload_required {
+            // The registration must reload, so its exited loop is not torn
+            // down here: the registration stays, detached, until a reload or
+            // an explicit resume settles it, and nothing serves the inputs it
+            // admitted before then. A caller still waiting on one of them is
+            // answered now, typed, instead of waiting on a registration that
+            // detached. The inputs stay durably admitted and run once the
+            // session's runtime reloads.
+            completions.lock().await.fail_all_waiters(
+                crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "the runtime of session {session_id} stopped serving before this input completed and must reload ({reload_required}); the input stays durably admitted and runs once the runtime reloads, so do not resubmit it"
+                )),
+            );
             return Err(RuntimeDriverError::RecoveryRepairBlocked {
                 evidence_digest: None,
                 reason: reload_required.to_string(),
@@ -8317,7 +8792,7 @@ impl MeerkatMachine {
 
         if registration_phase != dsl::RegistrationPhase::Draining {
             let staged = self
-                .stage_begin_unregister_session_authority(session_id)
+                .stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
                 .await
                 .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
             self.commit_session_dsl_transition(
@@ -8450,6 +8925,10 @@ impl MeerkatMachine {
             )),
             UnregisterTeardownWaitOutcome::UseChanged => Err(RuntimeDriverError::Internal(
                 "the runtime-loop watcher's ungated unregister answered a use change".to_string(),
+            )),
+            UnregisterTeardownWaitOutcome::NotStoppedResidue => Err(RuntimeDriverError::Internal(
+                "the runtime-loop watcher's unregister answered a stopped-residue refusal"
+                    .to_string(),
             )),
         }
     }
@@ -9052,6 +9531,38 @@ impl MeerkatMachine {
         .map(|_| ())
     }
 
+    /// Whether `entry` is the completed residue of a stopped machine-managed
+    /// attachment: Stopped and unattached (see
+    /// [`Self::require_terminal_unattached_registration`]), with that
+    /// attachment's post-stop callback recorded and completed, and
+    /// durability-ready. A registration that was never attached, a Retired
+    /// one, or one that needs a durability reload, is not.
+    fn is_stopped_attachment_residue(session_id: &SessionId, entry: &RuntimeSessionEntry) -> bool {
+        // An ordinary stop keeps the registration Queuing; Draining belongs
+        // to an unregister that owns it. A retired runtime is not served
+        // again, so only a Stopped one is residue to take over.
+        let (registration_queuing, stopped) = {
+            let authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (
+                authority.state().registration_phase
+                    == crate::meerkat_machine::dsl::RegistrationPhase::Queuing,
+                super::dsl_authority::runtime_phase_from_authority(&authority)
+                    == RuntimeState::Stopped,
+            )
+        };
+        registration_queuing
+            && stopped
+            && entry.post_stop_cleanup_attachment_id.is_some()
+            && entry.post_stop_cleanup_complete
+            && entry.pending_unregister_finalization.is_none()
+            && entry.pending_user_interrupt_dispatch.is_none()
+            && entry.require_durability_ready().is_ok()
+            && Self::require_terminal_unattached_registration(session_id, entry).is_ok()
+    }
+
     fn require_terminal_unattached_registration(
         session_id: &SessionId,
         entry: &RuntimeSessionEntry,
@@ -9151,6 +9662,36 @@ impl MeerkatMachine {
         expected_registration: Option<&RuntimeSessionRegistrationWitness>,
         wait: UnregisterTeardownWait,
     ) -> Result<UnregisterTeardownWaitOutcome, RuntimeDriverError> {
+        self.join_or_start_unregister_teardown_with_queued_inputs(
+            session_id,
+            expected_epoch,
+            caller,
+            admission,
+            expected_registration,
+            wait,
+            UnregisterDisposition::STOP,
+        )
+        .await
+    }
+
+    /// [`Self::join_or_start_unregister_teardown_with_admission`] with the
+    /// disposition a coordinator this call starts carries into
+    /// `BeginUnregisterSession`. A join keeps the disposition its unregister
+    /// began with.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the unregister admission tuple plus the queued-input disposition"
+    )]
+    async fn join_or_start_unregister_teardown_with_queued_inputs(
+        &self,
+        session_id: &SessionId,
+        expected_epoch: Option<&meerkat_core::RuntimeEpochId>,
+        caller: UnregisterTeardownCaller,
+        admission: UnregisterTeardownAdmission,
+        expected_registration: Option<&RuntimeSessionRegistrationWitness>,
+        wait: UnregisterTeardownWait,
+        queued_inputs: UnregisterDisposition,
+    ) -> Result<UnregisterTeardownWaitOutcome, RuntimeDriverError> {
         enum CoordinatorDecision {
             Join {
                 coordinator_id: uuid::Uuid,
@@ -9167,6 +9708,7 @@ impl MeerkatMachine {
             EpochChanged,
             RegistrationChanged,
             UseChanged,
+            NotStoppedResidue,
             Completed(Result<(), RuntimeDriverError>),
             Retry,
         }
@@ -9239,6 +9781,18 @@ impl MeerkatMachine {
                         ) =>
                     {
                         CoordinatorDecision::UseChanged
+                    }
+                    // Decided under T, the witness's exact M and the session
+                    // map lock, before any coordinator is joined or started:
+                    // only the completed residue of a stopped attachment is
+                    // taken over, and an unregister another owner already
+                    // runs is that owner's, never joined here.
+                    Some(entry)
+                        if admission == UnregisterTeardownAdmission::StoppedAttachmentResidue
+                            && (entry.unregister_coordinator.is_some()
+                                || !Self::is_stopped_attachment_residue(session_id, entry)) =>
+                    {
+                        CoordinatorDecision::NotStoppedResidue
                     }
                     Some(entry) => {
                         if entry.reload_required_discard_coordinator.is_some() {
@@ -9314,6 +9868,7 @@ impl MeerkatMachine {
                                 epoch_id: epoch_id.clone(),
                                 coordinator_id,
                                 result_rx: result_rx.clone(),
+                                queued_inputs,
                             });
                             CoordinatorDecision::Start {
                                 epoch_id,
@@ -9369,6 +9924,10 @@ impl MeerkatMachine {
             CoordinatorDecision::UseChanged => {
                 drop(registration_transaction_guard.take());
                 return Ok(UnregisterTeardownWaitOutcome::UseChanged);
+            }
+            CoordinatorDecision::NotStoppedResidue => {
+                drop(registration_transaction_guard.take());
+                return Ok(UnregisterTeardownWaitOutcome::NotStoppedResidue);
             }
             CoordinatorDecision::Completed(result) => {
                 drop(registration_transaction_guard.take());
@@ -9950,6 +10509,7 @@ impl MeerkatMachine {
     async fn stage_begin_unregister_session_authority(
         &self,
         session_id: &SessionId,
+        requested: UnregisterDisposition,
     ) -> Result<StagedSessionDslInput, String> {
         let sessions = self.sessions.read().await;
         let entry = sessions.get(session_id).ok_or_else(|| {
@@ -9963,6 +10523,15 @@ impl MeerkatMachine {
         }
         let mechanically_pending_attachment =
             matches!(entry.attachment_slot, RuntimeLoopAttachmentSlot::Pending(_));
+        // The disposition of the coordinator that owns this unregister; a
+        // prefix begun without one carries the caller's request (an
+        // attachment that never served asks to keep, the runtime loop's own
+        // teardown stops).
+        let (queued_inputs, requeue_max_age_ms) = entry
+            .unregister_coordinator
+            .as_ref()
+            .map_or(requested, |coordinator| coordinator.queued_inputs)
+            .dsl_disposition();
         let mut authority = entry
             .dsl_authority
             .lock()
@@ -9994,6 +10563,7 @@ impl MeerkatMachine {
                     fence_token,
                     generation,
                     runtime_epoch_id,
+                    queued_inputs,
                 },
                 "BeginUnregisterUnservedAttachment",
             )
@@ -10005,6 +10575,8 @@ impl MeerkatMachine {
                     fence_token,
                     generation,
                     runtime_epoch_id,
+                    queued_inputs,
+                    requeue_max_age_ms,
                 },
                 "BeginUnregisterSession",
             )
@@ -10262,7 +10834,7 @@ impl MeerkatMachine {
             return Ok(GatedBeginUnregister::WorkPresent);
         }
         match self
-            .stage_begin_unregister_session_authority(session_id)
+            .stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
             .await
         {
             Ok(staged) => {
@@ -10635,7 +11207,7 @@ ControlFlow::Break(()) => return Ok(()),
         // runtime snapshot before the drain can advance lifecycle state.
         tracing::info!(%session_id, "MeerkatMachine::unregister_session_inner_locked_authorized beginning drain window");
         match crate::stack_relief::box_in_own_frame(|| {
-            self.stage_begin_unregister_session_authority(session_id)
+            self.stage_begin_unregister_session_authority(session_id, UnregisterDisposition::STOP)
         })
         .await
         {
@@ -10787,16 +11359,70 @@ ControlFlow::Break(()) => return Ok(()),
             // Active-or-Draining authority needed to commit and terminalize.
             // Thus BeginUnregisterSession either follows a published run ID or
             // makes every later queue-admission attempt fail closed.
+            //
+            // A graceful unregister that requeues suspends a durable session's
+            // in-flight run instead: the turn is dropped at its next await as
+            // a hard cancel drops it, but with no terminal and no closing
+            // write, and the runtime loop marks the run resumable before the
+            // stop classifies any input. The run's inputs then stay bound to
+            // it, and the next start resumes it from its last committed
+            // round. The saga asks only when the machine would admit the
+            // suspension now; a run it would not, a surface that cannot
+            // suspend, or a run that is no longer current, falls back to the
+            // hard cancel.
             if let (Some(interrupt_handle), Some(expected_run_id)) =
                 (loop_interrupt_handle, loop_interrupt_run_id)
             {
+                let suspend_eligible = {
+                    let driver = crate::stack_relief::box_in_own_frame(|| driver_handle.lock())
+                        .await;
+                    driver.suspension_admissible(&expected_run_id)
+                };
+                let suspended = suspend_eligible
+                    && match crate::stack_relief::box_in_own_frame(|| {
+                        crate::tokio::time::timeout(
+                            UNREGISTER_INTERRUPT_DELIVERY_GRACE,
+                            interrupt_handle.suspend_run_if_current(
+                                &expected_run_id,
+                                "runtime session unregistered for a requeue".to_string(),
+                            ),
+                        )
+                    })
+                    .await
+                    {
+                        Ok(Ok(suspended)) => suspended,
+                        Ok(Err(error)) => {
+                            tracing::debug!(
+                                %session_id,
+                                %error,
+                                "in-flight run suspension during a requeue unregister returned an error; cancelling it instead"
+                            );
+                            false
+                        }
+                        Err(_elapsed) => {
+                            // The suspension may still land; a hard cancel now
+                            // would race it. The saga waits for the loop.
+                            tracing::warn!(
+                                %session_id,
+                                "in-flight run suspension delivery exceeded its grace window; exact executor remains owned by the runtime loop"
+                            );
+                            true
+                        }
+                    };
                 match crate::stack_relief::box_in_own_frame(|| {
                     crate::tokio::time::timeout(
                         UNREGISTER_INTERRUPT_DELIVERY_GRACE,
-                        interrupt_handle.hard_cancel_run_if_current(
-                            &expected_run_id,
-                            "runtime session unregistered".to_string(),
-                        ),
+                        async {
+                            if suspended {
+                                return Ok(true);
+                            }
+                            interrupt_handle
+                                .hard_cancel_run_if_current(
+                                    &expected_run_id,
+                                    "runtime session unregistered".to_string(),
+                                )
+                                .await
+                        },
                     )
                 })
                 .await
@@ -11115,15 +11741,19 @@ ControlFlow::Break(()) => return Ok(()),
         // Anything left in the registry is therefore orphaned plumbing, not a
         // second public terminal that unregister may fabricate.
         if unregister_state.unregister_completion_waiter_drain_pending {
-            crate::stack_relief::box_in_own_frame(|| completions.lock())
+            // An input the stop kept queued is not failed: the terminalization
+            // answered its waiters, and one still found here gets the same
+            // requeued answer, never the unregistered failure.
+            let requeued = crate::stack_relief::box_in_own_frame(|| driver_handle.lock())
                 .await
-                .fail_not_pending_waiters(
-                    |_| false,
-                    crate::completion::CompletionWaitError::AuthorityUnavailable(
-                        "runtime session unregistered after canonical terminal recipients resolved"
-                            .to_string(),
-                    ),
-                );
+                .stop_requeued_inputs();
+            let late = crate::stack_relief::box_in_own_frame(|| completions.lock())
+                .await
+                .drain_unregistered_waiters(requeued);
+            debug_assert_eq!(
+                late, 0,
+                "the stop terminalization answers every requeued input's waiters"
+            );
         }
 
 Ok::<_, RuntimeDriverError>(ControlFlow::Continue((_gate_guard, unregister_state)))
@@ -13189,11 +13819,13 @@ Ok::<(), RuntimeDriverError>(())
         // an abandoned hand-back releases M first and then tells.
         let abandonment = crate::tokio::spawn({
             let driver = Arc::clone(&driver);
+            let completions = Arc::clone(&completions);
             let reason = reason.clone();
             let mut runless_terminal = self.runless_terminal_announcement();
             async move {
                 let outcome = Self::abandon_retired_pending_inputs_owing(
                     &driver,
+                    &completions,
                     reason,
                     &mut runless_terminal,
                 )
@@ -13206,62 +13838,70 @@ Ok::<(), RuntimeDriverError>(())
                 "retired pending-input abandonment for session {session_id} failed: {error}"
             ))
         })?;
-        let prepared = outcome.and_then(
-            |(abandoned, completion_input_ids, candidate_owner_input_id)| {
-                let dispatch = match publication_handle {
-                    Some(publication_handle) => {
-                        Some(self.prepare_runless_terminal_publication_dispatch(
-                            &driver,
-                            &completions,
-                            &mutation_gate,
-                            publication_handle,
-                        )?)
-                    }
-                    None => None,
-                };
-                Ok((
-                    abandoned,
-                    completion_input_ids,
-                    candidate_owner_input_id,
-                    dispatch,
-                ))
-            },
-        );
+        let prepared = outcome.and_then(|(abandoned, terminal_batches)| {
+            let dispatch = match publication_handle {
+                Some(publication_handle) => {
+                    Some(self.prepare_runless_terminal_publication_dispatch(
+                        &driver,
+                        &completions,
+                        &mutation_gate,
+                        publication_handle,
+                    )?)
+                }
+                None => None,
+            };
+            Ok((abandoned, terminal_batches, dispatch))
+        });
         drop(gate_guard);
         // Every native guard is released: tell the abandonment now, before
         // its publication and before any error returns. Entering retirement
         // abandons nothing here and tells nothing.
         runless_terminal.release();
-        let (abandoned, completion_input_ids, candidate_owner_input_id, dispatch) = prepared?;
+        let (abandoned, terminal_batches, dispatch) = prepared?;
 
-        if let Some((result_rx, start_tx)) = dispatch {
+        // The dispatch publishes every committed directed batch with its
+        // nondirected siblings; its start permit is sent before anything is
+        // awaited. A batch with no directed recipient has no outbox, so
+        // neither the dispatch nor the convergence ever resolves it: it is
+        // resolved before either is awaited, so a directed publication that
+        // fails or outlives the deadline still leaves its waiters answered.
+        // The first error is returned once both are done.
+        let dispatch = dispatch.map(|(result_rx, start_tx)| {
             if let Some(start_tx) = start_tx {
                 let _ = start_tx.send(());
             }
-            self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
-                .await?;
-        } else {
-            crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+            result_rx
+        });
+        let nondirected = terminal_batches
+            .into_iter()
+            .filter(|batch| !batch.is_directed())
+            .collect::<Vec<_>>();
+        let nondirected_result =
+            crate::control_plane::publish_and_resolve_runless_runtime_terminations_before(
                 &driver,
                 Some(&completions),
                 None,
-                deadline,
-            )
-            .await?;
-        }
-
-        if candidate_owner_input_id.is_none() && !completion_input_ids.is_empty() {
-            crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
-                &driver,
-                Some(&completions),
-                None,
-                &completion_input_ids,
-                None,
+                &nondirected,
                 &reason,
                 deadline,
             )
-            .await?;
-        }
+            .await;
+        let directed_result = match dispatch {
+            Some(result_rx) => {
+                self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
+                    .await
+            }
+            None => {
+                crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                    &driver,
+                    Some(&completions),
+                    None,
+                    deadline,
+                )
+                .await
+            }
+        };
+        directed_result.and(nondirected_result)?;
         Ok(abandoned)
     }
 
@@ -13269,15 +13909,27 @@ Ok::<(), RuntimeDriverError>(())
     /// detached work that holds the session's M: abandon every pending input
     /// of the retired session, owing `runless_terminal` when the abandonment
     /// commits, and, when a later step fails, as a conservative re-observation
-    /// after a possibly committed transition. Returns the abandoned count, the
-    /// inputs whose waiters the abandonment terminates, and the candidate owner
-    /// of its committed terminal outbox.
+    /// after a possibly committed transition. Returns the abandoned count and
+    /// the committed terminal batches, which name the inputs whose waiters the
+    /// abandonment terminates and each directed batch's outbox owner.
     async fn abandon_retired_pending_inputs_owing(
         driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
         reason: String,
         runless_terminal: &mut super::RunlessTerminalAnnouncement,
-    ) -> Result<(usize, Vec<InputId>, Option<InputId>), RuntimeDriverError> {
+    ) -> Result<
+        (
+            usize,
+            Vec<crate::meerkat_machine::driver::RunlessTerminalBatch>,
+        ),
+        RuntimeDriverError,
+    > {
         let mut driver = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // pending: adopt them before this sweep names its batch.
+        driver
+            .adopt_durable_consumed_inputs(Some(completions))
+            .await?;
         let completion_input_ids = driver.as_driver().active_input_ids();
         let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
             &completion_input_ids,
@@ -13303,9 +13955,9 @@ Ok::<(), RuntimeDriverError>(())
         if abandoned > 0 {
             runless_terminal.owe();
         }
-        let candidate_owner_input_id =
+        let terminal_batches =
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
-        Ok((abandoned, completion_input_ids, candidate_owner_input_id))
+        Ok((abandoned, terminal_batches))
     }
 
     /// Abandon every input `session_id` holds queued, in either lane, at one
@@ -13371,11 +14023,13 @@ Ok::<(), RuntimeDriverError>(())
         // abandoned hand-back releases M first and then tells.
         let abandonment = crate::tokio::spawn({
             let driver = Arc::clone(&driver);
+            let completions = Arc::clone(&completions);
             let reason = reason.clone();
             let mut runless_terminal = self.runless_terminal_announcement();
             async move {
                 let outcome = Self::abandon_queued_inputs_owing(
                     &driver,
+                    &completions,
                     &dsl_authority,
                     reason,
                     &mut runless_terminal,
@@ -13458,6 +14112,7 @@ Ok::<(), RuntimeDriverError>(())
     /// stops the walk.
     async fn abandon_queued_inputs_owing(
         driver: &SharedDriver,
+        completions: &SharedCompletionRegistry,
         dsl_authority: &Arc<std::sync::Mutex<dsl::MeerkatMachineAuthority>>,
         reason: String,
         runless_terminal: &mut super::RunlessTerminalAnnouncement,
@@ -13469,6 +14124,14 @@ Ok::<(), RuntimeDriverError>(())
         use crate::input_state::InputAbandonReason;
 
         let mut driver_guard = driver.lock().await;
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // queued: adopt them before this sweep reads the lane.
+        if let Err(error) = driver_guard
+            .adopt_durable_consumed_inputs(Some(completions))
+            .await
+        {
+            return (None, Vec::new(), Some(error));
+        }
         let (current_run, lane) = {
             let authority = dsl_authority
                 .lock()
@@ -13508,10 +14171,8 @@ Ok::<(), RuntimeDriverError>(())
                 }
             };
             let prepared = match driver_guard
-                .prepare_runless_runtime_terminated_interaction_outboxes(
-                    std::slice::from_ref(&input_id),
-                    reason.clone(),
-                ) {
+                .prepare_sole_runless_runtime_termination(&input_id, reason.clone())
+            {
                 Ok(prepared) => prepared,
                 Err(error) => {
                     failure = Some(error);
@@ -13523,7 +14184,10 @@ Ok::<(), RuntimeDriverError>(())
                 .await
             {
                 Ok(true) => {
-                    let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+                    let candidate_owner_input_id =
+                        crate::meerkat_machine::driver::DriverEntry::commit_prepared_sole_runless_termination(
+                            prepared,
+                        );
                     runless_terminal.owe();
                     abandoned.push((input_id, candidate_owner_input_id));
                 }
@@ -13531,10 +14195,10 @@ Ok::<(), RuntimeDriverError>(())
                 // lane while the gate is held; an input that is not queued has
                 // no queued work to abandon.
                 Ok(false) => {
-                    driver_guard.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                    driver_guard.rollback_prepared_sole_runless_termination(prepared);
                 }
                 Err(error) => {
-                    driver_guard.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                    driver_guard.rollback_prepared_sole_runless_termination(prepared);
                     // The abandonment may have committed before a later step
                     // (its archival) failed, or left its commit uncertain:
                     // when the input left the active set, a conservative

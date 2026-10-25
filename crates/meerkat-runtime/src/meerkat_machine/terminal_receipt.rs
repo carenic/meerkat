@@ -18,29 +18,57 @@
 use super::*;
 use crate::input_state::StoredInputState;
 use crate::terminal_status::{
-    InputTerminalReceiptRead, InputTerminalReceiptWait, InteractionSelector, Sourced,
-    TerminalWitnessSource,
+    InputTerminalReceiptObservation, InputTerminalReceiptRead, InputTerminalReceiptWait,
+    InteractionSelector, Sourced, TerminalWitnessSource,
 };
 
+/// How a receipt read leaves the machine: through the payload reader's
+/// scoped disclosure decision, or (for the body-free observation) to the
+/// projection that drops its outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiptRelease {
+    PayloadReader,
+    Observation,
+}
+
 impl MeerkatMachine {
-    /// Read the terminal receipt of one input: its finalized receipt (the
-    /// scope, recipients and finalized outcome of the terminal batch the
-    /// runtime committed it in), a receipt-less terminal, or its current
-    /// pending lifecycle facts.
+    /// Observe this session's input-state witnesses through its actual runtime
+    /// owner. Registered sessions combine the live snapshot with durable rows
+    /// no longer held in memory; unregistered sessions read the durable store
+    /// without restoring a registration. Every durable row must decode, or the
+    /// whole observation fails. No input is filtered by phase, run or workflow.
     ///
-    /// A receipt proves which inputs were finalized together with one
-    /// outcome; it does not prove that a run's result answers every input
-    /// that run touched. See
-    /// [`crate::terminal_status::InputTerminalReceiptScope::Run`].
+    /// This read does not close ingress or prove that work has settled. A
+    /// caller requiring a complete closed cohort must separately establish
+    /// that the selected registration is Draining or its teardown has joined,
+    /// then check each input's canonical terminal receipt. Reused sessions
+    /// also require the caller's exact start baseline to scope its workflow.
+    /// Input ids are stable across the boundary: a requeue across a graceful
+    /// stop, a replay of a failed run and a retry keep an input's id. A
+    /// requeued input, or one bound to a run a graceful stop suspended, is not
+    /// finalized at shutdown: it finalizes at the next start, or as
+    /// `RequeueExpired` past the stop's max age. A coalesced or superseded
+    /// input names the newer admitted input of the same session that carries
+    /// its outcome.
+    /// The returned source identifies the read path, not a close receipt.
     ///
-    /// Selector resolution matches [`SessionServiceRuntimeExt::interaction_terminal_status`]:
-    /// a registered session resolves keys through the machine-owned admission
-    /// map and falls back to the durable store for rows archived out of
-    /// memory; an unregistered session answers from the durable store without
-    /// reviving the runtime. `Ok(None)` means the session exists but holds no
-    /// such input (or no such key yet). An unregistered session on a store-less
-    /// machine fails `NotReady`, and a never-admitted session on a persistent
-    /// machine fails `NotFound`.
+    /// A known empty session returns an empty observation. An unregistered
+    /// session on a store-less machine fails `NotReady`; a persistent session
+    /// with neither lifecycle nor input records fails `NotFound`.
+    ///
+    /// Each row is released as the public row read releases it: a result
+    /// payload (a run result or callback arguments) only to a reader the
+    /// input's scoped destination permits, so once a scoped session is
+    /// unregistered none comes out; every body-free lifecycle fact stays.
+    pub async fn session_input_states(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Sourced<Vec<StoredInputState>>, RuntimeDriverError> {
+        let (source, rows) = self.session_input_witnesses(session_id).await?;
+        let report = self.release_public_rows(session_id, rows).await;
+        Ok(Sourced { source, report })
+    }
+
     /// Wait until `session_id`'s live runtime has admitted an input for
     /// `idempotency_key` and return its id. Woken by the admission itself
     /// (the driver signals every accepted input); never re-reads on a timer.
@@ -83,10 +111,81 @@ impl MeerkatMachine {
         }
     }
 
+    /// Read the terminal receipt of one input: its finalized receipt (the
+    /// scope, recipients and finalized outcome of the terminal batch the
+    /// runtime committed it in), a receipt-less terminal, or its current
+    /// pending lifecycle facts.
+    ///
+    /// A receipt proves which inputs were finalized together with one
+    /// outcome; it does not prove that a run's result answers every input
+    /// that run touched. See
+    /// [`crate::terminal_status::InputTerminalReceiptScope::Run`].
+    ///
+    /// Selector resolution matches [`SessionServiceRuntimeExt::interaction_terminal_status`]:
+    /// a registered session resolves keys through the machine-owned admission
+    /// map and falls back to the durable store for rows archived out of
+    /// memory; an unregistered session answers from the durable store without
+    /// reviving the runtime. `Ok(None)` means the session exists but holds no
+    /// such input (or no such key yet). An unregistered session on a store-less
+    /// machine fails `NotReady`, and a never-admitted session on a persistent
+    /// machine fails `NotFound`.
+    ///
+    /// A finalized receipt carries the batch's outcome, so a result payload
+    /// is released only to a reader the input's scoped destination permits:
+    /// otherwise the read fails `ScopedResultWithheld`. A reader without the
+    /// current destination (for example after the session's unregister)
+    /// proves the input's completion with
+    /// [`Self::input_terminal_receipt_observation`] instead.
     pub async fn input_terminal_receipt(
         &self,
         session_id: &SessionId,
         selector: InteractionSelector,
+    ) -> Result<Option<Sourced<InputTerminalReceiptRead>>, RuntimeDriverError> {
+        crate::stack_relief::box_in_own_frame(|| {
+            self.read_input_terminal_receipt(session_id, selector, ReceiptRelease::PayloadReader)
+        })
+        .await
+    }
+
+    /// Observe the terminal receipt of one input without its outcome: the
+    /// same resolution, batch load and native batch validation as
+    /// [`Self::input_terminal_receipt`], with a finalized receipt's outcome
+    /// replaced by its body-free class
+    /// ([`crate::terminal_status::InputTerminalReceiptSummary`]).
+    ///
+    /// It carries every identity of the receipt (the input, its terminal and
+    /// attempts, the batch's scope, owner and recipients) and no run result,
+    /// callback call or failure text, so it answers whatever the reader's
+    /// destination: it never fails `ScopedResultWithheld`, and the payload
+    /// reader keeps withholding. A lost owner, recipient or recipient set
+    /// fails `RecoveryCorruption`, a store that cannot load the batch fails
+    /// `RecoveryRepairBlocked`, and selector resolution, `Ok(None)`,
+    /// `NotReady` and `NotFound` are as for the receipt. It is a read, not a
+    /// close receipt: a caller proving a closed cohort still establishes
+    /// that the registration is Draining or its teardown has joined.
+    pub async fn input_terminal_receipt_observation(
+        &self,
+        session_id: &SessionId,
+        selector: InteractionSelector,
+    ) -> Result<Option<Sourced<InputTerminalReceiptObservation>>, RuntimeDriverError> {
+        let read = crate::stack_relief::box_in_own_frame(|| {
+            self.read_input_terminal_receipt(session_id, selector, ReceiptRelease::Observation)
+        })
+        .await?;
+        Ok(read.map(|read| Sourced {
+            source: read.source,
+            report: crate::terminal_status::observe_input_terminal_receipt(read.report),
+        }))
+    }
+
+    /// The shared receipt read of [`Self::input_terminal_receipt`] and
+    /// [`Self::input_terminal_receipt_observation`]: resolution, batch load
+    /// and validation, then `release`.
+    async fn read_input_terminal_receipt(
+        &self,
+        session_id: &SessionId,
+        selector: InteractionSelector,
+        release: ReceiptRelease,
     ) -> Result<Option<Sourced<InputTerminalReceiptRead>>, RuntimeDriverError> {
         let driver = {
             let sessions = self.sessions.read().await;
@@ -111,7 +210,7 @@ impl MeerkatMachine {
                 }
             };
             return crate::stack_relief::box_in_own_frame(|| {
-                self.durable_input_terminal_receipt_read(session_id, target)
+                self.durable_input_terminal_receipt_read(session_id, target, release)
             })
             .await;
         };
@@ -124,7 +223,9 @@ impl MeerkatMachine {
                 }
             };
             let live = match &input_id {
-                Some(input_id) => self.live_input_terminal_receipt_read(&guard, input_id)?,
+                Some(input_id) => {
+                    self.live_input_terminal_receipt_read(&guard, input_id, release)?
+                }
                 None => None,
             };
             (input_id, live)
@@ -152,7 +253,7 @@ impl MeerkatMachine {
             }
         };
         crate::stack_relief::box_in_own_frame(|| {
-            self.durable_input_terminal_receipt_read(session_id, target)
+            self.durable_input_terminal_receipt_read(session_id, target, release)
         })
         .await
     }
@@ -220,7 +321,11 @@ impl MeerkatMachine {
             };
             let (completion, observer) = {
                 let guard = driver.lock().await;
-                match self.live_input_terminal_receipt_read(&guard, input_id)? {
+                match self.live_input_terminal_receipt_read(
+                    &guard,
+                    input_id,
+                    ReceiptRelease::PayloadReader,
+                )? {
                     Some(report) if report.is_resolved() => {
                         return Ok(Some(InputTerminalReceiptWait::Resolved(Sourced {
                             source: TerminalWitnessSource::LiveRuntime,
@@ -273,7 +378,7 @@ impl MeerkatMachine {
         target: Option<StoredInputState>,
     ) -> Result<Option<InputTerminalReceiptWait>, RuntimeDriverError> {
         Ok(self
-            .durable_input_terminal_receipt_read(session_id, target)
+            .durable_input_terminal_receipt_read(session_id, target, ReceiptRelease::PayloadReader)
             .await?
             .map(|read| {
                 if read.report.is_resolved() {
@@ -284,13 +389,17 @@ impl MeerkatMachine {
             }))
     }
 
-    /// A finalized receipt carries the batch's outcome, so its result
-    /// payload is released only to a reader the input's scoped destination
-    /// permits (see [`super::scoped_context::result_disclosure_permitted`]).
+    /// A finalized receipt carries the batch's outcome, so for the payload
+    /// reader its result payload is released only to a reader the input's
+    /// scoped destination permits (see
+    /// [`super::scoped_context::result_disclosure_permitted`]). For the
+    /// observation the read is returned unreleased, and its only caller
+    /// drops the outcome before anything leaves the machine.
     fn live_input_terminal_receipt_read(
         &self,
         driver: &DriverEntry,
         input_id: &InputId,
+        release: ReceiptRelease,
     ) -> Result<Option<InputTerminalReceiptRead>, RuntimeDriverError> {
         let Some(read) = driver
             .exact_input_terminal_completion_rows(input_id)?
@@ -299,6 +408,9 @@ impl MeerkatMachine {
         else {
             return Ok(None);
         };
+        if release == ReceiptRelease::Observation {
+            return Ok(Some(read));
+        }
         let posture =
             super::scoped_context::scoped_host_posture(&self.native_work_authorization_host);
         let permitted = match driver.as_driver().stored_input_state(input_id) {
@@ -335,6 +447,7 @@ impl MeerkatMachine {
         &self,
         session_id: &SessionId,
         target: Option<StoredInputState>,
+        release: ReceiptRelease,
     ) -> Result<Option<Sourced<InputTerminalReceiptRead>>, RuntimeDriverError> {
         let Some(target) = target else {
             return Ok(None);
@@ -350,6 +463,12 @@ impl MeerkatMachine {
         let rows = Self::load_durable_terminal_completion_rows(store.as_ref(), &runtime_id, target)
             .await?;
         let report = Self::classify_input_terminal_receipt(&rows, &input_id)?;
+        if release == ReceiptRelease::Observation {
+            return Ok(Some(Sourced {
+                source: TerminalWitnessSource::DurableStore,
+                report,
+            }));
+        }
         // Decided after the last awaited load, immediately before release.
         let permitted = self
             .stored_result_disclosure_permitted(session_id, &row)

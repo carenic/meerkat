@@ -199,6 +199,7 @@ impl MobCommand {
             | Self::PendingSpawnAnchorSettled { .. }
             | Self::PolicySpawnSettled { .. }
             | Self::ReviveMemberLiveMaterialization { .. }
+            | Self::StartupMemberRecovered { .. }
             | Self::ResumeLifecycleReadinessResolved { .. }
             | Self::ResumeLifecyclePreparationResolved { .. }
             | Self::AutonomousMemberStopsResolved { .. }
@@ -680,6 +681,7 @@ impl MobCommand {
             | Self::SpawnCleanupSettled { .. }
             | Self::PendingSpawnAnchorSettled { .. }
             | Self::PolicySpawnSettled { .. }
+            | Self::StartupMemberRecovered { .. }
             | Self::ResumeLifecycleReadinessResolved { .. }
             | Self::ResumeLifecyclePreparationResolved { .. }
             | Self::AutonomousMemberStopsResolved { .. }
@@ -908,6 +910,7 @@ mod tests {
                 agent_identity: crate::ids::AgentIdentity::from("m"),
                 turning_mode: None,
                 transport: None,
+                execution_identity: None,
                 reply_tx: tx,
             }
             .required_control_scope(),
@@ -970,6 +973,7 @@ mod tests {
             agent_identity: crate::ids::AgentIdentity::from("m"),
             turning_mode: None,
             transport: None,
+            execution_identity: None,
             reply_tx,
         }
         .reject_scope_denied(denial());

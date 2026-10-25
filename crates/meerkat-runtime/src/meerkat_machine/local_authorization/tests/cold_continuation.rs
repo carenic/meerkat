@@ -34,7 +34,10 @@ use crate::meerkat_machine::{
 };
 use crate::service_ext::SessionServiceRuntimeExt;
 use crate::store::{InMemoryRuntimeStore, RuntimeStore};
-use crate::terminal_status::{InputTerminalReceiptRead, InputTerminalReceiptWait};
+use crate::terminal_status::{
+    InputTerminalReceiptObservation, InputTerminalReceiptRead, InputTerminalReceiptSummary,
+    InputTerminalReceiptWait, InteractionSelector, TerminalWitnessSource,
+};
 use crate::traits::{ControllerReadinessFailure, RuntimeControlPlane};
 use meerkat_auth_core::auth_store::EphemeralTokenStore;
 use meerkat_authorization_contracts::work_association::{
@@ -80,6 +83,12 @@ struct CountingExecutor {
     /// The session boundary this executor's runtime loop holds across each
     /// turn, when it takes one.
     loop_boundary: Option<Boundary>,
+    /// When set, every run ends at an external callback boundary whose call
+    /// carries these arguments, instead of a result.
+    callback_arguments: Option<&'static str>,
+    /// When set, the attachment publishes directed terminals through this
+    /// owner instead of its actor's.
+    publication: Option<Arc<dyn CoreExecutorPublicationHandle>>,
 }
 
 #[async_trait::async_trait]
@@ -109,6 +118,21 @@ impl CoreExecutor for CountingExecutor {
         if let Some(hold) = &self.hold {
             hold.notified().await;
         }
+        if let Some(arguments) = self.callback_arguments {
+            return Ok(CoreApplyOutput::with_callback_pending(
+                RunBoundaryReceiptDraft {
+                    run_id: run,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: ids,
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                "census-call",
+                "census-tool",
+                serde_json::json!({ "argument": arguments }),
+            ));
+        }
         let result = serde_json::from_value(serde_json::json!({
             "text": self.reply,
             "session_id": self.session,
@@ -135,6 +159,20 @@ impl CoreExecutor for CountingExecutor {
         Ok(())
     }
 
+    async fn publish_interaction_terminals(
+        &mut self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+        match &self.publication {
+            Some(publication) => publication.publish_interaction_terminals(events).await,
+            None if events.is_empty() => Ok(Vec::new()),
+            None => Err(CoreExecutorError::Internal(
+                "exact interaction terminal publication is unsupported by this executor"
+                    .to_string(),
+            )),
+        }
+    }
+
     fn turn_finalization_boundary_handle(
         &self,
     ) -> Option<Arc<dyn CoreExecutorTurnFinalizationBoundaryHandle>> {
@@ -144,6 +182,9 @@ impl CoreExecutor for CountingExecutor {
     }
 
     fn publication_handle(&self) -> Option<Arc<dyn CoreExecutorPublicationHandle>> {
+        if let Some(publication) = &self.publication {
+            return Some(Arc::clone(publication));
+        }
         self.actor.as_ref().map(|actor| {
             Arc::new(ActorOwner(actor.clone())) as Arc<dyn CoreExecutorPublicationHandle>
         })
@@ -508,6 +549,37 @@ async fn attach_serving(
     Arc<AtomicUsize>,
     tokio::sync::mpsc::UnboundedReceiver<Applied>,
 ) {
+    attach_executor(
+        machine,
+        session,
+        reply,
+        actor,
+        loop_boundary,
+        None,
+        None,
+        None,
+    )
+    .await
+}
+
+/// [`attach_serving`] with an executor whose every run ends at an external
+/// callback boundary carrying `callback_arguments`, when set, whose runs
+/// wait for `hold` when set, and that publishes directed terminals through
+/// `publication` when set.
+#[allow(clippy::too_many_arguments)]
+async fn attach_executor(
+    machine: &Arc<MeerkatMachine>,
+    session: &SessionId,
+    reply: &'static str,
+    actor: Option<Actor>,
+    loop_boundary: Option<Boundary>,
+    callback_arguments: Option<&'static str>,
+    hold: Option<Arc<tokio::sync::Notify>>,
+    publication: Option<Arc<dyn CoreExecutorPublicationHandle>>,
+) -> (
+    Arc<AtomicUsize>,
+    tokio::sync::mpsc::UnboundedReceiver<Applied>,
+) {
     machine
         .register_session(session.clone())
         .await
@@ -526,9 +598,11 @@ async fn attach_serving(
                 reply,
                 effects: Arc::clone(&effects),
                 applied: tx,
-                hold: None,
+                hold,
                 actor,
                 loop_boundary,
+                callback_arguments,
+                publication,
             }),
         )
         .await
@@ -599,6 +673,34 @@ fn original_prompt(template: &Input, runtime: &LogicalRuntimeId) -> Input {
     prompt
         .with_ingress_context(ingress)
         .expect("exact final input")
+}
+
+/// An ordinary governed peer message, using this fixture's actual original,
+/// controller and ingress owners. No directed terminal or peer transport is
+/// fabricated by this admission-proof test.
+fn original_peer(template: &Input, runtime: &LogicalRuntimeId) -> Input {
+    use crate::input::{InputOrigin, PeerConvention, PeerInput};
+    let mut header = template.header().clone();
+    header.source = InputOrigin::Peer {
+        peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(7)).to_string(),
+        display_identity: None,
+        runtime_id: None,
+    };
+    let peer = Input::Peer(PeerInput {
+        header,
+        directed_interaction_id: None,
+        convention: Some(PeerConvention::Message),
+        content: "one governed peer message".into(),
+        payload: None,
+        handling_mode: None,
+        sender_taint: None,
+        objective_id: None,
+        system_prompts: vec![],
+        injected_context: vec![],
+        in_reply_to: None,
+    });
+    // The existing owner attaches a fresh observation of these peer bytes.
+    original_prompt(&peer, runtime)
 }
 
 /// The composition requires a bound destination: the registration owner
@@ -1170,6 +1272,13 @@ impl Reopened {
     /// [`Self::new`] whose reopened executor's runtime loop takes the
     /// session boundary, or, with `false`, takes none.
     async fn with_loop_boundary(loop_boundary: bool) -> Self {
+        Self::with_original(loop_boundary, original_prompt).await
+    }
+
+    async fn with_original(
+        loop_boundary: bool,
+        prepare: fn(&Input, &LogicalRuntimeId) -> Input,
+    ) -> Self {
         let (configuration, template, _account, _publication) =
             mutable_controller_configuration(true);
         let claims = template
@@ -1196,7 +1305,7 @@ impl Reopened {
         let blobs = Arc::new(MemoryBlobStore::new());
         let session = SessionId::new();
         let runtime = LogicalRuntimeId::for_session(&session);
-        let original = original_prompt(&template, &runtime);
+        let original = prepare(&template, &runtime);
         let original_id = original.id().clone();
         // The dropped machine's session service owns its own boundary.
         let before_actor = Actor::new(&Boundary::default(), &selection);
@@ -1396,6 +1505,271 @@ async fn a_lost_admission_is_published_once_per_step_after_a_same_process_reopen
         0,
         "nothing ran after the reopen"
     );
+}
+
+/// The existing real admission/reopen fixture, now with an ordinary peer
+/// original. Native retires its payload before the source recovers custody;
+/// neither the public row comparison nor live/durable proof needs that body.
+/// This is same-process owner reconstruction, not a comms delivery test.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_peer_admission_is_recovered_after_payload_retirement_and_reopen() {
+    let reopened = Reopened::with_original(true, original_peer).await;
+    let before = reopened.inputs().await;
+    let rows = reopened
+        .store
+        .load_input_states_strict(&reopened.runtime)
+        .await
+        .expect("actual native rows");
+    let stored = rows
+        .iter()
+        .find(|row| row.state.input_id == reopened.original_id)
+        .expect("actual peer admission");
+    assert!(
+        stored.state.persisted_input.is_none(),
+        "native retired the terminal payload"
+    );
+    assert!(stored.state.prompt_replay_identity.is_none());
+    assert!(
+        stored.state.directed_run_started_attribution.is_none(),
+        "ordinary peer message"
+    );
+    crate::input_state::verify_exact_replay(&stored.state, &reopened.original)
+        .expect("native exact peer row proof after retirement");
+
+    let (registration, attachment) = reopened.current().await;
+    let actor = reopened.actor.identity();
+    let custody = SourceCustody::default();
+    assert_eq!(
+        custody.admitted(),
+        None,
+        "source settlement was lost before reopen"
+    );
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Ok(Promotion::Promoted))
+    );
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Ok(Promotion::AlreadyAdmitted))
+    );
+    assert_eq!(custody.admitted(), Some(reopened.original_id.clone()));
+    assert_eq!(custody.publications.load(Ordering::SeqCst), 2);
+
+    let admitted = reopened
+        .durable(&reopened.original)
+        .await
+        .expect("durable peer proof");
+    assert_eq!(admitted.input_id(), &reopened.original_id);
+    assert_eq!(admitted.phase(), InputLifecycleState::Consumed);
+    assert_eq!(
+        admitted.terminal_outcome(),
+        Some(&crate::input_state::InputTerminalOutcome::Consumed)
+    );
+    reopened.retire().await;
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Err(crate::meerkat_machine::AdmittedOriginalRefusal::Unavailable)
+    );
+    assert_eq!(
+        reopened.durable(&reopened.original).await,
+        Ok(admitted.clone())
+    );
+    assert_eq!(
+        SessionServiceRuntimeExt::durable_admitted_original(
+            &*reopened.machine,
+            &reopened.session,
+            &reopened.original
+        )
+        .await,
+        Ok(admitted)
+    );
+    assert_eq!(reopened.inputs().await, before, "no new input or replay");
+    assert_eq!(
+        reopened.effects.load(Ordering::SeqCst),
+        0,
+        "no execution after reopen"
+    );
+    assert_eq!(
+        custody.publications.load(Ordering::SeqCst),
+        2,
+        "retirement publishes nothing"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn peer_recovery_refuses_changed_delivery_and_stale_current_owners() {
+    use crate::meerkat_machine::AdmittedOriginalRefusal::{Conflict, NotAdmitted, Unavailable};
+    let reopened = Reopened::with_original(true, original_peer).await;
+    let (registration, attachment) = reopened.current().await;
+    let actor = reopened.actor.identity();
+    let before = reopened.inputs().await;
+    let custody = SourceCustody::default();
+    let mut changed_inputs = Vec::new();
+    for change in 0..5 {
+        let mut changed = reopened.original.clone();
+        let Input::Peer(body) = &mut changed else {
+            panic!("peer fixture")
+        };
+        match change {
+            0 => body.header.id = InputId::new(),
+            1 => body.content = "changed delivery content".into(),
+            2 => {
+                body.header.source = crate::input::InputOrigin::Peer {
+                    peer_id: meerkat_core::comms::PeerId::from_uuid(uuid::Uuid::from_u128(8))
+                        .to_string(),
+                    display_identity: None,
+                    runtime_id: None,
+                }
+            }
+            3 => {
+                let mut claims = body
+                    .header
+                    .authority_association
+                    .as_ref()
+                    .expect("claims")
+                    .candidate()
+                    .clone();
+                claims.original_work.work = EvidenceId::new("another-delivery-work").expect("work");
+                body.header.authority_association =
+                    Some(InputAuthorityAssociation::new(claims).expect("well-formed changed work"));
+            }
+            _ => body.header.authority_association = None,
+        }
+        assert_eq!(
+            reopened
+                .promote(&registration, &attachment, &actor, &changed, &custody)
+                .await,
+            Err(Conflict),
+            "changed peer field {change}"
+        );
+        changed_inputs.push(changed);
+    }
+    let mut rekeyed = reopened.original.clone();
+    rekeyed.header_mut().idempotency_key =
+        Some(crate::identifiers::IdempotencyKey::new("other-peer-event"));
+    assert_eq!(
+        reopened
+            .promote(&registration, &attachment, &actor, &rekeyed, &custody)
+            .await,
+        Err(NotAdmitted)
+    );
+    let (old_registration, old_attachment) = &reopened.before_reopen;
+    let old_actor = reopened.before_actor.identity();
+    for (registration, attachment, actor) in [
+        (old_registration, &attachment, &actor),
+        (&registration, old_attachment, &actor),
+        (&registration, &attachment, &old_actor),
+    ] {
+        assert_eq!(
+            reopened
+                .promote(
+                    registration,
+                    attachment,
+                    actor,
+                    &reopened.original,
+                    &custody
+                )
+                .await,
+            Err(Unavailable)
+        );
+    }
+    let other = crate::input_authority::tests::input_for_account("caller", "another-account")
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("another controller");
+    reopened.actor.select(&other);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Err(Conflict)
+    );
+    reopened.actor.select(&reopened.selection);
+    assert_eq!(
+        custody.publications.load(Ordering::SeqCst),
+        0,
+        "all native refusals precede publication"
+    );
+    custody.cancel(Cancellation::Pending);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Err(OwnerRefusal::Unavailable))
+    );
+    custody.cancel(Cancellation::Committed);
+    assert_eq!(
+        reopened
+            .promote(
+                &registration,
+                &attachment,
+                &actor,
+                &reopened.original,
+                &custody
+            )
+            .await,
+        Ok(Err(OwnerRefusal::Denied))
+    );
+    assert_eq!(custody.admitted(), None);
+
+    reopened.retire().await;
+    for changed in changed_inputs {
+        assert_eq!(
+            reopened.durable(&changed).await,
+            Err(crate::meerkat_machine::DurableAdmittedOriginalRefusal::Conflict)
+        );
+    }
+    assert_eq!(
+        reopened.durable(&rekeyed).await,
+        Err(crate::meerkat_machine::DurableAdmittedOriginalRefusal::NotAdmitted)
+    );
+    assert!(
+        reopened.durable(&reopened.original).await.is_ok(),
+        "historical proof grants no live custody"
+    );
+    assert_eq!(reopened.inputs().await, before);
+    assert_eq!(reopened.effects.load(Ordering::SeqCst), 0);
 }
 
 /// Same-process reopen only, as above.
@@ -1611,6 +1985,8 @@ async fn a_stale_witness_or_inexact_evidence_runs_no_publication_step() {
                 hold: None,
                 actor: Some(newest_actor.clone()),
                 loop_boundary: Some(newest_actor.boundary.clone()),
+                callback_arguments: None,
+                publication: None,
             }),
         )
         .await
@@ -1887,6 +2263,8 @@ async fn a_reattach_while_the_call_waits_for_the_boundary_runs_no_step() {
                     hold: None,
                     actor: Some(replacement.clone()),
                     loop_boundary: None,
+                    callback_arguments: None,
+                    publication: None,
                 }),
             )
             .await
@@ -2007,6 +2385,8 @@ async fn a_live_admission_waits_for_its_open_run_to_release_the_boundary() {
                 hold: Some(Arc::clone(&hold)),
                 actor: Some(actor.clone()),
                 loop_boundary: Some(boundary.clone()),
+                callback_arguments: None,
+                publication: None,
             }),
         )
         .await
@@ -2359,4 +2739,948 @@ async fn the_durable_read_refuses_inexact_evidence_and_unreadable_stores() {
         Err(Unavailable),
         "an index entry the store cannot prove is not absence"
     );
+}
+
+/// One governed scoped input of a persistent machine whose session
+/// destination is bound, run to its terminal with `reply` (or, with
+/// `callback_arguments`, to an external callback boundary), and its
+/// session's input-state census serialized at three points: registered with
+/// the destination current, after the unregister joined its teardown, and on
+/// a machine reopened over the same store.
+async fn scoped_census(
+    reply: &'static str,
+    callback_arguments: Option<&'static str>,
+) -> [Vec<serde_json::Value>; 3] {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let selection = claims.controller_model.clone().expect("controller");
+    let owners = HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    };
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let census = async |machine: &MeerkatMachine| {
+        machine
+            .session_input_states(&session)
+            .await
+            .expect("the session's input census")
+            .report
+            .iter()
+            .map(|row| serde_json::to_value(row).expect("row serialization"))
+            .collect::<Vec<_>>()
+    };
+
+    let machine = open(&store, &blobs, &owners).await;
+    let (_effects, mut applied) = attach_executor(
+        &machine,
+        &session,
+        reply,
+        None,
+        None,
+        callback_arguments,
+        None,
+        None,
+    )
+    .await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    let original = original_prompt(&template, &runtime);
+    owners.custody.hold(&original);
+    bind_destination(&machine, &session, &original).await;
+    let original_id = original.id().clone();
+    machine
+        .ingest(&runtime, original)
+        .await
+        .expect("governed original admitted");
+    next_apply(&mut applied, "original").await;
+    let terminal = tokio::time::timeout(
+        BOUND,
+        machine.wait_input_terminal_receipt(&session, &original_id),
+    )
+    .await
+    .expect("terminal within bound")
+    .expect("receipt read")
+    .expect("attached input");
+    assert!(
+        matches!(terminal, InputTerminalReceiptWait::Resolved(_)),
+        "{terminal:?}"
+    );
+    let bound = census(&machine).await;
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        machine
+            .unregister_session_registration_until_terminal_if_current(&registration)
+            .await
+            .expect("the unregister joins its teardown"),
+        "the current registration unregistered"
+    );
+    let unregistered = census(&machine).await;
+    drop(applied);
+    drop(machine);
+    let reopened = open(&store, &blobs, &owners).await;
+    let after_reopen = census(&reopened).await;
+    [bound, unregistered, after_reopen]
+}
+
+/// The census releases each row as the public row read does: the marker
+/// comes out while the destination is current, and never once the session
+/// is unregistered or the store reopened, while the row's lifecycle facts
+/// and its receipt identity stay.
+fn assert_census_withholds(census: [Vec<serde_json::Value>; 3], marker: &str) {
+    let [bound, unregistered, reopened] = census;
+    assert!(
+        serde_json::to_string(&bound)
+            .expect("census text")
+            .contains(marker),
+        "released to the current destination: {bound:?}"
+    );
+    for (when, rows) in [
+        ("after the unregister", unregistered),
+        ("after a reopen", reopened),
+    ] {
+        assert_eq!(rows.len(), 1, "{when}: the one input");
+        let text = serde_json::to_string(&rows).expect("census text");
+        assert!(!text.contains(marker), "{when}: {marker} came out: {text}");
+        assert!(
+            !rows[0]["terminal_outcome"].is_null(),
+            "{when}: the input is terminal"
+        );
+        assert!(
+            !rows[0]["terminal_completion"].is_null(),
+            "{when}: its receipt identity stays"
+        );
+    }
+}
+
+/// After the unregister, a scoped result never comes out of the session's
+/// input-state census.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_result_never_comes_out_of_the_census_after_the_unregister() {
+    assert_census_withholds(
+        scoped_census("census-result-marker", None).await,
+        "census-result-marker",
+    );
+}
+
+/// After the unregister, a scoped run's callback arguments never come out of
+/// the session's input-state census.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn scoped_callback_arguments_never_come_out_of_the_census_after_the_unregister() {
+    assert_census_withholds(
+        scoped_census("no result", Some("census-argument-marker")).await,
+        "census-argument-marker",
+    );
+}
+
+/// A scoped input's completion is proven without its result after the
+/// unregister: the payload readers keep refusing the result
+/// (`ScopedResultWithheld`), while the body-free receipt observation reports
+/// the exact validated identities and class, on the unregistered machine and
+/// on a machine reopened over the same store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_scoped_completion_is_observed_without_its_result_after_the_unregister() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    let selection = claims.controller_model.clone().expect("controller");
+    let owners = HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    };
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+
+    let machine = open(&store, &blobs, &owners).await;
+    let (_effects, mut applied) = attach(&machine, &session, "observed-result-marker").await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &selection).await;
+    let original = original_prompt(&template, &runtime);
+    owners.custody.hold(&original);
+    bind_destination(&machine, &session, &original).await;
+    let original_id = original.id().clone();
+    machine
+        .ingest(&runtime, original)
+        .await
+        .expect("governed original admitted");
+    let entered = next_apply(&mut applied, "original").await;
+    assert_eq!(
+        completed_text(&machine, &session, &original_id).await,
+        "observed-result-marker",
+        "the result is released while its destination is current"
+    );
+    let selector = || InteractionSelector::InputId(original_id.clone());
+    let summary = |observation: &InputTerminalReceiptObservation| -> InputTerminalReceiptSummary {
+        match observation {
+            InputTerminalReceiptObservation::Finalized(summary) => (**summary).clone(),
+            other => panic!("expected a finalized observation, got {other:?}"),
+        }
+    };
+    let live = machine
+        .input_terminal_receipt_observation(&session, selector())
+        .await
+        .expect("observation")
+        .expect("known input");
+    let live_summary = summary(&live.report);
+    assert_eq!(live_summary.input_id(), &original_id);
+    assert_eq!(live_summary.owner_input_id(), &original_id);
+    assert_eq!(
+        live_summary.recipient_input_ids(),
+        std::slice::from_ref(&original_id)
+    );
+    assert_eq!(live_summary.run_id(), Some(&entered.run));
+    assert_eq!(
+        live_summary.terminal(),
+        &crate::input_state::InputTerminalOutcome::Consumed
+    );
+    assert_eq!(
+        live_summary.class(),
+        crate::completion::CompletionClass::Completed
+    );
+
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("current registration");
+    assert!(
+        machine
+            .unregister_session_registration_until_terminal_if_current(&registration)
+            .await
+            .expect("the unregister joins its teardown"),
+        "the current registration unregistered"
+    );
+    let withheld_and_observed = async |machine: &MeerkatMachine, when: &str| {
+        let withheld = |read: Result<(), RuntimeDriverError>| {
+            matches!(
+                read,
+                Err(RuntimeDriverError::ScopedResultWithheld { ref input_id })
+                    if input_id == &original_id
+            )
+        };
+        assert!(
+            withheld(
+                machine
+                    .input_terminal_receipt(&session, selector())
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the receipt read keeps withholding"
+        );
+        assert!(
+            withheld(
+                machine
+                    .input_terminal_completion(&session, &original_id)
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the completion read keeps withholding"
+        );
+        assert!(
+            withheld(
+                machine
+                    .wait_input_terminal_receipt(&session, &original_id)
+                    .await
+                    .map(drop)
+            ),
+            "{when}: the receipt wait keeps withholding"
+        );
+        let observed = machine
+            .input_terminal_receipt_observation(&session, selector())
+            .await
+            .expect("the observation answers without a destination")
+            .expect("known input");
+        assert_eq!(
+            observed.source,
+            TerminalWitnessSource::DurableStore,
+            "{when}"
+        );
+        assert_eq!(summary(&observed.report), live_summary, "{when}");
+        let text = format!("{observed:?}");
+        assert!(
+            !text.contains("observed-result-marker"),
+            "{when}: no result in {text}"
+        );
+    };
+    withheld_and_observed(&machine, "after the unregister").await;
+    drop(applied);
+    drop(machine);
+    let reopened = open(&store, &blobs, &owners).await;
+    withheld_and_observed(&reopened, "after a reopen").await;
+}
+
+/// [`original_prompt`] for a further original of the same parties: a fresh
+/// input and its own original work `label`.
+fn further_original(template: &Input, runtime: &LogicalRuntimeId, label: &str) -> Input {
+    let Input::Prompt(mut prompt) = template.clone() else {
+        panic!("prompt template")
+    };
+    prompt.header.id = InputId::new();
+    prompt.header.idempotency_key = None;
+    let mut candidate = prompt
+        .header
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    candidate.original_work.work = EvidenceId::new(label).expect("work label");
+    prompt.header.authority_association =
+        Some(InputAuthorityAssociation::new(candidate).expect("claims"));
+    original_prompt(&Input::Prompt(prompt), runtime)
+}
+
+/// A further original of the same parties as a directed peer delivery: its
+/// terminal is published through the attachment's publication owner, and
+/// its batch keeps a directed outbox row.
+fn directed_original(template: &Input, runtime: &LogicalRuntimeId, label: &str) -> Input {
+    let prompt = further_original(template, runtime, label);
+    let observed = Arc::clone(prompt.header().ingress_context.as_ref().expect("ingress"));
+    let selection = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("controller");
+    let mut header = prompt.header().clone();
+    let interaction = meerkat_core::interaction::InteractionId(header.id.0);
+    header.ingress_context = None;
+    header.correlation_id = Some(crate::identifiers::CorrelationId(header.id.0));
+    header.idempotency_key = Some(crate::identifiers::IdempotencyKey::new(
+        interaction.to_string(),
+    ));
+    header.durability = crate::input::InputDurability::Durable;
+    header.supersession_key = None;
+    header.source = crate::input::InputOrigin::Peer {
+        peer_id: "directed-peer".into(),
+        display_identity: None,
+        runtime_id: Some(LogicalRuntimeId::new("directed-peer-runtime")),
+    };
+    let input = Input::Peer(crate::input::PeerInput {
+        directed_interaction_id: Some(interaction),
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        sender_taint: None,
+        header,
+        convention: Some(crate::input::PeerConvention::Message),
+        content: format!("directed delivery {label}").into(),
+        payload: None,
+        handling_mode: None,
+        in_reply_to: None,
+    });
+    let ingress = NativeIngressContext::from_trusted_ingress(
+        &input,
+        observed.requester().clone(),
+        observed.ingress_actor().clone(),
+        observed.realm().clone(),
+        observed.authentication().clone(),
+    )
+    .expect("exact input observation")
+    .with_controller_client(
+        &input,
+        ControllerModelClient::new(selection.clone(), Arc::new(SelectedClient(selection))),
+    )
+    .expect("actual selected client");
+    input
+        .with_ingress_context(ingress)
+        .expect("exact final input")
+}
+
+/// A publication owner whose every publication fails, counting attempts: a
+/// directed batch's outbox stays finalized, its event kept for the retry.
+#[derive(Default)]
+struct FailingPublication(AtomicUsize);
+
+#[async_trait::async_trait]
+impl CoreExecutorPublicationHandle for FailingPublication {
+    async fn publish_interaction_terminals(
+        &self,
+        _events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Err(CoreExecutorError::Internal(
+            "the event store refuses the terminal".into(),
+        ))
+    }
+}
+
+/// A publication owner that publishes every terminal at its next sequence.
+#[derive(Default)]
+struct SucceedingPublication(AtomicUsize);
+
+#[async_trait::async_trait]
+impl CoreExecutorPublicationHandle for SucceedingPublication {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+        events
+            .iter()
+            .map(|event| {
+                let sequence = self.0.fetch_add(1, Ordering::SeqCst) as u64 + 1;
+                CoreInteractionTerminalPublicationReceipt::try_new(event, sequence)
+            })
+            .collect()
+    }
+}
+
+/// Every digest a stored row derives from its batch's payload: the
+/// candidate's and the finalized receipt's on its terminal completion, and on
+/// a directed outbox the candidate's and the finalized or published event's.
+fn payload_digests(row: &crate::input_state::StoredInputState) -> Vec<String> {
+    let mut digests = Vec::new();
+    if let Some(completion) = row.state.terminal_completion.as_ref() {
+        digests.push(completion.candidate_digest.clone());
+        if let crate::input_state::InputTerminalCompletionPhase::Finalized {
+            receipt_digest, ..
+        } = &completion.phase
+        {
+            digests.push(receipt_digest.clone());
+        }
+    }
+    if let Some(outbox) = row.state.interaction_terminal_outbox.as_ref() {
+        digests.push(outbox.candidate_digest.clone());
+        match &outbox.phase {
+            crate::input_state::InteractionTerminalOutboxPhase::Finalized {
+                finalized_payload_digest,
+                ..
+            } => digests.push(finalized_payload_digest.clone()),
+            crate::input_state::InteractionTerminalOutboxPhase::Published {
+                publication, ..
+            } => digests.push(publication.payload_digest.clone()),
+            crate::input_state::InteractionTerminalOutboxPhase::Candidate => {}
+        }
+    }
+    digests
+}
+
+/// One governed scoped session on a persistent machine, its destination
+/// bound, with the parts a row needs to run and read its inputs.
+struct ScopedSession {
+    owners: HostOwners,
+    store: InMemoryRuntimeStore,
+    blobs: Arc<MemoryBlobStore>,
+    template: Input,
+    session: SessionId,
+    runtime: LogicalRuntimeId,
+    selection: ControllerModelSelection,
+}
+
+impl ScopedSession {
+    fn new() -> Self {
+        let (configuration, template, _account, _publication) =
+            mutable_controller_configuration(true);
+        let claims = template
+            .header()
+            .authority_association
+            .as_ref()
+            .expect("claims")
+            .candidate()
+            .clone();
+        let selection = claims.controller_model.clone().expect("controller");
+        let owners = HostOwners {
+            grants: Arc::clone(&configuration.grants),
+            ingress_domain: claims.ingress_namespace.ingress.clone(),
+            custody: Arc::default(),
+            policy: Arc::new(Policy {
+                requester: claims.requester.clone(),
+                executor: claims.logical_executor.clone(),
+            }),
+            controllers: Arc::default(),
+            operation_owner: Arc::clone(&configuration.operation_owner),
+        };
+        drop(configuration);
+        let session = SessionId::new();
+        let runtime = LogicalRuntimeId::for_session(&session);
+        Self {
+            owners,
+            store: InMemoryRuntimeStore::new(),
+            blobs: Arc::new(MemoryBlobStore::new()),
+            template,
+            session,
+            runtime,
+            selection,
+        }
+    }
+
+    /// Every stored row of the session, read from the store itself, by input.
+    async fn stored_rows(
+        &self,
+    ) -> std::collections::HashMap<InputId, crate::input_state::StoredInputState> {
+        self.store
+            .load_input_states_strict(&self.runtime)
+            .await
+            .expect("the session's stored rows")
+            .into_iter()
+            .map(|row| (row.state.input_id.clone(), row))
+            .collect()
+    }
+}
+
+/// The released copy of `row` refuses to carry any payload or any digest of
+/// one, whatever the reader may not receive; every identity stays.
+fn assert_released_without_payload(
+    released: &crate::input_state::StoredInputState,
+    stored: &crate::input_state::StoredInputState,
+    marker: &str,
+    what: &str,
+) {
+    let text = serde_json::to_string(released).expect("released row serialization");
+    assert!(
+        !text.contains(marker),
+        "{what}: the payload came out: {text}"
+    );
+    for digest in payload_digests(stored) {
+        assert!(
+            !text.contains(&digest),
+            "{what}: the payload digest {digest} came out: {text}"
+        );
+    }
+    let completion = released
+        .state
+        .terminal_completion
+        .as_ref()
+        .expect("the receipt identity stays");
+    let stored_completion = stored
+        .state
+        .terminal_completion
+        .as_ref()
+        .expect("stored receipt");
+    assert_eq!(completion.input_id, stored_completion.input_id, "{what}");
+    assert_eq!(
+        completion.owner_input_id, stored_completion.owner_input_id,
+        "{what}"
+    );
+    assert_eq!(completion.batch_key, stored_completion.batch_key, "{what}");
+    assert_eq!(
+        completion.completion_input_ids_digest, stored_completion.completion_input_ids_digest,
+        "{what}: the recipient digest stays"
+    );
+    assert_eq!(
+        released.seed.terminal_outcome, stored.seed.terminal_outcome,
+        "{what}"
+    );
+}
+
+/// A further original of the same parties as a queued external event, so
+/// that events queued behind a running turn are consumed by one run.
+fn governed_event(template: &Input, runtime: &LogicalRuntimeId, label: &str) -> Input {
+    let prompt = further_original(template, runtime, label);
+    let observed = Arc::clone(prompt.header().ingress_context.as_ref().expect("ingress"));
+    let selection = prompt
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("controller");
+    let mut header = prompt.header().clone();
+    header.ingress_context = None;
+    header.source = crate::input::InputOrigin::External {
+        source_name: "withheld-batch-test".into(),
+    };
+    header.durability = crate::input::InputDurability::Durable;
+    let input = Input::ExternalEvent(crate::input::ExternalEventInput {
+        objective_id: None,
+        header,
+        event_type: "withheld_batch".into(),
+        payload: serde_json::json!({ "label": label }),
+        blocks: None,
+        handling_mode: meerkat_core::types::HandlingMode::Queue,
+        render_metadata: None,
+    });
+    let ingress = NativeIngressContext::from_trusted_ingress(
+        &input,
+        observed.requester().clone(),
+        observed.ingress_actor().clone(),
+        observed.realm().clone(),
+        observed.authentication().clone(),
+    )
+    .expect("exact input observation")
+    .with_controller_client(
+        &input,
+        ControllerModelClient::new(selection.clone(), Arc::new(SelectedClient(selection))),
+    )
+    .expect("actual selected client");
+    input
+        .with_ingress_context(ingress)
+        .expect("exact final input")
+}
+
+/// A batch's rows released to a reader the destination does not permit (it
+/// was retired) carry no result and no payload digest, on the batch's
+/// canonical owner and on its peer recipient, which holds the shared digests
+/// but no payload. The stored rows keep both and are byte-equal after the
+/// releases.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_batch_releases_no_payload_digest_on_its_owner_or_peer() {
+    let fixture = ScopedSession::new();
+    let machine = open(&fixture.store, &fixture.blobs, &fixture.owners).await;
+    let hold = Arc::new(tokio::sync::Notify::new());
+    let (_effects, mut applied) = attach_executor(
+        &machine,
+        &fixture.session,
+        "batched-result-marker",
+        None,
+        None,
+        None,
+        Some(Arc::clone(&hold)),
+        None,
+    )
+    .await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &fixture.selection).await;
+    let first = original_prompt(&fixture.template, &fixture.runtime);
+    fixture.owners.custody.hold(&first);
+    bind_destination(&machine, &fixture.session, &first).await;
+    let target = first
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .target
+        .clone();
+    machine
+        .ingest(&fixture.runtime, first)
+        .await
+        .expect("first original admitted");
+    next_apply(&mut applied, "first").await;
+    let mut batched = Vec::new();
+    for label in ["batched-second", "batched-third"] {
+        let input = governed_event(&fixture.template, &fixture.runtime, label);
+        fixture.owners.custody.hold(&input);
+        batched.push(input.id().clone());
+        machine
+            .ingest(&fixture.runtime, input)
+            .await
+            .expect("queued event admitted");
+    }
+    hold.notify_one();
+    let entered = next_apply(&mut applied, "batch").await;
+    let mut entered_ids = entered.ids.clone();
+    entered_ids.sort_by_key(|id| id.0);
+    batched.sort_by_key(|id| id.0);
+    assert_eq!(entered_ids, batched, "one run consumes both queued events");
+    hold.notify_one();
+    for input_id in &batched {
+        let resolved = tokio::time::timeout(
+            BOUND,
+            machine.wait_input_terminal_receipt(&fixture.session, input_id),
+        )
+        .await
+        .expect("terminal within bound")
+        .expect("receipt read")
+        .expect("attached input");
+        assert!(matches!(resolved, InputTerminalReceiptWait::Resolved(_)));
+    }
+    let stored = fixture.stored_rows().await;
+    let stored_bytes: Vec<Vec<u8>> = batched
+        .iter()
+        .map(|id| serde_json::to_vec(&stored[id]).expect("stored row bytes"))
+        .collect();
+    let owner = &batched[0];
+    let peer = &batched[1];
+    assert_eq!(
+        stored[peer]
+            .state
+            .terminal_completion
+            .as_ref()
+            .expect("peer receipt")
+            .owner_input_id,
+        *owner,
+        "the peer binds the owner's payload by digest"
+    );
+    assert!(
+        String::from_utf8_lossy(&stored_bytes[0]).contains("batched-result-marker"),
+        "the stored owner row keeps the result"
+    );
+    let released_owner = machine
+        .input_state(&fixture.session, owner)
+        .await
+        .expect("row read")
+        .expect("owner row");
+    assert!(
+        serde_json::to_string(&released_owner)
+            .expect("text")
+            .contains("batched-result-marker"),
+        "the current destination receives the result"
+    );
+
+    let registration = machine
+        .current_session_registration_witness(&fixture.session)
+        .await
+        .expect("current registration");
+    machine
+        .retire_scoped_context(&registration, target.context_generation)
+        .await
+        .expect("retire the destination");
+    for (input_id, what) in [(owner, "the owner"), (peer, "the peer")] {
+        let released = machine
+            .input_state(&fixture.session, input_id)
+            .await
+            .expect("row read")
+            .expect("row");
+        assert_released_without_payload(
+            &released,
+            &stored[input_id],
+            "batched-result-marker",
+            what,
+        );
+    }
+    let census = machine
+        .session_input_states(&fixture.session)
+        .await
+        .expect("census");
+    for row in &census.report {
+        if let Some(stored_row) = stored.get(&row.state.input_id)
+            && batched.contains(&row.state.input_id)
+        {
+            assert_released_without_payload(row, stored_row, "batched-result-marker", "census");
+        }
+    }
+    let after = fixture.stored_rows().await;
+    let after_bytes: Vec<Vec<u8>> = batched
+        .iter()
+        .map(|id| serde_json::to_vec(&after[id]).expect("stored row bytes"))
+        .collect();
+    assert_eq!(after_bytes, stored_bytes, "the stored rows are untouched");
+}
+
+/// A directed batch whose publication keeps failing keeps its finalized
+/// terminal event on the owner row for the retry. A reader the destination
+/// does not permit receives neither that event nor any payload digest
+/// through the public row read, while the stored row keeps both and the
+/// publication goes on being retried; the published binding answers on the
+/// released copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_directed_event_kept_for_a_failing_publication_is_withheld() {
+    let fixture = ScopedSession::new();
+    let machine = open(&fixture.store, &fixture.blobs, &fixture.owners).await;
+    let publication = Arc::new(FailingPublication::default());
+    let (_effects, mut applied) = attach_executor(
+        &machine,
+        &fixture.session,
+        "directed-result-marker",
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&publication) as Arc<dyn CoreExecutorPublicationHandle>),
+    )
+    .await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &fixture.selection).await;
+    let directed = directed_original(&fixture.template, &fixture.runtime, "directed-first");
+    fixture.owners.custody.hold(&directed);
+    bind_destination(&machine, &fixture.session, &directed).await;
+    let target = directed
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .target
+        .clone();
+    let directed_id = directed.id().clone();
+    machine
+        .ingest(&fixture.runtime, directed)
+        .await
+        .expect("directed original admitted");
+    next_apply(&mut applied, "directed").await;
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let stored = fixture.stored_rows().await;
+            let kept = stored.get(&directed_id).is_some_and(|row| {
+                matches!(
+                    row.state
+                        .interaction_terminal_outbox
+                        .as_ref()
+                        .map(|outbox| &outbox.phase),
+                    Some(
+                        crate::input_state::InteractionTerminalOutboxPhase::Finalized {
+                            finalized_event: Some(_),
+                            ..
+                        }
+                    )
+                )
+            });
+            if kept && publication.0.load(Ordering::SeqCst) > 0 {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the owner row keeps its finalized event while publication fails");
+    let stored = fixture.stored_rows().await;
+    let stored_bytes = serde_json::to_vec(&stored[&directed_id]).expect("stored row bytes");
+    assert!(
+        String::from_utf8_lossy(&stored_bytes).contains("directed-result-marker"),
+        "the stored owner row keeps the event for the retry"
+    );
+
+    let registration = machine
+        .current_session_registration_witness(&fixture.session)
+        .await
+        .expect("current registration");
+    machine
+        .retire_scoped_context(&registration, target.context_generation)
+        .await
+        .expect("retire the destination");
+    let released = machine
+        .input_state(&fixture.session, &directed_id)
+        .await
+        .expect("row read")
+        .expect("directed row");
+    assert_released_without_payload(
+        &released,
+        &stored[&directed_id],
+        "directed-result-marker",
+        "the directed owner",
+    );
+    assert!(
+        matches!(
+            released
+                .state
+                .interaction_terminal_outbox
+                .as_ref()
+                .map(|outbox| &outbox.phase),
+            Some(
+                crate::input_state::InteractionTerminalOutboxPhase::Finalized {
+                    finalized_event: None,
+                    ..
+                }
+            )
+        ),
+        "the finalized event is withheld"
+    );
+    assert!(
+        matches!(released.published_directed_terminal_binding(), Ok(None)),
+        "the published binding answers on the released copy: {:?}",
+        released.published_directed_terminal_binding()
+    );
+    let after = fixture.stored_rows().await;
+    assert_eq!(
+        serde_json::to_vec(&after[&directed_id]).expect("stored row bytes"),
+        stored_bytes,
+        "the stored row is untouched"
+    );
+}
+
+/// Once a directed terminal is published, the released copy of its row
+/// still yields the published binding (from identity and phase alone) to a
+/// reader the destination does not permit, while it carries no payload
+/// digest.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_withheld_published_row_still_yields_its_published_binding() {
+    let fixture = ScopedSession::new();
+    let machine = open(&fixture.store, &fixture.blobs, &fixture.owners).await;
+    let publication = Arc::new(SucceedingPublication::default());
+    let (_effects, mut applied) = attach_executor(
+        &machine,
+        &fixture.session,
+        "published-result-marker",
+        None,
+        None,
+        None,
+        None,
+        Some(Arc::clone(&publication) as Arc<dyn CoreExecutorPublicationHandle>),
+    )
+    .await;
+    install_credential(&machine, &EphemeralTokenStore::new(), &fixture.selection).await;
+    let directed = directed_original(&fixture.template, &fixture.runtime, "directed-published");
+    fixture.owners.custody.hold(&directed);
+    bind_destination(&machine, &fixture.session, &directed).await;
+    let target = directed
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .target
+        .clone();
+    let directed_id = directed.id().clone();
+    machine
+        .ingest(&fixture.runtime, directed)
+        .await
+        .expect("directed original admitted");
+    next_apply(&mut applied, "directed").await;
+    tokio::time::timeout(BOUND, async {
+        loop {
+            let stored = fixture.stored_rows().await;
+            if stored.get(&directed_id).is_some_and(|row| {
+                row.published_directed_terminal_binding()
+                    .is_ok_and(|binding| binding.is_some())
+            }) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the directed terminal is published");
+    let stored = fixture.stored_rows().await;
+    let registration = machine
+        .current_session_registration_witness(&fixture.session)
+        .await
+        .expect("current registration");
+    machine
+        .retire_scoped_context(&registration, target.context_generation)
+        .await
+        .expect("retire the destination");
+    let released = machine
+        .input_state(&fixture.session, &directed_id)
+        .await
+        .expect("row read")
+        .expect("directed row");
+    assert_released_without_payload(
+        &released,
+        &stored[&directed_id],
+        "published-result-marker",
+        "the published owner",
+    );
+    let binding = released
+        .published_directed_terminal_binding()
+        .expect("the binding answers on the released copy")
+        .expect("published");
+    assert!(binding.binds(
+        &directed_id,
+        meerkat_core::interaction::InteractionId(directed_id.0)
+    ));
 }

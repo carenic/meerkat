@@ -38,6 +38,9 @@ struct RevivalWork {
     session_id: SessionId,
     scope: MemberLiveRevivalScope,
     reply: std::sync::Mutex<Option<oneshot::Sender<Result<MemberLiveRevivalOutcome, MobError>>>>,
+    /// Set once this revival answered: a missing-live revival requested for
+    /// the same member meanwhile waits on it, then asks again.
+    settled: tokio::sync::watch::Sender<bool>,
 }
 
 impl RevivalWork {
@@ -50,6 +53,7 @@ impl RevivalWork {
         {
             let _ = reply.send(result);
         }
+        self.settled.send_replace(true);
     }
 }
 
@@ -135,6 +139,43 @@ impl MobActor {
         scope: MemberLiveRevivalScope,
         reply_tx: oneshot::Sender<Result<MemberLiveRevivalOutcome, MobError>>,
     ) {
+        // One missing-live revival per member at a time. A request that
+        // finds one in flight (a member turn's, a host's `ensure_member_live`,
+        // the revival a startup takeover dispatches) waits until it answered,
+        // then asks again and finds the member live, or Broken: two
+        // concurrent revivals of one session would race their
+        // materializations, and the loser would fail for no cause of its own.
+        let missing_live = scope.is_missing_live();
+        // A revival whose work was dropped without answering closed its
+        // channel unsettled: it ended too, so it is not joined, and this
+        // request starts a revival of its own in its place.
+        if missing_live
+            && let Some(in_flight) = self.member_live_revivals_in_flight.get(&identity)
+            && !*in_flight.borrow()
+            && in_flight.has_changed().is_ok()
+        {
+            let mut settled = in_flight.clone();
+            let command_tx = self.command_tx.clone();
+            self.actor_io_tasks.spawn(async move {
+                // A closed channel means that revival is gone: ask again.
+                let _ = settled.wait_for(|settled| *settled).await;
+                // A requester that left asks for nothing more.
+                if reply_tx.is_closed() {
+                    return;
+                }
+                let _ = command_tx
+                    .send(RoutedMobCommand::internal(
+                        MobCommand::ReviveMemberLiveMaterialization {
+                            agent_identity: identity,
+                            bridge_session_id: session_id,
+                            scope,
+                            reply_tx,
+                        },
+                    ))
+                    .await;
+            });
+            return;
+        }
         let prepared = async {
             let entry = self
                 .roster
@@ -167,7 +208,12 @@ impl MobActor {
             session_id,
             scope,
             reply: std::sync::Mutex::new(Some(reply_tx)),
+            settled: tokio::sync::watch::channel(false).0,
         });
+        if missing_live {
+            self.member_live_revivals_in_flight
+                .insert(identity, work.settled.subscribe());
+        }
         #[cfg(feature = "runtime-adapter")]
         if let Some(publication) = work.scope.publication.clone() {
             self.dispatch_warm_readiness(work, Some(publication));
@@ -676,6 +722,11 @@ impl MobActor {
             .warm_revival_overlay(&work.entry, &work.session_id)
             .await?;
         let external_tools = self.external_tools_for_profile(&profile, overlay)?;
+        // The continuity intent the member's incarnation was spawned with, read
+        // before the provision owner is taken: a durable worker is revived
+        // with its resume gate.
+        let continuity_intent =
+            Box::pin(self.recorded_member_continuity_intent(&work.entry, &work.session_id)).await?;
         let session_id = mob_dsl::SessionId::from_domain(&work.session_id);
         let transition = self.apply_dsl_signal_collect_transition(
             mob_dsl::MobMachineSignal::RecoverMemberSessionBinding {
@@ -752,6 +803,7 @@ impl MobActor {
             ops_registry: None,
             generated_self_owned_operation_owner: Some(work.session_id.clone()),
             direct_member_incarnation: None,
+            continuity_intent,
         }))
     }
 

@@ -302,7 +302,11 @@ pub fn standalone_tool_visibility_owner(
 }
 
 /// Error type for [`MeerkatMachine::prepare_bindings`].
+///
+/// Non-exhaustive: a later release can add a refusal without breaking a
+/// downstream match, which needs a wildcard arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum RuntimeBindingsError {
     /// Session was not found after registration (should not happen in practice).
     #[error("session {0} not found in runtime adapter after registration")]
@@ -314,15 +318,38 @@ pub enum RuntimeBindingsError {
     RegistrationNotCurrent(SessionId),
     #[error("materialization registration for session {0} has another owner")]
     RegistrationOwned(SessionId),
+    /// This runtime owner may not host the session: another runtime owner on
+    /// the realm hosts it ([`meerkat_core::SessionError::ServedElsewhere`]),
+    /// or its hosting claim cannot be taken
+    /// ([`meerkat_core::SessionError::HostingUnavailable`]). The typed
+    /// session refusal is carried as is, so a caller can tell it from a
+    /// preparation failure and keep its wire form.
+    #[error("runtime bindings for session {0} refused by session hosting: {1}")]
+    Hosting(SessionId, meerkat_core::SessionError),
 }
 
 impl RuntimeBindingsError {
+    /// The bindings error for a driver error a preparation stopped at: a
+    /// hosting refusal keeps its typed session error; any other error stays a
+    /// preparation failure with its message.
+    pub(crate) fn from_preparation_error(
+        session_id: SessionId,
+        error: &RuntimeDriverError,
+    ) -> Self {
+        match error.hosting_session_error() {
+            Some(cause) => Self::Hosting(session_id, cause),
+            None => Self::PrepareFailed(session_id, error.to_string()),
+        }
+    }
+
     /// Whether preparation was refused before this call reserved a
     /// materialization claim, inserted a registration, or installed handles.
     ///
     /// Both registration verdicts are returned only from checks that run
     /// before any mutation, so a caller may treat such a failed attempt as
-    /// proven no-effect rather than as an unproven cleanup obligation.
+    /// proven no-effect rather than as an unproven cleanup obligation. A
+    /// hosting refusal is not claimed as no-effect: a caller keeps its
+    /// cleanup open, as for any other preparation failure.
     #[must_use]
     pub fn rejected_before_effect(&self) -> bool {
         matches!(
@@ -926,6 +953,8 @@ fn input_terminality_parts(
                 InputAbandonReason::ToolProcessInterrupted => {
                     dsl::InputAbandonReason::ToolProcessInterrupted
                 }
+                InputAbandonReason::RequeueExpired => dsl::InputAbandonReason::RequeueExpired,
+                InputAbandonReason::ResumeRefused => dsl::InputAbandonReason::ResumeRefused,
             }),
         ),
     }
@@ -1209,6 +1238,7 @@ pub use admitted_original::{
     AdmittedOriginal, AdmittedOriginalRefusal, DurableAdmittedOriginal,
     DurableAdmittedOriginalRefusal,
 };
+mod resumed_run;
 mod retained_resume;
 mod runtime_control;
 pub use agent_mandate::{
@@ -1216,7 +1246,7 @@ pub use agent_mandate::{
 };
 pub(crate) mod scoped_context;
 mod service_call;
-pub use service_call::ServiceCall;
+pub use service_call::{ServiceCall, ServiceCallAuditError, ServiceCallOutcome};
 mod session_management;
 mod session_mutation_gate;
 mod terminal_receipt;
@@ -1238,6 +1268,7 @@ pub(crate) use session_management::{
 };
 
 pub use composition::{MeerkatCompositionSignalDispatcher, MeerkatConsumerSurface};
+pub use runtime_control::RuntimeCompletionWaitFailureAuthority;
 
 pub use comms_drain::{
     CommsDrainMode, CommsDrainPhase, DrainExitReason, PeerEndpointStageError, PeerIngressOwner,
@@ -1306,6 +1337,10 @@ struct UnregisterTeardownCoordinator {
     epoch_id: meerkat_core::RuntimeEpochId,
     coordinator_id: uuid::Uuid,
     result_rx: crate::tokio::sync::watch::Receiver<Option<UnregisterTeardownResult>>,
+    /// The checked disposition the caller that installed this coordinator
+    /// asked for. `BeginUnregisterSession` records it once; from then on the
+    /// generated state and the durable progress own it.
+    queued_inputs: UnregisterDisposition,
 }
 
 /// Read-only terminal-result observer for one exact runtime unregister
@@ -1397,6 +1432,141 @@ pub enum RuntimeSessionUnregisterAdmission {
     Pending(RuntimeSessionUnregisterObserver),
 }
 
+/// What a runtime unregister does with inputs still queued behind the
+/// session's running turn when it stops the runtime.
+///
+/// [`Self::Stop`] ends every non-terminal input as stopped, as an
+/// unregister always has. [`Self::Requeue`] keeps each eligible queued input
+/// (a durable prompt in the Queue lane that is neither directed nor bound to
+/// an objective) durably queued instead, marked for the runtime's next start,
+/// which runs it unless it is older than `max_age` by then. Its waiter is
+/// answered
+/// [`CompletionWaitError::RequeuedAcrossStop`](crate::completion::CompletionWaitError::RequeuedAcrossStop).
+/// [`Self::Keep`] keeps every non-terminal input the registration recovered
+/// from the store exactly as the store holds it, for the next registration
+/// to recover again, while the registration served no live work; once it did,
+/// the unregister stops every input, as [`Self::Stop`] does.
+/// An unregister already in progress keeps the disposition it began with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputs {
+    /// End every non-terminal input as stopped.
+    #[default]
+    Stop,
+    /// Keep eligible queued inputs durably queued for the next start.
+    Requeue {
+        /// The age, measured from admission, past which the next start ends
+        /// a kept input as expired instead of running it.
+        max_age: std::time::Duration,
+    },
+    /// Keep every input the registration recovered from the store, exactly
+    /// as the store holds it, unless the registration served live work (an
+    /// admission, a deduplicated resubmission or a recycle): an unregister
+    /// of a registration a host refused before it served, so the refusal
+    /// ends nothing a later start would run.
+    Keep,
+}
+
+impl UnregisterQueuedInputs {
+    /// The longest max age a requeue may carry.
+    pub const MAX_AGE_CAP: std::time::Duration = std::time::Duration::from_hours(24);
+
+    /// The max age of the requeue a graceful process shutdown uses when its
+    /// host names none ([`MeerkatMachine::graceful_shutdown_queued_inputs`]):
+    /// 15 minutes.
+    pub const DEFAULT_MAX_AGE: std::time::Duration = std::time::Duration::from_mins(15);
+
+    /// Check the disposition every unregister entry point checks before it
+    /// starts anything. A requeue's max age is recorded in whole
+    /// milliseconds, so a max age under one millisecond (zero included) is
+    /// refused, as is one over [`Self::MAX_AGE_CAP`]; neither is clamped.
+    ///
+    /// # Errors
+    /// [`UnregisterQueuedInputsError`] names the refused max age.
+    pub fn check(self) -> Result<(), UnregisterQueuedInputsError> {
+        self.recorded().map(|_| ())
+    }
+
+    /// The generated disposition and the max age in whole milliseconds that
+    /// `BeginUnregisterSession` records, for a disposition that passes
+    /// [`Self::check`].
+    pub(crate) fn recorded(self) -> Result<UnregisterDisposition, UnregisterQueuedInputsError> {
+        match self {
+            Self::Stop => Ok(UnregisterDisposition::STOP),
+            Self::Keep => Ok(UnregisterDisposition::KEEP),
+            Self::Requeue { max_age } => {
+                if max_age > Self::MAX_AGE_CAP {
+                    return Err(UnregisterQueuedInputsError::MaxAgeOverCap {
+                        max_age,
+                        cap: Self::MAX_AGE_CAP,
+                    });
+                }
+                match u64::try_from(max_age.as_millis()) {
+                    Ok(0) | Err(_) => {
+                        Err(UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond { max_age })
+                    }
+                    Ok(requeue_max_age_ms) => Ok(UnregisterDisposition {
+                        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Requeue,
+                        requeue_max_age_ms,
+                    }),
+                }
+            }
+        }
+    }
+}
+
+/// A refused [`UnregisterQueuedInputs`]: nothing was started.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum UnregisterQueuedInputsError {
+    /// The requeue max age is under one millisecond, the resolution the stop
+    /// mark records; zero is refused here too.
+    #[error("requeue max age {max_age:?} is under one millisecond")]
+    MaxAgeUnderOneMillisecond { max_age: std::time::Duration },
+    /// The requeue max age is over [`UnregisterQueuedInputs::MAX_AGE_CAP`].
+    #[error("requeue max age {max_age:?} is over the {cap:?} cap")]
+    MaxAgeOverCap {
+        max_age: std::time::Duration,
+        cap: std::time::Duration,
+    },
+}
+
+/// A checked [`UnregisterQueuedInputs`], as an unregister coordinator holds
+/// it: the generated disposition and the whole milliseconds
+/// `BeginUnregisterSession` records.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct UnregisterDisposition {
+    queued_inputs: dsl::UnregisterQueuedInputsDisposition,
+    requeue_max_age_ms: u64,
+}
+
+impl UnregisterDisposition {
+    /// Stop every non-terminal input; nothing to record.
+    pub(crate) const STOP: Self = Self {
+        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Stop,
+        requeue_max_age_ms: 0,
+    };
+
+    /// Keep every non-terminal input the registration recovered from the
+    /// store exactly as the store holds it, with no requeue mark: every
+    /// materialization rollback, the retirement of an attachment that never
+    /// served (a pending attachment's abort, a failed startup's cleanup), and
+    /// a host's refusal of a restored registration
+    /// ([`UnregisterQueuedInputs::Keep`]).
+    /// An input admitted while the registration stood still ends as stopped.
+    /// The machine grants the keep only to a registration that served no
+    /// live work: after an admission, a deduplicated resubmission or a recycle
+    /// it records the unregister as Stop.
+    pub(crate) const KEEP: Self = Self {
+        queued_inputs: dsl::UnregisterQueuedInputsDisposition::Keep,
+        requeue_max_age_ms: 0,
+    };
+
+    pub(crate) fn dsl_disposition(self) -> (dsl::UnregisterQueuedInputsDisposition, u64) {
+        (self.queued_inputs, self.requeue_max_age_ms)
+    }
+}
+
 /// Answer of
 /// [`MeerkatMachine::observe_unregister_session_registration_if_use_unchanged`].
 #[derive(Debug)]
@@ -1414,14 +1584,11 @@ pub enum RuntimeSessionUnregisterUseAdmission {
 /// Typed answer of the same-registration quiescent close admission
 /// ([`MeerkatMachine::unregister_session_registration_until_terminal_if_quiescent`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum RuntimeSessionQuiescentClose {
-    /// The exact registration's owned unregister teardown completed. Either
-    /// it held no non-terminal input and no run, and `BeginUnregisterSession`
-    /// committed while its mutation gate still excluded ingress; or its drain
-    /// window had lost its owner and no run was in flight. In that second
-    /// case the teardown, like any unregister, abandons every input the drain
-    /// still held (reason `Stopped`) and resolves its completion as
-    /// runtime-terminated, so a later resume does not run it.
+    /// The exact registration held no non-terminal input and no run. Its
+    /// owned unregister teardown completed after `BeginUnregisterSession`
+    /// committed while its mutation gate still excluded ingress.
     Closed,
     /// The exact registration holds a non-terminal input or a run. Nothing
     /// was staged: the registration and its running owner keep serving, and
@@ -1433,6 +1600,13 @@ pub enum RuntimeSessionQuiescentClose {
     AlreadyClosing,
     /// The supplied registration is absent or no longer current.
     NotCurrent,
+    /// The exact registration's orphaned drain or pending finalization was
+    /// completed with no run in flight. This is not a quiescent admission:
+    /// the teardown abandons any inputs the drain still held (reason
+    /// `Stopped`) and resolves their completions as runtime-terminated, so a
+    /// later resume does not run them. This variant also applies when the
+    /// orphaned drain held no inputs.
+    ClosedOrphanedDrain,
 }
 
 /// The wait a caller dispatched on after starting or joining an owned
@@ -1475,6 +1649,29 @@ pub enum RuntimeSessionAttachmentState {
         registration: RuntimeSessionRegistrationWitness,
         unregister: RuntimeDetachedUnregister,
     },
+}
+
+/// What [`MeerkatMachine::take_over_stopped_attachment_registration_if_current`]
+/// did with one exact registration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum StoppedRegistrationTakeover {
+    /// The registration was the completed residue of a stopped attachment,
+    /// and its canonical unregister completed.
+    Unregistered,
+    /// The witness no longer names the session's current registration.
+    /// Nothing changed.
+    NotCurrent,
+    /// The exact registration is not a stopped attachment's completed
+    /// residue: it is attached, its stop or post-stop cleanup did not
+    /// complete, it was never attached, it is not Stopped (a Retired
+    /// runtime included), it is claimed, or it needs a durability reload.
+    /// Nothing changed.
+    NotStoppedResidue,
+    /// A stop cleanup on the exact registration was still in flight when
+    /// the caller's bound on joining it ran out. Nothing was decided and
+    /// nothing changed; the cleanup goes on, owned by the runtime.
+    StopCleanupPending,
 }
 
 /// Where a detached registration's machine-owned unregister stands.
@@ -1591,6 +1788,9 @@ struct RuntimeSessionEntry {
     /// The tool-surface gate this registration's trusted host installed, if
     /// any. Every registration owns a fresh, empty slot.
     tool_surface_gate: meerkat_core::ToolSurfaceGateSlot,
+    /// The resumed-run admission this registration's host bound, if any.
+    /// Every registration owns a fresh, empty slot.
+    resumed_run_admission: crate::resumed_run_admission::ResumedRunAdmissionSlot,
     /// The MCP adapter this registration's latest finished construction
     /// installed, for observation only. Every registration owns a fresh slot.
     mcp_observation: meerkat_core::McpObservationSlot,
@@ -1933,10 +2133,13 @@ pub struct MachineSessionArchiveLease {
 pub trait MachineSessionArchivePostCommitHook: Send + Sync {
     /// Run only after the runtime lifecycle is durably Retired and before the
     /// exact recovered archive registration is removed. The hook must be
-    /// idempotent: failure or cancellation retains that registration, and an
+    /// idempotent and bounded: failure retains that registration, and an
     /// `AlreadyArchived` retry invokes the same obligation again. Higher
     /// layers may persist a typed receipt in their hook state and return `Ok`
-    /// only once that receipt makes a repeated invocation convergent.
+    /// only once that receipt makes a repeated invocation convergent. No
+    /// caller can cancel it: the retire runs in its own task while it holds
+    /// the session's mutation gate, so a hook that never returns holds that
+    /// gate until it does.
     async fn after_runtime_retire_commit(&self) -> Result<(), RuntimeControlPlaneError>;
 }
 
@@ -3201,6 +3404,89 @@ impl MeerkatMachine {
         self.native_work_authorization_host.get().is_some()
     }
 
+    /// Install the trusted host's binder of governed peer deliveries
+    /// ([`crate::input_authority::PeerIngressBinder`]): from now on a peer
+    /// delivery whose sender the transport established is offered to it
+    /// before admission, and admitted only as it binds it. The composition
+    /// installs it once, after the native work authorization host and before
+    /// any session is registered. Without a binder a governed runtime refuses
+    /// peer deliveries as before.
+    pub fn install_peer_ingress_binder(
+        &self,
+        binder: Arc<dyn crate::input_authority::PeerIngressBinder>,
+    ) -> Result<(), PeerIngressBinderInstallRefused> {
+        if self.native_work_authorization_host.get().is_none() {
+            return Err(PeerIngressBinderInstallRefused::Ungoverned);
+        }
+        if self.peer_ingress_binder.get().is_some() {
+            return Err(PeerIngressBinderInstallRefused::AlreadyInstalled);
+        }
+        let sessions = self
+            .sessions
+            .try_read()
+            .map_err(|_| PeerIngressBinderInstallRefused::SessionsRegistered)?;
+        if !sessions.is_empty() {
+            return Err(PeerIngressBinderInstallRefused::SessionsRegistered);
+        }
+        self.peer_ingress_binder
+            .set(binder)
+            .map_err(|_| PeerIngressBinderInstallRefused::AlreadyInstalled)?;
+        drop(sessions);
+        Ok(())
+    }
+
+    /// Whether a governed peer delivery binder was installed. A composition
+    /// observation, never a permission decision.
+    pub fn has_peer_ingress_binder(&self) -> bool {
+        self.peer_ingress_binder.get().is_some()
+    }
+
+    /// The installed peer delivery binder, on a governed runtime only.
+    pub(crate) fn installed_peer_ingress_binder(
+        &self,
+    ) -> Option<Arc<dyn crate::input_authority::PeerIngressBinder>> {
+        if self.native_work_authorization_host.get().is_none() {
+            return None;
+        }
+        self.peer_ingress_binder.get().map(Arc::clone)
+    }
+
+    /// A governed persistent machine over `store` with the host `build`
+    /// makes for it installed, as a governed open builds one, for tests
+    /// whose host is a fixture.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn persistent_governed_with_host_for_test(
+        store: Arc<dyn RuntimeStore>,
+        blob_store: Option<Arc<dyn meerkat_core::BlobStore>>,
+        build: impl FnOnce(&Self) -> Arc<dyn crate::input_authority::NativeWorkAuthorizationHost>,
+    ) -> Result<Self, RuntimeDriverError> {
+        let machine = Self::persistent_with_mode(store, blob_store, true)?;
+        let host = build(&machine);
+        machine.install_native_work_authorization(|_| host)
+    }
+
+    /// Mark `session_id`'s driver as served by an executor that supports
+    /// governed work, as the runtime loop does when such an executor
+    /// attaches, for tests that admit governed input with no executor.
+    #[cfg(test)]
+    pub(crate) async fn support_governed_work_for_test(&self, session_id: &SessionId) {
+        let driver = {
+            let sessions = self.sessions.read().await;
+            Arc::clone(&sessions.get(session_id).expect("registered session").driver)
+        };
+        match &mut *driver.lock().await {
+            DriverEntry::Ephemeral(driver) => {
+                driver.set_executor_work_authorization_support(true);
+            }
+            DriverEntry::Persistent(driver) => {
+                driver
+                    .inner_mut()
+                    .set_executor_work_authorization_support(true);
+            }
+        }
+    }
+
     /// Reauthenticate a fresh UI request through the installed member work
     /// owner. An ungoverned runtime starts with an empty dispatch context;
     /// neither path retains the last agent run's authorization or review.
@@ -3477,6 +3763,7 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 guard,
                 self.cleanup_spawner.clone(),
+                UnregisterDisposition::STOP,
             );
         self.armed = false;
         Ok(completion)
@@ -3503,6 +3790,7 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 RunlessTerminalAnnouncement::default(),
                 guard,
+                UnregisterDisposition::STOP,
             )
             .await
     }
@@ -3522,6 +3810,7 @@ impl Drop for PreparedRuntimeExecutorAttachmentRetirement {
                 self.witness.clone(),
                 guard,
                 self.cleanup_spawner.clone(),
+                UnregisterDisposition::STOP,
             );
         self.armed = false;
     }
@@ -3749,6 +4038,156 @@ impl PendingRuntimeExecutorAttachment {
         Ok(abandoned)
     }
 
+    /// Adopt, before this attachment can serve, the terminals a store-owned
+    /// recovery wrote outside this registration's driver after the driver
+    /// recovered its inputs at registration
+    /// (`DriverEntry::adopt_durable_consumed_inputs`). A materialization's own
+    /// durable-tail recovery runs between the two: it closes the tail it
+    /// finds and consumes the inputs the tail's run cursor binds, in the
+    /// store. On WholeBlob nothing settles the tail before registration, so
+    /// the driver still holds such an input as it recovered it (a staged input
+    /// rolled back to its queue), and without this its first lap would stage
+    /// the input again from that row, write over the terminal row, and run its
+    /// content a second time. Runs before every other settlement here, which
+    /// would otherwise end an input the store already ended. Returns the
+    /// adopted inputs.
+    pub(crate) async fn adopt_recovered_input_terminals(
+        &mut self,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let (driver, completions) = self
+            .exact_pending_driver("recovered input terminal adoption")
+            .await?;
+        let adopted = driver
+            .lock()
+            .await
+            .adopt_durable_consumed_inputs(Some(&completions))
+            .await?;
+        if !adopted.is_empty() {
+            tracing::info!(
+                session_id = %self.witness.session_id(),
+                inputs = adopted.len(),
+                "adopted the input terminals a recovery wrote after registration"
+            );
+        }
+        Ok(adopted)
+    }
+
+    /// End, before this attachment can serve, every input an earlier
+    /// graceful stop kept queued that is now older than that stop's max age
+    /// (`crate::input_state::stop_requeue_expired` at `now`). Each is
+    /// abandoned through the machine's `AbandonInput` with the typed
+    /// [`crate::input_state::InputAbandonReason::RequeueExpired`], durably
+    /// committed with its payload retired, so it never runs. The retained
+    /// mutation guard and the pending (non-serving) slot keep the input set
+    /// complete. Every attachment passes here before its serving gate, so no
+    /// path serves a kept input that has not been checked. Returns the
+    /// expired inputs.
+    ///
+    /// A run the same stop kept open (marked resumable again by this
+    /// registration, its inputs still bound to it) is checked first, as a
+    /// whole: when any of its inputs is over the stop's max age, the run is
+    /// settled with the same reason (`DriverEntry::settle_resumable_run`)
+    /// instead of resumed. Its inputs are Staged or Applied, never queued,
+    /// so the per-input sweep would not see them.
+    pub(crate) async fn settle_expired_stop_requeued_inputs(
+        &mut self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<InputId>, RuntimeDriverError> {
+        let (driver, completions) = self
+            .exact_pending_driver("requeue expiry settlement")
+            .await?;
+        // The expired run whose tail repair requires the session to reload.
+        let mut reload_for_run = None;
+        let expired = {
+            let mut driver = driver.lock().await;
+            let mut expired = Vec::new();
+            if let Some(run_id) = driver.resumable_run_id()
+                && driver.resumable_run_stop_requeue_expired(&run_id, now)
+            {
+                let settled = driver
+                    .settle_resumable_run(
+                        &run_id,
+                        crate::input_state::InputAbandonReason::RequeueExpired,
+                    )
+                    .await?;
+                tracing::info!(
+                    session_id = %self.witness.session_id(),
+                    %run_id,
+                    inputs = settled.len(),
+                    "a run a graceful stop kept open outlived the stop's max age; settled instead of resumed"
+                );
+                if !settled.is_empty() {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, as for an expired queued input.
+                    self.runless_terminal.owe();
+                }
+                expired.extend(settled);
+                // The settled run never resumes, so its provisional tail is
+                // repaired as an interrupted run, after the abandonment
+                // committed: its rows stay in the transcript, and the
+                // session's next run commits its first round over the
+                // repaired body (the session layer resynchronizes the seeded
+                // actor from it at its next step).
+                if driver
+                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
+                    .await
+                {
+                    reload_for_run = Some(run_id);
+                }
+            }
+            let candidates =
+                crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
+            expired.reserve(candidates.len());
+            for input_id in candidates {
+                if driver
+                    .abandon_queued_input(
+                        &input_id,
+                        crate::input_state::InputAbandonReason::RequeueExpired,
+                    )
+                    .await?
+                {
+                    // Committed: told once this attachment releases its
+                    // mutation guard, even if a later input fails here.
+                    self.runless_terminal.owe();
+                    expired.push(input_id);
+                } else {
+                    tracing::warn!(
+                        session_id = %self.witness.session_id(),
+                        %input_id,
+                        "an input a stop kept queued was not queued at its expiry settlement; left as is"
+                    );
+                }
+            }
+            expired
+        };
+        if !expired.is_empty() {
+            // As for an interrupted run's inputs: the old input is durably
+            // ended, and a retry is a new request.
+            completions.lock().await.fail_inputs(
+                expired.clone(),
+                crate::completion::CompletionWaitError::AttachmentReplaced,
+            );
+        }
+        // A tail the repair left standing would refuse the session's next
+        // run's first round commit, so the session reloads at once, and this
+        // attachment does not serve. A crash right after the settlement
+        // leaves the same state for the next registration's recovery.
+        if let Some(run_id) = reload_for_run {
+            let reason = format!("expired run {run_id}'s provisional tail still stands");
+            self.machine
+                .require_session_durability_reload(
+                    self.witness.session_id(),
+                    "expired_resumable_run_tail_repair",
+                    reason.clone(),
+                )
+                .await;
+            return Err(RuntimeDriverError::Internal(format!(
+                "{reason}; the session reloads before it serves"
+            )));
+        }
+        Ok(expired)
+    }
+
     /// Settle the session's interrupted-run evidence before serving, in a
     /// crash-safe order under the retained mutation guard:
     ///
@@ -3797,12 +4236,16 @@ impl PendingRuntimeExecutorAttachment {
                 .map(|(_, input)| input.clone())
                 .collect(),
         };
-        // A run whose provisional tail the store holds is committed by
-        // durable-tail recovery (which may run after this attachment, when
-        // the host builds the agent lazily). Settling it here would capture
-        // and abandon inputs that recovery then commits anyway, so its
-        // evidence is left for a later materialization, where the run is no
-        // longer in flight.
+        // A run whose provisional tail the store holds is committed or
+        // continued by durable-tail recovery (which may run after this
+        // attachment, when the host builds the agent lazily). Settling it here
+        // would capture and abandon inputs that recovery then commits anyway,
+        // or that the resumed run still holds, so its evidence is left: a
+        // resumed run's round reads it itself
+        // (`MeerkatMachine::resumed_run_interrupted_tool_calls`) and
+        // acknowledges it once the run has ended, and any other run's is
+        // settled at a later materialization, where the run is no longer in
+        // flight.
         let provisional_run = self
             .machine
             .provisional_tail_run(self.witness.session_id())
@@ -3875,6 +4318,11 @@ impl PendingRuntimeExecutorAttachment {
                             // The run committed the tool's result normally.
                             silently_moot.push(call.entry_id);
                         } else {
+                            // Owed unless the transcript already answers the
+                            // call (a resumed run's round answered it before
+                            // the run ended): recording the notice leaves
+                            // such a call out, so its evidence is acknowledged
+                            // without telling the model twice.
                             owed.push(OwedInterruptedToolNotice {
                                 call: call.clone(),
                                 disposition: InterruptedToolRunDisposition::RunCompleted,
@@ -4193,11 +4641,16 @@ impl PendingRuntimeExecutorAttachment {
         if let Some((driver, completions, publication_handle)) = predecessor_request_state {
             const REPLACED_REASON: &str =
                 "executor attachment was replaced before request completion";
-            let (predecessor_input_ids, candidate_owner_input_id) = {
+            let (predecessor_input_ids, directed_batches) = {
                 let mut driver = driver.lock().await;
+                // Inputs a store-owned durable-tail recovery consumed are not
+                // pending: adopt them before this sweep names its batch.
+                driver
+                    .adopt_durable_consumed_inputs(Some(&completions))
+                    .await?;
                 let predecessor_input_ids = driver.as_driver().active_input_ids();
                 if predecessor_input_ids.is_empty() {
-                    (predecessor_input_ids, None)
+                    (predecessor_input_ids, Vec::new())
                 } else {
                     // The outbox candidates and Cancelled input terminals are
                     // persisted by one driver checkpoint. Replacement may
@@ -4217,8 +4670,13 @@ impl PendingRuntimeExecutorAttachment {
                     // Told once M is released or handed off, whether or not
                     // this replacement then commits.
                     self.runless_terminal.owe();
-                    let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
-                    (predecessor_input_ids, candidate_owner_input_id)
+                    // Only a directed batch has a terminal to publish: its
+                    // durable outbox. Every waiter fails below either way.
+                    let directed_batches = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared)
+                        .into_iter()
+                        .filter(crate::meerkat_machine::driver::RunlessTerminalBatch::is_directed)
+                        .collect::<Vec<_>>();
+                    (predecessor_input_ids, directed_batches)
                 }
             };
             if !predecessor_input_ids.is_empty() {
@@ -4233,13 +4691,9 @@ impl PendingRuntimeExecutorAttachment {
                     crate::completion::CompletionWaitError::AttachmentReplaced,
                 );
                 self.should_wake = false;
-                if let Some(candidate_owner_input_id) = candidate_owner_input_id {
-                    predecessor_terminal_publication = Some((
-                        driver,
-                        publication_handle,
-                        predecessor_input_ids,
-                        candidate_owner_input_id,
-                    ));
+                if !directed_batches.is_empty() {
+                    predecessor_terminal_publication =
+                        Some((driver, publication_handle, directed_batches));
                 }
             }
         }
@@ -4262,7 +4716,7 @@ impl PendingRuntimeExecutorAttachment {
                 self.runless_terminal.release();
             }
             self.armed = false;
-            if let Some((driver, publication_handle, input_ids, candidate_owner_input_id)) =
+            if let Some((driver, publication_handle, directed_batches)) =
                 predecessor_terminal_publication
             {
                 // External publication must never pin M or delay B's serving
@@ -4272,12 +4726,11 @@ impl PendingRuntimeExecutorAttachment {
                 // later attachment's ordinary startup recovery.
                 let _terminal_publication = self.cleanup_spawner.spawn(async move {
                     let deadline = Instant::now() + std::time::Duration::from_secs(5);
-                    if let Err(error) = crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                    if let Err(error) = crate::control_plane::publish_and_resolve_runless_runtime_terminations_before(
                         &driver,
                         None,
                         publication_handle.as_deref(),
-                        &input_ids,
-                        Some(&candidate_owner_input_id),
+                        &directed_batches,
                         "executor attachment was replaced before request completion",
                         Some(deadline),
                     )
@@ -4493,6 +4946,11 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
 
         let predecessor_input_ids = {
             let mut driver = driver.lock().await;
+            // Inputs a store-owned durable-tail recovery consumed are not
+            // pending: adopt them before this sweep names its inputs.
+            driver
+                .adopt_durable_consumed_inputs(Some(&completions))
+                .await?;
             let predecessor_input_ids = driver.as_driver().active_input_ids();
             if predecessor_input_ids.is_empty() {
                 return Ok(0);
@@ -4670,6 +5128,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness.clone(),
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await;
             if let Err(error) = &retired {
@@ -4708,6 +5167,7 @@ impl CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness,
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await
         });
@@ -4738,6 +5198,7 @@ impl Drop for CommittedRuntimeExecutorAttachmentPublicationLease {
                     witness.clone(),
                     runless_terminal,
                     guard,
+                    UnregisterDisposition::STOP,
                 )
                 .await;
             if let Err(error) = retired {
@@ -5561,9 +6022,22 @@ impl PreparedSessionMaterialization {
 
     /// Roll back this exact materialization now. A pre-existing runtime entry is
     /// preserved after its exact provisional cleanup; an entry inserted for this
-    /// transaction is fully unregistered.
+    /// transaction is fully unregistered with the Keep disposition: every
+    /// non-terminal input its registration recovered from the store stays
+    /// exactly as the store holds it, with no requeue mark, for the next
+    /// registration to recover again. A refused materialization (a durable tail
+    /// held for recovery, a failed agent build) so ends nothing a later start
+    /// would run. An input admitted while the registration stood still ends as
+    /// stopped.
+    ///
+    /// The machine decides whether the keep stands: a registration that
+    /// served live work (an input admitted to it, a resubmission
+    /// deduplicated onto an input it holds, or a host's recycle, whose
+    /// recovery mixes live inputs into the recovered ones) unregisters with
+    /// Stop instead and ends every non-terminal input, so a turn whose caller
+    /// saw the materialization refused never runs on a later start.
     pub async fn rollback_now(&mut self) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(false)
+        self.rollback_now_with_turn_finalization_boundary(false, UnregisterDisposition::KEEP)
             .await
     }
 
@@ -5578,13 +6052,14 @@ impl PreparedSessionMaterialization {
     pub async fn rollback_now_under_turn_finalization_boundary(
         &mut self,
     ) -> Result<bool, RuntimeDriverError> {
-        self.rollback_now_with_turn_finalization_boundary(true)
+        self.rollback_now_with_turn_finalization_boundary(true, UnregisterDisposition::KEEP)
             .await
     }
 
     async fn rollback_now_with_turn_finalization_boundary(
         &mut self,
         turn_finalization_boundary_already_held: bool,
+        queued_inputs: UnregisterDisposition,
     ) -> Result<bool, RuntimeDriverError> {
         if !self.armed {
             return Ok(false);
@@ -5601,6 +6076,7 @@ impl PreparedSessionMaterialization {
                 Some(self.bindings.epoch_id()),
                 Some(&self.claim_state),
                 turn_finalization_boundary_already_held,
+                queued_inputs,
             )
             .await?;
         self.armed = false;
@@ -5648,6 +6124,9 @@ impl Drop for PreparedSessionMaterialization {
                     Some(&epoch_id),
                     Some(&claim_state),
                     false,
+                    // As rollback_now: the machine stops every input instead
+                    // once the registration served live work.
+                    UnregisterDisposition::KEEP,
                 )
                 .await
             {
@@ -5740,6 +6219,7 @@ impl Drop for PendingPreparedMaterialization {
                     None,
                     None,
                     false,
+                    UnregisterDisposition::KEEP,
                 )
                 .await
             {
@@ -7462,6 +7942,57 @@ impl MeerkatMachine {
         (entered_rx, release_tx)
     }
 
+    /// Deterministically pause the runtime loop's next lap that stages a
+    /// fresh batch after it read the batch's durable rows and before its
+    /// staging commit. Test builds only.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn arm_runtime_loop_before_batch_staging_test_hook(
+        &self,
+        session_id: SessionId,
+    ) -> (
+        crate::tokio::sync::oneshot::Receiver<()>,
+        crate::tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+        let mut hook = self
+            .test_runtime_loop_before_batch_staging
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            hook.is_none(),
+            "runtime-loop batch-staging test hook already armed"
+        );
+        *hook = Some((session_id, entered_tx, release_rx));
+        (entered_rx, release_tx)
+    }
+
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) async fn run_runtime_loop_before_batch_staging_test_hook(
+        &self,
+        session_id: &SessionId,
+    ) {
+        let armed = {
+            let mut hook = self
+                .test_runtime_loop_before_batch_staging
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if hook
+                .as_ref()
+                .is_some_and(|(armed_session_id, _, _)| armed_session_id == session_id)
+            {
+                hook.take()
+            } else {
+                None
+            }
+        };
+        if let Some((_, entered_tx, release_rx)) = armed {
+            let _ = entered_tx.send(());
+            let _ = release_rx.await;
+        }
+    }
+
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) async fn run_runtime_loop_before_executor_apply_test_hook(
         &self,
@@ -8209,6 +8740,15 @@ impl MeerkatMachine {
         context: &str,
     ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let authority = self.session_dsl_authority(session_id).await?;
+        Self::preview_dsl_input_on_shared_authority(&authority, input, context)
+    }
+
+    /// Preview `input` on a fork of one session's live authority.
+    fn preview_dsl_input_on_shared_authority(
+        authority: &std::sync::Mutex<dsl::MeerkatMachineAuthority>,
+        input: dsl::MeerkatMachineInput,
+        context: &str,
+    ) -> Result<Vec<dsl::MeerkatMachineEffect>, String> {
         let preview = match authority.lock() {
             Ok(authority) => Ok(authority.fork()),
             Err(poisoned) => {
@@ -10294,6 +10834,24 @@ pub enum ConsentOwnerLossInstallRefused {
     AlreadyInstalled,
 }
 
+/// Why a runtime refused to install a governed peer delivery binder
+/// ([`MeerkatMachine::install_peer_ingress_binder`]). Nothing changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+#[non_exhaustive]
+pub enum PeerIngressBinderInstallRefused {
+    /// No native work authorization host is installed: the runtime is
+    /// ungoverned, admits peer deliveries as it always did, and has nothing to
+    /// bind them for.
+    #[error("no native work authorization host is installed on this runtime")]
+    Ungoverned,
+    /// A session is registered, or being registered, on this runtime.
+    #[error("a session is already registered on this runtime")]
+    SessionsRegistered,
+    /// Another binder is already installed on this runtime.
+    #[error("another peer ingress binder is already installed on this runtime")]
+    AlreadyInstalled,
+}
+
 /// One tell of a machine's [`RunlessInputTerminalHint`], owed by the step
 /// that commits runless input terminals.
 ///
@@ -10377,6 +10935,10 @@ pub struct MeerkatMachineShared {
     /// settled and nothing is recorded as settled.
     consent_owner_loss_settlement:
         std::sync::OnceLock<Arc<dyn meerkat_core::approval::ConsentOwnerLossSettlement>>,
+    /// The trusted host's binder of governed peer deliveries, installed by
+    /// the composition before any session is registered. Empty: no peer
+    /// delivery is bound, and a governed runtime refuses them as before.
+    peer_ingress_binder: std::sync::OnceLock<Arc<dyn crate::input_authority::PeerIngressBinder>>,
     /// This runtime owner's identity for session hosting claims (#1813).
     /// Every claim this machine's lineage takes (its registrations, and its
     /// session service's actors, cold attaches and store-only writes) carries
@@ -10771,6 +11333,18 @@ pub struct MeerkatMachineShared {
     /// claimed the turn yet.
     #[cfg(any(test, feature = "test-support"))]
     test_runtime_loop_before_executor_apply: StdMutex<
+        Option<(
+            SessionId,
+            crate::tokio::sync::oneshot::Sender<()>,
+            crate::tokio::sync::oneshot::Receiver<()>,
+        )>,
+    >,
+    /// One-shot deterministic gate between a runtime loop lap's read of its
+    /// fresh batch's durable rows and the batch's staging commit: the lap
+    /// holds the turn-finalization boundary and its queue authority, not the
+    /// driver.
+    #[cfg(any(test, feature = "test-support"))]
+    test_runtime_loop_before_batch_staging: StdMutex<
         Option<(
             SessionId,
             crate::tokio::sync::oneshot::Sender<()>,
@@ -12480,6 +13054,28 @@ impl MeerkatMachine {
         self.store.is_some()
     }
 
+    /// What a graceful process shutdown that names no disposition does with
+    /// each session it unregisters, as `rkat-rpc`'s shutdown and the REST
+    /// server's shutdown do. A runtime with a persistence store serves
+    /// sessions that commit each round, so it requeues
+    /// ([`UnregisterQueuedInputs::Requeue`] with
+    /// [`UnregisterQueuedInputs::DEFAULT_MAX_AGE`]): eligible queued inputs
+    /// stay queued for the next start, and the runtime's stop decides per run
+    /// whether a run in flight continues there or ends as before. A runtime
+    /// without one stops ([`UnregisterQueuedInputs::Stop`]), as every
+    /// unregister did before. An unregister that names no disposition is
+    /// unchanged: it still stops.
+    #[must_use]
+    pub fn graceful_shutdown_queued_inputs(&self) -> UnregisterQueuedInputs {
+        if self.has_runtime_persistence() {
+            UnregisterQueuedInputs::Requeue {
+                max_age: UnregisterQueuedInputs::DEFAULT_MAX_AGE,
+            }
+        } else {
+            UnregisterQueuedInputs::Stop
+        }
+    }
+
     fn normalize_destroyed_error(err: RuntimeDriverError) -> RuntimeDriverError {
         match err {
             RuntimeDriverError::NotReady {
@@ -12502,6 +13098,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                peer_ingress_binder: std::sync::OnceLock::new(),
                 registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
@@ -12620,6 +13217,8 @@ impl MeerkatMachine {
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_before_batch_staging: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_scoped_binding_before_machine_authority: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
@@ -12754,6 +13353,7 @@ impl MeerkatMachine {
             shared: Arc::new(MeerkatMachineShared {
                 native_work_authorization_host: Arc::new(std::sync::OnceLock::new()),
                 consent_owner_loss_settlement: std::sync::OnceLock::new(),
+                peer_ingress_binder: std::sync::OnceLock::new(),
                 registration_use_sequence: std::sync::atomic::AtomicU64::new(0),
                 hosting_owner: meerkat_core::session_hosting::HostingOwner::mint(),
                 sessions: RwLock::new(HashMap::new()),
@@ -12872,6 +13472,8 @@ impl MeerkatMachine {
                 registration_run_start_holds: std::sync::Mutex::new(HashMap::new()),
                 #[cfg(any(test, feature = "test-support"))]
                 test_runtime_loop_before_executor_apply: StdMutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                test_runtime_loop_before_batch_staging: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]
                 test_scoped_binding_before_machine_authority: StdMutex::new(None),
                 #[cfg(any(test, feature = "test-support"))]

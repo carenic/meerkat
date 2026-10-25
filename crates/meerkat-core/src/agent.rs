@@ -19,7 +19,11 @@ mod extraction;
 mod hook_impl;
 #[cfg(all(test, feature = "workspace-tests"))]
 mod hooks_behavior_tests;
+#[cfg(test)]
+mod observation_barrier_tests;
 pub(crate) mod reasoning_preference;
+#[cfg(all(test, feature = "workspace-tests"))]
+mod round_commit_tests;
 mod runner;
 pub mod skills;
 mod state;
@@ -780,6 +784,54 @@ pub struct ExternalToolUpdate {
     pub pending: Vec<String>,
 }
 
+/// Where a run stood when the host dropped its future to suspend it
+/// ([`Agent::suspend_dropped_run`]), for a stop that keeps the session's
+/// queued work.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DroppedRunSuspension {
+    /// The run's latest checkpoint is a round commit, cursor included, or the
+    /// run wrote none: it resumes there at the session's next start, as after
+    /// a crash. A save without the cursor that was in flight when the future
+    /// was dropped counts here: the store may hold either tail, and the next
+    /// start's recovery reads which.
+    Resumable {
+        /// The suspended run.
+        run_id: crate::lifecycle::RunId,
+    },
+    /// The run's save without the cursor (its end-of-run save, or the closing
+    /// write of its exit) had landed: its latest checkpoint holds the run's
+    /// committed work and no cursor. Nothing of the run is left to resume,
+    /// and its inputs must not run again. It is not suspended: nothing of the
+    /// run was cleared, and the caller ends it with
+    /// [`Agent::cancel_dropped_run`], which publishes the run's terminal
+    /// where it is still owed.
+    PastFinalSave {
+        /// The run past its final save.
+        run_id: crate::lifecycle::RunId,
+    },
+    /// The run takes no round commits (its agent has no session
+    /// checkpointer, or it is a live bridge run, which commits nothing), so
+    /// nothing durable names its progress and it cannot be suspended: a stop
+    /// cancels it, as before. Nothing of the run was cleared; the caller ends
+    /// it with [`Agent::cancel_dropped_run`].
+    NotResumable {
+        /// The run that cannot be suspended.
+        run_id: crate::lifecycle::RunId,
+    },
+}
+
+impl DroppedRunSuspension {
+    /// The run this outcome names.
+    #[must_use]
+    pub fn run_id(&self) -> &crate::lifecycle::RunId {
+        match self {
+            Self::Resumable { run_id }
+            | Self::PastFinalSave { run_id }
+            | Self::NotResumable { run_id } => run_id,
+        }
+    }
+}
+
 /// Typed command requesting cancellation at the next turn boundary.
 ///
 /// Carried over the cancel-after-boundary command channel from the surface
@@ -813,6 +865,11 @@ impl CancelAfterBoundaryCommand {
 /// cancellation without holding a reference to the agent.
 pub type CancelAfterBoundarySender = tokio::sync::mpsc::UnboundedSender<CancelAfterBoundaryCommand>;
 
+/// Test observer of each durable round commit, given the cursor it wrote.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub type RoundCommitObserver = Arc<dyn Fn(&crate::SessionRunCursor) + Send + Sync>;
+
 /// Typed context supplied by the agent loop when dispatching a tool call.
 ///
 /// This is a dispatch-time projection of the already-admitted turn input. It
@@ -832,6 +889,11 @@ pub struct ToolDispatchContext {
     origin_session_id: Option<crate::types::SessionId>,
     interaction_lineage_id: Option<crate::interaction::InteractionId>,
     run_id: Option<crate::RunId>,
+    /// Zero-based index of the run's round this dispatch belongs to. Bound
+    /// with the run id by the agent loop for every tool round, so a call has
+    /// one dedupe key whether it runs fresh or again after a resume, and
+    /// cleared once the round's calls are collected.
+    round: Option<u64>,
     streaming: Option<crate::ToolStreamingDispatchContext>,
     live_bridge_admission: Option<LiveBridgeToolDispatchAdmission>,
     work_authorization: Option<crate::WorkAuthorizationContext>,
@@ -848,6 +910,10 @@ pub struct ToolDispatchContext {
     /// The host's operation refusal observer with the agent's session,
     /// attached by the agent. Host-only: nothing here reaches the model.
     refusal_observer: Option<crate::authorization::RefusalObserverBinding>,
+    /// The work's observation barrier, awaited by every fenced entry made
+    /// with this context before any dispatcher code runs. Only the native
+    /// runtime installs one, for a governed service call.
+    observation_barrier: Option<Arc<dyn crate::authorization::OperationObservationBarrier>>,
     // Monotonic restriction set by the core execution policy owner.
     read_only_execution_required: bool,
 }
@@ -1324,6 +1390,7 @@ impl std::fmt::Debug for ToolDispatchContext {
             .field("origin_session_id", &self.origin_session_id)
             .field("interaction_lineage_id", &self.interaction_lineage_id)
             .field("run_id", &self.run_id)
+            .field("round", &self.round)
             .field("streaming", &self.streaming)
             .field("live_bridge_admission", &self.live_bridge_admission)
             .field("work_authorization", &self.work_authorization)
@@ -1354,6 +1421,7 @@ impl PartialEq for ToolDispatchContext {
             && self.origin_session_id == other.origin_session_id
             && self.interaction_lineage_id == other.interaction_lineage_id
             && self.run_id == other.run_id
+            && self.round == other.round
             && self.streaming == other.streaming
             && self.live_bridge_admission == other.live_bridge_admission
             && match (&self.work_authorization, &other.work_authorization) {
@@ -1383,6 +1451,11 @@ impl PartialEq for ToolDispatchContext {
             }
             && match (&self.refusal_observer, &other.refusal_observer) {
                 (Some(left), Some(right)) => left.same_binding(right),
+                (None, None) => true,
+                _ => false,
+            }
+            && match (&self.observation_barrier, &other.observation_barrier) {
+                (Some(left), Some(right)) => Arc::ptr_eq(left, right),
                 (None, None) => true,
                 _ => false,
             }
@@ -1442,6 +1515,7 @@ impl ToolDispatchContext {
             origin_session_id: None,
             interaction_lineage_id: None,
             run_id: None,
+            round: None,
             streaming: None,
             live_bridge_admission: None,
             work_authorization: None,
@@ -1450,6 +1524,7 @@ impl ToolDispatchContext {
             review_entry: None,
             staging_wait: None,
             refusal_observer: None,
+            observation_barrier: None,
             read_only_execution_required: false,
         }
     }
@@ -1506,6 +1581,23 @@ impl ToolDispatchContext {
     #[must_use]
     fn with_staging_wait(mut self, wait: Arc<EntryStagingWait>) -> Self {
         self.staging_wait = Some(wait);
+        self
+    }
+
+    /// Attach the work's observation barrier: every fenced entry made with
+    /// this context awaits it before any dispatcher code runs, and its error
+    /// refuses the call unsent (see
+    /// [`crate::authorization::OperationObservationBarrier`]).
+    ///
+    /// Only the native runtime installs one, on the context of a governed
+    /// service call it built itself; host code never does. It grants
+    /// nothing, and every other context carries none.
+    #[must_use]
+    pub fn with_observation_barrier(
+        mut self,
+        barrier: Arc<dyn crate::authorization::OperationObservationBarrier>,
+    ) -> Self {
+        self.observation_barrier = Some(barrier);
         self
     }
 
@@ -1754,8 +1846,9 @@ impl ToolDispatchContext {
     /// An owned, single-use entry for a leaf whose effect runs on a worker
     /// (for example a queued blocking task). It re-derives the exact
     /// binding-owned call when entered, so it is `'static` and `Send`, and it
-    /// is consumed by value, so it can enter at most once. A ticket entered
-    /// after the admitting dispatch ended refuses.
+    /// is consumed by value, so it can enter at most once. A reviewed ticket
+    /// entered after the admitting dispatch ended refuses; any ticket refuses
+    /// once its run is no longer current.
     pub fn reviewed_entry_ticket(
         &self,
         call: ToolCallView<'_>,
@@ -2173,6 +2266,61 @@ impl ToolDispatchContext {
 
     pub(crate) fn bind_run_id(&mut self, run_id: crate::RunId) {
         self.run_id = Some(run_id);
+        self.round = None;
+    }
+
+    /// Zero-based index of the run's round this dispatch belongs to, when the
+    /// agent loop bound one.
+    pub const fn round(&self) -> Option<u64> {
+        self.round
+    }
+
+    pub(crate) fn bind_round(&mut self, round: u64) {
+        self.round = Some(round);
+    }
+
+    /// The round's calls are dispatched and their outcomes collected: a call
+    /// the host dispatches outside a round carries no dedupe key.
+    pub(crate) fn clear_round(&mut self) {
+        self.round = None;
+    }
+
+    /// This context for a call the host dispatches itself (an external
+    /// call): it belongs to no round of the agent's loop, so it carries no
+    /// dedupe key, whatever round the agent bound last.
+    #[must_use]
+    pub(crate) fn outside_round(mut self) -> Self {
+        self.round = None;
+        self
+    }
+
+    /// The deduplication key of one call of this dispatch's round.
+    ///
+    /// A durable run that resumes after a crash dispatches the calls of a
+    /// round whose results were never committed again, under the same call
+    /// ids, so the same call always carries the same key. Delivery is at
+    /// least once: a tool with external effects that must not repeat consults
+    /// this key and deduplicates on all of it. `None` outside an agent-loop
+    /// tool round (no run or no round bound) and for arguments that are not
+    /// JSON.
+    ///
+    /// An in-process tool reads it here. Core's MCP client sends it as the
+    /// `tools/call` `_meta` entry [`crate::TOOL_CALL_DEDUPE_KEY_META_KEY`],
+    /// and a callback tool receives it as the `dedupe_key` of its request or
+    /// pending call.
+    #[must_use]
+    pub fn tool_call_dedupe_key(
+        &self,
+        call: crate::ToolCallView<'_>,
+    ) -> Option<crate::ToolCallDedupeKey> {
+        crate::ToolCallDedupeKey::new(
+            self.run_id.clone()?,
+            self.round?,
+            call.id,
+            call.name,
+            call.args,
+        )
+        .ok()
     }
 
     /// Streaming-only liveness surface minted by the canonical supervisor.
@@ -2904,9 +3052,17 @@ fn staging_wait_site(boundary: crate::authorization::OperationEntryBoundary) -> 
 ///
 /// An operation refusal met before the dispatcher is invoked is certified
 /// [`crate::authorization::RefusalDispatch::NotDispatched`] at this entry's
-/// one boundary ([`FencedOutcome`]). What the dispatcher returns is
+/// one boundary (`FencedOutcome`). What the dispatcher returns is
 /// forwarded unchanged: its tool code may have produced an effect before a
 /// later governed step refused.
+///
+/// A context carrying an observation barrier
+/// ([`ToolDispatchContext::with_observation_barrier`]) awaits it after the
+/// root entry staging and before any dispatcher code runs, then checks the
+/// decision again (see
+/// [`crate::authorization::OperationObservationBarrier`]); its error refuses
+/// the call with [`crate::ToolError::OperationObservationUnavailable`]. A
+/// context without one is dispatched exactly as before.
 ///
 /// A refused or unavailable result is reported, from that same value, to
 /// the operation refusal observer of the host that composed the agent, when
@@ -3233,6 +3389,23 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
                 return Ok(Admitted::Superseded(superseded));
             }
         };
+        // Only a context carrying an observation barrier waits here, so its
+        // owner can make the staged decision and entry durable before any
+        // dispatcher code runs. Every other context goes straight on.
+        let entry_context = match context.observation_barrier.as_ref() {
+            None => entry_context,
+            Some(barrier) => {
+                match await_observation_barrier(barrier, context, entry_context, call, plan).await {
+                    Ok(entry_context) => entry_context,
+                    Err(crate::approval::review::ReviewAdmissionRefusal::Settled(error)) => {
+                        return Err(error);
+                    }
+                    Err(crate::approval::review::ReviewAdmissionRefusal::Superseded(
+                        superseded,
+                    )) => return Ok(Admitted::Superseded(superseded)),
+                }
+            }
+        };
         let context = entry_context.as_ref().unwrap_or(context);
         let result = match plan.kind() {
             crate::ResolvedExecutionKind::Streaming(policy) => {
@@ -3275,6 +3448,55 @@ async fn dispatch_admitted_plan<T: AgentToolDispatcher + ?Sized + 'static>(
         guard.complete();
     }
     outcome.unwrap_or_else(Admitted::Refused)
+}
+
+/// Rounds of a fenced entry's observation barrier before the entry is
+/// refused: each decision prepared again during a wait goes round once more.
+const OBSERVATION_BARRIER_ROUNDS: usize = 3;
+
+/// The observation barrier of one fenced entry, after its root staging and
+/// before any dispatcher code runs (see
+/// [`crate::authorization::OperationObservationBarrier`]).
+///
+/// After each wait the entering decision is checked again, as the root
+/// staging checks it (app custody, then the decision's currentness), with
+/// nothing held across the wait. A decision that is still current is the one
+/// the barrier just made durable, and the call enters with it. A decision
+/// prepared again meanwhile (an owner change during the wait) is staged with
+/// a new root entry and goes round once more, at most
+/// [`OBSERVATION_BARRIER_ROUNDS`] times, so what the barrier made durable
+/// always carries the decision the call enters with. A failed barrier, a
+/// refusal or too many changes settle the entry; nothing is sent.
+async fn await_observation_barrier(
+    barrier: &Arc<dyn crate::authorization::OperationObservationBarrier>,
+    root: &ToolDispatchContext,
+    mut entering: Option<ToolDispatchContext>,
+    call: ToolCallView<'_>,
+    plan: &crate::ResolvedToolExecutionPlan,
+) -> Result<Option<ToolDispatchContext>, crate::approval::review::ReviewAdmissionRefusal> {
+    for _ in 0..OBSERVATION_BARRIER_ROUNDS {
+        barrier
+            .before_entry()
+            .await
+            .map_err(|_| crate::ToolError::OperationObservationUnavailable)?;
+        let current = entering.as_ref().unwrap_or(root);
+        let Some(prepared_again) = current.check_tool_authorization(call, Some(plan))? else {
+            return Ok(entering);
+        };
+        let staged = prepared_again.stage_root_tool_entry(call, plan).await?;
+        entering = Some(staged.unwrap_or(prepared_again));
+    }
+    // The owner kept changing: the entering decision is refused, and the
+    // refusal is staged like every other refusal of the decision.
+    let refusal = crate::authorization::OperationRefused::new(
+        crate::authorization::OperationRefusalKind::ReprepareRequired,
+    );
+    if let Some(prepared) = entering.as_ref().unwrap_or(root).prepared_authorization() {
+        prepared
+            .observe_refusal(refusal)
+            .map_err(|_| crate::ToolError::OperationObservationUnavailable)?;
+    }
+    Err(crate::ToolError::AuthorizationRefused { refusal }.into())
 }
 
 /// Compute whether the current exact catalog should stay inline or switch to deferred mode.
@@ -4459,6 +4681,11 @@ where
     /// never consulted for authorization or turn control.
     #[cfg(any(test, feature = "test-support"))]
     pub(crate) model_preparation_observer: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// Per-instance callback after each durable round commit, with the
+    /// cursor it wrote; absent from ordinary builds and never consulted for
+    /// authorization or turn control.
+    #[cfg(any(test, feature = "test-support"))]
+    pub(crate) round_commit_observer: Option<RoundCommitObserver>,
     /// Request-only exact-boundary context coordinator for this live actor.
     pub(crate) transient_turn_context_state: crate::session::TransientTurnContextStateHandle,
     /// Optional default event channel configured at build time.
@@ -4482,6 +4709,16 @@ where
     /// actor removes it before each checkpoint await and installs only the
     /// exact returned successor.
     pub(crate) latest_run_checkpoint_receipt: Option<crate::RunCheckpointReceipt>,
+    /// The active run's per-round commit state: its round index, its bound
+    /// inputs, and whether a round commit wrote a run cursor. Run-local.
+    pub(crate) round_commits: state::RunRoundCommits,
+    /// Input ids the session layer staged for the next run: the runtime
+    /// batch's contributing inputs, which bind to the run that starts. Cleared
+    /// with the runtime execution kind.
+    pub(crate) run_start_input_ids: Vec<crate::lifecycle::InputId>,
+    /// The staged round a resumed run takes over at its first model
+    /// boundary, set by [`Agent::resume_run`] and consumed there.
+    pub(crate) pending_resumed_round: Option<state::ResumedToolRound>,
     pub(crate) tool_application_observations:
         crate::tool_application::ToolApplicationInvocationOwner,
     /// Rows `[0, floor)` are committed in the durable store exactly as they

@@ -533,3 +533,119 @@ async fn broken_member_refuses_revival_retry_typed() {
 
     fixture.shutdown().await;
 }
+
+// ===========================================================================
+// A boot revival that fails after its preparation registered the member
+// keeps the input the member's session held across the restart
+// ===========================================================================
+
+/// A boot revival that fails after its preparation registered the member
+/// (here the recorded member identity no longer matches the one the host
+/// derives) rolls that registration back with the keep: an input the
+/// member's session held across the restart, which the registration
+/// recovered from the store, stays queued for the next start, not ended and
+/// with no requeue mark. RED before: the rollback stopped it.
+#[tokio::test(flavor = "multi_thread")]
+async fn failed_boot_revival_keeps_the_input_the_member_session_held() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture =
+        spawn_host_daemon_fixture(HostFixtureOptions::named("rev-keep-host").with_member_build())
+            .await
+            .expect("member-build fixture");
+    let probe = spawn_peer_comms_endpoint("rev-keep-supervisor", true, None).await;
+    probe.trust(fixture.host_peer_descriptor()).await;
+    let ack = bind_then_materialize(&probe, &fixture, "mob-keep", "b2").await;
+    let session_id = meerkat_core::SessionId::parse(&ack.session_id).expect("session id");
+    let realm = fixture.member_realm.clone().expect("member realm");
+
+    let partitioned = fixture.partition().await;
+    // While the daemon is down, a runtime over the member's realm registers
+    // the session and accepts an input no executor runs, then goes away
+    // without unregistering: the session's durable runtime state holds the
+    // input across the restart.
+    let held = {
+        let seeding = std::sync::Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent_without_blobs(std::sync::Arc::clone(
+                &realm.runtime_store,
+            ))
+            .expect("a runtime over the member realm"),
+        );
+        seeding
+            .prepare_local_session_bindings(session_id.clone())
+            .await
+            .expect("the runtime registers the member's session");
+        let (accepted, _) = seeding
+            .accept_input_with_completion(
+                &session_id,
+                meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                    "held across the restart",
+                    None,
+                )),
+            )
+            .await
+            .expect("the registration holds the input");
+        let meerkat_runtime::AcceptOutcome::Accepted { input_id, .. } = accepted else {
+            panic!("the registration accepts the input, got {accepted:?}");
+        };
+        input_id
+    };
+    // The recorded member identity no longer matches the one the host
+    // derives, so the boot revival fails after its preparation registered
+    // the member and recovered the held input.
+    let diverged = meerkat_comms::Keypair::generate().public_key();
+    let partitioned = partitioned
+        .rewrite_host_binding_record("mob-keep", |record| {
+            let row = record
+                .materialized
+                .get_mut("b2")
+                .expect("materialized member row");
+            row.member_pubkey = diverged.to_pubkey_string();
+            row.member_peer_id = diverged.to_peer_id().to_string();
+        })
+        .await;
+    let fixture = partitioned.restore().await;
+
+    // The daemon serves, and reports the member it could not revive.
+    let reply = probe
+        .send_bridge_command_raw(
+            &fixture.host_peer_descriptor(),
+            &raw_host_status_command(&probe, "mob-keep", 1),
+            REPLY_TIMEOUT,
+        )
+        .await
+        .expect("host status after the failed revival");
+    let BridgeReply::HostStatus(status) = &reply else {
+        panic!("expected HostStatus, got {reply:?}");
+    };
+    let member = status
+        .members
+        .iter()
+        .find(|member| member.agent_identity == "b2")
+        .expect("the recorded member is still reported");
+    assert!(
+        !member.healthy,
+        "the member whose revival failed reports healthy:false"
+    );
+    let rows = meerkat_runtime::store::load_input_states_for_recovery(
+        realm.runtime_store.as_ref(),
+        &meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+    )
+    .await
+    .expect("the session's durable inputs");
+    let row = rows
+        .iter()
+        .find(|row| row.state.input_id == held)
+        .expect("the held input's durable row");
+    assert_eq!(
+        (row.seed.phase, &row.seed.terminal_outcome),
+        (meerkat_runtime::InputLifecycleState::Queued, &None),
+        "the held input stays queued for the next start: {:?}",
+        row.state.history
+    );
+    assert!(
+        row.state.stop_requeue.is_none(),
+        "the held input is kept as the store holds it, with no requeue mark"
+    );
+
+    fixture.shutdown().await;
+}

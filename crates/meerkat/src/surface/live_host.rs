@@ -35,6 +35,8 @@ use meerkat_live::{
 };
 use meerkat_llm_core::realtime_session::RealtimeSessionFactory;
 use meerkat_runtime::MeerkatMachine;
+#[cfg(feature = "openai-live")]
+use meerkat_runtime::member_live::MemberLiveExecutionOpen;
 use meerkat_runtime::member_live::{
     MEMBER_LIVE_OPEN_CEILING, MemberLiveError, MemberLiveHost, MemberLiveStatus,
 };
@@ -49,8 +51,8 @@ use crate::session_runtime::live_orchestration::ExperimentalLiveChannelOpenError
 #[cfg(feature = "openai-live")]
 use crate::session_runtime::live_orchestration::ExperimentalLivePendingChannel;
 use crate::session_runtime::live_orchestration::{
-    LiveOrchestrator, LiveSeedWindow, LiveSessionIngressReconciler, LiveTransportContext,
-    RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError,
+    LiveOrchestrator, LiveSeedWindow, LiveSessionAddressing, LiveSessionIngressReconciler,
+    LiveTransportContext, RealtimeSessionOpenProjection, RealtimeSessionOpenProjectionError,
 };
 use crate::session_runtime::runtime_state::ArchiveRuntimeCleanup;
 use crate::{PersistentSessionService, SessionAgentBuilder, StagedSessionRegistry};
@@ -978,6 +980,9 @@ pub struct ServiceMemberLiveHost<B: SessionAgentBuilder + 'static = FactoryAgent
     backend: Option<String>,
     #[cfg(feature = "openai-live")]
     context_summary_policy: Option<crate::session_runtime::live_summary::LiveContextSummaryPolicy>,
+    #[cfg(feature = "openai-live")]
+    execution_identity_authority:
+        Option<Arc<dyn crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider>>,
 }
 
 /// Shared production composition for canonical context mirroring. It wraps
@@ -1519,7 +1524,24 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
             backend: config.backend,
             #[cfg(feature = "openai-live")]
             context_summary_policy: None,
+            #[cfg(feature = "openai-live")]
+            execution_identity_authority: None,
         }
+    }
+
+    /// Serve [`MemberLiveHost::open_with_execution_identity`] through this
+    /// execution-identity authority (the composing surface's own, such as
+    /// the authority behind `rkat-rpc`'s strict `live/open`), and close the
+    /// channels it opens through it on [`MemberLiveHost::close_explicit`].
+    /// Without one, that open refuses typed.
+    #[cfg(feature = "openai-live")]
+    #[must_use]
+    pub fn with_execution_identity_authority(
+        mut self,
+        authority: Arc<dyn crate::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider>,
+    ) -> Self {
+        self.execution_identity_authority = Some(authority);
+        self
     }
 
     /// Apply one host-owned summary policy to strict initial and replacement
@@ -1641,12 +1663,18 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
                     .unwrap_or_else(std::sync::PoisonError::into_inner)
                     .insert(session_id, actor_witness_slot);
             }),
+            // Bridge live commands are member-addressed: the member's mob
+            // checked the member before it asked this host.
+            session_addressing: LiveSessionAddressing::MobMember,
         }
     }
 
-    /// Attach transport cleanup without widening member-addressed Open
-    /// policy: WebRTC remains a session-scoped transport, but lifecycle must
-    /// still physically close its peer before terminalizing a member session.
+    /// Serve WebRTC for member opens with this signaling state: tokens mint
+    /// against it, and the composing surface answers the offers on it (as
+    /// `rkat-rpc`'s `live/webrtc/answer` does). Lifecycle also needs it to
+    /// physically close a channel's peer before terminalizing a member
+    /// session. A host without it refuses a WebRTC open typed
+    /// (`TransportUnsupported`).
     #[cfg(feature = "live-webrtc")]
     #[must_use]
     pub fn with_webrtc_cleanup_state(mut self, state: Arc<meerkat_live::LiveWebrtcState>) -> Self {
@@ -1906,6 +1934,33 @@ impl<B: SessionAgentBuilder + 'static> ServiceMemberLiveHost<B> {
                 reason: "experimental live channel has no current machine-owned session"
                     .to_string(),
             })
+    }
+
+    /// Whether this host mints WebRTC bootstraps for its opens.
+    fn serves_webrtc(&self) -> bool {
+        #[cfg(feature = "live-webrtc")]
+        {
+            self.webrtc_state.is_some()
+        }
+        #[cfg(not(feature = "live-webrtc"))]
+        {
+            false
+        }
+    }
+
+    /// A host that serves no WebRTC refuses a WebRTC open typed, before the
+    /// pipeline connects a provider (the pipeline itself would refuse it
+    /// only at its bootstrap mint, after the provider opened).
+    fn refuse_unserved_webrtc(
+        &self,
+        transport: Option<LiveOpenTransport>,
+    ) -> Result<(), MemberLiveError> {
+        if transport == Some(LiveOpenTransport::Webrtc) && !self.serves_webrtc() {
+            return Err(MemberLiveError::TransportUnsupported {
+                requested: "webrtc".to_string(),
+            });
+        }
+        Ok(())
     }
 
     fn transport_context(&self) -> LiveTransportContext<'_> {
@@ -3006,6 +3061,7 @@ impl<B: SessionAgentBuilder + 'static> MemberLiveHost for ServiceMemberLiveHost<
         turning_mode: Option<RealtimeTurningMode>,
         transport: Option<LiveOpenTransport>,
     ) -> Result<LiveOpenResult, MemberLiveError> {
+        self.refuse_unserved_webrtc(transport)?;
         // ADJ-P6B-3: the member-side open runs under its OWN ceiling,
         // strictly inside the controlling bridge deadline, so the member
         // fails closed and replies typed BEFORE the caller times out. On
@@ -3046,6 +3102,82 @@ impl<B: SessionAgentBuilder + 'static> MemberLiveHost for ServiceMemberLiveHost<
         }
     }
 
+    /// The strict open behind a session-scoped `live/open` with an
+    /// execution identity, through the authority this host was composed
+    /// with ([`ServiceMemberLiveHost::with_execution_identity_authority`]),
+    /// under the member open ceiling.
+    #[cfg(feature = "openai-live")]
+    async fn open_with_execution_identity(
+        &self,
+        session: &SessionId,
+        execution_identity: &WireLiveExecutionIdentityOverrideV1,
+        turning_mode: Option<RealtimeTurningMode>,
+        transport: Option<LiveOpenTransport>,
+    ) -> Result<MemberLiveExecutionOpen, MemberLiveError> {
+        let Some(authority) = self.execution_identity_authority.as_deref() else {
+            return Err(MemberLiveError::Unavailable {
+                reason: "this member live host serves no channel-scoped execution identity"
+                    .to_string(),
+            });
+        };
+        self.refuse_unserved_webrtc(transport)?;
+        // The inherent strict open of the same name; this trait method wraps
+        // it.
+        let opened = tokio::time::timeout(
+            MEMBER_LIVE_OPEN_CEILING,
+            Self::open_with_execution_identity(
+                self,
+                authority,
+                session,
+                execution_identity,
+                turning_mode,
+                None,
+                transport,
+            ),
+        )
+        .await;
+        match opened {
+            Ok(Ok(pending)) => {
+                let session_id = pending.session_id().clone();
+                let pending_receipt = pending.pending_receipt().to_string();
+                Ok(MemberLiveExecutionOpen::new(
+                    pending.into_open(),
+                    session_id,
+                    pending_receipt,
+                ))
+            }
+            Ok(Err(error)) => Err(member_live_error_from_execution_open(error, transport)),
+            Err(_elapsed) => {
+                // An aborted strict open is retired as an unpublished one is:
+                // the authority's binding first, then the channel.
+                if let Some(channel_id) = self
+                    .runtime_adapter
+                    .live_active_channel_for_session(session)
+                    .await
+                    && let Err(error) = self
+                        .cleanup_execution_identity_publication_failure(
+                            authority,
+                            session,
+                            &channel_id,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        %error,
+                        channel = %channel_id,
+                        "aborted member execution-identity open left its channel for reconciliation"
+                    );
+                }
+                Err(MemberLiveError::Unavailable {
+                    reason: format!(
+                        "live open exceeded the member ceiling of {}s and was aborted fail-closed",
+                        MEMBER_LIVE_OPEN_CEILING.as_secs()
+                    ),
+                })
+            }
+        }
+    }
+
     async fn close(
         &self,
         session: &SessionId,
@@ -3068,6 +3200,39 @@ impl<B: SessionAgentBuilder + 'static> MemberLiveHost for ServiceMemberLiveHost<
             .await
             .map(|result| result.status)
             .map_err(member_live_error_from_verb)
+    }
+
+    /// A channel of `session` opened under a channel-scoped execution
+    /// identity closes through this host's execution-identity authority, as
+    /// a strict `live/close` closes one; any other channel closes as
+    /// [`MemberLiveHost::close`] closes it.
+    #[cfg(all(feature = "live-webrtc", feature = "openai-live"))]
+    async fn close_explicit(
+        &self,
+        session: &SessionId,
+        channel_id: &str,
+    ) -> Result<LiveCloseStatus, MemberLiveError> {
+        let channel = LiveChannelId::new(channel_id);
+        if let Some(authority) = self.execution_identity_authority.as_deref()
+            && self
+                .runtime_adapter
+                .live_session_for_status_channel(&channel)
+                .await
+                .as_ref()
+                == Some(session)
+            && matches!(
+                self.runtime_adapter
+                    .live_execution_channel_phase(session, &channel)
+                    .await,
+                Ok(Some(_))
+            )
+        {
+            return self
+                .close_live_channel(Some(authority), &channel)
+                .await
+                .map_err(member_live_error_from_execution_close);
+        }
+        MemberLiveHost::close(self, session, channel_id).await
     }
 
     async fn status(
@@ -3114,6 +3279,85 @@ impl<B: SessionAgentBuilder + 'static> MemberLiveHost for ServiceMemberLiveHost<
             )
             .await
             .map_err(member_live_error_from_verb)
+    }
+}
+
+/// Exhaustive projection of a member open under a channel-scoped execution
+/// identity onto the member live vocabulary: the open's own failures project
+/// as a stock open's do, and an authority refusal is the host's `Unavailable`
+/// with the authority's sanitized reason.
+#[cfg(feature = "openai-live")]
+fn member_live_error_from_execution_open(
+    error: ExperimentalLiveChannelOpenError,
+    transport: Option<LiveOpenTransport>,
+) -> MemberLiveError {
+    match error {
+        ExperimentalLiveChannelOpenError::InvalidTransport => {
+            MemberLiveError::TransportUnsupported {
+                requested: match transport {
+                    Some(LiveOpenTransport::Websocket) => "websocket",
+                    Some(LiveOpenTransport::Webrtc) => "webrtc",
+                    Some(_) => "unknown",
+                    None => "default",
+                }
+                .to_string(),
+            }
+        }
+        ExperimentalLiveChannelOpenError::Open(error) => member_live_error_from_open(error),
+        ExperimentalLiveChannelOpenError::Authority(
+            error @ ExperimentalLiveOpenAuthorityError::ChannelBindingFailed,
+        ) => MemberLiveError::Internal {
+            reason: error.to_string(),
+        },
+        ExperimentalLiveChannelOpenError::Authority(
+            error @ (ExperimentalLiveOpenAuthorityError::Unavailable
+            | ExperimentalLiveOpenAuthorityError::AccessDenied
+            | ExperimentalLiveOpenAuthorityError::DurableTargetUnavailable
+            | ExperimentalLiveOpenAuthorityError::MemberIneligible
+            | ExperimentalLiveOpenAuthorityError::InvalidExecutionIdentity
+            | ExperimentalLiveOpenAuthorityError::BindingUseDenied
+            | ExperimentalLiveOpenAuthorityError::AdmissionFailed),
+        ) => MemberLiveError::Unavailable {
+            reason: error.to_string(),
+        },
+        // Another open still holds the open-projection admission: transient,
+        // as for a stock open.
+        error @ ExperimentalLiveChannelOpenError::Projection(
+            RealtimeSessionOpenProjectionError::Backpressured,
+        ) => MemberLiveError::Unavailable {
+            reason: error.to_string(),
+        },
+        error @ (ExperimentalLiveChannelOpenError::Summary(_)
+        | ExperimentalLiveChannelOpenError::ExecutionProfile(_)) => MemberLiveError::Unavailable {
+            reason: error.to_string(),
+        },
+        error @ (ExperimentalLiveChannelOpenError::Projection(_)
+        | ExperimentalLiveChannelOpenError::BindingCleanup { .. }) => MemberLiveError::Internal {
+            reason: error.to_string(),
+        },
+    }
+}
+
+/// Exhaustive projection of an execution-identity channel's close onto the
+/// member live vocabulary.
+#[cfg(all(feature = "live-webrtc", feature = "openai-live"))]
+fn member_live_error_from_execution_close(
+    error: ExperimentalLiveChannelCloseError,
+) -> MemberLiveError {
+    match error {
+        ExperimentalLiveChannelCloseError::BindingMismatch => MemberLiveError::ChannelNotFound,
+        ExperimentalLiveChannelCloseError::Semantic(error) => member_live_error_from_verb(error),
+        error @ (ExperimentalLiveChannelCloseError::LifecycleAuthority(_)
+        | ExperimentalLiveChannelCloseError::PhysicalAuthority(_)) => {
+            MemberLiveError::Unavailable {
+                reason: error.to_string(),
+            }
+        }
+        error @ ExperimentalLiveChannelCloseError::TerminalProjection(_) => {
+            MemberLiveError::Internal {
+                reason: error.to_string(),
+            }
+        }
     }
 }
 

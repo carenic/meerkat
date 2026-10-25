@@ -293,6 +293,7 @@ fn profile_from_wire(profile: WireMobProfile) -> Result<Profile, meerkat_core::S
         max_inline_peer_notifications: profile.max_inline_peer_notifications,
         output_schema,
         provider_params: profile.provider_params.map(Into::into),
+        durable: profile.durable,
     })
 }
 
@@ -1237,15 +1238,9 @@ pub async fn handle_lifecycle(
             Err(MobMcpDestroyError::Mob(err)) => return mob_call_error(id, &err),
         },
     };
-    let destroy_report = match destroy_report {
-        Some(report) => match serde_json::to_value(&report) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                return invalid_params(id, format!("destroy report serialize: {err}"));
-            }
-        },
-        None => None,
-    };
+    let destroy_report = destroy_report
+        .as_ref()
+        .map(meerkat_contracts::WireMobDestroyReport::from);
     RpcResponse::success(
         id,
         MobLifecycleResult {
@@ -1292,6 +1287,40 @@ pub async fn handle_member_send(
         Ok(content) => content,
         Err(error) => return invalid_params(id, error),
     };
+    if let Some(key) = params.idempotency_key.as_deref() {
+        // A keyed send is a member continuation, which has no render slot.
+        if params.render_metadata.is_some() {
+            return invalid_params(id, "render_metadata does not combine with idempotency_key");
+        }
+        return match state
+            .mob_member_send_keyed(
+                &mob_id,
+                agent_identity.clone(),
+                content,
+                params.handling_mode.into(),
+                key,
+            )
+            .await
+        {
+            Ok(continuation) => {
+                let identity_str = agent_identity.to_string();
+                RpcResponse::success(
+                    id,
+                    MobMemberSendResult {
+                        mob_id: mob_id.to_string(),
+                        agent_identity: identity_str.clone(),
+                        member_ref: meerkat_contracts::WireMemberRef::encode(
+                            mob_id.as_str(),
+                            &identity_str,
+                        ),
+                        handling_mode: params.handling_mode,
+                        continuation: Some(continuation),
+                    },
+                )
+            }
+            Err(err) => mob_call_error(id, &err),
+        };
+    }
     match state
         .mob_member_send(
             &mob_id,
@@ -1314,6 +1343,7 @@ pub async fn handle_member_send(
                         &identity_str,
                     ),
                     handling_mode: receipt.handling_mode.into(),
+                    continuation: None,
                 },
             )
         }
@@ -1382,6 +1412,7 @@ pub async fn handle_ingress_interaction(
         agent_identity: identity_str.clone(),
         member_ref: meerkat_contracts::WireMemberRef::encode(mob_id.as_str(), &identity_str),
         handling_mode: receipt.handling_mode.into(),
+        continuation: None,
     };
     RpcResponse::success(
         id,
@@ -1993,25 +2024,14 @@ pub async fn handle_destroy(
         Err(resp) => return resp,
     };
     match state.mob_destroy(&mob_id).await {
-        Ok(report) => {
-            let report_value = match serde_json::to_value(&report) {
-                Ok(v) => v,
-                Err(err) => {
-                    return invalid_params(
-                        id,
-                        format!("failed to serialize MobDestroyReport: {err}"),
-                    );
-                }
-            };
-            RpcResponse::success(
-                id,
-                MobDestroyResult {
-                    mob_id: mob_id.to_string(),
-                    ok: true,
-                    destroy_report: report_value,
-                },
-            )
-        }
+        Ok(report) => RpcResponse::success(
+            id,
+            MobDestroyResult {
+                mob_id: mob_id.to_string(),
+                ok: true,
+                destroy_report: meerkat_contracts::WireMobDestroyReport::from(&report),
+            },
+        ),
         Err(MobMcpDestroyError::Incomplete { report }) => destroy_incomplete_response(id, &report),
         Err(MobMcpDestroyError::Mob(err)) => mob_call_error(id, &err),
     }
@@ -2931,6 +2951,7 @@ pub async fn handle_mob_turn_start(
         auth_binding: lower_turn_metadata_override(mob_params.auth_binding),
         injected_context,
         transient_turn_context: mob_params.transient_turn_context,
+        session_events: mob_params.session_events,
     };
 
     super::turn::start_turn_with_params(
@@ -3462,6 +3483,9 @@ pub async fn handle_stop_member_run(
     }
 }
 
+/// `mob/member_live_open` without an execution-identity authority: a
+/// request that names an `execution_identity` refuses as a strict
+/// `live/open` does on a host that composes no authority.
 pub async fn handle_member_live_open(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -3471,6 +3495,28 @@ pub async fn handle_member_live_open(
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
+    if params.execution_identity.is_some() {
+        return member_live_execution_identity_unavailable(id);
+    }
+    member_live_open_stock(id, params, state).await
+}
+
+fn member_live_execution_identity_unavailable(id: Option<RpcId>) -> RpcResponse {
+    RpcResponse::error(
+        id,
+        meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
+        format!(
+            "mob/member_live_open execution_identity requires negotiated capability '{}'",
+            meerkat_contracts::LIVE_EXECUTION_IDENTITY_V1_CAPABILITY
+        ),
+    )
+}
+
+async fn member_live_open_stock(
+    id: Option<RpcId>,
+    params: meerkat_contracts::wire::MobMemberLiveOpenParams,
+    state: &Arc<MobMcpState>,
+) -> RpcResponse {
     let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
         Ok(m) => m,
         Err(resp) => return resp,
@@ -3485,6 +3531,114 @@ pub async fn handle_member_live_open(
         // logged, or retained here.
         Ok(open) => RpcResponse::success(id, open),
         Err(err) => mob_call_error(id, &err),
+    }
+}
+
+/// `mob/member_live_open` on a router composed with an execution-identity
+/// authority. A request that names an `execution_identity` (for example
+/// `gpt-live-1`) opens the member's channel through its mob and that
+/// authority (the one behind the strict `live/open`), and this connection
+/// keeps the channel's playback custody as a strict `live/open` does, so
+/// its `live/webrtc/answer` completes here. The returned publication is
+/// cleaned up if the response is never delivered. Any other request is the
+/// stock member open.
+#[cfg(all(feature = "openai-live", feature = "live-webrtc"))]
+pub(crate) async fn handle_member_live_open_routed(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+    runtime: &SessionRuntime,
+    authority: Option<
+        &Arc<dyn meerkat::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider>,
+    >,
+    host: &meerkat_live::LiveAdapterHost,
+    playback_custodies: &super::live::ExperimentalLivePlaybackCustodies,
+) -> super::live::LiveOpenHandlerResult {
+    let params: meerkat_contracts::wire::MobMemberLiveOpenParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id).into(),
+    };
+    let Some(execution_identity) = params.execution_identity.clone() else {
+        return member_live_open_stock(id, params, state).await.into();
+    };
+    let Some(authority) = authority else {
+        return member_live_execution_identity_unavailable(id).into();
+    };
+    if params.transport != Some(meerkat_contracts::LiveOpenTransport::Webrtc) {
+        return RpcResponse::error(
+            id,
+            error::INVALID_PARAMS,
+            "mob/member_live_open execution_identity requires transport 'webrtc'",
+        )
+        .into();
+    }
+    let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
+        Ok(m) => m,
+        Err(resp) => return resp.into(),
+    };
+    let identity = AgentIdentity::from(params.agent_identity.as_str());
+    let opened = match state
+        .mob_member_live_open_with_execution_identity(
+            &mob_id,
+            identity,
+            execution_identity,
+            params.turning_mode,
+            params.transport,
+        )
+        .await
+    {
+        Ok(opened) => opened,
+        Err(err) => return mob_call_error(id, &err).into(),
+    };
+    let (open, session_id, pending_receipt) = opened.into_parts();
+    let channel_id = meerkat_live::LiveChannelId::new(&open.channel_id);
+    let published = match super::live::register_live_playback_custody(
+        runtime,
+        &session_id,
+        &channel_id,
+        &pending_receipt,
+        playback_custodies,
+    )
+    .await
+    {
+        Ok(()) => serde_json::to_value(&open)
+            .map_err(|error| format!("failed to serialize LiveOpenResult: {error}")),
+        Err(playback_error) => Err(format!(
+            "member execution-identity open playback authority registration failed: \
+             {playback_error}"
+        )),
+    };
+    match published {
+        Ok(value) => super::live::LiveOpenHandlerResult {
+            response: RpcResponse::success(id, value),
+            experimental_publication: Some(super::live::ExperimentalLiveOpenPublication {
+                session_id,
+                channel_id,
+                authority: Arc::clone(authority),
+            }),
+        },
+        // Retire the channel this connection cannot publish exactly as an
+        // unpublished strict `live/open` is retired.
+        Err(detail) => {
+            playback_custodies.lock().await.remove(&channel_id);
+            let cleanup = runtime
+                .cleanup_experimental_live_channel_after_publication_failure(
+                    host,
+                    authority.as_ref(),
+                    &session_id,
+                    &channel_id,
+                )
+                .await;
+            match cleanup {
+                Ok(()) => RpcResponse::error(id, error::INTERNAL_ERROR, detail),
+                Err(cleanup_error) => RpcResponse::error(
+                    id,
+                    error::INTERNAL_ERROR,
+                    format!("{detail}; cleanup failed: {cleanup_error}"),
+                ),
+            }
+            .into()
+        }
     }
 }
 
@@ -3574,6 +3728,35 @@ mod tests {
     };
     use std::sync::Arc;
 
+    /// A spawn's override profile keeps its durable worker flag across the
+    /// wire form, both ways.
+    #[test]
+    fn override_profile_keeps_the_durable_worker_flag_across_the_wire() {
+        let durable: Profile = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5",
+            "durable": true
+        }))
+        .expect("durable profile");
+        let wire = meerkat_mob::profile_to_wire(&durable);
+        assert!(wire.durable);
+        assert!(profile_from_wire(wire).expect("decode").durable);
+
+        let ordinary: Profile = serde_json::from_value(serde_json::json!({
+            "model": "claude-sonnet-4-5"
+        }))
+        .expect("ordinary profile");
+        let wire = meerkat_mob::profile_to_wire(&ordinary);
+        assert!(!wire.durable);
+        assert!(
+            serde_json::to_value(&wire)
+                .expect("encode")
+                .get("durable")
+                .is_none(),
+            "an ordinary wire profile does not write the field"
+        );
+        assert!(!profile_from_wire(wire).expect("decode").durable);
+    }
+
     fn rpc_destroy_test_definition(mob_id: &MobId) -> MobDefinition {
         let mut profiles = BTreeMap::new();
         profiles.insert(
@@ -3595,6 +3778,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         let mut definition = MobDefinition::explicit(mob_id.clone());
@@ -3813,6 +3997,137 @@ mod tests {
             spawned_helpers, 0,
             "a refused autonomous helper must never be spawned"
         );
+    }
+
+    /// `mob/adopt_member_identity_declaration` on a mob whose runtime has no
+    /// persistent store (the in-memory state runs every mob on an ephemeral
+    /// runtime) answers the typed refusal, `CAPABILITY_UNAVAILABLE` with
+    /// `data.kind` `mob_identity_adoption_requires_persistent_runtime`, and
+    /// the member stays as it was.
+    #[tokio::test]
+    async fn adopt_member_identity_declaration_on_an_ephemeral_runtime_answers_the_typed_refusal() {
+        let mob_id = MobId::from("rpc-ephemeral-adoption");
+        let member = AgentIdentity::from("worker-1");
+        let state = MobMcpState::new_in_memory();
+        // Mob members need comms; the shared fixture profile leaves it off.
+        let mut definition = rpc_destroy_test_definition(&mob_id);
+        if let Some(meerkat_mob::ProfileBinding::Inline(profile)) = definition
+            .profiles
+            .get_mut(&meerkat_mob::ProfileName::from("worker"))
+        {
+            profile.tools.comms = true;
+        }
+        let handle = MobBuilder::new(definition, MobStorage::in_memory())
+            .with_session_service(state.session_service())
+            .allow_ephemeral_sessions(true)
+            .create()
+            .await
+            .expect("create the mob");
+        state
+            .mob_insert_handle(mob_id.clone(), handle.clone())
+            .await;
+        let mut spawn = meerkat_mob::SpawnMemberSpec::new("worker", member.clone());
+        spawn.runtime_mode = Some(MobRuntimeMode::TurnDriven);
+        handle
+            .spawn_spec(spawn)
+            .await
+            .expect("spawn the member to adopt");
+        let attached = handle
+            .get_member(&member)
+            .await
+            .expect("read the member")
+            .expect("the member is attached");
+        let session_id = attached
+            .bridge_session_id()
+            .cloned()
+            .expect("session-backed member");
+        let adoption = meerkat_mob::AdoptMemberIdentityDeclaration {
+            mob_id: mob_id.clone(),
+            agent_identity: member.clone(),
+            request_id: meerkat_mob::IdentityAdoptionId::new("adopt-on-ephemeral-runtime")
+                .expect("valid adoption id"),
+            precondition: meerkat_mob::IdentityAdoptionPrecondition::ExpectedAbsent,
+            declaration_scope: meerkat_mob::IdentityDeclarationScopeId::new("example")
+                .expect("valid declaration scope"),
+            declaration_revision: 1,
+            session: meerkat_mob::DesiredSessionTarget {
+                session_id: session_id.clone(),
+                lineage_id: meerkat_core::SessionLineageId::for_session(&session_id),
+                lineage_generation: meerkat_core::SessionGeneration::INITIAL,
+                authority_policy: meerkat_mob::DesiredSessionAuthorityPolicy::RequireExisting,
+            },
+            member: meerkat_mob::IdentityProfileMemberDeclaration {
+                profile_name: meerkat_mob::ProfileName::from("worker"),
+                profile_override: None,
+                model_override: None,
+                external_addressable_override: None,
+                context: None,
+                labels: None,
+                additional_instructions: None,
+                system_prompt_override: None,
+                tool_access_policy: None,
+                auth_binding: None,
+                budget_limits: None,
+                runtime_mode: Some(meerkat_contracts::wire::WireMobRuntimeMode::TurnDriven),
+                required_env_keys: Vec::new(),
+                required_local_callback_tools: Vec::new(),
+                execution: meerkat_mob::DesiredExecution::ControllingSession,
+            },
+            wiring_custody: meerkat_mob::identity::IdentityWiringCustody::ExternalManaged,
+            owned_wiring: std::collections::BTreeSet::new(),
+            convergence: meerkat_mob::IdentityConvergenceMode::Drain { max_wait_ms: 5_000 },
+        };
+        let params = serde_json::to_value(&adoption).expect("encode the adoption request");
+        let raw = serde_json::value::RawValue::from_string(params.to_string())
+            .expect("serialize adoption params");
+
+        let response =
+            handle_adopt_member_identity_declaration(Some(RpcId::Num(21)), Some(&raw), &state)
+                .await;
+
+        let error = response.error.unwrap_or_else(|| {
+            panic!(
+                "adoption on an ephemeral runtime was accepted: {:?}",
+                response.result
+            )
+        });
+        assert_eq!(
+            error.code,
+            meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
+            "{}",
+            error.message
+        );
+        let data = error.data.expect("typed refusal data");
+        assert_eq!(
+            data.get("kind").and_then(serde_json::Value::as_str),
+            Some("mob_identity_adoption_requires_persistent_runtime")
+        );
+        assert_eq!(
+            data.get("member_id").and_then(serde_json::Value::as_str),
+            Some(member.as_str())
+        );
+        assert_eq!(
+            handle
+                .get_member(&member)
+                .await
+                .expect("read the member after the refusal"),
+            Some(attached),
+            "the member stays attached as it was"
+        );
+        let retired = handle
+            .events()
+            .replay_all()
+            .await
+            .expect("replay the mob events")
+            .into_iter()
+            .any(|event| {
+                matches!(
+                    &event.kind,
+                    meerkat_mob::event::MobEventKind::MemberRetired { agent_identity, .. }
+                        if agent_identity == &member
+                )
+            });
+        assert!(!retired, "a refused adoption retires nothing");
     }
 
     fn assert_destroy_incomplete_rpc_error_with_message(
@@ -4404,6 +4719,7 @@ mod tests {
             auth_binding: lower_turn_metadata_override(mob_params.auth_binding),
             injected_context: None,
             transient_turn_context: mob_params.transient_turn_context,
+            session_events: mob_params.session_events,
         };
 
         assert_eq!(turn_params.session_id, "resolved-session-123");

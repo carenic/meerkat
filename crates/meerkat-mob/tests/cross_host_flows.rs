@@ -16,6 +16,7 @@
 #![cfg(not(target_arch = "wasm32"))]
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod governed_peer_support;
 mod support;
 
 use std::time::Duration;
@@ -36,10 +37,10 @@ use support::{
     raw_deliver_member_input_command, raw_poll_member_events_command_with_outcome_protocol,
     sample_materialize_payload, sample_portable_member_spec,
     scripted_member_client_calling_tool_then_completing, scripted_member_client_completing,
-    scripted_member_client_stalling, single_step_flow, single_step_flow_with_blocked_tools,
-    single_step_flow_with_timeout, spawn_host_daemon_fixture, spawn_peer_comms_endpoint,
-    spawn_scripted_host_peer, spawn_scripted_member_turn_responder, wait_for_flow_run_terminal,
-    wait_until,
+    scripted_member_client_completing_recorded, scripted_member_client_stalling, single_step_flow,
+    single_step_flow_with_blocked_tools, single_step_flow_with_timeout, spawn_host_daemon_fixture,
+    spawn_peer_comms_endpoint, spawn_scripted_host_peer, spawn_scripted_member_turn_responder,
+    wait_for_flow_run_terminal, wait_until,
 };
 
 const RUN_WAIT: Duration = Duration::from_secs(60);
@@ -2085,6 +2086,44 @@ async fn stop_member_run_stops_live_local_run_by_its_run_started_id() {
 }
 
 // ==========================================================================
+// The fail-stop restart fixture refuses a cut with a turn in flight
+// ==========================================================================
+
+/// `restart_after_actor_fail_stop` stands in for a process exit, which
+/// writes nothing. Its session service shutdown would end a turn in flight
+/// with RunFailed, so a restart over that cut would read a shutdown's
+/// outcome, not a crash's. The fixture refuses the cut by name instead.
+#[tokio::test(flavor = "multi_thread")]
+#[should_panic(expected = "have a turn in flight")]
+async fn a_fail_stop_restart_refuses_a_cut_with_a_turn_in_flight() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let gate = StallGate::new();
+    let controlling = support::create_controlling_mob_with_local_llm_client(
+        "xhf-fail-stop-cut",
+        scripted_member_client_stalling(gate.clone()),
+    )
+    .await;
+    controlling
+        .handle
+        .spawn_spec(
+            meerkat_mob::SpawnMemberSpec::new("worker", "a12c")
+                .with_backend(meerkat_mob::MobBackendKind::Session),
+        )
+        .await
+        .expect("spawn local worker a12c");
+    controlling
+        .handle
+        .member(&identity("a12c"))
+        .await
+        .expect("member handle for a12c")
+        .send("stall forever", meerkat_core::HandlingMode::Queue)
+        .await
+        .expect("stalled local turn is admitted");
+    gate.wait_until_entered().await;
+    let _restarted = controlling.restart_after_actor_fail_stop().await;
+}
+
+// ==========================================================================
 // T-F11b - run-fenced Stop of a live placed-member run by its run_started id
 // ==========================================================================
 
@@ -2234,5 +2273,409 @@ async fn stop_member_run_stops_live_placed_run_by_its_run_started_id() {
     );
 
     gate.release();
+    fixture.shutdown().await;
+}
+
+// ==========================================================================
+// A placed member resumed on its member host delivers its first turn only
+// while the adopted session owes it (the host reads the session and reports
+// it on the materialize ack).
+// ==========================================================================
+
+/// A placed spawn of `member` that resumes `session_id` on `host_id`.
+fn placed_resume_of(
+    member: &AgentIdentity,
+    host_id: &str,
+    session_id: &str,
+    runtime_mode: meerkat_mob::MobRuntimeMode,
+    initial_message: Option<&str>,
+) -> meerkat_mob::SpawnMemberSpec {
+    let mut spec = support::placed_spawn_spec("worker", member.as_str(), host_id);
+    spec.runtime_mode = Some(runtime_mode);
+    spec.launch_mode = meerkat_mob::launch::MemberLaunchMode::Resume {
+        bridge_session_id: meerkat_core::SessionId::parse(session_id).expect("member session id"),
+        resume_from_role: None,
+    };
+    match initial_message {
+        Some(message) => spec.with_initial_message(message.to_string()),
+        None => spec,
+    }
+}
+
+async fn member_row(
+    fixture: &support::HostDaemonFixture,
+    mob_id: &str,
+    member: &AgentIdentity,
+) -> meerkat_mob::runtime::host_actor::MaterializedMemberRow {
+    fixture
+        .host_binding_record(mob_id)
+        .await
+        .materialized
+        .get(member.as_str())
+        .cloned()
+        .expect("materialized member row")
+}
+
+fn request_count(requests: &std::sync::Mutex<Vec<Vec<meerkat_core::Message>>>) -> usize {
+    requests.lock().expect("member request log").len()
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_autonomous_member_resumed_on_its_host_runs_no_second_kickoff() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut opts = HostFixtureOptions::named("xhf-resume-started-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing_recorded(
+        "resume-done",
+        std::sync::Arc::clone(&requests),
+    ));
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhf-resume-started").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    let member = identity("resumed-worker");
+
+    let mut spec = support::placed_spawn_spec("worker", member.as_str(), &report.host_id)
+        .with_initial_message("PLACED_KICKOFF token-kappa".to_string());
+    spec.runtime_mode = Some(meerkat_mob::MobRuntimeMode::AutonomousHost);
+    controlling
+        .handle
+        .spawn_spec(spec)
+        .await
+        .expect("placed autonomous member materializes");
+    controlling
+        .handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&member), Some(RUN_WAIT))
+        .await
+        .expect("the fresh kickoff completes");
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the fresh spawn ran its kickoff"
+    );
+    let session_id = member_row(&fixture, &mob_id, &member).await.session_id;
+
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member");
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::AutonomousHost,
+            Some("PLACED_KICKOFF token-kappa"),
+        ))
+        .await
+        .expect("the placed member resumes on its host");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the resume of a started session runs no second kickoff"
+    );
+    let row = member_row(&fixture, &mob_id, &member).await;
+    assert_eq!(row.session_id, session_id);
+    assert_eq!(
+        row.adopted_first_turn,
+        Some(meerkat_mob::runtime::bridge_protocol::BridgeAdoptedFirstTurn::Started)
+    );
+
+    fixture.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn a_placed_turn_driven_member_resumed_on_its_host_delivers_its_first_turn_once() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let mut opts = HostFixtureOptions::named("xhf-resume-owed-host").with_member_build();
+    opts.member_llm_client = Some(scripted_member_client_completing_recorded(
+        "resume-owed-done",
+        std::sync::Arc::clone(&requests),
+    ));
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhf-resume-owed").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    let member = identity("owed-worker");
+
+    // A turn-driven member spawned without a message never starts a turn.
+    controlling
+        .handle
+        .spawn_spec(support::placed_spawn_spec(
+            "worker",
+            member.as_str(),
+            &report.host_id,
+        ))
+        .await
+        .expect("placed turn-driven member materializes");
+    let session_id = member_row(&fixture, &mob_id, &member).await.session_id;
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member");
+
+    // Its session still owes the first turn: the resume delivers it once.
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::TurnDriven,
+            Some("PLACED_FIRST_TURN token-lambda"),
+        ))
+        .await
+        .expect("the owed resume commits");
+    wait_until("the owed first turn runs", || {
+        let requests = std::sync::Arc::clone(&requests);
+        async move { request_count(&requests) == 1 }
+    })
+    .await;
+    controlling
+        .handle
+        .retire(member.clone())
+        .await
+        .expect("retire the placed member again");
+
+    // Now it has started: a later resume delivers nothing.
+    controlling
+        .handle
+        .spawn_spec(placed_resume_of(
+            &member,
+            &report.host_id,
+            &session_id,
+            meerkat_mob::MobRuntimeMode::TurnDriven,
+            Some("PLACED_FIRST_TURN token-lambda"),
+        ))
+        .await
+        .expect("the second resume commits");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        request_count(&requests),
+        1,
+        "the first turn ran exactly once over both resumes"
+    );
+    assert_eq!(
+        member_row(&fixture, &mob_id, &member)
+            .await
+            .adopted_first_turn,
+        Some(meerkat_mob::runtime::bridge_protocol::BridgeAdoptedFirstTurn::Started)
+    );
+
+    fixture.shutdown().await;
+}
+
+// ==========================================================================
+// A governed placed member: the supervisor's deliveries bind through the
+// member host's peer ingress binder, end to end through the controlling mob
+// ==========================================================================
+
+/// A placed member on a governed host takes the controlling mob's deliveries
+/// through the host's peer ingress binder, end to end:
+/// - an untracked delivery passes the supervisor's own response check: the
+///   member admits it under its payload input id, and the tracked read of
+///   that id finds the governed row;
+/// - a tracked delivery sent while the member's previous turn still holds its
+///   turn boundary is bound once that turn ends, and its completion reaches
+///   the supervisor;
+/// - the tracked cancel a stop sends ends a held tracked turn on the member
+///   (a `Cancelled` host receipt, never `NoEffect`).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_governed_placed_member_takes_supervisor_deliveries_end_to_end() {
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let governed = governed_peer_support::GovernedMember::new();
+    let client = governed.client();
+    let mut opts = HostFixtureOptions::named("xhf-governed-host-b").with_member_build();
+    opts.member_llm_client = Some(client.clone());
+    opts.governed_member = Some(governed.clone());
+    let fixture = spawn_host_daemon_fixture(opts)
+        .await
+        .expect("spawn the governed member host");
+    let controlling = create_controlling_mob("xhf-governed").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    let worker = identity("governed-b1");
+    controlling
+        .spawn_placed("worker", worker.as_str(), &report.host_id)
+        .await
+        .expect("the governed member materializes on host B");
+    let session_id = controlling
+        .handle
+        .get_member(&worker)
+        .await
+        .expect("roster read")
+        .expect("placed member")
+        .bridge_session_id()
+        .expect("placed member names its remote session")
+        .clone();
+    let machine = fixture
+        .member_session_service()
+        .acquire_runtime_adapter(None)
+        .expect("member runtime")
+        .expect("member runtime adapter");
+    let member = controlling
+        .handle
+        .member(&worker)
+        .await
+        .expect("member handle");
+
+    // Untracked: the supervisor checks the member's answer against the payload
+    // input id it sent, and the governed row is admitted under that id. Its
+    // turn is held in its controller call, so the tracked delivery below
+    // arrives while the member's turn boundary is held.
+    client.hold();
+    let entered = client.governed_entered();
+    member
+        .send(
+            "an untracked governed delivery",
+            meerkat_core::types::HandlingMode::Queue,
+        )
+        .await
+        .expect("the supervisor reads the governed member's answer under its payload input id");
+    wait_until("the untracked turn reaches its controller", || {
+        let client = client.clone();
+        async move { client.governed_entered() > entered }
+    })
+    .await;
+    let offered = governed.supervisor_calls();
+    let [untracked] = offered.as_slice() else {
+        panic!("one supervisor delivery offered: {offered:?}");
+    };
+    assert_eq!(untracked.supervisor_tracked, Some(false));
+    assert_eq!(
+        untracked.input_id, untracked.event_key,
+        "a supervisor delivery keeps its payload input id"
+    );
+    let stored = machine
+        .tracked_delivery_input_state(&session_id, &untracked.event_key)
+        .await
+        .expect("tracked read")
+        .expect("the payload input id reads the governed row");
+    assert_eq!(stored.state.input_id.to_string(), untracked.event_key);
+    assert!(
+        stored
+            .state
+            .idempotency_key
+            .as_ref()
+            .is_some_and(|admitted| admitted.0 != untracked.event_key),
+        "a governed row is admitted under its key's qualification"
+    );
+    assert!(stored.admitted_under_idempotency_key(&untracked.event_key));
+    assert!(!stored.admitted_under_idempotency_key(&uuid::Uuid::new_v4().to_string()));
+
+    // Tracked, sent while the untracked turn still holds the member's turn
+    // boundary: the binding waits for that turn to end, then the member host
+    // journals the governed turn's terminal and the completion reaches the
+    // supervisor.
+    let tracked_turn = {
+        let handle = controlling.handle.clone();
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            handle
+                .member(&worker)
+                .await?
+                .internal_turn("a tracked governed delivery")
+                .await
+        })
+    };
+    wait_until(
+        "the tracked delivery is offered while the member is busy",
+        || {
+            let governed = std::sync::Arc::clone(&governed);
+            async move { governed.supervisor_calls().len() == 2 }
+        },
+    )
+    .await;
+    client.release();
+    tokio::time::timeout(RUN_WAIT, tracked_turn)
+        .await
+        .expect("the tracked completion is bounded")
+        .expect("the tracked turn's task")
+        .expect("the tracked governed turn's completion reaches the supervisor");
+    let tracked = governed
+        .supervisor_calls()
+        .last()
+        .cloned()
+        .expect("the tracked delivery was offered");
+    assert_eq!(tracked.supervisor_tracked, Some(true));
+    assert_eq!(tracked.input_id, tracked.event_key);
+
+    // A tracked turn held in its controller call: the tracked cancel the stop
+    // sends reaches it on the member host.
+    client.hold();
+    let entered = client.governed_entered();
+    let held_turn = {
+        let handle = controlling.handle.clone();
+        let worker = worker.clone();
+        tokio::spawn(async move {
+            handle
+                .member(&worker)
+                .await?
+                .internal_turn("a held tracked governed delivery")
+                .await
+        })
+    };
+    wait_until("the held tracked turn reaches its controller", || {
+        let client = client.clone();
+        async move { client.governed_entered() > entered }
+    })
+    .await;
+    let held = governed
+        .supervisor_calls()
+        .last()
+        .cloned()
+        .expect("the held delivery was offered");
+    assert_eq!(held.supervisor_tracked, Some(true));
+    assert_ne!(held.event_key, tracked.event_key);
+    controlling
+        .handle
+        .stop()
+        .await
+        .expect("stop the controlling mob");
+    wait_until("the tracked cancel ends the held turn", || {
+        let machine = machine.clone();
+        let session_id = session_id.clone();
+        let key = held.event_key.clone();
+        async move {
+            machine
+                .tracked_delivery_input_state(&session_id, &key)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|stored| stored.seed.terminal_outcome.is_some())
+        }
+    })
+    .await;
+    let record = fixture.host_binding_record(&mob_id).await;
+    let receipts = record
+        .tracked_input_cancellations
+        .get(worker.as_str())
+        .cloned()
+        .unwrap_or_default();
+    assert!(
+        receipts
+            .iter()
+            .any(|receipt| receipt.input_id == held.event_key
+                && receipt.outcome
+                    == meerkat_mob::runtime::host_actor::RecordedTrackedInputCancelKind::Cancelled),
+        "the member host cancelled the held governed turn: {receipts:?}"
+    );
+
+    client.release();
+    let _ = tokio::time::timeout(RUN_WAIT, held_turn).await;
+    assert_eq!(
+        client.ungoverned(),
+        0,
+        "every member turn ran as governed work"
+    );
     fixture.shutdown().await;
 }

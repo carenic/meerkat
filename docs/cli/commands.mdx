@@ -340,6 +340,7 @@ rkat session list [--limit <N>] [--offset <N>] [--label <KEY=VALUE>]
 rkat session show <SESSION_ID>
 rkat session export-atif <SESSION_ID> [--output <FILE>]
 rkat session repair-wholeblob <SESSION_ID> [--apply [--accept-shorter]] [--runtime-store <FILE>] [--json]
+rkat session resolve-held-tail <SESSION_ID> [--apply] [--runtime-store <FILE>] [--json]
 rkat session delete <SESSION_ID>
 rkat session interrupt <SESSION_ID>
 ```
@@ -355,6 +356,20 @@ committed session boundary.
 `session repair-wholeblob` diagnoses, and with `--apply` repairs, a WholeBlob
 session whose every send reports `reload_required`; see
 [Storage operations](/guides/storage-operations#repair-a-wholeblob-session-wedged-on-its-audited-endpoint).
+
+`session resolve-held-tail` reports why durable-tail recovery holds a
+session's tail as ambiguous (`tail_held_for_recovery`), or holds an
+interrupted tail beside inputs another run left staged or queued (a shape
+only pre-release builds of 0.9.5, or a store fault, leave), and what the
+repair keeps, answers, ends and requeues. With `--apply` it commits a repair
+the runtime machine authorizes as an interrupted run. Stop every host of the
+session first: the repair is refused while the persisted lifecycle row is
+not quiescent, and an idle live host is not detected. A row a host left
+`Stopped` when it ended before unregistering (no current run, no unregister
+in progress) counts as the `Idle` row a start would normalize it to: the
+report says so, and `--apply` writes it with the repair. The command never
+retries.
+See [Storage operations](/guides/storage-operations).
 
 Meerkat supports ordinary durable-state opens from 0.8.10 onward. For an older
 SQLite realm, stop every process that can access it and run the explicit
@@ -767,12 +782,15 @@ Multi-host notes:
   live URL and single-use token — to **stdout only**; stderr carries a
   token-free note. The socket it names is the input plane: there is no
   `live send` verb.
-- Member live channels are WebSocket-only in the current runtime. The shared
-  CLI transport enum accepts `--transport webrtc`, but the member host rejects
-  that selection. Session-scoped JSON-RPC `live/open` plus
-  `live/webrtc/answer` supports WebRTC only when the caller can address the
-  owning session directly. Controller `session/*` methods do not proxy a
-  placed member's host-local session in multi-host v1.
+- `--transport` is the member's own live host's to serve or refuse. A member
+  host started by `rkat mob host` serves WebSocket only, so it refuses
+  `--transport webrtc` (`LiveTransportUnsupported`), and the one-shot CLI
+  composes no live host for a member it runs itself. WebRTC to a member goes
+  through JSON-RPC `mob/member_live_open` with `transport: "webrtc"` and
+  `live/webrtc/answer` on the same server.
+  Session-scoped `live/open` refuses a mob member's session, and controller
+  `session/*` methods do not proxy a placed member's host-local session in
+  multi-host v1.
 - Mob verbs exit with typed codes: scope denied `45`, host unavailable
   `46`, stale cursor `47`, stale fence `48`, and stale delivery scope `56`
   (the member's session rotated under a still-current fence; capture the

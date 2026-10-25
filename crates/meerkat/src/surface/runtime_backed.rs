@@ -229,7 +229,7 @@ pub(crate) fn install_default_mcp_auth_resolver(
     )
 }
 
-/// [`install_default_mcp_auth_resolver`] for a host's builder whose sessions
+/// `install_default_mcp_auth_resolver` for a host's builder whose sessions
 /// run in `storage`'s realm but whose configuration is a snapshot, without
 /// the head config store and realm inheritance that let the builder name a
 /// server's defining realm (such a builder's own custody answers every
@@ -593,6 +593,14 @@ async fn run_runtime_backed_initial_turn_with_machine_boundary_mode<
     result.map_err(|(error, _admission)| SurfaceRuntimeMaterializeError::Session(error))
 }
 
+/// Roll back a prepared registration. The registration it inserted keeps
+/// every input it recovered from the store exactly as the store holds it, so
+/// a materialization refused before it served (a durable tail held for
+/// recovery, a failed agent build) ends nothing a later start would run. If
+/// the registration admitted live work (an admission, a deduplicated
+/// resubmission, a recycle), the machine stops every input instead, so a
+/// turn its caller saw refused never runs later. A direct initial turn
+/// leaves no input to keep or stop.
 async fn rollback_prepared_runtime_registration(
     prepared: &mut meerkat_runtime::PreparedSessionMaterialization,
 ) {
@@ -1225,6 +1233,9 @@ async fn materialize_prepared_session_actor_transaction_with_admission<
             &actor_witness_slot,
         )
         .await;
+    // Refused before it admitted anything: the rollback keeps every input the
+    // registration recovered, so a held durable tail stays held with its
+    // inputs open.
     let result = match create_result {
         Ok(result) => result,
         Err(error) => {
@@ -2211,35 +2222,37 @@ impl<B: SessionAgentBuilder + 'static> PersistentRuntimeExecutor<B> {
         self
     }
 
+    /// After the actor answered `NotFound`: is the session still committed and
+    /// not archived? Body-free, from the RuntimeStore's own observation
+    /// (`observe_live_durable_source`), so a run that holds a provisional
+    /// tail ahead of the committed snapshot cannot turn the answer into a
+    /// revision conflict.
     async fn authoritative_non_archived_session_after_not_found<F>(
         &self,
         not_found: &SessionError,
         authority_failure: F,
-    ) -> Result<Session, CoreExecutorError>
+    ) -> Result<(), CoreExecutorError>
     where
         F: Fn(String) -> CoreExecutorError,
     {
-        let Some(session) = self
+        match self
             .service
-            .load_authoritative_session(&self.session_id)
-            .await
-            .map_err(|error| authority_failure(error.to_string()))?
-        else {
-            return Err(CoreExecutorError::session_unavailable_requires_teardown(
-                not_found.to_string(),
-            ));
-        };
-        if self
-            .service
-            .session_archived_by_authority(&self.session_id, &session)
+            .observe_live_durable_source(&self.session_id)
             .await
             .map_err(|error| authority_failure(error.to_string()))?
         {
-            return Err(CoreExecutorError::archived_session_requires_teardown(
-                not_found.to_string(),
-            ));
+            meerkat_session::LiveDurableSourceObservation::Absent => Err(
+                CoreExecutorError::session_unavailable_requires_teardown(not_found.to_string()),
+            ),
+            meerkat_session::LiveDurableSourceObservation::Archived => Err(
+                CoreExecutorError::archived_session_requires_teardown(not_found.to_string()),
+            ),
+            meerkat_session::LiveDurableSourceObservation::Committed { .. } => Ok(()),
+            other => Err(authority_failure(format!(
+                "session {} has a durable source observation this build does not know: {other:?}",
+                self.session_id
+            ))),
         }
-        Ok(session)
     }
 }
 
@@ -2399,7 +2412,7 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
                     .await
                 {
                     Err(teardown) => Err(teardown),
-                    Ok(_) => Err(CoreExecutorError::session_unavailable_requires_teardown(
+                    Ok(()) => Err(CoreExecutorError::session_unavailable_requires_teardown(
                         error.to_string(),
                     )),
                 }
@@ -2446,6 +2459,16 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutor for PersistentRuntimeExecuto
     ) -> Result<(), CoreExecutorError> {
         self.service
             .reconcile_runtime_compaction_projections(&self.session_id, intents.to_vec())
+            .await
+            .map_err(|error| CoreExecutorError::Internal(error.to_string()))
+    }
+
+    async fn acknowledge_compaction_finalization(
+        &mut self,
+        authority: &meerkat_core::CommittedSessionBoundaryAuthority,
+    ) -> Result<(), CoreExecutorError> {
+        self.service
+            .acknowledge_runtime_compaction_finalization(&self.session_id, authority)
             .await
             .map_err(|error| CoreExecutorError::Internal(error.to_string()))
     }
@@ -5597,6 +5620,14 @@ mod tests {
             ) -> Result<(), CoreExecutorError> {
                 self.inner
                     .reconcile_committed_compaction_projections(intents)
+                    .await
+            }
+            async fn acknowledge_compaction_finalization(
+                &mut self,
+                authority: &CommittedSessionBoundaryAuthority,
+            ) -> Result<(), CoreExecutorError> {
+                self.inner
+                    .acknowledge_compaction_finalization(authority)
                     .await
             }
             async fn abort_uncommitted_compaction_projections(

@@ -68,6 +68,7 @@ rkat session delete <ID>
 rkat session interrupt <ID>
 rkat session export-atif <ID> [--output <FILE>]   # ATIF trajectory; default realm trajectory dir
 rkat session repair-wholeblob <ID> [--apply [--accept-shorter]] [--runtime-store <FILE>] [--json]  # diagnose by default
+rkat session resolve-held-tail <ID> [--apply] [--runtime-store <FILE>] [--json]  # report by default
 rkat blob get <BLOB-ID> [--output <FILE>] [--json]
 rkat realm current|list|show|create|delete|prune ...
 rkat realm govern|grant|revoke-grant <REALM> ...  # governed realms (see below)
@@ -580,10 +581,14 @@ Multi-host operator control:
 - `mob/bind_host`, `mob/revoke_host`, `mob/hard_cancel_member`
 - `mob/member_live_open`, `mob/member_live_close`, `mob/member_live_status`, `mob/member_live_control`
 
-The mob member-live family is WebSocket-only for both local and placed
-members. Session-scoped `live/*` can use WebRTC only for a session local to the
-RPC host; the controller's generic session surface cannot proxy a placed
-member's remote session.
+The mob member-live family leaves the transport to the member's own live host,
+for local and placed members alike: `transport: "webrtc"` returns a WebRTC
+bootstrap answered with `live/webrtc/answer` on the same server, and a host
+that serves no WebRTC refuses it (`LiveTransportUnsupported`; a member host
+started by `rkat mob host` serves WebSocket only). `execution_identity`
+(gpt-live-1) is served for a member local to the server. Session-scoped
+`live/open` refuses a mob member's session, and the controller's generic
+session surface cannot proxy a placed member's remote session.
 
 Flows:
 

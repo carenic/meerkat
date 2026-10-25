@@ -13,9 +13,10 @@
 # fails otherwise. With the counters left out the reachable space is finite,
 # so each run explores all of it, with no step bound. It checks two runs over
 # their whole space with TLC coverage:
-# - the lifecycle run (AuditSpec) with its three action properties and the two
+# - the lifecycle run (AuditSpec) with its four action properties and the two
 #   invariants that check the reasons of its not-covered list;
-# - the scope run (AuditScopeSpec) with its two RetireAtScope invariants.
+# - the scope run (AuditScopeSpec) with its two RetireAtScope invariants and
+#   the two destroy action properties.
 # Each run must finish without an error, reach at least its floor of distinct
 # states (so a guard that silently disables arms fails the lane instead of
 # shrinking the space), and fire every action of its covered list (TLC
@@ -23,7 +24,7 @@
 # space once per reachability witness, with that witness's negation as an
 # extra invariant (a state goal) or action property (a step goal), and
 # requires TLC to report exactly that violation, so the properties are not
-# vacuous. With --mutants it then seeds seven defects into a copy of the
+# vacuous. With --mutants it then seeds ten defects into a copy of the
 # generated model and requires TLC to refuse each: a progress arm without its
 # observation_monotonic guard (AuditObservationMonotonic); the same guard
 # rendered as a plain `<=` between option records, which TLC cannot evaluate
@@ -38,8 +39,11 @@
 # RetireAtScope Current arm without its runtime and fence guards
 # (AuditRetireAtScopeCoherent); and the StaleFenceToken arm without its
 # mapped guard, which then overlaps NoCurrentIncarnation
-# (AuditRetireAtScopeExactlyOne); and the roster recovery keeping the
-# predecessor's execution-health entries (AuditMintClearsExecutionHealth).
+# (AuditRetireAtScopeExactlyOne); the roster recovery keeping the
+# predecessor's execution-health entries (AuditMintClearsExecutionHealth);
+# a runtime destroy observation that ends the mob, one that leaves its
+# runtime live, and one that resets the mob's run count
+# (AuditRuntimeDestroyedRemovesOnlyItsRuntime).
 # An anchor this script
 # expects but cannot find fails the run. Each TLC run is held to the
 # canonical lane's per-run cap (tlc_run_cap.sh) and fails closed as TLC
@@ -53,12 +57,15 @@ if [[ "${1:-}" == "--mutants" ]]; then
 fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane.
-lifecycle_states=59607
+lifecycle_states=79476
 min_distinct_states=$(( lifecycle_states * 9 / 10 ))
-scope_states=3223
+scope_states=5908
 min_scope_distinct_states=$(( scope_states * 9 / 10 ))
 
 # Every lifecycle-run arm the audit's domains can enable; each must fire.
+# AuditStartRun is StartRunRunning held to one run at a time: TLC names a
+# guarded arm after the audit's wrapper, so its coverage line is of this
+# audit's module.
 covered_actions=(
   RecoverRosterMemberRunning
   RecoverRosterMemberResetRunning
@@ -97,6 +104,8 @@ covered_actions=(
   RecoverRosterMemberAddressabilityRunning
   ObserveRuntimeRetired
   ObserveRuntimeRetiredStopped
+  ObserveRuntimeDestroyed
+  ObserveRuntimeDestroyedStopped
   ObserveMemberRetirementArchivedLive
   ObserveMemberRetirementArchivedRetired
   ObserveMemberRetirementArchivedLiveStopped
@@ -110,13 +119,20 @@ covered_actions=(
   BeginPlacedCompletionLifecycleQuiesceFreshStop
   StopRunning
   ResumeStopped
+  AuditStartRun
+  FinishRunRunning
 )
 
-# Every RetireAtScope verdict arm, and the completion and destruction arms
-# that reach the not-running verdict; each must fire in the scope run.
+# Every RetireAtScope verdict arm, the completion and destruction arms that
+# reach the not-running verdict, the runtime destroy observation of a
+# completed mob, and the destroy admission with a runtime destroy
+# observation after it; each must fire in the scope run.
 scope_covered_actions=(
   BeginPlacedCompletionLifecycleQuiesceFresh
   MarkCompleted
+  ObserveRuntimeDestroyedCompleted
+  AdmitDestroyCleanup
+  ObserveRuntimeDestroyed
   DestroyMob
   RetireAtScopeCurrentRunning
   RetireAtScopeCurrentStopped
@@ -195,7 +211,7 @@ epoch_index="${view_positions#* }"
 
 # usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
 # where <run> is lifecycle (AuditSpec and its action properties) or scope
-# (AuditScopeSpec and its two invariants).
+# (AuditScopeSpec, its two invariants and the two destroy action properties).
 write_cfg() {
   local run="$1" cfg="$2" invariants="$3" properties="$4"
   cp "${ci_cfg}" "${cfg}"
@@ -215,14 +231,19 @@ write_cfg() {
       replace_exact_line "INVARIANTS" "PROPERTIES
   AuditObservationMonotonic
   AuditMintClearsExecutionHealth
-  AuditMintClearsFailureRecords${properties}
+  AuditMintClearsFailureRecords
+  AuditRuntimeDestroyedRemovesOnlyItsRuntime
+  AuditDestroyedOnlyThroughAnAdmittedDestroy${properties}
 INVARIANTS
   AuditPlacementAbsent
   AuditRetiringRuntimeMapped${invariants}" "${cfg}"
       ;;
     scope)
       replace_exact_line "SPECIFICATION Spec" "SPECIFICATION AuditScopeSpec" "${cfg}"
-      replace_exact_line "INVARIANTS" "INVARIANTS
+      replace_exact_line "INVARIANTS" "PROPERTIES
+  AuditRuntimeDestroyedRemovesOnlyItsRuntime
+  AuditDestroyedOnlyThroughAnAdmittedDestroy
+INVARIANTS
   AuditRetireAtScopeCoherent
   AuditRetireAtScopeExactlyOne${invariants}" "${cfg}"
       if [[ -n "${properties}" ]]; then
@@ -301,16 +322,17 @@ check_space() {
 
   # TLC prints a coverage block every minute and one at the end; read the
   # last. An action's line is
-  # `<Action line L, col C to line L, col C of module model>: D:T`, with D the
-  # new distinct states it found and T the successor states it generated; an
-  # action that fires only into known states has D = 0, so T counts.
+  # `<Action line L, col C to line L, col C of module model>: D:T` (of module
+  # member_lifecycle_audit for an audit wrapper), with D the new distinct
+  # states it found and T the successor states it generated; an action that
+  # fires only into known states has D = 0, so T counts.
   local coverage="${work_dir}/${run}-coverage.txt"
   awk '/^The coverage statistics at / { block = ""; next } { block = block $0 "\n" } END { printf "%s", block }' \
     "${log}" > "${coverage}"
   local action generated
   for action in "$@"; do
     generated="$(awk -v head="<${action} line " '
-      index($0, head) == 1 && $0 ~ / of module model>: [0-9]+:[0-9]+$/ {
+      index($0, head) == 1 && $0 ~ / of module (model|member_lifecycle_audit)>: [0-9]+:[0-9]+$/ {
         split($NF, counts, ":"); total += counts[2]; found = 1
       }
       END { if (found) print total }' "${coverage}")"
@@ -501,6 +523,63 @@ for field in ("member_run_open", "member_in_flight_work", "member_progress_token
     clear = "    /\\ " + field + "' = MapRemove(" + field + ", agent_identity)"
     assert body.count(clear) == 1, "expected one clear of " + field + " in RecoverRosterMemberRunning"
     body = body.replace(clear, "    /\\ " + field + "' = " + field)
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  # A runtime destroy observation that ends the mob, and one that leaves its
+  # runtime live and fenced.
+  mutate lifecycle destroyed_runtime_ends_the_mob "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+old = "    /\\ phase' = \"Running\""
+assert body.count(old) == 1, "expected one phase update in ObserveRuntimeDestroyed"
+body = body.replace(old, "    /\\ phase' = \"Destroyed\"")
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle destroyed_runtime_left_live "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+for field, removal in (
+    ("live_runtime_ids", "(live_runtime_ids \\ {agent_runtime_id})"),
+    ("runtime_fence_tokens", "MapRemove(runtime_fence_tokens, agent_runtime_id)"),
+):
+    old = "    /\\ " + field + "' = " + removal
+    assert body.count(old) == 1, f"expected one {field} removal in ObserveRuntimeDestroyed"
+    body = body.replace(old, "    /\\ " + field + "' = " + field)
+text = text[: block.start()] + body + text[block.end():]
+open(path, "w").write(text)
+PY
+
+  mutate lifecycle destroyed_runtime_resets_the_runs "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated" "$@" <<'PY'
+import os, re
+path = os.environ["MODEL"]
+text = open(path).read()
+block = re.search(r"^ObserveRuntimeDestroyed\(.*?\n\n", text, re.S | re.M)
+assert block, "ObserveRuntimeDestroyed not found"
+body = block.group(0)
+frames = re.findall(r"^    /\\ (UnchangedFrame_[0-9a-f]+)$", body, re.M)
+assert len(frames) == 1, "expected one UNCHANGED frame in ObserveRuntimeDestroyed"
+frame = frames[0]
+definition = re.findall(r"^" + frame + r" == UNCHANGED << (.*) >>$", text, re.M)
+assert len(definition) == 1, "expected one definition of " + frame
+names = [name.strip() for name in definition[0].split(",")]
+assert "active_run_count" in names, "the arm no longer leaves active_run_count unchanged"
+kept = ", ".join(name for name in names if name != "active_run_count")
+body = body.replace(
+    "    /\\ " + frame,
+    "    /\\ active_run_count' = 0\n    /\\ UNCHANGED << " + kept + " >>",
+)
 text = text[: block.start()] + body + text[block.end():]
 open(path, "w").write(text)
 PY

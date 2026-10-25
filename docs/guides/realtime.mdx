@@ -119,7 +119,10 @@ finally:
 </CodeGroup>
 
 `live/open` returns a `LiveOpenResult` containing a discriminated transport
-bootstrap, `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`. Omitted
+bootstrap, `WireLiveChannelCapabilities`, and `WireLiveContinuityMode`, plus
+`advisories` (left out when empty) naming what the open went ahead without,
+such as `staged_prompt_refused`. The advisory vocabulary may grow; an unknown
+advisory is informational, never an error. Omitted
 `transport` prefers WebSocket when its listener is configured and otherwise
 selects WebRTC when that is the only enabled transport. Request
 `"transport": "websocket"` or `"transport": "webrtc"` when the choice must be
@@ -597,13 +600,20 @@ comms = true
 Mob member construction requires `tools.comms = true` independently of whether
 the profile's model is live-capable.
 
-Open a live channel against the member's session after the member is spawned.
-The dedicated CLI and RPC member-live controls are currently WebSocket-only,
-for both local and placed members. Session-scoped `live/open` plus
-`live/webrtc/answer` works only when the caller can address the owning session
-directly, such as a controller-local member. Controller `session/*` methods do
-not proxy a placed member's host-local session in multi-host v1, and
-`mob/member_live_open` rejects WebRTC.
+Open a member's live channel through its mob after the member is spawned:
+`mob/member_live_open` over JSON-RPC, `rkat mob live open`, Python
+`Mob.member_live_open` or TypeScript `Mob.memberLiveOpen`. The mob checks the
+member first (not retiring, in cleanup or revoke, and restored), then the
+member's own live host serves the requested transport or refuses it typed.
+A WebSocket bootstrap names the owning host's advertised URL. With
+`transport: "webrtc"` the result is a WebRTC bootstrap: post the browser's
+offer with `live/webrtc/answer` on the same JSON-RPC server, as for a session
+channel. A host that serves no WebRTC refuses it with
+`LiveTransportUnsupported` before it connects a provider; a member host
+started by `rkat mob host` serves WebSocket only, so a placed member's channel
+is WebSocket. The session-scoped `live/open` refuses a mob member's session
+(data kind `mob_member_session_addressed_by_id`), and controller `session/*`
+methods do not proxy a placed member's host-local session in multi-host v1.
 
 ## GPT Live (public OpenAI Live API)
 
@@ -650,6 +660,28 @@ answer in the peer. The browser must not send `session.start`; the server
 already started the session. Capability atoms are `live.execution_identity.v1`
 and `live.execution.client_context.v1`, exactly as for the deprecated
 experimental profile.
+
+A mob member's voice channel opens through its mob with the same selector,
+after the mob's member checks:
+
+```json
+{"method":"mob/member_live_open","params":{
+  "mob_id":"...",
+  "agent_identity":"...",
+  "transport":"webrtc",
+  "execution_identity":{"version":"v1","profile_id":"openai.gpt-live-1.client-context.v1"}
+}}
+```
+
+Post the offer with `live/webrtc/answer` on the same connection, as above.
+The server's execution-identity authority serves it exactly as it serves
+`live/open`, and `mob/member_live_close` closes the channel through that
+authority. An execution-identity authority's refusal (access denied, an
+identity it does not admit, a member it finds ineligible) answers `-32026`
+(host unavailable) with the authority's reason, where `live/open` answers
+`-32020` or `INVALID_PARAMS`. The member must be local to the JSON-RPC
+server: a placed member refuses `execution_identity` with `Unsupported` in
+0.9.5, before anything reaches its host.
 
 Public Live has no authoritative turn identifiers, completed-turn events, or
 delegation task text. Meerkat synthesizes turns from transcript role
@@ -1271,8 +1303,7 @@ least one release.
 
 - **Ordinary/default composition uses OpenAI Realtime.** Its provider integration is OpenAI's Realtime API (`gpt-realtime-2`), not Azure OpenAI (`azure_openai`) or other providers. Public `gpt-live-1` uses the separate host-composed `openai-live` / execution-identity / WebRTC path above; the private experimental path is deprecated.
 - **One live channel per session.** A session has at most one live channel at a time. For per-member live channels in mobs, open channels against individual member sessions.
-- **Deferred sessions are model-gated.** `live/open` may materialize a deferred session whose resolved model is realtime-capable; a deferred non-realtime session is rejected before channel creation.
-- **The live seed carries no staged prompt.** When `live/open` materializes a deferred session (`initial_turn: "deferred"`), the session's create-time prompt stays staged: the realtime model does not see it. It lands with the session's first later text turn (`turn/start`), after any live rows.
+- **Deferred sessions are model-gated.** `live/open` may materialize a deferred session whose resolved model is realtime-capable; a deferred non-realtime session is rejected before channel creation. When the open materializes a deferred session, or opens one whose create-time prompt is still staged, the prompt reaches the realtime model as the session's first user row: the run-start hooks admit it once, and a later text turn does not deliver it again. A hook that refuses it keeps it staged for the first text turn; the open goes ahead without it and reports `staged_prompt_refused` in the result's `advisories`.
 - **Live rows wait for a running member turn.** Transcript rows commit in arrival order behind a running turn of the member, so the persisted transcript can lag the conversation by that turn's length (on a WebSocket or WebRTC channel, by each member turn queued behind it while turns run back to back; that channel's voice and events keep flowing meanwhile); rows handed to a channel close are held in memory until they commit and are lost if the process exits first, and a row released mid-close can commit ahead of an earlier held row (see [Transcript rows while the member's turn runs](#transcript-rows-while-the-members-turn-runs)).
 - **Ordinary Realtime refresh is not instruction/history replay.** Supported mutable settings such as visible tools can refresh; canonical `System`-sequence changes, model/provider swaps, and canonical transcript or user-content-registry rewrites require `live/close` + `live/open`. The adapter remains fixed to PCM 24 kHz mono, including after reopen.
 - **GPT Live may delegate a question asked over its own playback.** Public `gpt-live-1` sessions use client delegation for the whole session, and the provider's delegation events carry no typed reason, so Meerkat cannot keep a single turn native. A question that starts while the assistant is still speaking, before the cue for a delegated result has been sent, can be routed to the executor even when it asks about the conversation itself. The user then hears the answer late, in the same voice, once the executor's turn has finished and its result has been spoken after at least 1.6 s of output silence; occasionally the voice instead resumes its earlier readout and never answers, and the question has to be asked again.

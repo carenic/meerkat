@@ -207,6 +207,29 @@ impl SessionResumeAuthority {
     }
 }
 
+/// What settling a session's durable tail before a cold start left
+/// ([`MobSessionService::settle_durable_tail_before_cold_start_reporting`]).
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum ColdStartTailSettlement {
+    /// No open run's tail is reported: there was none, the store-owned
+    /// recovery committed it, or it kept it unproven. The caller's next
+    /// committed read decides (a tail that stands still refuses it).
+    Settled,
+    /// The store-owned recovery continues the session's open run from its
+    /// last round commit (a run a requeueing stop suspended): the run's
+    /// provisional tail stays for it, and the run resumes when the session's
+    /// actor is next materialized. `committed` is the session's committed
+    /// snapshot under that tail, for readers only: whether the run continues
+    /// is the recovery's own disposition, never derived from the snapshot.
+    ContinuesOpenRun {
+        /// The open run the recovery continues.
+        run_id: RunId,
+        /// The session's last committed snapshot.
+        committed: Box<Session>,
+    },
+}
+
 /// Operational resume decision after durable-tail convergence.
 ///
 /// This carrier deliberately contains only facts the current owner can prove:
@@ -1196,6 +1219,23 @@ impl ControllerRouteObservation {
     }
 }
 
+/// What [`MobSessionService::provisional_tail_stands`] answers by default: a
+/// service that keeps no durable sessions holds no tail, and one that reports
+/// persistent sessions without forwarding the check refuses it.
+pub(crate) fn provisional_tail_stands_unforwarded(
+    supports_persistent_sessions: bool,
+    session_id: &SessionId,
+) -> Result<bool, SessionError> {
+    if !supports_persistent_sessions {
+        return Ok(false);
+    }
+    Err(SessionError::Unsupported(format!(
+        "session {session_id}: this session service keeps durable sessions but does not \
+         forward the durable tail presence check (MobSessionService::provisional_tail_stands), \
+         so a resume spawn cannot tell whether a provisional tail stands"
+    )))
+}
+
 /// Extension trait for session services used by the mob runtime.
 ///
 /// Builds on `SessionServiceCommsExt` from core so mob orchestration can use
@@ -1467,6 +1507,22 @@ pub trait MobSessionService:
         false
     }
 
+    /// Whether a durable worker profile (`durable = true`) can spawn its
+    /// members on this service: their sessions must outlive the process, so
+    /// a host can re-attach the worker and resume its run after a restart. A
+    /// mob whose service answers `false` refuses such a spawn with
+    /// [`crate::MobError::NonDurableService`] before anything exists. Only the
+    /// durable-profile spawn checks read this.
+    ///
+    /// The default is [`Self::supports_persistent_sessions`]. A host that runs
+    /// a persistent session service over stores that do not outlive the
+    /// process (in-memory stores) keeps that contract for everything else and
+    /// answers `false` here. A wrapper around another service should forward
+    /// this method, or the wrapped service's answer is lost.
+    fn keeps_durable_member_sessions(&self) -> bool {
+        self.supports_persistent_sessions()
+    }
+
     /// Cost contract for exact persisted-session authority observation.
     fn persisted_session_authority_read_cost(&self) -> PersistedSessionAuthorityReadCost {
         PersistedSessionAuthorityReadCost::Unsupported
@@ -1531,7 +1587,7 @@ pub trait MobSessionService:
     }
 
     /// Whether this service implements the runtime-owned turn application
-    /// boundary used by [`MeerkatMachine`]. Merely exposing a runtime adapter
+    /// boundary used by [`MeerkatMachine`](meerkat_runtime::MeerkatMachine). Merely exposing a runtime adapter
     /// is not sufficient: some hosts use that adapter only for lifecycle or
     /// comms authority and still execute turns through the direct
     /// [`SessionService::start_turn`] path.
@@ -1576,6 +1632,21 @@ pub trait MobSessionService:
         Err(SessionError::Unsupported(format!(
             "exact-run interrupt for runtime-backed mob session {session_id} must be implemented by the machine-owned session service"
         )))
+    }
+
+    /// Suspend one exact run for a graceful requeue stop after machine
+    /// admission: the turn is dropped as a hard cancel drops it, and the run
+    /// ends with no terminal and no closing write, so the next start resumes
+    /// it. `false` for a stale run, and by default: a service that cannot
+    /// suspend leaves the stop to hard-cancel the run.
+    #[cfg(feature = "runtime-adapter")]
+    async fn suspend_run_with_machine_authority(
+        &self,
+        _session_id: &SessionId,
+        _expected_run_id: &RunId,
+        _authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        Ok(false)
     }
 
     /// Apply a live cooperative boundary cancel after `MeerkatMachine` accepts the command.
@@ -1653,7 +1724,7 @@ pub trait MobSessionService:
     ) -> Result<MemberStatusSessionView, SessionError>;
 
     /// Body-free observation of this session's durable transcript source,
-    /// for live readiness.
+    /// for live readiness and the live open's source check.
     ///
     /// Answered from the session authority row, the catalog entry, and the
     /// lifecycle row only: no body read or decode, no recovery gate, no
@@ -1678,6 +1749,20 @@ pub trait MobSessionService:
         _session_id: &SessionId,
     ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
         Ok(None)
+    }
+
+    /// The visible tool names of the live session `session_id` at a fork
+    /// boundary, for the fork child's notice, read without waiting on a
+    /// running turn ([`meerkat_core::fork_notice::ForkSeedSourceTools`]). A
+    /// service that cannot report them answers that the source was not live;
+    /// a decorator forwards it to the service it wraps.
+    async fn fork_source_tools(
+        &self,
+        _session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_core::fork_notice::ForkSeedSourceTools::NotRead {
+            reason: meerkat_core::fork_notice::ForkToolsNotComparedReason::SourceNotLive,
+        }
     }
 
     /// How the live session's next model request projects its tool catalog
@@ -1758,6 +1843,45 @@ pub trait MobSessionService:
         _session_id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
         Ok(None)
+    }
+
+    /// [`Self::load_persisted_session`] for a reader that serves the
+    /// session's committed snapshot while the session's own durable run
+    /// holds a provisional tail ahead of it, where the strict read refuses
+    /// the boundary (a running member, a fork source mid-turn).
+    ///
+    /// For readers only: the snapshot proves nothing about the tail, so a
+    /// caller that decides about a tail (presence, a settle, a resume) keeps
+    /// [`Self::load_persisted_session`], which stays strict.
+    ///
+    /// Default: the strict read. Durable services override it with their
+    /// tolerant committed read and the same archived-as-absent rule.
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        self.load_persisted_session(session_id).await
+    }
+
+    /// Whether a provisional durable tail stands for `session_id`: round
+    /// commits of a run whose runtime boundary has not committed, ahead of
+    /// the committed snapshot. Read without writing or settling anything and
+    /// without waiting on a running turn
+    /// (`PersistentSessionService::provisional_tail_stands`).
+    ///
+    /// A resume spawn asks it before anything that could complete such a
+    /// tail on a session no live actor hosts: the resume's verdict would. A
+    /// WholeBlob tail never makes the strict [`Self::load_persisted_session`]
+    /// refuse, so this is how the spawn sees one.
+    ///
+    /// Default: a service that keeps no durable sessions holds no tail
+    /// (`Ok(false)`). A service that reports persistent sessions
+    /// ([`Self::supports_persistent_sessions`]) without overriding this
+    /// refuses with [`SessionError::Unsupported`], so a wrapper around a
+    /// persistent service that does not forward it refuses the resume spawn
+    /// visibly instead of skipping the check. Such a wrapper must forward it.
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        provisional_tail_stands_unforwarded(self.supports_persistent_sessions(), session_id)
     }
 
     /// Persist a transcript fork for a concrete new mob identity.
@@ -1888,10 +2012,35 @@ pub trait MobSessionService:
     /// converges the durable tail, and refuses with
     /// [`SessionError::ServedElsewhere`] or [`SessionError::HostingUnavailable`]
     /// before any recovery. A wrapper that forwards this method inherits that.
+    ///
+    /// Its convergence commits only between runtime loop laps: once a durable
+    /// tail stands, the persistent preparation waits, at most one second, for
+    /// the session's runtime turn-finalization boundary, and refuses with
+    /// [`SessionError::Busy`] while a lap still holds it. A caller that holds
+    /// the boundary itself uses
+    /// [`Self::materialize_session_resume_verdict_under_runtime_turn_boundary`].
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError>;
+
+    /// [`Self::materialize_session_resume_verdict`] for a caller that holds
+    /// the session's runtime turn-finalization boundary
+    /// ([`Self::acquire_runtime_turn_finalization_guard`]), as a member
+    /// host's materialization does: the persistent service's preparation
+    /// does not wait for the boundary again
+    /// (`PersistentSessionService::prepare_committed_boundary_resume_under_runtime_turn_boundary`).
+    ///
+    /// The default answers [`Self::materialize_session_resume_verdict`]. A
+    /// wrapper around a persistent service should forward this method: that
+    /// service's plain verdict would wait for the boundary its caller holds
+    /// and, once a durable tail stands, refuse with [`SessionError::Busy`].
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        self.materialize_session_resume_verdict(session_id).await
+    }
 
     /// Settle a durable tail ahead of the committed runtime boundary before a
     /// start path reads a session that no live actor of this service hosts:
@@ -1925,6 +2074,30 @@ pub trait MobSessionService:
         self.materialize_session_resume_verdict(session_id)
             .await
             .map(|_| ())
+    }
+
+    /// [`Self::settle_durable_tail_before_cold_start`], reporting what the
+    /// settle left: a session whose store-owned durable-tail recovery
+    /// continues its open run (a run a requeueing stop suspended at its last
+    /// round commit) keeps that run's provisional tail, so a committed read of
+    /// it refuses until the run resumes. The report then carries the committed
+    /// snapshot under the tail
+    /// ([`ColdStartTailSettlement::ContinuesOpenRun`]), so a start path that
+    /// only reads the member's session can restore the member over its open
+    /// run instead of failing the start.
+    ///
+    /// The default settles through [`Self::settle_durable_tail_before_cold_start`]
+    /// and reports [`ColdStartTailSettlement::Settled`]: a service that cannot
+    /// say its tail continues leaves the caller's committed read to decide, as
+    /// before. The persistent service reports the continuation; a wrapper
+    /// around a persistent service should forward this method too.
+    async fn settle_durable_tail_before_cold_start_reporting(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ColdStartTailSettlement, SessionError> {
+        self.settle_durable_tail_before_cold_start(session_id)
+            .await
+            .map(|()| ColdStartTailSettlement::Settled)
     }
 
     /// Load the persisted session METADATA view when available.
@@ -2304,7 +2477,7 @@ pub trait MobSessionService:
     /// member's archive closes its own session's gate.
     async fn cancel_all_checkpointers(&self) {}
 
-    /// Re-enable checkpointer gates cancelled by [`cancel_all_checkpointers`].
+    /// Re-enable checkpointer gates cancelled by [`Self::cancel_all_checkpointers`].
     ///
     /// The mob's Resume and Reset call this to restore persistence.
     async fn rearm_all_checkpointers(&self) {}
@@ -2821,6 +2994,13 @@ where
         meerkat_session::EphemeralSessionService::<B>::tool_scope_snapshot(self, session_id).await
     }
 
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_session::EphemeralSessionService::<B>::fork_source_tools(self, session_id).await
+    }
+
     async fn tool_catalog_view(
         &self,
         session_id: &SessionId,
@@ -3015,6 +3195,111 @@ where
         _runtime_adapter: &meerkat_runtime::MeerkatMachine,
     ) -> Result<usize, SessionError> {
         Ok(0)
+    }
+}
+
+/// The persistent loaders' archived-as-absent rule: an archived session reads
+/// as `None` (the typed resume seam, `load_session_for_resume`, is where
+/// archived stops reading as absent).
+#[cfg(not(target_arch = "wasm32"))]
+async fn hide_archived_persisted_session<B>(
+    service: &meerkat_session::PersistentSessionService<B>,
+    session_id: &SessionId,
+    session: Option<Session>,
+) -> Result<Option<Session>, SessionError>
+where
+    B: meerkat_session::SessionAgentBuilder + 'static,
+{
+    let Some(session) = session else {
+        return Ok(None);
+    };
+    if service
+        .session_archived_by_authority(session_id, &session)
+        .await?
+    {
+        // Logged at debug because callers that treat this None as "missing"
+        // are the misdiagnosis this line exists to catch.
+        tracing::debug!(
+            session_id = %session_id,
+            "load_persisted_session hid an archived session (use the resume seam for revival)"
+        );
+        return Ok(None);
+    }
+    Ok(Some(session))
+}
+
+/// The resume verdict of a persistent service's committed-boundary resume
+/// preparation.
+#[cfg(not(target_arch = "wasm32"))]
+fn persistent_session_resume_verdict(
+    session_id: &SessionId,
+    prepared: meerkat_session::PreparedCommittedBoundaryResume,
+) -> Result<SessionResumeVerdict, SessionError> {
+    match prepared {
+        meerkat_session::PreparedCommittedBoundaryResume::Materializable {
+            session,
+            materialization,
+            observation,
+            preparation,
+        } => {
+            let authority = SessionResumeAuthority {
+                observation: Some(observation),
+            };
+            let load = match materialization {
+                meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active => {
+                    ResumeSessionLoad::Active(session)
+                }
+                meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable => {
+                    ResumeSessionLoad::Revivable(session)
+                }
+            };
+            let preparation =
+                SessionResumePreparationReceipt::from_persistent(session_id, &authority, preparation);
+            SessionResumeVerdict::from_authoritative_load_with_authority(
+                session_id,
+                load,
+                authority,
+                Some(preparation),
+            )
+        }
+        meerkat_session::PreparedCommittedBoundaryResume::Unavailable {
+            unavailable,
+            observation,
+        } => {
+            let authority = SessionResumeAuthority {
+                observation: Some(observation),
+            };
+            let load = match unavailable {
+                meerkat_session::PreparedCommittedBoundaryResumeUnavailable::Absent => {
+                    ResumeSessionLoad::Absent
+                }
+                meerkat_session::PreparedCommittedBoundaryResumeUnavailable::ArchivedNotRevivable {
+                    runtime_state,
+                } => ResumeSessionLoad::ArchivedNotRevivable { runtime_state },
+            };
+            SessionResumeVerdict::from_authoritative_load_with_authority(
+                session_id, load, authority, None,
+            )
+        }
+        meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
+            observation,
+            reason,
+        } => SessionResumeVerdict::committed_boundary_unprovable(
+            session_id,
+            ResumeSessionLoad::Absent,
+            SessionResumeAuthority {
+                observation: Some(observation),
+            },
+            reason,
+        ),
+        meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
+            observation,
+        } => Ok(SessionResumeVerdict::authority_changed_during_materialization(
+            session_id,
+            SessionResumeAuthority {
+                observation: Some(observation),
+            },
+        )),
     }
 }
 
@@ -3220,82 +3505,44 @@ where
         self.prepare_cold_attach(session_id, claim).await
     }
 
+    async fn settle_durable_tail_before_cold_start_reporting(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<ColdStartTailSettlement, SessionError> {
+        // #1813, as for the plain settle: the hosting claim first, by move.
+        let claim = self.grant_session_hosting(session_id)?;
+        Ok(
+            match self
+                .prepare_cold_attach_reporting(session_id, claim)
+                .await?
+            {
+                meerkat_session::ColdAttachSettlement::ContinuesOpenRun { run_id, committed } => {
+                    ColdStartTailSettlement::ContinuesOpenRun { run_id, committed }
+                }
+                _ => ColdStartTailSettlement::Settled,
+            },
+        )
+    }
+
     async fn materialize_session_resume_verdict(
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeVerdict, SessionError> {
-        match self.prepare_committed_boundary_resume(session_id).await? {
-            meerkat_session::PreparedCommittedBoundaryResume::Materializable {
-                session,
-                materialization,
-                observation,
-                preparation,
-            } => {
-                let authority = SessionResumeAuthority {
-                    observation: Some(observation),
-                };
-                let load = match materialization {
-                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Active => {
-                        ResumeSessionLoad::Active(session)
-                    }
-                    meerkat_session::PreparedCommittedBoundaryResumeMaterialization::Revivable => {
-                        ResumeSessionLoad::Revivable(session)
-                    }
-                };
-                let preparation = SessionResumePreparationReceipt::from_persistent(
-                    session_id,
-                    &authority,
-                    preparation,
-                );
-                SessionResumeVerdict::from_authoritative_load_with_authority(
-                    session_id,
-                    load,
-                    authority,
-                    Some(preparation),
-                )
-            }
-            meerkat_session::PreparedCommittedBoundaryResume::Unavailable {
-                unavailable,
-                observation,
-            } => {
-                let authority = SessionResumeAuthority {
-                    observation: Some(observation),
-                };
-                let load = match unavailable {
-                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::Absent => {
-                        ResumeSessionLoad::Absent
-                    }
-                    meerkat_session::PreparedCommittedBoundaryResumeUnavailable::ArchivedNotRevivable {
-                        runtime_state,
-                    } => ResumeSessionLoad::ArchivedNotRevivable { runtime_state },
-                };
-                SessionResumeVerdict::from_authoritative_load_with_authority(
-                    session_id,
-                    load,
-                    authority,
-                    None,
-                )
-            }
-            meerkat_session::PreparedCommittedBoundaryResume::CommittedBoundaryUnprovable {
-                observation,
-                reason,
-            } => SessionResumeVerdict::committed_boundary_unprovable(
-                session_id,
-                ResumeSessionLoad::Absent,
-                SessionResumeAuthority {
-                    observation: Some(observation),
-                },
-                reason,
-            ),
-            meerkat_session::PreparedCommittedBoundaryResume::AuthorityChangedDuringMaterialization {
-                observation,
-            } => Ok(SessionResumeVerdict::authority_changed_during_materialization(
-                session_id,
-                SessionResumeAuthority {
-                    observation: Some(observation),
-                },
-            )),
-        }
+        persistent_session_resume_verdict(
+            session_id,
+            self.prepare_committed_boundary_resume(session_id).await?,
+        )
+    }
+
+    async fn materialize_session_resume_verdict_under_runtime_turn_boundary(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<SessionResumeVerdict, SessionError> {
+        persistent_session_resume_verdict(
+            session_id,
+            self.prepare_committed_boundary_resume_under_runtime_turn_boundary(session_id)
+                .await?,
+        )
     }
 
     async fn create_session_with_actor_witness_under_runtime_turn_boundary(
@@ -3534,25 +3781,23 @@ where
         &self,
         session_id: &SessionId,
     ) -> Result<Option<Session>, SessionError> {
-        let Some(session) = self.load_authoritative_session(session_id).await? else {
-            return Ok(None);
-        };
-        if self
-            .session_archived_by_authority(session_id, &session)
-            .await?
-        {
-            // The ordinary loader deliberately hides archived sessions; the
-            // typed resume seam (`load_session_for_resume`) is where archived
-            // stops reading as absent. Logged at debug because callers that
-            // treat this None as "missing" are the misdiagnosis this line
-            // exists to catch.
-            tracing::debug!(
-                session_id = %session_id,
-                "load_persisted_session hid an archived session (use the resume seam for revival)"
-            );
-            return Ok(None);
-        }
-        Ok(Some(session))
+        let session = self.load_authoritative_session(session_id).await?;
+        hide_archived_persisted_session(self, session_id, session).await
+    }
+
+    async fn load_persisted_session_tolerating_tail(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<Session>, SessionError> {
+        let session = self
+            .load_committed_session_tolerating_tail(session_id)
+            .await?;
+        hide_archived_persisted_session(self, session_id, session).await
+    }
+
+    async fn provisional_tail_stands(&self, session_id: &SessionId) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::provisional_tail_stands(self, session_id)
+            .await
     }
 
     async fn observe_live_durable_source(
@@ -3569,7 +3814,9 @@ where
     /// the session task (which serves no command while a turn runs); other
     /// members answer from the committed durable head through the read-only
     /// body observation, which never writes and never replays the rewrite
-    /// audit. An archived session has no readable view.
+    /// audit, and which serves the committed snapshot while a run's
+    /// provisional tail stands ahead of it. An archived session has no
+    /// readable view.
     async fn observe_member_status_view(
         &self,
         session_id: &SessionId,
@@ -3585,7 +3832,10 @@ where
                 view.billing.total_tokens,
             ));
         }
-        let Some(session) = self.observe_authoritative_session_body(session_id).await? else {
+        let Some(session) = self
+            .observe_authoritative_session_body_tolerating_tail(session_id)
+            .await?
+        else {
             return Ok(MemberStatusSessionView::absent());
         };
         if self
@@ -3887,6 +4137,22 @@ where
     }
 
     #[cfg(feature = "runtime-adapter")]
+    async fn suspend_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::suspend_run_with_machine_authority(
+            self,
+            session_id,
+            expected_run_id,
+            authority,
+        )
+        .await
+    }
+
+    #[cfg(feature = "runtime-adapter")]
     async fn cancel_after_boundary_with_machine_authority(
         &self,
         session_id: &SessionId,
@@ -3923,6 +4189,13 @@ where
         session_id: &SessionId,
     ) -> Result<Option<ToolScopeSnapshot>, SessionError> {
         meerkat_session::PersistentSessionService::<B>::tool_scope_snapshot(self, session_id).await
+    }
+
+    async fn fork_source_tools(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::fork_notice::ForkSeedSourceTools {
+        meerkat_session::PersistentSessionService::<B>::fork_source_tools(self, session_id).await
     }
 
     async fn tool_catalog_view(
@@ -4266,7 +4539,10 @@ where
                 request.planned_child_session_id,
                 None,
                 None,
-                request.inherited_instructions,
+                meerkat_session::ForkInstructionPolicies {
+                    inherited: request.inherited_instructions,
+                    declared: request.declared_instructions,
+                },
             )
             .await?;
         Ok(crate::forked_participant::PlannedForkOutcome {

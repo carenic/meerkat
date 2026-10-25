@@ -16,7 +16,12 @@
 \* RetireMember signal (bound or peer-only), the session ingress detach (in
 \* Running and Stopped), the runtime retirement and archive observations (in
 \* Running and, where the machine has one, in Stopped, with and without
-\* topology preservation), and the resume path's replay arms: a roster reset
+\* topology preservation), the runtime destroy observations (in Running,
+\* Stopped and Completed, before and during the mob's own destroy), and the
+\* resume path's replay arms, and a mob-level run started and finished
+\* (StartRunRunning, FinishRunRunning; at most one at a time, so the run
+\* count stays 0 or 1 and every member arm also meets a counted run): a
+\* roster reset
 \* that replaces a live incarnation in place, the Retiring and Retired
 \* replays, the four unplaced retirement-start replays and the
 \* addressability replay. A later roster recovery or reset mints the next
@@ -56,9 +61,11 @@
 \*
 \* A second, smaller run (AuditScopeSpec) checks the RetireAtScope
 \* classifier: the same lifecycle arms without the progress observations,
-\* plus the mob's completion (MarkCompleted) and destruction (DestroyMob)
-\* after their lifecycle quiesce, and every RetireAtScope verdict arm over
-\* every scope the domains can name, current or stale. The progress
+\* plus the mob's completion (MarkCompleted) and destruction after their
+\* lifecycle quiesce (DestroyMob, and the destroy admission
+\* AdmitDestroyCleanup, after which a member runtime destroyed still removes
+\* only that runtime), and every RetireAtScope verdict arm
+\* over every scope the domains can name, current or stale. The progress
 \* observations write only progress variables, and no guard of these arms,
 \* nor of the Retire arms the coherence property enables, reads one; so the
 \* smaller run loses no reachable value of the variables the verdicts and
@@ -81,6 +88,18 @@
 \*     incarnation leaves the identity no restore failure, restore failure
 \*     code or materialization failure, so a new incarnation never reports
 \*     its predecessor's failure.
+\*   AuditRuntimeDestroyedRemovesOnlyItsRuntime (action property, in both
+\*     runs): a member runtime destroyed, before or during the mob's own
+\*     destroy, removes that runtime and nothing else: the mob keeps its
+\*     phase, its destroy admission, every other runtime, its active runs and
+\*     every member fact its own destroy has to drain, so only the Destroy
+\*     input, behind its drains, ends the mob. With one identity no state
+\*     holds two live runtimes when the arm fires, so "every other runtime"
+\*     cannot fail here; the machine row
+\*     a_member_runtime_destroyed_outside_the_mob_removes_only_that_runtime
+\*     (two members) pins it.
+\*   AuditDestroyedOnlyThroughAnAdmittedDestroy (action property, in both
+\*     runs): the mob becomes Destroyed only through a destroy it admitted.
 \*   AuditPlacementAbsent and AuditRetiringRuntimeMapped (invariants): no
 \*     member is ever placed, and every Retiring runtime is the one its
 \*     identity maps to. They check the reasons in the not-covered list
@@ -124,7 +143,10 @@
 \* fail, and drops the mapped guard of RetireAtScopeStaleFenceTokenRunning
 \* and requires AuditRetireAtScopeExactlyOne to fail, and keeps the
 \* predecessor's execution-health entries in RecoverRosterMemberRunning and
-\* requires AuditMintClearsExecutionHealth to fail.
+\* requires AuditMintClearsExecutionHealth to fail, and makes
+\* ObserveRuntimeDestroyed end the mob, leave its runtime live, and reset the
+\* mob's run count, and requires AuditRuntimeDestroyedRemovesOnlyItsRuntime to
+\* fail for each.
 \*
 \* Not covered:
 \*   states reachable only through BeginSpawnExec* (spawn phases, spawn
@@ -274,6 +296,23 @@ AuditArchivedStaleRuntimeAlreadyClearedStopped ==
     \E rid \in AuditRuntimes, fence \in AuditFences, g \in AuditGenerations, s \in AuditSessions :
         ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped(AuditIdentity, rid, fence, g, Some(s), AuditDisposal)
 
+\* A member runtime destroyed, in each phase that has one, before or during
+\* the mob's own destroy (in the scope run after AdmitDestroyCleanup): only
+\* that runtime is removed.
+AuditRuntimeDestroyedArm(rid, fence) ==
+    \/ ObserveRuntimeDestroyed(rid, fence)
+    \/ ObserveRuntimeDestroyedStopped(rid, fence)
+    \/ ObserveRuntimeDestroyedCompleted(rid, fence)
+
+AuditRuntimeDestroyed ==
+    \E rid \in AuditRuntimes, fence \in AuditFences : AuditRuntimeDestroyedArm(rid, fence)
+
+\* A mob-level run, at most one at a time: the destroyed and retired member
+\* arms must leave it counted.
+AuditStartRun == active_run_count = 0 /\ StartRunRunning
+
+AuditFinishRun == FinishRunRunning
+
 AuditQuiesceForStop == BeginPlacedCompletionLifecycleQuiesceFreshStop("Stop")
 
 AuditQuiesceForComplete == BeginPlacedCompletionLifecycleQuiesceFresh("Complete")
@@ -283,6 +322,9 @@ AuditQuiesceForDestroy == BeginPlacedCompletionLifecycleQuiesceFresh("Destroy")
 AuditComplete == MarkCompleted
 
 AuditDestroy == \E s \in AuditSessions : DestroyMob(s)
+
+\* The destroy admission, after the lifecycle quiesce for a destroy.
+AuditAdmitDestroy == AdmitDestroyCleanup
 
 AuditRetireAtScopeCurrentRunning ==
     \E rid \in AuditRuntimes, fence \in AuditFences, s \in AuditSessions :
@@ -413,6 +455,8 @@ AuditResume == ResumeStopped
 
 \* The member lifecycle arms without the progress observations.
 AuditLifecycleNext ==
+    \/ AuditStartRun
+    \/ AuditFinishRun
     \/ AuditRecoverMember
     \/ AuditBindSession
     \/ AuditBindSessionReplacing
@@ -440,6 +484,7 @@ AuditLifecycleNext ==
     \/ AuditRecoverRetirementStartedPeerOnly
     \/ AuditRuntimeRetired
     \/ AuditRuntimeRetiredStopped
+    \/ AuditRuntimeDestroyed
     \/ AuditArchivedLive
     \/ AuditArchivedRetired
     \/ AuditArchivedLiveStopped
@@ -479,6 +524,7 @@ AuditScopeNext ==
     \/ AuditStepCountOnlyNext
     \/ AuditQuiesceForComplete
     \/ AuditQuiesceForDestroy
+    \/ AuditAdmitDestroy
     \/ AuditComplete
     \/ AuditDestroy
     \/ AuditRetireAtScopeCurrentRunning
@@ -531,6 +577,30 @@ AuditMintClearsFailureRecords ==
             /\ id \notin DOMAIN member_restore_failure_codes'
             /\ id \notin DOMAIN member_materialization_failures'
       ]_vars
+
+\* A member runtime destroyed removes that runtime and nothing else: the mob
+\* keeps its phase, its destroy admission, every other runtime, its active
+\* runs and every member fact its own destroy has to drain.
+AuditRuntimeDestroyedRemovesOnlyItsRuntime ==
+    [][\A rid \in AuditRuntimes, fence \in AuditFences :
+         AuditRuntimeDestroyedArm(rid, fence) =>
+            /\ phase' = phase
+            /\ destroy_admitted' = destroy_admitted
+            /\ live_runtime_ids' = live_runtime_ids \ {rid}
+            /\ identity_to_runtime' = identity_to_runtime
+            /\ member_session_bindings' = member_session_bindings
+            /\ member_state_markers' = member_state_markers
+            /\ pending_respawn_topology' = pending_respawn_topology
+            /\ wiring_edges' = wiring_edges
+            /\ runtime_retire_pending_sessions' = runtime_retire_pending_sessions
+            /\ pending_session_ingress_detach_runtime_ids' = pending_session_ingress_detach_runtime_ids
+            /\ active_run_count' = active_run_count
+      ]_vars
+
+\* The mob reaches Destroyed only through a destroy it admitted
+\* (AdmitDestroyCleanup or DestroyMob).
+AuditDestroyedOnlyThroughAnAdmittedDestroy ==
+    [][(phase # "Destroyed" /\ phase' = "Destroyed") => destroy_admitted' = TRUE]_vars
 
 \* No arm here places a member: the placed archive, retirement-start and
 \* remote Retire arms need a placement.

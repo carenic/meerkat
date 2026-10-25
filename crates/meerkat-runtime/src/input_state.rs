@@ -74,6 +74,17 @@ pub enum InputAbandonReason {
     /// tool-process-interrupted notice. Abandoned silently, without a receipt,
     /// like a recovered predecessor input.
     ToolProcessInterrupted,
+    /// A graceful stop kept the input durably queued for the next start
+    /// ([`crate::UnregisterQueuedInputs::Requeue`]), and the next start found
+    /// it older than that stop's max age, so it ended without running.
+    /// Resubmitting it is now correct.
+    RequeueExpired,
+    /// The input's run was left open when its host stopped, and the run was
+    /// not resumed: the host's resumed-run admission refused it, or the
+    /// runtime ended before the resume. Settled without a receipt, like
+    /// [`Self::ToolProcessInterrupted`]. Resubmitting it is correct only when
+    /// the host knows the work was not done elsewhere.
+    ResumeRefused,
 }
 
 /// Terminal outcome for an input.
@@ -88,6 +99,19 @@ pub enum InputTerminalOutcome {
     Superseded { superseded_by: InputId },
     Coalesced { aggregate_id: InputId },
     Abandoned { reason: InputAbandonReason },
+}
+
+/// The durable mark of an input a graceful stop kept queued for the next
+/// start ([`crate::UnregisterQueuedInputs::Requeue`]). The next start runs the
+/// input unless it is older than `max_age_ms`, measured from its admission;
+/// an older one ends as [`InputAbandonReason::RequeueExpired`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StopRequeueMark {
+    /// When the stop kept the input.
+    pub stopped_at: DateTime<Utc>,
+    /// The max age the stop's unregister began with, in milliseconds.
+    pub max_age_ms: u64,
 }
 
 /// A single entry in the input's state history (shell bookkeeping).
@@ -141,6 +165,11 @@ pub(crate) enum InteractionTerminalCandidate {
         tool_use_id: Option<String>,
         tool_name: String,
         args: serde_json::Value,
+        /// The call's dedupe key. Absent for a call outside an agent-loop
+        /// round and on rows written before keys existed; skipped when
+        /// absent, so such a row re-serializes byte-identically.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dedupe_key: Option<meerkat_core::ToolCallDedupeKey>,
     },
     CallbackBatchPending {
         pending_tool_calls: Vec<meerkat_core::error::PendingCallbackToolCall>,
@@ -199,10 +228,12 @@ impl InteractionTerminalCandidate {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             }) => Self::CallbackPending {
                 tool_use_id: Some(tool_use_id.clone()),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             },
             Some(CoreApplyTerminal::CallbackBatchPending { pending_tool_calls }) => {
                 Self::CallbackBatchPending {
@@ -229,6 +260,7 @@ impl InteractionTerminalCandidate {
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             } => Some(CoreApplyTerminal::CallbackPending {
                 // A v0.8.7 row never recorded the id; empty means "identity
                 // unknown, pre-0.8.8 row". Durable-callback consumers that
@@ -237,6 +269,7 @@ impl InteractionTerminalCandidate {
                 tool_use_id: tool_use_id.clone().unwrap_or_default(),
                 tool_name: tool_name.clone(),
                 args: args.clone(),
+                dedupe_key: dedupe_key.clone(),
             }),
             Self::CallbackBatchPending { pending_tool_calls } => {
                 Some(CoreApplyTerminal::CallbackBatchPending {
@@ -344,6 +377,30 @@ impl InteractionTerminalCandidate {
         }
     }
 }
+
+/// The most inputs one terminal-completion batch names.
+///
+/// The batch's owner row carries the whole recipient set, every reader
+/// validates this bound at load (a larger batch is corruption to every
+/// released reader), and the batch's finalization and receipt writes are one
+/// input-state batch CAS, which the store contract caps at
+/// [`crate::store::MAX_INPUT_STATE_BATCH_CAS`] rows. Producers keep within
+/// it: a runtime-loop batch stages at most this many inputs and a run takes
+/// a durable Steer join only while its contributors stay within it
+/// (generated `RUNTIME_LOOP_BATCH_MAX_INPUTS` and the
+/// `run_contributor_capacity` guard), and a runless termination splits its
+/// recipients into batches of at most this many.
+pub(crate) const TERMINAL_COMPLETION_BATCH_MAX_INPUTS: usize = 256;
+
+const _: () = assert!(
+    TERMINAL_COMPLETION_BATCH_MAX_INPUTS == crate::store::MAX_INPUT_STATE_BATCH_CAS,
+    "a terminal-completion batch must fit one input-state batch CAS"
+);
+const _: () = assert!(
+    TERMINAL_COMPLETION_BATCH_MAX_INPUTS
+        == crate::meerkat_machine::dsl::command_capabilities::RUNTIME_LOOP_BATCH_MAX_INPUTS,
+    "a runtime-loop batch must fit one terminal-completion batch"
+);
 
 /// Stable identity for one exact terminal-completion batch.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -491,6 +548,15 @@ impl InputTerminalCompletion {
         if self.candidate_digest.is_empty() || self.completion_input_ids_digest.is_empty() {
             return Err("terminal completion row carried an empty immutable digest".into());
         }
+        if self.candidate_digest == WITHHELD_PAYLOAD_DIGEST
+            || matches!(
+                &self.phase,
+                InputTerminalCompletionPhase::Finalized { receipt_digest, .. }
+                    if receipt_digest == WITHHELD_PAYLOAD_DIGEST
+            )
+        {
+            return Err("terminal completion row carried a withheld payload digest".into());
+        }
         let owns_payload = self.input_id == self.owner_input_id;
         if owns_payload != (self.batch_ordinal == 0) {
             return Err("terminal completion owner/ordinal mismatch".into());
@@ -510,7 +576,7 @@ impl InputTerminalCompletion {
         }
         match (&self.completion_input_ids, owns_payload) {
             (Some(input_ids), true) => {
-                if input_ids.is_empty() || input_ids.len() > 256 {
+                if input_ids.is_empty() || input_ids.len() > TERMINAL_COMPLETION_BATCH_MAX_INPUTS {
                     return Err("terminal completion recipient set has invalid size".into());
                 }
                 if input_ids
@@ -601,7 +667,7 @@ impl InputTerminalCompletion {
 pub(crate) fn validate_input_terminal_completion_batch(
     rows: &[InputTerminalCompletion],
 ) -> Result<&InputTerminalCompletion, String> {
-    if rows.is_empty() || rows.len() > 256 {
+    if rows.is_empty() || rows.len() > TERMINAL_COMPLETION_BATCH_MAX_INPUTS {
         return Err("terminal completion batch has invalid size".into());
     }
     let owner = &rows[0];
@@ -745,6 +811,12 @@ pub(crate) struct InteractionTerminalOutbox {
     pub(crate) phase: InteractionTerminalOutboxPhase,
 }
 
+/// The value a released copy carries in place of every digest derived from
+/// a withheld result payload ([`StoredInputState::withhold_result_payload`]).
+/// It is no SHA-256 hex digest, so it never equals a real one, and every
+/// validation of a stored or decoded row refuses it.
+pub(crate) const WITHHELD_PAYLOAD_DIGEST: &str = "withheld";
+
 pub(crate) fn interaction_terminal_payload_digest<T: Serialize>(
     payload: &T,
 ) -> Result<String, String> {
@@ -796,6 +868,22 @@ pub(crate) fn interaction_terminal_event_for_id(
 }
 
 impl InteractionTerminalOutbox {
+    /// Whether a digest of this row is the [`WITHHELD_PAYLOAD_DIGEST`] a
+    /// released copy carries.
+    fn carries_withheld_payload_digest(&self) -> bool {
+        self.candidate_digest == WITHHELD_PAYLOAD_DIGEST
+            || match &self.phase {
+                InteractionTerminalOutboxPhase::Candidate => false,
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_payload_digest,
+                    ..
+                } => finalized_payload_digest == WITHHELD_PAYLOAD_DIGEST,
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    publication.payload_digest == WITHHELD_PAYLOAD_DIGEST
+                }
+            }
+    }
+
     /// Whether this row still carries the duplicated released-0.8.31 payloads
     /// that must be normalized into the single completion owner.
     pub(crate) fn has_released_0831_carriers(&self) -> bool {
@@ -808,6 +896,9 @@ impl InteractionTerminalOutbox {
         }
         if self.candidate_digest.is_empty() {
             return Err("interaction terminal outbox candidate digest is empty".into());
+        }
+        if self.carries_withheld_payload_digest() {
+            return Err("interaction terminal outbox carried a withheld payload digest".into());
         }
         if self.completion_input_ids_digest.is_empty() {
             return Err("interaction terminal outbox completion recipient digest is empty".into());
@@ -939,7 +1030,7 @@ impl InteractionTerminalOutbox {
 pub(crate) fn validate_interaction_terminal_outbox_batch_shape(
     outboxes: &[InteractionTerminalOutbox],
 ) -> Result<(), String> {
-    if outboxes.is_empty() || outboxes.len() > 256 {
+    if outboxes.is_empty() || outboxes.len() > TERMINAL_COMPLETION_BATCH_MAX_INPUTS {
         return Err("interaction terminal batch has invalid directed-row count".into());
     }
     let owner = &outboxes[0];
@@ -1112,6 +1203,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                 tool_use_id,
                 tool_name,
                 args,
+                dedupe_key,
             },
             AgentEvent::InteractionCallbackPending {
                 tool_name: event_tool,
@@ -1130,6 +1222,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                                 tool_name: tool_name.clone(),
                                 args: args.clone(),
                                 settlement_failures: Vec::new(),
+                                dedupe_key: dedupe_key.clone(),
                             }]
                     }
                     // A v0.8.7 candidate pairs with a v0.8.7 finalized event
@@ -1143,6 +1236,7 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                                     tool_name: tool_name.clone(),
                                     args: args.clone(),
                                     settlement_failures: Vec::new(),
+                                    dedupe_key: dedupe_key.clone(),
                                 }]
                     }
                 }
@@ -1253,6 +1347,20 @@ impl PublishedDirectedTerminalBinding {
 }
 
 impl StoredInputState {
+    /// Whether this row was admitted under its submitter's own idempotency
+    /// key `key`: its admission key is `key` itself, or it is a governed row
+    /// whose admission key is `key` qualified under the row's own retained
+    /// association (a governed admission binds that qualification, never the
+    /// submitter's key). Holds for a terminal row whose payload is retired.
+    #[must_use]
+    pub fn admitted_under_idempotency_key(&self, key: &str) -> bool {
+        self.state
+            .idempotency_key
+            .as_ref()
+            .is_some_and(|admitted| admitted.0 == key)
+            || crate::input_authority::governed_row_admitted_under(&self.state, key)
+    }
+
     /// Whether this row carries its run's result payload (a result or
     /// callback arguments) in its terminal completion or directed outbox.
     pub(crate) fn carries_result_payload(&self) -> bool {
@@ -1271,10 +1379,27 @@ impl StoredInputState {
                 .is_some_and(InteractionTerminalCandidate::carries_result_payload)
     }
 
-    /// Drop the result payload from a copy released to a public reader that
-    /// may not receive it. Every body-free lifecycle fact stays: phase,
-    /// terminal, receipt identity and digests, history and the destination
-    /// witness. Never applied to a row that is stored or compared.
+    /// Whether this row holds anything a reader its destination does not
+    /// permit must not receive: a result payload, or a terminal completion or
+    /// directed outbox whose digests derive from its batch's payload (a peer
+    /// recipient holds the batch's digests but not its payload).
+    pub(crate) fn carries_withholdable_facts(&self) -> bool {
+        self.carries_result_payload()
+            || self.state.terminal_completion.is_some()
+            || self.state.interaction_terminal_outbox.is_some()
+    }
+
+    /// Withhold everything of the result payload from a copy released to a
+    /// public reader that may not receive it: the result or callback
+    /// arguments on the completion and the 0.8.31 outbox carrier, the
+    /// directed terminal event a finalized outbox keeps until publication,
+    /// and every digest derived from the batch's payload, which reads
+    /// [`WITHHELD_PAYLOAD_DIGEST`]. The copy is marked
+    /// (`result_payload_withheld`), in process only. Every body-free
+    /// lifecycle fact stays: phase, terminal, receipt identity (input, owner,
+    /// batch, ordinal and recipients, with their digest), history and the
+    /// destination witness. Never applied to a row that is stored or
+    /// compared.
     pub(crate) fn withhold_result_payload(&mut self) {
         if let Some(completion) = self.state.terminal_completion.as_mut() {
             if completion
@@ -1291,15 +1416,38 @@ impl StoredInputState {
             {
                 completion.candidate = None;
             }
+            completion.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+                &mut completion.phase
+            {
+                *receipt_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            }
         }
-        if let Some(outbox) = self.state.interaction_terminal_outbox.as_mut()
-            && outbox
+        if let Some(outbox) = self.state.interaction_terminal_outbox.as_mut() {
+            if outbox
                 .released_0831_candidate
                 .as_ref()
                 .is_some_and(InteractionTerminalCandidate::carries_result_payload)
-        {
-            outbox.released_0831_candidate = None;
+            {
+                outbox.released_0831_candidate = None;
+            }
+            outbox.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+            match &mut outbox.phase {
+                InteractionTerminalOutboxPhase::Candidate => {}
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_event,
+                    finalized_payload_digest,
+                    ..
+                } => {
+                    *finalized_event = None;
+                    *finalized_payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+                }
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    publication.payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+                }
+            }
         }
+        self.state.result_payload_withheld = true;
     }
 
     /// A freshly accepted row for `input` carrying the replay witnesses its
@@ -1330,13 +1478,27 @@ impl StoredInputState {
 
     /// Return a sealed compact binding only after the runtime-private terminal
     /// outbox validates and carries its durable publication receipt.
+    ///
+    /// On a copy a public read released without its result payload (marked in
+    /// process only), whose digests and event are withheld, the binding is
+    /// decided from the outbox's identity and phase alone; the stored row it
+    /// was copied from was validated when read. A row that is not so marked
+    /// is validated in full, and a withheld digest on it is refused.
     pub fn published_directed_terminal_binding(
         &self,
     ) -> Result<Option<PublishedDirectedTerminalBinding>, String> {
         let Some(outbox) = self.state.interaction_terminal_outbox.as_ref() else {
             return Ok(None);
         };
-        outbox.validate()?;
+        if self.state.result_payload_withheld {
+            if outbox.input_id.0 != outbox.interaction_id.0 {
+                return Err(
+                    "interaction terminal outbox input/interaction identity mismatch".into(),
+                );
+            }
+        } else {
+            outbox.validate()?;
+        }
         if !matches!(
             outbox.phase,
             InteractionTerminalOutboxPhase::Published { .. }
@@ -1479,6 +1641,12 @@ pub(crate) fn input_terminal_completion_outcome(
 ///   silently settles the recovered inputs of a run whose tool process host
 ///   custody proved had started
 ///   (`PendingRuntimeExecutorAttachment::abandon_interrupted_run_inputs`).
+/// - `Abandoned { RequeueExpired }`: the same pre-serve settlement ends an
+///   input a graceful stop kept queued once it is older than the stop's max
+///   age (`PendingRuntimeExecutorAttachment::settle_expired_stop_requeued_inputs`).
+/// - `Abandoned { ResumeRefused }` (and the receipt-less `Cancelled` and
+///   `RequeueExpired` of the same path): a run left open by a restart that is
+///   settled instead of resumed (`DriverEntry::settle_resumable_run`).
 ///
 /// `Cancelled` and `MaxAttemptsExhausted` are also reached with a receipt
 /// (tracked cancel, attachment replacement, a failed run's batch); a row of
@@ -1507,7 +1675,9 @@ pub(crate) fn receipt_less_terminal(
         InputTerminalOutcome::Abandoned { reason } => match reason {
             InputAbandonReason::Cancelled
             | InputAbandonReason::MaxAttemptsExhausted { .. }
-            | InputAbandonReason::ToolProcessInterrupted => true,
+            | InputAbandonReason::ToolProcessInterrupted
+            | InputAbandonReason::RequeueExpired
+            | InputAbandonReason::ResumeRefused => true,
             InputAbandonReason::Retired
             | InputAbandonReason::Reset
             | InputAbandonReason::Stopped
@@ -1598,6 +1768,16 @@ impl InputStatePersistenceRecord {
             bundle,
             expected_row_digest: None,
         })
+    }
+
+    /// Test support: package an exact stored row, so recovery tests can start
+    /// from a durable row the current runtime no longer writes (an input a
+    /// pre-release build left staged for a run that never committed). The
+    /// seed still passes the machine's stored-seed authority.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn stored_row_for_test(bundle: StoredInputState) -> Result<Self, String> {
+        Self::from_machine_snapshot(bundle)
     }
 
     /// Fence this update on the exact stored row bytes it was derived from
@@ -1821,14 +2001,20 @@ pub fn verify_exact_resume_replay(
     Ok(())
 }
 
-/// Verify that the accepted row `stored` is an exact replay of the prompt
-/// `expected`: the same content and semantic header slots (the exact prompt
-/// identity, which includes the authority association) and the same retained
-/// authority. Input id and timestamp are not part of either.
+/// Verify that the accepted row `stored` is an exact replay of `expected`.
+/// Prompts retain their exact prompt identity and retained-authority checks;
+/// their fresh input id and timestamp are not part of that identity.
 ///
-/// A row recorded without an exact prompt identity (an older admission, or a
-/// non-prompt) never matches, so a key alone never stands in for an
-/// admission.
+/// A keyed governed peer input must instead name the row's exact input id and
+/// qualified event key, with exactly one own contributor, the same association
+/// (including the original work), and its native canonical replay digest.
+/// The digest retains all semantic input fields but normalizes the observation
+/// timestamp. This proof survives payload retirement; it admits no ungoverned
+/// peer, retained resume, or row without its own native authority witness.
+///
+/// Other input families and prompt rows without an exact prompt identity
+/// never match. A key alone never stands in for an admission. The comparison
+/// grants no current operation authority and does not prove completion.
 ///
 /// # Errors
 /// [`crate::RuntimeDriverError::InputIdempotencyConflict`] naming the row
@@ -1837,6 +2023,39 @@ pub fn verify_exact_replay(
     stored: &InputState,
     expected: &Input,
 ) -> Result<(), crate::RuntimeDriverError> {
+    if matches!(expected, Input::Peer(_)) {
+        let conflict = || crate::RuntimeDriverError::InputIdempotencyConflict {
+            existing_id: stored.input_id.clone(),
+        };
+        if stored.input_id != *expected.id()
+            || stored.retained_resume.is_some()
+            || expected.header().retained_resume.is_some()
+        {
+            return Err(conflict());
+        }
+        let association = expected
+            .header()
+            .authority_association
+            .as_ref()
+            .ok_or_else(conflict)?;
+        let key = crate::input_authority::qualified_idempotency_key(expected)
+            .map_err(|_| conflict())?
+            .ok_or_else(conflict)?;
+        if stored.idempotency_key.as_ref() != Some(&key) {
+            return Err(conflict());
+        }
+        let mut own = stored
+            .authority_contributors
+            .iter()
+            .filter(|contributor| contributor.input_id() == &stored.input_id);
+        let (Some(own), None) = (own.next(), own.next()) else {
+            return Err(conflict());
+        };
+        if own.association() != association {
+            return Err(conflict());
+        }
+        return own.verify_replay(expected);
+    }
     PromptReplayIdentity::verify_replay(
         stored,
         expected,
@@ -2007,7 +2226,15 @@ pub struct InputState {
     /// after completion/publication obligations close; terminal history is
     /// carried by the seed and receipts above.
     pub persisted_input: Option<Input>,
+    /// Set when a graceful stop kept this queued input for the next start.
+    pub stop_requeue: Option<StopRequeueMark>,
     pub created_at: DateTime<Utc>,
+    /// Set only on an in-process copy released to a reader that may not
+    /// receive this input's result ([`StoredInputState::withhold_result_payload`]).
+    /// Never serialized (the on-disk row has no such field), so a stored or
+    /// decoded row is never marked, and its validation refuses the
+    /// [`WITHHELD_PAYLOAD_DIGEST`] a released copy carries.
+    pub(crate) result_payload_withheld: bool,
 }
 
 impl InputState {
@@ -2038,7 +2265,9 @@ impl InputState {
             interaction_terminal_outbox: None,
             scoped_destination: ScopedDestinationWitness::Unrecorded,
             persisted_input: None,
+            stop_requeue: None,
             created_at: now,
+            result_payload_withheld: false,
         }
     }
 
@@ -2119,6 +2348,8 @@ struct InputStateSerde {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     persisted_input: Option<Input>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_requeue: Option<StopRequeueMark>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     last_run_id: Option<RunId>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     last_boundary_sequence: Option<u64>,
@@ -2144,7 +2375,8 @@ impl Serialize for StoredInputState {
             authority_contributors: self.state.authority_contributors.clone(),
             retained_resume: self.state.retained_resume.clone(),
             stored_input_state_version:
-                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version(
+                meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(
+                    carries_requeue_facts(self.state.stop_requeue.as_ref(), self.seed.terminal_outcome.as_ref()),
                 ),
             input_id: self.state.input_id.clone(),
             current_state: self.seed.phase,
@@ -2168,6 +2400,7 @@ impl Serialize for StoredInputState {
             interaction_terminal_outbox: self.state.interaction_terminal_outbox.clone(),
             scoped_destination: self.state.scoped_destination.clone(),
             persisted_input: self.state.persisted_input.clone(),
+            stop_requeue: self.state.stop_requeue,
             last_run_id: self.seed.last_run_id.clone(),
             last_boundary_sequence: self.seed.last_boundary_sequence,
             admission_sequence: self.seed.admission_sequence,
@@ -2177,6 +2410,75 @@ impl Serialize for StoredInputState {
         };
         helper.serialize(serializer)
     }
+}
+
+/// Whether an input a graceful stop kept queued has expired: its age at `now`,
+/// measured from `admitted_at`, is over the mark's max age. An input without
+/// a mark never expires (it is not a kept input), and a negative age (the
+/// clock went back) is not expired.
+#[must_use]
+pub(crate) fn stop_requeue_expired(
+    mark: Option<&StopRequeueMark>,
+    admitted_at: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> bool {
+    let Some(mark) = mark else {
+        return false;
+    };
+    let Ok(age_ms) = u64::try_from((now - admitted_at).num_milliseconds()) else {
+        return false;
+    };
+    age_ms > mark.max_age_ms
+}
+
+/// The active inputs an attachment at `now` ends as expired: every input an
+/// earlier graceful stop kept queued whose age at `now`, measured from its
+/// admission, is over its stop's max age ([`stop_requeue_expired`]). The
+/// stop's mark stays on a kept input until it runs or expires, so every
+/// attachment that still finds it queued checks it again: one that finds it
+/// within the bound leaves it queued and marked, and a later one can end it.
+pub(crate) fn expired_stop_requeued_inputs(
+    driver: &dyn crate::traits::RuntimeDriver,
+    now: DateTime<Utc>,
+) -> Vec<InputId> {
+    driver
+        .active_input_ids()
+        .into_iter()
+        .filter(|input_id| {
+            driver
+                .input_state(input_id)
+                .is_some_and(|state| input_stop_requeue_expired(state, now))
+        })
+        .collect()
+}
+
+/// Whether the input carries a graceful stop's mark that has expired at
+/// `now` ([`stop_requeue_expired`]), its age measured from its admission:
+/// the payload's own timestamp, or the row's creation when the payload is
+/// gone.
+pub(crate) fn input_stop_requeue_expired(state: &InputState, now: DateTime<Utc>) -> bool {
+    let admitted_at = state
+        .persisted_input
+        .as_ref()
+        .map_or(state.created_at, |input| input.header().timestamp);
+    stop_requeue_expired(state.stop_requeue.as_ref(), admitted_at, now)
+}
+
+/// Whether the row carries a fact only stored input state v8 can hold: a
+/// stop's requeue mark or the requeue-expired abandon reason. Such a row is
+/// written as v8; every other row stays v7, so a host that never requeues
+/// keeps the v7 downgrade.
+fn carries_requeue_facts(
+    stop_requeue: Option<&StopRequeueMark>,
+    terminal_outcome: Option<&InputTerminalOutcome>,
+) -> bool {
+    stop_requeue.is_some()
+        || matches!(
+            terminal_outcome,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::RequeueExpired
+            })
+        )
 }
 
 /// Whether an authority association the row carries bounds its resource
@@ -2248,6 +2550,23 @@ impl<'de> Deserialize<'de> for StoredInputState {
             return Err(<D::Error as serde::de::Error>::custom(
                 "stored input state before v7 cannot carry an authorization audit refusal read \
                  or a policy read's publication instance",
+            ));
+        }
+        if observed_stored_input_state_version < 8 && helper.stop_requeue.is_some() {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v8 cannot carry a stop requeue mark",
+            ));
+        }
+        if observed_stored_input_state_version < 8
+            && matches!(
+                helper.terminal_outcome,
+                Some(InputTerminalOutcome::Abandoned {
+                    reason: InputAbandonReason::RequeueExpired
+                })
+            )
+        {
+            return Err(<D::Error as serde::de::Error>::custom(
+                "stored input state before v8 cannot carry the requeue-expired abandon reason",
             ));
         }
         if observed_stored_input_state_version == 3 && helper.interaction_terminal_outbox.is_some()
@@ -2336,7 +2655,9 @@ impl<'de> Deserialize<'de> for StoredInputState {
             interaction_terminal_outbox: helper.interaction_terminal_outbox,
             scoped_destination: helper.scoped_destination,
             persisted_input: helper.persisted_input,
+            stop_requeue: helper.stop_requeue,
             created_at: helper.created_at,
+            result_payload_withheld: false,
         };
         let seed = InputStateSeed {
             phase: helper.current_state,
@@ -2557,6 +2878,315 @@ mod tests {
                 stored
             })
             .collect()
+    }
+
+    /// One finalized directed batch of two recipients (its canonical owner and
+    /// a peer) whose run returned a result carrying `marker`: each row holds
+    /// its terminal completion and its directed outbox, finalized and not yet
+    /// published, the owner's outbox keeping its terminal event for the
+    /// publication's retry.
+    fn finalized_directed_batch_fixture(marker: &str) -> Vec<StoredInputState> {
+        let mut input_ids = vec![InputId::new(), InputId::new()];
+        input_ids.sort_by_key(|input_id| input_id.0);
+        let owner_input_id = input_ids[0].clone();
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let result: meerkat_core::types::RunResult = serde_json::from_value(serde_json::json!({
+            "text": marker,
+            "session_id": session_id,
+            "usage": meerkat_core::Usage::default(),
+            "turns": 1,
+            "tool_calls": 0,
+        }))
+        .unwrap();
+        let candidate = InteractionTerminalCandidate::RunResult {
+            result: Box::new(result.clone()),
+        };
+        let outcome = crate::completion::CompletionOutcome::Completed(Box::new(result));
+        let finalization = InputTerminalCompletionFinalizationVerdict::Succeeded;
+        let candidate_digest = interaction_terminal_payload_digest(&candidate).unwrap();
+        let receipt_digest =
+            interaction_terminal_payload_digest(&(&outcome, &finalization)).unwrap();
+        let completion_input_ids_digest = interaction_terminal_payload_digest(&input_ids).unwrap();
+        input_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, input_id)| {
+                let owns = input_id == &owner_input_id;
+                let event = AgentEvent::InteractionComplete {
+                    interaction_id: InteractionId(input_id.0),
+                    result: marker.to_string(),
+                    structured_output: None,
+                };
+                let event_digest = interaction_terminal_payload_digest(&event).unwrap();
+                let mut stored = StoredInputState::new_accepted(input_id.clone());
+                stored.seed.phase = InputLifecycleState::Consumed;
+                stored.seed.terminal_outcome = Some(InputTerminalOutcome::Consumed);
+                stored.state.terminal_completion = Some(InputTerminalCompletion {
+                    input_id: input_id.clone(),
+                    batch_ordinal: ordinal as u16,
+                    batch_key: InputTerminalCompletionBatchKey::Run {
+                        run_id: run_id.clone(),
+                    },
+                    owner_input_id: owner_input_id.clone(),
+                    candidate_digest: candidate_digest.clone(),
+                    completion_input_ids_digest: completion_input_ids_digest.clone(),
+                    requires_session_checkpoint: true,
+                    candidate: owns.then(|| candidate.clone()),
+                    completion_input_ids: owns.then(|| input_ids.clone()),
+                    outcome: owns.then(|| outcome.clone()),
+                    phase: InputTerminalCompletionPhase::Finalized {
+                        receipt_digest: receipt_digest.clone(),
+                        finalization,
+                    },
+                });
+                stored.state.interaction_terminal_outbox = Some(InteractionTerminalOutbox {
+                    interaction_id: InteractionId(input_id.0),
+                    input_id: input_id.clone(),
+                    batch_ordinal: ordinal as u16,
+                    batch_key: InteractionTerminalBatchKey::Run {
+                        run_id: run_id.clone(),
+                    },
+                    owner_session_id: session_id.clone(),
+                    owner_agent_runtime_id: Some("fixture-runtime".to_string()),
+                    owner_fence_token: Some(7),
+                    owner_runtime_generation: Some(3),
+                    owner_runtime_epoch_id: Some("fixture-epoch".to_string()),
+                    candidate_owner_input_id: owner_input_id.clone(),
+                    released_0831_candidate: None,
+                    candidate_digest: candidate_digest.clone(),
+                    released_0831_completion_input_ids: None,
+                    completion_input_ids_digest: completion_input_ids_digest.clone(),
+                    phase: InteractionTerminalOutboxPhase::Finalized {
+                        finalization_failed: false,
+                        finalized_event: owns.then_some(event),
+                        finalized_payload_digest: event_digest,
+                    },
+                });
+                stored
+            })
+            .collect()
+    }
+
+    /// Every digest a row derives from its batch's payload.
+    fn row_payload_digests(row: &StoredInputState) -> Vec<String> {
+        let mut digests = Vec::new();
+        if let Some(completion) = row.state.terminal_completion.as_ref() {
+            digests.push(completion.candidate_digest.clone());
+            if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+                &completion.phase
+            {
+                digests.push(receipt_digest.clone());
+            }
+        }
+        if let Some(outbox) = row.state.interaction_terminal_outbox.as_ref() {
+            digests.push(outbox.candidate_digest.clone());
+            match &outbox.phase {
+                InteractionTerminalOutboxPhase::Finalized {
+                    finalized_payload_digest,
+                    ..
+                } => digests.push(finalized_payload_digest.clone()),
+                InteractionTerminalOutboxPhase::Published { publication, .. } => {
+                    digests.push(publication.payload_digest.clone());
+                }
+                InteractionTerminalOutboxPhase::Candidate => {}
+            }
+        }
+        digests
+    }
+
+    /// A copy released to a reader its destination does not permit carries
+    /// no payload and nothing derived from one, on the batch's canonical owner
+    /// and on a peer, which holds the shared digests but no payload: not the
+    /// result, not the owner's finalized terminal event, and none of the
+    /// payload digests. Every identity, the phases and the recipient digest
+    /// stay, and the stored row is untouched.
+    #[test]
+    fn a_withheld_copy_carries_no_payload_and_no_payload_digest() {
+        let marker = "withheld-copy-result-marker";
+        for row in finalized_directed_batch_fixture(marker) {
+            let stored_bytes = serde_json::to_vec(&row).unwrap();
+            let round_trip: StoredInputState = serde_json::from_slice(&stored_bytes)
+                .expect("the stored fixture row is a valid stored row");
+            assert_eq!(serde_json::to_vec(&round_trip).unwrap(), stored_bytes);
+            let mut copy = row.clone();
+            copy.withhold_result_payload();
+            assert_eq!(
+                serde_json::to_vec(&row).unwrap(),
+                stored_bytes,
+                "the stored row is untouched"
+            );
+            let released = serde_json::to_string(&copy).unwrap();
+            assert!(!released.contains(marker), "{released}");
+            for digest in row_payload_digests(&row) {
+                assert!(
+                    !released.contains(&digest),
+                    "the payload digest {digest} came out: {released}"
+                );
+            }
+            let stored_completion = row.state.terminal_completion.as_ref().unwrap();
+            let completion = copy.state.terminal_completion.as_ref().unwrap();
+            assert_eq!(completion.input_id, stored_completion.input_id);
+            assert_eq!(completion.owner_input_id, stored_completion.owner_input_id);
+            assert_eq!(completion.batch_key, stored_completion.batch_key);
+            assert_eq!(completion.batch_ordinal, stored_completion.batch_ordinal);
+            assert_eq!(
+                completion.completion_input_ids_digest,
+                stored_completion.completion_input_ids_digest
+            );
+            assert_eq!(
+                completion.completion_input_ids,
+                stored_completion.completion_input_ids
+            );
+            assert!(matches!(
+                completion.phase,
+                InputTerminalCompletionPhase::Finalized { .. }
+            ));
+            let outbox = copy.state.interaction_terminal_outbox.as_ref().unwrap();
+            assert!(
+                matches!(
+                    outbox.phase,
+                    InteractionTerminalOutboxPhase::Finalized {
+                        finalized_event: None,
+                        ..
+                    }
+                ),
+                "the finalized terminal event is withheld"
+            );
+            assert_eq!(outbox.input_id, completion.input_id);
+            assert_eq!(outbox.interaction_id, InteractionId(completion.input_id.0));
+        }
+    }
+
+    /// The withheld digest never passes for a real one. A released copy
+    /// written out and read back is refused (it carries the sentinel and no
+    /// mark), and on an otherwise valid stored row each digest set to the
+    /// sentinel is refused by the row's own validation.
+    #[test]
+    fn a_withheld_digest_never_passes_as_a_real_digest() {
+        let rows = finalized_directed_batch_fixture("sentinel-result-marker");
+        for row in &rows {
+            let mut copy = row.clone();
+            copy.withhold_result_payload();
+            assert!(
+                copy.state.result_payload_withheld,
+                "the copy is marked in process"
+            );
+            let written = serde_json::to_vec(&copy).unwrap();
+            assert!(
+                !String::from_utf8_lossy(&written).contains("result_payload_withheld"),
+                "the mark is never written"
+            );
+            assert!(
+                serde_json::from_slice::<StoredInputState>(&written).is_err(),
+                "a released copy read back is refused"
+            );
+        }
+
+        let peer = &rows[1];
+        let mut completion = peer.state.terminal_completion.clone().unwrap();
+        completion
+            .validate_row()
+            .expect("the stored peer completion is valid");
+        completion.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        assert!(
+            completion
+                .validate_row()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld candidate digest is refused"
+        );
+        let mut completion = peer.state.terminal_completion.clone().unwrap();
+        if let InputTerminalCompletionPhase::Finalized { receipt_digest, .. } =
+            &mut completion.phase
+        {
+            *receipt_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        }
+        assert!(
+            completion
+                .validate_row()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld receipt digest is refused"
+        );
+        let mut outbox = peer.state.interaction_terminal_outbox.clone().unwrap();
+        outbox.validate().expect("the stored peer outbox is valid");
+        outbox.candidate_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        assert!(
+            outbox
+                .validate()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld outbox candidate digest is refused"
+        );
+        let mut outbox = peer.state.interaction_terminal_outbox.clone().unwrap();
+        if let InteractionTerminalOutboxPhase::Finalized {
+            finalized_payload_digest,
+            ..
+        } = &mut outbox.phase
+        {
+            *finalized_payload_digest = WITHHELD_PAYLOAD_DIGEST.to_string();
+        }
+        assert!(
+            outbox
+                .validate()
+                .is_err_and(|error| error.contains("withheld")),
+            "a withheld event digest is refused"
+        );
+    }
+
+    /// The published binding is decided on a released copy from the outbox's
+    /// identity and phase alone: it answers for a published row and is
+    /// absent for a finalized one, whose event and digests are withheld. A
+    /// row that is not a released copy keeps its full validation and refuses
+    /// a withheld digest.
+    #[test]
+    fn the_published_binding_answers_on_a_withheld_copy_from_identity_and_phase() {
+        let mut owner = finalized_directed_batch_fixture("binding-result-marker").remove(0);
+        let finalized_copy = {
+            let mut copy = owner.clone();
+            copy.withhold_result_payload();
+            copy
+        };
+        assert!(matches!(
+            finalized_copy.published_directed_terminal_binding(),
+            Ok(None)
+        ));
+
+        let outbox = owner.state.interaction_terminal_outbox.as_mut().unwrap();
+        let InteractionTerminalOutboxPhase::Finalized {
+            finalization_failed,
+            finalized_payload_digest,
+            ..
+        } = outbox.phase.clone()
+        else {
+            panic!("finalized fixture")
+        };
+        outbox.phase = InteractionTerminalOutboxPhase::Published {
+            finalization_failed,
+            publication: InteractionTerminalPublication {
+                terminal_seq: 1,
+                payload_digest: finalized_payload_digest,
+            },
+        };
+        let input_id = owner.state.input_id.clone();
+        let stored_binding = owner
+            .published_directed_terminal_binding()
+            .expect("the stored published row validates")
+            .expect("published");
+        assert!(stored_binding.binds(&input_id, InteractionId(input_id.0)));
+
+        let mut released = owner.clone();
+        released.withhold_result_payload();
+        let binding = released
+            .published_directed_terminal_binding()
+            .expect("the released copy answers")
+            .expect("published");
+        assert!(binding.binds(&input_id, InteractionId(input_id.0)));
+
+        let mut unmarked = released.clone();
+        unmarked.state.result_payload_withheld = false;
+        assert!(
+            unmarked.published_directed_terminal_binding().is_err(),
+            "an unmarked row with a withheld digest is refused"
+        );
     }
 
     fn restart_terminal_completion_rows(rows: Vec<StoredInputState>) -> Vec<StoredInputState> {
@@ -3042,6 +3672,184 @@ mod tests {
                 .contains("disagrees with the retained replay payload")
         );
     }
+    /// The expiry of an input a graceful stop kept queued is decided from its
+    /// admission age against the stop's max age alone: exactly at the bound
+    /// or just under it keeps the input, just over ends it, a negative age
+    /// (the clock went back) keeps it, and an input without a mark is not a
+    /// kept input and never expires.
+    #[test]
+    fn stop_requeue_expiry_is_the_admission_age_over_the_marks_max_age() {
+        let admitted_at = DateTime::parse_from_rfc3339("2026-10-22T12:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let mark = StopRequeueMark {
+            stopped_at: admitted_at,
+            max_age_ms: 60_000,
+        };
+        let at = |offset_ms: i64| admitted_at + chrono::Duration::milliseconds(offset_ms);
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(60_000)));
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(59_999)));
+        assert!(stop_requeue_expired(Some(&mark), admitted_at, at(60_001)));
+        assert!(!stop_requeue_expired(Some(&mark), admitted_at, at(-5_000)));
+        assert!(!stop_requeue_expired(None, admitted_at, at(86_400_000)));
+    }
+
+    /// An input's expiry measures its age from the payload's own admission
+    /// timestamp, and from the row's creation once the payload is gone; an
+    /// unmarked row never expires. A run a graceful stop kept open is checked
+    /// input by input through the same reading.
+    #[test]
+    fn an_inputs_stop_requeue_expiry_reads_its_admission_from_its_payload() {
+        use crate::input::PromptInput;
+
+        let mut state = InputState::new_accepted(InputId::new());
+        let created_at = state.created_at;
+        let at = |offset_ms: i64| created_at + chrono::Duration::milliseconds(offset_ms);
+        assert!(
+            !input_stop_requeue_expired(&state, at(86_400_000)),
+            "an unmarked row never expires"
+        );
+        state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: created_at,
+            max_age_ms: 60_000,
+        });
+        assert!(!input_stop_requeue_expired(&state, at(60_000)));
+        assert!(input_stop_requeue_expired(&state, at(60_001)));
+
+        let mut prompt = PromptInput::new("kept across the stop", None);
+        prompt.header.timestamp = at(30_000);
+        state.persisted_input = Some(Input::Prompt(prompt));
+        assert!(
+            !input_stop_requeue_expired(&state, at(60_001)),
+            "the payload's admission is the age's origin"
+        );
+        assert!(!input_stop_requeue_expired(&state, at(90_000)));
+        assert!(input_stop_requeue_expired(&state, at(90_001)));
+    }
+
+    /// A row carrying a requeue-across-stop fact (a stop's requeue mark or the
+    /// requeue-expired abandon reason) is written as stored input state v8
+    /// and round-trips byte for byte; every other row is written at the v7
+    /// baseline. A row stamped before v8 cannot carry either fact.
+    #[test]
+    fn a_requeue_fact_is_written_at_v8_and_refused_in_an_older_row() {
+        let mut row = StoredInputState::new_accepted(InputId::new());
+        let plain = serde_json::to_value(&row).unwrap();
+        assert_eq!(plain["stored_input_state_version"], 7);
+
+        row.state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: Utc::now(),
+            max_age_ms: 900_000,
+        });
+        let marked = serde_json::to_value(&row).unwrap();
+        assert_eq!(marked["stored_input_state_version"], 8);
+        let reread: StoredInputState = serde_json::from_value(marked.clone()).unwrap();
+        assert_eq!(reread.state.stop_requeue, row.state.stop_requeue);
+        assert_eq!(serde_json::to_value(&reread).unwrap(), marked);
+        let mut older_mark = marked;
+        older_mark["stored_input_state_version"] = serde_json::json!(7);
+        let error = serde_json::from_value::<StoredInputState>(older_mark).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("stored input state before v8 cannot carry a stop requeue mark"),
+            "{error}"
+        );
+
+        let mut expired = StoredInputState::new_accepted(InputId::new());
+        expired.seed.phase = InputLifecycleState::Abandoned;
+        expired.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::RequeueExpired,
+        });
+        let expired_json = serde_json::to_value(&expired).unwrap();
+        assert_eq!(expired_json["stored_input_state_version"], 8);
+        assert_eq!(
+            expired_json["terminal_outcome"]["reason"],
+            serde_json::json!("requeue_expired")
+        );
+        let reread: StoredInputState = serde_json::from_value(expired_json.clone()).unwrap();
+        assert_eq!(reread.seed.terminal_outcome, expired.seed.terminal_outcome);
+        let mut older_expired = expired_json;
+        older_expired["stored_input_state_version"] = serde_json::json!(7);
+        let error = serde_json::from_value::<StoredInputState>(older_expired).unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "stored input state before v8 cannot carry the requeue-expired abandon reason"
+            ),
+            "{error}"
+        );
+    }
+
+    // Byte-exact released v0.9.4 terminal-outcome enums, commit
+    // e91835c5fea0170d0dfc1d297d70269234fd4a16, src/input_state.rs blob
+    // 0240352c88556191e86567813bdce53249f8bf14, lines 47-92: what the 0.9.4
+    // reader decodes a row's terminal outcome with, before its version gate.
+    #[allow(dead_code)]
+    mod released_v0_9_4_terminal_outcome {
+        use meerkat_core::lifecycle::InputId;
+        use serde::{Deserialize, Serialize};
+
+        include!("../tests/fixtures/v0_9_4_input_terminal_outcome.rs.txt");
+    }
+
+    /// What the released 0.9.4 reader does with each requeue-across-stop fact.
+    /// It decodes a row's whole helper, the terminal outcome included, before
+    /// its version gate. A row that ended `RequeueExpired` therefore fails on
+    /// the abandon reason 0.9.4 does not know: a decode failure, not the typed
+    /// version error, and still fail-closed. A row with a stop mark carries no
+    /// such terminal, and 0.9.4's helper ignores the mark field, so the row
+    /// reaches the version gate, which refuses v8 typed (meerkat-core's
+    /// `released_v0_9_4_version_gate_reads_baseline_rows_and_refuses_v8_typed`).
+    /// The same 0.9.4 enums still decode an ordinary stopped row's terminal.
+    #[test]
+    fn a_released_v0_9_4_reader_fails_closed_on_both_requeue_facts() {
+        use released_v0_9_4_terminal_outcome as released;
+
+        let mut expired = StoredInputState::new_accepted(InputId::new());
+        expired.seed.phase = InputLifecycleState::Abandoned;
+        expired.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::RequeueExpired,
+        });
+        let expired = serde_json::to_value(&expired).unwrap();
+        assert_eq!(expired["stored_input_state_version"], 8);
+        let error = serde_json::from_value::<released::InputTerminalOutcome>(
+            expired["terminal_outcome"].clone(),
+        )
+        .expect_err("0.9.4 does not know the requeue-expired reason");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown variant `requeue_expired`"),
+            "{error}"
+        );
+
+        let mut marked = StoredInputState::new_accepted(InputId::new());
+        marked.state.stop_requeue = Some(StopRequeueMark {
+            stopped_at: Utc::now(),
+            max_age_ms: 900_000,
+        });
+        let marked = serde_json::to_value(&marked).unwrap();
+        assert_eq!(marked["stored_input_state_version"], 8);
+        assert!(marked.get("terminal_outcome").is_none());
+        assert!(marked.get("stop_requeue").is_some());
+
+        let mut stopped = StoredInputState::new_accepted(InputId::new());
+        stopped.seed.phase = InputLifecycleState::Abandoned;
+        stopped.seed.terminal_outcome = Some(InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Stopped,
+        });
+        let stopped = serde_json::to_value(&stopped).unwrap();
+        assert_eq!(stopped["stored_input_state_version"], 7);
+        assert_eq!(
+            serde_json::from_value::<released::InputTerminalOutcome>(
+                stopped["terminal_outcome"].clone()
+            )
+            .unwrap(),
+            released::InputTerminalOutcome::Abandoned {
+                reason: released::InputAbandonReason::Stopped
+            }
+        );
+    }
 
     /// A row whose authority association bounds its resource domains by owner
     /// is written as stored input state v7. Stamped with an older version it
@@ -3204,6 +4012,7 @@ mod tests {
             tool_use_id: None,
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         let event = |pending_tool_calls| AgentEvent::InteractionCallbackPending {
             interaction_id,
@@ -3218,6 +4027,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &legacy_candidate,
@@ -3236,6 +4046,7 @@ mod tests {
             tool_use_id: Some("call-9".to_string()),
             tool_name: "external".to_string(),
             args: args.clone(),
+            dedupe_key: None,
         };
         assert!(!interaction_terminal_candidate_matches_event(
             &modern_candidate,
@@ -3248,6 +4059,7 @@ mod tests {
             tool_name: "external".to_string(),
             args: args.clone(),
             settlement_failures: Vec::new(),
+            dedupe_key: None,
         }]);
         assert!(interaction_terminal_candidate_matches_event(
             &modern_candidate,
@@ -3257,15 +4069,80 @@ mod tests {
         ));
     }
 
+    /// A candidate whose call has a dedupe key keeps it through the durable
+    /// row (it re-serializes byte-identically under its digest and projects
+    /// back to the same core terminal) and pairs only with an event whose
+    /// pending call carries the same key. (Unrun until the candidate's
+    /// validation.)
+    #[test]
+    fn keyed_callback_candidate_keeps_its_dedupe_key_and_pairs_only_with_it() {
+        let interaction_id = InteractionId(uuid::Uuid::new_v4());
+        let args = serde_json::json!({"value": 1});
+        let raw_args = serde_json::value::RawValue::from_string(args.to_string()).unwrap();
+        let key = meerkat_core::ToolCallDedupeKey::new(
+            meerkat_core::RunId::new(),
+            2,
+            "call-9",
+            "external",
+            &raw_args,
+        )
+        .unwrap();
+        let candidate = InteractionTerminalCandidate::CallbackPending {
+            tool_use_id: Some("call-9".to_string()),
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            dedupe_key: Some(key.clone()),
+        };
+
+        let encoded = serde_json::to_vec(&candidate).unwrap();
+        let decoded: InteractionTerminalCandidate = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(
+            interaction_terminal_payload_digest(&decoded).unwrap(),
+            interaction_terminal_payload_digest(&candidate).unwrap(),
+        );
+        assert!(matches!(
+            decoded.core_apply_terminal(),
+            Some(meerkat_core::lifecycle::core_executor::CoreApplyTerminal::CallbackPending {
+                dedupe_key: Some(ref restored),
+                ..
+            }) if *restored == key
+        ));
+
+        let event = |dedupe_key| AgentEvent::InteractionCallbackPending {
+            interaction_id,
+            tool_name: "external".to_string(),
+            args: args.clone(),
+            pending_tool_calls: vec![meerkat_core::error::PendingCallbackToolCall {
+                tool_use_id: "call-9".to_string(),
+                tool_name: "external".to_string(),
+                args: args.clone(),
+                settlement_failures: Vec::new(),
+                dedupe_key,
+            }],
+        };
+        assert!(interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(Some(key)),
+            false,
+        ));
+        assert!(!interaction_terminal_candidate_matches_event(
+            &candidate,
+            interaction_id,
+            &event(None),
+            false,
+        ));
+    }
+
     #[test]
     fn stored_input_state_unknown_versions_still_fail_closed() {
         let mut fixture =
             serde_json::to_value(StoredInputState::new_accepted(InputId::new())).unwrap();
-        for rejected in [2, 8] {
+        for rejected in [2, 9] {
             fixture["stored_input_state_version"] = serde_json::json!(rejected);
             let error = serde_json::from_value::<StoredInputState>(fixture.clone())
                 .expect_err("unknown historical and future versions must fail closed");
-            assert!(error.to_string().contains("expected current 7"));
+            assert!(error.to_string().contains("expected current 8"));
         }
 
         // 0.8.10 accepted still-retained v3 input rows lazily, so a supported
@@ -3289,10 +4166,12 @@ mod tests {
             serde_json::from_value(fixture).expect("0.8.10 v4 input state must migrate");
         assert!(restored.state.terminal_completion.is_none());
 
+        // The migrated row carries no requeue fact, so it is written at the
+        // baseline version.
         let migrated = serde_json::to_value(restored).unwrap();
         assert_eq!(
             migrated["stored_input_state_version"],
-            meerkat_core::generated::session_persistence_version_authority::STORED_INPUT_STATE_VERSION,
+            meerkat_core::generated::session_persistence_version_authority::stored_input_state_version_for_row(false),
         );
 
         let mut terminal_fixture =
@@ -3466,6 +4345,7 @@ mod tests {
                 tool_name: "external".to_string(),
                 args: serde_json::json!({"value": 1}),
                 settlement_failures: Vec::new(),
+                dedupe_key: None,
             }],
         };
         let event = AgentEvent::InteractionFailed {

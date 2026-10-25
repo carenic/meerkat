@@ -21,6 +21,7 @@ use meerkat_contracts::wire::supervisor_bridge::{
 };
 use meerkat_contracts::{
     LiveCloseStatus, LiveOpenResult, LiveOpenTransport, RealtimeTurningMode, WireLiveAdapterStatus,
+    WireLiveExecutionIdentityOverrideV1,
 };
 use meerkat_core::time_compat::Duration;
 use meerkat_core::types::SessionId;
@@ -174,6 +175,65 @@ pub struct MemberLiveStatus {
     pub status: WireLiveAdapterStatus,
 }
 
+/// A member live channel opened under a channel-scoped execution identity
+/// ([`MemberLiveHost::open_with_execution_identity`]): the owning host's
+/// open result, the member session the channel is bound to, and the opaque
+/// machine receipt of the pending channel. The surface that answers the
+/// channel's WebRTC offer registers the channel's playback owner against the
+/// receipt; machine authority revalidates it at every use. `Debug` redacts
+/// the session and the receipt.
+pub struct MemberLiveExecutionOpen {
+    open: LiveOpenResult,
+    session_id: SessionId,
+    pending_receipt: String,
+}
+
+impl MemberLiveExecutionOpen {
+    #[must_use]
+    pub fn new(open: LiveOpenResult, session_id: SessionId, pending_receipt: String) -> Self {
+        Self {
+            open,
+            session_id,
+            pending_receipt,
+        }
+    }
+
+    /// The owning host's open result, verbatim.
+    #[must_use]
+    pub fn open(&self) -> &LiveOpenResult {
+        &self.open
+    }
+
+    /// The member session the channel is bound to.
+    #[must_use]
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    /// The pending channel's opaque machine receipt.
+    #[must_use]
+    pub fn pending_receipt(&self) -> &str {
+        &self.pending_receipt
+    }
+
+    /// The open result, the member session and the pending receipt.
+    #[must_use]
+    pub fn into_parts(self) -> (LiveOpenResult, SessionId, String) {
+        (self.open, self.session_id, self.pending_receipt)
+    }
+}
+
+impl std::fmt::Debug for MemberLiveExecutionOpen {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MemberLiveExecutionOpen")
+            .field("open", &self.open)
+            .field("session_id", &"[REDACTED]")
+            .field("pending_receipt", &"[REDACTED]")
+            .finish()
+    }
+}
+
 /// Machine-wide injected member live host (ADJ-P6B-1). Implemented by the
 /// facade (`meerkat::surface::ServiceMemberLiveHost`) over the ONE extracted
 /// live pipeline; installed via `MeerkatMachine::set_member_live_host` by
@@ -199,14 +259,57 @@ pub trait MemberLiveHost: Send + Sync {
         transport: Option<LiveOpenTransport>,
     ) -> Result<LiveOpenResult, MemberLiveError>;
 
+    /// Run the open pipeline for the member session under a channel-scoped
+    /// execution identity (`live.execution_identity.v1`, for example
+    /// `gpt-live-1`), as a strict session-scoped `live/open` runs it: the
+    /// host's execution-identity authority admits the identity and owns the
+    /// channel's provider binding, and the member's durable session identity
+    /// does not change. Returns the open with the pending receipt that the
+    /// surface answering the channel's WebRTC offer registers its playback
+    /// owner against.
+    ///
+    /// The default refuses typed ([`MemberLiveError::Unavailable`]): a host
+    /// composed without an execution-identity authority serves no such open.
+    async fn open_with_execution_identity(
+        &self,
+        session: &SessionId,
+        execution_identity: &WireLiveExecutionIdentityOverrideV1,
+        turning_mode: Option<RealtimeTurningMode>,
+        transport: Option<LiveOpenTransport>,
+    ) -> Result<MemberLiveExecutionOpen, MemberLiveError> {
+        let _ = (session, execution_identity, turning_mode, transport);
+        Err(MemberLiveError::Unavailable {
+            reason: "this member live host serves no channel-scoped execution identity".to_string(),
+        })
+    }
+
     /// Close the named channel (close-what-you-name; an unknown channel is
     /// typed [`MemberLiveError::ChannelNotFound`], idempotent-safe for the
     /// caller-driven reconciliation loop).
+    ///
+    /// Lifecycle disposal calls this while it holds the session's live
+    /// lifecycle lease, so an implementation must not take that lease here.
     async fn close(
         &self,
         session: &SessionId,
         channel_id: &str,
     ) -> Result<LiveCloseStatus, MemberLiveError>;
+
+    /// Close the named channel on an explicit request: the member's mob
+    /// closing it, or cleaning up an open whose caller never took it. A
+    /// channel opened through [`Self::open_with_execution_identity`] closes
+    /// through that identity's authority, as a strict `live/close` closes
+    /// one; any other channel closes as [`Self::close`] does. This close may
+    /// take the session's live lifecycle lease, which is why lifecycle
+    /// disposal calls [`Self::close`] instead. The default is
+    /// [`Self::close`].
+    async fn close_explicit(
+        &self,
+        session: &SessionId,
+        channel_id: &str,
+    ) -> Result<LiveCloseStatus, MemberLiveError> {
+        self.close(session, channel_id).await
+    }
 
     /// Read-only point read. `channel_id: None` ⇒ resolve the member's
     /// active channel via `live_active_channel_by_session`; no active

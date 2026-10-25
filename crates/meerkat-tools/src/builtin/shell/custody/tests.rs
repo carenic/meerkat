@@ -2087,3 +2087,443 @@ async fn reopening_an_open_scope_reuses_its_handle_without_recovering_again() {
         ToolProcessCessation::NeverStarted
     );
 }
+
+// ---------------------------------------------------------------------------
+// A run that resumes in the process that ran it
+// ---------------------------------------------------------------------------
+
+/// The one custody record under `dir`.
+fn single_record(dir: &Path) -> CustodyRecord {
+    let files = record_files(dir);
+    assert_eq!(files.len(), 1, "one custody record: {files:?}");
+    serde_json::from_slice(&std::fs::read(&files[0]).unwrap()).unwrap()
+}
+
+/// A tool process of `run`, reserved and recorded spawned by `custody` (this
+/// incarnation), whose group is `leader`'s.
+async fn own_spawned(
+    custody: &Arc<ProcessCustody>,
+    call: &str,
+    run: &meerkat_core::RunId,
+    leader: &Child,
+) -> CustodyReservation {
+    let mut reservation = custody
+        .reserve(ToolProcessSpawner::ShellCall, Some(call), Some(run))
+        .await
+        .unwrap();
+    reservation
+        .record_spawned(leader.id() as i32)
+        .await
+        .unwrap();
+    reservation
+}
+
+/// A call the run's earlier execution in this process ran to its end leaves
+/// an `Exited` marker of this incarnation. Recovery and the attachment's read
+/// leave it alone; when the run resumes here, the resumption takes it as the
+/// run's interrupted evidence, durably, and a second resumption finds the
+/// same evidence.
+#[tokio::test]
+async fn a_resumed_runs_own_exit_marker_becomes_its_interrupted_evidence() {
+    use meerkat_core::tool_process::{InterruptedToolEvidence, InterruptedToolSettlement};
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope.clone())
+        .await
+        .unwrap();
+    let run = meerkat_core::RunId::new();
+    let mut leader = spawn_group("exec sleep 60");
+    let reservation = own_spawned(&custody, "call-ran", &run, &leader).await;
+    kill_test_group(leader.id() as i32);
+    leader.wait().unwrap();
+    reservation.settle().await;
+    assert!(
+        matches!(single_record(&dir).phase, CustodyPhase::Exited),
+        "the call's exit leaves a marker while its run is open"
+    );
+    assert!(
+        custody.interrupted_calls().await.unwrap().is_empty(),
+        "the attachment's read takes no marker of this incarnation"
+    );
+
+    let calls = custody.run_resumes(&run).await.unwrap();
+
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].run_id, run);
+    assert_eq!(calls[0].tool_call_id.as_deref(), Some("call-ran"));
+    assert_eq!(calls[0].cessation, ToolProcessCessation::ExitedBeforeCommit);
+    assert_eq!(calls[0].settlement, InterruptedToolSettlement::Pending);
+    assert!(
+        matches!(
+            single_record(&dir).phase,
+            CustodyPhase::Interrupted {
+                cessation: ToolProcessCessation::ExitedBeforeCommit,
+                ..
+            }
+        ),
+        "the record itself is the run's interrupted evidence now"
+    );
+    assert_eq!(custody.interrupted_calls().await.unwrap(), calls);
+    assert_eq!(
+        custody.run_resumes(&run).await.unwrap(),
+        calls,
+        "a second resumption settles nothing more"
+    );
+
+    // A later recovery of the scope leaves the settled evidence as it is.
+    drop(custody);
+    let (custody, report) = ProcessCustody::recover_and_open(root.path(), scope)
+        .await
+        .unwrap();
+    assert!(report.recovered.is_empty());
+    assert_eq!(custody.interrupted_calls().await.unwrap(), calls);
+    custody.acknowledge(&[calls[0].entry_id]).await.unwrap();
+    assert!(record_files(&dir).is_empty());
+}
+
+/// The run's earlier execution in this process let go of a call whose
+/// process still runs (its future was dropped by a stop or a teardown, and an
+/// exit watcher keeps the record). The resumption stops the group and takes
+/// the call as interrupted evidence; the watcher that finishes the record
+/// afterwards leaves that evidence as it is, and a second resumption kills
+/// nothing more.
+#[tokio::test]
+async fn a_resumed_run_stops_the_group_its_earlier_execution_let_go_of() {
+    use meerkat_core::tool_process::InterruptedToolEvidence;
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope)
+        .await
+        .unwrap();
+    let run = meerkat_core::RunId::new();
+    let mut leader = spawn_group("exec sleep 60");
+    let pgid = leader.id() as i32;
+    let reservation = own_spawned(&custody, "call-running", &run, &leader).await;
+    drop(reservation);
+    assert!(process_running(pgid), "the let-go group still runs");
+    assert!(registered(pgid), "its exit watcher keeps it registered");
+
+    let calls = custody.run_resumes(&run).await.unwrap();
+
+    leader.wait().unwrap();
+    assert!(
+        live_members(pgid).is_empty(),
+        "the resumption stopped the group"
+    );
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].tool_call_id.as_deref(), Some("call-running"));
+    assert!(
+        matches!(
+            calls[0].cessation,
+            ToolProcessCessation::KilledByRecovery { .. }
+        ),
+        "{:?}",
+        calls[0].cessation
+    );
+    assert!(
+        await_release(pgid),
+        "the exit watcher finished the record after the resumption"
+    );
+    let evidence = single_record(&dir);
+    assert!(
+        matches!(evidence.phase, CustodyPhase::Interrupted { .. }),
+        "the watcher's finish left the resumption's evidence: {:?}",
+        evidence.phase
+    );
+    assert_eq!(
+        custody.run_resumes(&run).await.unwrap(),
+        calls,
+        "a second resumption settles nothing more"
+    );
+}
+
+/// A call the run still runs in this process, under its live owner, means
+/// the run executes here: the resumption refuses, typed, before it settles
+/// anything. The process is not signalled, its record is as its owner wrote
+/// it, and the call then completes and is settled by its owner as usual.
+#[tokio::test]
+async fn a_resumption_refuses_a_run_whose_call_a_live_owner_still_holds() {
+    use meerkat_core::tool_process::InterruptedToolEvidence;
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope)
+        .await
+        .unwrap();
+    let run = meerkat_core::RunId::new();
+    // Another call of the run already ended here: its marker is not settled
+    // either when the resumption refuses.
+    let mut ended = spawn_group("exec sleep 60");
+    let ended_reservation = own_spawned(&custody, "call-ended", &run, &ended).await;
+    kill_test_group(ended.id() as i32);
+    ended.wait().unwrap();
+    ended_reservation.settle().await;
+    let mut leader = spawn_group("sleep 2");
+    let pgid = leader.id() as i32;
+    let reservation = own_spawned(&custody, "call-live", &run, &leader).await;
+
+    let refused = settle_resumed_run_blocking(
+        &dir,
+        incarnation().unwrap(),
+        &run,
+        Instant::now() + CESSATION_DEADLINE,
+    );
+    assert!(
+        matches!(
+            refused,
+            Err(ProcessCustodyError::ResumedRunStillOwned { entry_id, ref run_id })
+                if entry_id == reservation.entry_id() && run_id == &run
+        ),
+        "{refused:?}"
+    );
+    let error = custody.run_resumes(&run).await.unwrap_err();
+    assert!(error.reason.contains("still held by its owner"), "{error}");
+    assert!(
+        process_running(pgid),
+        "the live call's process is not signalled"
+    );
+    let phases: Vec<_> = record_files(&dir)
+        .iter()
+        .map(|path| {
+            serde_json::from_slice::<CustodyRecord>(&std::fs::read(path).unwrap())
+                .unwrap()
+                .phase
+        })
+        .collect();
+    assert_eq!(phases.len(), 2);
+    assert!(
+        phases
+            .iter()
+            .all(|phase| matches!(phase, CustodyPhase::Spawned { .. } | CustodyPhase::Exited)),
+        "nothing was settled: {phases:?}"
+    );
+
+    // The live call completes normally, and its owner settles it.
+    assert!(
+        leader.wait().unwrap().success(),
+        "the live call ran to its end"
+    );
+    reservation.settle().await;
+    let phases: Vec<_> = record_files(&dir)
+        .iter()
+        .map(|path| {
+            serde_json::from_slice::<CustodyRecord>(&std::fs::read(path).unwrap())
+                .unwrap()
+                .phase
+        })
+        .collect();
+    assert_eq!(phases.len(), 2);
+    assert!(
+        phases
+            .iter()
+            .all(|phase| matches!(phase, CustodyPhase::Exited)),
+        "both calls end as their owners settled them: {phases:?}"
+    );
+}
+
+/// A resumption settles exactly the run it names and only this
+/// incarnation's records of it: another run's marker of this incarnation and
+/// another incarnation's record of the same run (recovery's to settle) stay
+/// as they are. A reservation of the run whose owner let go of it before its
+/// gate opened never ran, so it is removed, not taken as evidence.
+#[tokio::test]
+async fn a_resumption_settles_only_its_runs_records_of_this_incarnation() {
+    use meerkat_core::tool_process::InterruptedToolEvidence;
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope.clone())
+        .await
+        .unwrap();
+    let current = incarnation().unwrap();
+    let run = meerkat_core::RunId::new();
+    let other_run = meerkat_core::RunId::new();
+    let own_marker = write_prior_record(
+        root.path(),
+        &scope,
+        current.id,
+        current.host,
+        CustodyPhase::Exited,
+    );
+    set_run_id(&own_marker, run.clone());
+    let other_runs_marker = write_prior_record(
+        root.path(),
+        &scope,
+        current.id,
+        current.host,
+        CustodyPhase::Exited,
+    );
+    set_run_id(&other_runs_marker, other_run.clone());
+    let other_incarnations_marker = write_prior_record(
+        root.path(),
+        &scope,
+        Uuid::new_v4(),
+        dead_identity(),
+        CustodyPhase::Exited,
+    );
+    set_run_id(&other_incarnations_marker, run.clone());
+    let never_started = write_prior_record(
+        root.path(),
+        &scope,
+        current.id,
+        current.host,
+        CustodyPhase::Reserved,
+    );
+    set_run_id(&never_started, run.clone());
+    let phase_of = |path: &Path| {
+        serde_json::from_slice::<CustodyRecord>(&std::fs::read(path).unwrap())
+            .unwrap()
+            .phase
+    };
+
+    assert!(
+        custody
+            .run_resumes(&meerkat_core::RunId::new())
+            .await
+            .unwrap()
+            .is_empty(),
+        "a run without records has no evidence"
+    );
+    let calls = custody.run_resumes(&run).await.unwrap();
+
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].run_id, run);
+    assert_eq!(calls[0].cessation, ToolProcessCessation::ExitedBeforeCommit);
+    assert!(matches!(
+        phase_of(&own_marker),
+        CustodyPhase::Interrupted { .. }
+    ));
+    assert!(
+        matches!(phase_of(&other_runs_marker), CustodyPhase::Exited),
+        "another run's marker is untouched"
+    );
+    assert!(
+        matches!(phase_of(&other_incarnations_marker), CustodyPhase::Exited),
+        "another incarnation's record is recovery's, untouched"
+    );
+    assert!(
+        !never_started.exists(),
+        "a reservation that never ran is removed, not evidence"
+    );
+    assert_eq!(
+        record_files(&dir).len(),
+        3,
+        "only the never-started reservation is gone"
+    );
+}
+
+/// The owner's finish of a record (its settle, or the exit watcher of an
+/// owner that let go) that a resumption already settled leaves the
+/// resumption's evidence, and does not bring back a record whose evidence
+/// was acknowledged.
+#[tokio::test]
+async fn a_finish_after_the_resumption_leaves_its_evidence() {
+    use meerkat_core::tool_process::InterruptedToolEvidence;
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope)
+        .await
+        .unwrap();
+    let run = meerkat_core::RunId::new();
+    let mut leader = spawn_group("exec sleep 60");
+    let mut reservation = own_spawned(&custody, "call-late", &run, &leader).await;
+    kill_test_group(leader.id() as i32);
+    leader.wait().unwrap();
+    // The owner lets go without starting a watcher: this test plays its
+    // late finish itself.
+    let path = reservation.path.take().unwrap();
+    let record = reservation.record.clone();
+    drop(reservation);
+
+    let calls = custody.run_resumes(&run).await.unwrap();
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].cessation, ToolProcessCessation::AlreadyExited);
+
+    for ran in [true, false] {
+        finish_record_blocking(&dir, &path, &record, ran).unwrap();
+        let evidence = single_record(&dir);
+        assert!(
+            matches!(
+                evidence.phase,
+                CustodyPhase::Interrupted {
+                    cessation: ToolProcessCessation::AlreadyExited,
+                    ..
+                }
+            ),
+            "a finish (ran: {ran}) after the resumption keeps its evidence: {:?}",
+            evidence.phase
+        );
+    }
+    custody.acknowledge(&[calls[0].entry_id]).await.unwrap();
+    finish_record_blocking(&dir, &path, &record, true).unwrap();
+    assert!(
+        record_files(&dir).is_empty(),
+        "an acknowledged record is not brought back"
+    );
+}
+
+/// A background job the run started runs on under its job's owner past the
+/// call that started it, by design. A resumption of the run leaves it to
+/// that owner (not signalled, not taken as evidence) and still settles the
+/// run's other records.
+#[tokio::test]
+async fn a_resumption_leaves_a_background_job_of_its_run_to_its_live_owner() {
+    use meerkat_core::tool_process::InterruptedToolEvidence;
+
+    let root = TempDir::new().unwrap();
+    let scope = scope();
+    let dir = root.path().join(scope.as_str());
+    let (custody, _) = ProcessCustody::recover_and_open(root.path(), scope.clone())
+        .await
+        .unwrap();
+    let current = incarnation().unwrap();
+    let run = meerkat_core::RunId::new();
+    let mut job = spawn_group("exec sleep 60");
+    let job_pgid = job.id() as i32;
+    let mut reservation = custody
+        .reserve(
+            ToolProcessSpawner::BackgroundJob {
+                job_id: "job-1".to_owned(),
+            },
+            Some("call-job"),
+            Some(&run),
+        )
+        .await
+        .unwrap();
+    reservation.record_spawned(job_pgid).await.unwrap();
+    let marker = write_prior_record(
+        root.path(),
+        &scope,
+        current.id,
+        current.host,
+        CustodyPhase::Exited,
+    );
+    set_run_id(&marker, run.clone());
+
+    let calls = custody.run_resumes(&run).await.unwrap();
+
+    assert_eq!(calls.len(), 1, "{calls:?}");
+    assert_eq!(calls[0].tool_call_id.as_deref(), Some("call-prior"));
+    assert!(process_running(job_pgid), "the live job is not signalled");
+    let job_record: CustodyRecord =
+        serde_json::from_slice(&std::fs::read(record_path(&dir, reservation.entry_id())).unwrap())
+            .unwrap();
+    assert!(
+        matches!(job_record.phase, CustodyPhase::Spawned { .. }),
+        "the job stays with its owner: {:?}",
+        job_record.phase
+    );
+
+    // The job ends under its owner as usual.
+    kill_test_group(job_pgid);
+    job.wait().unwrap();
+    reservation.settle().await;
+}

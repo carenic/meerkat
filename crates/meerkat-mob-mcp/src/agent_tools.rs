@@ -4301,6 +4301,7 @@ mod tests {
                 non_portable_disabled: None,
                 preview_unavailable,
                 registration_refusal: None,
+                custody_deferred: None,
             }
         };
         let note = |marker: Option<Marker>, run_state: Option<WireMemberRunState>| {
@@ -5707,6 +5708,14 @@ mod tests {
             self.reports_persistent_sessions.load(Ordering::Relaxed)
         }
 
+        /// This fake records no provisional durable tail.
+        async fn provisional_tail_stands(
+            &self,
+            _session_id: &SessionId,
+        ) -> Result<bool, SessionError> {
+            Ok(false)
+        }
+
         async fn load_persisted_session_metadata(
             &self,
             session_id: &SessionId,
@@ -5925,6 +5934,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
         profiles.insert(
@@ -5949,6 +5959,7 @@ mod tests {
                 max_inline_peer_notifications: None,
                 output_schema: None,
                 provider_params: None,
+                durable: false,
             })),
         );
 
@@ -9248,6 +9259,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9291,6 +9303,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9326,6 +9339,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9357,6 +9371,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,
@@ -9390,6 +9405,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: Some(vec!["send".to_string()]),
@@ -9424,6 +9440,7 @@ mod tests {
                     max_inline_peer_notifications: None,
                     output_schema: None,
                     provider_params: None,
+                    durable: false,
                 },
             ))),
             allow_overlay: None,

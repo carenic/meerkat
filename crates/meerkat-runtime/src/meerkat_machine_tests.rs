@@ -977,8 +977,184 @@ fn realtime_policy(target_realtime_capable: bool) -> ModelRoutingRealtimePolicy 
     }
 }
 
+/// A requeue disposition the stop mark cannot record as given is refused at
+/// the runtime boundary, typed, before any unregister starts, by both entry
+/// points: a max age under one millisecond (zero included) and one over the
+/// cap. The session stays registered. The accepted bounds record exactly
+/// their whole milliseconds, so nothing is clamped.
+#[tokio::test]
+async fn an_unregister_refuses_a_requeue_max_age_it_cannot_record() {
+    use crate::meerkat_machine::{UnregisterQueuedInputs, UnregisterQueuedInputsError};
+
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register the session");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registered session exposes its exact registration");
+    let registration_use = machine
+        .session_registration_use(&registration)
+        .await
+        .expect("the current registration has a use");
+    let over = UnregisterQueuedInputs::MAX_AGE_CAP + Duration::from_millis(1);
+    for (max_age, refusal) in [
+        (
+            Duration::ZERO,
+            UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond {
+                max_age: Duration::ZERO,
+            },
+        ),
+        (
+            Duration::from_micros(999),
+            UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond {
+                max_age: Duration::from_micros(999),
+            },
+        ),
+        (
+            over,
+            UnregisterQueuedInputsError::MaxAgeOverCap {
+                max_age: over,
+                cap: UnregisterQueuedInputs::MAX_AGE_CAP,
+            },
+        ),
+    ] {
+        let queued_inputs = UnregisterQueuedInputs::Requeue { max_age };
+        assert_eq!(queued_inputs.check(), Err(refusal));
+        let current = machine
+            .observe_unregister_session_registration_with_queued_inputs_if_current(
+                &registration,
+                queued_inputs,
+            )
+            .await
+            .expect_err("the current-registration entry refuses it");
+        assert!(
+            matches!(current, RuntimeDriverError::QueuedInputsRefused(found) if found == refusal),
+            "{current}"
+        );
+        let unchanged = machine
+            .observe_unregister_session_registration_with_queued_inputs_if_use_unchanged(
+                &registration,
+                registration_use,
+                queued_inputs,
+            )
+            .await
+            .expect_err("the use-gated entry refuses it");
+        assert!(
+            matches!(unchanged, RuntimeDriverError::QueuedInputsRefused(found) if found == refusal),
+            "{unchanged}"
+        );
+        assert!(
+            machine.contains_session(&session_id).await,
+            "a refused disposition starts no unregister"
+        );
+    }
+    for (max_age, recorded_ms) in [
+        (Duration::from_millis(1), 1),
+        (UnregisterQueuedInputs::MAX_AGE_CAP, 86_400_000),
+    ] {
+        assert_eq!(
+            UnregisterQueuedInputs::Requeue { max_age }
+                .recorded()
+                .map(|disposition| disposition.dsl_disposition()),
+            Ok((
+                crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
+                recorded_ms
+            ))
+        );
+    }
+}
+
 fn memory_blob_store() -> Arc<dyn meerkat_core::BlobStore> {
     Arc::new(meerkat_store::MemoryBlobStore::new())
+}
+
+/// A graceful process shutdown that names no disposition (rkat-rpc's and the
+/// REST server's) requeues on a runtime with a persistence store, with the
+/// 15 minute default max age recorded exactly, and stops on a runtime
+/// without one. Its until-terminal unregister entry point refuses a
+/// disposition it cannot record before it starts anything, as the other
+/// entry points do, and with the ephemeral default it unregisters the exact
+/// registration to terminal.
+#[tokio::test]
+async fn a_graceful_shutdown_requeues_on_a_persistent_runtime_and_stops_on_an_ephemeral_one() {
+    use crate::meerkat_machine::{UnregisterQueuedInputs, UnregisterQueuedInputsError};
+
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let persistent =
+        MeerkatMachine::persistent(store, memory_blob_store()).expect("persistent machine");
+    let ephemeral = MeerkatMachine::ephemeral();
+    assert_eq!(
+        UnregisterQueuedInputs::DEFAULT_MAX_AGE,
+        Duration::from_mins(15)
+    );
+    assert_eq!(
+        persistent.graceful_shutdown_queued_inputs(),
+        UnregisterQueuedInputs::Requeue {
+            max_age: UnregisterQueuedInputs::DEFAULT_MAX_AGE
+        }
+    );
+    assert_eq!(
+        persistent
+            .graceful_shutdown_queued_inputs()
+            .recorded()
+            .map(|disposition| disposition.dsl_disposition()),
+        Ok((
+            crate::meerkat_machine::dsl::UnregisterQueuedInputsDisposition::Requeue,
+            900_000
+        ))
+    );
+    assert_eq!(
+        ephemeral.graceful_shutdown_queued_inputs(),
+        UnregisterQueuedInputs::Stop
+    );
+
+    let session_id = SessionId::new();
+    ephemeral
+        .register_session(session_id.clone())
+        .await
+        .expect("register the session");
+    let registration = ephemeral
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registered session exposes its exact registration");
+    let refused = ephemeral
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            UnregisterQueuedInputs::Requeue {
+                max_age: Duration::ZERO,
+            },
+        )
+        .await
+        .expect_err("an unrecordable disposition is refused");
+    assert!(
+        matches!(
+            refused,
+            RuntimeDriverError::QueuedInputsRefused(
+                UnregisterQueuedInputsError::MaxAgeUnderOneMillisecond { .. }
+            )
+        ),
+        "{refused}"
+    );
+    assert!(
+        ephemeral.contains_session(&session_id).await,
+        "a refused disposition starts no unregister"
+    );
+    let unregistered = ephemeral
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            ephemeral.graceful_shutdown_queued_inputs(),
+        )
+        .await
+        .expect("the shutdown unregister completes");
+    assert!(
+        unregistered && !ephemeral.contains_session(&session_id).await,
+        "the exact registration is torn down to terminal"
+    );
 }
 
 #[derive(Clone)]
@@ -5800,32 +5976,33 @@ async fn mixed_directed_max_attempt_failure_terminalizes_only_exhausted_contribu
         .await
         .expect("accept first max-attempt input");
 
-    tokio::time::timeout(STEP_BOUND, async {
-        loop {
-            let first = machine
-                .input_state(&session_id, &first_input_id)
-                .await
-                .expect("read first input after initial failure")
-                .expect("first input remains inspectable");
-            if first.seed.phase == crate::input_state::InputLifecycleState::Queued
-                && first.seed.attempt_count == 1
-            {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-    })
-    .await
-    .expect("first directed input must park after its initial failed attempt");
-    assert!(
-        machine
-            .wake_runtime_if_active_inputs(&session_id)
-            .await
-            .expect("wake first input for its second attempt")
-    );
+    // The initial attempt fails while it is the only queued work, so the loop
+    // keeps draining: it rolls the input back to its queue and retries it at
+    // once. An observer on a loaded host may read only once that retry began.
     tokio::time::timeout(STEP_BOUND, second_apply_started.notified())
         .await
-        .expect("first input must reach its gated second attempt");
+        .expect("the runtime retries the rolled-back first input by itself");
+    // The input's Queued state at attempt 1 lasted only until that retry; its
+    // recorded rollback stays.
+    let first = machine
+        .input_state(&session_id, &first_input_id)
+        .await
+        .expect("read first input in its gated second attempt")
+        .expect("first input remains inspectable");
+    assert_eq!(
+        first
+            .state
+            .history
+            .iter()
+            .filter(|entry| {
+                entry.from == crate::input_state::InputLifecycleState::Staged
+                    && entry.to == crate::input_state::InputLifecycleState::Queued
+                    && entry.reason.as_deref() == Some("ResolveStagedRollback")
+            })
+            .count(),
+        1,
+        "the first input's initial attempt failed and rolled it back to its queue once"
+    );
 
     let second_uuid = meerkat_core::time_compat::new_uuid_v7();
     let second_input = crate::mob_adapter::create_tracked_flow_step_input(
@@ -8455,11 +8632,14 @@ async fn local_materialization_concludes_a_cold_recovered_drain() {
         )
         .expect("persistent machine"),
     );
-    let prepared = recovered
+    let mut prepared = recovered
         .prepare_local_session_materialization(session_id.clone())
         .await
         .expect("the materialization concludes the cold-recovered drain and prepares the fresh registration");
-    drop(prepared);
+    // Read the concluded teardown while the fresh registration is still
+    // prepared. Dropping it would roll the registration back on a
+    // process-owned task, whose own unregister writes Draining progress
+    // while it runs, so a read after the drop races that rollback.
     assert!(
         crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
             .await
@@ -8468,6 +8648,27 @@ async fn local_materialization_concludes_a_cold_recovered_drain() {
             .unregister_progress()
             .is_none(),
         "the concluded teardown left no Draining progress"
+    );
+    assert!(
+        prepared.inserted_registration(),
+        "the materialization registers the session again for its own claim"
+    );
+    assert!(
+        prepared
+            .rollback_now()
+            .await
+            .expect("roll the fresh registration back"),
+        "the prepared materialization owns its rollback"
+    );
+    assert!(!recovered.contains_session(&session_id).await);
+    assert!(
+        crate::store::load_machine_lifecycle(inner.as_ref(), &runtime_id)
+            .await
+            .expect("load final record")
+            .expect("lifecycle record should remain queryable")
+            .unregister_progress()
+            .is_none(),
+        "the rollback's unregister settled"
     );
 }
 
@@ -9333,6 +9534,196 @@ async fn quiescent_close_queued_behind_ingress_that_won_the_mutation_gate_answer
     );
     assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
     assert_eq!(recorded_contributions(&contributions), vec![vec![won_id]]);
+}
+
+/// Commit the canonical drain prefix without installing a teardown owner,
+/// reproducing the recovery case separately from an ordinary quiescent close.
+async fn inject_orphaned_quiescent_close_drain(machine: &MeerkatMachine, session_id: &SessionId) {
+    let state = machine
+        .session_dsl_state(session_id)
+        .await
+        .expect("registered session retains DSL authority");
+    machine
+        .apply_session_dsl_input(
+            session_id,
+            mm_dsl::MeerkatMachineInput::BeginUnregisterSession {
+                session_id: mm_dsl::SessionId::from_domain(session_id),
+                agent_runtime_id: state.active_runtime_id,
+                fence_token: state.active_fence_token,
+                generation: state.active_runtime_generation,
+                runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
+            },
+            "BeginUnregisterSession(orphaned quiescent-close regression)",
+        )
+        .await
+        .expect("the orphaned drain prefix commits");
+    assert_eq!(
+        machine
+            .session_dsl_state(session_id)
+            .await
+            .expect("draining session retains DSL authority")
+            .registration_phase,
+        mm_dsl::RegistrationPhase::Draining
+    );
+    let sessions = machine.sessions.read().await;
+    assert!(
+        sessions
+            .get(session_id)
+            .expect("the drain retains its registration")
+            .unregister_coordinator
+            .is_none(),
+        "the injected drain has no teardown owner"
+    );
+}
+
+#[tokio::test]
+async fn quiescent_close_distinguishes_orphaned_drain_from_idle() {
+    // An empty orphaned drain is still recovery, not a new idle admission.
+    for (orphaned, queued) in [(false, false), (true, false), (true, true)] {
+        let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+        let machine = MeerkatMachine::persistent(store.clone(), memory_blob_store())
+            .expect("persistent machine");
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("idle registration");
+        let registration = machine
+            .current_session_registration_witness(&session_id)
+            .await
+            .expect("exact registration witness");
+        let queued_id = if queued {
+            let input = make_prompt("retained by the orphaned drain");
+            let input_id = input.id().clone();
+            assert!(
+                machine
+                    .accept_input_without_wake(&session_id, input)
+                    .await
+                    .expect("queued input is admitted")
+                    .is_accepted()
+            );
+            Some(input_id)
+        } else {
+            None
+        };
+        if orphaned {
+            inject_orphaned_quiescent_close_drain(&machine, &session_id).await;
+        }
+
+        let answer = tokio::time::timeout(
+            Duration::from_secs(5),
+            machine.unregister_session_registration_until_terminal_if_quiescent(&registration),
+        )
+        .await
+        .expect("the exact close completes")
+        .expect("the close answers typed");
+        assert_eq!(
+            answer,
+            if orphaned {
+                RuntimeSessionQuiescentClose::ClosedOrphanedDrain
+            } else {
+                RuntimeSessionQuiescentClose::Closed
+            }
+        );
+        assert!(!machine.contains_session(&session_id).await);
+        if let Some(input_id) = queued_id {
+            let input = store
+                .load_input_state(&runtime_id_for_session(&session_id), &input_id)
+                .await
+                .expect("read durable input after recovery")
+                .expect("the abandoned input remains in history");
+            assert_eq!(
+                input.seed.terminal_outcome,
+                Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                    reason: crate::input_state::InputAbandonReason::Stopped,
+                }),
+                "orphaned-drain recovery must not be reported as non-interrupting idle"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn quiescent_close_of_orphaned_drain_with_a_run_in_flight_is_busy() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    let apply_started = Arc::new(Notify::new());
+    let apply_release = Arc::new(Notify::new());
+    let contributions = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let hard_cancels = Arc::new(AtomicUsize::new(0));
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(QuiescentCloseExecutor {
+                apply_started: Arc::clone(&apply_started),
+                apply_release: Some(Arc::clone(&apply_release)),
+                contributions,
+                hard_cancels: Arc::clone(&hard_cancels),
+            }),
+        )
+        .await
+        .expect("runtime executor registration");
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("exact registration witness");
+    assert!(
+        machine
+            .accept_input(
+                &session_id,
+                make_prompt("running when the orphaned drain begins")
+            )
+            .await
+            .expect("input is admitted")
+            .is_accepted()
+    );
+    tokio::time::timeout(Duration::from_secs(5), apply_started.notified())
+        .await
+        .expect("the admitted run starts");
+    inject_orphaned_quiescent_close_drain(&machine, &session_id).await;
+    let run_id = machine
+        .session_dsl_state(&session_id)
+        .await
+        .expect("running drain state")
+        .current_run_id
+        .expect("the drain still has a live run");
+
+    assert_eq!(
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            machine.unregister_session_registration_until_terminal_if_quiescent(&registration),
+        )
+        .await
+        .expect("busy answers without waiting for the run")
+        .expect("the close answers typed"),
+        RuntimeSessionQuiescentClose::Busy
+    );
+    assert_eq!(hard_cancels.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("busy preserves the running drain")
+            .current_run_id,
+        Some(run_id)
+    );
+    {
+        let sessions = machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("busy retains the registration");
+        assert!(entry.unregister_coordinator.is_none());
+    }
+
+    // Explicit ordinary teardown owns cleanup after the Busy assertions.
+    apply_release.notify_one();
+    machine
+        .unregister_session_registration_until_terminal_if_current(&registration)
+        .await
+        .expect("cleanup joins the exact registration");
+    assert!(!machine.contains_session(&session_id).await);
 }
 
 /// The quiescent close's own prefix is owned by the canonical unregister
@@ -18568,6 +18959,8 @@ async fn exact_hard_interrupt_reaches_retiring_draining_run_only() {
                 fence_token: state.active_fence_token,
                 generation: state.active_runtime_generation,
                 runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             },
             "BeginUnregisterSession(exact retiring interrupt regression)",
         )
@@ -21378,6 +21771,7 @@ mod stop_teardown_coordinator_class {
                 epoch_id: entry.epoch_id.clone(),
                 coordinator_id: uuid::Uuid::new_v4(),
                 result_rx,
+                queued_inputs: UnregisterDisposition::STOP,
             });
         }
         drop(held_transaction);
@@ -22617,6 +23011,8 @@ mod stop_under_gate_deadlock_class {
                     fence_token: first_sample.active_fence_token,
                     generation: first_sample.active_runtime_generation,
                     runtime_epoch_id: first_sample.active_runtime_epoch_id,
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                    requeue_max_age_ms: 0,
                 },
                 "BeginUnregisterSession(test post-stop watcher recheck)",
             )
@@ -22673,6 +23069,8 @@ mod stop_under_gate_deadlock_class {
                     fence_token: state.active_fence_token,
                     generation: state.active_runtime_generation,
                     runtime_epoch_id: state.active_runtime_epoch_id,
+                    queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                    requeue_max_age_ms: 0,
                 },
                 "BeginUnregisterSession(test stop coordinator phase recheck)",
             )
@@ -23869,6 +24267,8 @@ async fn exact_run_boundary_cancel_remains_admitted_after_unregister_drain_begin
                 fence_token: state.active_fence_token,
                 generation: state.active_runtime_generation,
                 runtime_epoch_id: state.active_runtime_epoch_id,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             },
             "BeginUnregisterSession(exact retire cancel regression)",
         )
@@ -36571,7 +36971,26 @@ async fn persistent_staged_run_driver(
     // registration path, so use the UUID session alias as the contract-owned
     // session identity. Failed-but-applied validation intentionally rejects
     // opaque/non-session owner strings.
-    let runtime_id = LogicalRuntimeId::legacy_session_uuid_alias(&SessionId::new());
+    persistent_staged_run_driver_on(
+        LogicalRuntimeId::legacy_session_uuid_alias(&SessionId::new()),
+        store,
+    )
+    .await
+}
+
+/// [`persistent_staged_run_driver`] on the session's canonical runtime id. A
+/// store commits a receipt-only boundary only under a session key that owns
+/// its runtime, so the rows that commit one stage their run here.
+async fn persistent_staged_run_driver_for_session(
+    store: Arc<dyn RuntimeStore>,
+) -> (SharedDriver, LogicalRuntimeId, RunId, InputId) {
+    persistent_staged_run_driver_on(LogicalRuntimeId::for_session(&SessionId::new()), store).await
+}
+
+async fn persistent_staged_run_driver_on(
+    runtime_id: LogicalRuntimeId,
+    store: Arc<dyn RuntimeStore>,
+) -> (SharedDriver, LogicalRuntimeId, RunId, InputId) {
     let mut driver = PersistentRuntimeDriver::new(runtime_id.clone(), store, memory_blob_store());
     let input = make_prompt("persistent terminalization");
     let input_id = input.id().clone();
@@ -37173,8 +37592,9 @@ async fn persistent_commit_success_persists_receipt_and_terminalizes_once() {
 async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_collision() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
-    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+    let (driver, runtime_id, run_id, input_id) =
+        persistent_staged_run_driver_for_session(store).await;
+    let owner_session_id = runtime_id.session_id().unwrap();
 
     let live_input = Input::Prompt(crate::input::PromptInput::new(
         "context admitted at the active boundary",
@@ -37265,8 +37685,9 @@ async fn terminal_receipt_follows_live_boundary_checkpoint_without_sequence_coll
 async fn mid_run_receipts_carry_no_transcript_count_or_digest() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
-    let (driver, runtime_id, run_id, input_id) = persistent_staged_run_driver(store).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string()).unwrap();
+    let (driver, runtime_id, run_id, input_id) =
+        persistent_staged_run_driver_for_session(store).await;
+    let owner_session_id = runtime_id.session_id().unwrap();
 
     let live_input = Input::Prompt(crate::input::PromptInput::new(
         "context admitted at the active boundary",
@@ -37618,13 +38039,14 @@ async fn persistent_machine_terminal_atomic_failure_publishes_no_durable_termina
 async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_transcript() {
     let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
     let store: Arc<dyn RuntimeStore> = inner.clone();
+    // Staged under the id registration recovers, so the recovery below reads
+    // this runtime's terminal truth, not an empty runtime.
+    let session_id = SessionId::new();
+    let canonical_runtime_id = MeerkatMachine::logical_runtime_id(&session_id);
     let (driver, runtime_id, run_id, input_id) =
-        persistent_staged_run_driver(Arc::clone(&store)).await;
+        persistent_staged_run_driver_on(canonical_runtime_id, Arc::clone(&store)).await;
     mark_staged_runtime_turn_machine_failed(&driver, &run_id).await;
-    let owner_session_id = SessionId::parse(&runtime_id.to_string())
-        .expect("direct driver runtime id should be its session UUID alias");
-    let session_id = owner_session_id.clone();
-    let (session, session_snapshot) = failed_turn_session_snapshot(owner_session_id);
+    let (session, session_snapshot) = failed_turn_session_snapshot(session_id.clone());
 
     commit_machine_terminal_run(
         &driver,
@@ -37680,14 +38102,32 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
             .lifecycle_phase,
         mm_dsl::MeerkatPhase::Idle,
     );
+    // Recovery keeps the consumed input terminal instead of replaying it: no
+    // input of the session is active, and the input reads Consumed under the
+    // run that consumed it. Its row stays inspectable (the durable witness);
+    // while its terminal completion is still pending, recovery also holds it
+    // in live authority as that completion's owner, terminal, so the
+    // completion can still be delivered. An empty runtime (the wrong id)
+    // reads no input at all.
     assert!(
-        recovered
-            .input_state(&session_id, &input_id)
-            .await
-            .expect("read recovered machine-terminal input")
-            .is_none(),
-        "registration recovery must archive the consumed machine-terminal input instead of replaying it"
+        !recovered.session_has_active_inputs(&session_id).await,
+        "registration recovery must not leave the consumed machine-terminal input runnable"
     );
+    let recovered_input = recovered
+        .input_state(&session_id, &input_id)
+        .await
+        .expect("read recovered machine-terminal input")
+        .expect("the consumed machine-terminal input remains inspectable after recovery");
+    assert_eq!(
+        recovered_input.seed.phase,
+        crate::input_state::InputLifecycleState::Consumed,
+        "registration recovery must keep the consumed machine-terminal input terminal instead of replaying it"
+    );
+    assert_eq!(
+        recovered_input.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Consumed)
+    );
+    assert_eq!(recovered_input.seed.last_run_id.as_ref(), Some(&run_id));
     let recovered_session: meerkat_core::Session = serde_json::from_slice(
         &inner
             .load_session_snapshot(&runtime_id)
@@ -37702,6 +38142,511 @@ async fn persistent_machine_terminal_commit_recovers_consumed_input_and_failed_t
         }),
         "recovery must retain the failed turn's transcript effects"
     );
+}
+
+/// A durable session's resumed run, as the runtime holds it while the run
+/// executes: `applied` of its inputs one of its committed rounds already
+/// applied (pending consumption), and `staged` more still staged, all bound
+/// to the run. The store holds the run's provisional tail over a committed
+/// base, its cursor binding every input, as the session's durable state
+/// leaves it for a restart.
+struct ResumedRunWithAppliedInputs {
+    store: Arc<crate::store::InMemoryRuntimeStore>,
+    driver: SharedDriver,
+    session_id: SessionId,
+    runtime_id: LogicalRuntimeId,
+    run_id: RunId,
+    applied: Vec<InputId>,
+    staged: Vec<InputId>,
+    /// The run's tail, and the store-issued receipt naming it.
+    tail: meerkat_core::Session,
+    tail_receipt: meerkat_core::RunCheckpointReceipt,
+}
+
+impl ResumedRunWithAppliedInputs {
+    /// Every input of the run, in admission order.
+    fn inputs(&self) -> Vec<InputId> {
+        self.applied.iter().chain(&self.staged).cloned().collect()
+    }
+}
+
+/// `round_complete` names the tail's resume point: a completed round awaits
+/// the model (a tail a run's failure may promote); otherwise the round's
+/// first commit holds its staged call only in the run cursor.
+async fn resumed_run_with_applied_inputs(
+    applied: usize,
+    staged: usize,
+    round_complete: bool,
+) -> ResumedRunWithAppliedInputs {
+    use meerkat_core::types::{
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
+        UserMessage,
+    };
+
+    let store = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let mut committed = meerkat_core::Session::with_id(session_id.clone());
+    committed.push(Message::User(UserMessage::text("committed before the run")));
+    let base = store
+        .commit_prepared_session_boundary(
+            &runtime_id,
+            crate::store::PreparedRuntimeSessionCommit::snapshot_only(
+                BoundSessionCommit::sealed(Arc::new(committed.clone()))
+                    .expect("seal the committed base"),
+            ),
+        )
+        .await
+        .expect("the committed base commits")
+        .authority()
+        .and_then(|authority| authority.whole_blob())
+        .cloned()
+        .expect("the committed base has a WholeBlob authority");
+
+    let mut driver = PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&store) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    );
+    let mut inputs = Vec::new();
+    for ordinal in 0..applied + staged {
+        let input = make_prompt(&format!("the resumed run's input {ordinal}"));
+        inputs.push(input.id().clone());
+        driver
+            .accept_input(input)
+            .await
+            .expect("the input is accepted");
+    }
+    let run_id = RunId::new();
+    driver
+        .contract_begin_run_authority(run_id.clone())
+        .expect("the run begins through generated authority");
+    driver
+        .machine_realize_authorized_stage_batch(
+            crate::meerkat_machine::driver::test_authorized_stage_for_run(
+                inputs.clone(),
+                run_id.clone(),
+            ),
+        )
+        .expect("the inputs stage for the run");
+    let (applied_inputs, staged_inputs) = inputs.split_at(applied);
+    if !applied_inputs.is_empty() {
+        let receipt = RunBoundaryReceiptDraft {
+            run_id: run_id.clone(),
+            boundary: RunApplyBoundary::Immediate,
+            contributing_input_ids: applied_inputs.to_vec(),
+            conversation_digest: None,
+            message_count: 0,
+        }
+        .into_sequenced(1);
+        driver
+            .machine_realize_boundary_applied_in_memory(&run_id, &receipt)
+            .expect("a committed round applies its contributors");
+    }
+
+    // The run's tail, its cursor binding every input of the run.
+    let staged_call = BlockAssistantMessage {
+        blocks: vec![AssistantBlock::ToolUse {
+            id: "resumed-call".to_string(),
+            name: "durable_tool".to_string(),
+            args: serde_json::value::RawValue::from_string("{}".to_string())
+                .expect("raw tool arguments"),
+            meta: None,
+        }],
+        stop_reason: Some(StopReason::ToolUse),
+        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+        created_at: meerkat_core::types::message_timestamp_now(),
+        assistant_message_id: Some(
+            serde_json::from_value(serde_json::Value::String(uuid::Uuid::now_v7().to_string()))
+                .expect("an assistant message id"),
+        ),
+    };
+    let resume_point = if round_complete {
+        meerkat_core::RunResumePoint::AwaitingModel
+    } else {
+        meerkat_core::RunResumePoint::ToolsPending {
+            assistant_message: staged_call,
+        }
+    };
+    let mut tail = committed;
+    tail.push(Message::User(UserMessage::text(
+        "the run's committed round",
+    )));
+    tail.set_run_cursor(&meerkat_core::SessionRunCursor::new(
+        run_id.clone(),
+        inputs.clone(),
+        0,
+        resume_point,
+    ))
+    .expect("the run cursor is recorded");
+    let tail_authority = store
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime_id,
+            crate::store::PreparedWholeBlobProvisionalTail::prepare(
+                base,
+                run_id.clone(),
+                1,
+                &BoundSessionCommit::sealed(Arc::new(tail.clone())).expect("seal the run's tail"),
+            )
+            .expect("the run's tail prepares"),
+        )
+        .await
+        .expect("the run's tail is written");
+    let tail_receipt = meerkat_core::RunCheckpointReceipt::issued(
+        meerkat_core::RunCheckpointAuthority::WholeBlob(tail_authority),
+        tail.transcript_content_digest()
+            .expect("the tail's transcript digests"),
+        u64::try_from(tail.messages().len()).expect("message count fits"),
+    )
+    .expect("a well-formed checkpoint receipt");
+
+    ResumedRunWithAppliedInputs {
+        store,
+        driver: Arc::new(Mutex::new(DriverEntry::Persistent(driver))),
+        session_id,
+        runtime_id,
+        run_id,
+        applied: applied_inputs.to_vec(),
+        staged: staged_inputs.to_vec(),
+        tail,
+        tail_receipt,
+    }
+}
+
+/// The durable phase and terminal outcome each input of `run` ended with, in
+/// admission order. The live driver keeps none of them bound to the run and
+/// none of them queued.
+async fn ended_run_input_outcomes(
+    run: &ResumedRunWithAppliedInputs,
+) -> Vec<(
+    crate::input_state::InputLifecycleState,
+    Option<crate::input_state::InputTerminalOutcome>,
+)> {
+    {
+        let entry = run.driver.lock().await;
+        for input_id in run.inputs() {
+            assert!(
+                !entry.input_bound_to_open_run(&input_id, &run.run_id),
+                "no input stays bound to the ended run: {input_id}"
+            );
+        }
+        assert!(
+            !entry.has_queued_input_in_any_lane(),
+            "the ended run returned none of its inputs to a lane"
+        );
+    }
+    let mut outcomes = Vec::new();
+    for input_id in run.inputs() {
+        let stored = run
+            .store
+            .load_input_state(&run.runtime_id, &input_id)
+            .await
+            .expect("the input's durable row loads")
+            .expect("the ended run's input stays inspectable");
+        outcomes.push((stored.seed.phase, stored.seed.terminal_outcome));
+    }
+    outcomes
+}
+
+/// A cold registration over the ended run's store, as a restart takes it:
+/// the run is not kept resumable, and none of its inputs is requeued, so no
+/// committed round's content runs again.
+async fn assert_cold_registration_neither_resumes_nor_requeues(run: ResumedRunWithAppliedInputs) {
+    let ResumedRunWithAppliedInputs {
+        store,
+        driver,
+        session_id,
+        run_id,
+        ..
+    } = run;
+    drop(driver);
+    let machine = MeerkatMachine::persistent_without_blobs(store as Arc<dyn RuntimeStore>)
+        .expect("persistent machine");
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("a cold registration recovers the ended run's durable state");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        None,
+        "a cold registration does not resume the ended run {run_id}"
+    );
+    let recovered = machine
+        .session_dsl_state(&session_id)
+        .await
+        .expect("the recovered authority reads");
+    assert!(
+        recovered.input_lane.is_empty(),
+        "a cold registration requeues none of the ended run's inputs: {:?}",
+        recovered.input_lane
+    );
+}
+
+/// RED before: a cancelled resumed run whose inputs one of its committed
+/// rounds had all applied could not end. Its cancel collected only staged
+/// contributors and was refused ("run cancelled requires at least one staged
+/// contributor"), and a refused cancel stops the runtime loop's executor.
+/// The cancel now ends the run, so the loop's refusal arm is never taken, and
+/// the applied input ends cancelled, as the graceful stop leaves an in-flight
+/// input. A cold registration then neither resumes the run nor requeues the
+/// input.
+#[tokio::test]
+async fn a_resumed_run_whose_inputs_were_all_applied_is_cancellable() {
+    let run = resumed_run_with_applied_inputs(1, 0, false).await;
+
+    crate::meerkat_machine::cancel_runtime_loop_run(&run.driver, run.run_id.clone())
+        .await
+        .expect("the cancel ends the run instead of stopping the executor");
+
+    let cancelled = (
+        crate::input_state::InputLifecycleState::Abandoned,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+    );
+    assert_eq!(ended_run_input_outcomes(&run).await, vec![cancelled]);
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// RED before: a cancelled resumed run abandoned only its staged inputs; the
+/// one a committed round had already applied stayed bound to the cancelled
+/// run, and a later registration found the run open and resumable again.
+/// Every input bound to the run now ends cancelled.
+#[tokio::test]
+async fn a_cancelled_resumed_run_leaves_none_of_its_inputs_bound() {
+    let run = resumed_run_with_applied_inputs(1, 1, false).await;
+
+    crate::meerkat_machine::cancel_runtime_loop_run(&run.driver, run.run_id.clone())
+        .await
+        .expect("the cancel ends the run");
+
+    let cancelled = (
+        crate::input_state::InputLifecycleState::Abandoned,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Cancelled,
+        }),
+    );
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![cancelled.clone(), cancelled]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// RED before: a machine-terminal failure of a resumed run collected only its
+/// staged inputs, so the receipt, which names every input of the run, did
+/// not match them and the failure was refused. The run's failed boundary
+/// promotes the tail its completed round left, as a hard failure over a held
+/// checkpoint does, and the input a committed round already applied is
+/// consumed with the staged one: its effect is the run's committed history.
+#[tokio::test]
+async fn a_hard_failure_of_a_resumed_run_consumes_its_staged_and_applied_inputs() {
+    let run = resumed_run_with_applied_inputs(1, 1, true).await;
+    mark_staged_runtime_turn_machine_failed(&run.driver, &run.run_id).await;
+
+    commit_machine_terminal_run(
+        &run.driver,
+        run.run_id.clone(),
+        machine_terminal_tool_failure(),
+        crate::meerkat_machine::driver::MachineTerminalAppliedDraft {
+            receipt: machine_terminal_receipt(run.run_id.clone(), run.inputs(), &run.tail),
+            session: BoundSessionCommit::provisional_promotion(run.tail_receipt.clone()),
+        },
+    )
+    .await
+    .expect("the machine-terminal failure commits");
+
+    let consumed = (
+        crate::input_state::InputLifecycleState::Consumed,
+        Some(crate::input_state::InputTerminalOutcome::Consumed),
+    );
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![consumed.clone(), consumed]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// RED before: a resumed run that never began executing abandoned only its
+/// staged inputs, as never executed, and left the applied one bound. The
+/// staged input keeps that reason; the applied one did execute, so it is
+/// consumed, never reported as never executed.
+#[tokio::test]
+async fn a_never_started_resumed_run_consumes_the_inputs_its_rounds_applied() {
+    let run = resumed_run_with_applied_inputs(1, 1, false).await;
+
+    fail_runtime_loop_run(
+        &run.driver,
+        run.run_id.clone(),
+        CoreApplyFailureCause::executor_stopped(),
+        crate::meerkat_machine::FailedRunContributorDisposition::Terminalized,
+    )
+    .await
+    .expect("the never-started run terminalizes");
+
+    assert_eq!(
+        ended_run_input_outcomes(&run).await,
+        vec![
+            (
+                crate::input_state::InputLifecycleState::Consumed,
+                Some(crate::input_state::InputTerminalOutcome::Consumed),
+            ),
+            (
+                crate::input_state::InputLifecycleState::Abandoned,
+                Some(crate::input_state::InputTerminalOutcome::Abandoned {
+                    reason: crate::input_state::InputAbandonReason::NeverExecuted,
+                }),
+            ),
+        ]
+    );
+    assert_cold_registration_neither_resumes_nor_requeues(run).await;
+}
+
+/// A durable Steer that would join a resumed run at its model boundary.
+fn resumed_run_durable_steer() -> Input {
+    let mut metadata = crate::runtime_stamped_prompt_turn_metadata(None);
+    metadata.handling_mode = Some(meerkat_core::types::HandlingMode::Steer);
+    let mut prompt = crate::input::PromptInput::new("joins the resumed run", Some(metadata));
+    prompt.typed_turn_appends = vec![meerkat_core::lifecycle::ConversationAppend {
+        runtime_source: None,
+        role: meerkat_core::lifecycle::ConversationAppendRole::SystemNotice,
+        content: meerkat_core::lifecycle::CoreRenderable::SystemNotice {
+            kind: meerkat_core::types::SystemNoticeKind::Generic,
+            body: Some("joins the resumed run".into()),
+            blocks: Vec::new(),
+        },
+        identity: None,
+    }];
+    Input::Prompt(prompt)
+}
+
+/// A resumed run whose committed rounds applied `applied` of its inputs,
+/// with `staged` more still staged, parked at its model boundary while a
+/// durable Steer waits: whether generated authority lets the Steer join.
+async fn resumed_run_offered_a_durable_join(
+    applied: usize,
+    staged: usize,
+) -> (ResumedRunWithAppliedInputs, InputId, Result<(), String>) {
+    let run = resumed_run_with_applied_inputs(applied, staged, false).await;
+    let steer = resumed_run_durable_steer();
+    let steer_id = steer.id().clone();
+    let mut driver = run.driver.lock().await;
+    assert!(
+        driver
+            .as_driver_mut()
+            .accept_input(steer)
+            .await
+            .expect("the durable Steer is accepted")
+            .is_accepted()
+    );
+    let authority = driver.shared_dsl_authority();
+    {
+        let mut owner = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut *owner,
+            mm_dsl::MeerkatMachineInput::StartConversationRun {
+                run_id: mm_dsl::RunId::from_domain(&run.run_id),
+                primitive_kind: mm_dsl::TurnPrimitiveKind::ConversationTurn,
+                admitted_content_shape: mm_dsl::ContentShape::Conversation,
+                vision_enabled: false,
+                image_tool_results_enabled: false,
+                max_extraction_retries: 0,
+            },
+        )
+        .expect("the resumed run's turn starts");
+        mm_dsl::MeerkatMachineMutator::apply(
+            &mut *owner,
+            mm_dsl::MeerkatMachineInput::PrimitiveApplied {
+                run_id: mm_dsl::RunId::from_domain(&run.run_id),
+            },
+        )
+        .expect("the resumed run parks at its model boundary");
+        let state = owner.state();
+        assert_eq!(state.turn_phase, mm_dsl::TurnPhase::CallingLlm);
+        assert_eq!(
+            state
+                .input_live_boundary_delivery
+                .get(&steer_id.to_string()),
+            Some(&mm_dsl::LiveBoundaryDelivery::DurableAppend),
+            "the Steer is a durable join candidate"
+        );
+    }
+    let joined = MeerkatMachine::preview_dsl_input_on_shared_authority(
+        &authority,
+        mm_dsl::MeerkatMachineInput::JoinLiveBoundaryDurableAppend {
+            run_id: mm_dsl::RunId::from_domain(&run.run_id),
+            input_id: steer_id.to_string(),
+        },
+        "JoinLiveBoundaryDurableAppend",
+    )
+    .map(|_| ());
+    drop(driver);
+    (run, steer_id, joined)
+}
+
+/// A resumed run's commit names every input still bound to it, the ones its
+/// committed rounds already applied as well as the staged ones, as one
+/// terminal-completion batch of at most 256 inputs. So the applied ones count
+/// against the join bound: a resumed run with 128 applied and 128 staged
+/// inputs takes no durable join. The Steer keeps its queued steer-lane
+/// follow-up, and once the run ends the next run's batch is that Steer.
+/// RED with a count of staged inputs only: it saw 128, took the join, and
+/// left the run a commit of 257 inputs that the bound refuses.
+#[tokio::test]
+async fn a_resumed_run_counts_the_inputs_its_rounds_applied_against_the_join_bound() {
+    let (run, steer_id, joined) = resumed_run_offered_a_durable_join(128, 128).await;
+    // The row below offers the same join to the same run with one staged
+    // input fewer, and the join is taken: the contributor bound is the guard
+    // that refuses this one.
+    let refusal = joined.expect_err("a resumed run that holds 256 contributors refuses the join");
+    assert!(
+        refusal.contains("guard rejected"),
+        "a generated guard refuses the join: {refusal}"
+    );
+    {
+        let driver = run.driver.lock().await;
+        assert_eq!(
+            driver.input_phase(&steer_id),
+            Some(crate::input_state::InputLifecycleState::Queued),
+            "the refused Steer stays queued"
+        );
+        let authority = driver.shared_dsl_authority();
+        let owner = authority
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(
+            owner.state().input_lane.get(&steer_id.to_string()),
+            Some(&mm_dsl::InputLane::Steer),
+            "the refused Steer keeps its steer-lane follow-up"
+        );
+    }
+
+    crate::meerkat_machine::cancel_runtime_loop_run(&run.driver, run.run_id.clone())
+        .await
+        .expect("the resumed run ends");
+    let driver = run.driver.lock().await;
+    let next = crate::meerkat_machine::machine_authorize_runtime_loop_batch(&driver)
+        .expect("the next run has a batch");
+    assert_eq!(
+        next.input_ids(),
+        std::slice::from_ref(&steer_id),
+        "the next run carries the refused Steer"
+    );
+    assert_eq!(
+        next.source(),
+        crate::meerkat_machine::driver::RuntimeLoopBatchSource::Steer
+    );
+}
+
+/// The bound is exact for a resumed run as well: with 128 applied and 127
+/// staged inputs, 255 in all, the run takes one durable join, and its commit
+/// names 256.
+#[tokio::test]
+async fn a_resumed_run_takes_a_durable_join_while_its_contributors_stay_below_the_bound() {
+    let (_run, _steer_id, joined) = resumed_run_offered_a_durable_join(128, 127).await;
+    joined.expect("a resumed run that holds 255 contributors takes the join");
 }
 
 #[tokio::test]
@@ -42634,6 +43579,97 @@ impl meerkat_core::tool_process::InterruptedToolEvidence for OneOwedNoticeEviden
     ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
         Ok(())
     }
+}
+
+/// Interrupted-run evidence that records every run it is told resumes.
+#[derive(Default)]
+struct ResumeRecordingEvidence {
+    resumed: StdMutex<Vec<RunId>>,
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::tool_process::InterruptedToolEvidence for ResumeRecordingEvidence {
+    async fn interrupted_calls(
+        &self,
+    ) -> Result<
+        Vec<meerkat_core::tool_process::InterruptedToolCall>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        Ok(Vec::new())
+    }
+
+    async fn mark_inputs_settled(
+        &self,
+        _entry_ids: &[uuid::Uuid],
+        _inputs: &meerkat_core::tool_process::InterruptedRunInputs,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn acknowledge(
+        &self,
+        _entry_ids: &[uuid::Uuid],
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn run_ended(
+        &self,
+        _run_id: &RunId,
+    ) -> Result<(), meerkat_core::tool_process::InterruptedToolEvidenceError> {
+        Ok(())
+    }
+
+    async fn run_resumes(
+        &self,
+        run_id: &RunId,
+    ) -> Result<
+        Vec<meerkat_core::tool_process::InterruptedToolCall>,
+        meerkat_core::tool_process::InterruptedToolEvidenceError,
+    > {
+        self.resumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(run_id.clone());
+        Ok(Vec::new())
+    }
+}
+
+/// The resumed round's read of its run's custody evidence settles only the
+/// run the registration resumes, the session's current run: a run id that is
+/// not current here fails the read and tells the evidence nothing, so no
+/// record of a run that does not resume here is ever taken as evidence.
+#[tokio::test]
+async fn a_resumed_runs_evidence_read_settles_nothing_for_a_run_that_is_not_current() {
+    let machine = MeerkatMachine::ephemeral();
+    let session_id = SessionId::new();
+    let bindings = machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("prepare the session's bindings");
+    let evidence = Arc::new(ResumeRecordingEvidence::default());
+    bindings.interrupted_tool_evidence().install(
+        Arc::clone(&evidence) as Arc<dyn meerkat_core::tool_process::InterruptedToolEvidence>
+    );
+    assert_eq!(machine.current_run(&session_id).await, None);
+
+    let error = machine
+        .resumed_run_interrupted_tool_calls(&session_id, &RunId::new())
+        .await
+        .expect_err("a run that is not current does not resume here");
+
+    assert!(
+        error.to_string().contains("is not the current run"),
+        "{error}"
+    );
+    assert!(
+        evidence
+            .resumed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_empty(),
+        "the evidence was told no run resumes"
+    );
 }
 
 /// Hands one owed notice's evidence to the session's first settlement only,
@@ -50500,6 +51536,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::HostingUnavailable { session_id } => {
             format!("hosting_unavailable:{session_id}")
         }
+        RuntimeDriverError::DurableResumeHeld { session_id, hold } => {
+            format!("durable_resume_held:{session_id}:{hold}")
+        }
         RuntimeDriverError::ConsentOwnerLossUnsettled { session_id } => {
             format!("consent_owner_loss_unsettled:{session_id}")
         }
@@ -50565,6 +51604,9 @@ fn summarize_runtime_parity_driver_error(error: &RuntimeDriverError) -> String {
         RuntimeDriverError::Internal(reason) => format!("internal:{reason}"),
         RuntimeDriverError::ScopedContextGenerationNotAdvanced { bound, requested } => {
             format!("scoped_context_generation_not_advanced:{bound}:{requested}")
+        }
+        RuntimeDriverError::QueuedInputsRefused(refusal) => {
+            format!("queued_inputs_refused:{refusal:?}")
         }
     }
 }
@@ -51366,12 +52408,11 @@ async fn reset_from_running_surfaces_dsl_rejection() {
     assert!(
         matches!(
             err,
-            MeerkatMachineCommandError::Control(RuntimeControlPlaneError::Internal(ref reason))
-                if reason.contains("DSL authority (Reset)")
-                    && reason.contains("Running")
-                    && reason.contains("Reset")
+            MeerkatMachineCommandError::Control(RuntimeControlPlaneError::InvalidState {
+                state: RuntimeState::Running
+            })
         ),
-        "expected DSL authority rejection for Reset from Running, got {err:?}"
+        "expected the typed refusal the machine's Reset guard gives from Running, got {err:?}"
     );
 }
 
@@ -52558,6 +53599,38 @@ fn host_addressed_trust_commands_are_served_off_drain_by_host_daemon() {
     }
 }
 
+/// Protocol V7 (prompt-context fork children): the host-addressed
+/// `HostFeatures` probe is admitted and served off the member drain by the
+/// host daemon, as `HostStatus` is; the member-addressed
+/// `ReadMemberVisibleTools` read is admitted through the bound-supervisor
+/// ladder and served on the member drain, as `ReadMemberHistory` is.
+#[test]
+fn v7_fork_child_commands_are_classified() {
+    use crate::meerkat_machine_types::{
+        OffDrainResponder, SupervisorBridgeCommandAdmissionRoute, SupervisorBridgeCommandKind,
+        SupervisorBridgeCommandRealization,
+    };
+
+    assert_eq!(
+        SupervisorBridgeCommandKind::HostFeatures.admission_route(),
+        SupervisorBridgeCommandAdmissionRoute::NotMemberAddressed,
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::HostFeatures.realization(),
+        SupervisorBridgeCommandRealization::RealizedOffDrain {
+            by: OffDrainResponder::HostDaemon,
+        },
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools.admission_route(),
+        SupervisorBridgeCommandAdmissionRoute::SupervisorBridgeCommand,
+    );
+    assert_eq!(
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools.realization(),
+        SupervisorBridgeCommandRealization::Realized,
+    );
+}
+
 /// Multi-host mobs phase 6 (§7.4, DEC-P6E-1): the observation pair and
 /// member-input cancellation commands are served by member-drain arms and the
 /// manifest says so; the live-channel family stays fail-closed until phase 6b.
@@ -52655,6 +53728,7 @@ async fn member_addressed_bridge_admission_covers_manifest_kinds() {
         SupervisorBridgeCommandKind::CloseMemberLiveChannel,
         SupervisorBridgeCommandKind::MemberLiveChannelStatus,
         SupervisorBridgeCommandKind::ControlMemberLiveChannel,
+        SupervisorBridgeCommandKind::ReadMemberVisibleTools,
     ] {
         assert!(
             member_addressed.contains(&kind),
@@ -54301,6 +55375,563 @@ async fn empty_compaction_outbox_skips_the_identity_checkpoint_cycle_after_commi
     assert_eq!(store.session_snapshot_commits(), 2);
 }
 
+/// While a run's provisional tail stands over the committed WholeBlob base (a
+/// run resumed from it, or kept across a requeue stop), the startup and
+/// teardown reconciliation keeps the outboxed intents' stages and does nothing
+/// else: no reload, no recommit (the store refuses one under the tail), no
+/// executor checkpoint (it would replace the resumed actor's image with the
+/// committed base) and no finalization. Once the tail is gone, the recovery
+/// form refreshes as before. Unrun: written while Cargo is not run.
+#[tokio::test]
+async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
+    struct RecordingCompactionExecutor {
+        reconcile_intent_counts: Vec<usize>,
+        checkpoint_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for RecordingCompactionExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Internal(
+                "outbox reconciliation never applies a primitive".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn checkpoint_committed_session_snapshot(
+            &mut self,
+            _session_snapshot: Arc<Vec<u8>>,
+        ) -> Result<(), CoreExecutorError> {
+            self.checkpoint_calls += 1;
+            Ok(())
+        }
+
+        async fn reconcile_committed_compaction_projections(
+            &mut self,
+            intents: &[meerkat_core::CompactionProjectionIntent],
+        ) -> Result<(), CoreExecutorError> {
+            self.reconcile_intent_counts.push(intents.len());
+            Ok(())
+        }
+    }
+
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let store = Arc::new(RuntimeCommitAtomicityStore::pass_through(Arc::clone(
+        &inner,
+    )));
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let committed = serde_json::to_vec(&session).expect("committed session serializes");
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(&runtime_id, &session_id, committed)
+        .await
+        .expect("base authority");
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("the open run's committed round"),
+    ));
+    let run_id = RunId::new();
+    let prepared = crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+        base,
+        run_id.clone(),
+        1,
+        &session,
+    )
+    .expect("the run's tail prepares");
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        prepared,
+    )
+    .await
+    .expect("the run's tail is written");
+
+    let driver: crate::meerkat_machine::SharedDriver = Arc::new(Mutex::new(
+        DriverEntry::Persistent(PersistentRuntimeDriver::new(
+            runtime_id.clone(),
+            Arc::clone(&store) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )),
+    ));
+    let mut executor = RecordingCompactionExecutor {
+        reconcile_intent_counts: Vec::new(),
+        checkpoint_calls: 0,
+    };
+
+    for empty_outbox in [
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+        crate::runtime_loop::EmptyOutboxCheckpoint::SkipIdentityRefresh,
+    ] {
+        let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+            &driver,
+            &mut executor,
+            Vec::new(),
+            empty_outbox,
+        )
+        .await
+        .expect("reconciliation under a standing tail succeeds");
+        assert_eq!(checkpoint, None, "{empty_outbox:?}");
+    }
+    assert_eq!(
+        executor.reconcile_intent_counts,
+        vec![0, 0],
+        "the outboxed intents' stages are reconciled every time"
+    );
+    assert_eq!(
+        executor.checkpoint_calls, 0,
+        "the resumed actor's image is left exactly as seeded"
+    );
+    assert_eq!(inner.committed_whole_blob_bytes_loads(), 0);
+    assert_eq!(store.session_snapshot_loads(), 0);
+    assert_eq!(
+        store.session_snapshot_commits(),
+        0,
+        "nothing is written under the tail"
+    );
+    let tail =
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .expect("the tail still stands");
+    assert_eq!(tail.authority().run_id(), &run_id);
+
+    // Once the run's tail is gone, the recovery form heals as before.
+    assert!(
+        crate::store::RuntimeStore::discard_whole_blob_provisional_tail(
+            inner.as_ref(),
+            &runtime_id,
+            tail.authority(),
+        )
+        .await
+        .expect("the tail discards")
+    );
+    let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+        &driver,
+        &mut executor,
+        Vec::new(),
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+    )
+    .await
+    .expect("the recovery form refreshes once no tail stands");
+    assert!(checkpoint.is_some());
+    assert_eq!(executor.checkpoint_calls, 1);
+    assert_eq!(store.session_snapshot_commits(), 1);
+}
+
+/// A settled run's tail repair makes the session reload only while a tail
+/// stands: a tail of another run stands (the run guard touches nothing), so
+/// the session reloads; with no tail at all the committed document is already
+/// aligned, nothing is written, and the session keeps serving. This row
+/// covers those two arms. The committing arm (the settled run's own tail, its
+/// inputs terminal, repaired and answered without a reload, the session layer
+/// resynchronizing the seeded actor) needs the settled run's durable input
+/// rows, which the run-guarded recovery's own contract row builds; the long
+/// run harness covers it end to end (a refused resume and a deploy stop past
+/// its bound, each serving the session's next run).
+#[tokio::test]
+async fn a_settled_runs_repair_reloads_only_while_a_tail_stands() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let settled_run = RunId::new();
+    assert!(
+        !driver
+            .repair_settled_run_tail(&session_id, &settled_run)
+            .await,
+        "no tail stood: the committed document is aligned and the session keeps serving"
+    );
+
+    let mut candidate = session.clone();
+    candidate.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("another run's committed round"),
+    ));
+    let other_run = RunId::new();
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base,
+            other_run.clone(),
+            1,
+            &candidate,
+        )
+        .expect("the other run's tail prepares"),
+    )
+    .await
+    .expect("the other run's tail is written");
+    assert!(
+        driver
+            .repair_settled_run_tail(&session_id, &settled_run)
+            .await,
+        "another run's tail stands: the session reloads"
+    );
+    let tail =
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .expect("the other run's tail is untouched");
+    assert_eq!(tail.authority().run_id(), &other_run);
+}
+
+/// Under a standing provisional tail the reconciliation keeps an outboxed
+/// compaction intent pending: the executor reconciles its stage, and nothing
+/// finalizes it (a finalization here would fail on an intent the store never
+/// outboxed). Its finalization belongs to the run's boundary. Unrun: written
+/// while Cargo is not run.
+#[tokio::test]
+async fn compaction_reconciliation_keeps_an_outboxed_intent_pending_under_a_tail() {
+    struct CountingExecutor {
+        reconcile_intent_counts: Vec<usize>,
+        checkpoint_calls: usize,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for CountingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Err(CoreExecutorError::Internal(
+                "outbox reconciliation never applies a primitive".to_string(),
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn checkpoint_committed_session_snapshot(
+            &mut self,
+            _session_snapshot: Arc<Vec<u8>>,
+        ) -> Result<(), CoreExecutorError> {
+            self.checkpoint_calls += 1;
+            Ok(())
+        }
+
+        async fn reconcile_committed_compaction_projections(
+            &mut self,
+            intents: &[meerkat_core::CompactionProjectionIntent],
+        ) -> Result<(), CoreExecutorError> {
+            self.reconcile_intent_counts.push(intents.len());
+            Ok(())
+        }
+    }
+
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.append_system_message("system prompt");
+    for turn in 0..5 {
+        session.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text(format!("question {turn}")),
+        ));
+    }
+    let live = session.messages().to_vec();
+    let mut replacement = vec![live[0].clone()];
+    replacement.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::compaction_summary(
+            "[Compaction summary] earlier questions",
+        ),
+    ));
+    replacement.extend(live[4..].iter().cloned());
+    let (_rewrite, intent) = session
+        .stage_validated_compaction_for_test(replacement, 12)
+        .expect("the run compacts");
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("the compacted session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let mut candidate = session.clone();
+    candidate.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("a round after the compaction"),
+    ));
+    crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+        inner.as_ref(),
+        &runtime_id,
+        crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base,
+            RunId::new(),
+            1,
+            &candidate,
+        )
+        .expect("the run's tail prepares"),
+    )
+    .await
+    .expect("the run's tail is written");
+
+    let driver: crate::meerkat_machine::SharedDriver = Arc::new(Mutex::new(
+        DriverEntry::Persistent(PersistentRuntimeDriver::new(
+            runtime_id,
+            Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )),
+    ));
+    let mut executor = CountingExecutor {
+        reconcile_intent_counts: Vec::new(),
+        checkpoint_calls: 0,
+    };
+    for empty_outbox in [
+        crate::runtime_loop::EmptyOutboxCheckpoint::RefreshFromStore,
+        crate::runtime_loop::EmptyOutboxCheckpoint::SkipIdentityRefresh,
+    ] {
+        let checkpoint = crate::runtime_loop::reconcile_loaded_compaction_projection_outbox(
+            &driver,
+            &mut executor,
+            vec![intent.clone()],
+            empty_outbox,
+        )
+        .await
+        .expect("nothing is finalized under the tail");
+        assert_eq!(checkpoint, None, "{empty_outbox:?}");
+    }
+    assert_eq!(
+        executor.reconcile_intent_counts,
+        vec![1, 1],
+        "the intent's stage is reconciled, and kept"
+    );
+    assert_eq!(executor.checkpoint_calls, 0);
+}
+
+/// A released run (its inputs requeued to run again) leaves no provisional
+/// tail: it is discarded by its own exact authority, and the session's next
+/// run then writes its first round commit over the same committed base.
+/// Another run's tail is never discarded in its place. Unrun: written while
+/// Cargo is not run.
+#[tokio::test]
+async fn a_released_runs_tail_is_discarded_so_the_next_runs_first_commit_lands() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed before the run"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let write_tail = |run_id: RunId, text: &'static str| {
+        let mut candidate = session.clone();
+        candidate.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text(text),
+        ));
+        let prepared = crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+            base.clone(),
+            run_id,
+            1,
+            &candidate,
+        )
+        .expect("the tail prepares");
+        let inner = Arc::clone(&inner);
+        let runtime_id = runtime_id.clone();
+        async move {
+            crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+                inner.as_ref(),
+                &runtime_id,
+                prepared,
+            )
+            .await
+        }
+    };
+    let tail_run = |inner: Arc<crate::store::InMemoryRuntimeStore>,
+                    runtime_id: LogicalRuntimeId| async move {
+        crate::store::RuntimeStore::load_whole_blob_provisional_tail(inner.as_ref(), &runtime_id)
+            .await
+            .expect("the tail loads")
+            .map(|tail| tail.authority().run_id().clone())
+    };
+
+    let released_run = RunId::new();
+    write_tail(released_run.clone(), "the released run's committed round")
+        .await
+        .expect("the released run's tail is written");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+
+    assert!(
+        !driver
+            .discard_run_provisional_tail(&RunId::new())
+            .await
+            .expect("the tail reads"),
+        "another run's discard leaves the released run's tail alone"
+    );
+    assert_eq!(
+        tail_run(Arc::clone(&inner), runtime_id.clone()).await,
+        Some(released_run.clone())
+    );
+
+    assert!(
+        driver
+            .discard_run_provisional_tail(&released_run)
+            .await
+            .expect("the tail discards")
+    );
+    assert_eq!(tail_run(Arc::clone(&inner), runtime_id.clone()).await, None);
+    assert!(
+        driver
+            .discard_run_provisional_tail(&released_run)
+            .await
+            .expect("nothing left to discard"),
+        "no tail of the run is left"
+    );
+
+    write_tail(RunId::new(), "the next run's first round")
+        .await
+        .expect("the next run's first round commit lands over the same base");
+}
+
+/// A run whose provisional tail records its re-base is never released to
+/// requeue (`MeerkatMachine::release_resumable_run` refuses it): its inputs
+/// are already in the committed body. The driver reads the fact from the
+/// tail's own cursor. A tail of the run whose cursor carries the re-base,
+/// or whose cursor names another run, records it; a cursor without the
+/// re-base, a tail without a cursor, and no tail at all do not. RED before:
+/// a release discarded such a tail and requeued the inputs. Unrun: written
+/// while Cargo is not run.
+#[tokio::test]
+async fn a_run_tail_that_records_its_rebase_is_never_released() {
+    let inner = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let mut session = meerkat_core::Session::new();
+    session.push(meerkat_core::types::Message::User(
+        meerkat_core::types::UserMessage::text("committed by the run's re-base"),
+    ));
+    let session_id = session.id().clone();
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let base = inner
+        .inject_committed_whole_blob_bytes_for_test(
+            &runtime_id,
+            &session_id,
+            serde_json::to_vec(&session).expect("committed session serializes"),
+        )
+        .await
+        .expect("base authority");
+    let driver = DriverEntry::Persistent(PersistentRuntimeDriver::new(
+        runtime_id.clone(),
+        Arc::clone(&inner) as Arc<dyn RuntimeStore>,
+        memory_blob_store(),
+    ));
+    let run_id = RunId::new();
+    assert!(
+        !driver
+            .run_tail_records_rebase(&run_id)
+            .await
+            .expect("the tail reads"),
+        "no tail records no re-base"
+    );
+
+    for (cursor_run, rebased, records) in [
+        (Some(run_id.clone()), true, true),
+        (Some(run_id.clone()), false, false),
+        (Some(RunId::new()), false, true),
+        (None, false, false),
+    ] {
+        assert!(
+            driver
+                .discard_run_provisional_tail(&run_id)
+                .await
+                .expect("the previous tail of the run discards"),
+            "no other run's tail stands"
+        );
+        let mut candidate = session.clone();
+        candidate.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("a round the run committed after its re-base"),
+        ));
+        if let Some(cursor_run) = cursor_run.clone() {
+            let mut cursor = meerkat_core::SessionRunCursor::new(
+                cursor_run,
+                Vec::new(),
+                1,
+                meerkat_core::RunResumePoint::AwaitingModel,
+            );
+            cursor.rebased = rebased;
+            candidate
+                .set_run_cursor(&cursor)
+                .expect("the cursor is recorded");
+        }
+        crate::store::RuntimeStore::write_prepared_whole_blob_provisional_tail(
+            inner.as_ref(),
+            &runtime_id,
+            crate::store::PreparedWholeBlobProvisionalTail::prepare_from_session(
+                base.clone(),
+                run_id.clone(),
+                1,
+                &candidate,
+            )
+            .expect("the run's tail prepares"),
+        )
+        .await
+        .expect("the run's tail is written");
+        assert_eq!(
+            driver
+                .run_tail_records_rebase(&run_id)
+                .await
+                .expect("the tail reads"),
+            records,
+            "cursor of {cursor_run:?}, rebased {rebased}"
+        );
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Runtime host health probes.
 //
@@ -54384,6 +56015,120 @@ impl CoreExecutor for HealthProbeBlockingExecutor {
     async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
         Ok(())
     }
+}
+
+/// A caller waiting on an input its runtime admitted is answered, typed,
+/// once the session's registration must reload and its runtime loop exits
+/// without serving that input. The registration stays detached until a
+/// reload, so nothing would answer the waiter otherwise: a turn request that
+/// queued behind a run whose actor could not be materialized waited forever.
+/// The input stays durably admitted for the runtime's reload.
+#[tokio::test]
+async fn a_waiter_on_a_registration_that_must_reload_is_answered_when_its_loop_exits() {
+    struct GatedFailingExecutor {
+        apply_entered: Arc<Notify>,
+        release_apply: Arc<Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GatedFailingExecutor {
+        async fn apply(
+            &mut self,
+            _run_id: RunId,
+            _primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            self.apply_entered.notify_one();
+            self.release_apply.notified().await;
+            Err(CoreExecutorError::apply_failed_runtime_turn(
+                "the run's actor could not be materialized",
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let store: Arc<dyn RuntimeStore> = Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("persistent machine"),
+    );
+    let session_id = SessionId::new();
+    let apply_entered = Arc::new(Notify::new());
+    let release_apply = Arc::new(Notify::new());
+    machine
+        .register_session_with_executor(
+            session_id.clone(),
+            Box::new(GatedFailingExecutor {
+                apply_entered: Arc::clone(&apply_entered),
+                release_apply: Arc::clone(&release_apply),
+            }),
+        )
+        .await
+        .expect("register the session with its executor");
+
+    let (_running, running_waiter) = machine
+        .accept_input_with_completion(&session_id, make_prompt("the run that fails"))
+        .await
+        .expect("accept the running input");
+    tokio::time::timeout(Duration::from_secs(5), apply_entered.notified())
+        .await
+        .expect("the first input's run reaches its apply");
+    let (queued, queued_waiter) = machine
+        .accept_input_with_completion(&session_id, make_prompt("the input queued behind it"))
+        .await
+        .expect("accept the queued input");
+    assert!(
+        matches!(queued, AcceptOutcome::Accepted { .. }),
+        "the second input queues behind the run: {queued:?}"
+    );
+
+    assert!(
+        machine
+            .force_session_durability_reload_required_for_test(&session_id)
+            .await,
+        "the registration must reload"
+    );
+    release_apply.notify_one();
+
+    let queued_answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        queued_waiter
+            .expect("the queued input has a completion waiter")
+            .try_wait(),
+    )
+    .await
+    .expect("the queued input's waiter is answered once the registration must reload");
+    match queued_answer {
+        Err(crate::completion::CompletionWaitError::AuthorityUnavailable(reason)) => assert!(
+            reason.contains("must reload") && reason.contains("do not resubmit"),
+            "the answer says the runtime must reload and the input is kept: {reason}"
+        ),
+        other => panic!("expected the typed reload answer, got {other:?}"),
+    }
+    let running_answer = tokio::time::timeout(
+        Duration::from_secs(10),
+        running_waiter
+            .expect("the running input has a completion waiter")
+            .try_wait(),
+    )
+    .await
+    .expect("the running input's waiter is answered too");
+    assert!(
+        running_answer.is_err(),
+        "the run that failed under a reload requirement answers its waiter with an error: {running_answer:?}"
+    );
 }
 
 fn persistent_health_probe_machine() -> Arc<MeerkatMachine> {
@@ -55791,6 +57536,8 @@ fn unregister_completes_after_normal_close_of_a_staged_live_channel() {
                 fence_token,
                 generation,
                 runtime_epoch_id: None,
+                queued_inputs: mm_dsl::UnregisterQueuedInputsDisposition::Stop,
+                requeue_max_age_ms: 0,
             }
         }),
         "begin unregister",
@@ -56723,6 +58470,97 @@ async fn a_fresh_executor_attachment_publishes_only_after_its_settlement() {
     );
 }
 
+/// Binding preparation for a session another runtime owner hosts refuses
+/// with the typed hosting refusal, not a preparation string, on every
+/// preparation seam. The refusal is not claimed as no-effect (a caller keeps
+/// its cleanup open), and the refused owner publishes no registration.
+#[cfg(feature = "sqlite-store")]
+#[tokio::test]
+async fn binding_preparation_for_a_session_another_owner_hosts_refuses_typed() {
+    use crate::session_hosting::HostingPaths;
+
+    let dir = tempfile::tempdir().unwrap();
+    let store: Arc<dyn RuntimeStore> = Arc::new(
+        crate::store::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+            .unwrap()
+            .with_hosting_paths(HostingPaths {
+                hosting_lock_dir: dir.path().join("hosting"),
+                cold_delivery_lock: dir.path().join("delivery").join("cold-delivery.lock"),
+                database: None,
+            }),
+    );
+    let host = MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store()).unwrap();
+    let other = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("separate machines may share one store"),
+    );
+    let session_id = SessionId::new();
+    host.register_session(session_id.clone())
+        .await
+        .expect("the first owner registers");
+
+    let local = other
+        .prepare_local_session_bindings(session_id.clone())
+        .await
+        .expect_err("another runtime owner's local bindings are refused");
+    let authoritative = other
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect_err("another runtime owner's bindings are refused");
+    let Err(materialization) = other
+        .prepare_local_session_materialization_with_mode(
+            session_id.clone(),
+            crate::LocalSessionMaterializationMode::Ordinary,
+        )
+        .await
+    else {
+        panic!("another runtime owner's materialization is refused");
+    };
+    for (seam, error) in [
+        ("local bindings", &local),
+        ("bindings", &authoritative),
+        ("materialization", &materialization),
+    ] {
+        assert!(
+            matches!(
+                error,
+                crate::meerkat_machine::RuntimeBindingsError::Hosting(
+                    refused,
+                    meerkat_core::SessionError::ServedElsewhere { id },
+                ) if refused == &session_id && id == &session_id
+            ),
+            "{seam}: the typed hosting refusal: {error:?}"
+        );
+        assert!(
+            !error.rejected_before_effect(),
+            "{seam}: a hosting refusal is not claimed as no-effect"
+        );
+    }
+    assert!(
+        !other.contains_session(&session_id).await,
+        "the refused owner published no registration"
+    );
+    assert!(matches!(
+        crate::meerkat_machine::RuntimeBindingsError::from_preparation_error(
+            session_id.clone(),
+            &RuntimeDriverError::HostingUnavailable {
+                session_id: session_id.clone(),
+            },
+        ),
+        crate::meerkat_machine::RuntimeBindingsError::Hosting(
+            _,
+            meerkat_core::SessionError::HostingUnavailable { .. },
+        )
+    ));
+    assert!(matches!(
+        crate::meerkat_machine::RuntimeBindingsError::from_preparation_error(
+            session_id,
+            &RuntimeDriverError::Destroyed,
+        ),
+        crate::meerkat_machine::RuntimeBindingsError::PrepareFailed(..)
+    ));
+}
+
 /// #1813 (ADR's R6 objection): hosting claims are owner-scoped. Two
 /// MeerkatMachines may share one store for distinct runtimes, and each is a
 /// distinct runtime owner. A session one hosts is refused to the other
@@ -56996,5 +58834,2074 @@ fn interrupted_request_identity_is_the_one_its_run_stamped() {
     assert!(
         stamped_turn_metadata(&stored(prompt(None), false)).is_none(),
         "a row without stored semantics keeps the prompt's own metadata"
+    );
+}
+
+/// Terminal-completion batch bound rows.
+///
+/// A terminal-completion batch names at most 256 inputs: its owner row
+/// carries the whole recipient set, every reader validates that bound at
+/// load, and its finalization and receipt writes are one input-state batch
+/// CAS, which the store contract caps at 256 rows. A session holds no such
+/// bound on its backlog, so every row here works a backlog of 300 inputs
+/// through each path that completes a batch, on a persistent machine over
+/// the in-memory store, the SQLite store and a host store realm (the host
+/// store adapter over its in-memory test host). Each row requires every input
+/// to reach its terminal and its waiter to settle, and the registration to
+/// stay ready: a refused batch must never leave it reload-required.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-store"))]
+mod terminal_completion_batch_bound {
+    use super::*;
+    use crate::completion::{CompletionHandle, CompletionWaitError};
+    use crate::input_state::{InputAbandonReason, InputLifecycleState, InputTerminalOutcome};
+    use meerkat_core::types::HandlingMode;
+
+    /// More inputs than one terminal-completion batch may name.
+    const BACKLOG: usize = 300;
+    /// The most inputs one terminal-completion batch names.
+    const BATCH_BOUND: usize = 256;
+
+    #[derive(Clone, Copy, Debug)]
+    enum BoundStore {
+        Memory,
+        Sqlite,
+        HostRealm,
+    }
+
+    /// A persistent machine over one store, with everything that must
+    /// outlive it.
+    struct Fixture {
+        machine: Arc<MeerkatMachine>,
+        store: Arc<dyn crate::store::RuntimeStore>,
+        session_id: SessionId,
+        /// The test host under the host store realm, whose commit gate parks
+        /// a commit in flight.
+        host: Option<Arc<crate::store::spi::test_host::TestHost>>,
+        _owners: Vec<Box<dyn std::any::Any + Send + Sync>>,
+    }
+
+    impl Fixture {
+        async fn new(store: BoundStore) -> Self {
+            let mut owners: Vec<Box<dyn std::any::Any + Send + Sync>> = Vec::new();
+            let mut host_handle = None;
+            let runtime_store: Arc<dyn crate::store::RuntimeStore> = match store {
+                BoundStore::Memory => Arc::new(crate::store::InMemoryRuntimeStore::new()),
+                BoundStore::Sqlite => {
+                    let dir = tempfile::TempDir::new().expect("temp dir");
+                    let sqlite =
+                        crate::store::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+                            .expect("sqlite runtime store");
+                    owners.push(Box::new(dir));
+                    Arc::new(sqlite)
+                }
+                BoundStore::HostRealm => {
+                    let host = Arc::new(crate::store::spi::test_host::TestHost::new());
+                    let realm = crate::store::spi::SpiRealm::open(
+                        Arc::clone(&host) as _,
+                        crate::store::spi::SpiRealmConfig::default(),
+                    )
+                    .await
+                    .expect("host store realm opens");
+                    let spi = crate::store::spi::SpiRuntimeStore::open(Arc::clone(&realm))
+                        .await
+                        .expect("host store runtime store opens");
+                    owners.push(Box::new(realm));
+                    host_handle = Some(Arc::clone(&host));
+                    owners.push(Box::new(host));
+                    Arc::new(spi)
+                }
+            };
+            let machine = Arc::new(
+                MeerkatMachine::persistent(Arc::clone(&runtime_store), memory_blob_store())
+                    .expect("persistent machine"),
+            );
+            Self {
+                machine,
+                store: runtime_store,
+                session_id: SessionId::new(),
+                host: host_handle,
+                _owners: owners,
+            }
+        }
+
+        /// A process restart: a new machine over the same store.
+        fn restart(&mut self) {
+            self.machine = Arc::new(
+                MeerkatMachine::persistent(Arc::clone(&self.store), memory_blob_store())
+                    .expect("restarted persistent machine"),
+            );
+        }
+
+        /// Stop the runtime and wait for the stop to reach its terminal.
+        async fn stop_until_terminal(&self, reason: &str) {
+            let registration = self
+                .machine
+                .current_session_registration_witness(&self.session_id)
+                .await
+                .expect("the session is registered");
+            let stopped = tokio::time::timeout(
+                Duration::from_secs(120),
+                self.machine
+                    .stop_runtime_executor_until_terminal_if_current(&registration, reason),
+            )
+            .await
+            .expect("the stop reaches its terminal within 120 s")
+            .expect("stop the runtime");
+            assert!(stopped, "the stop ran against the current registration");
+        }
+
+        fn runtime_id(&self) -> LogicalRuntimeId {
+            runtime_id_for_session(&self.session_id)
+        }
+
+        /// Admit `count` non-prompt external events in `handling_mode`, in
+        /// admission order, with their waiters.
+        async fn admit_backlog(
+            &self,
+            count: usize,
+            handling_mode: HandlingMode,
+        ) -> (Vec<InputId>, Vec<CompletionHandle>) {
+            self.admit(
+                (0..count)
+                    .map(|index| {
+                        let mut input = make_queued_external_event(&format!("backlog-{index}"));
+                        if let Input::ExternalEvent(event) = &mut input {
+                            event.handling_mode = handling_mode;
+                        }
+                        input
+                    })
+                    .collect(),
+            )
+            .await
+        }
+
+        /// Admit `inputs` in order, with their waiters.
+        async fn admit(&self, inputs: Vec<Input>) -> (Vec<InputId>, Vec<CompletionHandle>) {
+            let mut input_ids = Vec::with_capacity(inputs.len());
+            let mut waiters = Vec::with_capacity(inputs.len());
+            for input in inputs {
+                let input_id = input.id().clone();
+                let (outcome, waiter) = self
+                    .machine
+                    .accept_input_with_completion(&self.session_id, input)
+                    .await
+                    .expect("admit a backlog input");
+                assert!(outcome.is_accepted(), "{outcome:?}");
+                input_ids.push(input_id);
+                waiters.push(waiter.expect("a queued input installs a waiter"));
+            }
+            (input_ids, waiters)
+        }
+
+        async fn assert_ready(&self, context: &str) {
+            let required = self
+                .machine
+                .durability_reload_required(&self.session_id)
+                .await;
+            assert!(
+                required.is_none(),
+                "{context}: the registration became reload-required: {required:?}"
+            );
+        }
+
+        /// Wait for every waiter, failing at once if the registration
+        /// becomes reload-required meanwhile.
+        async fn settle(
+            &self,
+            waiters: Vec<CompletionHandle>,
+            context: &str,
+        ) -> Vec<Result<CompletionOutcome, CompletionWaitError>> {
+            self.settle_within(waiters, context, Duration::from_secs(120))
+                .await
+        }
+
+        /// [`Self::settle`] within `bound`.
+        async fn settle_within(
+            &self,
+            waiters: Vec<CompletionHandle>,
+            context: &str,
+            bound: Duration,
+        ) -> Vec<Result<CompletionOutcome, CompletionWaitError>> {
+            let mut all = tokio::spawn(async move {
+                let mut outcomes = Vec::with_capacity(waiters.len());
+                for waiter in waiters {
+                    outcomes.push(waiter.wait().await);
+                }
+                outcomes
+            });
+            let deadline = tokio::time::Instant::now() + bound;
+            loop {
+                match tokio::time::timeout(Duration::from_millis(100), &mut all).await {
+                    Ok(joined) => return joined.expect("the waiter task"),
+                    Err(_) => {
+                        self.assert_ready(context).await;
+                        assert!(
+                            tokio::time::Instant::now() < deadline,
+                            "{context}: the waiters did not settle within {bound:?}"
+                        );
+                    }
+                }
+            }
+        }
+
+        /// Every input reached `expected`, and its exact terminal completion
+        /// is readable.
+        async fn assert_every_terminal(
+            &self,
+            input_ids: &[InputId],
+            expected: &InputTerminalOutcome,
+            context: &str,
+        ) {
+            self.assert_every_terminal_outcome(input_ids, expected, context)
+                .await;
+            for input_id in input_ids {
+                let completion = self
+                    .machine
+                    .input_terminal_completion(&self.session_id, input_id)
+                    .await
+                    .expect("read an input's terminal completion");
+                assert!(
+                    completion.is_some(),
+                    "{context}: input {input_id} has its exact terminal completion"
+                );
+            }
+        }
+
+        /// Every input's directed interaction terminal was published.
+        async fn assert_every_outbox_published(&self, input_ids: &[InputId], context: &str) {
+            for input_id in input_ids {
+                let stored = self
+                    .machine
+                    .input_state(&self.session_id, input_id)
+                    .await
+                    .expect("read an input")
+                    .unwrap_or_else(|| panic!("{context}: input {input_id} is retained"));
+                let outbox = stored
+                    .state
+                    .interaction_terminal_outbox
+                    .as_ref()
+                    .unwrap_or_else(|| panic!("{context}: input {input_id} has its outbox"));
+                assert!(
+                    matches!(
+                        outbox.phase,
+                        crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
+                    ),
+                    "{context}: input {input_id}'s directed terminal was published: {:?}",
+                    outbox.phase
+                );
+            }
+        }
+
+        /// Every input reached `expected`.
+        async fn assert_every_terminal_outcome(
+            &self,
+            input_ids: &[InputId],
+            expected: &InputTerminalOutcome,
+            context: &str,
+        ) {
+            for input_id in input_ids {
+                let stored = self
+                    .machine
+                    .input_state(&self.session_id, input_id)
+                    .await
+                    .expect("read an input")
+                    .unwrap_or_else(|| panic!("{context}: input {input_id} is retained"));
+                assert_eq!(
+                    stored.seed.terminal_outcome.as_ref(),
+                    Some(expected),
+                    "{context}: input {input_id} reached its terminal"
+                );
+            }
+        }
+    }
+
+    /// Completes every run at once and records each run's contributors.
+    struct RecordingCompletingExecutor {
+        runs: Arc<std::sync::Mutex<Vec<Vec<InputId>>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for RecordingCompletingExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            let contributors = primitive.contributing_input_ids().to_vec();
+            self.runs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .push(contributors.clone());
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: primitive.apply_boundary(),
+                    contributing_input_ids: contributors,
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// Holds the first run inside `apply` until released; every later run
+    /// completes at once.
+    struct GatedFirstRunExecutor {
+        started: Arc<Notify>,
+        release: Arc<Notify>,
+        gated: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for GatedFirstRunExecutor {
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            if std::mem::take(&mut self.gated) {
+                self.started.notify_one();
+                self.release.notified().await;
+            }
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: primitive.apply_boundary(),
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// Refuses every directed interaction terminal it is asked to publish.
+    #[derive(Default)]
+    struct RefusingTerminalPublisher {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for RefusingTerminalPublisher {
+        async fn publish_interaction_terminals(
+            &self,
+            _events: &[meerkat_core::event::AgentEvent],
+        ) -> Result<
+            Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+            CoreExecutorError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Err(CoreExecutorError::Internal(
+                "the directed terminal publication is refused".to_string(),
+            ))
+        }
+    }
+
+    /// Publishes every directed interaction terminal it is given, and counts
+    /// the calls and the terminals.
+    #[derive(Default)]
+    struct CountingTerminalPublisher {
+        calls: AtomicUsize,
+        terminals: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for CountingTerminalPublisher {
+        async fn publish_interaction_terminals(
+            &self,
+            events: &[meerkat_core::event::AgentEvent],
+        ) -> Result<
+            Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+            CoreExecutorError,
+        > {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.terminals.fetch_add(events.len(), Ordering::SeqCst);
+            events
+                .iter()
+                .zip(1_u64..)
+                .map(|(event, sequence)| {
+                    meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
+                        event, sequence,
+                    )
+                })
+                .collect()
+        }
+    }
+
+    /// Completes every run at once and publishes directed terminals through
+    /// `publisher`.
+    struct PublishingCompletingExecutor {
+        publisher: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    }
+
+    #[async_trait::async_trait]
+    impl CoreExecutor for PublishingCompletingExecutor {
+        fn publication_handle(
+            &self,
+        ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
+            Some(Arc::clone(&self.publisher))
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: RunId,
+            primitive: RunPrimitive,
+        ) -> Result<CoreApplyOutput, CoreExecutorError> {
+            Ok(CoreApplyOutput::with_untyped_snapshot(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: primitive.apply_boundary(),
+                    contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                None,
+            ))
+        }
+
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    /// A tracked flow step: a directed input, whose terminal is published as
+    /// its interaction's terminal.
+    fn directed_flow_step(index: usize) -> Input {
+        let interaction = meerkat_core::time_compat::new_uuid_v7();
+        crate::mob_adapter::create_tracked_flow_step_input(
+            &format!("directed-{index}"),
+            meerkat_core::types::ContentInput::Text(format!("directed step {index}")),
+            "batch-bound-flow",
+            None,
+            &interaction.to_string(),
+        )
+        .expect("a directed flow step")
+    }
+
+    /// A retired session whose held runtime loop owns the drain, with
+    /// `directed` directed inputs admitted first and `nondirected` queued
+    /// external events after them, all pending: every input's id and waiter,
+    /// in admission order, and which inputs are directed.
+    async fn retired_with_pending_mixed_inputs(
+        fixture: &Fixture,
+        publisher: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        directed: usize,
+        nondirected: usize,
+    ) -> (
+        Vec<InputId>,
+        Vec<CompletionHandle>,
+        std::collections::HashSet<InputId>,
+    ) {
+        // Bound like a mob member's session: a directed terminal names its
+        // runtime placement.
+        fixture
+            .machine
+            .prepare_bindings(fixture.session_id.clone())
+            .await
+            .expect("prepare the session's runtime bindings");
+        fixture
+            .machine
+            .ensure_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(PublishingCompletingExecutor { publisher }),
+            )
+            .await
+            .expect("attach the publishing loop");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let mut parks = fixture.machine.run_start_held_parks();
+        let mut inputs = (0..directed).map(directed_flow_step).collect::<Vec<_>>();
+        inputs.extend((0..nondirected).map(|index| {
+            let mut input = make_queued_external_event(&format!("nondirected-{index}"));
+            if let Input::ExternalEvent(event) = &mut input {
+                event.handling_mode = HandlingMode::Queue;
+            }
+            input
+        }));
+        let directed_ids = inputs[..directed]
+            .iter()
+            .map(|input| input.id().clone())
+            .collect::<std::collections::HashSet<_>>();
+        let (input_ids, waiters) = fixture.admit(inputs).await;
+        tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+            .await
+            .expect("the runtime loop parks on the hold")
+            .expect("park signal");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::traits::RuntimeControlPlane::retire(
+                fixture.machine.as_ref(),
+                &fixture.runtime_id(),
+            ),
+        )
+        .await
+        .expect("the retire returns within 60 s")
+        .expect("retire while the held loop owns the drain");
+        (input_ids, waiters, directed_ids)
+    }
+
+    fn abandoned(reason: InputAbandonReason) -> InputTerminalOutcome {
+        InputTerminalOutcome::Abandoned { reason }
+    }
+
+    fn assert_every_runtime_terminated(
+        outcomes: &[Result<CompletionOutcome, CompletionWaitError>],
+        reason: &str,
+        context: &str,
+    ) {
+        for outcome in outcomes {
+            assert!(
+                matches!(
+                    outcome,
+                    Ok(CompletionOutcome::RuntimeTerminated { reason: terminated, .. })
+                        if terminated == reason
+                ),
+                "{context}: every waiter gets the runtime terminal: {outcome:?}"
+            );
+        }
+    }
+
+    /// A session with a register-held backlog of 300 non-prompt inputs gets an
+    /// executor: the loop works the whole backlog, at most 256 inputs a run,
+    /// in admission order, until every input is consumed.
+    async fn backlog_runs_in_bounded_runs(store: BoundStore, handling_mode: HandlingMode) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, handling_mode).await;
+        let lanes = fixture
+            .machine
+            .meerkat_machine_spine_snapshot(&fixture.session_id)
+            .await
+            .expect("spine snapshot")
+            .inputs;
+        let lane = match handling_mode {
+            HandlingMode::Steer => lanes.steer_queue,
+            _ => lanes.queue,
+        };
+        assert_eq!(
+            lane, input_ids,
+            "the whole backlog waits in the {handling_mode:?} lane, in admission order"
+        );
+
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fixture
+            .machine
+            .ensure_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(RecordingCompletingExecutor {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("attach the executor");
+        let outcomes = fixture.settle(waiters, "backlog runs").await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Ok(CompletionOutcome::CompletedWithoutResult)),
+                "every backlog input completes: {outcome:?}"
+            );
+        }
+        fixture
+            .assert_every_terminal(&input_ids, &InputTerminalOutcome::Consumed, "backlog runs")
+            .await;
+        fixture.assert_ready("after the backlog ran").await;
+
+        let runs = runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            runs.iter().all(|run| run.len() <= BATCH_BOUND),
+            "no run takes more than {BATCH_BOUND} inputs: {:?}",
+            runs.iter().map(Vec::len).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            runs.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![BATCH_BOUND, BACKLOG - BATCH_BOUND],
+            "a full run takes the bound and the rest wait for the next run"
+        );
+        assert_eq!(
+            runs.concat(),
+            input_ids,
+            "every input runs exactly once, in admission order, across runs"
+        );
+    }
+
+    async fn queue_backlog_runs_in_bounded_runs(store: BoundStore) {
+        backlog_runs_in_bounded_runs(store, HandlingMode::Queue).await;
+    }
+
+    async fn steer_backlog_runs_in_bounded_runs(store: BoundStore) {
+        backlog_runs_in_bounded_runs(store, HandlingMode::Steer).await;
+    }
+
+    /// A stop of a session without a runtime loop completes its whole
+    /// 300-input backlog as stopped.
+    async fn loopless_stop_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        fixture.stop_until_terminal("operator stop").await;
+        let outcomes = fixture.settle(waiters, "loop-less stop").await;
+        assert_every_runtime_terminated(&outcomes, "runtime stopped", "loop-less stop");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Stopped),
+                "loop-less stop",
+            )
+            .await;
+        fixture.assert_ready("after the loop-less stop").await;
+    }
+
+    /// A session whose runtime loop is held from starting runs is stopped
+    /// with a 300-input backlog: the loop's stop completes every input.
+    async fn held_loop_stop_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fixture
+            .machine
+            .register_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(RecordingCompletingExecutor {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("register the session with a loop");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let mut parks = fixture.machine.run_start_held_parks();
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+            .await
+            .expect("the runtime loop parks on the hold")
+            .expect("park signal");
+        fixture.stop_until_terminal("operator stop").await;
+        let outcomes = fixture.settle(waiters, "held-loop stop").await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Ok(CompletionOutcome::RuntimeTerminated { .. })),
+                "held-loop stop: every waiter gets the runtime terminal: {outcome:?}"
+            );
+        }
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Stopped),
+                "held-loop stop",
+            )
+            .await;
+        fixture.assert_ready("after the held-loop stop").await;
+        assert!(
+            runs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing ran"
+        );
+    }
+
+    /// A destroy completes the whole 300-input backlog as destroyed.
+    async fn destroy_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        let report = crate::traits::RuntimeControlPlane::destroy(
+            fixture.machine.as_ref(),
+            &fixture.runtime_id(),
+        )
+        .await
+        .expect("destroy the runtime");
+        assert_eq!(report.inputs_abandoned, BACKLOG);
+        let outcomes = fixture.settle(waiters, "destroy").await;
+        assert_every_runtime_terminated(&outcomes, "runtime destroyed", "destroy");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Destroyed),
+                "destroy",
+            )
+            .await;
+        fixture.assert_ready("after the destroy").await;
+    }
+
+    /// A retire of a session without a runtime loop completes the whole
+    /// 300-input backlog as retired.
+    async fn loopless_retire_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        let report = crate::traits::RuntimeControlPlane::retire(
+            fixture.machine.as_ref(),
+            &fixture.runtime_id(),
+        )
+        .await
+        .expect("retire the loop-less runtime");
+        assert_eq!(report.inputs_abandoned, BACKLOG);
+        let outcomes = fixture.settle(waiters, "loop-less retire").await;
+        assert_every_runtime_terminated(
+            &outcomes,
+            "retired without runtime loop",
+            "loop-less retire",
+        );
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "loop-less retire",
+            )
+            .await;
+        fixture.assert_ready("after the loop-less retire").await;
+    }
+
+    /// A retired session whose held runtime loop still owns the drain gets
+    /// its retirement cleanup: the cleanup completes the whole 300-input
+    /// backlog as retired.
+    ///
+    /// The backlog queues before the loop attaches, with the run-start hold
+    /// staged for the registration, so the held loop wakes once instead of
+    /// once per admission. (Retire holds the session mutation gate while it
+    /// wakes the loop on its bounded wake channel, and the loop takes that
+    /// gate to process each wake; a full channel would hold both.)
+    async fn retired_pending_cleanup_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .stage_registration_run_start_hold(
+                &fixture.session_id,
+                crate::RunStartHoldReason::MobStop,
+            )
+            .await
+            .expect("stage the registration's run-start hold");
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the held session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        let mut parks = fixture.machine.run_start_held_parks();
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fixture
+            .machine
+            .ensure_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(RecordingCompletingExecutor {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("attach the held loop");
+        tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+            .await
+            .expect("the runtime loop parks on the hold")
+            .expect("park signal");
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::traits::RuntimeControlPlane::retire(
+                fixture.machine.as_ref(),
+                &fixture.runtime_id(),
+            ),
+        )
+        .await
+        .expect("the retire returns within 60 s")
+        .expect("retire while the held loop owns the drain");
+        let abandoned_count = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture
+                .machine
+                .abandon_retired_pending_inputs(&fixture.session_id, "retired cleanup"),
+        )
+        .await
+        .expect("the retirement cleanup finishes")
+        .expect("retirement cleanup");
+        assert_eq!(abandoned_count, BACKLOG);
+        let outcomes = fixture.settle(waiters, "retirement cleanup").await;
+        assert_every_runtime_terminated(&outcomes, "retired cleanup", "retirement cleanup");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "retirement cleanup",
+            )
+            .await;
+        fixture.assert_ready("after the retirement cleanup").await;
+        assert!(
+            runs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing ran"
+        );
+    }
+
+    /// A retire of a session whose held runtime loop has a burst of wakes
+    /// pending returns. Retire holds the session mutation gate while it wakes
+    /// the loop, and the loop takes that gate to process each wake, so retire
+    /// must never wait for room on the loop's bounded wake channel: a pending
+    /// wake already makes the loop run the drain.
+    async fn retire_after_a_wake_burst_returns(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fixture
+            .machine
+            .register_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(RecordingCompletingExecutor {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("register the session with a loop");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let mut parks = fixture.machine.run_start_held_parks();
+        // Every admission wakes the held loop.
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+            .await
+            .expect("the runtime loop parks on the hold")
+            .expect("park signal");
+        let report = tokio::time::timeout(
+            Duration::from_secs(60),
+            crate::traits::RuntimeControlPlane::retire(
+                fixture.machine.as_ref(),
+                &fixture.runtime_id(),
+            ),
+        )
+        .await
+        .expect("the retire returns within 60 s")
+        .expect("retire while the held loop owns the drain");
+        assert_eq!(
+            report.inputs_abandoned, 0,
+            "the held loop owns the drain: retire abandons nothing"
+        );
+        let abandoned_count = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture
+                .machine
+                .abandon_retired_pending_inputs(&fixture.session_id, "retired cleanup"),
+        )
+        .await
+        .expect("the retirement cleanup finishes")
+        .expect("retirement cleanup");
+        assert_eq!(abandoned_count, BACKLOG);
+        let outcomes = fixture.settle(waiters, "retirement cleanup").await;
+        assert_every_runtime_terminated(&outcomes, "retired cleanup", "retirement cleanup");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "retirement cleanup",
+            )
+            .await;
+        fixture.assert_ready("after the retirement cleanup").await;
+        assert!(
+            runs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "nothing ran"
+        );
+    }
+
+    /// A replacement attachment published over a 300-input backlog cancels
+    /// every predecessor input and fails each waiter as replaced.
+    async fn attachment_replacement_completes_every_input(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture.admit_backlog(BACKLOG, HandlingMode::Queue).await;
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let pending = match fixture
+            .machine
+            .ensure_session_with_executor_factory(fixture.session_id.clone(), {
+                let runs = Arc::clone(&runs);
+                move |_witness| Box::new(RecordingCompletingExecutor { runs })
+            })
+            .await
+            .expect("prepare the replacement attachment")
+        {
+            EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+            EnsureRuntimeExecutorAttachment::Existing(witness) => {
+                panic!("the replacement unexpectedly found attachment {witness:?}")
+            }
+        };
+        let witness = pending
+            .commit_replacing_predecessor()
+            .await
+            .expect("publish the replacement and fence the predecessor waiters");
+        let outcomes = fixture.settle(waiters, "attachment replacement").await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Err(error) if error.is_attachment_replaced()),
+                "every predecessor waiter fails as replaced: {outcome:?}"
+            );
+        }
+        // The replacement fails each predecessor waiter itself and publishes
+        // only directed batches; a batch with no directed recipient keeps
+        // its pending completion for a later recovery, as before.
+        fixture
+            .assert_every_terminal_outcome(
+                &input_ids,
+                &abandoned(InputAbandonReason::Cancelled),
+                "attachment replacement",
+            )
+            .await;
+        fixture.assert_ready("after the replacement").await;
+        assert!(
+            fixture
+                .machine
+                .list_active_inputs(&fixture.session_id)
+                .await
+                .expect("inspect the backlog after the replacement")
+                .is_empty(),
+            "the replacement leaves no predecessor work"
+        );
+        assert!(
+            runs.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty(),
+            "the replacement never runs predecessor work"
+        );
+        fixture
+            .machine
+            .unregister_executor_attachment_if_current(&witness)
+            .await
+            .expect("clean the replacement attachment");
+    }
+
+    /// A Reset the machine refuses while a run is in flight answers a typed
+    /// refusal before it prepares or checkpoints anything; the session stays
+    /// ready, its inputs run, and a new input runs to completion.
+    async fn reset_refused_while_running_keeps_the_session_usable(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        let started = Arc::new(Notify::new());
+        let release = Arc::new(Notify::new());
+        fixture
+            .machine
+            .register_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(GatedFirstRunExecutor {
+                    started: Arc::clone(&started),
+                    release: Arc::clone(&release),
+                    gated: true,
+                }),
+            )
+            .await
+            .expect("register the gated session");
+        let in_flight = make_prompt("the run in flight");
+        let in_flight_id = in_flight.id().clone();
+        let (outcome, in_flight_waiter) = fixture
+            .machine
+            .accept_input_with_completion(&fixture.session_id, in_flight)
+            .await
+            .expect("admit the run's input");
+        assert!(outcome.is_accepted(), "{outcome:?}");
+        tokio::time::timeout(Duration::from_secs(30), started.notified())
+            .await
+            .expect("the run starts");
+        let (queued_ids, queued_waiters) = fixture.admit_backlog(2, HandlingMode::Queue).await;
+        assert!(
+            fixture
+                .machine
+                .current_run(&fixture.session_id)
+                .await
+                .is_some(),
+            "a run is in flight"
+        );
+
+        let refused = crate::traits::RuntimeControlPlane::reset(
+            fixture.machine.as_ref(),
+            &fixture.runtime_id(),
+        )
+        .await
+        .expect_err("the machine refuses Reset while a run is in flight");
+        fixture.assert_ready("after the refused reset").await;
+        assert!(
+            matches!(
+                refused,
+                RuntimeControlPlaneError::InvalidState {
+                    state: RuntimeState::Running
+                }
+            ),
+            "a typed refusal: {refused:?}"
+        );
+        let refused = fixture
+            .machine
+            .reset_runtime(&fixture.session_id)
+            .await
+            .expect_err("the session-service reset is refused the same way");
+        assert!(
+            matches!(
+                refused,
+                RuntimeDriverError::NotReady {
+                    state: RuntimeState::Running
+                }
+            ),
+            "a typed refusal: {refused:?}"
+        );
+        fixture.assert_ready("after the refused reset").await;
+
+        release.notify_one();
+        let mut waiters = vec![in_flight_waiter.expect("the run's input has a waiter")];
+        waiters.extend(queued_waiters);
+        let outcomes = fixture.settle(waiters, "after the refused reset").await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Ok(CompletionOutcome::CompletedWithoutResult)),
+                "every input runs after the refused reset: {outcome:?}"
+            );
+        }
+        let mut ran = vec![in_flight_id];
+        ran.extend(queued_ids);
+        fixture
+            .assert_every_terminal(&ran, &InputTerminalOutcome::Consumed, "refused reset")
+            .await;
+        let (later_ids, later_waiters) = fixture.admit_backlog(1, HandlingMode::Queue).await;
+        let outcomes = fixture.settle(later_waiters, "a later input").await;
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [Ok(CompletionOutcome::CompletedWithoutResult)]
+            ),
+            "a later input runs to completion: {outcomes:?}"
+        );
+        fixture
+            .assert_every_terminal(&later_ids, &InputTerminalOutcome::Consumed, "a later input")
+            .await;
+        fixture.assert_ready("after the later input").await;
+    }
+
+    /// A Reset the machine refuses on a stopped session that still holds
+    /// queued inputs answers a typed refusal before it prepares or
+    /// checkpoints anything; the session stays ready, revives, and runs its
+    /// inputs and a new one.
+    ///
+    /// No public step leaves a registered session Stopped with inputs: a
+    /// stopped session admits none (`NotReady { state: Stopped }`), a stop
+    /// terminalizes every input but those a requeue unregister keeps, and a
+    /// restart registers those kept inputs on an Idle session. So the row
+    /// stops the session's machine with its two inputs queued: it applies
+    /// the generated `RuntimeExecutorExited` to the session's authority, the
+    /// transition a stop applies once its inputs are terminal.
+    async fn reset_refused_while_stopped_keeps_the_session_usable(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (queued_ids, queued_waiters) = fixture.admit_backlog(2, HandlingMode::Queue).await;
+        {
+            let authority = fixture
+                .machine
+                .session_dsl_authority(&fixture.session_id)
+                .await
+                .expect("session authority");
+            let mut authority = authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            mm_dsl::MeerkatMachineMutator::apply(
+                &mut *authority,
+                mm_dsl::MeerkatMachineInput::RuntimeExecutorExited,
+            )
+            .expect("the machine stops with the inputs queued");
+        }
+        let driver = fixture
+            .machine
+            .sessions
+            .read()
+            .await
+            .get(&fixture.session_id)
+            .map(|entry| Arc::clone(&entry.driver))
+            .expect("the session is registered");
+        driver
+            .lock()
+            .await
+            .sync_control_projection_from_dsl_authority();
+        assert_eq!(
+            fixture
+                .machine
+                .meerkat_machine_spine_snapshot(&fixture.session_id)
+                .await
+                .expect("spine snapshot")
+                .control
+                .phase,
+            RuntimeState::Stopped,
+            "the session is stopped with queued inputs"
+        );
+
+        let refused = crate::traits::RuntimeControlPlane::reset(
+            fixture.machine.as_ref(),
+            &fixture.runtime_id(),
+        )
+        .await
+        .expect_err("the machine refuses Reset on a stopped session");
+        fixture.assert_ready("after the refused reset").await;
+        assert!(
+            matches!(
+                refused,
+                RuntimeControlPlaneError::InvalidState {
+                    state: RuntimeState::Stopped
+                }
+            ),
+            "a typed refusal: {refused:?}"
+        );
+        for input_id in &queued_ids {
+            assert_eq!(
+                fixture
+                    .machine
+                    .input_state(&fixture.session_id, input_id)
+                    .await
+                    .expect("read a queued input")
+                    .expect("the queued input is retained")
+                    .seed
+                    .phase,
+                InputLifecycleState::Queued,
+                "the refused reset leaves the queued input queued"
+            );
+        }
+
+        fixture
+            .machine
+            .prepare_bindings(fixture.session_id.clone())
+            .await
+            .expect("revive the stopped session");
+        let runs = Arc::new(std::sync::Mutex::new(Vec::new()));
+        fixture
+            .machine
+            .ensure_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(RecordingCompletingExecutor {
+                    runs: Arc::clone(&runs),
+                }),
+            )
+            .await
+            .expect("attach an executor");
+        let outcomes = fixture
+            .settle(queued_waiters, "after the refused reset")
+            .await;
+        for outcome in &outcomes {
+            assert!(
+                matches!(outcome, Ok(CompletionOutcome::CompletedWithoutResult)),
+                "the queued inputs run after the refused reset: {outcome:?}"
+            );
+        }
+        fixture
+            .assert_every_terminal(
+                &queued_ids,
+                &InputTerminalOutcome::Consumed,
+                "refused reset",
+            )
+            .await;
+        let (later_ids, later_waiters) = fixture.admit_backlog(1, HandlingMode::Queue).await;
+        let outcomes = fixture.settle(later_waiters, "a later input").await;
+        assert!(
+            matches!(
+                outcomes.as_slice(),
+                [Ok(CompletionOutcome::CompletedWithoutResult)]
+            ),
+            "a later input runs to completion: {outcomes:?}"
+        );
+        fixture
+            .assert_every_terminal(&later_ids, &InputTerminalOutcome::Consumed, "a later input")
+            .await;
+        fixture.assert_ready("after the later input").await;
+    }
+
+    /// A retirement cleanup of 300 inputs, four of them directed and admitted
+    /// first, commits two batches: the first 256 in canonical order, with
+    /// every directed input, and 44 nondirected ones with no outbox. When the
+    /// publisher refuses the directed terminals, the cleanup answers
+    /// RuntimeTerminalPublicationInProgress once the caller's deadline passes
+    /// (the mob provisioner's cleanup passes one) while the process-owned
+    /// dispatch keeps the publication and keeps retrying it; it never reports
+    /// success while the publication is refused. The 44 inputs' waiters are
+    /// answered all the same. Neither the dispatch nor a later retry ever resolves a batch with
+    /// no outbox, and a retired session reaches no drain that would. RED while
+    /// the cleanup awaited the directed dispatch first and returned its error
+    /// before resolving them.
+    async fn retirement_cleanup_answers_the_batch_a_failed_publication_leaves(store: BoundStore) {
+        const DIRECTED: usize = 4;
+        let fixture = Fixture::new(store).await;
+        let publisher = Arc::new(RefusingTerminalPublisher::default());
+        let (input_ids, waiters, directed_ids) = retired_with_pending_mixed_inputs(
+            &fixture,
+            Arc::clone(&publisher) as _,
+            DIRECTED,
+            BACKLOG - DIRECTED,
+        )
+        .await;
+        let mut canonical = input_ids.clone();
+        canonical.sort_by_key(|input_id| input_id.0);
+        let unowned = canonical[BATCH_BOUND..].to_vec();
+        assert!(
+            canonical[..BATCH_BOUND]
+                .iter()
+                .filter(|input_id| directed_ids.contains(input_id))
+                .count()
+                == DIRECTED,
+            "every directed input is in the first batch, so the second has no outbox"
+        );
+
+        let deadline = meerkat_core::time_compat::Instant::now()
+            + meerkat_core::time_compat::Duration::from_secs(2);
+        let cleanup = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture.machine.abandon_retired_pending_inputs_before(
+                &fixture.session_id,
+                "retired cleanup",
+                deadline,
+            ),
+        )
+        .await
+        .expect("the retirement cleanup returns by its deadline");
+        // The publisher refuses every directed terminal, so the dispatch never
+        // converges, and the cleanup answers in-progress once its deadline
+        // passes while the dispatch keeps the publication. It commits the
+        // abandonment and starts the dispatch before it reads the deadline,
+        // so it can answer before the dispatch first calls the publisher.
+        assert!(
+            matches!(
+                cleanup,
+                Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
+            ),
+            "the cleanup reports the refused publication in progress: {cleanup:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while publisher.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dispatch hands the directed batch to the publisher");
+
+        let mut unowned_waiters = Vec::with_capacity(unowned.len());
+        for (input_id, waiter) in input_ids.iter().zip(waiters) {
+            if unowned.contains(input_id) {
+                unowned_waiters.push(waiter);
+            }
+        }
+        let outcomes = fixture
+            .settle_within(
+                unowned_waiters,
+                "the batch with no outbox",
+                Duration::from_secs(30),
+            )
+            .await;
+        assert_every_runtime_terminated(&outcomes, "retired cleanup", "the batch with no outbox");
+        fixture
+            .assert_every_terminal(
+                &unowned,
+                &abandoned(InputAbandonReason::Retired),
+                "the batch with no outbox",
+            )
+            .await;
+        fixture
+            .assert_ready("after the refused directed publication")
+            .await;
+    }
+
+    /// A retirement cleanup of 300 directed inputs commits two directed
+    /// batches, each with its own outbox, and the dispatch publishes both:
+    /// every terminal once, every waiter answered.
+    async fn retirement_cleanup_publishes_every_directed_batch(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        let publisher = Arc::new(CountingTerminalPublisher::default());
+        let (input_ids, waiters, _) =
+            retired_with_pending_mixed_inputs(&fixture, Arc::clone(&publisher) as _, BACKLOG, 0)
+                .await;
+        let abandoned_count = tokio::time::timeout(
+            Duration::from_secs(120),
+            fixture
+                .machine
+                .abandon_retired_pending_inputs(&fixture.session_id, "retired cleanup"),
+        )
+        .await
+        .expect("the retirement cleanup finishes")
+        .expect("retirement cleanup");
+        assert_eq!(abandoned_count, BACKLOG);
+        let outcomes = fixture.settle(waiters, "directed cleanup").await;
+        assert_every_runtime_terminated(&outcomes, "retired cleanup", "directed cleanup");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "directed cleanup",
+            )
+            .await;
+        fixture
+            .assert_every_outbox_published(&input_ids, "directed cleanup")
+            .await;
+        assert_eq!(
+            publisher.terminals.load(Ordering::SeqCst),
+            BACKLOG,
+            "every directed terminal is published once"
+        );
+        assert!(
+            publisher.calls.load(Ordering::SeqCst) >= 2,
+            "each directed batch is its own publication"
+        );
+        fixture.assert_ready("after the directed cleanup").await;
+    }
+
+    /// A stop of a held loop with 300 directed inputs commits two directed
+    /// batches, and the stop's own publication publishes both.
+    async fn held_loop_stop_publishes_every_directed_batch(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        let publisher = Arc::new(CountingTerminalPublisher::default());
+        fixture
+            .machine
+            .prepare_bindings(fixture.session_id.clone())
+            .await
+            .expect("prepare the session's runtime bindings");
+        fixture
+            .machine
+            .ensure_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(PublishingCompletingExecutor {
+                    publisher: Arc::clone(&publisher) as _,
+                }),
+            )
+            .await
+            .expect("attach the publishing loop");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let mut parks = fixture.machine.run_start_held_parks();
+        let (input_ids, waiters) = fixture
+            .admit((0..BACKLOG).map(directed_flow_step).collect())
+            .await;
+        tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+            .await
+            .expect("the runtime loop parks on the hold")
+            .expect("park signal");
+        fixture.stop_until_terminal("runtime stopped").await;
+        let outcomes = fixture.settle(waiters, "directed stop").await;
+        assert_every_runtime_terminated(&outcomes, "runtime stopped", "directed stop");
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Stopped),
+                "directed stop",
+            )
+            .await;
+        fixture
+            .assert_every_outbox_published(&input_ids, "directed stop")
+            .await;
+        assert_eq!(
+            publisher.terminals.load(Ordering::SeqCst),
+            BACKLOG,
+            "every directed terminal is published once"
+        );
+        fixture.assert_ready("after the directed stop").await;
+    }
+
+    /// A session registered with a publishing executor but never bound to a
+    /// runtime placement (`prepare_bindings`) refuses a directed input at
+    /// admission, typed, before anything is queued: a directed terminal names
+    /// its runtime placement, so the input's runless termination could never
+    /// stage its outbox, and a stop would fail after its checkpoint and leave
+    /// the registration reload-required. The session stays usable: a stop
+    /// ends it cleanly. RED while admission checked only for a publisher.
+    async fn directed_input_without_a_runtime_placement_is_refused_at_admission(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session_with_executor(
+                fixture.session_id.clone(),
+                Box::new(PublishingCompletingExecutor {
+                    publisher: Arc::new(CountingTerminalPublisher::default()),
+                }),
+            )
+            .await
+            .expect("register the session with a publishing loop and no bindings");
+        fixture
+            .machine
+            .hold_run_starts(&fixture.session_id, crate::RunStartHoldReason::MobStop)
+            .await
+            .expect("hold run starts");
+        let admitted = fixture
+            .machine
+            .accept_input_with_completion(&fixture.session_id, directed_flow_step(0))
+            .await;
+        assert!(
+            matches!(admitted, Err(RuntimeDriverError::ValidationFailed { .. })),
+            "a directed input with no runtime placement is refused at admission: {:?}",
+            admitted.as_ref().map(|(outcome, _)| outcome)
+        );
+        assert!(
+            fixture
+                .machine
+                .list_active_inputs(&fixture.session_id)
+                .await
+                .expect("list the active inputs")
+                .is_empty(),
+            "nothing was queued"
+        );
+        fixture.stop_until_terminal("runtime stopped").await;
+        fixture
+            .assert_ready("after the stop of the session that refused it")
+            .await;
+    }
+
+    /// Fails every archive post-commit obligation it is handed.
+    struct FailingArchiveHook;
+
+    #[async_trait::async_trait]
+    impl crate::meerkat_machine::MachineSessionArchivePostCommitHook for FailingArchiveHook {
+        async fn after_runtime_retire_commit(&self) -> Result<(), RuntimeControlPlaneError> {
+            Err(RuntimeControlPlaneError::Internal(
+                "the archive's post-commit obligation failed".to_string(),
+            ))
+        }
+    }
+
+    /// An archive retire of a session with no runtime loop durably ends its
+    /// pending inputs before its fallible steps (the session's DSL commit, the
+    /// archive's model-routing handoffs, the post-commit hook, the removal of
+    /// a recovered registration). When one fails, the retire answers that
+    /// error and the ended inputs' terminals are still published: every
+    /// waiter is answered, every completion is readable, and the registration
+    /// stays ready (a failed hook retains it for the retry). RED while the
+    /// retire returned at the failed step, before its publication.
+    async fn archive_retire_publishes_its_ended_inputs_when_its_hook_fails(store: BoundStore) {
+        let fixture = Fixture::new(store).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture
+            .admit_backlog(DROPPED_CALLER_INPUTS, HandlingMode::Queue)
+            .await;
+        let lease = fixture
+            .machine
+            .prepare_session_archive_lease(&fixture.session_id)
+            .await
+            .expect("prepare the archive lease")
+            .expect("the registered session has an archive lease");
+        let retired = tokio::time::timeout(
+            Duration::from_secs(60),
+            fixture
+                .machine
+                .retire_session_with_archive_lease_and_post_commit_hook_before(
+                    lease,
+                    Arc::new(FailingArchiveHook),
+                    meerkat_core::time_compat::Instant::now()
+                        + meerkat_core::time_compat::Duration::from_secs(30),
+                ),
+        )
+        .await
+        .expect("the archive retire returns");
+        assert!(
+            matches!(
+                &retired,
+                Err(RuntimeControlPlaneError::Internal(reason))
+                    if reason.contains("post-commit obligation failed")
+            ),
+            "the failed hook is the retire's answer: {retired:?}"
+        );
+        let outcomes = fixture
+            .settle_within(waiters, "failed archive hook", Duration::from_secs(30))
+            .await;
+        assert_every_runtime_terminated(
+            &outcomes,
+            "retired without runtime loop",
+            "failed archive hook",
+        );
+        fixture
+            .assert_every_terminal(
+                &input_ids,
+                &abandoned(InputAbandonReason::Retired),
+                "failed archive hook",
+            )
+            .await;
+        fixture.assert_ready("after the failed archive hook").await;
+    }
+
+    macro_rules! on_every_store {
+        ($($row:ident),* $(,)?) => {
+            $(
+                mod $row {
+                    use super::*;
+
+                    #[tokio::test]
+                    async fn memory() {
+                        super::$row(BoundStore::Memory).await;
+                    }
+
+                    #[tokio::test]
+                    async fn sqlite() {
+                        super::$row(BoundStore::Sqlite).await;
+                    }
+
+                    #[tokio::test]
+                    async fn host_realm() {
+                        super::$row(BoundStore::HostRealm).await;
+                    }
+                }
+            )*
+        };
+    }
+
+    on_every_store!(
+        queue_backlog_runs_in_bounded_runs,
+        steer_backlog_runs_in_bounded_runs,
+        loopless_stop_completes_every_input,
+        held_loop_stop_completes_every_input,
+        destroy_completes_every_input,
+        loopless_retire_completes_every_input,
+        retired_pending_cleanup_completes_every_input,
+        retire_after_a_wake_burst_returns,
+        attachment_replacement_completes_every_input,
+        reset_refused_while_running_keeps_the_session_usable,
+        reset_refused_while_stopped_keeps_the_session_usable,
+        retirement_cleanup_answers_the_batch_a_failed_publication_leaves,
+        retirement_cleanup_publishes_every_directed_batch,
+        held_loop_stop_publishes_every_directed_batch,
+        directed_input_without_a_runtime_placement_is_refused_at_admission,
+        archive_retire_publishes_its_ended_inputs_when_its_hook_fails,
+    );
+
+    /// Inputs a dropped-caller row queues.
+    const DROPPED_CALLER_INPUTS: usize = 3;
+
+    /// Run `operation` in a caller task until it parks at its first durable
+    /// commit on the host store, drop the caller there (as an RPC request
+    /// aborted after EOF or SIGTERM, an aborted mob task or a cancelled
+    /// schedule host drops it), then let the commit land.
+    async fn drop_the_caller_at_its_first_commit(
+        fixture: &Fixture,
+        operation: impl std::future::Future<Output = ()> + Send + 'static,
+    ) {
+        let host = fixture
+            .host
+            .as_ref()
+            .expect("the dropped-caller rows run on the host store realm");
+        let gate = Arc::new(Notify::new());
+        let started = host.commits_started.load(Ordering::Acquire);
+        *host
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+        let caller = tokio::spawn(operation);
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while host.commits_started.load(Ordering::Acquire) == started {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the operation reaches its durable commit");
+        caller.abort();
+        let dropped = caller.await;
+        assert!(
+            dropped
+                .as_ref()
+                .is_err_and(tokio::task::JoinError::is_cancelled),
+            "the caller is dropped while the commit is in flight: {dropped:?}"
+        );
+        *host
+            .commit_gate
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+        gate.notify_one();
+    }
+
+    /// After a dropped caller: every waiter got the operation's runtime
+    /// terminal, every input reached `reason`, the runtime is `state`, and
+    /// the registration is ready.
+    async fn assert_completed_after_the_dropped_caller(
+        fixture: &Fixture,
+        input_ids: &[InputId],
+        waiters: Vec<CompletionHandle>,
+        terminated: &str,
+        reason: InputAbandonReason,
+        state: RuntimeState,
+        context: &str,
+    ) {
+        let outcomes = fixture
+            .settle_within(waiters, context, Duration::from_secs(30))
+            .await;
+        assert_every_runtime_terminated(&outcomes, terminated, context);
+        fixture
+            .assert_every_terminal(input_ids, &abandoned(reason), context)
+            .await;
+        assert_eq!(
+            crate::traits::RuntimeControlPlane::runtime_state(
+                fixture.machine.as_ref(),
+                &fixture.runtime_id(),
+            )
+            .await
+            .expect("read the runtime state"),
+            state,
+            "{context}: the operation completed"
+        );
+        fixture.assert_ready(context).await;
+    }
+
+    /// A reset whose caller is dropped while its durable commit is in flight
+    /// completes all the same. RED while the reset ran in its caller's task:
+    /// the drop dropped its armed terminal transition, which marks the
+    /// registration reload-required, and nothing finished the reset.
+    #[tokio::test]
+    async fn a_reset_dropped_at_its_commit_completes() {
+        let fixture = Fixture::new(BoundStore::HostRealm).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture
+            .admit_backlog(DROPPED_CALLER_INPUTS, HandlingMode::Queue)
+            .await;
+        let machine = Arc::clone(&fixture.machine);
+        let runtime_id = fixture.runtime_id();
+        drop_the_caller_at_its_first_commit(&fixture, async move {
+            let _ = crate::traits::RuntimeControlPlane::reset(machine.as_ref(), &runtime_id).await;
+        })
+        .await;
+        assert_completed_after_the_dropped_caller(
+            &fixture,
+            &input_ids,
+            waiters,
+            "runtime reset",
+            InputAbandonReason::Reset,
+            RuntimeState::Idle,
+            "dropped reset",
+        )
+        .await;
+    }
+
+    /// A destroy whose caller is dropped while its durable commit is in
+    /// flight completes all the same. RED while the destroy ran in its
+    /// caller's task, as the reset.
+    #[tokio::test]
+    async fn a_destroy_dropped_at_its_commit_completes() {
+        let fixture = Fixture::new(BoundStore::HostRealm).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture
+            .admit_backlog(DROPPED_CALLER_INPUTS, HandlingMode::Queue)
+            .await;
+        let machine = Arc::clone(&fixture.machine);
+        let runtime_id = fixture.runtime_id();
+        drop_the_caller_at_its_first_commit(&fixture, async move {
+            let _ =
+                crate::traits::RuntimeControlPlane::destroy(machine.as_ref(), &runtime_id).await;
+        })
+        .await;
+        assert_completed_after_the_dropped_caller(
+            &fixture,
+            &input_ids,
+            waiters,
+            "runtime destroyed",
+            InputAbandonReason::Destroyed,
+            RuntimeState::Destroyed,
+            "dropped destroy",
+        )
+        .await;
+    }
+
+    /// A retire without a runtime loop whose caller is dropped while its
+    /// durable commit is in flight completes all the same. RED while the
+    /// retire ran in its caller's task: the drop left the session Retired in
+    /// memory with its pending inputs never ended and nothing marked.
+    #[tokio::test]
+    async fn a_loopless_retire_dropped_at_its_commit_completes() {
+        let fixture = Fixture::new(BoundStore::HostRealm).await;
+        fixture
+            .machine
+            .register_session(fixture.session_id.clone())
+            .await
+            .expect("register the session without a loop");
+        let (input_ids, waiters) = fixture
+            .admit_backlog(DROPPED_CALLER_INPUTS, HandlingMode::Queue)
+            .await;
+        let machine = Arc::clone(&fixture.machine);
+        let runtime_id = fixture.runtime_id();
+        drop_the_caller_at_its_first_commit(&fixture, async move {
+            let _ = crate::traits::RuntimeControlPlane::retire(machine.as_ref(), &runtime_id).await;
+        })
+        .await;
+        assert_completed_after_the_dropped_caller(
+            &fixture,
+            &input_ids,
+            waiters,
+            "retired without runtime loop",
+            InputAbandonReason::Retired,
+            RuntimeState::Retired,
+            "dropped loop-less retire",
+        )
+        .await;
+    }
+}
+
+/// An executor that serves nothing: every run applies empty, and its stop and
+/// cancel answer at once. With `reject_startup` it refuses the startup
+/// projection reconciliation every attachment runs, so its attachment fails
+/// before it serves.
+struct KeepRowExecutor {
+    reject_startup: bool,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for KeepRowExecutor {
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Ok(CoreApplyOutput::with_untyped_snapshot(
+            RunBoundaryReceiptDraft {
+                run_id,
+                boundary: primitive.apply_boundary(),
+                contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                conversation_digest: None,
+                message_count: 0,
+            },
+            None,
+            None,
+        ))
+    }
+
+    async fn reconcile_committed_compaction_projections(
+        &mut self,
+        _intents: &[meerkat_core::CompactionProjectionIntent],
+    ) -> Result<(), CoreExecutorError> {
+        if self.reject_startup {
+            return Err(CoreExecutorError::Internal(
+                "the executor refuses its startup projection recovery".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// The durable runtime state a crashed process leaves: its runtime registered
+/// the session and accepted a prompt no executor ran, so the prompt stays
+/// queued in the store. The returned runtime is that process's; a later
+/// runtime over the same store recovers the prompt when it registers the
+/// session.
+async fn a_crash_leaving_a_queued_prompt(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+) -> (Arc<MeerkatMachine>, InputId) {
+    let crashed = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(store), memory_blob_store())
+            .expect("the crashed process's runtime"),
+    );
+    crashed
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the crashed process registers the session");
+    let prompt = crate::input::Input::Prompt(crate::input::PromptInput::new(
+        "queued when the process stopped",
+        None,
+    ));
+    let prompt_id = prompt.id().clone();
+    let (accepted, _) = crashed
+        .accept_input_with_completion(session_id, prompt)
+        .await
+        .expect("the registration holds the prompt");
+    assert!(accepted.is_accepted(), "{accepted:?}");
+    (crashed, prompt_id)
+}
+
+/// Wait until `machine` no longer registers `session_id`: the rollback or
+/// abort under test finished its unregister.
+async fn wait_unregistered(machine: &MeerkatMachine, session_id: &SessionId) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while machine.contains_session(session_id).await {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the registration is unregistered");
+}
+
+/// The prompt's durable row is still queued with no terminal outcome and no
+/// requeue mark, exactly as the crash left it.
+async fn assert_prompt_kept(
+    store: &Arc<dyn crate::store::RuntimeStore>,
+    session_id: &SessionId,
+    prompt_id: &InputId,
+) {
+    let row = store
+        .load_input_state(&runtime_id_for_session(session_id), prompt_id)
+        .await
+        .expect("load the prompt's row")
+        .expect("the prompt's row stays durable");
+    assert_eq!(
+        (row.seed.phase, row.seed.terminal_outcome.clone()),
+        (crate::input_state::InputLifecycleState::Queued, None),
+        "the prompt the registration recovered stays queued for the next start: {:?}",
+        row.state.history
+    );
+    assert!(
+        row.state.stop_requeue.is_none(),
+        "kept as the store holds it, with no requeue mark"
+    );
+}
+
+/// A prepared materialization dropped while it still holds its registration
+/// (every `?` exit between preparation and commit) rolls the registration
+/// back with the keep: the prompt the registration recovered from the store
+/// stays queued for the next start. RED before: the drop's rollback stopped
+/// it.
+#[tokio::test]
+async fn a_dropped_prepared_materialization_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    let prepared = machine
+        .prepare_session_materialization(session_id.clone())
+        .await
+        .expect("the next start prepares the session");
+    drop(prepared);
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// A pending executor attachment aborted before it served unregisters with
+/// the keep its abort asks for: the prompt the registration recovered stays
+/// queued for the next start. RED before: an unserved attachment's
+/// unregister always stopped it.
+#[tokio::test]
+async fn an_aborted_pending_attachment_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let pending = match machine
+        .ensure_session_with_executor_factory(session_id.clone(), |_witness| {
+            Box::new(KeepRowExecutor {
+                reject_startup: false,
+            }) as Box<dyn CoreExecutor>
+        })
+        .await
+        .expect("the attachment is prepared")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("a fresh registration found a committed attachment {witness:?}")
+        }
+    };
+    pending
+        .abort()
+        .await
+        .expect("the pending attachment aborts");
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// An executor whose startup fails (it refuses the startup projection
+/// recovery) never serves: its startup owner aborts the attachment, which
+/// keeps the prompt the registration recovered for the next start. RED
+/// before: that abort stopped it.
+#[tokio::test]
+async fn a_failed_executor_startup_keeps_the_inputs_its_registration_recovered() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let refused = machine
+        .ensure_session_with_executor(
+            session_id.clone(),
+            Box::new(KeepRowExecutor {
+                reject_startup: true,
+            }),
+        )
+        .await
+        .expect_err("the executor's startup fails");
+    assert!(
+        refused
+            .to_string()
+            .contains("the executor refuses its startup projection recovery"),
+        "{refused}"
+    );
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+/// The control: a retire that meets a pending attachment still stops the
+/// inputs the registration recovered. Only the attachment's own abort or
+/// cleanup asks to keep them; the retire takes the registration's mutation
+/// gate in the window after the attachment's startup released it and before
+/// the attachment took it back, so it begins the unregister over the pending
+/// attachment with its own Stop.
+#[tokio::test]
+async fn a_retire_over_a_pending_attachment_still_stops_the_recovered_inputs() {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+    let (regate_reached_tx, regate_reached) = tokio::sync::oneshot::channel();
+    let (release_regate, release_regate_rx) = tokio::sync::oneshot::channel();
+    *machine
+        .test_pending_attachment_before_regate
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        Some((regate_reached_tx, release_regate_rx));
+    let ensure = tokio::spawn({
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            machine
+                .ensure_session_with_executor_factory(session_id, |_witness| {
+                    Box::new(KeepRowExecutor {
+                        reject_startup: false,
+                    }) as Box<dyn CoreExecutor>
+                })
+                .await
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(10), regate_reached)
+        .await
+        .expect("the attachment's startup releases the registration gate")
+        .expect("the regate hook reports");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.unregister_session(&session_id),
+    )
+    .await
+    .expect("the retire settles while the attachment is pending")
+    .expect("the retire unregisters the session");
+    let _ = release_regate.send(());
+    let ensured = tokio::time::timeout(Duration::from_secs(10), ensure)
+        .await
+        .expect("the attachment's owner returns")
+        .expect("the attachment's owner task joins");
+    assert!(
+        ensured.is_err(),
+        "the retired registration has no attachment to commit"
+    );
+    let row = store
+        .load_input_state(&runtime_id_for_session(&session_id), &prompt_id)
+        .await
+        .expect("load the prompt's row")
+        .expect("the prompt's row stays durable");
+    assert_eq!(
+        row.seed.terminal_outcome,
+        Some(crate::input_state::InputTerminalOutcome::Abandoned {
+            reason: crate::input_state::InputAbandonReason::Stopped
+        }),
+        "a retire over a pending attachment stops the recovered prompt: {:?}",
+        row.state.history
     );
 }

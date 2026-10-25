@@ -1180,7 +1180,7 @@ impl MeerkatMachine {
             .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))
     }
 
-    pub(super) async fn existing_session_runtime_state(
+    pub(crate) async fn existing_session_runtime_state(
         &self,
         session_id: &SessionId,
     ) -> Option<RuntimeState> {
@@ -2136,6 +2136,125 @@ impl MeerkatMachine {
         Ok(recovered_from_quiescent_archive)
     }
 
+    /// End, under `lease`, the work this session's runtime still keeps for a
+    /// later start, when the session's archive met a durable tail that its
+    /// recovery held beside that work; the archive then runs its recovery
+    /// once more. Returns the inputs it ended.
+    ///
+    /// The archive can run before any start registers the session's runtime
+    /// again: after a graceful stop that kept a durable run and requeued its
+    /// queued inputs, or after a crash. No live retire's quiesce has ended that
+    /// work then, so this ends it as the runtime ends work nothing resumes:
+    /// - the run the registration keeps resumable is settled as a stop
+    ///   settles a marked run: its bound inputs are abandoned as cancelled and
+    ///   their completion waiters failed;
+    /// - every queued input is cancelled as an exact cancellation cancels a
+    ///   queued input (the live retire's quiesce): abandoned as cancelled, with
+    ///   the interaction terminal outbox a runless cancellation records. A
+    ///   nondirected input's terminal batch is finalized and its waiters
+    ///   answered here; a directed input's publication is the archive's to
+    ///   converge, after it releases the lease.
+    ///
+    /// Every input commits through the lease's own driver. The recovery the
+    /// archive runs next finds them terminal, so its commit terminalizes
+    /// nothing this driver still holds, and the retire under the same lease
+    /// does not write over them. The runless-terminal hint is told when this returns,
+    /// while the archive still holds M: it is a pure signal to a delivery
+    /// owner, which waits for M if it needs it, and the terminals it
+    /// announces are durable by then.
+    pub async fn end_unresumed_work_with_archive_lease_before(
+        &self,
+        lease: &super::MachineSessionArchiveLease,
+        reason: &str,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<Vec<meerkat_core::lifecycle::InputId>, RuntimeControlPlaneError> {
+        use crate::input_state::{InputAbandonReason, InputLifecycleState};
+
+        let internal =
+            |error: RuntimeDriverError| RuntimeControlPlaneError::Internal(error.to_string());
+        // Owed after each committed terminal and told when this returns,
+        // a committed prefix included.
+        let mut runless_terminal = self.runless_terminal_announcement();
+        let mut ended = Vec::new();
+
+        let settled = {
+            let mut driver = lease.driver.lock().await;
+            match driver.resumable_run_id() {
+                Some(run_id) => driver
+                    .settle_resumable_run(&run_id, InputAbandonReason::Cancelled)
+                    .await
+                    .map_err(internal)?,
+                None => Vec::new(),
+            }
+        };
+        if !settled.is_empty() {
+            runless_terminal.owe();
+            lease.completions.lock().await.fail_inputs(
+                settled.iter().cloned(),
+                crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                    "the run these inputs were bound to ended with the archive of its session \
+                     before it resumed: {reason}"
+                )),
+            );
+            ended.extend(settled);
+        }
+
+        let queued: Vec<meerkat_core::lifecycle::InputId> = {
+            let driver = lease.driver.lock().await;
+            let runtime = driver.as_driver();
+            runtime
+                .active_input_ids()
+                .into_iter()
+                .filter(|input_id| {
+                    runtime
+                        .stored_input_state(input_id)
+                        .is_some_and(|stored| stored.seed.phase == InputLifecycleState::Queued)
+                })
+                .collect()
+        };
+        for input_id in queued {
+            let candidate_owner_input_id = {
+                let mut driver = lease.driver.lock().await;
+                let still_queued = driver
+                    .as_driver()
+                    .stored_input_state(&input_id)
+                    .is_some_and(|stored| stored.seed.phase == InputLifecycleState::Queued);
+                if !still_queued {
+                    continue;
+                }
+                let prepared = driver
+                    .prepare_sole_runless_runtime_termination(&input_id, reason.to_string())
+                    .map_err(internal)?;
+                if let Err(error) = driver
+                    .abandon_queued_input(&input_id, InputAbandonReason::Cancelled)
+                    .await
+                {
+                    driver.rollback_prepared_sole_runless_termination(prepared);
+                    return Err(internal(error));
+                }
+                runless_terminal.owe();
+                crate::meerkat_machine::driver::DriverEntry::commit_prepared_sole_runless_termination(
+                    prepared,
+                )
+            };
+            if candidate_owner_input_id.is_none() {
+                crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                    &lease.driver,
+                    Some(&lease.completions),
+                    None,
+                    std::slice::from_ref(&input_id),
+                    None,
+                    reason,
+                    Some(deadline),
+                )
+                .await
+                .map_err(internal)?;
+            }
+            ended.push(input_id);
+        }
+        Ok(ended)
+    }
+
     /// Archive-only sibling that supplies an owned, quiescent stored-session
     /// publisher when the restarted runtime has no attached executor. The
     /// lease-retained live publisher always wins when present.
@@ -2323,19 +2442,18 @@ impl MeerkatMachine {
             _live_lifecycle_lease: live_lifecycle_lease,
             _mutation_guard: mutation_guard,
         };
-        let result = self
-            .realize_retire_with_archive_lease_announcing(
-                lease,
-                None,
-                deadline,
-                None,
-                &[],
-                &mut runless_terminal,
-            )
-            .await
-            .map(|(report, _)| report);
-        drop(direct_member_slot_guard);
-        result.map_err(super::DirectMemberRetireError::Runtime)
+        self.realize_retire_with_archive_lease_announcing(
+            lease,
+            None,
+            deadline,
+            None,
+            &[],
+            &mut runless_terminal,
+            direct_member_slot_guard,
+        )
+        .await
+        .map(|(report, _)| report)
+        .map_err(super::DirectMemberRetireError::Runtime)
     }
 
     /// [`Self::realize_retire_with_archive_lease_announcing`] that tells the
@@ -2365,6 +2483,7 @@ impl MeerkatMachine {
             post_commit_hook,
             archive_handoffs,
             &mut runless_terminal,
+            None,
         )
         .await
     }
@@ -2372,7 +2491,64 @@ impl MeerkatMachine {
     /// Realize Retire under `lease`, owing `runless_terminal` the inputs it
     /// abandons. The caller took the announcement before every guard it holds
     /// around this realization, so that it is told after them.
+    ///
+    /// The lease holds M, the registration transaction and the live lifecycle
+    /// lease, so from here the retire changes the session: it runs in one
+    /// task that owns the lease, `retained_guard` (a guard the caller holds
+    /// around the whole retire) and the announcement, so a caller dropped
+    /// mid-await only detaches it, and the retire commits and publishes, or
+    /// fails typed, as a whole. The task hands the announcement back to a
+    /// caller that still waits, so it is told after the caller's guards; a
+    /// dropped caller's is told once the task ends, after M is released.
+    #[allow(clippy::too_many_arguments)]
     async fn realize_retire_with_archive_lease_announcing(
+        &self,
+        lease: super::MachineSessionArchiveLease,
+        archive_publication_handle: Option<
+            Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        >,
+        deadline: Option<meerkat_core::time_compat::Instant>,
+        post_commit_hook: Option<Arc<dyn super::MachineSessionArchivePostCommitHook>>,
+        archive_handoffs: &[crate::meerkat_machine_types::CommittedModelRoutingHandoff],
+        runless_terminal: &mut super::RunlessTerminalAnnouncement,
+        retained_guard: Option<crate::tokio::sync::OwnedMutexGuard<()>>,
+    ) -> Result<
+        (
+            RetireReport,
+            Vec<meerkat_core::image_generation::SwitchTurnRequestId>,
+        ),
+        RuntimeControlPlaneError,
+    > {
+        let machine = self.clone();
+        let archive_handoffs = archive_handoffs.to_vec();
+        let announcement = std::mem::take(runless_terminal);
+        let retirement = crate::tokio::spawn(async move {
+            let mut announcement = announcement;
+            let result = machine
+                .realize_retire_owning_lease(
+                    lease,
+                    archive_publication_handle,
+                    deadline,
+                    post_commit_hook,
+                    &archive_handoffs,
+                    &mut announcement,
+                )
+                .await;
+            drop(retained_guard);
+            (result, announcement)
+        });
+        let (result, announcement) = retirement.await.map_err(|error| {
+            RuntimeControlPlaneError::Internal(format!(
+                "the runtime retire task ended before it answered: {error}"
+            ))
+        })?;
+        *runless_terminal = announcement;
+        result
+    }
+
+    /// The body of [`Self::realize_retire_with_archive_lease_announcing`], in
+    /// the task that owns the lease.
+    async fn realize_retire_owning_lease(
         &self,
         lease: super::MachineSessionArchiveLease,
         archive_publication_handle: Option<
@@ -2412,6 +2588,17 @@ impl MeerkatMachine {
             "MeerkatMachine::retire_runtime_control_plane start"
         );
 
+        // An input that a store-owned durable-tail recovery consumed outside
+        // this driver is not pending work. Adopt that terminal before the
+        // retire counts what is pending, so neither a runtime loop's drain
+        // nor the sweep below abandons it over the consumed row.
+        driver
+            .lock()
+            .await
+            .adopt_durable_consumed_inputs(Some(&completions))
+            .await
+            .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
+
         let staged_dsl = self
             .stage_session_dsl_transition(
                 &session_id,
@@ -2424,7 +2611,23 @@ impl MeerkatMachine {
             .map_err(RuntimeControlPlaneError::Internal)?;
 
         let mut drv = driver.lock().await;
-        let mut report = match Box::pin(machine_retire(&mut drv)).await {
+        // A run the session left open never resumes past a retire: its mark
+        // ends with the retire, and the retire's sweep settles its bound
+        // inputs with the rest. A failed retire restores the staged state,
+        // the mark with it.
+        let ended_run = drv.resumable_run_id();
+        let retire_result = match ended_run.as_ref() {
+            Some(run_id) => {
+                match drv
+                    .end_resumable_run(run_id, &crate::input_state::InputAbandonReason::Retired)
+                {
+                    Ok(()) => Box::pin(machine_retire(&mut drv)).await,
+                    Err(error) => Err(error),
+                }
+            }
+            None => Box::pin(machine_retire(&mut drv)).await,
+        };
+        let mut report = match retire_result {
             Ok(report) => report,
             Err(err) => {
                 drop(drv);
@@ -2467,64 +2670,129 @@ impl MeerkatMachine {
             commit_error = Some(reason);
         }
 
+        // The inputs the run this retire ended still holds (staged for it, or
+        // applied by one of its committed rounds) never finish: the run does
+        // not resume past the retire, and the retired drain runs only queued
+        // inputs. They end here, as one runless runtime termination, the way
+        // a retire without a runtime loop ends its pending inputs; queued
+        // inputs keep the drain.
+        //
+        // They are the inputs the run's agreeing cursor binds. A run is kept
+        // resumable only from a tail the classifier reads as continuable,
+        // which needs the run cursor to agree with the tail, and its
+        // registration kept bound only the inputs that cursor binds; any other
+        // input that names the run recovered as for a run nothing resumes
+        // (requeued, or consumed by its committed receipt). A tail whose
+        // cursor disagrees or is unreadable keeps no run resumable, so the
+        // retire ends nothing here and takes its path as before.
+        // From the durable retire on, a failed step is recorded, not
+        // returned: the inputs this retire durably ends are published from
+        // that durable outcome whatever a later step does, and the first
+        // error is the retire's answer once they are. A failed step skips
+        // the steps that would change the session after it, as returning
+        // did.
+        let mut step_error: Option<RuntimeControlPlaneError> = None;
+        let mut ended_run_batch = None;
+        if let Some(run_id) = ended_run.as_ref() {
+            let reason = "retired with the resumable run it ended";
+            let mut drv = driver.lock().await;
+            let held = drv.ended_resumable_run_kept_inputs(run_id);
+            if !held.is_empty() {
+                match drv.prepare_runless_runtime_terminated_interaction_outboxes(
+                    &held,
+                    reason.to_string(),
+                ) {
+                    Err(error) => {
+                        step_error = Some(RuntimeControlPlaneError::Internal(error.to_string()));
+                    }
+                    Ok(prepared) => match drv
+                        .abandon_inputs(&held, crate::input_state::InputAbandonReason::Retired)
+                        .await
+                    {
+                        Err(error) => {
+                            drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                            step_error =
+                                Some(RuntimeControlPlaneError::Internal(error.to_string()));
+                        }
+                        Ok(abandoned) => {
+                            if abandoned > 0 {
+                                runless_terminal.owe();
+                            }
+                            let terminal_batches = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+                            report.inputs_abandoned += abandoned;
+                            report.inputs_pending_drain =
+                                report.inputs_pending_drain.saturating_sub(abandoned);
+                            ended_run_batch = Some((terminal_batches, reason));
+                        }
+                    },
+                }
+            }
+        }
+
         let mut abandoned_batch = None;
-        if report.inputs_pending_drain > 0 {
-            let woke_runtime = if let Some(ref tx) = wake_tx {
-                tx.send(()).await.is_ok()
-            } else {
-                false
-            };
+        if step_error.is_none() && report.inputs_pending_drain > 0 {
+            // Retire holds M here, and the runtime loop takes M to process
+            // each wake, so it never waits for room on the loop's bounded
+            // wake channel: a full channel already holds a wake the loop will
+            // run the drain on. Only a closed channel means no loop.
+            let woke_runtime = wake_tx.as_ref().is_some_and(|tx| {
+                matches!(
+                    tx.try_send(()),
+                    Ok(()) | Err(mpsc::error::TrySendError::Full(()))
+                )
+            });
             if !woke_runtime {
                 let reason = "retired without runtime loop";
-                let (abandoned, completion_input_ids, candidate_owner_input_id) = {
-                    let mut drv = driver.lock().await;
-                    let completion_input_ids = drv.as_driver().active_input_ids();
-                    let prepared = drv
-                        .prepare_runless_runtime_terminated_interaction_outboxes(
-                            &completion_input_ids,
-                            reason.to_string(),
-                        )
-                        .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-                    let abandoned = match drv
+                let mut drv = driver.lock().await;
+                let completion_input_ids = drv.as_driver().active_input_ids();
+                match drv.prepare_runless_runtime_terminated_interaction_outboxes(
+                    &completion_input_ids,
+                    reason.to_string(),
+                ) {
+                    Err(error) => {
+                        step_error = Some(RuntimeControlPlaneError::Internal(error.to_string()));
+                    }
+                    Ok(prepared) => match drv
                         .abandon_pending_inputs(crate::input_state::InputAbandonReason::Retired)
                         .await
                     {
-                        Ok(abandoned) => abandoned,
                         Err(error) => {
                             drv.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
-                            return Err(RuntimeControlPlaneError::Internal(error.to_string()));
+                            step_error =
+                                Some(RuntimeControlPlaneError::Internal(error.to_string()));
                         }
-                    };
-                    if abandoned > 0 {
-                        runless_terminal.owe();
-                    }
-                    let candidate_owner_input_id = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
-                    (abandoned, completion_input_ids, candidate_owner_input_id)
-                };
-                report.inputs_abandoned += abandoned;
-                report.inputs_pending_drain = 0;
-                abandoned_batch = Some((completion_input_ids, candidate_owner_input_id, reason));
+                        Ok(abandoned) => {
+                            if abandoned > 0 {
+                                runless_terminal.owe();
+                            }
+                            let terminal_batches = crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+                            report.inputs_abandoned += abandoned;
+                            report.inputs_pending_drain = 0;
+                            abandoned_batch = Some((terminal_batches, reason));
+                        }
+                    },
+                }
             }
         }
 
         let dispatch = match retained_publication_handle {
-            Some(publication_handle) => {
-                let (result_rx, start_tx) = self
-                    .prepare_runless_terminal_publication_dispatch(
-                        &driver,
-                        &completions,
-                        &mutation_gate_identity,
-                        publication_handle,
-                    )
-                    .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-                Some((result_rx, start_tx))
-            }
+            Some(publication_handle) => match self.prepare_runless_terminal_publication_dispatch(
+                &driver,
+                &completions,
+                &mutation_gate_identity,
+                publication_handle,
+            ) {
+                Ok(dispatch) => Some(dispatch),
+                Err(error) => {
+                    step_error.get_or_insert(RuntimeControlPlaneError::Internal(error.to_string()));
+                    None
+                }
+            },
             None => None,
         };
 
-        if let Some(reason) = commit_error {
-            return Err(RuntimeControlPlaneError::Internal(reason));
-        }
+        let mut first_error =
+            step_error.or_else(|| commit_error.map(RuntimeControlPlaneError::Internal));
 
         // The durable runtime terminal is committed. Only now may generated
         // authority terminalize an unresolved committed handoff: running it
@@ -2532,15 +2800,22 @@ impl MeerkatMachine {
         // request if any later archive step failed. The registration is still
         // present here (it is removed below), so generated authority is
         // reachable for exactly this window.
-        let archived_model_routing_handoffs = if archive_handoffs.is_empty() {
-            Vec::new()
-        } else {
-            self.archive_unresolved_model_routing_handoffs_inner(&session_id, archive_handoffs)
-                .await?
-        };
+        let mut archived_model_routing_handoffs = Vec::new();
+        if first_error.is_none() && !archive_handoffs.is_empty() {
+            match self
+                .archive_unresolved_model_routing_handoffs_inner(&session_id, archive_handoffs)
+                .await
+            {
+                Ok(archived) => archived_model_routing_handoffs = archived,
+                Err(error) => first_error = Some(error),
+            }
+        }
 
-        if let Some(hook) = post_commit_hook {
-            hook.after_runtime_retire_commit().await?;
+        if first_error.is_none()
+            && let Some(hook) = post_commit_hook
+            && let Err(error) = hook.after_runtime_retire_commit().await
+        {
+            first_error = Some(error);
         }
 
         drop(mutation_guard);
@@ -2549,60 +2824,75 @@ impl MeerkatMachine {
         #[cfg(not(feature = "live"))]
         let _ = live_lifecycle_lease;
         drop(registration_transaction_guard);
-        if recovered_registration_for_archive {
-            self.remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
-                .await?;
+        if first_error.is_none()
+            && recovered_registration_for_archive
+            && let Err(error) = self
+                .remove_archive_recovered_registration_exact(&session_id, &runtime_id, &driver)
+                .await
+        {
+            first_error = Some(error);
         }
 
-        if let Some((result_rx, start_tx)) = dispatch {
+        // The dispatch publishes every committed directed batch with its
+        // nondirected siblings; its start permit is sent before anything is
+        // awaited. A batch with no directed recipient has no outbox, so
+        // neither the dispatch nor the convergence ever resolves it: it is
+        // resolved before either is awaited, so a directed publication that
+        // fails or outlives the deadline still leaves its waiters answered.
+        // The first error is returned once both are done.
+        let dispatch = dispatch.map(|(result_rx, start_tx)| {
             if let Some(start_tx) = start_tx {
                 let _ = start_tx.send(());
             }
-            self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
+            result_rx
+        });
+        let mut nondirected_result: Result<(), RuntimeDriverError> = Ok(());
+        for (terminal_batches, reason) in [ended_run_batch, abandoned_batch].into_iter().flatten() {
+            let nondirected = terminal_batches
+                .into_iter()
+                .filter(|batch| !batch.is_directed())
+                .collect::<Vec<_>>();
+            let published =
+                crate::control_plane::publish_and_resolve_runless_runtime_terminations_before(
+                    &driver,
+                    Some(&completions),
+                    None,
+                    &nondirected,
+                    reason,
+                    deadline,
+                )
+                .await;
+            nondirected_result = nondirected_result.and(published);
+        }
+        let directed_result = match dispatch {
+            Some(result_rx) => {
+                self.await_runless_terminal_publication_dispatch(&runtime_id, result_rx, deadline)
+                    .await
+            }
+            None => {
+                crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+                    &driver,
+                    Some(&completions),
+                    None,
+                    deadline,
+                )
                 .await
-                .map_err(|error| match error {
-                    RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
-                        RuntimeControlPlaneError::RetirementInProgress {
-                            runtime_id: runtime_id.clone(),
-                            stage: "terminal_publication".to_string(),
-                        }
-                    }
-                    other => RuntimeControlPlaneError::Internal(other.to_string()),
-                })?;
-        } else {
-            crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
-                &driver,
-                Some(&completions),
-                None,
-                deadline,
-            )
-            .await
-            .map_err(|error| match error {
-                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
-                    RuntimeControlPlaneError::RetirementInProgress {
-                        runtime_id: runtime_id.clone(),
-                        stage: "terminal_publication".to_string(),
-                    }
+            }
+        };
+        if let Some(error) = first_error {
+            return Err(error);
+        }
+        directed_result.map_err(|error| match error {
+            RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. } => {
+                RuntimeControlPlaneError::RetirementInProgress {
+                    runtime_id: runtime_id.clone(),
+                    stage: "terminal_publication".to_string(),
                 }
-                other => RuntimeControlPlaneError::Internal(other.to_string()),
-            })?;
-        }
-
-        if let Some((completion_input_ids, candidate_owner_input_id, reason)) = abandoned_batch
-            && candidate_owner_input_id.is_none()
-        {
-            crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
-                &driver,
-                Some(&completions),
-                None,
-                &completion_input_ids,
-                None,
-                reason,
-                deadline,
-            )
-            .await
+            }
+            other => RuntimeControlPlaneError::Internal(other.to_string()),
+        })?;
+        nondirected_result
             .map_err(|error| RuntimeControlPlaneError::Internal(error.to_string()))?;
-        }
         Ok((report, archived_model_routing_handoffs))
     }
 }
@@ -3023,10 +3313,7 @@ mod tests {
     ) {
         let mut driver = driver.lock().await;
         let prepared = driver
-            .prepare_runless_runtime_terminated_interaction_outboxes(
-                std::slice::from_ref(input_id),
-                reason.to_string(),
-            )
+            .prepare_sole_runless_runtime_termination(input_id, reason.to_string())
             .expect("prepare exact dispatch outbox");
         if abandon_active_inputs {
             driver
@@ -3035,7 +3322,7 @@ mod tests {
                 .expect("abandon dispatch inputs before committing terminal outbox");
         }
         assert_eq!(
-            DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+            DriverEntry::commit_prepared_sole_runless_termination(prepared),
             Some(input_id.clone())
         );
     }

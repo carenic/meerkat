@@ -70,10 +70,12 @@ impl RunlessTerminalConvergenceError {
             | RuntimeDriverError::LiveContextBarrierRevoked { .. }
             | RuntimeDriverError::ServedElsewhere { .. }
             | RuntimeDriverError::HostingUnavailable { .. }
+            | RuntimeDriverError::DurableResumeHeld { .. }
             | RuntimeDriverError::StaleAuthority { .. }) => Self::StaleAuthority { context, error },
             // A receipt-less terminal is a legitimate read verdict, but a
             // runless terminal convergence expects the receipt it staged.
             error @ (RuntimeDriverError::ValidationFailed { .. }
+            | RuntimeDriverError::QueuedInputsRefused(_)
             | RuntimeDriverError::ScopedContextGenerationNotAdvanced { .. }
             | RuntimeDriverError::InputRefused { .. }
             | RuntimeDriverError::RetainedResumeRefused { .. }
@@ -238,36 +240,92 @@ fn spawn_nondirected_runless_terminal_handoff(
     })
 }
 
-/// Publish one already-committed runless runtime-termination batch and only
-/// then deliver the same generated decision to its completion waiters.
-///
-/// `completion_input_ids` is the exact full recipient set, including
-/// nondirected siblings. Interaction events are emitted only for the directed
-/// subset represented by durable outboxes. A missing publisher is therefore a
-/// hard failure only when that subset is nonempty; the outboxes remain the
-/// recovery anchor and no waiter is resolved ahead of publication.
-pub(crate) async fn publish_and_resolve_runless_runtime_termination(
+/// Publish and resolve every batch one runless runtime termination
+/// committed, with no deadline
+/// ([`publish_and_resolve_runless_runtime_terminations_before`]).
+pub(crate) async fn publish_and_resolve_runless_runtime_terminations(
     driver: &SharedDriver,
     completions: Option<&SharedCompletionRegistry>,
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
-    completion_input_ids: &[meerkat_core::lifecycle::InputId],
-    candidate_owner_input_id: Option<&meerkat_core::lifecycle::InputId>,
+    batches: &[crate::meerkat_machine::driver::RunlessTerminalBatch],
     reason: &str,
 ) -> Result<(), RuntimeDriverError> {
-    publish_and_resolve_runless_runtime_termination_before(
+    publish_and_resolve_runless_runtime_terminations_before(
         driver,
         completions,
         publication_handle,
-        completion_input_ids,
-        candidate_owner_input_id,
+        batches,
         reason,
         None,
     )
     .await
 }
 
-/// Request-bounded publication of one already-committed runless terminal.
-/// A deadline error leaves the durable outbox as the exact retry authority.
+/// Publish and resolve every batch one runless runtime termination
+/// committed, as [`publish_and_resolve_runless_runtime_termination_before`]
+/// does for one. A termination of more inputs than one terminal-completion
+/// batch names commits several batches. Every nondirected batch's waiter
+/// handoff is spawned before the first await, as for a single batch, so a
+/// dropped caller cannot lose a recipient list; every batch is attempted,
+/// and the first error is returned. A directed batch that fails keeps its
+/// durable outbox as the exact retry authority.
+pub(crate) async fn publish_and_resolve_runless_runtime_terminations_before(
+    driver: &SharedDriver,
+    completions: Option<&SharedCompletionRegistry>,
+    publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    batches: &[crate::meerkat_machine::driver::RunlessTerminalBatch],
+    reason: &str,
+    publication_deadline: Option<Instant>,
+) -> Result<(), RuntimeDriverError> {
+    let nondirected = batches
+        .iter()
+        .filter(|batch| !batch.is_directed() && !batch.input_ids().is_empty())
+        .map(|batch| {
+            spawn_nondirected_runless_terminal_handoff(
+                driver.clone(),
+                completions.cloned(),
+                batch.input_ids().to_vec(),
+                reason.to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let mut first_error = None;
+    for batch in batches.iter().filter(|batch| batch.is_directed()) {
+        if let Err(error) = publish_and_resolve_runless_runtime_termination_before(
+            driver,
+            completions,
+            publication_handle,
+            batch.input_ids(),
+            batch.candidate_owner_input_id(),
+            reason,
+            publication_deadline,
+        )
+        .await
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    for handoff in nondirected {
+        if let Err(error) =
+            await_runless_terminal_handoff(handoff, "nondirected runtime-terminal waiter").await
+        {
+            first_error.get_or_insert(error);
+        }
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
+/// Publish one already-committed runless runtime-termination batch and only
+/// then deliver the same generated decision to its completion waiters.
+///
+/// `completion_input_ids` is the batch's exact full recipient set, including
+/// nondirected siblings. Interaction events are emitted only for the directed
+/// subset represented by durable outboxes. A missing publisher is therefore a
+/// hard failure only when that subset is nonempty; the outboxes remain the
+/// recovery anchor and no waiter is resolved ahead of publication.
+///
+/// Request-bounded: a deadline error leaves the durable outbox as the exact
+/// retry authority.
 pub(crate) async fn publish_and_resolve_runless_runtime_termination_before(
     driver: &SharedDriver,
     completions: Option<&SharedCompletionRegistry>,
@@ -667,43 +725,111 @@ pub(crate) async fn terminalize_async_stop_once(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
-    let (completion_input_ids, candidate_owner_input_id, termination_reason) = {
+    let (settled_resumable_input_ids, terminal_batches, requeued_input_ids, termination_reason) = {
         let mut driver = driver.lock().await;
-        let completion_input_ids = driver.as_driver().active_input_ids();
+        // Inputs a store-owned durable-tail recovery consumed are not
+        // pending: adopt them before this stop names its batch.
+        driver.adopt_durable_consumed_inputs(completions).await?;
+        // A run the session left open and has not resumed ends with the stop,
+        // as an in-flight run does: its bound inputs are abandoned as
+        // cancelled and its mark ends, before the stop classifies the rest. A
+        // graceful unregister that keeps queued work keeps that run too: the
+        // next registration finds it open again.
+        let settled_resumable_input_ids = match driver.resumable_run_id() {
+            Some(run_id) if !driver.stop_keeps_queued_work() => {
+                let settled = driver
+                    .settle_resumable_run(
+                        &run_id,
+                        crate::input_state::InputAbandonReason::Cancelled,
+                    )
+                    .await?;
+                // Its provisional tail is repaired as an interrupted run,
+                // after the abandonment committed: every committed round
+                // stays. A tail the repair leaves standing is the next
+                // registration's recovery's to repair, before anything
+                // serves.
+                if let Some(session_id) = driver.session_id() {
+                    driver.repair_settled_run_tail(&session_id, &run_id).await;
+                }
+                settled
+            }
+            _ => Vec::new(),
+        };
+        if !settled_resumable_input_ids.is_empty() {
+            runless_terminal.owe();
+        }
+        let active_input_ids = driver.as_driver().active_input_ids();
         let termination_reason = generated_runtime_termination_reason(&driver).to_string();
-        let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
-            &completion_input_ids,
-            termination_reason.clone(),
-        )?;
         // `Stopped` must still replay RuntimeExecutorExited so an interrupted
         // terminalization can idempotently repair cleanup facts. `Destroyed`
         // is different: Destroy already committed the absorbing DSL terminal
         // while the executor stop hook was in flight, and the machine
         // intentionally has no RuntimeExecutorExited transition from it.
-        if driver.runtime_state() != crate::RuntimeState::Destroyed {
-            if let Err(error) = machine_stop_runtime(&mut driver).await {
+        let stops = driver.runtime_state() != crate::RuntimeState::Destroyed;
+        // The inputs the stop keeps queued for the next start are not
+        // terminal, so they get no runless carrier and are not in its batch.
+        // The generated classifier names them before anything is staged; the
+        // stop checks it gives the same verdicts after the executor's exit.
+        let retained_input_ids = if stops {
+            driver.stop_retained_input_ids(&active_input_ids)?
+        } else {
+            Vec::new()
+        };
+        let completion_input_ids: Vec<meerkat_core::lifecycle::InputId> = active_input_ids
+            .into_iter()
+            .filter(|input_id| !retained_input_ids.contains(input_id))
+            .collect();
+        let prepared = driver.prepare_runless_runtime_terminated_interaction_outboxes(
+            &completion_input_ids,
+            termination_reason.clone(),
+        )?;
+        let mut requeued_input_ids = Vec::new();
+        if stops {
+            if let Err(error) = machine_stop_runtime(&mut driver, &retained_input_ids).await {
                 driver.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
                 return Err(error);
             }
+            // Their waiters get the requeued answer instead of a terminal.
+            requeued_input_ids = driver
+                .stop_requeued_inputs()
+                .into_iter()
+                .filter(|(input_id, _)| retained_input_ids.contains(input_id))
+                .collect();
             if !completion_input_ids.is_empty() {
                 runless_terminal.owe();
             }
         }
-        let candidate_owner_input_id =
+        let terminal_batches =
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
         (
-            completion_input_ids,
-            candidate_owner_input_id,
+            settled_resumable_input_ids,
+            terminal_batches,
+            requeued_input_ids,
             termination_reason,
         )
     };
 
-    publish_and_resolve_runless_runtime_termination(
+    if let Some(completions) = completions {
+        let mut completions = completions.lock().await;
+        completions.fail_inputs(
+            settled_resumable_input_ids,
+            crate::completion::CompletionWaitError::AuthorityUnavailable(format!(
+                "the run these inputs were bound to ended with the stop before it resumed: {termination_reason}"
+            )),
+        );
+        for (input_id, stopped_at) in requeued_input_ids {
+            completions.fail_inputs(
+                [input_id],
+                crate::completion::CompletionWaitError::RequeuedAcrossStop { stopped_at },
+            );
+        }
+    }
+
+    publish_and_resolve_runless_runtime_terminations(
         driver,
         completions,
         publication_handle,
-        &completion_input_ids,
-        candidate_owner_input_id.as_ref(),
+        &terminal_batches,
         &termination_reason,
     )
     .await
@@ -1709,12 +1835,12 @@ mod tests {
         );
         let mut driver_entry = DriverEntry::Ephemeral(raw_driver);
         let prepared = driver_entry
-            .prepare_runless_runtime_terminated_interaction_outboxes(
-                std::slice::from_ref(&directed_input_id),
+            .prepare_sole_runless_runtime_termination(
+                &directed_input_id,
                 "runtime stopped".to_string(),
             )
             .expect("stage runless outbox before lifecycle commit");
-        DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared)
+        DriverEntry::commit_prepared_sole_runless_termination(prepared)
             .expect("directed staging should mint a carrier owner");
         assert_eq!(driver_entry.runtime_state(), crate::RuntimeState::Attached);
         let driver = Arc::new(crate::tokio::sync::Mutex::new(driver_entry));
@@ -2115,8 +2241,10 @@ mod tests {
                 .prepare_runless_runtime_terminated_interaction_outboxes(input_ids, reason.clone())
                 .expect("unrelated runless batch should stage independently");
             owners.push(
-                DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared)
-                    .expect("directed batch has a candidate owner"),
+                crate::meerkat_machine::driver::RunlessTerminalBatch::only_batch_owner_for_test(
+                    DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+                )
+                .expect("directed batch has a candidate owner"),
             );
         }
         assert_ne!(owners[0], owners[1]);
@@ -2128,7 +2256,9 @@ mod tests {
             )
             .expect("exact retry should select its existing batch");
         assert_eq!(
-            DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(exact_retry),
+            crate::meerkat_machine::driver::RunlessTerminalBatch::only_batch_owner_for_test(
+                DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(exact_retry),
+            ),
             Some(owners[0].clone())
         );
 

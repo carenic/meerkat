@@ -54,6 +54,9 @@
 // so no pull request fits the 20-minute cap from the start of the pre-push
 // hook to a green CI gate with them. The plan lists what a pull request left
 // to the push (deferred_to_push), and the push plan runs all of it.
+// The workspace rustdoc (`doc --workspace --no-deps` with rustdoc's lints
+// denied) is left to the push the same way: it documents meerkat-mob and
+// every crate built on it.
 //
 // A push runs no unit lane of its own: the rows a pull request's unit lane
 // would run (the same shards, so the same `-p` sets, because Cargo unifies
@@ -138,10 +141,17 @@
 // current estimates require comparison with hosted results. On d1dda1482 the
 // runtime unit lane models 15.1 minutes, not a measured completion guarantee.
 // The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
-// surrogate packing cap and not a measured timing. It is 18, the gate's lane
-// execution budget, since the runtime lane modelled 17.1 minutes while its
-// measured runs took 6-12 minutes (pull-request runs 39337274765, 39360046041,
-// 39388235216 and 39394366439: 684, 693, 715 and 359 s).
+// surrogate packing cap and not a measured timing. It is 20, since the
+// runtime lane models 18.3 minutes at 8ef2d8b939 (17.1 when the cap became
+// 18). Measured, the runtime lane alone took 790 and 839 s on the last two
+// green release pull-request runs (40055499505 and 40073579948), about 0.78
+// of its modelled time at a model of about 18 minutes; earlier pull-request
+// runs took 359-715 s (39337274765, 39360046041, 39388235216 and
+// 39394366439). At that ratio the heaviest lane the 20-minute cap packs at
+// 8ef2d8b939 (runtime+3, modelled 19.5) projects to about 915-945 s of
+// execution path, under the gate's 1080 s. The cap sits above the gate's
+// 18-minute execution budget because it is a model threshold; the gate
+// itself is unchanged.
 // The enforced limits are the CI gate's: 1080 s of lane execution and 1200 s
 // push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
 // CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
@@ -282,7 +292,7 @@ const NULL_SHA = "0000000000000000000000000000000000000000";
 const LINK_COST_PER_DEP = 8000;
 const COST_UNITS_PER_MINUTE = 35000;
 const LANE_SETUP_MINUTES = 1;
-export const PR_UNIT_BUDGET_MINUTES = 18;
+export const PR_UNIT_BUDGET_MINUTES = 20;
 // Packages whose unit tests run long get a unit lane of their own, so their
 // test time does not stack on other crates' builds; the line-and-closure
 // model counts only the build. xtask's lib and bin tests (the governance
@@ -2217,6 +2227,7 @@ function plan(args) {
   const deferred = {
     closure_test_rows: 0,
     closure_check: false,
+    rustdoc: false,
     feature_check_jobs: 0,
     integration_suites: [],
     unit_feature_suites: [],
@@ -2516,12 +2527,40 @@ function plan(args) {
     : changed === null
       ? Object.keys(GUARD_LANE_DEFINITIONS)
       : changedGuardDefinitions(args, changedPaths);
-  const guardRuns = (lane) =>
-    !deferToPush || touchesGuardLane(lane, changedPaths) || result.guard_definitions_changed.includes(lane);
+  // Why each exact-profile lane runs, typed: the one predicate that plans
+  // the lane, so a lane runs exactly when it has a reason. The CI gate reads
+  // the reasons for its pull-request budget, which leaves out a lane that
+  // runs only because the change touches its inputs (inputs_changed) or
+  // changes its definition (definition_changed): its own cold build takes
+  // 27-33 minutes (ci.yml's mcp-confinement-positive job), and the gate names
+  // it in a warning instead. Every other reason keeps the lane in the
+  // budget: a plan that runs it on every Rust change (every_rust_change: a
+  // push, a dispatch or a release projection), and a pull request whose diff
+  // is unknown (diff_unknown), where any definition only may have changed;
+  // that plan carries no other reason.
+  const guardReasons = (lane) => {
+    if (!result.rust_changed) return [];
+    if (!deferToPush) return ["every_rust_change"];
+    if (changed === null) return ["diff_unknown"];
+    return [
+      ...(result.guard_definitions_changed.includes(lane) ? ["definition_changed"] : []),
+      ...(touchesGuardLane(lane, changedPaths) ? ["inputs_changed"] : []),
+    ];
+  };
+  result.guard_lane_reasons = Object.fromEntries(
+    Object.keys(GUARD_LANE_DEFINITIONS)
+      .map((lane) => [lane, guardReasons(lane)])
+      .filter(([, reasons]) => reasons.length > 0),
+  );
+  const guardRuns = (lane) => Object.hasOwn(result.guard_lane_reasons, lane);
   result.closure_check = result.rust_changed && !deferToPush;
-  result.governed_jsonl = result.rust_changed && guardRuns("governed_jsonl");
-  result.mcp_confinement_positive = result.rust_changed && guardRuns("mcp_confinement_positive");
+  // Every crate's documentation, with rustdoc's lints denied: the push
+  // runs it on a Rust change, like the closure check.
+  result.rustdoc = result.rust_changed && !deferToPush;
+  result.governed_jsonl = guardRuns("governed_jsonl");
+  result.mcp_confinement_positive = guardRuns("mcp_confinement_positive");
   deferred.closure_check = result.rust_changed && deferToPush;
+  deferred.rustdoc = result.rust_changed && deferToPush;
   deferred.governed_jsonl = result.rust_changed && !result.governed_jsonl;
   deferred.mcp_confinement_positive = result.rust_changed && !result.mcp_confinement_positive;
 
@@ -2787,6 +2826,7 @@ function deferredSummary(deferred) {
   if (deferred.governed_jsonl) parts.push("governed JSONL");
   if (deferred.mcp_confinement_positive) parts.push("MCP confinement positive");
   if (deferred.example_web_wasm) parts.push("the web wasm build and browser suites");
+  if (deferred.rustdoc) parts.push("the workspace rustdoc");
   return parts.join("; ");
 }
 
@@ -2818,8 +2858,10 @@ function githubOutput(result) {
   scalar("closure_count", String(result.closure.length));
   scalar("closure_flags", result.closure_flags);
   scalar("closure_check", String(result.closure_check));
+  scalar("rustdoc", String(result.rustdoc));
   scalar("governed_jsonl", String(result.governed_jsonl));
   scalar("mcp_confinement_positive", String(result.mcp_confinement_positive));
+  scalar("guard_lane_reasons", JSON.stringify(result.guard_lane_reasons));
   scalar("deferred_to_push", deferredSummary(result.deferred_to_push));
   // Each two-wave lane's first wave keeps the lane's matrix name; its rest
   // is the _rest matrix of the twin job that waits for the stagger job. The

@@ -18,6 +18,14 @@ use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input::Input;
 use crate::traits::RuntimeDriverError;
 
+mod peer_ingress;
+pub(crate) use peer_ingress::delivery_input_id;
+pub use peer_ingress::{
+    PeerIngressBindFuture, PeerIngressBindRefusal, PeerIngressBindRequest, PeerIngressBinder,
+    PeerIngressBinding, PeerIngressClaimKind, PeerIngressCommsOrigin, PeerIngressOrigin,
+    PeerIngressSupervisorOrigin,
+};
+
 /// The native replay lookup's verdict for one admission of a governed input:
 /// the driver's existing qualified-key lookup and exact replay verification,
 /// resolved before the installed host authenticates the input. The runtime
@@ -236,38 +244,53 @@ impl ServiceOccurrence {
 /// association is the record the host's original source holds enrolled, and
 /// the operator's grant, selected for exactly the operation's MCP server,
 /// decides every call it then makes. The occurrence is audit data
-/// ([`ServiceOccurrence`]); the audit sink receives every decision and
-/// refusal of the request's calls and must be durable: a failing sink
-/// refuses the call.
+/// ([`ServiceOccurrence`]). The audit of the request's calls is Core's: the
+/// machine stages every decision and refusal in the audit sink it builds
+/// for the request, and makes them durable in its store's service-call
+/// audit log under [`Self::audit_key`]
+/// ([`crate::store::RuntimeStore::append_service_call_audit`]); an append
+/// that fails refuses the call before it is sent.
 #[non_exhaustive]
 pub struct ServiceCallRequest {
     association: InputAuthorityAssociation,
     occurrence: ServiceOccurrence,
-    audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
+    audit_key: crate::store::ServiceCallAuditKey,
     claimed: std::sync::atomic::AtomicBool,
 }
 
+/// The domain tag of a service original's identity digest
+/// ([`ServiceCallRequest::audit_key`]).
+const SERVICE_ORIGINAL_DIGEST_DOMAIN: &[u8] = b"meerkat.service-call-audit.original.v1";
+
 impl ServiceCallRequest {
     /// The request of a trusted host for `association`, the service
-    /// original it enrolled, in `occurrence`, with `audit` for its calls.
+    /// original it enrolled, in `occurrence`.
     ///
     /// # Errors
     /// Refuses as `MalformedFacts` an association that cannot be a service
-    /// original.
+    /// original, or that has no canonical encoding.
     pub fn from_trusted_host(
         association: InputAuthorityAssociation,
         occurrence: ServiceOccurrence,
-        audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<Arc<Self>, meerkat_core::OperationRefused> {
+        let malformed = || {
+            meerkat_core::OperationRefused::new(meerkat_core::OperationRefusalKind::MalformedFacts)
+        };
         if !service_original_shape(&association) {
-            return Err(meerkat_core::OperationRefused::new(
-                meerkat_core::OperationRefusalKind::MalformedFacts,
-            ));
+            return Err(malformed());
         }
+        let canonical = association.canonical_bytes().map_err(|_| malformed())?;
+        let audit_key = crate::store::ServiceCallAuditKey::new(
+            crate::delivery_inbox::delivery_digest_hex(&[
+                SERVICE_ORIGINAL_DIGEST_DOMAIN,
+                &canonical,
+            ]),
+            occurrence.occurrence.as_str(),
+        );
         Ok(Arc::new(Self {
             association,
             occurrence,
-            audit,
+            audit_key,
             claimed: std::sync::atomic::AtomicBool::new(false),
         }))
     }
@@ -284,12 +307,15 @@ impl ServiceCallRequest {
         &self.occurrence
     }
 
-    /// The sink every decision and refusal of the request's calls goes to.
+    /// The key of the request's rows in the service-call audit log: the
+    /// identity digest of the service original it presents (a SHA-256 of
+    /// the association's canonical bytes, so a re-enrollment with other
+    /// claims is another original in the log) and its occurrence. A host
+    /// reads its occurrence's audit back with it
+    /// ([`crate::store::RuntimeStore::read_service_call_audit`]).
     #[must_use]
-    pub fn audit_sink(
-        &self,
-    ) -> &Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink> {
-        &self.audit
+    pub fn audit_key(&self) -> &crate::store::ServiceCallAuditKey {
+        &self.audit_key
     }
 
     /// Claim the request's one admission. The installed host claims it
@@ -444,12 +470,16 @@ pub trait NativeWorkAuthorizationHost: Send + Sync {
     /// admits the request only when the request's whole association is the
     /// record its original source holds enrolled, and every operation is
     /// then decided again by the work owner, the operator's grant selected
-    /// for the operation's MCP server and the operation owner. The default
-    /// refuses: a host that cannot read enrolled service originals serves no
-    /// service call, and no run's authority is ever borrowed for one.
+    /// for the operation's MCP server and the operation owner. Every
+    /// decision and refusal goes to `audit`, the sink the machine built for
+    /// this request (its observations reach the store's service-call audit
+    /// log before a call is sent). The default refuses: a host that cannot
+    /// read enrolled service originals serves no service call, and no run's
+    /// authority is ever borrowed for one.
     fn service_call_authorization(
         &self,
         _request: Arc<ServiceCallRequest>,
+        _audit: Arc<dyn meerkat_authorization_contracts::audit::AuthorizationAuditSink>,
     ) -> Result<WorkAuthorizationContext, meerkat_core::OperationAuthorizationError> {
         Err(meerkat_core::OperationAuthorizationError::Unavailable)
     }
@@ -752,15 +782,74 @@ pub(crate) fn qualified_idempotency_key(
     let Some(association) = &input.header().authority_association else {
         return Ok(Some(raw.clone()));
     };
+    qualify_idempotency_key(association, &raw.0).map(Some)
+}
+
+/// The submitter's key `raw` qualified under `association`: the key a
+/// governed admission binds in place of `raw`.
+fn qualify_idempotency_key(
+    association: &InputAuthorityAssociation,
+    raw: &str,
+) -> Result<IdempotencyKey, RuntimeDriverError> {
     let event = EvidenceId::new(raw.to_string()).map_err(|_| unavailable())?;
     let bytes = association
         .qualified_key(event)
         .canonical_bytes()
         .map_err(|_| unavailable())?;
-    Ok(Some(IdempotencyKey::new(format!(
+    Ok(IdempotencyKey::new(format!(
         "local-governed-v1:{}",
         hex(&bytes)
-    ))))
+    )))
+}
+
+/// Whether `state` is a governed row admitted under its submitter's own key
+/// `key`: its admission key is `key` qualified under the row's own retained
+/// association. That association survives payload retirement, so a terminal
+/// row answers too. A row admitted without an association (or as a retained
+/// resume, whose contributors are not its own) is never governed here.
+pub(crate) fn governed_row_admitted_under(
+    state: &crate::input_state::InputState,
+    key: &str,
+) -> bool {
+    let Some(admitted) = state.idempotency_key.as_ref() else {
+        return false;
+    };
+    if state.retained_resume.is_some() {
+        return false;
+    }
+    state
+        .authority_contributors
+        .iter()
+        .find(|contributor| contributor.input_id() == &state.input_id)
+        .and_then(|own| qualify_idempotency_key(own.association(), key).ok())
+        .is_some_and(|qualified| &qualified == admitted)
+}
+
+/// The input id a tracked delivery's payload input id names: a
+/// supervisor-bridge delivery keeps its payload input id, a canonical UUID,
+/// as its input id. `None` for any other text.
+pub(crate) fn tracked_delivery_input_id(payload_input_id: &str) -> Option<InputId> {
+    let uuid = uuid::Uuid::parse_str(payload_input_id).ok()?;
+    (uuid.to_string() == payload_input_id).then(|| InputId::from_uuid(uuid))
+}
+
+/// The input a tracked cancel addressed by `key` names in `driver`'s live
+/// state. A canonical input id names the tracked delivery with that id, and
+/// only when that row was admitted under it as its key (the id itself, or a
+/// governed row's qualification of it): never another input that merely
+/// carries the id as its key. Any other key names the input its machine
+/// binding names.
+pub(crate) fn tracked_input_id_for_key(
+    driver: &dyn crate::traits::RuntimeDriver,
+    key: &str,
+) -> Option<InputId> {
+    match tracked_delivery_input_id(key) {
+        Some(input_id) => driver
+            .stored_input_state(&input_id)
+            .filter(|stored| stored.admitted_under_idempotency_key(key))
+            .map(|_| input_id),
+        None => driver.input_id_for_idempotency_key(key),
+    }
 }
 
 pub(crate) fn replay_digest(input: &Input) -> Result<[u8; 32], RuntimeDriverError> {
@@ -805,6 +894,92 @@ pub(crate) fn verify_retained_replay(
         _ => Err(RuntimeDriverError::InputIdempotencyConflict {
             existing_id: state.input_id.clone(),
         }),
+    }
+}
+
+/// What a bound original's association must name as its original work.
+#[derive(Debug, Clone, Copy)]
+#[non_exhaustive]
+pub enum BoundOriginalPin<'a> {
+    /// The exact original its namespace owner confirmed (a host continuation
+    /// original): authority and work.
+    Original(&'a meerkat_authorization_contracts::work_association::OriginalWorkRef),
+    /// Core's work id for one delivery (a peer delivery,
+    /// [`PeerIngressBindRequest::delivery_work`]): the original's work only,
+    /// since its authority principal is the host's.
+    DeliveryWork(&'a EvidenceId),
+}
+
+/// Check a trusted host's binding of an input Core handed it: Core's exact
+/// `handed` input with only its authority association set and its trusted
+/// ingress observation attached (the ingress observation is not part of the
+/// input's serialized form, so the byte comparison reads the association).
+/// The association names `runtime`, a controller grant lineage and model,
+/// and the original `pin` requires; the ingress names the association's
+/// requester, actor and realm, with a controller client of its model.
+///
+/// # Errors
+/// Why the binding is not Core's exact input so bound.
+pub fn check_bound_original(
+    handed: &Input,
+    bound: &Input,
+    runtime: &LogicalRuntimeId,
+    pin: BoundOriginalPin<'_>,
+) -> Result<(), String> {
+    let header = bound.header();
+    if header.retained_resume.is_some() {
+        return Err("a bound original carries no retained resume".into());
+    }
+    let association = header
+        .authority_association
+        .as_ref()
+        .ok_or("the bound original carries no authority association")?;
+    let ingress = header
+        .ingress_context
+        .as_ref()
+        .ok_or("the bound original carries no trusted ingress observation")?;
+    let mut expected = handed.clone();
+    expected.header_mut().authority_association = Some(association.clone());
+    let expected = serde_json::to_vec(&expected).map_err(|error| error.to_string())?;
+    if serde_json::to_vec(bound).map_err(|error| error.to_string())? != expected {
+        return Err("the bound input is not the input it was handed".into());
+    }
+    let claims = association.candidate();
+    if claims.controller_grant_lineage.is_empty() {
+        return Err("the binding names no controller grant lineage".into());
+    }
+    let model = claims
+        .controller_model
+        .as_ref()
+        .ok_or("the binding names no controller model")?;
+    if claims.target.logical_runtime.as_str() != runtime.to_string() {
+        return Err("the binding targets another runtime than the admitting one".into());
+    }
+    match pin {
+        BoundOriginalPin::Original(original_work) => {
+            if claims.original_work != *original_work {
+                return Err(
+                    "the binding names another original than its namespace owner confirmed".into(),
+                );
+            }
+        }
+        BoundOriginalPin::DeliveryWork(work) => {
+            if claims.original_work.work != *work {
+                return Err("the binding names another delivery's work than Core's".into());
+            }
+        }
+    }
+    if ingress.requester() != &claims.requester
+        || ingress.ingress_actor() != &claims.ingress_actor
+        || ingress.realm() != &claims.ingress_namespace.realm
+    {
+        return Err("the ingress observation names other principals than the binding".into());
+    }
+    match ingress.controller_client() {
+        Some(client) if client.selection() == model => Ok(()),
+        _ => Err(
+            "the ingress observation carries no controller client of the binding's model".into(),
+        ),
     }
 }
 
@@ -1176,6 +1351,73 @@ pub(crate) mod tests {
     }
     pub(crate) fn input(requester: &str) -> Input {
         input_with_controller(requester, controller_selection("controller"))
+    }
+
+    /// Bind `request`'s input as a test peer binder does: the association
+    /// [`TestIngress`] admits, naming `requester`, the request's runtime and
+    /// `work` (the request's own `delivery_work` for a well-formed binding),
+    /// with the event key set and the trusted ingress observation attached
+    /// with a controller client of `selection`.
+    pub(crate) fn bind_peer_delivery_for_test(
+        request: &PeerIngressBindRequest,
+        requester: &str,
+        work: EvidenceId,
+        selection: &meerkat_core::ControllerModelSelection,
+    ) -> Input {
+        let association = InputAuthorityAssociation::new(InputAuthorityAssociationCandidate {
+            requester: principal(requester),
+            ingress_actor: principal("ingress"),
+            represented_subject: None,
+            original_authentication: evidence("authenticated-peer-transport"),
+            logical_executor: principal("executor"),
+            target: NativeWorkTarget {
+                logical_owner: principal("native-owner"),
+                logical_runtime: id(&request.runtime_id.to_string()),
+                context: id("context"),
+                context_generation: 1,
+                audience: AudienceRef::Principal {
+                    principal: principal("audience"),
+                },
+            },
+            original_work: OriginalWorkRef {
+                authority: principal("ingress"),
+                work,
+            },
+            root_event: evidence("peer-event"),
+            contributing_work: Vec::new(),
+            authority_basis: WorkAuthorityBasis::HostPolicy {
+                policy: evidence("policy"),
+            },
+            controller_grant_lineage: vec![GrantLineageRef {
+                root_authority: principal("grant-owner"),
+                authority_namespace: id("controller"),
+                authority_generation: 1,
+                authority_incarnation: serde_json::from_value(serde_json::json!(
+                    "00000000-0000-4000-8000-000000000001"
+                ))
+                .expect("fixture incarnation data"),
+                grant_id: id("controller-leaf"),
+                issued_revision: 1,
+            }],
+            controller_model: Some(selection.clone()),
+            controller_ceiling: ExecutionRestrictions::unrestricted(),
+            admitted_ceiling: ExecutionRestrictions::unrestricted(),
+            source_observations: Vec::new(),
+            ingress_namespace: QualifiedIngressNamespace {
+                realm: RealmId::parse("native-test").expect("realm"),
+                ingress: ResourceDomain {
+                    authority: principal("ingress"),
+                    namespace: "peers".into(),
+                },
+                occurrence_scope: id("occurrence"),
+            },
+            contract: ContractRequirements::local_governed_v1(),
+        })
+        .expect("well-formed peer delivery claims");
+        let mut input = request.input.clone();
+        input.header_mut().authority_association = Some(association);
+        input.header_mut().idempotency_key = Some(request.event_key.clone());
+        attach_ingress(input, requester, "peer-delivery-authentication")
     }
     /// The same fixture input under its own controller credential account.
     /// The credential lifecycle lease is process-wide per credential, so

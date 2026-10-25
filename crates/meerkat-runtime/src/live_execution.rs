@@ -1322,6 +1322,7 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             | E::ControllerInUse
             | E::NotFound { .. }
             | E::ValidationFailed { .. }
+            | E::QueuedInputsRefused(_)
             | E::ScopedContextGenerationNotAdvanced { .. }
             | E::InputIdempotencyConflict { .. }
             // An existing-only admission admitted nothing.
@@ -1341,7 +1342,10 @@ impl From<crate::traits::RuntimeDriverError> for LiveBridgeOutcomeBindingError {
             // resolves this runtime's bridge rows.
             | E::ServedElsewhere { .. }
             // A broken hosting invariant, as recovery corruption.
-            | E::HostingClaimInvariantViolated { .. } => Self::Unavailable(error),
+            | E::HostingClaimInvariantViolated { .. }
+            // A durable tail withheld from resume clears only once it is
+            // reconciled, not on its own.
+            | E::DurableResumeHeld { .. } => Self::Unavailable(error),
         }
     }
 }

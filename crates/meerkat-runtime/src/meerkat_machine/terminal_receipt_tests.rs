@@ -11,10 +11,11 @@ use meerkat_core::lifecycle::run_primitive::RunApplyBoundary;
 use meerkat_core::lifecycle::run_primitive::RunPrimitive;
 use meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft;
 
-use crate::completion::CompletionOutcome;
+use crate::completion::{CompletionClass, CompletionOutcome};
 use crate::input_state::InputTerminalOutcome;
 use crate::terminal_status::{
-    InputTerminalReceiptRead, InputTerminalReceiptScope, InputTerminalReceiptWait,
+    InputTerminalReceipt, InputTerminalReceiptObservation, InputTerminalReceiptRead,
+    InputTerminalReceiptScope, InputTerminalReceiptSummary, InputTerminalReceiptWait,
     InteractionSelector, Sourced, TerminalWitnessSource,
 };
 
@@ -28,6 +29,8 @@ struct GatedResultExecutor {
     batches: Arc<std::sync::Mutex<Vec<(RunId, Vec<InputId>)>>>,
     calls: Arc<AtomicUsize>,
     failing_calls: Vec<usize>,
+    /// Calls that end at an external callback boundary instead of a result.
+    callback_calls: Vec<usize>,
 }
 
 /// Build the `RunResult` through serde so optional fields another change
@@ -66,6 +69,21 @@ impl CoreExecutor for GatedResultExecutor {
                 "scripted failure {call}"
             )));
         }
+        if self.callback_calls.contains(&call) {
+            return Ok(CoreApplyOutput::with_callback_pending(
+                RunBoundaryReceiptDraft {
+                    run_id,
+                    boundary: RunApplyBoundary::RunStart,
+                    contributing_input_ids: contributors,
+                    conversation_digest: None,
+                    message_count: 0,
+                },
+                None,
+                format!("callback-call-marker-{call}"),
+                "external-tool-marker",
+                serde_json::json!({ "argument": "callback-argument-marker" }),
+            ));
+        }
         Ok(CoreApplyOutput::with_run_result(
             RunBoundaryReceiptDraft {
                 run_id,
@@ -97,6 +115,19 @@ struct Harness {
 
 impl Harness {
     async fn new(machine: MeerkatMachine, failing_calls: Vec<usize>) -> Self {
+        Self::scripted(machine, failing_calls, Vec::new()).await
+    }
+
+    /// A harness whose `callback_calls` end at an external callback boundary.
+    async fn with_callbacks(machine: MeerkatMachine, callback_calls: Vec<usize>) -> Self {
+        Self::scripted(machine, Vec::new(), callback_calls).await
+    }
+
+    async fn scripted(
+        machine: MeerkatMachine,
+        failing_calls: Vec<usize>,
+        callback_calls: Vec<usize>,
+    ) -> Self {
         let machine = Arc::new(machine);
         let session_id = SessionId::new();
         let permits = Arc::new(crate::tokio::sync::Semaphore::new(0));
@@ -110,6 +141,7 @@ impl Harness {
                     batches: Arc::clone(&batches),
                     calls: Arc::new(AtomicUsize::new(0)),
                     failing_calls,
+                    callback_calls,
                 }),
             )
             .await
@@ -232,6 +264,39 @@ fn completed_text(outcome: &CompletionOutcome) -> &str {
 fn sorted(mut ids: Vec<InputId>) -> Vec<InputId> {
     ids.sort_by(|a, b| a.0.cmp(&b.0));
     ids
+}
+
+/// The body-free observation of one input.
+async fn observe(
+    machine: &MeerkatMachine,
+    session_id: &SessionId,
+    selector: InteractionSelector,
+) -> Sourced<InputTerminalReceiptObservation> {
+    machine
+        .input_terminal_receipt_observation(session_id, selector)
+        .await
+        .expect("terminal receipt observation")
+        .expect("input is known")
+}
+
+fn summary(observation: &InputTerminalReceiptObservation) -> &InputTerminalReceiptSummary {
+    match observation {
+        InputTerminalReceiptObservation::Finalized(summary) => summary,
+        other => panic!("expected a finalized observation, got {other:?}"),
+    }
+}
+
+/// The summary carries exactly the receipt's identities, and the class of
+/// its outcome.
+fn assert_summarizes(summary: &InputTerminalReceiptSummary, receipt: &InputTerminalReceipt) {
+    assert_eq!(summary.input_id(), receipt.input_id());
+    assert_eq!(summary.terminal(), receipt.terminal());
+    assert_eq!(summary.attempt_count(), receipt.attempt_count());
+    assert_eq!(summary.scope(), receipt.scope());
+    assert_eq!(summary.run_id(), receipt.run_id());
+    assert_eq!(summary.owner_input_id(), receipt.owner_input_id());
+    assert_eq!(summary.recipient_input_ids(), receipt.recipient_input_ids());
+    assert_eq!(summary.class(), receipt.outcome().class());
 }
 
 /// Two queued inputs that one run consumes read the same run, the same
@@ -717,6 +782,7 @@ async fn boot_revival_abandonment_reads_terminal_without_receipt() {
                     batches: Arc::clone(&batches),
                     calls: Arc::new(AtomicUsize::new(0)),
                     failing_calls: Vec::new(),
+                    callback_calls: Vec::new(),
                 }) as Box<dyn CoreExecutor>
             }
         })
@@ -840,11 +906,18 @@ async fn unknown_input_reads_the_same_through_read_and_wait_with_or_without_regi
         wait(&ephemeral, &unregistered, &unknown).await,
         Err(RuntimeDriverError::NotReady { .. })
     ));
+    assert!(matches!(
+        ephemeral.session_input_states(&unregistered).await,
+        Err(RuntimeDriverError::NotReady { .. })
+    ));
     let session_id = SessionId::new();
     ephemeral
         .register_session(session_id.clone())
         .await
         .expect("register session");
+    let empty = ephemeral.session_input_states(&session_id).await.unwrap();
+    assert_eq!(empty.source, TerminalWitnessSource::LiveRuntime);
+    assert!(empty.report.is_empty());
     assert!(
         read(&ephemeral, &session_id, &unknown)
             .await
@@ -883,6 +956,10 @@ async fn unknown_input_reads_the_same_through_read_and_wait_with_or_without_regi
     <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(&attached, &session_id, queued)
         .await
         .expect("queue a durable input");
+    let live_inputs = attached.session_input_states(&session_id).await.unwrap();
+    assert_eq!(live_inputs.source, TerminalWitnessSource::LiveRuntime);
+    assert_eq!(live_inputs.report.len(), 1);
+    assert_eq!(live_inputs.report[0].state.input_id, queued_id);
     assert!(
         read(&attached, &session_id, &unknown)
             .await
@@ -898,6 +975,16 @@ async fn unknown_input_reads_the_same_through_read_and_wait_with_or_without_regi
 
     let detached =
         MeerkatMachine::persistent_without_blobs(Arc::clone(&store)).expect("persistent machine");
+    // A durable observation does not claim that the still-attached owner has
+    // stopped admitting or that its pending row is settled.
+    let durable_inputs = detached.session_input_states(&session_id).await.unwrap();
+    assert_eq!(durable_inputs.source, TerminalWitnessSource::DurableStore);
+    assert_eq!(durable_inputs.report.len(), 1);
+    assert_eq!(durable_inputs.report[0].state.input_id, queued_id);
+    assert_eq!(
+        durable_inputs.report[0].seed.phase,
+        live_inputs.report[0].seed.phase
+    );
     assert!(
         read(&detached, &session_id, &unknown)
             .await
@@ -919,6 +1006,10 @@ async fn unknown_input_reads_the_same_through_read_and_wait_with_or_without_regi
         wait(&detached, &never_admitted, &unknown).await,
         Err(RuntimeDriverError::NotFound { .. })
     ));
+    assert!(matches!(
+        detached.session_input_states(&never_admitted).await,
+        Err(RuntimeDriverError::NotFound { .. })
+    ));
     match wait(&detached, &session_id, &queued_id).await {
         Ok(Some(InputTerminalReceiptWait::Detached(Sourced {
             source: TerminalWitnessSource::DurableStore,
@@ -926,6 +1017,14 @@ async fn unknown_input_reads_the_same_through_read_and_wait_with_or_without_regi
         }))) => assert_eq!(input_id, queued_id),
         other => panic!("a pending row with no live registration detaches, got {other:?}"),
     }
+    let before_close = attached.session_input_states(&session_id).await.unwrap();
+    assert_eq!(before_close.report.len(), 1);
+    assert_eq!(before_close.report[0].state.input_id, queued_id);
+    attached.unregister_session(&session_id).await.unwrap();
+    let closed_inputs = attached.session_input_states(&session_id).await.unwrap();
+    assert_eq!(closed_inputs.source, TerminalWitnessSource::DurableStore);
+    assert_eq!(closed_inputs.report.len(), 1);
+    assert_eq!(closed_inputs.report[0].state.input_id, queued_id);
 }
 
 /// A finalized receipt survives restart: a fresh machine over the same store
@@ -952,7 +1051,20 @@ async fn finalized_receipt_is_read_from_the_store_after_restart() {
     let live = harness.wait_resolved(&x).await;
     let live_receipt = finalized(&live.report).clone();
     assert_eq!(completed_text(live_receipt.outcome()), "answer-1");
+    let live_inputs = harness
+        .machine
+        .session_input_states(&harness.session_id)
+        .await
+        .unwrap();
+    assert_eq!(live_inputs.source, TerminalWitnessSource::LiveRuntime);
+    assert_eq!(live_inputs.report.len(), 1);
+    assert_eq!(live_inputs.report[0].state.input_id, x);
     let session_id = harness.session_id.clone();
+    harness
+        .machine
+        .unregister_session(&session_id)
+        .await
+        .unwrap();
     drop(harness);
     drop(store);
 
@@ -963,6 +1075,14 @@ async fn finalized_receipt_is_read_from_the_store_after_restart() {
         Arc::new(meerkat_store::MemoryBlobStore::new()),
     )
     .expect("persistent machine");
+    let inputs = restarted.session_input_states(&session_id).await.unwrap();
+    assert_eq!(inputs.source, TerminalWitnessSource::DurableStore);
+    assert_eq!(inputs.report.len(), 1);
+    assert_eq!(inputs.report[0].state.input_id, x);
+    assert_eq!(
+        inputs.report[0].seed.phase,
+        live_inputs.report[0].seed.phase
+    );
     let read = restarted
         .input_terminal_receipt(
             &session_id,
@@ -1003,4 +1123,450 @@ async fn finalized_receipt_is_read_from_the_store_after_restart() {
             .expect("unknown key read")
             .is_none()
     );
+}
+
+/// Even when a damaged durable row has a valid live counterpart, a complete
+/// census must refuse rather than hide it or return only the other good row.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-store"))]
+#[tokio::test]
+async fn session_input_states_refuse_corrupt_rows_without_repair_or_registration() {
+    let dir = tempfile::TempDir::new().unwrap();
+    let path = dir.path().join("runtime.sqlite3");
+    let store = Arc::new(crate::store::SqliteRuntimeStore::new(path.clone()).unwrap())
+        as Arc<dyn crate::store::RuntimeStore>;
+    let attached = MeerkatMachine::persistent_without_blobs(store.clone()).unwrap();
+    let session_id = SessionId::new();
+    attached.register_session(session_id.clone()).await.unwrap();
+    let mut ids = Vec::new();
+    for key in ["census-good", "census-corrupt"] {
+        let input = keyed_external_event(key);
+        ids.push(input.id().clone());
+        let outcome = <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(
+            &attached,
+            &session_id,
+            input,
+        )
+        .await
+        .unwrap();
+        assert!(outcome.is_accepted());
+    }
+    let before = attached.session_input_states(&session_id).await.unwrap();
+    assert_eq!(
+        sorted(
+            before
+                .report
+                .iter()
+                .map(|row| row.state.input_id.clone())
+                .collect()
+        ),
+        sorted(ids.clone())
+    );
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let connection = rusqlite::Connection::open(path).unwrap();
+    let damaged = b"{invalid input row";
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE runtime_input_states SET state_json=?3 WHERE runtime_id=?1 AND input_id=?2",
+                rusqlite::params![
+                    runtime_id.to_string(),
+                    ids[1].to_string(),
+                    damaged.as_slice()
+                ],
+            )
+            .unwrap(),
+        1
+    );
+    let detached = MeerkatMachine::persistent_without_blobs(store).unwrap();
+    for machine in [&attached, &detached] {
+        assert!(matches!(
+            machine.session_input_states(&session_id).await,
+            Err(RuntimeDriverError::Internal(_))
+        ));
+    }
+    assert!(!detached.sessions.read().await.contains_key(&session_id));
+    let retained: Vec<u8> = connection
+        .query_row(
+            "SELECT state_json FROM runtime_input_states WHERE runtime_id=?1 AND input_id=?2",
+            rusqlite::params![runtime_id.to_string(), ids[1].to_string()],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(retained, damaged);
+}
+
+/// The body-free observation of each input carries exactly its receipt's
+/// identities (the input, its terminal and attempts, the batch's scope,
+/// owner and recipients) and its outcome's class, by id and by key; a queued
+/// input is observed pending, and no result text is observed.
+#[tokio::test]
+async fn the_observation_carries_each_receipts_identities_and_its_outcomes_class() {
+    let harness = Harness::new(MeerkatMachine::ephemeral(), Vec::new()).await;
+    let head = harness.accept("observed-head").await;
+    harness.wait_for_applies(1).await;
+    let x = harness.accept("observed-x").await;
+    let y = harness.accept("observed-y").await;
+
+    let queued = observe(
+        &harness.machine,
+        &harness.session_id,
+        InteractionSelector::InputId(x.clone()),
+    )
+    .await;
+    match &queued.report {
+        InputTerminalReceiptObservation::Pending {
+            input_id,
+            terminal: None,
+            ..
+        } => assert_eq!(input_id, &x),
+        other => panic!("a queued input is observed pending, got {other:?}"),
+    }
+    assert!(!queued.report.is_resolved());
+
+    harness.permits.add_permits(2);
+    let mut summaries = Vec::new();
+    for input in [&head, &x, &y] {
+        let read = harness.wait_resolved(input).await;
+        let receipt = finalized(&read.report);
+        let observed = observe(
+            &harness.machine,
+            &harness.session_id,
+            InteractionSelector::InputId(input.clone()),
+        )
+        .await;
+        assert_eq!(observed.source, read.source);
+        let summary = summary(&observed.report);
+        assert_summarizes(summary, receipt);
+        assert_eq!(summary.class(), CompletionClass::Completed);
+        let text = format!("{observed:?}");
+        assert!(!text.contains("answer-"), "no result text: {text}");
+        summaries.push(summary.clone());
+    }
+    let (x_summary, y_summary) = (&summaries[1], &summaries[2]);
+    assert_eq!(x_summary.run_id(), y_summary.run_id(), "one run's batch");
+    assert_eq!(x_summary.owner_input_id(), y_summary.owner_input_id());
+    assert_eq!(
+        x_summary.recipient_input_ids(),
+        sorted(vec![x.clone(), y.clone()]).as_slice()
+    );
+    assert_eq!(
+        x_summary.recipient_input_ids(),
+        y_summary.recipient_input_ids()
+    );
+    assert_ne!(
+        summaries[0].run_id(),
+        x_summary.run_id(),
+        "the head ran alone"
+    );
+
+    let by_key = observe(
+        &harness.machine,
+        &harness.session_id,
+        InteractionSelector::IdempotencyKey("observed-x".into()),
+    )
+    .await;
+    assert_eq!(summary(&by_key.report), x_summary);
+}
+
+/// A run that ends at an external callback boundary finalizes its input's
+/// receipt: the observation is finalized (not pending) with the callback
+/// class (not completed), and carries none of the pending call.
+#[tokio::test]
+async fn a_callback_pending_receipt_is_observed_as_its_class_without_the_call() {
+    let harness = Harness::with_callbacks(MeerkatMachine::ephemeral(), vec![1]).await;
+    let x = harness.accept("callback-x").await;
+    harness.wait_for_applies(1).await;
+    let before = observe(
+        &harness.machine,
+        &harness.session_id,
+        InteractionSelector::InputId(x.clone()),
+    )
+    .await;
+    assert!(
+        matches!(
+            before.report,
+            InputTerminalReceiptObservation::Pending { .. }
+        ),
+        "an input still in its run is observed pending: {before:?}"
+    );
+
+    harness.permits.add_permits(1);
+    let read = harness.wait_resolved(&x).await;
+    let receipt = finalized(&read.report);
+    assert!(
+        matches!(receipt.outcome(), CompletionOutcome::CallbackPending { .. }),
+        "the run ended at its callback boundary: {:?}",
+        receipt.outcome()
+    );
+    let observed = observe(
+        &harness.machine,
+        &harness.session_id,
+        InteractionSelector::InputId(x.clone()),
+    )
+    .await;
+    assert!(observed.report.is_resolved(), "finalized, not pending");
+    let summary = summary(&observed.report);
+    assert_summarizes(summary, receipt);
+    assert_eq!(summary.class(), CompletionClass::CallbackPending);
+    assert_ne!(summary.class(), CompletionClass::Completed);
+    let text = format!("{observed:?}");
+    for marker in [
+        "callback-call-marker",
+        "external-tool-marker",
+        "callback-argument-marker",
+    ] {
+        assert!(!text.contains(marker), "{marker} left in {text}");
+    }
+}
+
+/// A retired runtime's queued input is observed with its runtime-termination
+/// scope and class; a coalesced input is observed exactly as the receipt
+/// read reports its receipt-less terminal.
+#[tokio::test]
+async fn runtime_termination_and_receipt_less_terminals_are_observed_as_read() {
+    let machine = Arc::new(MeerkatMachine::ephemeral());
+    let session_id = SessionId::new();
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("register session");
+    let first = response_progress("observed-first");
+    let first_id = first.id().clone();
+    <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(&machine, &session_id, first)
+        .await
+        .expect("accept first");
+    let second = response_progress("observed-second");
+    let second_id = second.id().clone();
+    <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(&machine, &session_id, second)
+        .await
+        .expect("accept second");
+    let read = machine
+        .input_terminal_receipt(&session_id, InteractionSelector::InputId(first_id.clone()))
+        .await
+        .expect("read")
+        .expect("known input");
+    let observed = observe(
+        &machine,
+        &session_id,
+        InteractionSelector::InputId(first_id.clone()),
+    )
+    .await;
+    match (&read.report, &observed.report) {
+        (
+            InputTerminalReceiptRead::TerminalWithoutReceipt {
+                input_id,
+                terminal,
+                last_run_id,
+                attempt_count,
+            },
+            InputTerminalReceiptObservation::TerminalWithoutReceipt {
+                input_id: observed_input,
+                terminal: observed_terminal,
+                last_run_id: observed_run,
+                attempt_count: observed_attempts,
+            },
+        ) => {
+            assert_eq!(observed_input, input_id);
+            assert_eq!(observed_terminal, terminal);
+            assert_eq!(observed_run, last_run_id);
+            assert_eq!(observed_attempts, attempt_count);
+            assert_eq!(
+                observed_terminal,
+                &InputTerminalOutcome::Coalesced {
+                    aggregate_id: second_id
+                }
+            );
+        }
+        other => panic!("a coalesced input is observed as read, got {other:?}"),
+    }
+
+    let input = keyed_external_event("observed-retired");
+    let retired = input.id().clone();
+    <MeerkatMachine as SessionServiceRuntimeExt>::accept_input(&machine, &session_id, input)
+        .await
+        .expect("accept");
+    <MeerkatMachine as SessionServiceRuntimeExt>::retire_runtime(&machine, &session_id)
+        .await
+        .expect("retire abandons the queued inputs");
+    let read = match tokio::time::timeout(
+        BOUND,
+        machine.wait_input_terminal_receipt(&session_id, &retired),
+    )
+    .await
+    .expect("retired receipt wait resolves")
+    .expect("wait succeeds")
+    {
+        Some(InputTerminalReceiptWait::Resolved(read)) => read,
+        other => panic!("expected resolved, got {other:?}"),
+    };
+    let receipt = finalized(&read.report);
+    let observed = observe(
+        &machine,
+        &session_id,
+        InteractionSelector::InputId(retired.clone()),
+    )
+    .await;
+    let summary = summary(&observed.report);
+    assert_summarizes(summary, receipt);
+    assert_eq!(
+        summary.scope(),
+        &InputTerminalReceiptScope::RuntimeTermination
+    );
+    assert_eq!(summary.run_id(), None);
+    assert_eq!(summary.class(), CompletionClass::RuntimeTerminated);
+}
+
+/// After a restart, a fresh machine over the same store observes from the
+/// store exactly what the attached machine observed. A batch whose recipient
+/// row is damaged or lost is refused by the observation exactly as the
+/// receipt read refuses it: both readers share the batch load and its
+/// validation, and neither answers from the owner row alone.
+#[cfg(all(not(target_arch = "wasm32"), feature = "sqlite-store"))]
+#[tokio::test]
+async fn the_observation_survives_restart_and_refuses_a_broken_batch_as_the_receipt_does() {
+    let dir = tempfile::TempDir::new().expect("temp dir");
+    let path = dir.path().join("runtime.sqlite3");
+    let store = Arc::new(crate::store::SqliteRuntimeStore::new(path.clone()).expect("store"))
+        as Arc<dyn crate::store::RuntimeStore>;
+    let harness = Harness::new(
+        MeerkatMachine::persistent(
+            Arc::clone(&store),
+            Arc::new(meerkat_store::MemoryBlobStore::new()),
+        )
+        .expect("persistent machine"),
+        Vec::new(),
+    )
+    .await;
+    let _head = harness.accept("broken-head").await;
+    harness.wait_for_applies(1).await;
+    let x = harness.accept("broken-x").await;
+    let y = harness.accept("broken-y").await;
+    harness.permits.add_permits(2);
+    harness.wait_resolved(&x).await;
+    harness.wait_resolved(&y).await;
+    let live = observe(
+        &harness.machine,
+        &harness.session_id,
+        InteractionSelector::InputId(x.clone()),
+    )
+    .await;
+    let live_summary = summary(&live.report).clone();
+    assert_eq!(
+        live_summary.recipient_input_ids(),
+        sorted(vec![x.clone(), y.clone()]).as_slice()
+    );
+    let owner = live_summary.owner_input_id().clone();
+    let other = live_summary
+        .recipient_input_ids()
+        .iter()
+        .find(|recipient| **recipient != owner)
+        .expect("a second recipient")
+        .clone();
+    let session_id = harness.session_id.clone();
+    harness
+        .machine
+        .unregister_session(&session_id)
+        .await
+        .expect("unregister");
+    drop(harness);
+    drop(store);
+
+    let restarted = MeerkatMachine::persistent(
+        Arc::new(crate::store::SqliteRuntimeStore::new(path.clone()).expect("reopen"))
+            as Arc<dyn crate::store::RuntimeStore>,
+        Arc::new(meerkat_store::MemoryBlobStore::new()),
+    )
+    .expect("persistent machine");
+    let durable = observe(
+        &restarted,
+        &session_id,
+        InteractionSelector::InputId(x.clone()),
+    )
+    .await;
+    assert_eq!(durable.source, TerminalWitnessSource::DurableStore);
+    assert_eq!(summary(&durable.report), &live_summary);
+
+    let both = async |restarted: &MeerkatMachine| {
+        let selector = || InteractionSelector::InputId(owner.clone());
+        (
+            restarted
+                .input_terminal_receipt_observation(&session_id, selector())
+                .await
+                .map(drop),
+            restarted
+                .input_terminal_receipt(&session_id, selector())
+                .await
+                .map(drop),
+        )
+    };
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let connection = rusqlite::Connection::open(&path).expect("open the store file");
+    let original: Vec<u8> = connection
+        .query_row(
+            "SELECT state_json FROM runtime_input_states WHERE runtime_id=?1 AND input_id=?2",
+            rusqlite::params![runtime_id.to_string(), other.to_string()],
+            |row| row.get(0),
+        )
+        .expect("the other recipient's row");
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE runtime_input_states SET state_json=?3 WHERE runtime_id=?1 AND input_id=?2",
+                rusqlite::params![
+                    runtime_id.to_string(),
+                    other.to_string(),
+                    b"{damaged recipient row".as_slice()
+                ],
+            )
+            .expect("damage the recipient row"),
+        1
+    );
+    match both(&restarted).await {
+        (Err(RuntimeDriverError::Internal(observed)), Err(RuntimeDriverError::Internal(read))) => {
+            assert_eq!(observed, read, "one batch load, one refusal");
+        }
+        other => panic!("a damaged recipient row is refused by both readers, got {other:?}"),
+    }
+    assert_eq!(
+        connection
+            .execute(
+                "UPDATE runtime_input_states SET state_json=?3 WHERE runtime_id=?1 AND input_id=?2",
+                rusqlite::params![runtime_id.to_string(), other.to_string(), original],
+            )
+            .expect("restore the recipient row"),
+        1
+    );
+    assert_eq!(
+        summary(
+            &observe(
+                &restarted,
+                &session_id,
+                InteractionSelector::InputId(owner.clone())
+            )
+            .await
+            .report
+        )
+        .owner_input_id(),
+        &owner,
+        "the restored batch is observed again"
+    );
+    assert_eq!(
+        connection
+            .execute(
+                "DELETE FROM runtime_input_states WHERE runtime_id=?1 AND input_id=?2",
+                rusqlite::params![runtime_id.to_string(), other.to_string()],
+            )
+            .expect("lose the recipient row"),
+        1
+    );
+    match both(&restarted).await {
+        (
+            Err(RuntimeDriverError::RecoveryCorruption { reason: observed }),
+            Err(RuntimeDriverError::RecoveryCorruption { reason: read }),
+        ) => {
+            assert_eq!(observed, read, "one batch validation, one refusal");
+            assert!(observed.contains(&other.to_string()), "{observed}");
+        }
+        other => panic!("a lost recipient row is refused by both readers, got {other:?}"),
+    }
 }

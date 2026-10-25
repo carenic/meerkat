@@ -1089,8 +1089,9 @@ impl HostMemberObservation {
     }
 
     /// Reattach watchers for one snapshot of durable Pending rows. The
-    /// runtime's restart-safe idempotency ledger distinguishes pre-accept
-    /// Pending (`None`, retain) from accepted work (`Some`). Nonterminal work
+    /// runtime's restart-safe input ledger, read by the delivery's payload
+    /// input id, distinguishes pre-accept Pending (`None`, retain) from
+    /// accepted work (`Some`). Nonterminal work
     /// is re-submitted only to obtain a Deduplicated completion handle;
     /// terminal work is reconstructed from its original durable window.
     #[cfg(feature = "runtime-adapter")]
@@ -1166,7 +1167,7 @@ impl HostMemberObservation {
                     continue;
                 }
                 let stored = match adapter
-                    .input_state_by_idempotency_key(&session, &pending.input_id)
+                    .tracked_delivery_input_state(&session, &pending.input_id)
                     .await
                 {
                     Ok(stored) => stored,
@@ -1928,6 +1929,22 @@ impl MemberObservationHost for HostMemberObservation {
         Ok(self.session_facts(session)?.generation)
     }
 
+    async fn visible_tool_names(
+        &self,
+        session: &SessionId,
+    ) -> Result<Option<Vec<String>>, MemberObservationError> {
+        // Only a resident member's session answers.
+        self.session_facts(session)?;
+        Ok(
+            match self.session_service.fork_source_tools(session).await {
+                meerkat_core::fork_notice::ForkSeedSourceTools::Read { names } => {
+                    Some(names.iter().map(ToString::to_string).collect())
+                }
+                meerkat_core::fork_notice::ForkSeedSourceTools::NotRead { .. } => None,
+            },
+        )
+    }
+
     async fn read_history(
         &self,
         session: &SessionId,
@@ -2364,7 +2381,7 @@ impl MemberObservationHost for HostMemberObservation {
                         .to_string(),
                 })?;
             let runtime_input = adapter
-                .input_state_by_idempotency_key(session, input_id)
+                .tracked_delivery_input_state(session, input_id)
                 .await
                 .map_err(|error| MemberObservationError::Unavailable {
                     reason: format!(
@@ -2516,7 +2533,7 @@ impl MemberObservationHost for HostMemberObservation {
                     )
                 })?;
             let stored = adapter
-                .input_state_by_idempotency_key(session, &admission.input_id)
+                .tracked_delivery_input_state(session, &admission.input_id)
                 .await
                 .map_err(|error| {
                     DirectedTurnReject::unsupported(format!(
@@ -2525,7 +2542,7 @@ impl MemberObservationHost for HostMemberObservation {
                 })?
                 .ok_or_else(|| {
                     DirectedTurnReject::unsupported(
-                        "accepted directed turn is absent from the runtime idempotency ledger",
+                        "accepted directed turn is absent from the runtime input ledger",
                     )
                 })?;
             let attribution =
@@ -2585,8 +2602,8 @@ enum DirectedTurnTrackingKind {
 }
 
 impl DirectedTurnRuntimeAttribution {
-    /// Prove that the idempotency lookup and runtime-owned compact attribution
-    /// name the exact Pending obligation. Nonterminal rows additionally bind
+    /// Prove that the tracked delivery read (by its payload input id) and the
+    /// runtime-owned compact attribution name the exact Pending obligation. Nonterminal rows additionally bind
     /// the retained replay payload; terminal rows remain recoverable after
     /// that payload is deliberately retired.
     fn from_stored(
@@ -2610,7 +2627,9 @@ impl DirectedTurnRuntimeAttribution {
             .idempotency_key
             .as_ref()
             .ok_or_else(|| "runtime input has no stored idempotency key".to_string())?;
-        if shell_key.0 != pending_input_id {
+        // A governed delivery is admitted under its key's qualification, so
+        // the runtime decides whether its admission key is this one.
+        if !stored.admitted_under_idempotency_key(pending_input_id) {
             return Err(format!(
                 "runtime idempotency binding '{}' differs from Pending '{}'",
                 shell_key.0, pending_input_id
@@ -3225,7 +3244,7 @@ async fn refresh_terminal_attribution(
     let mut retry_delay = CAUSAL_RETRY_MIN;
     loop {
         match adapter
-            .input_state_by_idempotency_key(session, pending_input_id)
+            .tracked_delivery_input_state(session, pending_input_id)
             .await
         {
             Ok(Some(stored)) => {
@@ -3255,7 +3274,7 @@ async fn refresh_terminal_attribution(
                 tracing::error!(
                     session_id = %session,
                     input_id = %pending_input_id,
-                    "accepted directed turn disappeared from the runtime idempotency ledger; retaining Pending"
+                    "accepted directed turn disappeared from the runtime input ledger; retaining Pending"
                 );
                 return None;
             }
@@ -3378,14 +3397,36 @@ async fn run_directed_turn_watcher(
         Some(handle) => Some(handle.try_wait().await),
         None => None,
     };
+    // A wait failure the generated authority resolves as resumable (a
+    // graceful stop kept the input durably queued for the next start) is
+    // neither failed nor terminal here. Record nothing; the tracked turn
+    // stays Pending and the next start's recovery reattaches to it.
+    if let Some(Err(error)) = &completion_result
+        && adapter
+            .resolve_runtime_completion_wait_failure(&session, error)
+            .await
+            .is_ok_and(|authority| authority.resumable)
+    {
+        tracing::info!(
+            session_id = %session,
+            input_id = %input_id,
+            error = %error,
+            "input kept queued across a graceful stop; retaining tracked turn Pending for the next start"
+        );
+        return;
+    }
+    // A kept input whose resolution failed is no terminal either.
     if completion_result.as_ref().is_some_and(|result| {
-        result
-            .as_ref()
-            .err()
-            .and_then(CompletionWaitError::wait_failure_observation)
-            == Some(
-                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable,
+        matches!(
+            result
+                .as_ref()
+                .err()
+                .and_then(CompletionWaitError::wait_failure_observation),
+            Some(
+                meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::AuthorityUnavailable
+                    | meerkat_runtime::meerkat_machine::dsl::RuntimeCompletionWaitFailureObservation::RequeuedAcrossStop,
             )
+        )
     }) {
         if let Some(Err(error)) = &completion_result {
             tracing::error!(

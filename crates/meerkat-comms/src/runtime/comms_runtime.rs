@@ -729,6 +729,7 @@ pub(crate) fn test_peer_ingress_queue_claim(
     let raw_item_id = claim.entry.raw_item_id;
     let class = claim.entry.class;
     let delivery_contract = claim.entry.delivery_contract;
+    let sender_authentication = claim.entry.sender_authentication;
     let candidate = classified_entry_to_interaction(claim.entry);
     meerkat_core::PeerIngressQueueClaim::from_comms_queue(
         claim.claim_id,
@@ -738,6 +739,7 @@ pub(crate) fn test_peer_ingress_queue_claim(
         candidate,
         claim.lease,
     )
+    .with_sender_authentication(sender_authentication)
 }
 
 #[cfg(test)]
@@ -1587,15 +1589,19 @@ impl CoreCommsRuntime for CommsRuntime {
         let class = claim.entry.class;
         let delivery_contract = claim.entry.delivery_contract;
         let raw_item_id = claim.entry.raw_item_id;
+        let sender_authentication = claim.entry.sender_authentication;
         let candidate = classified_entry_to_interaction(claim.entry);
-        Ok(Some(meerkat_core::PeerIngressQueueClaim::from_comms_queue(
-            claim.claim_id,
-            raw_item_id,
-            class,
-            delivery_contract,
-            candidate,
-            claim.lease,
-        )))
+        Ok(Some(
+            meerkat_core::PeerIngressQueueClaim::from_comms_queue(
+                claim.claim_id,
+                raw_item_id,
+                class,
+                delivery_contract,
+                candidate,
+                claim.lease,
+            )
+            .with_sender_authentication(sender_authentication),
+        ))
     }
 
     async fn peer_ingress_queue_snapshot(
@@ -3237,7 +3243,7 @@ impl CommsRuntime {
     /// disposition for the late reply — the drain consumes and discards it
     /// instead of injecting bridge JSON into the session. Tombstones are
     /// removed on take or lazily evicted after
-    /// [`BRIDGE_REPLY_TOMBSTONE_TTL`] at the next registry write.
+    /// `BRIDGE_REPLY_TOMBSTONE_TTL` at the next registry write.
     #[cfg(not(target_arch = "wasm32"))]
     pub fn tombstone_bridge_reply_waiter(&self, envelope_id: Uuid) {
         if let Some(entry) = self.bridge_reply_waiters.lock().get_mut(&envelope_id) {
@@ -3988,7 +3994,7 @@ impl CommsRuntime {
     }
 
     /// Release this runtime's published inproc route at a point the owner
-    /// chooses, instead of waiting for the last [`Arc`](std::sync::Arc) to drop.
+    /// chooses, instead of waiting for the last [`Arc`] to drop.
     ///
     /// A live participant name is never displaced, so a teardown that hands its
     /// name to a replacement in the same process has to *release* it. Route

@@ -19,9 +19,10 @@
 //!
 //! It can also fail a runtime's reads until restored: its resume-authority
 //! observation ([`CommitGateRuntimeStore::fail_resume_observations`]), so the
-//! session owner's lifecycle cannot be observed, the bounded identity read
-//! a session read consults ([`CommitGateRuntimeStore::fail_session_reads`]),
-//! so the session cannot be read, or the versioned input snapshot a cold
+//! session owner's lifecycle cannot be observed, the committed reads a
+//! session read makes (its bounded identity read and its committed snapshot;
+//! [`CommitGateRuntimeStore::fail_session_reads`]), so the session cannot be
+//! read, or the versioned input snapshot a cold
 //! registration recovers from
 //! ([`CommitGateRuntimeStore::fail_input_recovery_reads`]), so the runtime
 //! cannot reload the session from its durable store.
@@ -83,8 +84,9 @@ impl CommitGateRuntimeStore {
         *self.failing_observations.lock().expect("commit gate lock") = None;
     }
 
-    /// Fail every bounded committed-identity read of `runtime_id` (the read
-    /// a session read consults) until [`Self::restore_session_reads`].
+    /// Fail every committed read of `runtime_id`'s session (its bounded
+    /// identity read, and the committed snapshot read when the service holds
+    /// no verified body) until [`Self::restore_session_reads`].
     pub fn fail_session_reads(&self, runtime_id: LogicalRuntimeId) {
         *self.failing_reads.lock().expect("commit gate lock") = Some(runtime_id);
     }
@@ -275,6 +277,21 @@ impl meerkat_runtime::RuntimeStore for CommitGateRuntimeStore {
     > {
         Self::read_fails(&self.failing_reads, runtime_id, "session read")?;
         meerkat_runtime::RuntimeStore::load_whole_blob_store_authority(&self.inner, runtime_id)
+            .await
+    }
+
+    /// The committed body read a session read makes when the service holds
+    /// no verified body of the session; fails with the identity read, so a
+    /// failed session read does not depend on what the service holds.
+    async fn load_committed_whole_blob_snapshot(
+        &self,
+        runtime_id: &meerkat_runtime::LogicalRuntimeId,
+    ) -> Result<
+        Option<meerkat_runtime::store::CommittedWholeBlobSnapshot>,
+        meerkat_runtime::RuntimeStoreError,
+    > {
+        Self::read_fails(&self.failing_reads, runtime_id, "session read")?;
+        meerkat_runtime::RuntimeStore::load_committed_whole_blob_snapshot(&self.inner, runtime_id)
             .await
     }
 

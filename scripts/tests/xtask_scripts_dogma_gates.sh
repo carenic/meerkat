@@ -324,7 +324,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # before they accept a run. live_context_outbox_audit.sh also requires each of
 # its goals to be reported violated, so the fake reports those too.
 # durable_in_turn_steer_audit.sh also requires AuditLateNeverJoins reported
-# violated once per content input kind.
+# violated once per content input kind, and AuditCapacityRefusalNeverReached
+# reported violated under a run contributor bound of one.
 # live_unregister_cleanup_audit.sh also walks a TLC state-graph dump
 # (-dump dot <base>), so the fake writes a one-state graph whose state is
 # unregistered.
@@ -334,6 +335,11 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # and with --mutants each seeded defect's property violated.
 # run_start_hold_audit.sh requires each of its seven reachability witnesses
 # to be reported violated.
+# requeue_across_stop_audit.sh requires each of its eight reachability
+# witnesses to be reported violated.
+# materialization_rollback_keep_audit.sh requires each of its ten
+# reachability witnesses violated, and with --mutants each seeded defect's
+# invariant, the generated keep_unregister_only_without_live_input among them.
 # live_delegation_worker_start_after_close_audit.sh requires its two goals to
 # be reported violated.
 # live_context_result_barrier_audit.sh with --mutants requires its
@@ -351,9 +357,12 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # violated, and with --mutants its unguarded mutant's property violated, its
 # plain-ordering mutant's evaluation error, its two replay mutants' generated
 # invariants violated, its two RetireAtScope mutants' invariants violated,
-# and its mint mutant's action property violated.
+# its mint mutant's action property violated, and its three destroyed-runtime
+# mutants' action property violated.
 # durable_tail_classification_audit.sh requires its Ready witness violated,
 # and with --mutants each seeded defect's target invariant violated.
+# durable_tail_recovery_ownership_audit.sh requires its four witnesses
+# violated, and with --mutants each seeded defect's target invariant violated.
 printf '%s\n' \
   '#!/bin/sh' \
   'printf "%s\n" "$JAVA_TOOL_OPTIONS" > "$TLC_JAVA_OPTIONS_CAPTURE"' \
@@ -363,6 +372,7 @@ printf '%s\n' \
   'echo "Error: Action property AuditNeverRecoveryEndsCarriedRows is violated."' \
   'echo "Error: Invariant AuditReplacementNeverReceivesALaterRow is violated."' \
   'echo "Error: Invariant AuditLateNeverJoins is violated."' \
+  'echo "Error: Invariant AuditCapacityRefusalNeverReached is violated."' \
   'echo "Error: Invariant AuditNeverReopensAfterFailedRealization is violated."' \
   'echo "Error: Invariant NotGoalDeliveredConfirmed is violated."' \
   'echo "Error: Invariant NotGoalNotDelivered is violated."' \
@@ -385,6 +395,31 @@ printf '%s\n' \
   'echo "Error: Invariant NotAuditWitnessRegisteredHeldRefused is violated."' \
   'echo "Error: Invariant NotAuditWitnessStillHeldRefused is violated."' \
   'echo "Error: Invariant NotAuditWitnessStoppedHoldSurvivesResume is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetainedRunsAfterGracefulStop is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetainedRunsAfterCrash is violated."' \
+  'echo "Error: Invariant NotAuditWitnessExpiredSettled is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStagedNotRetained is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStopAbandonsEligible is violated."' \
+  'echo "Error: Invariant NotAuditWitnessPlainStopAbandons is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRequeuedWaitAnswered is violated."' \
+  'echo "Error: Invariant NotAuditWitnessSuspendedRunResumes is violated."' \
+  'echo "Error: Invariant NotAuditWitnessKeptQueuedInputRuns is violated."' \
+  'echo "Error: Invariant NotAuditWitnessKeptRequeuedInputRuns is violated."' \
+  'echo "Error: Invariant NotAuditWitnessAdmittedInputStoppedUnderKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStopRollbackEndsRecoveredInput is violated."' \
+  'echo "Error: Invariant AuditKeepEndsNoRecoveredInput is violated."' \
+  'echo "Error: Invariant AuditKeepStopsWhatItAdmitted is violated."' \
+  'echo "Error: Invariant AuditRollbackVerdictIsAFunction is violated."' \
+  'echo "Error: Invariant AuditKeepOnlyUnderKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRecycledAdmittedInputStoppedUnderKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessDedupedInputStoppedUnderKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessDrainingLiveWorkStopsRecoveredInput is violated."' \
+  'echo "Error: Invariant AuditLiveWorkForfeitsKeep is violated."' \
+  'echo "Error: Invariant NotAuditWitnessUnservedAbortKeepsRecoveredInput is violated."' \
+  'echo "Error: Invariant NotAuditWitnessUnservedRetireStopsRecoveredInput is violated."' \
+  'echo "Error: Invariant NotAuditWitnessUnservedAbortAfterLiveWorkStops is violated."' \
+  'echo "Error: Invariant AuditRetireOverUnservedStops is violated."' \
+  'echo "Error: Invariant keep_unregister_only_without_live_input is violated."' \
   'echo "Error: Action property AuditNeverUnregisters is violated."' \
   'echo "Error: Action property AuditNeverUnregistersWithPreparation is violated."' \
   'echo "Error: Invariant AuditNeverCancelsRecovery is violated."' \
@@ -449,16 +484,31 @@ printf '%s\n' \
   'echo "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated."' \
   'echo "Error: Action property AuditObservationMonotonic is violated."' \
   'echo "Error: Action property AuditMintClearsExecutionHealth is violated."' \
+  'echo "Error: Action property AuditRuntimeDestroyedRemovesOnlyItsRuntime is violated."' \
   'echo "Error: Invariant NotAuditWitnessReady is violated by the initial state:"' \
   'echo "Error: Invariant AuditClassificationIsTotalAndDisjoint is violated by the initial state:"' \
   'echo "Error: Invariant AuditRewriteClassifiesLikeStrict is violated by the initial state:"' \
   'echo "Error: Invariant AuditRewriteWithoutOneRunIdHolds is violated by the initial state:"' \
   'echo "Error: Invariant AuditRewriteEndTurnCompletes is violated by the initial state:"' \
   'echo "Error: Invariant AuditRewriteToolUseRepairs is violated by the initial state:"' \
+  'echo "Error: Invariant AuditRewriteUnattributedHolds is violated by the initial state:"' \
+  'echo "Error: Invariant AuditDisagreeingCursorHolds is violated by the initial state:"' \
+  'echo "Error: Invariant AuditCursorOnEndTurnHolds is violated by the initial state:"' \
+  'echo "Error: Invariant AuditContinuableNeedsAgreeingBoundCursor is violated by the initial state:"' \
+  'echo "Error: Invariant NotAuditWitnessIdle is violated."' \
+  'echo "Error: Invariant NotAuditWitnessRetired is violated."' \
+  'echo "Error: Invariant NotAuditWitnessTerminalized is violated."' \
+  'echo "Error: Invariant NotAuditWitnessOtherTerminal is violated."' \
+  'echo "Error: Invariant AuditRecoveryIsTotalAndDisjoint is violated."' \
+  'echo "Error: Invariant AuditUnprovenOwnershipGatesAsBefore is violated."' \
+  'echo "Error: Invariant AuditOwnershipNeverAdmitsAnotherRunOrAnUndecodableRow is violated."' \
+  'echo "Error: Invariant AuditHostRecoversAsARestartDoes is violated."' \
+  'echo "Error: Invariant AuditWriterRecoversAsRetired is violated."' \
+  'echo "Error: Invariant AuditWriterNeverContinues is violated."' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \
-  'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning ObserveMemberProgressChangedOpenRunning ObserveMemberProgressChangedIdleRunning ObserveMemberProgressUnchangedIdleRunning ObserveMemberProgressUnchangedOpenHealthyRunning ObserveMemberProgressUnchangedOpenDegradedRunning ObserveMemberProgressUnchangedOpenWedgedRunning ObserveMemberProgressStaleRunning RetireRunningReleasing RetireRunningPreservingBinding RetireRunningNoBinding RetireStoppedReleasing RetireStoppedPreservingBinding RetireStoppedNoBinding RetireAbsentRunning RetireAbsentStopped RetireMember SessionIngressDetachedForMobDestroyRunning ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped ObserveMemberRetirementArchivedAlreadyCleared ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared ObserveMemberRetirementArchivedAlreadyClearedStopped ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped BeginPlacedCompletionLifecycleQuiesceFresh MarkCompleted DestroyMob RetireAtScopeCurrentRunning RetireAtScopeCurrentStopped RetireAtScopeNoCurrentIncarnationRunning RetireAtScopeNoCurrentIncarnationStopped RetireAtScopeStaleFenceTokenRunning RetireAtScopeStaleFenceTokenStopped RetireAtScopeStaleSessionBindingRunning RetireAtScopeStaleSessionBindingStopped RetireAtScopeMobNotRunningCompleted RetireAtScopeMobNotRunningDestroyed RecoverRosterMemberResetRunning RecoverMemberSessionBindingReplacingRunning RecoverMemberSessionBindingAlreadyCurrentRunning RetireMemberPeerOnly SessionIngressDetachedForMobDestroyStopped RecoverRosterMemberRetiringRunning RecoverRosterMemberRetiringReplay RecoverRosterMemberRetiredRunning RecoverRosterMemberRetiredCurrentAlreadyAbsent RecoverRosterMemberRetiredStaleGeneration RecoverRosterMemberRetiredStaleIncarnation RecoverRosterMemberRetirementStartedReleasing RecoverRosterMemberRetirementStartedReleasingAlreadyApplied RecoverRosterMemberRetirementStartedPreservingBinding RecoverRosterMemberRetirementStartedPeerOnly RecoverRosterMemberAddressabilityRunning ObserveMemberRetirementArchivedLivePreservingTopology ObserveMemberRetirementArchivedRetiredPreservingTopology; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
+  'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning ObserveMemberProgressChangedOpenRunning ObserveMemberProgressChangedIdleRunning ObserveMemberProgressUnchangedIdleRunning ObserveMemberProgressUnchangedOpenHealthyRunning ObserveMemberProgressUnchangedOpenDegradedRunning ObserveMemberProgressUnchangedOpenWedgedRunning ObserveMemberProgressStaleRunning RetireRunningReleasing RetireRunningPreservingBinding RetireRunningNoBinding RetireStoppedReleasing RetireStoppedPreservingBinding RetireStoppedNoBinding RetireAbsentRunning RetireAbsentStopped RetireMember SessionIngressDetachedForMobDestroyRunning ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped ObserveMemberRetirementArchivedAlreadyCleared ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared ObserveMemberRetirementArchivedAlreadyClearedStopped ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped BeginPlacedCompletionLifecycleQuiesceFresh MarkCompleted DestroyMob RetireAtScopeCurrentRunning RetireAtScopeCurrentStopped RetireAtScopeNoCurrentIncarnationRunning RetireAtScopeNoCurrentIncarnationStopped RetireAtScopeStaleFenceTokenRunning RetireAtScopeStaleFenceTokenStopped RetireAtScopeStaleSessionBindingRunning RetireAtScopeStaleSessionBindingStopped RetireAtScopeMobNotRunningCompleted RetireAtScopeMobNotRunningDestroyed RecoverRosterMemberResetRunning RecoverMemberSessionBindingReplacingRunning RecoverMemberSessionBindingAlreadyCurrentRunning RetireMemberPeerOnly SessionIngressDetachedForMobDestroyStopped RecoverRosterMemberRetiringRunning RecoverRosterMemberRetiringReplay RecoverRosterMemberRetiredRunning RecoverRosterMemberRetiredCurrentAlreadyAbsent RecoverRosterMemberRetiredStaleGeneration RecoverRosterMemberRetiredStaleIncarnation RecoverRosterMemberRetirementStartedReleasing RecoverRosterMemberRetirementStartedReleasingAlreadyApplied RecoverRosterMemberRetirementStartedPreservingBinding RecoverRosterMemberRetirementStartedPeerOnly RecoverRosterMemberAddressabilityRunning ObserveMemberRetirementArchivedLivePreservingTopology ObserveMemberRetirementArchivedRetiredPreservingTopology ObserveRuntimeDestroyed ObserveRuntimeDestroyedStopped ObserveRuntimeDestroyedCompleted AdmitDestroyCleanup AuditStartRun FinishRunRunning; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"

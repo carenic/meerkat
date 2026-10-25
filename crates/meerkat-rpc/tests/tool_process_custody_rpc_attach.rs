@@ -3,13 +3,24 @@
 //!
 //! A child RPC "gateway" process creates a deferred session and starts a turn
 //! whose scripted model calls the shell tool with a delayed file effect, and
-//! is SIGKILLed while the tool runs. The next RPC incarnation (this test
-//! process) serves `turn/start` for the session, which attaches the runtime
-//! executor on demand before any agent is built. The runtime must settle the
-//! session's process custody at that attach: kill the orphaned tool, settle
-//! the interrupted input instead of replaying it (a replay would reach the
-//! model without the notice and call the tool again), and record the typed
-//! notice so the next real turn's one model call sees it.
+//! is SIGKILLed while the tool runs. The run's round commit precedes the
+//! tool, so the run is open at a committed round. The next RPC incarnation
+//! (this test process) serves `turn/start` for the session, which attaches
+//! the runtime executor on demand before any agent is built. The runtime
+//! must settle the session's process custody at that attach (kill the
+//! orphaned tool, so its delayed effect never happens), and the open run
+//! resumes: its round answers the interrupted call with an outcome-uncertain
+//! result instead of running it again, and the run ends once, without an
+//! interrupted-run notice (the call's own result tells the model). The new
+//! turn then runs after it.
+//!
+//! The scripted tool appends a line to `runs` on every execution and signals
+//! `started.fifo` on its first execution only, so a call that runs again
+//! shows as a second line (and as its effect) instead of blocking on the
+//! FIFO.
+//!
+//! The on-demand attach row runs on a HeadCanonical (SQLite) realm and on a
+//! WholeBlob (JSONL) realm.
 
 #![cfg(any(target_os = "linux", target_os = "macos"))]
 #![allow(
@@ -27,7 +38,7 @@ use std::time::Duration;
 
 use meerkat::AgentFactory;
 use meerkat_client::{LlmClient, LlmDoneOutcome, LlmError, LlmEvent, LlmRequest};
-use meerkat_core::types::{SystemNoticeBlock, SystemNoticeKind};
+use meerkat_core::types::SystemNoticeKind;
 use meerkat_core::{Config, ConfigRuntime, MemoryConfigStore, Message, SessionHistoryQuery};
 use meerkat_rpc::server::RpcServer;
 use meerkat_rpc::session_runtime::SessionRuntime;
@@ -39,6 +50,15 @@ const CHILD_TEST: &str = "rpc_custody_gateway_child";
 const TOOL_CALL_ID: &str = "call-rpc-crash";
 const INTERRUPTED_PROMPT: &str = "create the effect file";
 const NEXT_PROMPT: &str = "what happened?";
+const ANSWER: &str = "noted";
+/// Bound on the gateway reaching its tool; a gateway that exits first fails
+/// the row at once.
+const CHILD_BOUND: Duration = Duration::from_secs(120);
+/// Present in a row's root when every incarnation opens a WholeBlob (JSONL)
+/// realm instead of a HeadCanonical (SQLite) one.
+const WHOLE_BLOB_MARKER: &str = "whole-blob";
+/// Bound on turn/start answering after the restart.
+const TURN_BOUND: Duration = Duration::from_secs(90);
 const PHASE_GATEWAY: &str = "gateway";
 /// Run a quick tool, then pause the run's terminal commit (the turn is
 /// terminal in its agent, its provisional tail written, its boundary not
@@ -90,7 +110,7 @@ impl LlmClient for ScriptedShellClient {
         let mut events = Vec::new();
         let stop_reason = if answered {
             events.push(LlmEvent::TextDelta {
-                delta: "noted".to_string(),
+                delta: ANSWER.to_string(),
                 meta: None,
             });
             meerkat_core::StopReason::EndTurn
@@ -126,12 +146,63 @@ impl LlmClient for ScriptedShellClient {
     }
 }
 
+/// The scripted tool: one `runs` line per execution, the FIFO signal on the
+/// first execution only, then the delayed effect.
 fn tool_command(root: &Path) -> String {
     format!(
-        "echo started > '{}'; sleep 2; echo effect >> '{}'",
-        root.join("started.fifo").display(),
-        root.join("effect").display()
+        "echo $$ >> '{pids}'; echo ran >> '{runs}'; if [ ! -e '{once}' ]; then : > '{once}'; echo started > '{fifo}'; fi; sleep 30; echo effect >> '{effect}'",
+        pids = root.join("pids").display(),
+        runs = root.join("runs").display(),
+        once = root.join("started-once").display(),
+        fifo = root.join("started.fifo").display(),
+        effect = root.join("effect").display()
     )
+}
+
+/// Bound on the scripted tool's shells exiting after recovery killed them.
+/// The tool sleeps three times as long before its effect, so a shell gone
+/// within the bound was killed, not finished.
+const PROCESS_EXIT_BOUND: Duration = Duration::from_secs(10);
+
+/// Whether a process with this pid exists (`kill -0`; a zombie counts until
+/// it is reaped).
+fn process_exists(pid: u32) -> bool {
+    std::process::Command::new("sh")
+        .args(["-c", &format!("kill -0 {pid}")])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success())
+}
+
+/// The scripted tool's delayed effect can no longer happen: every shell the
+/// tool started has exited (recovery killed the interrupted one, which
+/// writes the effect only after its sleep). Waits a bounded time for exits
+/// still being reaped; a shell still running fails the row.
+async fn assert_tool_processes_gone(root: &Path) {
+    let pids = std::fs::read_to_string(root.join("pids")).unwrap_or_default();
+    assert!(
+        !pids.trim().is_empty(),
+        "the scripted tool recorded no process"
+    );
+    let started = std::time::Instant::now();
+    for pid in pids.lines() {
+        let pid: u32 = pid.trim().parse().expect("a recorded pid");
+        while process_exists(pid) {
+            assert!(
+                started.elapsed() < PROCESS_EXIT_BOUND,
+                "the interrupted tool's shell {pid} is still running"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    }
+}
+
+/// How many times the scripted tool has run.
+fn tool_runs(root: &Path) -> usize {
+    std::fs::read_to_string(root.join("runs"))
+        .map(|runs| runs.lines().count())
+        .unwrap_or(0)
 }
 
 /// A tool that finishes at once, appending one line per execution.
@@ -139,16 +210,76 @@ fn quick_tool_command(root: &Path) -> String {
     format!("echo ran >> '{}'", root.join("ran").display())
 }
 
+fn child_log_path(root: &Path, phase: &str) -> PathBuf {
+    root.join(format!("child-{phase}.log"))
+}
+
 fn spawn_child(root: &Path, phase: &str) -> std::process::Child {
+    let log = std::fs::File::create(child_log_path(root, phase)).expect("child log");
     std::process::Command::new(std::env::current_exe().unwrap())
         .args(["--exact", CHILD_TEST, "--nocapture", "--test-threads=1"])
         .env(PHASE_ENV, phase)
         .env(ROOT_ENV, root)
         .env("MEERKAT_DISABLE_GRAPH_DECODE_MEMO", "1")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(log.try_clone().expect("child log"))
+        .stderr(log)
         .spawn()
         .expect("spawn child")
+}
+
+/// Wait for the tool's line in `started.fifo`. A gateway that exits first,
+/// or never starts the tool within the bound, fails the row at once with its
+/// log.
+async fn tool_started(root: &Path, gateway: &mut std::process::Child, phase: &str) -> String {
+    let fifo = root.join("started.fifo");
+    // A plain thread, not a runtime blocking task, so a read that never ends
+    // cannot hold the test runtime's shutdown.
+    let reader = std::thread::spawn({
+        let fifo = fifo.clone();
+        move || std::fs::read_to_string(fifo)
+    });
+    let started = std::time::Instant::now();
+    loop {
+        if reader.is_finished() {
+            return reader
+                .join()
+                .expect("join the FIFO reader")
+                .expect("read the FIFO");
+        }
+        let failure = match gateway.try_wait().expect("poll the gateway") {
+            Some(status) => Some(format!("exited before its tool started ({status})")),
+            None if started.elapsed() > CHILD_BOUND => Some("never started its tool".to_string()),
+            None => None,
+        };
+        if let Some(failure) = failure {
+            let _ = gateway.kill();
+            let _ = gateway.wait();
+            // End the blocked read: a writer that opens and closes the FIFO
+            // gives it end of file. Detached, since its open blocks when the
+            // reader has already finished.
+            drop(std::thread::spawn(move || {
+                std::fs::OpenOptions::new().write(true).open(fifo)
+            }));
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while !reader.is_finished() && std::time::Instant::now() < deadline {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            if reader.is_finished() {
+                let line = reader
+                    .join()
+                    .expect("join the FIFO reader")
+                    .unwrap_or_default();
+                if !line.is_empty() {
+                    return line;
+                }
+            }
+            panic!(
+                "the gateway {failure}: {}",
+                std::fs::read_to_string(child_log_path(root, phase)).unwrap_or_default()
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 }
 
 /// Block (no polling) until a child writes a line into `fifo`.
@@ -171,14 +302,26 @@ fn mkfifo(path: &Path) {
 }
 
 async fn build_runtime(root: &Path, client: Arc<ScriptedShellClient>) -> Arc<SessionRuntime> {
+    let whole_blob = root.join(WHOLE_BLOB_MARKER).exists();
+    let backend = if whole_blob {
+        meerkat_store::RealmBackend::Jsonl
+    } else {
+        meerkat_store::RealmBackend::Sqlite
+    };
     let (_manifest, persistence) = meerkat::open_realm_persistence_in(
         root,
         "custody-rpc-realm",
-        Some(meerkat_store::RealmBackend::Sqlite),
+        Some(backend),
         Some(meerkat_store::RealmOrigin::Explicit),
     )
     .await
     .expect("open realm persistence");
+    let expected = if whole_blob {
+        meerkat_runtime::RuntimeSessionPersistenceProfile::WholeBlobV1
+    } else {
+        meerkat_runtime::RuntimeSessionPersistenceProfile::HeadCanonicalV1
+    };
+    assert_eq!(persistence.session_persistence_profile(), expected);
     let project = root.join("project");
     std::fs::create_dir_all(&project).expect("project dir");
     let factory = AgentFactory::new(root.join("sessions"))
@@ -323,58 +466,69 @@ async fn rpc_custody_gateway_child() {
     std::future::pending::<()>().await;
 }
 
-#[tokio::test]
-async fn rpc_on_demand_attach_settles_an_interrupted_run_instead_of_replaying_it() {
+async fn on_demand_attach_resumes_the_interrupted_run(whole_blob: bool) {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path();
+    if whole_blob {
+        std::fs::write(root.join(WHOLE_BLOB_MARKER), "").expect("profile marker");
+    }
     mkfifo(&root.join("started.fifo"));
 
     let mut gateway = spawn_child(root, PHASE_GATEWAY);
-    // Block (no polling) until the tool itself reports it is running.
-    let fifo = root.join("started.fifo");
-    let started = tokio::time::timeout(
-        Duration::from_secs(120),
-        tokio::task::spawn_blocking(move || std::fs::read_to_string(fifo)),
-    )
-    .await;
+    // The tool itself reports it is running.
+    let started = tool_started(root, &mut gateway, PHASE_GATEWAY).await;
     // Abrupt gateway death mid-tool.
     gateway.kill().unwrap();
     gateway.wait().unwrap();
-    let started = started
-        .expect("the gateway's shell tool never started")
-        .unwrap()
-        .unwrap();
     assert_eq!(started.trim(), "started");
+    assert_eq!(tool_runs(root), 1, "the gateway ran the tool once");
     let session_id = std::fs::read_to_string(root.join("session-id"))
         .expect("session id")
         .trim()
         .to_string();
 
     // Next incarnation: `turn/start` attaches the runtime executor on demand
-    // before any agent exists for the session.
+    // before any agent exists for the session. The open run resumes there,
+    // and the new turn runs after it.
     let client = Arc::new(ScriptedShellClient::new(tool_command(root)));
     let runtime = build_runtime(root, Arc::clone(&client)).await;
     let mut rpc = RpcClient::serve(Arc::clone(&runtime));
-    rpc.call(
-        "turn/start",
-        serde_json::json!({ "session_id": session_id, "prompt": NEXT_PROMPT }),
-    )
-    .await;
-
+    let id = rpc
+        .send(
+            "turn/start",
+            serde_json::json!({ "session_id": session_id, "prompt": NEXT_PROMPT }),
+        )
+        .await;
+    let response = tokio::time::timeout(TURN_BOUND, rpc.response(id))
+        .await
+        .unwrap_or_else(|_| {
+            panic!(
+                "turn/start did not answer within {TURN_BOUND:?} (the interrupted call ran {} times)",
+                tool_runs(root)
+            )
+        });
+    // The open run resumes at the attach, before the new turn is admitted,
+    // so a call it runs again has its `runs` line by now.
     assert_eq!(
-        client.requests.load(Ordering::SeqCst),
+        tool_runs(root),
         1,
-        "only the new turn reached the model: the interrupted input was not replayed"
+        "the interrupted call ran again: {response}"
     );
-    assert_eq!(
-        client.requests_seeing_notice.load(Ordering::SeqCst),
-        1,
-        "the new turn sees the interrupted-run notice"
-    );
+    assert!(response["error"].is_null(), "turn/start failed: {response}");
     assert_eq!(
         client.tool_calls.load(Ordering::SeqCst),
         0,
-        "the interrupted input was replayed"
+        "the model never asked for the call again"
+    );
+    assert_eq!(
+        client.requests.load(Ordering::SeqCst),
+        2,
+        "two model calls: the resumed run's next one and the new turn's"
+    );
+    assert_eq!(
+        client.requests_seeing_notice.load(Ordering::SeqCst),
+        0,
+        "the call's own result tells the model: no interrupted-run notice"
     );
     let history = runtime
         .session_service()
@@ -384,43 +538,87 @@ async fn rpc_on_demand_attach_settles_an_interrupted_run_instead_of_replaying_it
         )
         .await
         .expect("read history");
-    let prompts = history
+    let prompts = |prompt: &str| {
+        history
+            .messages
+            .iter()
+            .filter(|message| {
+                matches!(message, Message::User(user) if user.text_content().contains(prompt))
+            })
+            .count()
+    };
+    assert_eq!(
+        prompts(INTERRUPTED_PROMPT),
+        1,
+        "the interrupted request appears exactly once"
+    );
+    assert_eq!(prompts(NEXT_PROMPT), 1, "the new request appears once");
+    let calls = history
         .messages
         .iter()
         .filter(|message| {
-            matches!(message, Message::User(user) if user.text_content().contains(INTERRUPTED_PROMPT))
+            matches!(message, Message::BlockAssistant(answer)
+                if answer.tool_calls().any(|call| call.id == TOOL_CALL_ID))
         })
         .count();
-    assert_eq!(prompts, 1, "the interrupted request appears exactly once");
-    let blocks: Vec<&SystemNoticeBlock> = history
+    assert_eq!(calls, 1, "the model asked for the call exactly once");
+    let results: Vec<String> = history
         .messages
         .iter()
         .filter_map(|message| match message {
-            Message::SystemNotice(notice)
-                if notice.kind == SystemNoticeKind::ToolProcessRecovery =>
-            {
-                Some(notice.blocks.iter())
-            }
+            Message::ToolResults { results, .. } => Some(results),
             _ => None,
         })
         .flatten()
+        .filter(|result| result.tool_use_id == TOOL_CALL_ID)
+        .map(meerkat_core::ToolResult::text_content)
         .collect();
-    assert_eq!(blocks.len(), 1, "exactly one interrupted-run notice");
-    assert!(
-        matches!(
-            blocks[0],
-            SystemNoticeBlock::ToolProcessInterrupted { tool_call_id: Some(id), .. }
-                if id == TOOL_CALL_ID
-        ),
-        "{:?}",
-        blocks[0]
+    assert_eq!(
+        results.len(),
+        1,
+        "the call has exactly one result: {results:?}"
     );
-    // The killed tool's delayed effect never happens.
-    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert!(
+        results[0].contains("outcome_uncertain") && results[0].contains("It was not run again"),
+        "the interrupted call is answered outcome-uncertain: {}",
+        results[0]
+    );
+    assert!(
+        !history.messages.iter().any(|message| matches!(
+            message,
+            Message::SystemNotice(notice) if notice.kind == SystemNoticeKind::ToolProcessRecovery
+        )),
+        "no interrupted-run notice"
+    );
+    let answers = history
+        .messages
+        .iter()
+        .filter(|message| {
+            matches!(message, Message::BlockAssistant(answer)
+                if answer.text_blocks().collect::<String>() == ANSWER)
+        })
+        .count();
+    assert_eq!(
+        answers, 2,
+        "the resumed run and the new turn answered once each"
+    );
+    // The killed tool's delayed effect never happens: its shell is gone.
+    assert_tool_processes_gone(root).await;
     assert!(
         !root.join("effect").exists(),
         "the interrupted tool's effect happened"
     );
+    assert_eq!(tool_runs(root), 1, "the interrupted call ran again");
+}
+
+#[tokio::test]
+async fn rpc_on_demand_attach_settles_an_interrupted_run_instead_of_replaying_it() {
+    on_demand_attach_resumes_the_interrupted_run(false).await;
+}
+
+#[tokio::test]
+async fn rpc_on_demand_attach_settles_an_interrupted_run_instead_of_replaying_it_whole_blob() {
+    on_demand_attach_resumes_the_interrupted_run(true).await;
 }
 
 /// Crash window: the run finished (its tool ran once) and its provisional

@@ -184,6 +184,10 @@ pub fn format_external_event_projection(source_name: &str, body: Option<&str>) -
     }
 }
 
+/// The line a model reads after peer content whose sender declared it
+/// tainted.
+pub const SENDER_TAINT_MARKER: &str = "[sender declared this content tainted]";
+
 /// Canonical model-facing text projection for a peer message.
 pub fn format_peer_message_projection(from_peer: &str, body: &str) -> String {
     format!("Peer message from {from_peer}:\n{body}")
@@ -326,8 +330,10 @@ pub fn format_peer_lifecycle_projection(
         "Peer lifecycle notice from {sender}\n\
          Kind: {kind}{params_str}\n\
          \n\
-         This is a one-way status notice, not a request. There is nothing to \
-         answer: do not call send_response or send_message for it."
+         This is a one-way status notice, not a request. No peer reply is required. \
+         Do not call send_response or send_message for it. Complete the current \
+         local turn with a short, nonempty final response recording any action \
+         taken, or that no action is needed."
     )
 }
 
@@ -447,6 +453,34 @@ pub enum PeerIngressAuthDecision {
 impl PeerIngressAuthDecision {
     pub const fn is_exempt(self) -> bool {
         matches!(self, Self::Exempt(_))
+    }
+}
+
+/// How the transport established the sender of one queued peer ingress
+/// item, as the comms layer observed it when it admitted the item. A fact,
+/// never a trust decision: trust and routing still come from the admitted
+/// ingress fact.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[non_exhaustive]
+pub enum PeerIngressSenderAuthentication {
+    /// Nothing established the sender: an open-auth listener (which never
+    /// checks a signature, so the envelope's own `from` is a claim), a plain
+    /// event, or an item admitted without transport evidence.
+    #[default]
+    Unverified,
+    /// The listener verified the envelope's signature against the sender key
+    /// it names before the item was admitted.
+    SignatureVerified,
+    /// An in-process delivery: the sending runtime built the envelope from
+    /// its own keypair in this process, so no remote party chose the sender.
+    InProcess,
+}
+
+impl PeerIngressSenderAuthentication {
+    /// Whether the sender's identity was established by the transport, not
+    /// only claimed by the envelope.
+    pub const fn is_established(self) -> bool {
+        matches!(self, Self::SignatureVerified | Self::InProcess)
     }
 }
 
@@ -1190,6 +1224,7 @@ pub struct PeerIngressQueueClaim {
     class: PeerInputClass,
     delivery_contract: PeerIngressDeliveryContract,
     candidate: Option<PeerInputCandidate>,
+    sender_authentication: PeerIngressSenderAuthentication,
     lease: Option<Arc<dyn PeerIngressClaimLease>>,
 }
 
@@ -1221,8 +1256,27 @@ impl PeerIngressQueueClaim {
             class,
             delivery_contract,
             candidate,
+            sender_authentication: PeerIngressSenderAuthentication::Unverified,
             lease: Some(lease),
         }
+    }
+
+    /// The same claim with the sender authentication the comms queue
+    /// recorded for its item when the transport admitted it.
+    #[doc(hidden)]
+    pub fn with_sender_authentication(
+        mut self,
+        authentication: PeerIngressSenderAuthentication,
+    ) -> Self {
+        self.sender_authentication = authentication;
+        self
+    }
+
+    /// How the transport established this item's sender (see
+    /// [`PeerIngressSenderAuthentication`]). A claim built without that
+    /// evidence reads `Unverified`.
+    pub fn sender_authentication(&self) -> PeerIngressSenderAuthentication {
+        self.sender_authentication
     }
 
     pub fn claim_id(&self) -> PeerIngressClaimId {
@@ -1325,6 +1379,30 @@ pub struct PeerIngressRuntimeSnapshot {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kickoff_lifecycle_projection_preserves_no_peer_reply_and_local_completion() {
+        let peer_id = PeerId::new();
+        for kind in ["mob.kickoff_starting", "mob.kickoff_started"] {
+            let projection = format_peer_lifecycle_projection(
+                Some(peer_id),
+                Some("review_orchestrator"),
+                kind,
+                &serde_json::json!({ "peer": "review_orchestrator" }),
+            );
+
+            assert!(projection.contains(&peer_id.to_string()));
+            assert!(projection.contains("review_orchestrator"));
+            assert!(projection.contains(&format!("Kind: {kind}")));
+            assert!(projection.contains("not a request. No peer reply is required."));
+            assert!(projection.contains("Do not call send_response or send_message for it."));
+            assert!(projection.contains("Complete the current local turn"));
+            assert!(projection.contains("short, nonempty final response"));
+            assert!(projection.contains("or that no action is needed."));
+            assert!(!projection.contains("There is nothing to answer"));
+            assert!(!projection.contains("Request ID:"));
+        }
+    }
 
     #[test]
     fn interaction_id_json_roundtrip() {

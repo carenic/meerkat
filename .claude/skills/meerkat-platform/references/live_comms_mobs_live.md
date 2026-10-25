@@ -101,7 +101,7 @@ Details that matter:
 - `live/open` can promote a deferred session or recover an idle one. A
   deferred session that carries `injected_context` must run `turn/start`
   first.
-- A GPT Live close converges within 15 seconds of the first close request,
+- A GPT Live close converges within 10 seconds of the first close request,
   even when the remote side is already gone, and reports `closed`.
 
 Minimal WebSocket flow:
@@ -291,23 +291,30 @@ rkat mob live control <MOB_ID> <AGENT_IDENTITY> <CHANNEL_ID> commit-input|interr
 rkat mob live close <MOB_ID> <AGENT_IDENTITY> <CHANNEL_ID>
 ```
 
-- `open` prints the `LiveOpenResult` JSON (the owning host's WebSocket URL and
-  single-use token) on stdout. The WebSocket is the input plane, so there is
-  deliberately no `send` verb.
+- `open` prints the `LiveOpenResult` JSON (the owning host's bootstrap: a
+  WebSocket URL and single-use token, or a WebRTC token) on stdout. The
+  WebSocket is the input plane, so there is deliberately no `send` verb.
 - `status` without `--channel-id` discovers the member's active channel.
   `truncate` requires all three truncate flags.
 - RPC: `mob/member_live_open {mob_id, agent_identity, turning_mode?,
-  transport?}`, `mob/member_live_status` (optional `channel_id`),
+  transport?, execution_identity?}`, `mob/member_live_status` (optional
+  `channel_id`),
   `mob/member_live_control` (`verb`: `commit_input`, `interrupt`, `truncate`
   or `refresh`) and `mob/member_live_close`. SDKs: Python
   `Mob.member_live_open/close/status/control`, TypeScript
   `Mob.memberLiveOpen/Close/Status/Control`.
-- WebRTC refusal: `--transport webrtc` parses, but the member-live family
-  rejects it for local and placed members alike with "webrtc is not supported
-  for mob member live channels; use the session-scoped live/open". Use
-  session `live/open` with the member's session id, which works only for a
-  member local to that `rkat-rpc`. A controller cannot open a placed member's
-  session through `session/*` or `live/*`.
+- WebRTC: the member's mob checks the member, then the member's own live
+  host serves the transport or refuses it typed (`LiveTransportUnsupported`).
+  Over JSON-RPC, `transport: "webrtc"` returns a WebRTC bootstrap; answer the
+  offer with `live/webrtc/answer` on the same server. A member host started
+  by `rkat mob host` (and the one-shot CLI) serves WebSocket only. For a
+  gpt-live-1 voice channel pass `execution_identity` (`{"version": "v1",
+  "profile_id": "openai.gpt-live-1.client-context.v1"}`) with
+  `transport: "webrtc"`; it needs a server with an execution-identity
+  authority and a member local to it (a placed member refuses it). Session
+  `live/open` refuses a member's session id
+  (`mob_member_session_addressed_by_id`), and a controller cannot open a
+  placed member's session through `session/*` or `live/*`.
 - REST and the public MCP server have no member-live verbs.
 - A member host serves live channels when started with `rkat mob host
   --live-ws <ADDR> --live-ws-advertise <ws(s)://...>`; `--live-ws` without the

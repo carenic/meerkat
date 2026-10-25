@@ -459,6 +459,10 @@ pub(super) struct HostOrphanReleaseKey {
 /// method return closes the ack sender and triggers exact channel cleanup.
 pub(super) struct MemberLiveOpenDelivery {
     pub(super) open: super::bridge_protocol::LiveOpenResult,
+    /// For an open under a channel-scoped execution identity, the member
+    /// session and the pending channel's opaque machine receipt; `None` for
+    /// a stock open.
+    pub(super) execution_receipt: Option<(SessionId, String)>,
     /// The handle sends a confirmation channel and waits for the actor to
     /// delete durable cleanup custody before it returns the public Open.
     pub(super) delivery_ack: oneshot::Sender<oneshot::Sender<Result<(), MobError>>>,
@@ -869,6 +873,14 @@ pub(super) enum MobCommand {
         scope: super::actor::MemberLiveRevivalScope,
         reply_tx: oneshot::Sender<Result<super::actor::MemberLiveRevivalOutcome, MobError>>,
     },
+    /// Internal re-entry carrying the settled recovery, and the readiness
+    /// step, of one member a Running start left out (a stopped registration
+    /// it took over, or one that needed a durability reload). Boxed so the
+    /// roster entry does not widen every command on the channel.
+    StartupMemberRecovered {
+        cause: super::actor::StartupMemberRecoveryCause,
+        outcome: Box<super::actor::MemberReadinessOutcome>,
+    },
     /// Non-destructive cold reload of one member's durability-degraded
     /// runtime registration (same session id, same continuity generation).
     /// The actor performs only the authority reads inline; the quiesce,
@@ -1038,6 +1050,7 @@ pub(super) enum MobCommand {
         external_delivery_intent: Option<crate::store::MobExternalDeliveryIntent>,
         scoped_event_tx: Option<tokio::sync::mpsc::Sender<meerkat_core::ScopedAgentEvent>>,
         exact_operation: Option<super::handle::FlowOperationCustody>,
+        role_targets: Option<std::sync::Arc<crate::run::FlowRoleTargets>>,
         reply_tx: oneshot::Sender<Result<RunId, MobError>>,
     },
     PreviewRunFlowAdmission {
@@ -1522,6 +1535,9 @@ pub(super) enum MobCommand {
         agent_identity: AgentIdentity,
         turning_mode: Option<super::bridge_protocol::RealtimeTurningMode>,
         transport: Option<super::bridge_protocol::LiveOpenTransport>,
+        /// A channel-scoped execution identity (for example `gpt-live-1`),
+        /// served by a local member's live host only.
+        execution_identity: Option<meerkat_contracts::WireLiveExecutionIdentityOverrideV1>,
         reply_tx: oneshot::Sender<Result<MemberLiveOpenDelivery, MobError>>,
     },
     /// Close one NAMED live channel (DEC-P6B-C9: close-what-you-name is the
@@ -1717,6 +1733,9 @@ pub(super) enum MobCommand {
         /// Caller-owned bound for the Shutdown's waits; `None` uses the
         /// member lifecycle hang guard.
         deadline: Option<meerkat_core::time_compat::Instant>,
+        /// What the Shutdown does with inputs still queued behind a member's
+        /// running turn.
+        queued_inputs: super::QueuedInputsOnShutdown,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
     /// Test-support-only process-death simulation. Unlike `Shutdown`, this
@@ -1925,6 +1944,7 @@ impl MobCommand {
             Self::SpawnActivationStageSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::MemberTurnAdmissionSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleReadinessResolved { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::StartupMemberRecovered { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecyclePreparationResolved { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::AutonomousStopInterruptSettled => ShutdownAnswerClass::ActorCompletion,
             Self::AutonomousMemberStopsResolved { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2151,6 +2171,7 @@ impl MobCommand {
             Self::PolicySpawnSettled { .. } => "PolicySpawnSettled",
             Self::MemberTurnAdmissionSettled { .. } => "MemberTurnAdmissionSettled",
             Self::ReviveMemberLiveMaterialization { .. } => "ReviveMemberLiveMaterialization",
+            Self::StartupMemberRecovered { .. } => "StartupMemberRecovered",
             Self::ReloadMemberRegistration { .. } => "ReloadMemberRegistration",
             Self::ResumeLifecycleReadinessResolved { .. } => "ResumeLifecycleReadinessResolved",
             Self::ResumeLifecyclePreparationResolved { .. } => "ResumeLifecyclePreparationResolved",

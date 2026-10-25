@@ -159,7 +159,8 @@ fi
 # resolution followed by every run-ending arm; deeper bounds run by hand. It
 # then requires TLC to reach a durable join of the late Steer input once per
 # content input kind (five short runs), so the invariants are not vacuous for
-# any of them.
+# any of them, and substitutes a small run contributor bound for the generated
+# 256 (three short runs), so the join the contributor guard refuses is explored.
 durable_steer_audit="${workspace_root}/specs/machines/meerkat_machine/durable_in_turn_steer_audit.sh"
 if [[ ! -x "${durable_steer_audit}" ]]; then
   echo "error: durable in-turn steer audit runner is missing from workspace runfiles: ${durable_steer_audit}" >&2
@@ -219,6 +220,69 @@ fi
 if run_part audits-c; then
   echo "running bounded run-start hold TLC audit"
   TLC_WORKERS="${tlc_workers}" "${run_start_hold_audit}" "${RUN_START_HOLD_AUDIT_MAX_STEPS:-12}"
+fi
+
+# Keeping queued inputs across a graceful stop: an unregister records the
+# disposition it began with (Stop, or Requeue with a max age), and every
+# runtime stop asks the generated ClassifyStopInputDisposition which
+# non-terminal inputs it keeps. A hand-written audit over the same generated
+# model explores two processes. One session stops with either disposition or
+# none, its in-flight run cancelled or still running, with every kind,
+# durability, directedness and objective binding of the queued input, a
+# replayed stop transaction and the unregister drain. A new process (every
+# variable at the generated Init) then recovers the durable rows through the
+# generated recovery arms, settles each kept row's expiry before the serving
+# gate and runs. Under every generated invariant it checks that a kept input
+# never runs before the restart, never gets a stop's runless carrier while
+# every input a stop ends gets one, runs at most once across the restart,
+# never runs once expired or before its settlement, and is kept only under
+# Requeue and only when eligible (never objective-bound), that exactly one
+# verdict arm answers each input, and that the requeued wait-failure arm has
+# no session guard and changes no state. It requires seven witnesses reached,
+# a graceful end and a crash among them; its --mutants mode (by hand) refuses
+# fifteen seeded defects. 32 steps reach the deepest witness, and 36 the whole
+# reachable space.
+requeue_across_stop_audit="${workspace_root}/specs/machines/meerkat_machine/requeue_across_stop_audit.sh"
+if [[ ! -x "${requeue_across_stop_audit}" ]]; then
+  echo "error: requeue-across-stop audit runner is missing from workspace runfiles: ${requeue_across_stop_audit}" >&2
+  exit 1
+fi
+if run_part audits-c; then
+  echo "running bounded requeue-across-stop TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${requeue_across_stop_audit}" "${REQUEUE_ACROSS_STOP_AUDIT_MAX_STEPS:-36}"
+fi
+
+# The Keep disposition: a materialization refused before it served (a durable
+# tail held for recovery, a failed agent build) rolls its registration back
+# with an unregister that keeps every input the registration recovered from
+# the store, exactly as the store holds it, and still stops an input admitted
+# while the registration stood; so does the retirement of an executor
+# attachment that never served, while a retire that meets one still stops;
+# once the registration served live work (an admission, a deduplicated wait
+# or a recycle) its unregister keeps nothing. A hand-written audit over the
+# same generated model runs three processes: the first crashes with one
+# input staged and one queued under a key, the second recovers both through
+# the generated recovery arms, may admit a third, resolve a resubmission as a
+# duplicate or take a recycle, and rolls back with Keep (or, as the control,
+# Stop), or attaches an executor that never serves and unregisters it
+# through the unserved-attachment arm with its abort's Keep or a retire's
+# Stop, and the third recovers and serves. It checks that exactly one
+# verdict arm answers each input, that Keep stops no recovered input and
+# keeps no admitted one, that only Keep keeps, that a kept input survives
+# the rollback, that live work forfeits the keep and that a retire over the
+# unserved attachment keeps nothing, and requires ten witnesses reached; its
+# --mutants mode refuses twelve seeded defects, the machine without the Keep
+# arm, an unregister begin that keeps after live work and a retire that
+# requests Keep among them. 44 steps reach the deepest witness, and 50 the
+# whole reachable space.
+materialization_rollback_keep_audit="${workspace_root}/specs/machines/meerkat_machine/materialization_rollback_keep_audit.sh"
+if [[ ! -x "${materialization_rollback_keep_audit}" ]]; then
+  echo "error: materialization-rollback keep audit runner is missing from workspace runfiles: ${materialization_rollback_keep_audit}" >&2
+  exit 1
+fi
+if run_part audits-c; then
+  echo "running bounded materialization-rollback keep TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${materialization_rollback_keep_audit}" "${MATERIALIZATION_ROLLBACK_KEEP_AUDIT_MAX_STEPS:-50}" --mutants
 fi
 
 # The live-context result barrier: a delegation result on a channel with a
@@ -386,37 +450,45 @@ fi
 
 # The MobMachine member lifecycle (roster recovery and reset, session
 # binding, progress observations, the local Retire arms, RetireMember, the
-# session ingress detach, the runtime retirement and archive observations,
-# the resume path's replay arms, stop and resume) is empty in the MobMachine
-# ci sweep, whose AgentIdentityValues are {}, and deep.cfg, which has
-# identities, does not finish within the per-run cap: the spawn arms'
+# session ingress detach, the runtime retirement, destroy and archive
+# observations, the resume path's replay arms, stop and resume) is empty in
+# the MobMachine ci sweep, whose AgentIdentityValues are {}, and deep.cfg,
+# which has identities, does not finish within the per-run cap: the spawn arms'
 # parameters give a state millions of successors. A hand-written audit over
 # the same generated model gives one identity two runtime ids, two fence
 # tokens, generations 0..1 and two sessions, and drives every one of those
 # arms its domains enable without spawning, under every generated invariant
-# plus an action property (a member's recorded observation time never
-# decreases) and two invariants that check why the remaining member arms
-# cannot fire. It explores the whole reachable space, with no step bound: its
-# TLC VIEW leaves out the two counters the model never reads
+# plus action properties (a member's recorded observation time never
+# decreases; a new incarnation keeps no predecessor's health or failure
+# record; a member runtime destroyed removes only that runtime; the mob is
+# Destroyed only through a destroy it admitted) and two
+# invariants that check why the remaining member arms cannot fire. It
+# explores the whole reachable space, with no step bound: its TLC VIEW
+# leaves out the two counters the model never reads
 # (model_step_count, topology_epoch), which it checks first. It runs with
 # TLC coverage and requires every listed arm to fire and a floor of distinct
 # states, requires its six witnesses reached (one recovers an archived
 # identity's next incarnation, one replays a delayed final of an older
-# generation), and refuses four seeded defects (--mutants): a progress arm
+# generation), and refuses eight seeded defects (--mutants): a progress arm
 # without its observation guard, that guard rendered as a plain `<=` between
 # option records, which TLC cannot evaluate, a peer-only retirement-start
 # replay that drops a releasing retirement's session while its ingress
-# detach is pending, and the stale-incarnation Retired replay with its old
+# detach is pending, the stale-incarnation Retired replay with its old
 # guard, which prunes the Retiring runtime of an identity held for a
-# respawn.
+# respawn, a roster recovery that keeps its predecessor's execution health,
+# and a runtime destroy observation that ends the mob, one that leaves its
+# runtime live, and one that resets the mob's run count (the audit also starts
+# and finishes one mob-level run, so the count is not always zero).
 # A second run of the same audit drops the progress observations, adds the
-# mob's completion and destruction, and drives every RetireAtScope verdict
-# arm over every scope its domains name. It checks that exactly one verdict
-# arm is enabled for every scope, and that a Current verdict names the
-# identity's current runtime and fence and admits a Retire of that
-# incarnation; it requires two more witnesses and refuses two more defects:
-# the Current arm without its runtime and fence guards, and the
-# StaleFenceToken arm overlapping NoCurrentIncarnation.
+# mob's completion and destruction (DestroyMob, and the destroy admission,
+# after which a member runtime destroyed still removes only that runtime),
+# and drives every
+# RetireAtScope verdict arm over every scope its domains name. It checks
+# that exactly one verdict arm is enabled for every scope, and that a
+# Current verdict names the identity's current runtime and fence and admits
+# a Retire of that incarnation; it requires two more witnesses and refuses
+# two more defects: the Current arm without its runtime and fence guards,
+# and the StaleFenceToken arm overlapping NoCurrentIncarnation.
 member_lifecycle_audit="${workspace_root}/specs/machines/mob_machine/member_lifecycle_audit.sh"
 if [[ ! -x "${member_lifecycle_audit}" ]]; then
   echo "error: member lifecycle audit runner is missing from workspace runfiles: ${member_lifecycle_audit}" >&2
@@ -449,6 +521,31 @@ fi
 if run_part audits-b; then
   echo "running bounded durable-tail classification TLC audit"
   TLC_WORKERS="${tlc_workers}" "${durable_tail_classification_audit}" --mutants
+fi
+
+# The MeerkatMachine durable-tail recovery authorization
+# (AuthorizeDurableTailRecovery*, Idle and Retired) over the drive's
+# store-proven ownership (NotProven, ExclusiveHost, ExclusiveWriter): a
+# hand-written audit over the same generated model checks, with ENABLED in
+# each state of a short walk (Idle and Retired, with no terminal run, the
+# candidate's run terminal, or another run terminal) over all 2160
+# observation tuples, that exactly one arm answers each tuple, that an
+# unproven drive gates on the persisted facts as before, that ownership never
+# admits another run or an undecodable row, that a host decides as a restart
+# does over the row read as quiescent, and that a writer decides as for a
+# retired runtime and never continues a run. It first checks on the
+# generated model that the arms read no state but phase, the current run and
+# the terminal run, so the walk stands for every state without a current
+# run, and requires its four witnesses reached. --mutants refuses eleven
+# seeded defects, each by the invariant it targets.
+durable_tail_recovery_ownership_audit="${workspace_root}/specs/machines/meerkat_machine/durable_tail_recovery_ownership_audit.sh"
+if [[ ! -x "${durable_tail_recovery_ownership_audit}" ]]; then
+  echo "error: durable-tail recovery ownership audit runner is missing from workspace runfiles: ${durable_tail_recovery_ownership_audit}" >&2
+  exit 1
+fi
+if run_part audits-a; then
+  echo "running bounded durable-tail recovery ownership TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${durable_tail_recovery_ownership_audit}" --mutants
 fi
 
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
@@ -494,33 +591,30 @@ run_machine_verify() {
     --skip-tlc-composition adaptive_mob_bundle
 }
 
-# Shard assignment balances measured audit cost on a hosted 4-vCPU CI runner
-# (4 TLC workers, default bounds, run 38859112297), where each TLC run's JVM
-# start and model parse is most of a small audit:
-# audits-a = live unregister cleanup (295 s), live-context outbox (149 s),
-# live-context result barrier with --mutants (32 s), live worker start after
-# close (26 s): 502 s; plus mob operator grant with --mutants (88 s on a
-# local 4-worker run, not yet hosted; the other audits' hosted runs took
-# 1.5-3.1x their local ones, so expect 130-270 s);
-# audits-b = durable in-turn steer (352 s, plus its five per-kind goal runs:
-# 26 s on a local 4-worker run beside 135 s for its safety run, so expect
-# 40-80 s hosted), live delegation steer (44 s), peer request maps with
-# --mutants (64 s measured on a local 4-worker run, not yet hosted; the
-# other audits' hosted runs took 1.5-3.1x their local ones, so expect
-# 100-200 s): about 540-680 s (234 s for the shard locally);
-# plus the member lifecycle audit with --mutants (58 s on a loaded local
-# 4-worker run, fourteen small runs over each run's whole space; not yet
-# hosted, expect 90-180 s), plus the durable-tail classification audit
-# with --mutants (20 s on a local 4-worker run, sixteen runs of one state;
-# not yet hosted, expect 30-60 s; the lightest shard by a local run of all
-# three on 10-22: a 394 s, b 314 s, c 352 s);
-# audits-c = run-start hold (239 s), live media health (155 s),
-# live-context causal-tail batch with --mutants (112 s): 506 s; plus the
-# generation high-water audit with --mutants (30 s on a local 4-worker run,
-# twelve small runs, not yet hosted; expect 50-100 s).
-# Two shards ran 592 s and 812 s, past the pull-request lane target. A new
-# audit joins the lightest shard. Shard of the two audits the `all` lane runs
-# concurrently with machine-verify below:
+# Shard assignment balances measured audit cost on hosted 4-vCPU CI runners
+# (4 TLC workers, default bounds), where each TLC run's JVM start and model
+# parse is most of a small audit. Hosted seconds per audit on pull-request
+# run 40167083875, with push run 40167079954 in brackets (its runners were
+# 1.2-1.6x slower):
+# audits-a = live unregister cleanup 298 (301), mob operator grant with
+# --mutants 218 (214), durable-tail recovery ownership with --mutants 178
+# (216), live-context outbox 153 (149), live-context result barrier with
+# --mutants 34 (35), live worker start after close 26 (26): about 905 s
+# (940 s);
+# audits-b = durable in-turn steer with its per-kind goal runs 427 (the job
+# timeout cut it off after 296), member lifecycle with --mutants 202 (250),
+# peer request maps with --mutants 92 (119), live delegation steer 34 (45),
+# durable-tail classification with --mutants 24 (34): about 780 s (about
+# 985 s, the steer audit estimated at 1.26x);
+# audits-c = materialization-rollback keep with --mutants 185 (237),
+# run-start hold 144 (243), live media health 104 (153), requeue-across-stop
+# 90 (131), live-context causal-tail batch with --mutants 74 (110),
+# generation high-water with --mutants 38 (55): about 635 s (930 s).
+# With the durable-tail recovery ownership and materialization-rollback keep
+# audits both in audits-b, that shard ran 1143 s on the pull request, past
+# the 1080 s execution budget, and hit the 20-minute job timeout on the
+# push. A new audit joins the lightest shard. Shard of the two audits the
+# `all` lane runs concurrently with machine-verify below:
 durable_steer_shard="audits-b"
 live_context_outbox_shard="audits-a"
 

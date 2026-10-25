@@ -313,10 +313,18 @@ pub struct StoredAuthorizationAuditObservation {
     pub observation: AuthorizationAuditObservation,
 }
 
-/// A host-installed sink bound to the existing native input row. This trait
-/// only stages payload for that row's next existing commit; it never adds a
-/// transaction or grants permission. Production contexts require the real
-/// native implementation, not a logging-only or lossy event exporter.
+/// A sink installed by a native owner of the work's audit; it never adds a
+/// permission. It has two native owners:
+/// - work admitted as a runtime input: the sink is bound to the existing
+///   native input row and only stages payload for that row's next existing
+///   commit, never adding a transaction;
+/// - a governed service call, which no input carries: Core builds the sink
+///   for the request, it stages each observation in process, and the
+///   service-call audit log's own append makes them durable in the runtime
+///   store before the call is sent.
+///
+/// Production contexts require the real native implementation, not a
+/// logging-only or lossy event exporter.
 pub trait AuthorizationAuditSink: Send + Sync {
     fn append(
         &self,

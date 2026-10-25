@@ -17,7 +17,7 @@
 use chrono::{DateTime, Utc};
 use meerkat_core::lifecycle::{InputId, RunId};
 
-use crate::completion::CompletionOutcome;
+use crate::completion::{CompletionClass, CompletionOutcome};
 use crate::identifiers::IdempotencyKey;
 use crate::input_state::{
     InputAbandonReason, InputLifecycleState, InputTerminalCompletionBatchKey,
@@ -258,6 +258,186 @@ impl InputTerminalReceiptRead {
     #[must_use]
     pub const fn is_resolved(&self) -> bool {
         !matches!(self, Self::Pending { .. })
+    }
+}
+
+/// The body-free summary of one input's finalized terminal receipt: every
+/// identity of [`InputTerminalReceipt`], read and validated from the same
+/// durable terminal-completion batch, and the class of its outcome instead
+/// of the outcome itself.
+///
+/// It carries no run result, no callback call and no failure text, so no
+/// destination is needed to read it: a reader the scoped destination rule
+/// refuses the receipt (`ScopedResultWithheld`) can still prove that the
+/// input was finalized, with which recipients and in which class. It is a
+/// read, not a close receipt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct InputTerminalReceiptSummary {
+    input_id: InputId,
+    terminal: InputTerminalOutcome,
+    attempt_count: u32,
+    scope: InputTerminalReceiptScope,
+    owner_input_id: InputId,
+    recipient_input_ids: Vec<InputId>,
+    class: CompletionClass,
+}
+
+impl InputTerminalReceiptSummary {
+    /// The input this summary was read for.
+    #[must_use]
+    pub fn input_id(&self) -> &InputId {
+        &self.input_id
+    }
+
+    /// The input's machine-owned terminal outcome.
+    #[must_use]
+    pub fn terminal(&self) -> &InputTerminalOutcome {
+        &self.terminal
+    }
+
+    /// Execution attempts the machine recorded for the input.
+    #[must_use]
+    pub const fn attempt_count(&self) -> u32 {
+        self.attempt_count
+    }
+
+    /// The batch scope that produced the receipt.
+    #[must_use]
+    pub fn scope(&self) -> &InputTerminalReceiptScope {
+        &self.scope
+    }
+
+    /// The run whose terminal transaction committed the input's batch, when
+    /// a run did (see [`InputTerminalReceipt::run_id`]).
+    #[must_use]
+    pub fn run_id(&self) -> Option<&RunId> {
+        match &self.scope {
+            InputTerminalReceiptScope::Run { run_id } => Some(run_id),
+            InputTerminalReceiptScope::RuntimeTermination => None,
+        }
+    }
+
+    /// The canonical owner input of the batch (the first recipient).
+    #[must_use]
+    pub fn owner_input_id(&self) -> &InputId {
+        &self.owner_input_id
+    }
+
+    /// Every input finalized in the same batch, in canonical (input-id)
+    /// order (see [`InputTerminalReceipt::recipient_input_ids`]).
+    #[must_use]
+    pub fn recipient_input_ids(&self) -> &[InputId] {
+        &self.recipient_input_ids
+    }
+
+    /// The class of the batch's finalized outcome, shared by every
+    /// recipient.
+    #[must_use]
+    pub const fn class(&self) -> CompletionClass {
+        self.class
+    }
+}
+
+/// The body-free observation of one input's terminal receipt
+/// ([`crate::MeerkatMachine::input_terminal_receipt_observation`]): the
+/// variants of [`InputTerminalReceiptRead`], with a finalized receipt's
+/// outcome replaced by its class. `Pending` and `TerminalWithoutReceipt`
+/// carry exactly the read's facts, none of them a payload.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InputTerminalReceiptObservation {
+    /// No finalized receipt yet. `terminal` is `Some` once the terminal
+    /// transaction committed but its receipt is still being finalized.
+    Pending {
+        input_id: InputId,
+        phase: InputLifecycleState,
+        terminal: Option<InputTerminalOutcome>,
+        last_run_id: Option<RunId>,
+        attempt_count: u32,
+    },
+    /// The runtime finalized the input's terminal receipt.
+    Finalized(Box<InputTerminalReceiptSummary>),
+    /// The input reached a terminal through a machine transition that stages
+    /// no receipt (see [`InputTerminalReceiptRead::TerminalWithoutReceipt`]).
+    TerminalWithoutReceipt {
+        input_id: InputId,
+        terminal: InputTerminalOutcome,
+        last_run_id: Option<RunId>,
+        attempt_count: u32,
+    },
+}
+
+impl InputTerminalReceiptObservation {
+    /// The input this observation describes.
+    #[must_use]
+    pub fn input_id(&self) -> &InputId {
+        match self {
+            Self::Pending { input_id, .. } | Self::TerminalWithoutReceipt { input_id, .. } => {
+                input_id
+            }
+            Self::Finalized(summary) => summary.input_id(),
+        }
+    }
+
+    /// Whether the observation is final: a finalized receipt or a
+    /// receipt-less terminal. Only `Pending` can still change.
+    #[must_use]
+    pub const fn is_resolved(&self) -> bool {
+        !matches!(self, Self::Pending { .. })
+    }
+}
+
+/// The body-free observation of a validated receipt read: every identity is
+/// kept, and a finalized outcome is replaced by its class and dropped.
+pub(crate) fn observe_input_terminal_receipt(
+    read: InputTerminalReceiptRead,
+) -> InputTerminalReceiptObservation {
+    match read {
+        InputTerminalReceiptRead::Pending {
+            input_id,
+            phase,
+            terminal,
+            last_run_id,
+            attempt_count,
+        } => InputTerminalReceiptObservation::Pending {
+            input_id,
+            phase,
+            terminal,
+            last_run_id,
+            attempt_count,
+        },
+        InputTerminalReceiptRead::Finalized(receipt) => {
+            let InputTerminalReceipt {
+                input_id,
+                terminal,
+                attempt_count,
+                scope,
+                owner_input_id,
+                recipient_input_ids,
+                outcome,
+            } = *receipt;
+            InputTerminalReceiptObservation::Finalized(Box::new(InputTerminalReceiptSummary {
+                input_id,
+                terminal,
+                attempt_count,
+                scope,
+                owner_input_id,
+                recipient_input_ids,
+                class: outcome.class(),
+            }))
+        }
+        InputTerminalReceiptRead::TerminalWithoutReceipt {
+            input_id,
+            terminal,
+            last_run_id,
+            attempt_count,
+        } => InputTerminalReceiptObservation::TerminalWithoutReceipt {
+            input_id,
+            terminal,
+            last_run_id,
+            attempt_count,
+        },
     }
 }
 
@@ -781,6 +961,209 @@ mod tests {
                     receipt, completion,
                     "both readers agree for {terminal:?} ran={ran} migrated={unavailable}"
                 );
+            }
+        }
+    }
+
+    fn failure() -> meerkat_core::TurnErrorMetadata {
+        meerkat_core::TurnErrorMetadata::terminal(
+            meerkat_core::TurnTerminalCauseKind::FatalFailure,
+            meerkat_core::TurnTerminalOutcome::Failed,
+            "failure-text-marker",
+        )
+    }
+
+    fn pending_call(marker: &str) -> meerkat_core::error::PendingCallbackToolCall {
+        meerkat_core::error::PendingCallbackToolCall {
+            tool_use_id: format!("call-id-marker-{marker}"),
+            tool_name: format!("tool-name-marker-{marker}"),
+            args: serde_json::json!({ "argument": format!("argument-marker-{marker}") }),
+            settlement_failures: Vec::new(),
+            dedupe_key: None,
+        }
+    }
+
+    /// Every completion outcome has its body-free class. The two callback
+    /// outcomes share one, so the class does not tell one pending call from
+    /// several; no class is the pending (not yet finalized) state.
+    #[test]
+    fn every_completion_outcome_has_its_body_free_class() {
+        let result: meerkat_core::RunResult = serde_json::from_value(serde_json::json!({
+            "text": "result-marker",
+            "session_id": meerkat_core::types::SessionId::new(),
+            "usage": meerkat_core::Usage::default(),
+            "turns": 1,
+            "tool_calls": 0,
+        }))
+        .expect("minimal RunResult");
+        let one = pending_call("one");
+        let cases = [
+            (
+                CompletionOutcome::Completed(Box::new(result)),
+                CompletionClass::Completed,
+            ),
+            (
+                CompletionOutcome::CompletedWithoutResult,
+                CompletionClass::CompletedWithoutResult,
+            ),
+            (
+                CompletionOutcome::CallbackPending {
+                    tool_use_id: one.tool_use_id,
+                    tool_name: one.tool_name,
+                    args: one.args,
+                    dedupe_key: None,
+                },
+                CompletionClass::CallbackPending,
+            ),
+            (
+                CompletionOutcome::CallbackBatchPending {
+                    pending_tool_calls: vec![pending_call("two"), pending_call("three")],
+                },
+                CompletionClass::CallbackPending,
+            ),
+            (CompletionOutcome::Cancelled, CompletionClass::Cancelled),
+            (
+                CompletionOutcome::Abandoned {
+                    reason: "reason-marker".into(),
+                    error: failure(),
+                },
+                CompletionClass::Abandoned,
+            ),
+            (
+                CompletionOutcome::AbandonedWithError {
+                    reason: "reason-marker".into(),
+                    error: failure(),
+                },
+                CompletionClass::AbandonedWithError,
+            ),
+            (
+                CompletionOutcome::CompletedWithFinalizationFailure { error: failure() },
+                CompletionClass::CompletedWithFinalizationFailure,
+            ),
+            (
+                CompletionOutcome::RuntimeTerminated {
+                    reason: "reason-marker".into(),
+                    error: failure(),
+                },
+                CompletionClass::RuntimeTerminated,
+            ),
+        ];
+        for (outcome, class) in cases {
+            assert_eq!(outcome.class(), class, "{outcome:?}");
+        }
+    }
+
+    /// A receipt read projected without its outcome: a finalized receipt
+    /// keeps every identity and replaces its outcome by the outcome's class,
+    /// pending and receipt-less reads are copied as they are, and nothing of
+    /// a result, a callback call or a failure text remains.
+    #[test]
+    fn the_observation_keeps_every_identity_and_drops_the_outcome() {
+        let input_id = InputId::new();
+        let owner = InputId::new();
+        let run_id = RunId::new();
+        let pending = |terminal: Option<InputTerminalOutcome>| InputTerminalReceiptRead::Pending {
+            input_id: input_id.clone(),
+            phase: InputLifecycleState::Consumed,
+            terminal,
+            last_run_id: Some(run_id.clone()),
+            attempt_count: 2,
+        };
+        for terminal in [None, Some(InputTerminalOutcome::Consumed)] {
+            let observed = observe_input_terminal_receipt(pending(terminal.clone()));
+            assert_eq!(
+                observed,
+                InputTerminalReceiptObservation::Pending {
+                    input_id: input_id.clone(),
+                    phase: InputLifecycleState::Consumed,
+                    terminal,
+                    last_run_id: Some(run_id.clone()),
+                    attempt_count: 2,
+                }
+            );
+            assert!(!observed.is_resolved(), "pending stays pending");
+        }
+
+        let receipt_less =
+            observe_input_terminal_receipt(InputTerminalReceiptRead::TerminalWithoutReceipt {
+                input_id: input_id.clone(),
+                terminal: InputTerminalOutcome::Coalesced {
+                    aggregate_id: owner.clone(),
+                },
+                last_run_id: None,
+                attempt_count: 1,
+            });
+        assert_eq!(
+            receipt_less,
+            InputTerminalReceiptObservation::TerminalWithoutReceipt {
+                input_id: input_id.clone(),
+                terminal: InputTerminalOutcome::Coalesced {
+                    aggregate_id: owner.clone(),
+                },
+                last_run_id: None,
+                attempt_count: 1,
+            }
+        );
+
+        let finalized = |outcome: CompletionOutcome| {
+            InputTerminalReceiptRead::Finalized(Box::new(InputTerminalReceipt {
+                input_id: input_id.clone(),
+                terminal: InputTerminalOutcome::Consumed,
+                attempt_count: 3,
+                scope: InputTerminalReceiptScope::Run {
+                    run_id: run_id.clone(),
+                },
+                owner_input_id: owner.clone(),
+                recipient_input_ids: vec![owner.clone(), input_id.clone()],
+                outcome,
+            }))
+        };
+        let outcomes = [
+            CompletionOutcome::Completed(Box::new(
+                serde_json::from_value(serde_json::json!({
+                    "text": "result-marker",
+                    "session_id": meerkat_core::types::SessionId::new(),
+                    "usage": meerkat_core::Usage::default(),
+                    "turns": 1,
+                    "tool_calls": 0,
+                }))
+                .expect("minimal RunResult"),
+            )),
+            CompletionOutcome::CallbackBatchPending {
+                pending_tool_calls: vec![pending_call("batch")],
+            },
+            CompletionOutcome::AbandonedWithError {
+                reason: "reason-marker".into(),
+                error: failure(),
+            },
+        ];
+        for outcome in outcomes {
+            let class = outcome.class();
+            let observed = observe_input_terminal_receipt(finalized(outcome));
+            let InputTerminalReceiptObservation::Finalized(summary) = &observed else {
+                panic!("a finalized receipt is observed finalized: {observed:?}")
+            };
+            assert!(observed.is_resolved());
+            assert_eq!(summary.input_id(), &input_id);
+            assert_eq!(summary.terminal(), &InputTerminalOutcome::Consumed);
+            assert_eq!(summary.attempt_count(), 3);
+            assert_eq!(summary.run_id(), Some(&run_id));
+            assert_eq!(summary.owner_input_id(), &owner);
+            assert_eq!(
+                summary.recipient_input_ids(),
+                &[owner.clone(), input_id.clone()]
+            );
+            assert_eq!(summary.class(), class);
+            let text = format!("{observed:?}");
+            for marker in [
+                "result-marker",
+                "call-id-marker",
+                "tool-name-marker",
+                "argument-marker",
+                "reason-marker",
+                "failure-text-marker",
+            ] {
+                assert!(!text.contains(marker), "{marker} left in {text}");
             }
         }
     }

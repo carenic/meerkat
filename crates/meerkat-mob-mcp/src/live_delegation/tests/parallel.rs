@@ -43,6 +43,8 @@ struct ScriptedClient {
     entered: tokio::sync::mpsc::UnboundedSender<ObservedCall>,
     cancelled: tokio::sync::mpsc::UnboundedSender<usize>,
     gates: std::sync::Mutex<HashMap<usize, Arc<tokio::sync::Semaphore>>>,
+    /// Calls that answer with one tool call (by tool name) instead of text.
+    tool_calls: std::sync::Mutex<HashMap<usize, String>>,
 }
 
 impl ScriptedClient {
@@ -59,10 +61,20 @@ impl ScriptedClient {
                 entered: entered_tx,
                 cancelled: cancelled_tx,
                 gates: std::sync::Mutex::new(HashMap::new()),
+                tool_calls: std::sync::Mutex::new(HashMap::new()),
             }),
             entered_rx,
             cancelled_rx,
         )
+    }
+
+    /// Let call `index`, once released, ask for one call of tool `name`
+    /// instead of answering with text.
+    fn answer_with_tool_call(&self, index: usize, name: &str) {
+        self.tool_calls
+            .lock()
+            .expect("tool call map")
+            .insert(index, name.to_string());
     }
 
     fn gate(&self, index: usize) -> Arc<tokio::sync::Semaphore> {
@@ -155,16 +167,40 @@ impl meerkat_client::LlmClient for ScriptedClient {
                 .expect("scripted gate")
                 .forget();
             call.completed = true;
-            Ok::<_, meerkat_client::LlmError>(meerkat_client::LlmEvent::TextDelta {
-                delta: format!("completed:{index}"),
-                meta: None,
-            })
+            let tool_call = self
+                .tool_calls
+                .lock()
+                .expect("tool call map")
+                .remove(&index);
+            let events = match tool_call {
+                Some(name) => vec![
+                    meerkat_client::LlmEvent::ToolCallComplete {
+                        id: format!("scripted-call-{index}"),
+                        name,
+                        args: serde_json::json!({}),
+                        meta: None,
+                    },
+                    meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::ToolUse,
+                        ),
+                    },
+                ],
+                None => vec![
+                    meerkat_client::LlmEvent::TextDelta {
+                        delta: format!("completed:{index}"),
+                        meta: None,
+                    },
+                    meerkat_client::LlmEvent::Done {
+                        outcome: meerkat_client::LlmDoneOutcome::success(
+                            meerkat_core::StopReason::EndTurn,
+                        ),
+                    },
+                ],
+            };
+            futures::stream::iter(events.into_iter().map(Ok::<_, meerkat_client::LlmError>))
         });
-        Box::pin(response.chain(futures::stream::once(async {
-            Ok(meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
-            })
-        })))
+        Box::pin(response.flatten())
     }
 
     fn provider(&self) -> meerkat_core::Provider {
@@ -1531,6 +1567,70 @@ async fn a_continuation_that_misses_the_workers_last_model_call_is_not_delivered
             || fx.unconfirmed_continuations(&split).await.is_none()
     })
     .await;
+    fx.close().await;
+}
+
+/// The rest of the user's sentence reaches a running worker after its tool
+/// round: it lands at the worker's next model call, and the worker completes
+/// and releases its result. By then the round's commits wrote the run's
+/// provisional tail, and the steer's boundary receipt is a mid-run receipt of
+/// that run. Live gate run 40073579938 (release/0.9.5): the store refused that
+/// receipt beside the tail, the worker's runtime went repair-blocked, and the
+/// delegation ended Failed with its result never delivered.
+#[tokio::test]
+async fn a_continuation_after_the_workers_tool_round_lands_and_the_worker_completes() {
+    let mut fx = fixture(true).await;
+    // The worker's first model call asks for a tool, so its round commits
+    // run before the next model call; that call ends the turn.
+    fx.client.answer_with_tool_call(0, "count_workspace_files");
+    let quick = fx
+        .delegate("quick", "how many files are in your working directory")
+        .await;
+    let head = fx.next_call().await;
+    assert_eq!(head.index, 0);
+
+    fx.commit_continuation("continuation-1", " and answer in one sentence")
+        .await;
+    fx.continue_utterance("quick", "continuation-1", " and answer in one sentence")
+        .await;
+    assert!(fx.steered("continuation-1").await);
+    fx.client.release(0);
+    let next = fx.next_call().await;
+    fx.client.release(next.index);
+    wait_until(WAIT, || async {
+        matches!(
+            fx.schedule_state(&quick).await,
+            Some(
+                meerkat_runtime::live_execution::LiveDelegationScheduleState::Completed
+                    | meerkat_runtime::live_execution::LiveDelegationScheduleState::Failed
+            )
+        )
+    })
+    .await;
+    assert_eq!(
+        fx.schedule_state(&quick).await,
+        Some(meerkat_runtime::live_execution::LiveDelegationScheduleState::Completed),
+        "a steer into the running worker must not fail it"
+    );
+    assert!(
+        next.task_text.contains("answer in one sentence"),
+        "the continuation reached the worker's next model call: {next:?}"
+    );
+    assert_eq!(
+        fx.runtime
+            .live_delegation_steer_delivered(&fx.session_id, "continuation-1")
+            .await
+            .expect("machine state"),
+        Some(true)
+    );
+    wait_until(WAIT, || async {
+        fx.announced_releases()
+            .await
+            .iter()
+            .any(|(key, _)| key == "quick-delegation")
+    })
+    .await;
+    fx.assert_nothing_cancelled();
     fx.close().await;
 }
 

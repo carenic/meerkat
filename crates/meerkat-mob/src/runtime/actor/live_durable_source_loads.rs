@@ -1,18 +1,20 @@
-//! Single flight for the live open's durable-source body load.
+//! Single flight for the live open's durable-source check.
 //!
 //! The actor validates a member's roster and session binding inline for
-//! `ValidateLiveDurableSourceAvailability`, then loads the durable source body
-//! off the actor loop. That load reads, decodes, and hashes the whole session
-//! body, so it can take seconds on a large member. Without sharing, every
-//! concurrent open started its own load, and a caller that timed out left its
-//! load running while the next caller started another.
+//! `ValidateLiveDurableSourceAvailability`, then checks the durable source off
+//! the actor loop: the store's own observation that the exact session is
+//! committed and not archived. The check reads no session body, so a run's
+//! provisional tail standing ahead of the committed snapshot does not refuse
+//! it. It still goes to the store, which can stall. Without sharing, every
+//! concurrent open started its own check, and a caller that timed out left its
+//! check running while the next caller started another.
 //!
-//! This registry keeps at most one body load per session in flight. A caller
-//! that arrives while a load runs waits on that load's result instead of
-//! starting a second one; a caller that goes away leaves the one load running
-//! for the others. A load still running at [`LIVE_DURABLE_SOURCE_LOAD_CEILING`]
-//! is abandoned as temporarily unavailable, and its slot is released so a
-//! stalled store cannot pin every later open to one hung read.
+//! This registry keeps at most one check per session in flight. A caller that
+//! arrives while a check runs waits on that check's result instead of starting
+//! a second one; a caller that goes away leaves the one check running for the
+//! others. A check still running at [`LIVE_DURABLE_SOURCE_LOAD_CEILING`] is
+//! abandoned as temporarily unavailable, and its slot is released so a stalled
+//! store cannot pin every later open to one hung read.
 //!
 //! This is actor-owned shell state for read sharing. It holds no MobMachine
 //! fact: the roster and binding checks stay inline in the actor.
@@ -25,16 +27,16 @@ use meerkat_core::types::SessionId;
 use tokio::sync::{oneshot, watch};
 
 use super::super::LiveBridgeOperationStartError;
-use super::super::session_service::MobSessionService;
+use super::super::session_service::{LiveDurableSourceObservation, MobSessionService};
 
-/// Longest one shared durable-source body load is driven before it is
-/// abandoned as temporarily unavailable.
+/// Longest one shared durable-source check is driven before it is abandoned
+/// as temporarily unavailable.
 pub(in crate::runtime) const LIVE_DURABLE_SOURCE_LOAD_CEILING: Duration = Duration::from_secs(30);
 
 type LoadResult = Result<(), LiveBridgeOperationStartError>;
 type LoadSlot = watch::Receiver<Option<LoadResult>>;
 
-/// Durable-source body loads in flight, at most one per session.
+/// Durable-source checks in flight, at most one per session.
 #[derive(Clone, Default)]
 pub(in crate::runtime) struct LiveDurableSourceLoads(
     Arc<std::sync::Mutex<HashMap<SessionId, LoadSlot>>>,
@@ -47,14 +49,14 @@ impl LiveDurableSourceLoads {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// How many body loads are running.
+    /// How many checks are running.
     #[cfg(test)]
     pub(in crate::runtime) fn in_flight(&self) -> usize {
         self.lock().len()
     }
 
-    /// Answer `reply_tx` from the one body load of `session_id` in flight,
-    /// starting that load when none is running. Never blocks the caller.
+    /// Answer `reply_tx` from the one check of `session_id` in flight,
+    /// starting that check when none is running. Never blocks the caller.
     pub(in crate::runtime) fn validate(
         &self,
         session_service: Arc<dyn MobSessionService>,
@@ -87,7 +89,7 @@ impl LiveDurableSourceLoads {
                     tracing::warn!(
                         session_id = %slot.session_id,
                         ceiling_ms = LIVE_DURABLE_SOURCE_LOAD_CEILING.as_millis() as u64,
-                        "live durable-source body load abandoned at its ceiling"
+                        "live durable-source check abandoned at its ceiling"
                     );
                     Err(LiveBridgeOperationStartError::TemporarilyUnavailable)
                 });
@@ -132,20 +134,19 @@ impl Drop for LoadSlotRelease {
     }
 }
 
-/// The durable-source check itself: the exact session must load.
+/// The durable-source check itself: the exact session is committed and not
+/// archived. Body-free (the store's own observation), so a run whose
+/// provisional tail stands ahead of the committed snapshot does not reject
+/// it.
 async fn load_durable_source(
     session_service: &dyn MobSessionService,
     session_id: &SessionId,
 ) -> LoadResult {
-    let source = session_service
-        .load_persisted_session(session_id)
+    match session_service
+        .observe_live_durable_source(session_id)
         .await
-        .map_err(|_| LiveBridgeOperationStartError::Rejected)?;
-    if source
-        .as_ref()
-        .is_none_or(|session| session.id() != session_id)
     {
-        return Err(LiveBridgeOperationStartError::Rejected);
+        Ok(LiveDurableSourceObservation::Committed { .. }) => Ok(()),
+        Ok(_) | Err(_) => Err(LiveBridgeOperationStartError::Rejected),
     }
-    Ok(())
 }
