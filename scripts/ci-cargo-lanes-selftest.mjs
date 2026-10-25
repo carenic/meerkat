@@ -497,7 +497,7 @@ function assertArchivedLanes(plan, label) {
 // authorization dependency has native facade fixtures in its own dev graph.
 {
   const plan = planFor(["crates/meerkat-runtime/src/lib.rs"]);
-  assert.equal(plan.pr_unit_budget_minutes, 18, "runtime uses the 18-minute surrogate packing cap");
+  assert.equal(plan.pr_unit_budget_minutes, 20, "runtime uses the 20-minute surrogate packing cap");
   assert.deepEqual(
     unitOf(plan).shards.map((shard) => shard.packages).sort(),
     [["meerkat-runtime"]],
