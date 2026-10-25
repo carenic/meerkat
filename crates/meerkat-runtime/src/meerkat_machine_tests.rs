@@ -60081,10 +60081,12 @@ mod terminal_completion_batch_bound {
     /// A retirement cleanup of 300 inputs, four of them directed and admitted
     /// first, commits two batches: the first 256 in canonical order, with
     /// every directed input, and 44 nondirected ones with no outbox. When the
-    /// publisher refuses the directed terminals, the process-owned dispatch
-    /// keeps retrying them past the caller's deadline (the mob provisioner's
-    /// cleanup passes one), and the 44 inputs' waiters are answered all the
-    /// same. Neither the dispatch nor a later retry ever resolves a batch with
+    /// publisher refuses the directed terminals, the cleanup answers
+    /// RuntimeTerminalPublicationInProgress once the caller's deadline passes
+    /// (the mob provisioner's cleanup passes one) while the process-owned
+    /// dispatch keeps the publication and keeps retrying it; it never reports
+    /// success while the publication is refused. The 44 inputs' waiters are
+    /// answered all the same. Neither the dispatch nor a later retry ever resolves a batch with
     /// no outbox, and a retired session reaches no drain that would. RED while
     /// the cleanup awaited the directed dispatch first and returned its error
     /// before resolving them.
@@ -60123,17 +60125,17 @@ mod terminal_completion_batch_bound {
         )
         .await
         .expect("the retirement cleanup returns by its deadline");
-        // The deadline bounds only the cleanup's answer. The cleanup commits
-        // the abandonment and starts the dispatch before it reads the
-        // deadline, so it can answer before the dispatch first calls the
-        // publisher; the dispatch keeps retrying on its own. Either answer is
-        // the cleanup's: done in time, or the documented in-progress refusal.
+        // The publisher refuses every directed terminal, so the dispatch never
+        // converges, and the cleanup answers in-progress once its deadline
+        // passes while the dispatch keeps the publication. It commits the
+        // abandonment and starts the dispatch before it reads the deadline,
+        // so it can answer before the dispatch first calls the publisher.
         assert!(
             matches!(
                 cleanup,
-                Ok(_) | Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
+                Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
             ),
-            "the cleanup answers in time or reports the publication in progress: {cleanup:?}"
+            "the cleanup reports the refused publication in progress: {cleanup:?}"
         );
         tokio::time::timeout(Duration::from_secs(30), async {
             while publisher.calls.load(Ordering::SeqCst) == 0 {
