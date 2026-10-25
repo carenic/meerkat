@@ -324,7 +324,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # before they accept a run. live_context_outbox_audit.sh also requires each of
 # its goals to be reported violated, so the fake reports those too.
 # durable_in_turn_steer_audit.sh also requires AuditLateNeverJoins reported
-# violated once per content input kind.
+# violated once per content input kind, and AuditCapacityRefusalNeverReached
+# reported violated under a run contributor bound of one.
 # live_unregister_cleanup_audit.sh also walks a TLC state-graph dump
 # (-dump dot <base>), so the fake writes a one-state graph whose state is
 # unregistered.
@@ -371,6 +372,7 @@ printf '%s\n' \
   'echo "Error: Action property AuditNeverRecoveryEndsCarriedRows is violated."' \
   'echo "Error: Invariant AuditReplacementNeverReceivesALaterRow is violated."' \
   'echo "Error: Invariant AuditLateNeverJoins is violated."' \
+  'echo "Error: Invariant AuditCapacityRefusalNeverReached is violated."' \
   'echo "Error: Invariant AuditNeverReopensAfterFailedRealization is violated."' \
   'echo "Error: Invariant NotGoalDeliveredConfirmed is violated."' \
   'echo "Error: Invariant NotGoalNotDelivered is violated."' \
