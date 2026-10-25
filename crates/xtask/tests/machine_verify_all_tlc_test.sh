@@ -280,7 +280,7 @@ if [[ ! -x "${materialization_rollback_keep_audit}" ]]; then
   echo "error: materialization-rollback keep audit runner is missing from workspace runfiles: ${materialization_rollback_keep_audit}" >&2
   exit 1
 fi
-if run_part audits-b; then
+if run_part audits-c; then
   echo "running bounded materialization-rollback keep TLC audit"
   TLC_WORKERS="${tlc_workers}" "${materialization_rollback_keep_audit}" "${MATERIALIZATION_ROLLBACK_KEEP_AUDIT_MAX_STEPS:-50}" --mutants
 fi
@@ -543,7 +543,7 @@ if [[ ! -x "${durable_tail_recovery_ownership_audit}" ]]; then
   echo "error: durable-tail recovery ownership audit runner is missing from workspace runfiles: ${durable_tail_recovery_ownership_audit}" >&2
   exit 1
 fi
-if run_part audits-b; then
+if run_part audits-a; then
   echo "running bounded durable-tail recovery ownership TLC audit"
   TLC_WORKERS="${tlc_workers}" "${durable_tail_recovery_ownership_audit}" --mutants
 fi
@@ -591,41 +591,30 @@ run_machine_verify() {
     --skip-tlc-composition adaptive_mob_bundle
 }
 
-# Shard assignment balances measured audit cost on a hosted 4-vCPU CI runner
-# (4 TLC workers, default bounds, run 38859112297), where each TLC run's JVM
-# start and model parse is most of a small audit:
-# audits-a = live unregister cleanup (295 s), live-context outbox (149 s),
-# live-context result barrier with --mutants (32 s), live worker start after
-# close (26 s): 502 s; plus mob operator grant with --mutants (88 s on a
-# local 4-worker run, not yet hosted; the other audits' hosted runs took
-# 1.5-3.1x their local ones, so expect 130-270 s);
-# audits-b = durable in-turn steer (352 s, plus its five per-kind goal runs:
-# 26 s on a local 4-worker run beside 135 s for its safety run, so expect
-# 40-80 s hosted), live delegation steer (44 s), peer request maps with
-# --mutants (64 s measured on a local 4-worker run, not yet hosted; the
-# other audits' hosted runs took 1.5-3.1x their local ones, so expect
-# 100-200 s): about 540-680 s (234 s for the shard locally);
-# plus the member lifecycle audit with --mutants (58 s on a loaded local
-# 4-worker run, fourteen small runs over each run's whole space; not yet
-# hosted, expect 90-180 s), plus the durable-tail classification audit
-# with --mutants (20 s on a local 4-worker run, sixteen runs of one state;
-# not yet hosted, expect 30-60 s; the lightest shard by a local run of all
-# three on 10-22: a 394 s, b 314 s, c 352 s), plus the durable-tail recovery
-# ownership audit with --mutants (127 s on a local 4-worker run, thirteen runs
-# of nine states over the whole MeerkatMachine model, whose parse is most of
-# each run; not yet hosted, expect 190-380 s), plus the
-# materialization-rollback keep audit with --mutants (about 100 s on a local
-# 8-worker run, seventeen runs of at most 16,468 distinct states; not yet
-# hosted, expect 150-300 s);
-# audits-c = run-start hold (239 s), live media health (155 s),
-# live-context causal-tail batch with --mutants (112 s): 506 s; plus the
-# generation high-water audit with --mutants (30 s on a local 4-worker run,
-# twelve small runs, not yet hosted; expect 50-100 s), plus the
-# requeue-across-stop audit (about 55 s on a local 4-worker run, seven runs
-# of about 8 s each; not yet hosted, expect 100-150 s).
-# Two shards ran 592 s and 812 s, past the pull-request lane target. A new
-# audit joins the lightest shard. Shard of the two audits the `all` lane runs
-# concurrently with machine-verify below:
+# Shard assignment balances measured audit cost on hosted 4-vCPU CI runners
+# (4 TLC workers, default bounds), where each TLC run's JVM start and model
+# parse is most of a small audit. Hosted seconds per audit on pull-request
+# run 40167083875, with push run 40167079954 in brackets (its runners were
+# 1.2-1.6x slower):
+# audits-a = live unregister cleanup 298 (301), mob operator grant with
+# --mutants 218 (214), durable-tail recovery ownership with --mutants 178
+# (216), live-context outbox 153 (149), live-context result barrier with
+# --mutants 34 (35), live worker start after close 26 (26): about 905 s
+# (940 s);
+# audits-b = durable in-turn steer with its per-kind goal runs 427 (the job
+# timeout cut it off after 296), member lifecycle with --mutants 202 (250),
+# peer request maps with --mutants 92 (119), live delegation steer 34 (45),
+# durable-tail classification with --mutants 24 (34): about 780 s (about
+# 985 s, the steer audit estimated at 1.26x);
+# audits-c = materialization-rollback keep with --mutants 185 (237),
+# run-start hold 144 (243), live media health 104 (153), requeue-across-stop
+# 90 (131), live-context causal-tail batch with --mutants 74 (110),
+# generation high-water with --mutants 38 (55): about 635 s (930 s).
+# With the durable-tail recovery ownership and materialization-rollback keep
+# audits both in audits-b, that shard ran 1143 s on the pull request, past
+# the 1080 s execution budget, and hit the 20-minute job timeout on the
+# push. A new audit joins the lightest shard. Shard of the two audits the
+# `all` lane runs concurrently with machine-verify below:
 durable_steer_shard="audits-b"
 live_context_outbox_shard="audits-a"
 
