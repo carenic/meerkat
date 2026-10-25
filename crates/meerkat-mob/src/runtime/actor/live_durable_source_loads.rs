@@ -36,7 +36,7 @@ pub(in crate::runtime) const LIVE_DURABLE_SOURCE_LOAD_CEILING: Duration = Durati
 type LoadResult = Result<(), LiveBridgeOperationStartError>;
 type LoadSlot = watch::Receiver<Option<LoadResult>>;
 
-/// Durable-source body loads in flight, at most one per session.
+/// Durable-source checks in flight, at most one per session.
 #[derive(Clone, Default)]
 pub(in crate::runtime) struct LiveDurableSourceLoads(
     Arc<std::sync::Mutex<HashMap<SessionId, LoadSlot>>>,
@@ -49,14 +49,14 @@ impl LiveDurableSourceLoads {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    /// How many body loads are running.
+    /// How many checks are running.
     #[cfg(test)]
     pub(in crate::runtime) fn in_flight(&self) -> usize {
         self.lock().len()
     }
 
-    /// Answer `reply_tx` from the one body load of `session_id` in flight,
-    /// starting that load when none is running. Never blocks the caller.
+    /// Answer `reply_tx` from the one check of `session_id` in flight,
+    /// starting that check when none is running. Never blocks the caller.
     pub(in crate::runtime) fn validate(
         &self,
         session_service: Arc<dyn MobSessionService>,

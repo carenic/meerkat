@@ -8715,7 +8715,7 @@ pub(super) struct MobActor {
     /// The underlying member-status session-view reads still running, one
     /// per session, shared with the observation tasks.
     pub(super) member_status_view_reads: MemberStatusViewReads,
-    /// The live open's durable-source body loads still running, one per
+    /// The live open's durable-source checks still running, one per
     /// session, shared by concurrent opens (see `live_durable_source_loads`).
     #[cfg(feature = "openai-live")]
     pub(super) live_durable_source_loads: live_durable_source_loads::LiveDurableSourceLoads,
@@ -28845,15 +28845,14 @@ impl MobActor {
                     }
                     .await;
                     // The roster and binding checks above are the actor's
-                    // authority and stay inline. Loading the durable source
-                    // body is store I/O that took seconds on large members
-                    // and, run inline, queued every later mob command behind
-                    // one voice status poll. Reply from a detached task so
-                    // the actor keeps serving; the reply contract is
-                    // unchanged.
-                    // Concurrent opens of one session share one body load
+                    // authority and stay inline. The durable-source check is
+                    // store I/O (body-free, but a store can stall), and run
+                    // inline it queued every later mob command behind one
+                    // voice status poll. Reply from a detached task so the
+                    // actor keeps serving; the reply contract is unchanged.
+                    // Concurrent opens of one session share one check
                     // (`live_durable_source_loads`), so a timed-out caller
-                    // never leaves a duplicate load behind.
+                    // never leaves a duplicate check behind.
                     match result {
                         Err(error) => {
                             let _ = reply_tx.send(Err(error));

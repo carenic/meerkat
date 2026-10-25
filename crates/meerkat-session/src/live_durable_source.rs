@@ -6,7 +6,9 @@
 //! entry, and the machine lifecycle row. It never reads, decodes, or hashes
 //! the session body, and it takes neither the recovery gate nor the
 //! turn-finalization boundary, so a member mid-turn or a slow body cannot stall
-//! it. The actual live open still validates the body through its own path.
+//! it. The live open's source check asks the same question. A body is read
+//! only where the live path loads a session that has no live actor, and that
+//! strict load refuses, typed, a body it cannot read.
 
 /// Body-free classification of a session's durable transcript source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
