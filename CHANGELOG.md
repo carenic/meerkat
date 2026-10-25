@@ -2432,6 +2432,12 @@ them.
 
 ### Changed
 
+- `meerkat`: a GPT Live close whose provider never confirms now retires the
+  transport locally after 10 s instead of 15 s
+  (`LIVE_CLOSE_CONFIRMATION_BOUND`), so `mob/member_live_close` of a
+  gpt-live-1 member channel converges inside the mob's 15 s member live
+  close timeout instead of timing out on its first request.
+
 - `meerkat-core`, `meerkat-session`, `meerkat-runtime`: stopping a durable
   run (for example with `MeerkatMachine::stop_run`) keeps the rounds it has
   already committed in the transcript, closed as an interrupted run with a
@@ -3683,6 +3689,17 @@ them.
   `Unsupported`, nothing dispatched to its host): the supervisor bridge does
   not carry an execution identity, and a member host started by
   `rkat mob host` serves WebSocket only. The 0.9.6 line extends the bridge.
+
+- `meerkat`, `meerkat-runtime`: when lifecycle disposal itself closes a
+  channel opened under a channel-scoped `execution_identity` (gpt-live-1),
+  it closes it without the execution-identity authority's physical close and
+  unbind, so the authority's transport can keep that channel's binding. That
+  happens when such a channel is still open as its session is archived or
+  destroyed: a session-scoped channel, or a mob member's channel whose
+  session is disposed outside its mob. The mob's own close, retire, destroy,
+  stop and shutdown close the channel through the authority first. Close the
+  channel (`live/close` or `mob/member_live_close`) before disposing of its
+  session. The 0.9.6 line runs the authority's close ahead of disposal.
 
 ## [0.9.4] - 2026-10-20
 

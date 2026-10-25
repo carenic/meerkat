@@ -676,9 +676,12 @@ after the mob's member checks:
 Post the offer with `live/webrtc/answer` on the same connection, as above.
 The server's execution-identity authority serves it exactly as it serves
 `live/open`, and `mob/member_live_close` closes the channel through that
-authority. The member must be local to the JSON-RPC server: a placed member
-refuses `execution_identity` with `Unsupported` in 0.9.5, before anything
-reaches its host.
+authority. An execution-identity authority's refusal (access denied, an
+identity it does not admit, a member it finds ineligible) answers `-32026`
+(host unavailable) with the authority's reason, where `live/open` answers
+`-32020` or `INVALID_PARAMS`. The member must be local to the JSON-RPC
+server: a placed member refuses `execution_identity` with `Unsupported` in
+0.9.5, before anything reaches its host.
 
 Public Live has no authoritative turn identifiers, completed-turn events, or
 delegation task text. Meerkat synthesizes turns from transcript role

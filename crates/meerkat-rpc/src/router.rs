@@ -19963,6 +19963,79 @@ provider_params = { provider_tag = { provider = "anthropic", cache_control = "di
         );
     }
 
+    /// Retiring a mob member whose gpt-live-1-shaped channel is still open
+    /// closes that channel through the execution-identity authority in the
+    /// retirement's own live close, before the member's session is disposed.
+    #[cfg(all(feature = "openai-live", feature = "comms"))]
+    #[tokio::test]
+    async fn retiring_a_mob_member_closes_its_execution_identity_channel_through_the_authority() {
+        let _effect_test_guard = STRICT_LIVE_OPEN_EFFECT_TEST_LOCK.lock().await;
+        let transport = Arc::new(TestRemoteAnswerTransport {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            provider_offers: std::sync::atomic::AtomicUsize::new(0),
+            fail: false,
+        });
+        let log = Arc::new(tokio::sync::Mutex::new(Vec::new()));
+        let authority = Arc::new(ExperimentalAuthorityTestProvider {
+            log: Arc::clone(&log),
+            deny: false,
+        });
+        let (router, _notifications) = member_live_webrtc_router(transport).await;
+        let router = router.with_experimental_live_open_authority(authority);
+        spawn_realtime_voice_member(&router, "voice-retire-mob").await;
+
+        let opened = router
+            .dispatch(make_request(
+                "mob/member_live_open",
+                serde_json::json!({
+                    "mob_id": "voice-retire-mob",
+                    "agent_identity": "voice-1",
+                    "transport": "webrtc",
+                    "execution_identity": {
+                        "version": "v1",
+                        "profile_id": meerkat::GPT_LIVE_CLIENT_CONTEXT_PROFILE_ID
+                    }
+                }),
+            ))
+            .await
+            .expect("mob/member_live_open response");
+        assert!(
+            opened.error.is_none(),
+            "a member execution-identity open goes through the authority: {opened:?}"
+        );
+        assert_eq!(*log.lock().await, vec!["prepare", "factory", "bind"]);
+        let channel_id = meerkat_live::LiveChannelId::new(
+            result_value(&opened)["channel_id"]
+                .as_str()
+                .expect("channel_id"),
+        );
+
+        let retired = router
+            .dispatch(make_request(
+                "mob/retire",
+                serde_json::json!({
+                    "mob_id": "voice-retire-mob",
+                    "agent_identity": "voice-1"
+                }),
+            ))
+            .await
+            .expect("mob/retire response");
+        assert!(retired.error.is_none(), "member retire failed: {retired:?}");
+        assert_eq!(result_value(&retired)["retired"], true);
+        assert_eq!(
+            *log.lock().await,
+            vec!["prepare", "factory", "bind", "physical_close", "unbind"],
+            "the retirement's live close goes through the authority"
+        );
+        assert!(
+            router
+                .runtime_adapter
+                .live_session_for_active_channel(&channel_id)
+                .await
+                .is_none()
+        );
+    }
+
     /// A session with one applied host activation and its transcript length.
     async fn activated_rpc_session(router: &MethodRouter) -> (String, u64) {
         let create_resp = router

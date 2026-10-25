@@ -169,10 +169,13 @@ into that concrete binding and rejects bare `External` without details.
 
 Managed placement must not be described as External binding. The controlling
 host retains roster, placement, grant, and teardown authority while the bound
-member host owns the placed session's runtime. Member-live control is
-WebSocket-only for both local and placed members; controller-level `session/*`
-live methods do not proxy a placed member, and the placed-member surface does
-not currently offer WebRTC.
+member host owns the placed session's runtime. Member-live open leaves the
+transport to the member's own live host after the mob's member checks: WebRTC
+where that host serves it (rkat-rpc answers the offer with
+`live/webrtc/answer`), a typed `LiveTransportUnsupported` elsewhere; a member
+host started by `rkat mob host` serves WebSocket only. A channel-scoped
+`execution_identity` (gpt-live-1) is served for a local member only.
+Controller-level `session/*` live methods do not proxy a placed member.
 
 **Member kickoff state** lives in MobMachine DSL as a multi-field decomposition keyed on `AgentIdentity`: `member_kickoff_pending` / `member_kickoff_starting` / `member_kickoff_callback_pending` / `member_kickoff_started` / `member_kickoff_failed` / `member_kickoff_cancelled` (Sets) plus `member_kickoff_error: Map<AgentIdentity, String>`. `MobActor` drives `KickoffMarkPending`/`KickoffMarkStarting`/`KickoffResolveStarted`/`KickoffCancelRequested` transitions directly through its `apply_dsl_input` seam (`MobMachineMutator::apply(&mut self.dsl_authority, mob_dsl::MobMachineInput::…)`; in-crate access, no cross-crate handle needed). Persistence flows through `MobEventKind::MemberKickoffUpdated` emitted from the DSL effect handler.
 

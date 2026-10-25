@@ -299,7 +299,7 @@ not treat an agent's ability to call a model-visible tool as an operator API.
 | Durable jobs and monitors | No dedicated command | No | `jobs/*`, `monitors/start` | No |
 | Schedules | Agent tools only | Full CRUD and tool call | Full CRUD and tool call | Schedule tools |
 | WorkGraph | Observation plus trusted goal/attention controls | Observation | Observation | Agent mutation tools plus observation |
-| Live audio | Placed mob-member WebSocket controls | No | Session `live/*` supports WebSocket/WebRTC; member control is WebSocket-only | No |
+| Live audio | Placed mob-member WebSocket controls | No | Session `live/*` and the member `mob/member_live_*` family support WebSocket/WebRTC; the member's own live host serves the transport or refuses it | No |
 | Multi-host mobs | Admin and observation | Observation only | Admin and observation | Placement plus observation only |
 | Temporary councils | No | No | No | No |
 | Provider credential management | Yes | Yes | Yes | No |

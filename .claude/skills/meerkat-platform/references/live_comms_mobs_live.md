@@ -101,7 +101,7 @@ Details that matter:
 - `live/open` can promote a deferred session or recover an idle one. A
   deferred session that carries `injected_context` must run `turn/start`
   first.
-- A GPT Live close converges within 15 seconds of the first close request,
+- A GPT Live close converges within 10 seconds of the first close request,
   even when the remote side is already gone, and reports `closed`.
 
 Minimal WebSocket flow:

@@ -574,13 +574,15 @@ struct literal, and treat an advisory you do not know as informational.
     key to `WireCallbackPending::single`.
 12. Handle `ClosedOrphanedDrain` where you match
     `RuntimeSessionQuiescentClose`.
-13. Open mob members' live channels with `mob/member_live_open` over
-    WebSocket.
+13. Open mob members' live channels, WebSocket or WebRTC, with
+    `mob/member_live_open` instead of `live/open` by the member's session id.
 14. Tools whose effects must not repeat: record and check the dedupe key, as
     described in [Durable Runs](/guides/durable-runs#the-dedupe-key).
 15. On `jsonl` or host-store realms, check the write volume of long,
     tool-heavy runs.
 16. Set `advisories` in `LiveOpenResult` struct literals.
+17. Set `execution_identity: None` in `MobMemberLiveOpenParams` struct
+    literals.
 
 ### Downgrading to 0.9.4
 

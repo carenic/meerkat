@@ -641,10 +641,13 @@ an SDK backlog.
 | Agent tools | `delegate` and `mob_spawn_member` accept optional `placement`. Host/grant/observation/live/hard-cancel console verbs are deliberately absent from the LLM-visible roster. |
 | Web / WASM | Single-host. Spawn carriers accept the source-compatible optional placement field, but a non-local placement is rejected by the typed capability boundary. No member-host, grant, observation-console, or member-live console exports. |
 
-Member-live open/control is WebSocket-only for both local and placed members.
-The generic session `live/*` family can negotiate WebRTC only when the session
-is local to that RPC host; a controlling host cannot use `session/*` or
-`live/*` to proxy a placed member's remote session.
+Member-live open leaves the transport to the member's own live host, for local
+and placed members alike: WebRTC where that host serves it (answer the offer
+with `live/webrtc/answer` on the same server), a typed refusal elsewhere; a
+member host started by `rkat mob host` serves WebSocket only. A gpt-live-1
+`execution_identity` is served for a member local to the server. The generic
+session `live/open` refuses a mob member's session, and a controlling host
+cannot use `session/*` or `live/*` to proxy a placed member's remote session.
 
 All console surfaces consume the same four classified failures (wire codes
 `SCOPE_DENIED`, `HOST_UNAVAILABLE`, `STALE_CURSOR`, and `STALE_FENCE`), plus
