@@ -331,6 +331,27 @@ async def test_live_wrappers_pass_verbatim_and_never_log(caplog) -> None:
     ), "single-use token must never be logged"
 
 
+@pytest.mark.asyncio
+async def test_member_live_open_carries_the_execution_identity() -> None:
+    client, calls = canned_client()
+    mob = Mob(client, "mob-1")
+    selector = {"version": "v1", "profile_id": "openai.gpt-live-1.client-context.v1"}
+
+    await mob.member_live_open(
+        "worker", transport="webrtc", execution_identity=selector
+    )
+
+    assert calls[0] == (
+        "mob/member_live_open",
+        {
+            "mob_id": "mob-1",
+            "agent_identity": "worker",
+            "transport": "webrtc",
+            "execution_identity": selector,
+        },
+    )
+
+
 def _history_result(message: dict[str, Any]) -> dict[str, Any]:
     return {
         "page": {

@@ -941,13 +941,31 @@ async fn register_experimental_live_playback_custody(
     pending: &meerkat::surface::ExperimentalLivePendingChannel,
     custodies: &ExperimentalLivePlaybackCustodies,
 ) -> Result<(), String> {
+    register_live_playback_custody(
+        runtime,
+        pending.session_id(),
+        pending.channel_id(),
+        pending.pending_receipt(),
+        custodies,
+    )
+    .await
+}
+
+/// Register the sole playback owner of one strict pending channel against
+/// its exact pending receipt and retain both receipts in this connection's
+/// custody, so its `live/webrtc/answer` can be validated. Shared by the
+/// strict `live/open` and the execution-identity `mob/member_live_open`.
+#[cfg(all(feature = "openai-live", feature = "live-webrtc"))]
+pub(crate) async fn register_live_playback_custody(
+    runtime: &SessionRuntime,
+    session_id: &SessionId,
+    channel_id: &LiveChannelId,
+    pending_receipt: &str,
+    custodies: &ExperimentalLivePlaybackCustodies,
+) -> Result<(), String> {
     let stage = runtime
         .runtime_adapter()
-        .validate_live_pending_channel_receipt(
-            pending.session_id(),
-            pending.channel_id(),
-            pending.pending_receipt(),
-        )
+        .validate_live_pending_channel_receipt(session_id, channel_id, pending_receipt)
         .await
         .map_err(|error| error.to_string())?;
     let readiness = runtime
@@ -956,15 +974,15 @@ async fn register_experimental_live_playback_custody(
         .await
         .map_err(|error| error.to_string())?;
     let custody = ExperimentalLivePlaybackCustody {
-        session_id: pending.session_id().clone(),
-        pending_receipt: pending.pending_receipt().to_string(),
+        session_id: session_id.clone(),
+        pending_receipt: pending_receipt.to_string(),
         readiness_receipt: readiness.readiness_id().to_string(),
     };
     let mut custodies = custodies.lock().await;
-    if custodies.contains_key(pending.channel_id()) {
+    if custodies.contains_key(channel_id) {
         return Err("strict live/open collided with existing connection custody".to_string());
     }
-    custodies.insert(pending.channel_id().clone(), custody);
+    custodies.insert(channel_id.clone(), custody);
     Ok(())
 }
 

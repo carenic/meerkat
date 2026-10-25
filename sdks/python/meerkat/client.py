@@ -3863,13 +3863,27 @@ class MeerkatClient:
         *,
         turning_mode: RealtimeTurningMode | None = None,
         transport: MobMemberLiveTransport | None = None,
+        execution_identity: dict[str, Any] | None = None,
     ) -> LiveOpenResult:
-        """Open a member live channel while preserving its opaque bootstrap."""
+        """Open a member live channel while preserving its opaque bootstrap.
+
+        The member's mob checks the member first, and the member's own live
+        host serves the transport or refuses it typed. With
+        ``transport="webrtc"`` the result is a WebRTC bootstrap: post the
+        offer with :meth:`live_webrtc_answer` on this connection.
+
+        ``execution_identity`` selects a channel-scoped execution profile, as
+        on ``live/open``; for gpt-live-1 pass ``{"version": "v1",
+        "profile_id": "openai.gpt-live-1.client-context.v1"}``. It requires
+        ``transport="webrtc"``, a server composed with an execution-identity
+        authority, and a member local to that server.
+        """
         params = MobMemberLiveOpenParams(
             mob_id=mob_id,
             agent_identity=agent_identity,
             turning_mode=turning_mode,
             transport=transport,
+            execution_identity=execution_identity,
         )
         result = await self._request("mob/member_live_open", _wire_params(params))
         return self._parse_live_open_result(

@@ -2611,6 +2611,7 @@ export interface MobStopMemberRunResult {
 
 export interface MobMemberLiveOpenParams {
   agent_identity: string;
+  execution_identity?: Record<string, unknown> | null;
   mob_id: string;
   transport?: LiveOpenTransport | null;
   turning_mode?: RealtimeTurningMode | null;

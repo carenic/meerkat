@@ -10205,7 +10205,11 @@ impl MobHandle {
     /// absolute WS URL + single-use token VERBATIM (DEC-P6B-C7/C8: never
     /// parsed, rewritten, logged, or retained controlling-side); the caller
     /// connects the WS directly — the socket is the input plane, there is
-    /// no bridge frame verb (DL10). `turning_mode: None` defaults to
+    /// no bridge frame verb (DL10). The transport is the owning member live
+    /// host's to serve or refuse: a WebRTC bootstrap carries a token whose
+    /// offer the composing surface answers (`rkat-rpc`'s
+    /// `live/webrtc/answer`), and a host that serves no WebRTC refuses typed
+    /// (`LiveTransportUnsupported`). `turning_mode: None` defaults to
     /// `ProviderManaged` on the owning host (DEC-P6B-L15, one owner).
     ///
     /// Reply-loss reconciliation contract (DEC-P6B-C9): a
@@ -10229,29 +10233,95 @@ impl MobHandle {
         transport: Option<super::bridge_protocol::LiveOpenTransport>,
     ) -> Result<super::bridge_protocol::LiveOpenResult, MobError> {
         let delivery = self
-            .clone()
+            .member_live_open_delivery(caller, identity, turning_mode, transport, None)
+            .await?;
+        let open = delivery.open;
+        Self::take_member_live_open_custody(delivery.delivery_ack).await?;
+        // There is no cancellation point after confirmed durable transfer.
+        Ok(open)
+    }
+
+    /// [`Self::member_live_open`] under a channel-scoped execution identity
+    /// (`live.execution_identity.v1`, for example `gpt-live-1`), through the
+    /// same member checks. The member's live host serves it through its
+    /// execution-identity authority (the authority behind a strict
+    /// session-scoped `live/open`); the member's durable session identity
+    /// does not change. The result carries the pending receipt the surface
+    /// answering the channel's WebRTC offer registers its playback owner
+    /// against.
+    ///
+    /// Served for a member local to this host only: a placed member refuses
+    /// typed (`BridgeCommandRejected` with cause `Unsupported`) without any
+    /// bridge dispatch, and a local member live host composed without an
+    /// execution-identity authority refuses typed (`Unavailable`).
+    pub async fn member_live_open_with_execution_identity(
+        &self,
+        caller: crate::control_policy::MobControlPrincipal,
+        identity: AgentIdentity,
+        execution_identity: meerkat_contracts::WireLiveExecutionIdentityOverrideV1,
+        turning_mode: Option<super::bridge_protocol::RealtimeTurningMode>,
+        transport: Option<super::bridge_protocol::LiveOpenTransport>,
+    ) -> Result<meerkat_runtime::member_live::MemberLiveExecutionOpen, MobError> {
+        let delivery = self
+            .member_live_open_delivery(
+                caller,
+                identity,
+                turning_mode,
+                transport,
+                Some(execution_identity),
+            )
+            .await?;
+        // Without its receipt the channel cannot be answered: the delivery
+        // dropped unacknowledged here hands it to the actor's exact cleanup.
+        let Some((session_id, pending_receipt)) = delivery.execution_receipt else {
+            return Err(MobError::Internal(
+                "the member's execution-identity open returned no pending receipt".to_string(),
+            ));
+        };
+        let open = delivery.open;
+        Self::take_member_live_open_custody(delivery.delivery_ack).await?;
+        // There is no cancellation point after confirmed durable transfer.
+        Ok(meerkat_runtime::member_live::MemberLiveExecutionOpen::new(
+            open,
+            session_id,
+            pending_receipt,
+        ))
+    }
+
+    async fn member_live_open_delivery(
+        &self,
+        caller: crate::control_policy::MobControlPrincipal,
+        identity: AgentIdentity,
+        turning_mode: Option<super::bridge_protocol::RealtimeTurningMode>,
+        transport: Option<super::bridge_protocol::LiveOpenTransport>,
+        execution_identity: Option<meerkat_contracts::WireLiveExecutionIdentityOverrideV1>,
+    ) -> Result<super::state::MemberLiveOpenDelivery, MobError> {
+        self.clone()
             .with_command_authority(crate::control_policy::CommandAuthority::principal(caller))
             .send_actor_command(|reply_tx| super::state::MobCommand::MemberLiveOpen {
                 agent_identity: identity,
                 turning_mode,
                 transport,
+                execution_identity,
                 reply_tx,
             })
-            .await??;
-        // Durable cleanup custody must be deleted before public ownership is
-        // returned. The actor confirms that deletion over this second
-        // channel; a crash before confirmation closes this receiver and the
-        // caller never observes a success that recovery could later reclaim.
+            .await?
+    }
+
+    /// Durable cleanup custody must be deleted before public ownership is
+    /// returned. The actor confirms that deletion over this second channel;
+    /// a crash before confirmation closes this receiver and the caller never
+    /// observes a success that recovery could later reclaim.
+    async fn take_member_live_open_custody(
+        delivery_ack: oneshot::Sender<oneshot::Sender<Result<(), MobError>>>,
+    ) -> Result<(), MobError> {
         let (custody_confirm_tx, custody_confirm_rx) = oneshot::channel();
-        delivery
-            .delivery_ack
+        delivery_ack
             .send(custody_confirm_tx)
             .map_err(|_| MobError::ActorReplyChannelClosed)?;
         custody_confirm_rx
             .await
-            .map_err(|_| MobError::ActorReplyChannelClosed)??;
-        // There is no cancellation point after confirmed durable transfer.
-        Ok(delivery.open)
+            .map_err(|_| MobError::ActorReplyChannelClosed)?
     }
 
     /// Close one NAMED live channel on a member (phase 6b, DEC-P6B-C9:

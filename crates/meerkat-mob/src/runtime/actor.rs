@@ -9121,6 +9121,9 @@ pub(super) enum MemberLiveMutationCompletion {
         agent_identity: AgentIdentity,
         target: MemberLiveMutationTarget,
         result: Result<super::bridge_protocol::LiveOpenResult, MobError>,
+        /// The pending channel's machine receipt of a successful open under
+        /// a channel-scoped execution identity.
+        execution_receipt: Option<String>,
         ambiguous: bool,
         reply_tx: oneshot::Sender<Result<super::state::MemberLiveOpenDelivery, MobError>>,
     },
@@ -30543,10 +30546,17 @@ impl MobActor {
                     agent_identity,
                     turning_mode,
                     transport,
+                    execution_identity,
                     reply_tx,
                 } => {
-                    self.handle_member_live_open(agent_identity, turning_mode, transport, reply_tx)
-                        .await;
+                    self.handle_member_live_open(
+                        agent_identity,
+                        turning_mode,
+                        transport,
+                        execution_identity,
+                        reply_tx,
+                    )
+                    .await;
                 }
                 MobCommand::MemberLiveClose {
                     agent_identity,
@@ -41541,7 +41551,7 @@ impl MobActor {
                     return Err(Self::local_live_transport_unavailable());
                 };
                 let timeout = super::member_live_proxy::LIVE_CHANNEL_BRIDGE_TIMEOUT;
-                tokio::time::timeout(timeout, live_host.close(&session_id, &channel_id))
+                tokio::time::timeout(timeout, live_host.close_explicit(&session_id, &channel_id))
                     .await
                     .map_err(|_| Self::member_live_timeout_error("cleanup-close", timeout))?
                     .map(|_| ())
@@ -41852,8 +41862,17 @@ impl MobActor {
         agent_identity: AgentIdentity,
         target: MemberLiveMutationTarget,
         open: super::bridge_protocol::LiveOpenResult,
+        execution_receipt: Option<String>,
         reply_tx: oneshot::Sender<Result<super::state::MemberLiveOpenDelivery, MobError>>,
     ) -> Result<(), MobError> {
+        // Only the local lane opens under an execution identity; its receipt
+        // names the member session the channel is bound to.
+        let execution_receipt = execution_receipt.and_then(|receipt| match &target {
+            MemberLiveMutationTarget::Local { session_id, .. } => {
+                Some((session_id.clone(), receipt))
+            }
+            MemberLiveMutationTarget::Placed { .. } => None,
+        });
         let reason = "successful Open result was not acknowledged by its caller";
         let durable_record = Self::member_live_open_cleanup_record(
             &agent_identity,
@@ -41950,6 +41969,7 @@ impl MobActor {
         // then converts the retained obligation into an exact cleanup.
         let _ = reply_tx.send(Ok(super::state::MemberLiveOpenDelivery {
             open,
+            execution_receipt,
             delivery_ack,
         }));
         Ok(())
@@ -42263,6 +42283,7 @@ impl MobActor {
                 agent_identity,
                 target,
                 result,
+                execution_receipt,
                 ambiguous,
                 reply_tx,
             } => {
@@ -42275,6 +42296,7 @@ impl MobActor {
                             agent_identity,
                             target,
                             open,
+                            execution_receipt,
                             reply_tx,
                         )
                         .await
@@ -42815,16 +42837,23 @@ impl MobActor {
 
     /// Phase 6b (DEC-P6B-C3): the identity-addressed live OPEN. Handler
     /// order per ADJ-P6B-11: scope gate (dispatch loop) → roster →
-    /// placement → capability gate (zero bridge traffic) → webrtc gate
-    /// (zero dispatch, BOTH branches — the family is placement-blind,
-    /// DEC-P6B-C4) → DETACHED round-trip (bridge AND local gateway — the
-    /// phase-3 deadlock class; the local open does provider connects +
-    /// per-open credential resolution, the same starvation class).
+    /// placement → capability gate (zero bridge traffic) → DETACHED
+    /// round-trip (bridge AND local gateway, the phase-3 deadlock class:
+    /// the local open does provider connects + per-open credential
+    /// resolution, the same starvation class).
+    ///
+    /// The transport is the owning member live host's to serve or refuse,
+    /// on both placements: a host that serves no WebRTC refuses a WebRTC
+    /// open typed (`LiveTransportUnsupported`). A channel-scoped execution
+    /// identity is served by a local member's live host only; a placed
+    /// member refuses it typed (`Unsupported`) with zero dispatch, since the
+    /// supervisor bridge does not carry one.
     async fn handle_member_live_open(
         &mut self,
         agent_identity: AgentIdentity,
         turning_mode: Option<super::bridge_protocol::RealtimeTurningMode>,
         transport: Option<super::bridge_protocol::LiveOpenTransport>,
+        execution_identity: Option<meerkat_contracts::WireLiveExecutionIdentityOverrideV1>,
         reply_tx: oneshot::Sender<Result<super::state::MemberLiveOpenDelivery, MobError>>,
     ) {
         // Opening a live channel can connect a provider and create a fresh
@@ -42854,26 +42883,16 @@ impl MobActor {
                 return;
             }
         };
-        // DEC-P6B-C4 / ADJ-P6B-12: webrtc is a typed reject at this verb
-        // family REGARDLESS of placement — a family that succeeded for
-        // local members and rejected for placed ones would leak placement
-        // through behavior (DL3). Session-scoped `live/open` keeps local
-        // webrtc; nothing is removed.
-        if matches!(
-            transport,
-            Some(super::bridge_protocol::LiveOpenTransport::Webrtc)
-        ) {
-            let _ = reply_tx.send(Err(MobError::BridgeCommandRejected {
-                cause: super::bridge_protocol::BridgeRejectionCause::LiveTransportUnsupported {
-                    requested: "webrtc".to_string(),
-                },
-                reason: "webrtc is not supported for mob member live channels; \
-                         use the session-scoped live/open"
-                    .to_string(),
-            }));
-            return;
-        }
         match lane {
+            MemberLiveLane::Placed { .. } if execution_identity.is_some() => {
+                let _ = reply_tx.send(Err(MobError::BridgeCommandRejected {
+                    cause: super::bridge_protocol::BridgeRejectionCause::Unsupported,
+                    reason: format!(
+                        "member '{agent_identity}' is placed on another host; a channel-scoped \
+                         execution identity is served only for a member local to this host"
+                    ),
+                }));
+            }
             MemberLiveLane::Placed {
                 peer,
                 expected_member,
@@ -42927,6 +42946,7 @@ impl MobActor {
                         agent_identity: completion_identity,
                         target,
                         result,
+                        execution_receipt: None,
                         ambiguous,
                         reply_tx,
                     }
@@ -42948,12 +42968,27 @@ impl MobActor {
                 self.member_live_mutation_tasks.spawn(async move {
                     let timeout = super::member_live_proxy::LIVE_OPEN_BRIDGE_TIMEOUT;
                     let attempted = std::panic::AssertUnwindSafe(async {
-                        match tokio::time::timeout(
-                            timeout,
-                            live_host.open(&session_id, turning_mode, transport),
-                        )
-                        .await
-                        {
+                        let opened = async {
+                            match execution_identity.as_ref() {
+                                None => live_host
+                                    .open(&session_id, turning_mode, transport)
+                                    .await
+                                    .map(|open| (open, None)),
+                                Some(execution_identity) => live_host
+                                    .open_with_execution_identity(
+                                        &session_id,
+                                        execution_identity,
+                                        turning_mode,
+                                        transport,
+                                    )
+                                    .await
+                                    .map(|opened| {
+                                        let (open, _session, receipt) = opened.into_parts();
+                                        (open, Some(receipt))
+                                    }),
+                            }
+                        };
+                        match tokio::time::timeout(timeout, opened).await {
                             Ok(result) => {
                                 (result.map_err(Self::member_live_error_to_mob_error), false)
                             }
@@ -42983,10 +43018,15 @@ impl MobActor {
                             true,
                         ),
                     };
+                    let (result, execution_receipt) = match result {
+                        Ok((open, execution_receipt)) => (Ok(open), execution_receipt),
+                        Err(error) => (Err(error), None),
+                    };
                     MemberLiveMutationCompletion::Open {
                         agent_identity: completion_identity,
                         target,
                         result,
+                        execution_receipt,
                         ambiguous,
                         reply_tx,
                     }
@@ -43080,10 +43120,13 @@ impl MobActor {
                 self.actor_io_tasks.spawn(async move {
                     let timeout = super::member_live_proxy::LIVE_CHANNEL_BRIDGE_TIMEOUT;
                     let attempted = std::panic::AssertUnwindSafe(async {
-                        tokio::time::timeout(timeout, live_host.close(&session_id, &channel_id))
-                            .await
-                            .map_err(|_| Self::member_live_timeout_error("close", timeout))?
-                            .map_err(Self::member_live_error_to_mob_error)
+                        tokio::time::timeout(
+                            timeout,
+                            live_host.close_explicit(&session_id, &channel_id),
+                        )
+                        .await
+                        .map_err(|_| Self::member_live_timeout_error("close", timeout))?
+                        .map_err(Self::member_live_error_to_mob_error)
                     })
                     .catch_unwind()
                     .await;

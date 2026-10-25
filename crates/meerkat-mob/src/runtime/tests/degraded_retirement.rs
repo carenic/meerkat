@@ -139,6 +139,61 @@ async fn a_member_that_degrades_after_its_quiesce_is_reloaded_at_its_ingress_det
     assert_retired(&mob, &member, &session).await;
 }
 
+/// A retiring member refuses a WebRTC live open exactly as it refuses a
+/// WebSocket one: the member checks run before the member's live host sees
+/// the requested transport, so the member WebRTC route opens nothing on a
+/// member whose retirement is under way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retiring_member_refuses_a_webrtc_live_open_as_it_refuses_a_websocket_one() {
+    let mob = create_isolation_mob(1).await;
+    let member = mob.member(0).clone();
+    let session = mob.session(0).clone();
+    let (hold, retire) = retire_held_at_the_ingress_detach(&mob, &member).await;
+
+    let open = |transport| {
+        mob.handle.member_live_open(
+            crate::control_policy::MobControlPrincipal::Owner,
+            member.clone(),
+            None,
+            Some(transport),
+        )
+    };
+    let websocket = open(crate::runtime::bridge_protocol::LiveOpenTransport::Websocket)
+        .await
+        .expect_err("a retiring member refuses a WebSocket live open");
+    let webrtc = open(crate::runtime::bridge_protocol::LiveOpenTransport::Webrtc)
+        .await
+        .expect_err("a retiring member refuses a WebRTC live open");
+    match &webrtc {
+        MobError::BridgeCommandRejected { reason, .. } => assert!(
+            reason.contains("is retiring"),
+            "the WebRTC open is refused by the member's retirement: {webrtc:?}"
+        ),
+        other => panic!("the WebRTC open is refused by the member's retirement: {other:?}"),
+    }
+    assert_eq!(
+        std::mem::discriminant(&webrtc),
+        std::mem::discriminant(&websocket),
+        "{webrtc:?} vs {websocket:?}"
+    );
+    assert_eq!(webrtc.to_string(), websocket.to_string());
+    assert_eq!(webrtc.wire_error_code(), websocket.wire_error_code());
+
+    hold.release();
+    match tokio::time::timeout(STEP, retire)
+        .await
+        .expect("the retire answers")
+        .expect("join the retire")
+    {
+        Ok(()) => {}
+        Err(error) if error.is_retirement_in_progress() => settle(&mob, &member, false)
+            .await
+            .expect("the retirement completes"),
+        Err(error) => panic!("the retirement completes: {error:?}"),
+    }
+    assert_retired(&mob, &member, &session).await;
+}
+
 /// A retirement whose member is not degraded asks for no reload at its
 /// ingress detach: the stage reads the gate and detaches as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

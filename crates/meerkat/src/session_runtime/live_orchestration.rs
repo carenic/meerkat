@@ -51,9 +51,13 @@ use crate::session_runtime::errors::LiveOpenPrecheckError;
 /// retry with the same unavailable error. Recovery-driven closes keep the
 /// binding for retry so a slow but progressing drain can settle.
 ///
+/// It stays below the mob's 15 s member live close timeout, so a mob close
+/// of a channel whose provider never confirms converges on its first
+/// request instead of timing out.
+///
 /// Lives here, outside the provider-gated experimental module, because the
 /// close verb applies it on every feature set.
-pub const LIVE_CLOSE_CONFIRMATION_BOUND: std::time::Duration = std::time::Duration::from_secs(15);
+pub const LIVE_CLOSE_CONFIRMATION_BOUND: std::time::Duration = std::time::Duration::from_secs(10);
 
 /// How long an accepted playback terminal (a truncation or completion the
 /// adapter queued for the provider) may wait for its settlement. The

@@ -4112,6 +4112,14 @@ pub struct MobMemberLiveOpenParams {
     pub turning_mode: Option<super::realtime::RealtimeTurningMode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<super::live::LiveOpenTransport>,
+    /// Channel-scoped execution profile selection for the member's channel,
+    /// as on `live/open` (for example `gpt-live-1`): the host owns the full
+    /// execution identity, and the member's durable session identity does
+    /// not change. Requires transport `webrtc`, negotiated
+    /// [`super::live::LIVE_EXECUTION_IDENTITY_V1_CAPABILITY`] support, and a
+    /// member local to the host that serves the request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_identity: Option<super::live::WireLiveExecutionIdentityOverrideV1>,
 }
 
 /// Request payload for `mob/member_live_close`. Close-what-you-name

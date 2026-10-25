@@ -459,6 +459,10 @@ pub(super) struct HostOrphanReleaseKey {
 /// method return closes the ack sender and triggers exact channel cleanup.
 pub(super) struct MemberLiveOpenDelivery {
     pub(super) open: super::bridge_protocol::LiveOpenResult,
+    /// For an open under a channel-scoped execution identity, the member
+    /// session and the pending channel's opaque machine receipt; `None` for
+    /// a stock open.
+    pub(super) execution_receipt: Option<(SessionId, String)>,
     /// The handle sends a confirmation channel and waits for the actor to
     /// delete durable cleanup custody before it returns the public Open.
     pub(super) delivery_ack: oneshot::Sender<oneshot::Sender<Result<(), MobError>>>,
@@ -1531,6 +1535,9 @@ pub(super) enum MobCommand {
         agent_identity: AgentIdentity,
         turning_mode: Option<super::bridge_protocol::RealtimeTurningMode>,
         transport: Option<super::bridge_protocol::LiveOpenTransport>,
+        /// A channel-scoped execution identity (for example `gpt-live-1`),
+        /// served by a local member's live host only.
+        execution_identity: Option<meerkat_contracts::WireLiveExecutionIdentityOverrideV1>,
         reply_tx: oneshot::Sender<Result<MemberLiveOpenDelivery, MobError>>,
     },
     /// Close one NAMED live channel (DEC-P6B-C9: close-what-you-name is the

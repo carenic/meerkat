@@ -372,10 +372,13 @@ bundle; it does not compile wasm32.
 
 Live channels execute in the owning session. For a mob member, use the
 identity-routed `mob/member_live_open`, close, status, and control family. It
-is placement-transparent and returns the owning host's WebSocket endpoint.
-Explicit WebRTC is rejected with `LiveTransportUnsupported` for local and
-placed members; session-scoped `live/open` remains the WebRTC path for a
-controller-local session.
+is placement-transparent: after the mob's member checks, the member's own live
+host serves the requested transport (the owning host's WebSocket endpoint, or
+a WebRTC bootstrap answered with `live/webrtc/answer` on the same JSON-RPC
+server) or refuses it with `LiveTransportUnsupported`. A channel-scoped
+`execution_identity` (gpt-live-1) is served for a member local to the
+JSON-RPC server; a placed member refuses it with `Unsupported`. Session-scoped
+`live/open` refuses a mob member's session.
 
 The old realtime attachment/status plane has been removed. Live channel
 lifecycle is caller-initiated through the `live/*` method family.

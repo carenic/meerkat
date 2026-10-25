@@ -4105,9 +4105,10 @@ enum MobLiveCommands {
         /// Turning mode (omitted = the owning host's provider-managed default)
         #[arg(long, value_enum)]
         turning_mode: Option<CliRealtimeTurningMode>,
-        /// Requested live transport. Member live channels support only
-        /// websocket; webrtc is refused (use the session-scoped JSON-RPC
-        /// live/open for WebRTC)
+        /// Requested live transport. The member's own live host serves it or
+        /// refuses it typed; a member host started by `rkat mob host`
+        /// serves websocket only. WebRTC needs a host that answers the
+        /// offer, such as the JSON-RPC server
         #[arg(long, value_enum)]
         transport: Option<CliLiveOpenTransport>,
     },

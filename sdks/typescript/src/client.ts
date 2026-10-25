@@ -693,6 +693,13 @@ export interface ConnectOptions {
 export interface MobMemberLiveOpenOptions {
   turningMode?: RpcMobMemberLiveOpenParams["turning_mode"];
   transport?: RpcMobMemberLiveOpenParams["transport"];
+  /**
+   * Channel-scoped execution profile, as on `live/open`; for gpt-live-1
+   * `{ version: "v1", profile_id: "openai.gpt-live-1.client-context.v1" }`.
+   * Requires `transport: "webrtc"`, a server composed with an
+   * execution-identity authority, and a member local to that server.
+   */
+  executionIdentity?: RpcMobMemberLiveOpenParams["execution_identity"];
 }
 
 interface WireSkillKey {
@@ -3175,7 +3182,12 @@ export class MeerkatClient {
     };
   }
 
-  /** Open a live realtime channel on a mob member. */
+  /**
+   * Open a live realtime channel on a mob member. The member's mob checks
+   * the member first, and the member's own live host serves the transport
+   * or refuses it typed. A WebRTC bootstrap's offer is answered with
+   * `liveWebrtcAnswer` on this connection.
+   */
   async openMobMemberLive(
     mobId: string,
     agentIdentity: string,
@@ -3186,6 +3198,9 @@ export class MeerkatClient {
       agent_identity: agentIdentity,
       ...(opts?.turningMode !== undefined ? { turning_mode: opts.turningMode } : {}),
       ...(opts?.transport !== undefined ? { transport: opts.transport } : {}),
+      ...(opts?.executionIdentity !== undefined
+        ? { execution_identity: opts.executionIdentity }
+        : {}),
     });
     return MeerkatClient.parseLiveOpenResult(
       result,

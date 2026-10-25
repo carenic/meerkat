@@ -3483,6 +3483,9 @@ pub async fn handle_stop_member_run(
     }
 }
 
+/// `mob/member_live_open` without an execution-identity authority: a
+/// request that names an `execution_identity` refuses as a strict
+/// `live/open` does on a host that composes no authority.
 pub async fn handle_member_live_open(
     id: Option<RpcId>,
     params: Option<&RawValue>,
@@ -3492,6 +3495,28 @@ pub async fn handle_member_live_open(
         Ok(p) => p,
         Err(resp) => return resp.with_id(id),
     };
+    if params.execution_identity.is_some() {
+        return member_live_execution_identity_unavailable(id);
+    }
+    member_live_open_stock(id, params, state).await
+}
+
+fn member_live_execution_identity_unavailable(id: Option<RpcId>) -> RpcResponse {
+    RpcResponse::error(
+        id,
+        meerkat_contracts::ErrorCode::CapabilityUnavailable.jsonrpc_code(),
+        format!(
+            "mob/member_live_open execution_identity requires negotiated capability '{}'",
+            meerkat_contracts::LIVE_EXECUTION_IDENTITY_V1_CAPABILITY
+        ),
+    )
+}
+
+async fn member_live_open_stock(
+    id: Option<RpcId>,
+    params: meerkat_contracts::wire::MobMemberLiveOpenParams,
+    state: &Arc<MobMcpState>,
+) -> RpcResponse {
     let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
         Ok(m) => m,
         Err(resp) => return resp,
@@ -3506,6 +3531,114 @@ pub async fn handle_member_live_open(
         // logged, or retained here.
         Ok(open) => RpcResponse::success(id, open),
         Err(err) => mob_call_error(id, &err),
+    }
+}
+
+/// `mob/member_live_open` on a router composed with an execution-identity
+/// authority. A request that names an `execution_identity` (for example
+/// `gpt-live-1`) opens the member's channel through its mob and that
+/// authority (the one behind the strict `live/open`), and this connection
+/// keeps the channel's playback custody as a strict `live/open` does, so
+/// its `live/webrtc/answer` completes here. The returned publication is
+/// cleaned up if the response is never delivered. Any other request is the
+/// stock member open.
+#[cfg(all(feature = "openai-live", feature = "live-webrtc"))]
+pub(crate) async fn handle_member_live_open_routed(
+    id: Option<RpcId>,
+    params: Option<&RawValue>,
+    state: &Arc<MobMcpState>,
+    runtime: &SessionRuntime,
+    authority: Option<
+        &Arc<dyn meerkat::experimental_gpt_live::ExperimentalLiveOpenAuthorityProvider>,
+    >,
+    host: &meerkat_live::LiveAdapterHost,
+    playback_custodies: &super::live::ExperimentalLivePlaybackCustodies,
+) -> super::live::LiveOpenHandlerResult {
+    let params: meerkat_contracts::wire::MobMemberLiveOpenParams = match parse_params(params) {
+        Ok(p) => p,
+        Err(resp) => return resp.with_id(id).into(),
+    };
+    let Some(execution_identity) = params.execution_identity.clone() else {
+        return member_live_open_stock(id, params, state).await.into();
+    };
+    let Some(authority) = authority else {
+        return member_live_execution_identity_unavailable(id).into();
+    };
+    if params.transport != Some(meerkat_contracts::LiveOpenTransport::Webrtc) {
+        return RpcResponse::error(
+            id,
+            error::INVALID_PARAMS,
+            "mob/member_live_open execution_identity requires transport 'webrtc'",
+        )
+        .into();
+    }
+    let mob_id = match parse_mob_id(id.clone(), &params.mob_id) {
+        Ok(m) => m,
+        Err(resp) => return resp.into(),
+    };
+    let identity = AgentIdentity::from(params.agent_identity.as_str());
+    let opened = match state
+        .mob_member_live_open_with_execution_identity(
+            &mob_id,
+            identity,
+            execution_identity,
+            params.turning_mode,
+            params.transport,
+        )
+        .await
+    {
+        Ok(opened) => opened,
+        Err(err) => return mob_call_error(id, &err).into(),
+    };
+    let (open, session_id, pending_receipt) = opened.into_parts();
+    let channel_id = meerkat_live::LiveChannelId::new(&open.channel_id);
+    let published = match super::live::register_live_playback_custody(
+        runtime,
+        &session_id,
+        &channel_id,
+        &pending_receipt,
+        playback_custodies,
+    )
+    .await
+    {
+        Ok(()) => serde_json::to_value(&open)
+            .map_err(|error| format!("failed to serialize LiveOpenResult: {error}")),
+        Err(playback_error) => Err(format!(
+            "member execution-identity open playback authority registration failed: \
+             {playback_error}"
+        )),
+    };
+    match published {
+        Ok(value) => super::live::LiveOpenHandlerResult {
+            response: RpcResponse::success(id, value),
+            experimental_publication: Some(super::live::ExperimentalLiveOpenPublication {
+                session_id,
+                channel_id,
+                authority: Arc::clone(authority),
+            }),
+        },
+        // Retire the channel this connection cannot publish exactly as an
+        // unpublished strict `live/open` is retired.
+        Err(detail) => {
+            playback_custodies.lock().await.remove(&channel_id);
+            let cleanup = runtime
+                .cleanup_experimental_live_channel_after_publication_failure(
+                    host,
+                    authority.as_ref(),
+                    &session_id,
+                    &channel_id,
+                )
+                .await;
+            match cleanup {
+                Ok(()) => RpcResponse::error(id, error::INTERNAL_ERROR, detail),
+                Err(cleanup_error) => RpcResponse::error(
+                    id,
+                    error::INTERNAL_ERROR,
+                    format!("{detail}; cleanup failed: {cleanup_error}"),
+                ),
+            }
+            .into()
+        }
     }
 }
 

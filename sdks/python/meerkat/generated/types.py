@@ -3486,6 +3486,7 @@ class MobMemberLiveOpenParams:
 `LiveOpenResult` verbatim."""
     agent_identity: str
     mob_id: str
+    execution_identity: Optional[dict[str, Any]] = None
     transport: Optional[LiveOpenTransport] = None
     turning_mode: Optional[RealtimeTurningMode] = None
 
