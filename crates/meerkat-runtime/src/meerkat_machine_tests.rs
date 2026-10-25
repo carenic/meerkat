@@ -60081,13 +60081,15 @@ mod terminal_completion_batch_bound {
     /// A retirement cleanup of 300 inputs, four of them directed and admitted
     /// first, commits two batches: the first 256 in canonical order, with
     /// every directed input, and 44 nondirected ones with no outbox. When the
-    /// publisher refuses the directed terminals, their publication retries
-    /// past the caller's deadline (the mob provisioner's cleanup passes one),
-    /// and the cleanup answers that error; the 44 inputs' waiters are
-    /// answered all the same. Neither the dispatch nor a later retry ever
-    /// resolves a batch with no outbox, and a retired session reaches no
-    /// drain that would. RED while the cleanup awaited the directed dispatch
-    /// first and returned its error before resolving them.
+    /// publisher refuses the directed terminals, the cleanup answers
+    /// RuntimeTerminalPublicationInProgress once the caller's deadline passes
+    /// (the mob provisioner's cleanup passes one) while the process-owned
+    /// dispatch keeps the publication and keeps retrying it; it never reports
+    /// success while the publication is refused. The 44 inputs' waiters are
+    /// answered all the same. Neither the dispatch nor a later retry ever resolves a batch with
+    /// no outbox, and a retired session reaches no drain that would. RED while
+    /// the cleanup awaited the directed dispatch first and returned its error
+    /// before resolving them.
     async fn retirement_cleanup_answers_the_batch_a_failed_publication_leaves(store: BoundStore) {
         const DIRECTED: usize = 4;
         let fixture = Fixture::new(store).await;
@@ -60123,14 +60125,25 @@ mod terminal_completion_batch_bound {
         )
         .await
         .expect("the retirement cleanup returns by its deadline");
+        // The publisher refuses every directed terminal, so the dispatch never
+        // converges, and the cleanup answers in-progress once its deadline
+        // passes while the dispatch keeps the publication. It commits the
+        // abandonment and starts the dispatch before it reads the deadline,
+        // so it can answer before the dispatch first calls the publisher.
         assert!(
-            cleanup.is_err(),
-            "the refused directed publication outlives the deadline: {cleanup:?}"
+            matches!(
+                cleanup,
+                Err(RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. })
+            ),
+            "the cleanup reports the refused publication in progress: {cleanup:?}"
         );
-        assert!(
-            publisher.calls.load(Ordering::SeqCst) >= 1,
-            "the directed batch reached the publisher: {cleanup:?}"
-        );
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while publisher.calls.load(Ordering::SeqCst) == 0 {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the dispatch hands the directed batch to the publisher");
 
         let mut unowned_waiters = Vec::with_capacity(unowned.len());
         for (input_id, waiter) in input_ids.iter().zip(waiters) {
