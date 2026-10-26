@@ -381,7 +381,7 @@ async fn the_settlement_registration_refuses_every_taker_and_leaves_exactly() {
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::new(RecordingPublisher::default())),
+            Arc::new(RecordingPublisher::default()),
             deadline(),
         )
         .await
@@ -461,7 +461,7 @@ async fn a_queued_nondirected_input_is_ended_stopped_with_its_runless_receipt() 
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::new(RecordingPublisher::default())),
+            Arc::new(RecordingPublisher::default()),
             deadline(),
         )
         .await
@@ -881,7 +881,7 @@ async fn settle_whole<P: CoreExecutorPublicationHandle + 'static>(
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::clone(publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            Arc::clone(publisher) as Arc<dyn CoreExecutorPublicationHandle>,
             deadline(),
         )
         .await;
@@ -1095,7 +1095,7 @@ async fn a_tail_held_beside_unbound_work_commits_once_the_sweep_ended_it() {
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>,
             deadline(),
         )
         .await
@@ -1949,7 +1949,7 @@ async fn an_open_run_held_beside_unbound_work_is_ended_and_then_committed_interr
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>,
             deadline(),
         )
         .await
@@ -2232,6 +2232,8 @@ enum Script {
     /// Appends, then fails before the caller learns of it (a crash between
     /// the event append and its receipt).
     FailAfterAppend,
+    /// Panics before it appends anything.
+    Panic,
 }
 
 /// A stored-only publisher scripted for its next publication. An event it
@@ -2316,6 +2318,7 @@ impl CoreExecutorPublicationHandle for ScriptedPublisher {
                     "the process stopped before the append's receipt".to_string(),
                 ))
             }
+            Script::Panic => panic!("the publisher panics before it appends anything"),
         }
     }
 }
@@ -2398,7 +2401,7 @@ async fn a_deadline_before_the_drain_reports_final_evidence_only_and_the_task_fi
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>,
             deadline_in(200),
         )
         .await
@@ -2512,7 +2515,7 @@ async fn a_held_publication_holds_no_gate_and_finishes_once_released() {
         .machine
         .finish_predecessor_settlement_before(
             lease,
-            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>,
             deadline_in(1_000),
         )
         .await
@@ -2832,7 +2835,7 @@ async fn every_live_caller_is_refused_while_the_settlement_task_holds_the_regist
         let publisher = Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>;
         crate::tokio::spawn(async move {
             machine
-                .finish_predecessor_settlement_before(lease, Some(publisher), deadline())
+                .finish_predecessor_settlement_before(lease, publisher, deadline())
                 .await
         })
     };
@@ -2967,4 +2970,72 @@ async fn every_live_caller_is_refused_while_the_settlement_task_holds_the_regist
         .register_session(session_id.clone())
         .await
         .expect("a fresh registration inserts");
+}
+
+/// A settlement task that panics frees its slot and tells its waiters: the
+/// finish answers at once that the task ended without a result, and a later
+/// begin answers at once (`Registered`: the panic left the internal
+/// registration in place) instead of waiting out its deadline on a slot no
+/// task would free.
+#[tokio::test]
+async fn a_panicking_settlement_task_frees_its_slot() {
+    let host = Host::head_canonical();
+    let (session_id, _q1, _d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the drive answers");
+    host.machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep commits");
+
+    let refused = host
+        .machine
+        .finish_predecessor_settlement_before(
+            lease,
+            Arc::new(ScriptedPublisher::new(Script::Panic)),
+            deadline(),
+        )
+        .await
+        .expect_err("a task that panics gives no result");
+    assert!(
+        matches!(
+            refused.refusal,
+            PredecessorSettlementRefusal::Runtime(RuntimeDriverError::Internal(_))
+        ),
+        "{:?}",
+        refused.refusal
+    );
+
+    let started = std::time::Instant::now();
+    let later = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect_err("the panic left the internal registration in place");
+    assert!(
+        matches!(later, PredecessorSettlementRefusal::Registered),
+        "{later:?}"
+    );
+    assert!(
+        started.elapsed() < BOUND / 2,
+        "the later begin waited {:?} on the slot of a task that ended",
+        started.elapsed()
+    );
+    assert!(
+        !host
+            .machine
+            .pending_predecessor_settlements
+            .lock()
+            .unwrap()
+            .contains_key(&session_id),
+        "the slot is free"
+    );
 }

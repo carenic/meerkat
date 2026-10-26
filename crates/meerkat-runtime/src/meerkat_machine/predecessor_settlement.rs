@@ -28,7 +28,10 @@
 //!    gate and hands the rest to one process-owned task: the runtime loop's
 //!    startup terminal drain with a stored-only publisher, then, under T and
 //!    the registration's mutation gate, a closing census of every durable
-//!    input row and the exact removal of the internal registration.
+//!    input row and the exact removal of the internal registration. A
+//!    settlement that stops before its drain removes the registration with
+//!    [`MeerkatMachine::remove_predecessor_settlement_registration_before`]
+//!    instead, publishing nothing.
 //!
 //! The internal registration carries a marker that refuses every path that
 //! could make it live (adoption, attachment, admission, lifecycle mutation,
@@ -320,6 +323,9 @@ pub struct MachinePredecessorSettlementLease {
     census: BeginCensus,
     /// The placement the outboxes of directed work name, read at begin.
     placement: Option<InteractionTerminalPlacement>,
+    /// The consent owner-loss outcome, kept from the internal registration's
+    /// publication on, so every later refusal reports it.
+    owner_loss: Option<PredecessorOwnerLoss>,
     tail_held: bool,
     internal: Option<PublishedSettlementRegistration>,
     runless_terminal: RunlessTerminalAnnouncement,
@@ -357,6 +363,14 @@ impl MachinePredecessorSettlementLease {
     #[must_use]
     pub fn registered(&self) -> bool {
         self.internal.is_some()
+    }
+
+    /// The consent owner-loss outcome of the claim's lineage, once the
+    /// internal registration published: `None` before that, and when the
+    /// publication could not establish one.
+    #[must_use]
+    pub fn owner_loss(&self) -> Option<&PredecessorOwnerLoss> {
+        self.owner_loss.as_ref()
     }
 }
 
@@ -434,6 +448,35 @@ pub(super) enum SettlementRegistrationRefused {
 pub(super) struct PendingPredecessorSettlement {
     task_id: uuid::Uuid,
     done_rx: crate::tokio::sync::watch::Receiver<bool>,
+}
+
+/// A running settlement task's hold on its slot: dropped when the task ends,
+/// by return or by panic, it frees the slot (when it is still the task's)
+/// and tells every waiter.
+struct PredecessorSettlementSlot {
+    machine: MeerkatMachine,
+    session_id: SessionId,
+    task_id: uuid::Uuid,
+    done_tx: crate::tokio::sync::watch::Sender<bool>,
+}
+
+impl Drop for PredecessorSettlementSlot {
+    fn drop(&mut self) {
+        {
+            let mut pending = self
+                .machine
+                .pending_predecessor_settlements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending
+                .get(&self.session_id)
+                .is_some_and(|pending| pending.task_id == self.task_id)
+            {
+                pending.remove(&self.session_id);
+            }
+        }
+        self.done_tx.send_replace(true);
+    }
 }
 
 /// How one decoded durable input row reads to a settlement.
@@ -965,6 +1008,7 @@ impl MeerkatMachine {
             claim: claim.clone(),
             census,
             placement,
+            owner_loss: None,
             tail_held: false,
             internal: None,
             runless_terminal: self.runless_terminal_announcement(),
@@ -1092,6 +1136,9 @@ impl MeerkatMachine {
         let session_id = lease.session_id.clone();
         let runtime_id = lease.runtime_id.clone();
         let mut concluded_drain = false;
+        // The proof this call's own first publication completed, when that
+        // publication came back as a cold-recovered drain.
+        let mut completed_by_this_call = None;
         let published = loop {
             // Directed work that still needs a new outbox keeps the placement
             // witness in the converged lifecycle row until the sweep commit.
@@ -1123,6 +1170,7 @@ impl MeerkatMachine {
             if !published.cold_recovered_draining {
                 break published;
             }
+            completed_by_this_call = published.completed_owner_loss.clone();
             if concluded_drain {
                 return Err(PredecessorSettlementRefusal::Runtime(
                     RuntimeDriverError::Internal(format!(
@@ -1148,10 +1196,13 @@ impl MeerkatMachine {
             self.refuse_registered_under_transaction(&session_id)
                 .await?;
         };
-        let owner_loss = predecessor_owner_loss(&published, &lease.claim);
+        let owner_loss =
+            predecessor_owner_loss(&published, &lease.claim, completed_by_this_call.as_ref());
         let mutation_gate = published.mutation_gate.clone();
-        // From here a dropped lease hands the registration's removal off.
+        // From here a dropped lease hands the registration's removal off,
+        // and every refusal reports the owner-loss outcome.
         lease.internal = Some(published);
+        lease.owner_loss = owner_loss.as_ref().ok().cloned();
         let owner_loss = owner_loss?;
 
         #[cfg(feature = "live")]
@@ -1203,9 +1254,41 @@ impl MeerkatMachine {
     /// Awaits the task's result until `deadline`; past it, the task drains
     /// and removes on its own, and the call answers
     /// `RuntimeTerminalPublicationInProgress` with the evidence final at that
-    /// moment. Without `publication` nothing is published and no census runs:
-    /// the task only removes the registration.
+    /// moment.
     pub async fn finish_predecessor_settlement_before(
+        &self,
+        lease: MachinePredecessorSettlementLease,
+        publication: Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<PredecessorPublication, PredecessorPublicationRefused> {
+        self.hand_off_predecessor_settlement_before(lease, Some(publication), deadline)
+            .await
+    }
+
+    /// Remove the settlement's internal registration exactly, for a
+    /// settlement that stops before its drain: the gates are released and the
+    /// same process-owned task takes T and M and removes it, publishing
+    /// nothing and running no census. `Ok` once it is removed, or when the
+    /// lease holds no registration; past `deadline`,
+    /// `RuntimeTerminalPublicationInProgress` while the task removes it on its
+    /// own.
+    pub async fn remove_predecessor_settlement_registration_before(
+        &self,
+        lease: MachinePredecessorSettlementLease,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), PredecessorSettlementRefusal> {
+        if !lease.registered() {
+            return Ok(());
+        }
+        self.hand_off_predecessor_settlement_before(lease, None, deadline)
+            .await
+            .map(|_| ())
+            .map_err(|refused| refused.refusal)
+    }
+
+    /// [`Self::finish_predecessor_settlement_before`], and with no
+    /// `publication` [`Self::remove_predecessor_settlement_registration_before`].
+    async fn hand_off_predecessor_settlement_before(
         &self,
         mut lease: MachinePredecessorSettlementLease,
         publication: Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>>,
@@ -1232,16 +1315,26 @@ impl MeerkatMachine {
         drop(lease.live_lifecycle_lease.take());
         drop(lease.registration_guard.take());
         lease.runless_terminal.release();
-        let census_for_progress = census.clone();
+        // A removal publishes nothing and reports no progress.
+        let census_for_progress = publication.is_some().then(|| census.clone());
         let (result_tx, result_rx) = crate::tokio::sync::oneshot::channel();
-        self.start_predecessor_settlement_task(
+        if let Err(error) = self.start_predecessor_settlement_task(
             session_id.clone(),
             internal,
             publication,
             census,
             Some(result_tx),
-        )
-        .map_err(|error| refused(PredecessorSettlementRefusal::Runtime(error)))?;
+        ) {
+            return Err(PredecessorPublicationRefused {
+                refusal: PredecessorSettlementRefusal::Runtime(error),
+                progress: finish_progress(
+                    store.as_ref(),
+                    &runtime_id,
+                    census_for_progress.as_ref(),
+                )
+                .await,
+            });
+        }
         drop(lease);
         let in_progress = || {
             PredecessorSettlementRefusal::Runtime(
@@ -1253,21 +1346,38 @@ impl MeerkatMachine {
         let Some(remaining) = remaining_until(deadline) else {
             return Err(PredecessorPublicationRefused {
                 refusal: in_progress(),
-                progress: settlement_progress(store.as_ref(), &runtime_id, &census_for_progress)
-                    .await,
+                progress: finish_progress(
+                    store.as_ref(),
+                    &runtime_id,
+                    census_for_progress.as_ref(),
+                )
+                .await,
             });
         };
         match crate::tokio::time::timeout(remaining, result_rx).await {
             Ok(Ok(result)) => result,
-            Ok(Err(_)) => Err(refused(PredecessorSettlementRefusal::Runtime(
-                RuntimeDriverError::Internal(format!(
-                    "the predecessor settlement task of session {session_id} ended without a result"
+            Ok(Err(_)) => Err(PredecessorPublicationRefused {
+                refusal: PredecessorSettlementRefusal::Runtime(RuntimeDriverError::Internal(
+                    format!(
+                        "the predecessor settlement task of session {session_id} ended without a \
+                         result"
+                    ),
                 )),
-            ))),
+                progress: finish_progress(
+                    store.as_ref(),
+                    &runtime_id,
+                    census_for_progress.as_ref(),
+                )
+                .await,
+            }),
             Err(_) => Err(PredecessorPublicationRefused {
                 refusal: in_progress(),
-                progress: settlement_progress(store.as_ref(), &runtime_id, &census_for_progress)
-                    .await,
+                progress: finish_progress(
+                    store.as_ref(),
+                    &runtime_id,
+                    census_for_progress.as_ref(),
+                )
+                .await,
             }),
         }
     }
@@ -1551,8 +1661,8 @@ impl MeerkatMachine {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .get(session_id)
-                .map(|pending| pending.done_rx.clone());
-            let Some(mut done_rx) = pending else {
+                .map(|pending| (pending.task_id, pending.done_rx.clone()));
+            let Some((task_id, mut done_rx)) = pending else {
                 return Ok(());
             };
             let remaining = remaining_until(deadline).ok_or_else(in_progress)?;
@@ -1569,6 +1679,18 @@ impl MeerkatMachine {
             .await;
             if finished.is_err() {
                 return Err(in_progress());
+            }
+            // A task that ended without freeing its slot is done as well:
+            // its slot goes, so no later begin waits on it again.
+            let mut pending = self
+                .pending_predecessor_settlements
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if pending
+                .get(session_id)
+                .is_some_and(|pending| pending.task_id == task_id)
+            {
+                pending.remove(session_id);
             }
         }
     }
@@ -1600,24 +1722,20 @@ impl MeerkatMachine {
                 session_id.clone(),
                 PendingPredecessorSettlement { task_id, done_rx },
             );
+        // Frees the slot and tells its waiters when the task ends: by return,
+        // by panic, or with its future dropped unpolled.
+        let slot = PredecessorSettlementSlot {
+            machine: self.clone(),
+            session_id: session_id.clone(),
+            task_id,
+            done_tx,
+        };
         let machine = self.clone();
         spawner.spawn(async move {
             let result = machine
                 .run_predecessor_settlement_task(&session_id, internal, publication, &census)
                 .await;
-            {
-                let mut pending = machine
-                    .pending_predecessor_settlements
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if pending
-                    .get(&session_id)
-                    .is_some_and(|pending| pending.task_id == task_id)
-                {
-                    pending.remove(&session_id);
-                }
-            }
-            done_tx.send_replace(true);
+            drop(slot);
             if let Some(result_tx) = result_tx {
                 let _ = result_tx.send(result);
             }
@@ -1786,6 +1904,19 @@ async fn settlement_progress(
     }
 }
 
+/// The final evidence a refused finish reports: that of `census`, or none
+/// for a removal, which publishes nothing.
+async fn finish_progress(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    census: Option<&BeginCensus>,
+) -> PredecessorPublication {
+    match census {
+        Some(census) => settlement_progress(store, runtime_id, census).await,
+        None => PredecessorPublication::default(),
+    }
+}
+
 /// `refusal`, with the final evidence of `census`: its converged inputs and
 /// owed ids, never a census count.
 fn refused_with_final_evidence(
@@ -1804,7 +1935,10 @@ fn refused_with_final_evidence(
 }
 
 /// The consent owner-loss outcome of the internal registration's
-/// publication.
+/// publication. `completed_by_this_call` is the proof an earlier publication
+/// of this same call completed (the unmarked publication of a cold-recovered
+/// drain it concluded first): this call completed it, so it is reported
+/// `Completed`, not `NotOwed`.
 #[allow(
     clippy::result_large_err,
     reason = "the public refusal carries a runtime or recovery error inline"
@@ -1812,8 +1946,13 @@ fn refused_with_final_evidence(
 fn predecessor_owner_loss(
     published: &PublishedSettlementRegistration,
     claim: &HostingClaim,
+    completed_by_this_call: Option<&HostingOwnerLossProof>,
 ) -> Result<PredecessorOwnerLoss, PredecessorSettlementRefusal> {
-    if let Some(proof) = published.completed_owner_loss.clone() {
+    if let Some(proof) = published
+        .completed_owner_loss
+        .clone()
+        .or_else(|| completed_by_this_call.cloned())
+    {
         return Ok(PredecessorOwnerLoss::Completed(proof));
     }
     if !published.consent_owner_installed {

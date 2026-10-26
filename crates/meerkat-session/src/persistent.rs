@@ -17807,118 +17807,147 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                 .await
                 .map_err(|_| busy())?;
 
+        // A restart keeps what an earlier pass made durable: its tail commit,
+        // its owner-loss outcome, and the inputs it ended or answered, owed
+        // until a drain converges them.
         let mut progress = meerkat_runtime::ColdPredecessorSettlement::untouched(id.clone());
-        let (publication, held_refusal) = 'settle: loop {
-            progress.tail = None;
-            progress.owner_loss = None;
-            let mut lease = owner
-                .begin_predecessor_settlement_before(claim, deadline)
-                .await
-                .map_err(|refusal| untouched(Refusal::Settlement(refusal)))?;
-            // R is only ever try-locked while the lease holds T: a busy R
-            // drops the lease, waits for R holding nothing, and restarts.
-            let recovery_gate = self.recovery_gate_for_session(id).await;
-            let Ok(recovery_guard) = Arc::clone(&recovery_gate).try_lock_owned() else {
-                drop(lease);
-                drop(
-                    self.settlement_recovery_gate_before(id, recovery_gate, deadline)
-                        .await
-                        .map_err(session)?,
-                );
-                continue 'settle;
-            };
-            if !self
-                .session_known_to_archive_authority(id)
-                .await
-                .map_err(session)?
-                || self
-                    .session_archived_by_runtime_store_authority(id)
+        let settled: Result<(Result<_, _>, Option<Settlement>), Refusal> = async {
+            let (publication, held_refusal) = 'settle: loop {
+                let mut lease = owner
+                    .begin_predecessor_settlement_before(claim, deadline)
                     .await
-                    .map_err(session)?
-            {
-                return Err(session(SessionError::NotFound { id: id.clone() }));
-            }
-            if self.inner.has_live_session(id).await.map_err(session)? {
-                return Err(busy());
-            }
-            progress.tail = owner
-                .settle_predecessor_tail_with_lease(&mut lease)
-                .await
-                .map_err(|refusal| untouched(Refusal::Settlement(refusal)))?;
-            drop(recovery_guard);
-
-            let work = match owner
-                .end_predecessor_work_with_lease_before(&mut lease, deadline)
-                .await
-            {
-                Ok(work) => work,
-                Err(refusal) => {
-                    // A published registration is removed exactly, with
-                    // nothing published.
-                    if lease.registered() {
-                        let _ = owner
-                            .finish_predecessor_settlement_before(lease, None, deadline)
-                            .await;
-                    }
-                    self.note_settled_tail(id, &progress);
-                    return Err(SettleError::with_progress(
-                        Refusal::Settlement(refusal),
-                        progress,
-                    ));
-                }
-            };
-            progress.owner_loss = Some(work.owner_loss);
-
-            let mut held_refusal = None;
-            if lease.tail_held() {
+                    .map_err(Refusal::Settlement)?;
+                // R is only ever try-locked while the lease holds T: a busy R
+                // drops the lease, waits for R holding nothing, and restarts.
                 let recovery_gate = self.recovery_gate_for_session(id).await;
                 let Ok(recovery_guard) = Arc::clone(&recovery_gate).try_lock_owned() else {
-                    // The ended work is durable: remove the registration,
-                    // wait for R holding nothing, and settle again.
-                    let _ = owner
-                        .finish_predecessor_settlement_before(lease, None, deadline)
-                        .await;
+                    drop(lease);
                     drop(
                         self.settlement_recovery_gate_before(id, recovery_gate, deadline)
                             .await
-                            .map_err(session)?,
+                            .map_err(Refusal::Session)?,
                     );
                     continue 'settle;
                 };
-                match owner.settle_predecessor_tail_with_lease(&mut lease).await {
-                    Ok(Some(tail)) => progress.tail = Some(tail),
-                    Ok(None) => {}
-                    Err(refusal) => held_refusal = Some(refusal),
+                if !self
+                    .session_known_to_archive_authority(id)
+                    .await
+                    .map_err(Refusal::Session)?
+                    || self
+                        .session_archived_by_runtime_store_authority(id)
+                        .await
+                        .map_err(Refusal::Session)?
+                {
+                    return Err(Refusal::Session(SessionError::NotFound { id: id.clone() }));
+                }
+                if self
+                    .inner
+                    .has_live_session(id)
+                    .await
+                    .map_err(Refusal::Session)?
+                {
+                    return Err(Refusal::Session(SessionError::Busy { id: id.clone() }));
+                }
+                if let Some(tail) = owner
+                    .settle_predecessor_tail_with_lease(&mut lease)
+                    .await
+                    .map_err(Refusal::Settlement)?
+                {
+                    progress.tail = Some(tail);
                 }
                 drop(recovery_guard);
-            }
 
-            // Only while no live actor of the session is hosted here.
-            if self.inner.has_live_session(id).await.map_err(session)? {
-                let _ = owner
-                    .finish_predecessor_settlement_before(lease, None, deadline)
-                    .await;
-                self.note_settled_tail(id, &progress);
-                return Err(SettleError::with_progress(
-                    Refusal::Session(SessionError::Busy { id: id.clone() }),
-                    progress,
+                let work = match owner
+                    .end_predecessor_work_with_lease_before(&mut lease, deadline)
+                    .await
+                {
+                    Ok(work) => work,
+                    Err(refusal) => {
+                        // The owner-loss outcome stands once the internal
+                        // registration published; the registration is
+                        // removed exactly, with nothing published.
+                        if let Some(owner_loss) = lease.owner_loss() {
+                            progress.owner_loss = Some(merged_owner_loss(
+                                progress.owner_loss.take(),
+                                owner_loss.clone(),
+                            ));
+                        }
+                        let _ = owner
+                            .remove_predecessor_settlement_registration_before(lease, deadline)
+                            .await;
+                        return Err(Refusal::Settlement(refusal));
+                    }
+                };
+                progress.owner_loss = Some(merged_owner_loss(
+                    progress.owner_loss.take(),
+                    work.owner_loss,
                 ));
-            }
-            let publisher: Arc<dyn CoreExecutorPublicationHandle> =
-                Arc::new(StoredOnlyTerminalPublisher {
-                    inner: Arc::clone(&self.inner),
-                    session_id: id.clone(),
-                    recovery_gate: self.recovery_gate_for_session(id).await,
-                    event_store: self.event_store.clone(),
-                    event_projection_faults: Arc::clone(&self.event_projection_faults),
-                    event_projection_drains: Arc::clone(&self.event_projection_drains),
-                });
-            let publication = owner
-                .finish_predecessor_settlement_before(lease, Some(publisher), deadline)
-                .await;
-            break 'settle (publication, held_refusal);
-        };
+                // Durable terminals with their carriers from here on, owed
+                // until a drain converges them.
+                for input_id in work.ended.into_iter().chain(work.answered) {
+                    if !progress.terminals_owed.contains(&input_id) {
+                        progress.terminals_owed.push(input_id);
+                    }
+                }
+
+                let mut held_refusal = None;
+                if lease.tail_held() {
+                    let recovery_gate = self.recovery_gate_for_session(id).await;
+                    let Ok(recovery_guard) = Arc::clone(&recovery_gate).try_lock_owned() else {
+                        // The ended work is durable: remove the registration,
+                        // wait for R holding nothing, and settle again.
+                        let _ = owner
+                            .remove_predecessor_settlement_registration_before(lease, deadline)
+                            .await;
+                        drop(
+                            self.settlement_recovery_gate_before(id, recovery_gate, deadline)
+                                .await
+                                .map_err(Refusal::Session)?,
+                        );
+                        continue 'settle;
+                    };
+                    match owner.settle_predecessor_tail_with_lease(&mut lease).await {
+                        Ok(Some(tail)) => progress.tail = Some(tail),
+                        Ok(None) => {}
+                        Err(refusal) => held_refusal = Some(refusal),
+                    }
+                    drop(recovery_guard);
+                }
+
+                // Only while no live actor of the session is hosted here.
+                let live = match self.inner.has_live_session(id).await {
+                    Ok(false) => None,
+                    Ok(true) => Some(SessionError::Busy { id: id.clone() }),
+                    Err(error) => Some(error),
+                };
+                if let Some(error) = live {
+                    let _ = owner
+                        .remove_predecessor_settlement_registration_before(lease, deadline)
+                        .await;
+                    return Err(Refusal::Session(error));
+                }
+                let publisher: Arc<dyn CoreExecutorPublicationHandle> =
+                    Arc::new(StoredOnlyTerminalPublisher {
+                        inner: Arc::clone(&self.inner),
+                        session_id: id.clone(),
+                        recovery_gate: self.recovery_gate_for_session(id).await,
+                        event_store: self.event_store.clone(),
+                        event_projection_faults: Arc::clone(&self.event_projection_faults),
+                        event_projection_drains: Arc::clone(&self.event_projection_drains),
+                    });
+                let publication = owner
+                    .finish_predecessor_settlement_before(lease, publisher, deadline)
+                    .await;
+                break 'settle (publication, held_refusal);
+            };
+            Ok((publication, held_refusal))
+        }
+        .await;
         self.note_settled_tail(id, &progress);
+        let (publication, held_refusal) = match settled {
+            Ok(settled) => settled,
+            Err(refusal) => return Err(SettleError::with_progress(refusal, progress)),
+        };
         match publication {
             Ok(publication) => {
                 progress.inputs = publication.converged;
@@ -17936,8 +17965,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             Err(refused) => {
                 progress.inputs = refused.progress.converged;
                 progress.terminals_owed = refused.progress.owed;
+                // A task still removing the registration answers in
+                // progress, ahead of a held tail's refusal.
+                let refusal = match (held_refusal, refused.refusal) {
+                    (
+                        _,
+                        in_progress @ Settlement::Runtime(
+                            meerkat_runtime::RuntimeDriverError::RuntimeTerminalPublicationInProgress {
+                                ..
+                            },
+                        ),
+                    ) => in_progress,
+                    (Some(held), _) => held,
+                    (None, refusal) => refusal,
+                };
                 Err(SettleError::with_progress(
-                    Refusal::Settlement(held_refusal.unwrap_or(refused.refusal)),
+                    Refusal::Settlement(refusal),
                     progress,
                 ))
             }
@@ -17971,6 +18014,22 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         tokio::time::timeout(remaining, recovery_gate.lock_owned())
             .await
             .map_err(|_| busy())
+    }
+}
+
+/// `next`, the owner-loss outcome of a later pass of one settlement call,
+/// after `earlier`: a proof an earlier pass of the call completed stays
+/// `Completed` when the later pass finds it already settled.
+fn merged_owner_loss(
+    earlier: Option<meerkat_runtime::PredecessorOwnerLoss>,
+    next: meerkat_runtime::PredecessorOwnerLoss,
+) -> meerkat_runtime::PredecessorOwnerLoss {
+    use meerkat_runtime::PredecessorOwnerLoss as OwnerLoss;
+    match (earlier, next) {
+        (Some(OwnerLoss::Completed(proof)), OwnerLoss::NotOwed(settled)) if settled == proof => {
+            OwnerLoss::Completed(proof)
+        }
+        (_, next) => next,
     }
 }
 
@@ -53403,6 +53462,290 @@ mod tests {
                 )
             ),
             "{refused:?}"
+        );
+    }
+
+    /// The runtime that hosted a settled session before, as its lifecycle row
+    /// names it.
+    const PREDECESSOR_RUNTIME: &str = "predecessor-runtime";
+
+    impl HostedDurableTail {
+        /// [`Self::service`] with a durable event store, so the service can
+        /// publish the terminals of directed work.
+        fn service_with_event_store(
+            &self,
+            event_store: &Arc<RecordingEventStore>,
+        ) -> PersistentSessionService<DummyBuilder> {
+            self.service().with_event_projection(
+                Arc::clone(event_store) as Arc<dyn EventStore>,
+                Arc::new(SessionProjector::new(self._dir.path().join(".rkat"))),
+            )
+        }
+
+        /// The session's lifecycle row as a quiescent predecessor placed at
+        /// its own runtime left it: Idle and bound.
+        async fn placed_lifecycle_row(&self) {
+            self.runtime_store
+                .commit_machine_lifecycle(
+                    &LogicalRuntimeId::for_session(&self.session_id),
+                    meerkat_runtime::store::MachineLifecycleCommit::placed_idle_for_test(
+                        PREDECESSOR_RUNTIME,
+                        11,
+                        3,
+                        "predecessor-epoch",
+                    ),
+                    &[],
+                )
+                .await
+                .expect("the lifecycle row is written");
+        }
+
+        /// A directed input the predecessor queued and no run bound.
+        async fn queued_directed_input(&self) -> meerkat_runtime::Input {
+            let input = meerkat_runtime::mob_adapter::create_tracked_flow_step_input(
+                "queued by the predecessor",
+                meerkat_core::types::ContentInput::Text("directed by the predecessor".to_string()),
+                "predecessor-settlement-flow",
+                None,
+                &meerkat_core::time_compat::new_uuid_v7().to_string(),
+            )
+            .expect("a directed flow step");
+            let mut state =
+                meerkat_runtime::input_state::InputState::new_accepted(input.id().clone());
+            state.persisted_input = Some(input.clone());
+            state.durability = Some(meerkat_runtime::InputDurability::Durable);
+            state.runtime_semantics = Some(
+                meerkat_runtime::ingress_types::RuntimeInputSemantics::try_from_generated_admission(
+                    &input, true,
+                )
+                .expect("generated admission semantics"),
+            );
+            let policy = meerkat_runtime::DefaultPolicyTable::resolve(&input, true);
+            state.policy = Some(meerkat_runtime::PolicySnapshot {
+                version: policy.policy_version,
+                decision: policy,
+            });
+            let queued = StoredInputState {
+                state,
+                seed: meerkat_runtime::input_state::InputStateSeed {
+                    phase: InputLifecycleState::Queued,
+                    last_run_id: None,
+                    last_boundary_sequence: None,
+                    admission_sequence: Some(1),
+                    terminal_outcome: None,
+                    attempt_count: 0,
+                    recovery_lane: Some(meerkat_core::types::HandlingMode::Queue),
+                },
+            };
+            self.runtime_store
+                .persist_input_state(
+                    &LogicalRuntimeId::for_session(&self.session_id),
+                    &InputStatePersistenceRecord::stored_row_for_test(queued)
+                        .expect("a stored row"),
+                )
+                .await
+                .expect("the input row is written");
+            input
+        }
+    }
+
+    /// The sweep commit fails after the internal registration published: the
+    /// call answers the blocked repair with the final evidence it made
+    /// durable, the committed tail and the owner-loss outcome (final from
+    /// that publication on), and nothing for the inputs, since the sweep's
+    /// outcome is not known to it. The registration is removed exactly, the
+    /// lifecycle row is the internal registration's with its placement
+    /// witness (the registration landed, the sweep did not), the queued input
+    /// is still queued, and a repeat settles the session.
+    #[tokio::test]
+    async fn a_failed_sweep_commit_reports_the_owner_loss_and_removes_the_registration() {
+        let tail = HostedDurableTail::new().await;
+        tail.placed_lifecycle_row().await;
+        let directed = tail.queued_directed_input().await;
+        let event_store = Arc::new(RecordingEventStore::default());
+        let service = tail.service_with_event_store(&event_store);
+        let claim = service
+            .grant_session_hosting(&tail.session_id)
+            .expect("this runtime owner takes the session's claim");
+        let runtime_id = LogicalRuntimeId::for_session(&tail.session_id);
+        tail.runtime_store
+            .fail_next_terminal_lifecycle_commit_of_input_for_test(directed.id().clone());
+
+        let refused = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect_err("the failed sweep stops the settlement");
+        assert!(
+            matches!(
+                refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::Runtime(
+                        meerkat_runtime::RuntimeDriverError::RecoveryRepairBlocked { .. }
+                    )
+                )
+            ),
+            "{refused:?}"
+        );
+        let progress = &refused.progress;
+        assert_eq!(
+            progress.tail.as_ref().map(|tail| tail.disposition),
+            Some(meerkat_runtime::recovery::DurableTailRecoveryDisposition::CommitCompleted),
+            "the committed tail is final evidence"
+        );
+        assert_eq!(
+            progress.owner_loss,
+            Some(meerkat_runtime::PredecessorOwnerLoss::NoConsentOwner),
+            "the owner-loss outcome is final from the internal registration's publication on"
+        );
+        assert!(progress.inputs.is_empty());
+        assert!(
+            progress.terminals_owed.is_empty(),
+            "an input the failed sweep may not have ended is never reported owed"
+        );
+        let machine = service
+            .acquire_canonical_runtime_adapter(None)
+            .expect("the service's runtime owner");
+        assert!(
+            !machine.contains_session(&tail.session_id).await,
+            "the internal registration is removed"
+        );
+        match tail
+            .runtime_store
+            .observe_machine_lifecycle(&runtime_id)
+            .await
+            .expect("the lifecycle row reads")
+        {
+            meerkat_runtime::store::MachineLifecycleObservation::Decoded { record, .. } => {
+                assert_eq!(record.record_version(), 7);
+                assert_eq!(
+                    record
+                        .placement_witness()
+                        .and_then(|witness| witness.agent_runtime_id()),
+                    Some(PREDECESSOR_RUNTIME),
+                    "the internal registration kept the predecessor's placement as its witness"
+                );
+            }
+            other => panic!("the lifecycle row decodes: {other:?}"),
+        }
+        let row = tail
+            .runtime_store
+            .load_input_state(&runtime_id, directed.id())
+            .await
+            .expect("the input row reads")
+            .expect("the input row exists");
+        assert_eq!(
+            row.seed.phase,
+            InputLifecycleState::Queued,
+            "the failed sweep wrote nothing"
+        );
+
+        let repeat = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect("a repeat settles the session");
+        assert!(repeat.tail.is_none(), "no tail stands any more");
+        assert_eq!(
+            repeat
+                .inputs
+                .iter()
+                .map(|settled| (settled.input_id.clone(), settled.settled_by))
+                .collect::<Vec<_>>(),
+            vec![(directed.id().clone(), meerkat_runtime::SettledBy::Ended)]
+        );
+        assert!(repeat.terminals_owed.is_empty());
+        assert!(!machine.contains_session(&tail.session_id).await);
+    }
+
+    /// A directed input the predecessor queued, settled through the service's
+    /// own stored-only publisher into its durable event store: the input
+    /// ends `Stopped`, its requester's terminal is published at the sequence
+    /// the event store recorded, nothing stays owed, the session's event line
+    /// allocates strictly above the published row, and a repeat publishes
+    /// nothing again.
+    #[tokio::test]
+    async fn a_directed_input_is_settled_through_the_services_stored_only_publisher() {
+        let tail = HostedDurableTail::new().await;
+        tail.placed_lifecycle_row().await;
+        let directed = tail.queued_directed_input().await;
+        let event_store = Arc::new(RecordingEventStore::default());
+        let service = tail.service_with_event_store(&event_store);
+        let claim = service
+            .grant_session_hosting(&tail.session_id)
+            .expect("this runtime owner takes the session's claim");
+
+        let settled = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect("the settlement certifies the session");
+        assert!(settled.terminals_owed.is_empty());
+        assert_eq!(settled.durable_rows_closed, 1);
+        let [input] = settled.inputs.as_slice() else {
+            panic!("one settled input: {:?}", settled.inputs);
+        };
+        assert_eq!(&input.input_id, directed.id());
+        assert_eq!(input.settled_by, meerkat_runtime::SettledBy::Ended);
+        let interaction_id = input
+            .interaction_id
+            .expect("a directed input names its requester's interaction");
+        let published_seq = input
+            .published_terminal_seq
+            .expect("the requester's terminal is published");
+        let rows = event_store
+            .read_from(&tail.session_id, 0)
+            .await
+            .expect("read the event log");
+        let published = rows
+            .iter()
+            .find(|row| {
+                matches!(
+                    row.source,
+                    meerkat_core::event::EventSourceIdentity::Interaction {
+                        interaction_id: source
+                    } if source == interaction_id
+                )
+            })
+            .expect("the published terminal is a durable row");
+        assert_eq!(
+            published.stream_seq, published_seq,
+            "the settled input names the sequence the event store recorded"
+        );
+        assert!(
+            matches!(
+                &published.event,
+                AgentEvent::InteractionFailed {
+                    reason: meerkat_core::event::InteractionFailureReason::Abandoned { detail },
+                    ..
+                } if detail == "runtime stopped"
+            ),
+            "{:?}",
+            published.event
+        );
+        let line = service
+            .inner
+            .stored_only_event_line(&tail.session_id, None)
+            .await;
+        assert!(
+            line.reserve(1) + 1 > published_seq,
+            "the session's next allocation lands above the published row"
+        );
+        let machine = service
+            .acquire_canonical_runtime_adapter(None)
+            .expect("the service's runtime owner");
+        assert!(!machine.contains_session(&tail.session_id).await);
+
+        let repeat = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect("a repeat certifies the session again");
+        assert!(repeat.inputs.is_empty(), "nothing is left to settle");
+        assert_eq!(
+            event_store
+                .read_from(&tail.session_id, 0)
+                .await
+                .expect("read the event log again")
+                .len(),
+            rows.len(),
+            "nothing is published twice"
         );
     }
 

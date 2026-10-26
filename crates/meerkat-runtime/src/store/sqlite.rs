@@ -11866,6 +11866,10 @@ ORDER BY runtime_id";
         /// regression tests only.
         #[cfg(test)]
         machine_lifecycle_commit_pause: std::sync::Mutex<Option<MachineLifecycleCommitPause>>,
+        /// Test support: the input whose next terminal machine-lifecycle
+        /// commit fails before it writes anything.
+        #[cfg(any(test, feature = "test-support"))]
+        machine_lifecycle_commit_fault: std::sync::Mutex<Option<InputId>>,
     }
 
     impl SqliteRuntimeStore {
@@ -11993,6 +11997,8 @@ ORDER BY runtime_id";
                 input_persist_ack_loss: crate::store::InputPersistAckLossFault::default(),
                 #[cfg(test)]
                 machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                machine_lifecycle_commit_fault: std::sync::Mutex::new(None),
             })
         }
 
@@ -12355,6 +12361,8 @@ ORDER BY runtime_id";
                 input_persist_ack_loss: crate::store::InputPersistAckLossFault::default(),
                 #[cfg(test)]
                 machine_lifecycle_commit_pause: std::sync::Mutex::new(None),
+                #[cfg(any(test, feature = "test-support"))]
+                machine_lifecycle_commit_fault: std::sync::Mutex::new(None),
             }
         }
 
@@ -12639,6 +12647,19 @@ ORDER BY runtime_id";
                     entered,
                     release,
                 });
+        }
+
+        /// Test support: fail the next machine-lifecycle commit that writes
+        /// `input_id` terminal, before it writes anything. That commit
+        /// answers `WriteFailed` and every row stays as it was; later commits
+        /// run as usual.
+        #[cfg(any(test, feature = "test-support"))]
+        #[doc(hidden)]
+        pub fn fail_next_terminal_lifecycle_commit_of_input_for_test(&self, input_id: InputId) {
+            *self
+                .machine_lifecycle_commit_fault
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(input_id);
         }
 
         /// Total candidate bytes this store has shipped into the snapshot
@@ -18829,6 +18850,29 @@ ORDER BY runtime_id";
                     )
                 })
                 .collect::<Vec<_>>();
+            #[cfg(any(test, feature = "test-support"))]
+            {
+                let mut armed = self
+                    .machine_lifecycle_commit_fault
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let failed = armed.as_ref().and_then(|input_id| {
+                    input_states
+                        .iter()
+                        .find(|(stored, _)| {
+                            &stored.state.input_id == input_id
+                                && stored.seed.terminal_outcome.is_some()
+                        })
+                        .map(|(stored, _)| stored.state.input_id.clone())
+                });
+                if let Some(input_id) = failed {
+                    *armed = None;
+                    return Err(RuntimeStoreError::WriteFailed(format!(
+                        "injected failure of the machine-lifecycle commit that ends input \
+                         {input_id}"
+                    )));
+                }
+            }
             #[cfg(test)]
             let pause = {
                 let mut armed = self

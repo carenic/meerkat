@@ -8676,6 +8676,32 @@ pub struct MachineLifecycleCommit {
 }
 
 impl MachineLifecycleCommit {
+    /// Test support: the lifecycle row a quiescent runtime placed at the
+    /// given binding leaves: Idle, bound, with no run, no supervisor and no
+    /// unregister progress.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub fn placed_idle_for_test(
+        agent_runtime_id: &str,
+        fence_token: u64,
+        runtime_generation: u64,
+        runtime_epoch_id: &str,
+    ) -> Self {
+        Self::new_with_binding_run_unregister_progress_and_live_bridge(
+            RuntimeState::Idle,
+            MachineLifecycleBindingFacts::new(
+                Some(agent_runtime_id.to_string()),
+                Some(fence_token),
+                Some(runtime_generation),
+                Some(runtime_epoch_id.to_string()),
+            ),
+            MachineLifecycleRunFacts::default(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            None,
+            crate::live_execution::LiveBridgeRecoveryImage::default(),
+        )
+    }
+
     #[cfg(test)]
     pub(crate) fn new_with_binding(
         runtime_state: RuntimeState,
