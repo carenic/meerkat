@@ -40,6 +40,9 @@ fn llm_identity(session: &Session) -> SessionLlmIdentity {
 struct ScriptedClient {
     requests: Arc<Mutex<Vec<meerkat_client::LlmRequest>>>,
     released: tokio::sync::watch::Sender<bool>,
+    /// How many of the next requests answer at once with a `peers` tool
+    /// call, released or not ([`Self::call_a_tool_next`]).
+    tool_rounds: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScriptedClient {
@@ -48,7 +51,16 @@ impl ScriptedClient {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             released,
+            tool_rounds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Answer the next request at once with a `peers` tool call, released or
+    /// not: the run commits that round and asks the model again, so a run
+    /// blocked on that next request has a committed round to continue from.
+    fn call_a_tool_next(&self) {
+        self.tool_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn requests(&self) -> Vec<meerkat_client::LlmRequest> {
@@ -95,17 +107,34 @@ impl meerkat_client::LlmClient for ScriptedClient {
             requests.push(request.clone());
             requests.len()
         };
+        let tool_round = self
+            .tool_rounds
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |rounds| rounds.checked_sub(1),
+            )
+            .is_ok();
         let mut released = self.released.subscribe();
         Box::pin(async_stream::try_stream! {
-            while !*released.borrow_and_update() {
-                if released.changed().await.is_err() {
-                    break;
+            if tool_round {
+                yield meerkat_client::LlmEvent::ToolCallComplete {
+                    id: format!("round-call-{sequence}"),
+                    name: "peers".to_string(),
+                    args: serde_json::json!({}),
+                    meta: None,
+                };
+            } else {
+                while !*released.borrow_and_update() {
+                    if released.changed().await.is_err() {
+                        break;
+                    }
                 }
+                yield meerkat_client::LlmEvent::TextDelta {
+                    delta: format!("executor-answer-{sequence}"),
+                    meta: None,
+                };
             }
-            yield meerkat_client::LlmEvent::TextDelta {
-                delta: format!("executor-answer-{sequence}"),
-                meta: None,
-            };
             yield meerkat_client::LlmEvent::UsageUpdate {
                 usage: meerkat_core::TurnUsage::host_declared(
                     Provider::OpenAI,
@@ -113,8 +142,13 @@ impl meerkat_client::LlmClient for ScriptedClient {
                     Usage::default(),
                 ),
             };
+            let stop = if tool_round {
+                meerkat_core::StopReason::ToolUse
+            } else {
+                meerkat_core::StopReason::EndTurn
+            };
             yield meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
+                outcome: meerkat_client::LlmDoneOutcome::success(stop),
             };
         })
     }
@@ -2933,9 +2967,11 @@ async fn member_input_rows(
 
 /// A Shutdown with `QueuedInputsOnShutdown::Keep` over a member whose
 /// registration served nothing hands the store back as it found it. The first
-/// process shuts down with a requeue while a turn runs and a second input
-/// waits behind it, so the store holds the member's open run and its requeued
-/// input. The second process restores the mob with the member's run starts
+/// process shuts down with a requeue while a turn runs, its first round
+/// committed (a tool call) and its second request blocked, and a second input
+/// waits behind it, so the store holds the member's open run with a round to
+/// continue from and its requeued input. The second process restores the mob
+/// with the member's run starts
 /// held by its host, so the member's registration recovers both and runs
 /// nothing, and shuts down with Keep: every input row of the member is the
 /// same before and after it, and its model saw no request. The third process
@@ -2951,6 +2987,10 @@ async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it()
     let (identity, session_id, entry) = spawn_stop_member(&host).await;
 
     client.block();
+    // The running turn's first request calls a tool, which commits that
+    // round; its second request blocks, so the run stays open with a round
+    // to continue from, which a held restart marks as resumable.
+    client.call_a_tool_next();
     let requests_before = client.requests().len();
     let running_key = delivery("keep-running");
     let running = start_stop_input(
@@ -2962,7 +3002,7 @@ async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it()
     )
     .await
     .expect("running human admission");
-    client.wait_for_requests(requests_before + 1).await;
+    client.wait_for_requests(requests_before + 2).await;
     let running_id = admitted_input_id(&host.runtime_store, &session_id, &running_key).await;
     let key = delivery("keep-queued-behind");
     let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
@@ -5448,7 +5488,8 @@ async fn a_kept_kickoff_whose_input_already_ended_resolves_from_its_receipt() {
 }
 
 /// The Keep row of a member whose kickoff run is still in flight at the
-/// first process's requeue Shutdown, which keeps the kickoff and its run. The
+/// first process's requeue Shutdown, its first round committed (a tool call)
+/// and its second request blocked, which keeps the kickoff and its run. The
 /// second process restores the mob with the member's run starts held by its
 /// host and shuts down with Keep. While the host holds the member, its kept
 /// kickoff is not re-attached (a re-attach is a deduplicated resubmission,
@@ -5465,6 +5506,10 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
     let host = open_stop_host(&root_path, &client, Some("keep-kickoff")).await;
     let mob_id = host.handle.mob_id().clone();
     let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    // The kickoff run's first request calls a tool, which commits that
+    // round; its second request blocks, so the run stays open with a round
+    // to continue from, which a held restart marks as resumable.
+    client.call_a_tool_next();
     let session_id = host
         .handle
         .spawn(
@@ -5477,7 +5522,7 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
         .bridge_session_id()
         .expect("local session member")
         .clone();
-    client.wait_for_requests(1).await;
+    client.wait_for_requests(2).await;
     let before = host
         .handle
         .get_member(&identity)
