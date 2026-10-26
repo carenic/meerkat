@@ -1459,3 +1459,104 @@ async fn a_mid_run_checkpoint_commits_beside_its_runs_tail_over_the_host_store()
         "the tail stands on the host"
     );
 }
+
+// Unrun until the candidate's validation. A create-only import through the
+// host store adapter, which forwards the in-memory store's import: one batch
+// carries the document, its catalog entry and its pending compaction
+// intent's outbox row, and a reopen reads them all from the host. Importing
+// the same bytes again, or other bytes, writes no batch.
+#[tokio::test]
+async fn an_import_lands_as_one_batch_with_its_outbox_row_and_survives_a_reopen() {
+    use meerkat_core::types::{Message, UserMessage};
+
+    use crate::store::{SerializedSessionSnapshot, WholeBlobSessionImport};
+
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let (session, intent) = crate::store::memory::tests::session_with_compaction_intent();
+    let runtime_id = LogicalRuntimeId::for_session(session.id());
+    let bytes = serde_json::to_vec(&session).unwrap();
+    let before = host.commit_count();
+    let outcome = opened
+        .1
+        .import_whole_blob_session(
+            &runtime_id,
+            SerializedSessionSnapshot {
+                session_snapshot: Arc::new(bytes.clone()),
+            },
+        )
+        .await
+        .expect("the import lands");
+    let WholeBlobSessionImport::Created(authority) = outcome else {
+        unreachable!("the first import creates the session");
+    };
+    assert_eq!(
+        host.commit_count(),
+        before + 1,
+        "one batch carries the document, its catalog entry and its outbox row"
+    );
+    assert_eq!(
+        opened
+            .1
+            .import_whole_blob_session(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: Arc::new(bytes.clone()),
+                },
+            )
+            .await
+            .expect("the same bytes again"),
+        WholeBlobSessionImport::AlreadyCurrent(authority.clone())
+    );
+    let mut other = session.clone();
+    other.push(Message::User(UserMessage::text("other bytes")));
+    let refused = opened
+        .1
+        .import_whole_blob_session(
+            &runtime_id,
+            SerializedSessionSnapshot {
+                session_snapshot: Arc::new(serde_json::to_vec(&other).unwrap()),
+            },
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { .. })
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        host.commit_count(),
+        before + 1,
+        "neither the repeat nor the refusal wrote a batch"
+    );
+
+    let reopened = reopen(&host, opened).await;
+    let committed = reopened
+        .1
+        .load_committed_whole_blob_snapshot(&runtime_id)
+        .await
+        .unwrap()
+        .expect("the imported document is on the host");
+    assert_eq!(committed.bytes(), bytes.as_slice());
+    assert_eq!(committed.authority(), &authority);
+    assert_eq!(
+        reopened
+            .1
+            .load_pending_compaction_projections(&runtime_id)
+            .await
+            .unwrap(),
+        vec![intent],
+        "the pending intent's outbox row is on the host"
+    );
+    assert!(
+        reopened
+            .1
+            .load_runtime_session_catalog_entry(&runtime_id)
+            .await
+            .unwrap()
+            .is_some(),
+        "the catalog entry is on the host"
+    );
+}

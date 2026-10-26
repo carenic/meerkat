@@ -9375,6 +9375,18 @@ pub enum WholeBlobRunRebaseOutcome {
     Stale,
 }
 
+/// What [`RuntimeStore::import_whole_blob_session`] answers.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WholeBlobSessionImport {
+    /// The runtime had no committed session document: the import committed
+    /// this one, with its catalog entry and its pending compaction
+    /// projection intents. Carries the authority the store issued for it.
+    Created(WholeBlobStoreAuthority),
+    /// The runtime's committed document already is these exact bytes: the
+    /// import wrote nothing. Carries the current authority.
+    AlreadyCurrent(WholeBlobStoreAuthority),
+}
+
 /// The key of one governed service call occurrence's rows in the
 /// service-call audit log ([`RuntimeStore::append_service_call_audit`]): the
 /// identity digest of the enrolled service original the occurrence's calls
@@ -10089,6 +10101,46 @@ pub trait RuntimeStore: Send + Sync {
         runtime_id: &LogicalRuntimeId,
         session_delta: SerializedSessionSnapshot,
     ) -> Result<(), RuntimeStoreError>;
+
+    /// Import one whole-blob session document (the bytes a WholeBlob store
+    /// keeps for a session) into this store, create-only, as ordinary
+    /// writes: the verb a host uses to move existing sessions into a store.
+    ///
+    /// When `runtime_id` has no committed session document, the store
+    /// commits this one in one atomic write (one transaction, one lock, or
+    /// one host store batch after the chunk batches of a large document):
+    /// the document under a new store-issued authority, its catalog entry,
+    /// and every pending compaction projection intent the document carries
+    /// as a pending outbox row ([`Self::load_pending_compaction_projections`]),
+    /// so the intents' projection work is neither refused nor dropped. It
+    /// answers [`WholeBlobSessionImport::Created`].
+    ///
+    /// When the committed document is exactly these bytes, it writes
+    /// nothing and answers [`WholeBlobSessionImport::AlreadyCurrent`], so an
+    /// interrupted import can run again. When another document is committed
+    /// for the runtime, it writes nothing and refuses with
+    /// [`RuntimeStoreError::SessionPersistenceAuthorityConflict`]: an import
+    /// never overwrites. It also refuses, writing nothing, bytes that are not
+    /// a session document of the session `runtime_id` belongs to, and a
+    /// document carrying an intent the outbox already finalized or holds
+    /// with other content.
+    ///
+    /// Unlike [`Self::commit_session_snapshot`], which refuses a document
+    /// whose intents are not in the outbox yet, the import writes them
+    /// there. The default answers [`RuntimeStoreError::Unsupported`]; the
+    /// in-memory store and the host store adapter implement it. A decorator
+    /// forwards it to the store it wraps: left to the default, an import
+    /// through the decorator answers `Unsupported`.
+    async fn import_whole_blob_session(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        snapshot: SerializedSessionSnapshot,
+    ) -> Result<WholeBlobSessionImport, RuntimeStoreError> {
+        let _ = (runtime_id, snapshot);
+        Err(RuntimeStoreError::Unsupported(
+            "import_whole_blob_session".into(),
+        ))
+    }
 
     /// Commit one valid-by-construction WholeBlob transcript-rewrite boundary.
     ///
@@ -11332,6 +11384,36 @@ mod runtime_store_write_fence_tests {
         assert!(
             matches!(read, Err(RuntimeStoreError::Unsupported(_))),
             "{read:?}"
+        );
+    }
+
+    /// A store that does not implement the whole-blob session import
+    /// answers `Unsupported` and writes nothing: the provided default, which
+    /// a decorator that does not forward the import keeps even when the
+    /// store it wraps implements it.
+    #[tokio::test]
+    async fn a_store_without_the_session_import_answers_unsupported_and_writes_nothing() {
+        let inner = InMemoryRuntimeStore::new();
+        let store = DefaultFenceDecorator {
+            inner: inner.clone(),
+        };
+        let session = meerkat_core::Session::new();
+        let runtime_id = LogicalRuntimeId::for_session(session.id());
+        let imported = store
+            .import_whole_blob_session(
+                &runtime_id,
+                SerializedSessionSnapshot {
+                    session_snapshot: std::sync::Arc::new(serde_json::to_vec(&session).unwrap()),
+                },
+            )
+            .await;
+        assert!(
+            matches!(imported, Err(RuntimeStoreError::Unsupported(_))),
+            "{imported:?}"
+        );
+        assert_eq!(
+            inner.load_session_snapshot(&runtime_id).await.unwrap(),
+            None
         );
     }
 }

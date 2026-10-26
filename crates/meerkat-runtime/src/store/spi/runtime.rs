@@ -1134,6 +1134,28 @@ impl RuntimeStore for SpiRuntimeStore {
         .await
     }
 
+    /// An import is one in-memory call, so it lands as one host batch
+    /// (after the chunk batches of a large document): the document, its
+    /// authority, its catalog entry and its pending intents' outbox rows. An
+    /// import that finds the document current, or refuses, changes nothing
+    /// and writes no batch.
+    async fn import_whole_blob_session(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        snapshot: SerializedSessionSnapshot,
+    ) -> Result<crate::store::WholeBlobSessionImport, RuntimeStoreError> {
+        self.call(
+            Mode::Mutate,
+            vec![runtime_id_scope(runtime_id)],
+            <InMemoryRuntimeStore as RuntimeStore>::import_whole_blob_session(
+                &self.memory,
+                runtime_id,
+                snapshot,
+            ),
+        )
+        .await
+    }
+
     async fn commit_prepared_whole_blob_rewrite_boundary(
         &self,
         runtime_id: &LogicalRuntimeId,
