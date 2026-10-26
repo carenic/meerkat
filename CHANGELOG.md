@@ -85,9 +85,11 @@ them.
   inputs: a boundary of the run attempts the exact retained call, as for
   consent the run requested itself, and its `consent_attempt` notice also
   names that input (`resumed_input_id`). A receipt that commits after the
-  run's first model request can let the model call the operation again
-  first, which asks for fresh consent once more; the moved consent still
-  runs once, at the next boundary.
+  consent step of the run's first boundary can let the model call the
+  operation again first, which asks for fresh consent once more (approving
+  it runs the operation again); the moved consent still runs once, at the
+  run's next boundary, and the run's close withdraws it unspent when there
+  is none.
 
 ## [0.9.5] - 2026-10-23
 

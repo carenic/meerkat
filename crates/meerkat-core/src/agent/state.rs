@@ -6597,7 +6597,9 @@ where
         if self.spend_decided_run_consent(ctx).await? {
             // In-run consent attempts registered asynchronous work with this
             // turn, which now waits for its barrier operations before the
-            // next model request, exactly as after a tool batch.
+            // next model request, exactly as after a tool batch; or a held
+            // approval owner deferred the read of the consent moved into
+            // this run, and the boundary looks again.
             return Ok(CallingLlmStep::Repoll);
         }
         let tool_defs = self.apply_calling_llm_tool_scope(ctx).await?;
@@ -6951,21 +6953,26 @@ where
     /// this run requested itself, and consent the approval owner moved into
     /// this run by the committed receipt of one of its staged notice inputs
     /// (before the run opened or at any later boundary), is examined: a run
-    /// that requested none and resumes no retained work pays one empty-set
-    /// check and never touches the approval owner. A receipt that commits
-    /// after the run's first model request can let the model call the
-    /// operation again first, which asks for fresh consent once more; the
-    /// moved consent still runs once, at the next boundary. Each approved
-    /// candidate gets one fresh retained attempt in this run: the
-    /// exact original call and plan, with this run's work and run, through
-    /// the common fenced entry whose leaf spends the decision once. Nothing
-    /// waits: a held owner defers to the next boundary. The run can still
+    /// that requested none, and resumes no retained work under a consent
+    /// scope, pays one empty-set check and never touches the approval
+    /// owner. A receipt that commits after the consent step of the run's
+    /// first boundary can let the model call the operation again first,
+    /// which asks for fresh consent once more (approving it runs the
+    /// operation again); the moved consent still runs once, at the run's
+    /// next boundary, and the run's close withdraws it unspent when there
+    /// is none. Each approved candidate gets one fresh retained attempt in
+    /// this run: the exact original call and plan, with this run's work and
+    /// run, through the common fenced entry whose leaf spends the decision
+    /// once. Nothing waits for the owner: when it is held, the run's own
+    /// decided consent waits for the next boundary, and the read of the
+    /// consent moved into the run yields and the boundary looks again, so a
+    /// transient hold never costs the run that consent. The run can still
     /// close, or be dropped, before or during an attempt; its run scope then
     /// parks or withdraws what it admitted, and an attempt that entered keeps
     /// its own outcome. Asynchronous work the attempts started is registered
     /// with this turn through the turn owner, with its exact refs and wait
     /// policies, as a tool batch's is; `true` means the turn now waits for
-    /// it and the boundary must repoll.
+    /// it, or the moved read was deferred, and the boundary must repoll.
     async fn spend_decided_run_consent(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
@@ -6975,24 +6982,31 @@ where
         if self.noncommitting_live_bridge_run {
             return Ok(false);
         }
-        // A run that resumes retained work enrols the consent the approval
-        // owner moved into it, at every boundary: a receipt can commit, and
-        // move its consent here, after the run opened. Each is still
-        // attempted at most once in this run.
-        let moved = match (
+        // A run that resumes retained work under a consent scope enrols the
+        // consent the approval owner moved into it, at every boundary: a
+        // receipt can commit, and move its consent here, after the run
+        // opened. Each is still attempted at most once in this run. Without
+        // a consent scope nothing can move into the run, and the owner is
+        // not read.
+        if let (Some(review), Some(work)) = (
             self.operation_review.as_ref(),
             self.tool_dispatch_context.work_authorization(),
-        ) {
-            (Some(review), Some(work)) if !work.resumed_inputs().is_empty() => {
-                match review.consent_moved_into_run(work, self.tool_dispatch_context.run_id()) {
-                    crate::approval::consent::MovedConsentScan::Moved(moved) => moved,
-                    crate::approval::consent::MovedConsentScan::Deferred => Vec::new(),
+        ) && !work.resumed_inputs().is_empty()
+            && work.consent_scope().is_some()
+        {
+            match review.consent_moved_into_run(work, self.tool_dispatch_context.run_id()) {
+                crate::approval::consent::MovedConsentScan::Moved(moved) => {
+                    for approval_id in &moved {
+                        self.run_consent_attempts.moved_in(approval_id);
+                    }
+                }
+                // A held owner: yield, and the boundary looks again, as the
+                // notice gate does.
+                crate::approval::consent::MovedConsentScan::Deferred => {
+                    tokio::task::yield_now().await;
+                    return Ok(true);
                 }
             }
-            _ => Vec::new(),
-        };
-        for approval_id in &moved {
-            self.run_consent_attempts.moved_in(approval_id);
         }
         let requested = self.run_consent_attempts.unattempted();
         if requested.is_empty() {
@@ -38217,10 +38231,12 @@ mod tests {
             /// moved consent and is cut inside its body, so the attempt's
             /// result never reaches the session. A second host restores the
             /// same approval store; its resumed run of the same work, staged
-            /// with the same input, finds nothing moved, since a restored
-            /// spent row is history, never custody. The body ran once across
-            /// both hosts, the spend stands as first recorded, and the model's
-            /// new call of the operation requests fresh consent.
+            /// with the same input, finds nothing moved at its first boundary
+            /// while it is open, and the spent row resolves no attempt there
+            /// (already consumed), since a restored spent row is history,
+            /// never custody. The body ran once across both hosts, the spend
+            /// stands as first recorded, and the model's new call of the
+            /// operation requests fresh consent.
             #[tokio::test]
             async fn a_run_cut_between_the_spend_and_its_result_never_runs_the_operation_again() {
                 let store = Arc::new(crate::approval::InMemoryApprovalStore::new());
@@ -38289,7 +38305,36 @@ mod tests {
                 }]);
                 let rerun = RunId::new();
                 let rework = run_work(&owner, &model, &scope, &rerun, &resumed);
-                run_as(&mut second.agent, &rerun, rework.clone()).await;
+                // At the rerun's first boundary, before its consent step, the
+                // restored owner is read for the open rerun.
+                let restored = Arc::new(Mutex::new(None));
+                let read_restored = {
+                    let approvals = second.approvals.clone();
+                    let rework = rework.clone();
+                    let rerun = rerun.clone();
+                    let consent = consent.clone();
+                    let restored = Arc::clone(&restored);
+                    move || {
+                        let mut seen = restored.lock().unwrap();
+                        if seen.is_none() {
+                            *seen = Some((
+                                approvals.consent_moved_into_run(&rework, Some(&rerun)),
+                                matches!(
+                                    approvals.resolve_consent_attempt(
+                                        &consent,
+                                        &rework,
+                                        Some(&rerun)
+                                    ),
+                                    Err(crate::approval::consent::ConsentRefusal::AlreadyConsumed)
+                                ),
+                            ));
+                        }
+                    }
+                };
+                second
+                    .agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(read_restored)));
+                run_as(&mut second.agent, &rerun, rework).await;
 
                 assert_eq!(
                     tools.bodies(),
@@ -38302,17 +38347,10 @@ mod tests {
                     "the spend stands as first recorded"
                 );
                 assert_eq!(
-                    second
-                        .approvals
-                        .consent_moved_into_run(&rework, Some(&rerun)),
-                    MovedConsentScan::Moved(Vec::new())
-                );
-                assert!(
-                    second
-                        .approvals
-                        .resolve_consent_attempt(&consent, &rework, Some(&rerun))
-                        .is_err(),
-                    "the restored spent row resolves no attempt"
+                    *restored.lock().unwrap(),
+                    Some((MovedConsentScan::Moved(Vec::new()), true)),
+                    "in the open rerun nothing moved, and the restored spent row is refused \
+                     as already consumed"
                 );
                 let requested = second.route.0.lock().unwrap().clone();
                 assert_eq!(requested.len(), 1, "the new call requested fresh consent");

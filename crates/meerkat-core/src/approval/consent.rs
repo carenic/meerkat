@@ -477,8 +477,8 @@ pub(crate) enum DecidedConsentScan {
 /// moved into it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum MovedConsentScan {
-    /// The approval owner is held or unavailable: nothing was examined and
-    /// the run's next boundary looks again.
+    /// The approval owner is held now: nothing was examined, and the
+    /// boundary yields and looks again.
     Deferred,
     /// The live consent moved into the run, by approval (possibly none).
     Moved(Vec<ApprovalId>),
@@ -1258,25 +1258,26 @@ impl ApprovalService {
     /// to one of that run's own staged inputs. Withdrawn, spent or expired
     /// consent, consent moved into another run, and parked or pending
     /// consent are never named; nothing is matched by tool or arguments.
-    /// The owner is never waited for: a held or unavailable owner is
-    /// [`MovedConsentScan::Deferred`], and the run's next boundary looks
-    /// again. It only names candidates for the run's own consent attempts.
+    /// The owner is never waited for: a held owner is
+    /// [`MovedConsentScan::Deferred`], and the boundary yields and looks
+    /// again. An unavailable owner holds no custody, so nothing moved. It
+    /// only names candidates for the run's own consent attempts.
     pub(crate) fn consent_moved_into_run(
         &self,
         work: &WorkAuthorizationContext,
         run_id: Option<&RunId>,
     ) -> MovedConsentScan {
         if self.ensure_available().is_err() {
-            return MovedConsentScan::Deferred;
+            return MovedConsentScan::Moved(Vec::new());
         }
-        let Some(state) = self.state.try_read() else {
-            return MovedConsentScan::Deferred;
-        };
         let staged: Vec<String> = work
             .resumed_inputs()
             .iter()
             .map(|resumed| resumed.input_id.to_string())
             .collect();
+        let Some(state) = self.state.try_read() else {
+            return MovedConsentScan::Deferred;
+        };
         let moved = state
             .resumed_runs
             .iter()
