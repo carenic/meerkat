@@ -3,10 +3,10 @@
   "source_repository": "https://github.com/lukacf/meerkat-meta",
   "source_branch": "main",
   "source_ref": "main",
-  "source_commit": "3d6c065ce69971ef49183728acc5fad2609266ae",
-  "source_commit_date": "2026-10-25",
+  "source_commit": "cb88d10df2f92fa153872e94ecd35db690de6820",
+  "source_commit_date": "2026-10-26",
   "source_version": "0.9.5",
   "source_docs_dirty": false,
   "public_pages": 31,
-  "content_sha256": "741f700b80266b9fc06f4ee168588f306989a90ab19b95ba02e579b05e976f0f"
+  "content_sha256": "d9cd764a77103396fe48dd06fa48076973653105dd1ecae0ee4f5be0ba7ba911"
 }
