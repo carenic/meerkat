@@ -5199,6 +5199,33 @@ pub(crate) enum CompactionTransactionPhase {
 pub(crate) struct CompactionTransaction {
     pub(crate) phase: CompactionTransactionPhase,
     pub(crate) projections: Vec<crate::memory::CompactionProjectionId>,
+    /// The intents the session already carried when the transaction began:
+    /// a run resumed from a provisional tail that holds an earlier rewrite's
+    /// intent, which commits with this transaction's at the run's boundary.
+    /// They are expected in the outbox and finalized with it, but their
+    /// stages are not this transaction's to abort.
+    pub(crate) carried_projections: Vec<crate::memory::CompactionProjectionId>,
+    /// A run checkpoint wrote the rewrite, with its intents, into the run's
+    /// provisional tail while the transaction awaited the runtime commit.
+    /// The tail's settlement decides the rewrite from then on (an
+    /// interrupted run's tail is committed with the intents), so an abort no
+    /// longer restores the rollback image or aborts the stages.
+    pub(crate) tail_carries_rewrite: bool,
+}
+
+impl CompactionTransaction {
+    /// The projections the run's boundary commits with this transaction: the
+    /// intents the session carried when it began, then its own.
+    pub(crate) fn committed_projections(&self) -> Vec<crate::memory::CompactionProjectionId> {
+        let mut expected = self.carried_projections.clone();
+        expected.extend(
+            self.projections
+                .iter()
+                .filter(|projection| !self.carried_projections.contains(projection))
+                .cloned(),
+        );
+        expected
+    }
 }
 
 #[cfg(test)]

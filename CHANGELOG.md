@@ -312,6 +312,45 @@ them.
   unbounded size, and a request that still does not fit fails as
   `RequestTooLarge`.
 
+- `meerkat-runtime`, `meerkat-core`: a compaction with durable semantic
+  memory inside a run no longer leaves its session unable to start or its
+  memory projection lost. The compaction stages its memory projection and
+  records its intent in the session; the intent rides in the run's
+  provisional tail and reaches the compaction outbox only when the tail
+  commits. Four gaps are closed:
+  - A run kept by a graceful stop resumes again. The reconciliation at the
+    next start (and at an attachment's teardown) asked the agent first: an
+    agent seeded from the tail refused with "runtime compaction outbox omits
+    a validated session projection intent", failing the startup at every
+    start while the tail stood, and an agent not yet materialized aborted
+    the intent's memory stage as an orphan. While a run's provisional tail
+    stands, the whole reconciliation now waits: no agent check, no memory
+    finalization, no orphan clean-up and no refresh. The reconciliation
+    after the run's boundary commits the tail finalizes the intent once.
+  - A revived or restored mob member with a committed intent not finalized
+    yet (a crash after the commit, a stopped run's settled tail) starts
+    again. Its startup reconciliation refused the intent with "compaction
+    projection coordinator rejected the handoff: session has no
+    authoritative runtime binding for compaction commit", because the mob
+    binds a member's runtime only after its revival succeeds, so the member
+    failed at every start. `CompactionCommitCoordinator` gains
+    `authorize_committed_projection` (defaulting to `authorize_projection`):
+    the runtime's coordinator authorizes finalizing a committed row under
+    the member's live session and epoch before its runtime is placed,
+    latching nothing, while staging a new compaction still needs a placement
+    and a rotated placement still refuses.
+  - A run stopped or interrupted after a round commit had written its
+    compaction into the tail no longer deletes the compaction's memory
+    stage. The tail is committed as an interrupted run with the intent, so
+    once a run checkpoint (or re-base) wrote a pending compaction into the
+    tail, an abort leaves the rewrite and the stage to the tail's settlement
+    instead of rolling them back, and the next reconciliation finalizes the
+    intent once instead of failing with "missing durable compaction stage
+    for committed rewrite".
+  - A resumed run that compacts again before its boundary commits with the
+    intent it carried, instead of refusing finalization because the outbox
+    held more intents than its own compaction.
+
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
   start (`UnregisterQueuedInputs::Requeue`, which the graceful shutdowns of
   `rkat-rpc`, the REST server and a mob use by default for durable

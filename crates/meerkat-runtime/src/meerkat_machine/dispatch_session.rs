@@ -625,12 +625,14 @@ impl RuntimeCompactionCommitCoordinator {
         };
         meerkat_core::memory::CompactionCommitCoordinationError::refused(cause, refusal.to_string())
     }
-}
 
-impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionCommitCoordinator {
-    fn authorize_projection(
+    /// Authorize `projection`. `committed`: the runtime store already
+    /// committed its rewrite (finalization), rather than a new compaction
+    /// asking to stage durable work.
+    fn authorize(
         &self,
         projection: &meerkat_core::memory::CompactionProjectionId,
+        committed: bool,
     ) -> Result<(), meerkat_core::memory::CompactionCommitCoordinationError> {
         if projection.session_id() != &self.session_id {
             return Err(
@@ -654,7 +656,30 @@ impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionComm
                 ),
             );
         }
-        let current = self.sample_live_binding()?;
+        let current = match self.sample_live_binding() {
+            Ok(current) => current,
+            // A revived mob member reconciles its committed outbox at
+            // startup, before the routed RequestRuntimeBinding places its
+            // runtime, and that placement waits for the startup to succeed.
+            // The sample has already fenced a stale executor (teardown gate,
+            // durability, exact session, live epoch); a committed row needs
+            // nothing more. Nothing is latched, and once a placement was
+            // latched its absence refuses as before.
+            Err(error)
+                if committed
+                    && self.allow_late_binding
+                    && error.refusal()
+                        == meerkat_core::memory::CompactionHandoffRefusal::RuntimeBindingAbsent
+                    && self
+                        .runtime_binding
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .is_none() =>
+            {
+                return Ok(());
+            }
+            Err(error) => return Err(error),
+        };
         let mut expected = self
             .runtime_binding
             .lock()
@@ -688,6 +713,22 @@ impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionComm
             }
         }
         Ok(())
+    }
+}
+
+impl meerkat_core::memory::CompactionCommitCoordinator for RuntimeCompactionCommitCoordinator {
+    fn authorize_projection(
+        &self,
+        projection: &meerkat_core::memory::CompactionProjectionId,
+    ) -> Result<(), meerkat_core::memory::CompactionCommitCoordinationError> {
+        self.authorize(projection, false)
+    }
+
+    fn authorize_committed_projection(
+        &self,
+        projection: &meerkat_core::memory::CompactionProjectionId,
+    ) -> Result<(), meerkat_core::memory::CompactionCommitCoordinationError> {
+        self.authorize(projection, true)
     }
 }
 
@@ -1004,6 +1045,173 @@ mod compaction_coordinator_tests {
         assert_eq!(
             refusal_of(&error),
             CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+    }
+
+    /// A revived mob member reconciles its committed outbox at startup,
+    /// before the routed binding places its runtime, and that placement
+    /// waits for the startup. Finalizing a committed row is authorized under
+    /// the live session and epoch with no placement, and latches nothing;
+    /// staging new durable work still needs a bound placement. Once placed,
+    /// both latch and fence a rotation as before, and a torn-down epoch or a
+    /// foreign session refuses both. RED before: the committed row was
+    /// refused with `RuntimeBindingAbsent` and the member's startup failed.
+    #[test]
+    fn a_committed_row_finalizes_before_the_member_is_placed() {
+        let fixture = CoordinatorFixture::new();
+        let teardown_gate = Arc::clone(&fixture.teardown_gate);
+        let coordinator = fixture.coordinator(true);
+        let row = projection(&fixture.session_id);
+        fixture.register();
+
+        coordinator
+            .authorize_committed_projection(&row)
+            .expect("a committed row finalizes under the live session and epoch");
+        assert!(
+            coordinator
+                .runtime_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "no placement is latched before one exists"
+        );
+        let staging = coordinator
+            .authorize_projection(&row)
+            .expect_err("staging new durable work still needs a placement");
+        assert_eq!(
+            refusal_of(&staging),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+
+        fixture.bind(7);
+        coordinator
+            .authorize_committed_projection(&row)
+            .expect("the placed member's committed row is authorized and latched");
+        coordinator
+            .authorize_projection(&row)
+            .expect("staging matches the latched placement");
+
+        fixture.rewrite_state(|state| {
+            state.active_fence_token = Some(dsl::FenceToken::from(8));
+        });
+        for (label, result) in [
+            (
+                "committed",
+                coordinator.authorize_committed_projection(&row),
+            ),
+            ("staging", coordinator.authorize_projection(&row)),
+        ] {
+            let error = result.expect_err("a rotated placement refuses");
+            assert_eq!(
+                refusal_of(&error),
+                CompactionHandoffRefusal::RuntimeBindingRotated,
+                "{label}"
+            );
+        }
+
+        let foreign = projection_for_other_session();
+        for (label, result) in [
+            (
+                "committed",
+                coordinator.authorize_committed_projection(&foreign),
+            ),
+            ("staging", coordinator.authorize_projection(&foreign)),
+        ] {
+            let error = result.expect_err("a foreign session refuses");
+            assert_eq!(
+                refusal_of(&error),
+                CompactionHandoffRefusal::SessionMismatch,
+                "{label}"
+            );
+        }
+
+        let unplaced = CoordinatorFixture::new();
+        let unplaced_gate = Arc::clone(&unplaced.teardown_gate);
+        let unplaced_coordinator = unplaced.coordinator(true);
+        let unplaced_projection = projection(&unplaced.session_id);
+        unplaced.register();
+        unplaced_gate.close();
+        teardown_gate.close();
+        for (label, result) in [
+            (
+                "unplaced committed",
+                unplaced_coordinator.authorize_committed_projection(&unplaced_projection),
+            ),
+            (
+                "unplaced staging",
+                unplaced_coordinator.authorize_projection(&unplaced_projection),
+            ),
+            (
+                "placed committed",
+                coordinator.authorize_committed_projection(&row),
+            ),
+        ] {
+            let error = result.expect_err("a torn-down epoch refuses");
+            assert_eq!(
+                refusal_of(&error),
+                CompactionHandoffRefusal::RuntimeEpochRetired,
+                "{label}"
+            );
+        }
+
+        let strict_fixture = CoordinatorFixture::new();
+        let strict = strict_fixture.coordinator(false);
+        strict_fixture.register();
+        let error = strict
+            .authorize_committed_projection(&projection(&strict_fixture.session_id))
+            .expect_err("a canonical coordinator binds at preparation and never waits for one");
+        assert_eq!(
+            refusal_of(&error),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+    }
+
+    /// The registration re-mints the session's epoch while the revived
+    /// member's agent still holds a coordinator from the previous one, and no
+    /// placement is bound yet. Finalizing a committed row is then authorized
+    /// under the session's CURRENT epoch: the one bounded re-derivation
+    /// samples the live epoch, and that sample finds the live session and
+    /// epoch with no placement. A cleared epoch has no current value and
+    /// refuses as retired. Staging still refuses for the absent placement.
+    #[test]
+    fn an_unplaced_committed_row_is_authorized_under_the_current_epoch() {
+        let fixture = CoordinatorFixture::new();
+        let coordinator = fixture.coordinator(true);
+        let row = projection(&fixture.session_id);
+        fixture.register();
+
+        let current_epoch = dsl::RuntimeEpochId::from_domain(&meerkat_core::RuntimeEpochId::new());
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = Some(current_epoch.clone());
+        });
+        coordinator.authorize_committed_projection(&row).expect(
+            "a committed row is authorized under the session's current epoch before placement",
+        );
+        assert!(
+            coordinator
+                .runtime_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "nothing is latched before a placement exists"
+        );
+        let staging = coordinator
+            .authorize_projection(&row)
+            .expect_err("staging still needs a placement");
+        assert_eq!(
+            refusal_of(&staging),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = None;
+        });
+        let cleared = coordinator
+            .authorize_committed_projection(&row)
+            .expect_err("an epochless session has no current epoch to authorize under");
+        assert_eq!(
+            refusal_of(&cleared),
+            CompactionHandoffRefusal::RuntimeEpochRetired
         );
     }
 

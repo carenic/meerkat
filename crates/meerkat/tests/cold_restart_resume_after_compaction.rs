@@ -2411,13 +2411,15 @@ mod tests {
     }
 
     /// On the legacy whole-blob profile, a rejected RuntimeStore atomic
-    /// boundary has no committed outbox authority. The live agent must
-    /// therefore roll back the compaction rewrite and delete its exact
-    /// invisible HNSW stage immediately; later recovery must have no orphan
-    /// left to discover or clean up.
+    /// boundary has no committed outbox authority. The run's end-of-run save
+    /// had already written the compaction rewrite and its intent into the
+    /// run's provisional tail, so the live abort releases the compaction to
+    /// that tail's settlement instead of deleting its invisible HNSW stage:
+    /// the stage is kept, never query-visible, and with no committed
+    /// authority a later reconciliation aborts it as an orphan.
     #[cfg(all(feature = "memory-store-session", feature = "session-compaction"))]
     #[tokio::test]
-    async fn atomic_apply_failure_aborts_live_compaction_stage_before_teardown() {
+    async fn atomic_apply_failure_releases_a_tail_carried_compaction_stage() {
         let temp = tempfile::tempdir().expect("tempdir");
         let compaction_attempts = Arc::new(AtomicUsize::new(0));
         let client: Arc<dyn LlmClient> = Arc::new(CompactionFailureTrackingClient::new(
@@ -2493,10 +2495,11 @@ mod tests {
                 &[],
             )
             .await
-            .expect("reconcile empty authority after live abort");
+            .expect("reconcile empty authority after the live release");
         assert_eq!(
-            cleanup.aborted_orphans, 0,
-            "the live post-error abort must delete the stage before teardown; recovery must find no orphan"
+            cleanup.aborted_orphans, 1,
+            "the live abort keeps the tail-carried stage; with no committed authority the \
+             reconciliation aborts it as the one orphan"
         );
         let page = memory_store
             .enumerate_scoped(
