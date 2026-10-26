@@ -16,12 +16,15 @@ use meerkat_core::{ContentInput, SessionId};
 use meerkat_schedule::{
     ClaimDueRequest, CreateScheduleRequest, IntervalTriggerSpec, MisfirePolicy,
     MissingTargetPolicy, Occurrence, OccurrenceFilter, OccurrenceOrdinal, OccurrencePhase,
-    OverlapPolicy, Schedule, ScheduleLifecycleInput, ScheduleStore, ScheduledSessionAction,
-    SessionTargetBinding, TargetBinding, TriggerSpec,
+    OverlapPolicy, Schedule, ScheduleLifecycleInput, ScheduleService, ScheduleStore,
+    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    handle_schedule_tools_call,
 };
 use meerkat_store::SqliteScheduleStore;
 use rusqlite::{Connection, params};
+use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 fn sample_schedule_request(name: &str) -> CreateScheduleRequest {
     CreateScheduleRequest {
@@ -351,4 +354,188 @@ async fn live_listing_survives_poisoned_terminal_rows() {
         })
         .await
         .expect_err("a listing that admits the poisoned row keeps failing typed");
+}
+
+// --- meerkat_schedule_occurrences bounded reads over the SQLite store -------
+
+async fn occurrences_tool(service: &ScheduleService, args: Value) -> Value {
+    handle_schedule_tools_call(service, "meerkat_schedule_occurrences", &args)
+        .await
+        .expect("occurrences tool call")
+}
+
+fn tool_ids(reply: &Value) -> Vec<String> {
+    reply["occurrences"]
+        .as_array()
+        .expect("occurrences array")
+        .iter()
+        .map(|row| {
+            row["occurrence_id"]
+                .as_str()
+                .expect("occurrence_id")
+                .to_string()
+        })
+        .collect()
+}
+
+/// Pages one schedule to the end through the tool, from `cursor` or the start.
+async fn tool_pages(
+    service: &ScheduleService,
+    schedule: &Schedule,
+    limit: usize,
+    mut cursor: Option<String>,
+) -> (Vec<String>, Vec<(usize, bool)>) {
+    let mut seen = Vec::new();
+    let mut pages = Vec::new();
+    for _ in 0..32 {
+        let mut args = json!({
+            "schedule_id": schedule.schedule_id.to_string(),
+            "limit": limit,
+            "view": "summary",
+        });
+        if let Some(cursor) = &cursor {
+            args["cursor"] = json!(cursor);
+        }
+        let reply = occurrences_tool(service, args).await;
+        let page_ids = tool_ids(&reply);
+        let has_more = reply["page"]["has_more"].as_bool().expect("page.has_more");
+        pages.push((page_ids.len(), has_more));
+        seen.extend(page_ids);
+        if !has_more {
+            return (seen, pages);
+        }
+        cursor = Some(
+            reply["page"]["next_cursor"]
+                .as_str()
+                .expect("has_more carries next_cursor")
+                .to_string(),
+        );
+    }
+    unreachable!("paging did not finish")
+}
+
+#[tokio::test]
+async fn tool_pages_over_sqlite_follow_the_store_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteScheduleStore::open(dir.path().join("schedule.sqlite3")).expect("open store"),
+    );
+    let schedule = commit_schedule(&store, "paged").await;
+    let base = Utc::now() + Duration::hours(1);
+    for ordinal in 0..7 {
+        commit_occurrence(
+            &store,
+            &schedule,
+            ordinal,
+            base + Duration::minutes(i64::try_from(ordinal).expect("small ordinal")),
+        )
+        .await;
+    }
+    let service = ScheduleService::new(store.clone());
+
+    let listed = store
+        .list_occurrences(OccurrenceFilter {
+            schedule_id: Some(schedule.schedule_id.clone()),
+            include_terminal: true,
+            ..OccurrenceFilter::default()
+        })
+        .await
+        .expect("store listing");
+    let (paged, pages) = tool_pages(&service, &schedule, 3, None).await;
+    assert_eq!(
+        paged,
+        ids(&listed),
+        "pages follow the store's canonical order"
+    );
+    assert_eq!(pages, vec![(3, true), (3, true), (1, false)]);
+}
+
+#[tokio::test]
+async fn an_append_between_sqlite_pages_is_keyset_stable() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteScheduleStore::open(dir.path().join("schedule.sqlite3")).expect("open store"),
+    );
+    let schedule = commit_schedule(&store, "appended").await;
+    let base = Utc::now() + Duration::hours(1);
+    let mut planted = Vec::new();
+    for ordinal in 0..4 {
+        let due = base + Duration::minutes(i64::try_from(ordinal).expect("small ordinal"));
+        planted.push(commit_occurrence(&store, &schedule, ordinal, due).await);
+    }
+    let service = ScheduleService::new(store.clone());
+
+    let first = occurrences_tool(
+        &service,
+        json!({ "schedule_id": schedule.schedule_id.to_string(), "limit": 2 }),
+    )
+    .await;
+    assert_eq!(tool_ids(&first), ids(&planted[..2]));
+    let cursor = first["page"]["next_cursor"]
+        .as_str()
+        .expect("first page continues")
+        .to_string();
+
+    // Appended after the first page: one between rows 1 and 2, one before the
+    // cursor (keyset paging does not go back for it), one after the end.
+    let between = commit_occurrence(
+        &store,
+        &schedule,
+        4,
+        base + Duration::minutes(1) + Duration::seconds(30),
+    )
+    .await;
+    let _behind = commit_occurrence(&store, &schedule, 5, base - Duration::minutes(1)).await;
+    let after_end = commit_occurrence(&store, &schedule, 6, base + Duration::minutes(10)).await;
+
+    let (rest, pages) = tool_pages(&service, &schedule, 2, Some(cursor)).await;
+    let expected = ids(&[between, planted[2].clone(), planted[3].clone(), after_end]);
+    assert_eq!(
+        rest, expected,
+        "no repeat, no skip after the cursor, appends in key order"
+    );
+    assert_eq!(pages, vec![(2, true), (2, false)]);
+}
+
+#[tokio::test]
+async fn a_local_day_range_selects_that_days_rows_through_the_tool() {
+    // 06:15 and 16:15 Europe/Stockholm around the end of summer time on
+    // 2026-10-25: the day before, the two rows of the 25-hour day, a week on.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Arc::new(
+        SqliteScheduleStore::open(dir.path().join("schedule.sqlite3")).expect("open store"),
+    );
+    let schedule = commit_schedule(&store, "local-day").await;
+    let at = |text: &str| {
+        chrono::DateTime::parse_from_rfc3339(text)
+            .expect("fixture instant")
+            .with_timezone(&Utc)
+    };
+    let mut rows = Vec::new();
+    for (ordinal, due) in [
+        "2026-10-24T14:15:00Z",
+        "2026-10-25T05:15:00Z",
+        "2026-10-25T15:15:00Z",
+        "2026-10-31T15:15:00Z",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let ordinal = u64::try_from(ordinal).expect("small ordinal");
+        rows.push(commit_occurrence(&store, &schedule, ordinal, at(due)).await);
+    }
+    let service = ScheduleService::new(store.clone());
+
+    let reply = occurrences_tool(
+        &service,
+        json!({
+            "schedule_id": schedule.schedule_id.to_string(),
+            "due_after_utc": "2026-10-25T00:00:00+02:00",
+            "due_before_utc": "2026-10-25T23:59:59.999+01:00",
+            "view": "summary",
+        }),
+    )
+    .await;
+    assert_eq!(tool_ids(&reply), ids(&rows[1..3]));
+    assert_eq!(reply["page"]["has_more"].as_bool(), Some(false));
 }

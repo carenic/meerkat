@@ -1,7 +1,8 @@
 use crate::{
-    CreateScheduleRequest, Occurrence, OccurrenceFilter, OccurrenceId, OccurrencePhase,
-    ScheduleDomainError, ScheduleId, ScheduleService, ScheduleStoreError, ScheduledSessionAction,
-    SessionTargetBinding, TargetBinding, TriggerSpec, UpdateScheduleRequest,
+    CreateScheduleRequest, DeliveryReceipt, Occurrence, OccurrenceFilter, OccurrenceId,
+    OccurrencePhase, ScheduleDomainError, ScheduleId, ScheduleService, ScheduleStoreError,
+    ScheduledSessionAction, SessionTargetBinding, TargetBinding, TriggerSpec,
+    UpdateScheduleRequest,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -72,10 +73,16 @@ struct OccurrencesArgs {
     #[serde(default)]
     cursor: Option<String>,
     #[serde(default)]
-    view: OccurrencesView,
+    view: Option<OccurrencesView>,
 }
 
 impl OccurrencesArgs {
+    fn view(&self) -> OccurrencesView {
+        self.view.unwrap_or_default()
+    }
+
+    /// No option beyond `schedule_id`, or only `view: "full"`: the legacy
+    /// full, unpaged reply.
     fn is_unbounded(&self) -> bool {
         self.occurrence_id.is_none()
             && self.due_after_utc.is_none()
@@ -83,7 +90,7 @@ impl OccurrencesArgs {
             && self.phase.is_none()
             && self.limit.is_none()
             && self.cursor.is_none()
-            && self.view == OccurrencesView::Full
+            && self.view() == OccurrencesView::Full
     }
 }
 
@@ -96,15 +103,16 @@ enum OccurrencesView {
 }
 
 /// The page size `meerkat_schedule_occurrences` uses once any bounded option
-/// is given without `limit`, and the largest page it returns in one call.
+/// is given without `limit`.
 const DEFAULT_OCCURRENCE_PAGE: usize = 100;
+/// The largest page `meerkat_schedule_occurrences` returns in one call.
 const MAX_OCCURRENCE_PAGE: usize = 500;
 /// Version tag of the opaque page cursor.
 const OCCURRENCE_CURSOR_PREFIX: &str = "c1";
 /// The target fields a summary keeps: what kind of target it is and which
-/// session, identity, mob, member or flow it names. Everything else (the
-/// action, prompt, helper options, materialization spec, flow params) is
-/// payload and stays out of a summary.
+/// session, identity, mob, member, flow or host runnable it names. Everything
+/// else (the action, prompt, helper options, materialization spec, flow and
+/// runnable params) is payload and stays out of a summary.
 const SUMMARY_TARGET_KEYS: &[&str] = &[
     "target_kind",
     "type",
@@ -115,6 +123,7 @@ const SUMMARY_TARGET_KEYS: &[&str] = &[
     "member_id",
     "source_member_id",
     "flow_id",
+    "runnable",
 ];
 
 #[derive(Debug, Deserialize)]
@@ -191,9 +200,10 @@ pub fn schedule_tools_list() -> Vec<Value> {
                 "long-running schedule. To read less: occurrence_id returns that one occurrence with all ",
                 "of its delivery receipts (not found if it belongs to another schedule); due_after_utc / ",
                 "due_before_utc (inclusive, RFC 3339 with any offset) and phase filter the rows; limit pages ",
-                "them in due order (default 100 once any of these options is given, maximum 500) and the ",
-                "reply's opaque page.next_cursor continues after the last row; view=summary drops the ",
-                "trigger, the target action and prompt and the machine state. A receipt with stage ",
+                "them in due order (default 100 once any of these options or view=summary is given, ",
+                "maximum 500; view=full alone keeps the full unpaged reply) and the reply's opaque ",
+                "page.next_cursor continues after the last row; view=summary drops the trigger, the ",
+                "target action and prompt and the machine state. A receipt with stage ",
                 "completed records that delivery finished, not the outcome of the work the target did; a ",
                 "missing or null materialized_session_id means the runtime session is unknown.",
             ),
@@ -852,7 +862,13 @@ async fn bounded_occurrences(
             .into());
         };
         let receipts = service.list_occurrence_receipts(&occurrence_id).await?;
-        let rendered = render_occurrence(&occurrence, args.view)?;
+        let rendered = render_occurrence(&occurrence, args.view())?;
+        let receipts = match args.view() {
+            OccurrencesView::Full => encode("meerkat_schedule_occurrences", &receipts)?,
+            OccurrencesView::Summary => {
+                Value::Array(receipts.iter().map(receipt_summary).collect())
+            }
+        };
         return Ok(encode(
             "meerkat_schedule_occurrences",
             json!({ "occurrences": [rendered], "receipts": receipts }),
@@ -888,9 +904,11 @@ async fn bounded_occurrences(
         .map(OccurrencePageKey::decode)
         .transpose()?;
 
-    // A cursor narrows the store read to rows due at or after its row; rows at
-    // that same instant up to and including the cursor row are dropped below,
-    // so the store must not cut the page before that happens.
+    // A cursor narrows the store read to rows due at or after its row. Rows at
+    // that same instant up to and including the cursor row come back again and
+    // are dropped below, so a cursor page reads limit + 2 rows (the cursor's own
+    // row plus one to tell has_more) and widens the read only when the dropped
+    // rows leave `limit` or fewer: a page never scans the rest of the history.
     let cursor_due = after_key
         .as_ref()
         .and_then(|key| DateTime::<Utc>::from_timestamp_millis(key.due_at_ms));
@@ -898,24 +916,33 @@ async fn bounded_occurrences(
         (Some(after), Some(cursor)) => Some(after.max(cursor)),
         (after, cursor) => after.or(cursor),
     };
-    let store_limit = after_key.is_none().then_some(limit + 1);
-    let mut rows = service
-        .list_occurrences_matching(
-            schedule_id,
-            OccurrenceFilter {
-                schedule_id: None,
-                phase: args.phase,
-                include_terminal: true,
-                due_after_utc: store_due_after,
-                due_before_utc: due_before,
-                limit: store_limit,
-            },
-        )
-        .await?;
-    rows.sort_by_key(OccurrencePageKey::of);
-    if let Some(after) = &after_key {
-        rows.retain(|occurrence| OccurrencePageKey::of(occurrence) > *after);
-    }
+    let mut fetch = limit + if after_key.is_some() { 2 } else { 1 };
+    let mut rows = loop {
+        let mut rows = service
+            .list_occurrences_matching(
+                schedule_id,
+                OccurrenceFilter {
+                    schedule_id: None,
+                    phase: args.phase,
+                    include_terminal: true,
+                    due_after_utc: store_due_after,
+                    due_before_utc: due_before,
+                    limit: Some(fetch),
+                },
+            )
+            .await?;
+        let exhausted = rows.len() < fetch;
+        rows.sort_by_key(OccurrencePageKey::of);
+        if let Some(after) = &after_key {
+            rows.retain(|occurrence| OccurrencePageKey::of(occurrence) > *after);
+        }
+        // Either every row after the cursor is here, or more than a page is:
+        // has_more below is exact in both cases.
+        if exhausted || rows.len() > limit {
+            break rows;
+        }
+        fetch = fetch.saturating_mul(2);
+    };
 
     let has_more = rows.len() > limit;
     rows.truncate(limit);
@@ -926,16 +953,19 @@ async fn bounded_occurrences(
     };
     let rendered = rows
         .iter()
-        .map(|occurrence| render_occurrence(occurrence, args.view))
+        .map(|occurrence| render_occurrence(occurrence, args.view()))
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(json!({
-        "occurrences": rendered,
-        "page": {
-            "returned": rows.len(),
-            "has_more": has_more,
-            "next_cursor": next_cursor,
-        },
-    }))
+    Ok(encode(
+        "meerkat_schedule_occurrences",
+        json!({
+            "occurrences": rendered,
+            "page": {
+                "returned": rows.len(),
+                "has_more": has_more,
+                "next_cursor": next_cursor,
+            },
+        }),
+    )?)
 }
 
 fn parse_due_bound(
@@ -1013,8 +1043,14 @@ impl OccurrencePageKey {
         else {
             return Err(invalid());
         };
+        let due_at_ms: i64 = due.parse().map_err(|_| invalid())?;
+        // A cursor names a row that exists, so its instant is one chrono can
+        // represent; anything else would silently drop the page's lower bound.
+        if DateTime::<Utc>::from_timestamp_millis(due_at_ms).is_none() {
+            return Err(invalid());
+        }
         Ok(Self {
-            due_at_ms: due.parse().map_err(|_| invalid())?,
+            due_at_ms,
             schedule_revision: revision.parse().map_err(|_| invalid())?,
             occurrence_ordinal: ordinal.parse().map_err(|_| invalid())?,
         })
@@ -1040,16 +1076,7 @@ fn occurrence_summary(occurrence: &Occurrence) -> Result<Value, ScheduleToolErro
     )?);
     let (due_at_local, timezone) =
         local_due_at(&occurrence.trigger_snapshot, occurrence.due_at_utc).unzip();
-    let last_receipt = occurrence.last_receipt.as_ref().map(|receipt| {
-        json!({
-            "receipt_id": receipt.receipt_id,
-            "occurrence_id": receipt.occurrence_id,
-            "attempt": receipt.attempt,
-            "stage": receipt.stage,
-            "recorded_at_utc": receipt.recorded_at_utc,
-            "materialized_session_id": receipt.materialized_session_id,
-        })
-    });
+    let last_receipt = occurrence.last_receipt.as_ref().map(receipt_summary);
     encode(
         "meerkat_schedule_occurrences",
         json!({
@@ -1074,6 +1101,19 @@ fn occurrence_summary(occurrence: &Occurrence) -> Result<Value, ScheduleToolErro
             "target": target,
         }),
     )
+}
+
+/// A delivery receipt without its detail, correlation id or runtime outcome
+/// payload: which attempt reached which stage, when, and in which session.
+fn receipt_summary(receipt: &DeliveryReceipt) -> Value {
+    json!({
+        "receipt_id": receipt.receipt_id,
+        "occurrence_id": receipt.occurrence_id,
+        "attempt": receipt.attempt,
+        "stage": receipt.stage,
+        "recorded_at_utc": receipt.recorded_at_utc,
+        "materialized_session_id": receipt.materialized_session_id,
+    })
 }
 
 /// The identifying fields of a serialized target (`SUMMARY_TARGET_KEYS`),
@@ -1301,14 +1341,12 @@ fn occurrences_schema() -> Value {
                 "type": "string",
                 "description": "Read only this occurrence, with all of its delivery receipts. Not found when it belongs to a different schedule. Cannot be combined with the filters or paging.",
             },
-            "due_after_utc": {
-                "type": "string",
-                "description": "Only occurrences due at or after this instant (RFC 3339, any offset; e.g. 2026-03-29T00:00:00+01:00).",
-            },
-            "due_before_utc": {
-                "type": "string",
-                "description": "Only occurrences due at or before this instant (RFC 3339, any offset). Inclusive: to cover one local day, pass its last second.",
-            },
+            "due_after_utc": date_time_schema(
+                "Only occurrences due at or after this instant (RFC 3339, any offset; e.g. 2026-03-29T00:00:00+01:00).",
+            ),
+            "due_before_utc": date_time_schema(
+                "Only occurrences due at or before this instant (RFC 3339, any offset). Inclusive: to cover one local day, pass the day's last instant, e.g. 2026-03-29T23:59:59.999+02:00.",
+            ),
             "phase": {
                 "type": "string",
                 "enum": [
@@ -1319,7 +1357,9 @@ fn occurrences_schema() -> Value {
             },
             "limit": {
                 "type": "integer",
-                "description": "Return at most this many occurrences in due order: 1 to 500, default 100 once any option other than schedule_id is given. Paged replies carry page.returned (rows in this page), page.has_more and page.next_cursor.",
+                "minimum": 1,
+                "maximum": MAX_OCCURRENCE_PAGE,
+                "description": "Return at most this many occurrences in due order: default 100 once a filter, cursor, limit or view=summary is given, maximum 500. Paged replies carry page.returned (rows in this page), page.has_more and page.next_cursor. With only schedule_id, or only view=full, the reply is the full unpaged list.",
             },
             "cursor": {
                 "type": "string",
@@ -1328,7 +1368,7 @@ fn occurrences_schema() -> Value {
             "view": {
                 "type": "string",
                 "enum": ["full", "summary"],
-                "description": "full (default) returns whole occurrence objects; summary returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome and which target it names, without the trigger, the target action or prompt, or machine state. Applies to the list and to an occurrence_id read alike.",
+                "description": "full (default) returns whole occurrence objects; summary returns ids, phase, due time in UTC and in the trigger's timezone, attempts, the last receipt, the runtime outcome and which target it names, without the trigger, the target action or prompt, or machine state. Applies to the list and to an occurrence_id read alike; in a summary occurrence_id read the receipts are summarized too (no detail, correlation id or runtime outcome).",
             },
         },
         "required": ["schedule_id"],
@@ -3175,6 +3215,16 @@ mod tests {
                     && row.get("target_snapshot").is_some()),
             "the default view stays the full occurrence object"
         );
+        // Explicit nulls and view=full alone take the same unpaged path.
+        for args in [
+            json!({ "schedule_id": schedule_id, "view": null, "limit": null, "cursor": null }),
+            json!({ "schedule_id": schedule_id, "view": "full" }),
+        ] {
+            let same = read_occurrences(&service, args)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(same, reply, "an all-default call must not change the reply");
+        }
         Ok(())
     }
 
@@ -3270,17 +3320,19 @@ mod tests {
     }
 
     #[test]
-    fn a_local_day_range_selects_exactly_that_days_occurrences() -> Result<(), String> {
+    fn local_day_bounds_parse_to_the_25_hour_day_in_utc() -> Result<(), String> {
         // The 25-hour local day 2026-10-25 in Europe/Stockholm, as a caller
-        // would pass it: first and last second, each with its own offset.
+        // would pass it: its first and last instant, each with its own offset.
+        // The store-backed selection of that day is pinned in meerkat-store
+        // (schedule_occurrence_list_pushdown.rs).
         let after = parse_due_bound("due_after_utc", Some("2026-10-25T00:00:00+02:00"))
             .map_err(|error| error.message)?
             .ok_or("due_after_utc should parse")?;
-        let before = parse_due_bound("due_before_utc", Some("2026-10-25T23:59:59+01:00"))
+        let before = parse_due_bound("due_before_utc", Some("2026-10-25T23:59:59.999+01:00"))
             .map_err(|error| error.message)?
             .ok_or("due_before_utc should parse")?;
         assert_eq!(after, utc("2026-10-24T22:00:00Z")?);
-        assert_eq!(before, utc("2026-10-25T22:59:59Z")?);
+        assert_eq!(before, utc("2026-10-25T22:59:59.999Z")?);
 
         let planned = crate::occurrences_for_horizon(
             &stockholm_morning_and_afternoon(),
@@ -3535,6 +3587,15 @@ mod tests {
                 "member_id": "helper-1",
             })
         );
+        let runnable = json!({
+            "target_kind": "host_runnable",
+            "runnable": "nightly-report",
+            "params": { "window": "24h" },
+        });
+        assert_eq!(
+            Value::Object(summary_target(&runnable)),
+            json!({ "target_kind": "host_runnable", "runnable": "nightly-report" })
+        );
         let identity = json!({
             "target_kind": "identity",
             "type": "resumable_identity",
@@ -3548,6 +3609,210 @@ mod tests {
                 "type": "resumable_identity",
                 "identity": "member-1",
             })
+        );
+    }
+
+    fn new_session_target_update() -> UpdateScheduleRequest {
+        // schedule_request() mints a fresh session id, so this is a real
+        // target change that keeps the trigger: the next revision re-plans the
+        // same instants.
+        UpdateScheduleRequest {
+            target: Some(schedule_request().target),
+            ..UpdateScheduleRequest::default()
+        }
+    }
+
+    async fn all_rows_in_key_order(
+        service: &ScheduleService,
+        schedule_id: &str,
+    ) -> Result<Vec<Value>, String> {
+        let rows = rows_of(
+            &read_occurrences(service, json!({ "schedule_id": schedule_id }))
+                .await
+                .map_err(|error| format!("{error:?}"))?,
+        )?;
+        let mut keyed = Vec::new();
+        for row in rows {
+            keyed.push((row_key(&row)?, row));
+        }
+        keyed.sort_by_key(|(key, _)| *key);
+        Ok(keyed.into_iter().map(|(_, row)| row).collect())
+    }
+
+    /// Pages from `cursor` (or the start) to the end, returning every row and
+    /// each page's (rows, has_more).
+    async fn read_all_pages(
+        service: &ScheduleService,
+        schedule_id: &str,
+        limit: usize,
+        mut cursor: Option<String>,
+    ) -> Result<(Vec<Value>, Vec<(usize, bool)>), String> {
+        let mut rows = Vec::new();
+        let mut pages = Vec::new();
+        for _ in 0..64 {
+            let mut args = json!({ "schedule_id": schedule_id, "limit": limit, "view": "summary" });
+            if let Some(cursor) = &cursor {
+                args["cursor"] = json!(cursor);
+            }
+            let reply = read_occurrences(service, args)
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            let page_rows = rows_of(&reply)?;
+            let has_more = reply["page"]["has_more"].as_bool().ok_or("page.has_more")?;
+            pages.push((page_rows.len(), has_more));
+            rows.extend(page_rows);
+            if !has_more {
+                return Ok((rows, pages));
+            }
+            cursor = Some(
+                reply["page"]["next_cursor"]
+                    .as_str()
+                    .ok_or("has_more without next_cursor")?
+                    .to_string(),
+            );
+        }
+        Err("paging did not finish".into())
+    }
+
+    #[tokio::test]
+    async fn a_same_instant_replan_between_pages_continues_at_the_cursor_instant()
+    -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule_id = create_for_bounded_reads(&service, 6).await?;
+        let first = read_occurrences(
+            &service,
+            json!({ "schedule_id": schedule_id, "limit": 2, "view": "summary" }),
+        )
+        .await
+        .map_err(|error| format!("{error:?}"))?;
+        let first_rows = rows_of(&first)?;
+        let boundary = row_key(first_rows.last().ok_or("first page is empty")?)?;
+        assert_eq!(boundary.schedule_revision, 1);
+        let cursor = first["page"]["next_cursor"]
+            .as_str()
+            .ok_or("first page should continue")?
+            .to_string();
+
+        let parsed_id = parse_schedule_id(&schedule_id).map_err(|error| error.message)?;
+        service
+            .update(&parsed_id, new_session_target_update())
+            .await
+            .map_err(|error| error.to_string())?;
+
+        let (after_cursor, pages) = read_all_pages(&service, &schedule_id, 2, Some(cursor)).await?;
+        let next = after_cursor.first().ok_or("nothing after the cursor")?;
+        let next_key = row_key(next)?;
+        assert_eq!(
+            next_key.due_at_ms, boundary.due_at_ms,
+            "the next page starts at the cursor's own instant"
+        );
+        assert_eq!(
+            next_key.schedule_revision, 2,
+            "with the re-planned row: {next}"
+        );
+
+        // No skip, no repeat: exactly the unbounded listing after the cursor.
+        let mut expected = Vec::new();
+        for row in all_rows_in_key_order(&service, &schedule_id).await? {
+            if row_key(&row)? > boundary {
+                expected.push(row);
+            }
+        }
+        assert_eq!(ids_of(&after_cursor), ids_of(&expected));
+        let last = pages.last().ok_or("no pages")?;
+        assert!(!last.1, "only the last page has has_more false: {pages:?}");
+        assert!(
+            pages.iter().rev().skip(1).all(|(_, has_more)| *has_more),
+            "{pages:?}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn limit_one_pages_walk_every_revision_at_a_shared_instant() -> Result<(), String> {
+        // Three revisions planned at the same two instants: a cursor page
+        // whose own instant holds more dropped rows than its first read must
+        // widen the read instead of ending early or skipping.
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule_id = create_for_bounded_reads(&service, 2).await?;
+        let parsed_id = parse_schedule_id(&schedule_id).map_err(|error| error.message)?;
+        for _ in 0..2 {
+            service
+                .update(&parsed_id, new_session_target_update())
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        let everything = all_rows_in_key_order(&service, &schedule_id).await?;
+        assert_eq!(everything.len(), 6, "two instants under three revisions");
+
+        let (paged, pages) = read_all_pages(&service, &schedule_id, 1, None).await?;
+        assert_eq!(ids_of(&paged), ids_of(&everything));
+        assert_eq!(
+            pages,
+            vec![
+                (1, true),
+                (1, true),
+                (1, true),
+                (1, true),
+                (1, true),
+                (1, false)
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn page_sizes_default_to_100_cap_at_500_and_end_exactly() -> Result<(), String> {
+        let service = ScheduleService::new(Arc::new(MemoryScheduleStore::default()));
+        let schedule_id = create_for_bounded_reads(&service, 120).await?;
+        for (mut args, returned, has_more) in [
+            (json!({ "view": "summary" }), 100, true),
+            (json!({ "limit": 500 }), 120, false),
+            (json!({ "limit": 120 }), 120, false),
+            (json!({ "limit": 119 }), 119, true),
+        ] {
+            args["schedule_id"] = json!(schedule_id);
+            let reply = read_occurrences(&service, args.clone())
+                .await
+                .map_err(|error| format!("{error:?}"))?;
+            assert_eq!(rows_of(&reply)?.len(), returned, "{args}");
+            assert_eq!(
+                reply["page"]["returned"].as_u64(),
+                Some(returned as u64),
+                "{args}"
+            );
+            assert_eq!(
+                reply["page"]["has_more"].as_bool(),
+                Some(has_more),
+                "{args}"
+            );
+            assert_eq!(
+                reply["page"]["next_cursor"].is_string(),
+                has_more,
+                "a cursor exactly when more rows follow: {args}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn summary_receipts_drop_detail_and_payload() {
+        let mut receipt = DeliveryReceipt::new(
+            crate::OccurrenceId::new(),
+            1,
+            crate::DeliveryReceiptStage::Completed,
+        );
+        receipt.detail = Some("delivery detail text".into());
+        receipt.correlation_id = Some("correlation-1".into());
+        let summary = receipt_summary(&receipt);
+        assert!(summary.get("detail").is_none());
+        assert!(summary.get("correlation_id").is_none());
+        assert!(summary.get("runtime_outcome").is_none());
+        assert_eq!(summary["stage"], "completed");
+        assert_eq!(summary["attempt"], 1);
+        assert!(
+            summary["materialized_session_id"].is_null(),
+            "an unknown runtime session reads as null"
         );
     }
 
@@ -3579,6 +3844,15 @@ mod tests {
             occurrence_ordinal: 1,
         };
         assert!(later > superseding, "due time decides first");
+        let unrepresentable = OccurrencePageKey {
+            due_at_ms: i64::MAX,
+            schedule_revision: 1,
+            occurrence_ordinal: 1,
+        };
+        assert!(
+            OccurrencePageKey::decode(&unrepresentable.encode()).is_err(),
+            "a cursor instant chrono cannot represent is refused"
+        );
         // "c1" + hex of "1.2", "1.2.3.4" and "a.2.3"; then broken hex.
         for bad in [
             "",

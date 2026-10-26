@@ -42,15 +42,20 @@ them.
   delivery receipts and answers not found when it belongs to another
   schedule. `due_after_utc` / `due_before_utc` (inclusive, RFC 3339 with any
   offset) and `phase` filter in the store query. `limit` (default 100 once any
-  of these options is given, maximum 500) pages the rows in due order with a
-  `page` object (`returned`, `has_more`, `next_cursor`), and `cursor` (opaque)
-  continues after the last row, stable while new occurrences are planned or a
-  revision supersedes old ones. `view: "summary"` drops the trigger, the
-  target action and prompt and the machine state, in both the list and the
-  exact read, and adds the due time in a calendar trigger's own timezone. A
-  call with only `schedule_id` returns exactly what it returned before.
-  `ScheduleService` gains `list_occurrences_matching`,
-  `get_schedule_occurrence` and `list_occurrence_receipts`.
+  of these options or `view: "summary"` is given, maximum 500) pages the rows
+  in due order with a `page` object (`returned`, `has_more`, `next_cursor`),
+  and `cursor` (opaque) continues after the last row, stable while new
+  occurrences are planned or a revision supersedes old ones; a cursor page
+  reads a bounded number of rows, never the rest of the history.
+  `view: "summary"` drops the trigger, the target action and prompt and the
+  machine state, in both the list and the exact read (whose receipts are
+  summarized too), and adds the due time in a calendar trigger's own
+  timezone. A call with only `schedule_id`, or with only `view: "full"`,
+  returns exactly what it returned before. `ScheduleService` gains
+  `list_occurrences_matching`, `get_schedule_occurrence` and
+  `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
+  documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
+  limit it already followed.
 
 ### Fixed
 
