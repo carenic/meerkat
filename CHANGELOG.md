@@ -96,6 +96,18 @@ them.
   schedules are included; the tool lists active and paused schedules only, and
   the description now says so.
 
+- `meerkat-runtime`: an executor attachment whose startup fails keeps the
+  inputs its registration recovered from the store, as the cleanup of a
+  failed startup has asked since 0.9.5. The runtime loop's own teardown
+  could act on the failed attachment before the owner that started it
+  retired it, and stopped those inputs: a queued prompt that a crash left
+  behind ended as stopped, and the next start ran without it. In rare cases
+  the race stalled the failed attachment's teardown instead. The loop's
+  teardown now leaves an attachment that never served to that owner, whose
+  unregister keeps every input the registration recovered for the next
+  start, unless the registration served live work. A retire or an archive
+  that meets an unserved attachment still stops every input.
+
 ## [0.9.5] - 2026-10-23
 
 ### Breaking
