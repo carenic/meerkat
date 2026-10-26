@@ -182,14 +182,21 @@ them.
   metadata must name the profile's issuer, the authorization request uses
   the profile's client id and redirect with PKCE S256, and the code
   exchange and every refresh authenticate the client by its method; a
-  refresh token the server rotates is stored and presented next. Attempts
+  refresh token the server rotates is stored and presented next. Under an
+  `https` issuer the token endpoint, where the secret is sent, must use
+  `https` too, with no loopback exception: discovery refuses another, and a
+  refresh never sends the secret to a stored one that does not fit. Attempts
   and credentials are bound to the profile's facts: a completion whose
   profile was removed or replaced is refused and its attempt retired, and a
   refresh that cannot authenticate (the profile removed or replaced, or its
-  secret refused by the server) ends the credential as `ReauthRequired`,
-  never falling back to dynamic registration or a public client. Without a
-  profile nothing changes. `auth_oauth` gains `OAuthClientAuthentication`
-  with `exchange_authorization_code_with_client_auth` and
+  secret refused by the server with a standard OAuth error response) ends
+  the credential as `ReauthRequired`, never falling back to dynamic
+  registration or a public client. A server that reports errors with HTTP
+  200 keeps the credential: every use retries and fails with a typed error,
+  and status can stay `Authorized`, as with Core's other OAuth refreshes.
+  Without a profile nothing changes. `auth_oauth` gains
+  `OAuthClientAuthentication` with
+  `exchange_authorization_code_with_client_auth` and
   `exchange_refresh_token_with_client_auth` (HTTP Basic sends the
   form-encoded client id and secret, RFC 6749 section 2.3.1). No RPC, REST
   or SDK method installs a profile.

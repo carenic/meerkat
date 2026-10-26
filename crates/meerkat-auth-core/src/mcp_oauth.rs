@@ -3849,6 +3849,28 @@ impl McpOAuthAuthority {
                 }
             },
         };
+        // The client secret goes only to a token endpoint that fits the
+        // profile's issuer ([`require_client_secret_endpoint`]). A stored
+        // endpoint that does not is never sent the secret: the credential is
+        // closed as needing a new login, whose discovery refuses it.
+        if let Some(profile) = &profile
+            && require_client_secret_endpoint(
+                target,
+                profile.issuer(),
+                &metadata.discovery.token_endpoint,
+            )
+            .is_err()
+        {
+            let observation = meerkat_core::RefreshFailureObservation::local_credential_unusable();
+            let disposition = self
+                .close_refresh_failure(key, &lease_key, &observation)
+                .await?;
+            return Err(RefreshError::Classified {
+                message: "the stored MCP OAuth token endpoint does not use https under the client's https issuer; log in again".to_string(),
+                observation,
+                disposition,
+            });
+        }
         let endpoints = OAuthEndpoints {
             client_id: metadata.client.client_id.clone(),
             authorize_url: metadata.discovery.authorization_endpoint.clone(),
@@ -4466,7 +4488,8 @@ impl McpOAuthAuthority {
     /// absent (see [`authorization_server_metadata_urls`]). The first document
     /// found must have the exact issuer, PKCE S256, and https (or loopback)
     /// endpoints, and, for a dynamically registered client, a registration
-    /// endpoint. Redirects are refused.
+    /// endpoint. A host-registered client's token endpoint must also fit its
+    /// issuer ([`require_client_secret_endpoint`]). Redirects are refused.
     async fn discover_authorization_server(
         &self,
         target: &McpServerIdentity,
@@ -4582,6 +4605,10 @@ impl McpOAuthAuthority {
             .transpose()?;
         require_https_or_loopback(target, &authorization_endpoint, "authorization endpoint")?;
         require_https_or_loopback(target, &token_endpoint, "token endpoint")?;
+        // A host-registered client sends its secret to the token endpoint.
+        if registration == ClientRegistration::HostRegistered {
+            require_client_secret_endpoint(target, &auth_server, &token_endpoint)?;
+        }
         if let Some(registration_endpoint) = &registration_endpoint {
             require_https_or_loopback(target, registration_endpoint, "registration endpoint")?;
         }
@@ -5672,6 +5699,31 @@ pub(crate) fn is_loopback_url(url: &reqwest::Url) -> bool {
         url.host_str(),
         Some("localhost" | "127.0.0.1" | "::1" | "[::1]")
     )
+}
+
+/// Refuse a token endpoint a host-registered client's secret would be sent
+/// to unless it fits the client's `issuer`. Under an `https` issuer the
+/// endpoint must use `https` as well, with no loopback exception: a plaintext
+/// loopback endpoint would hand the secret to whatever local process holds
+/// the port. Only a plain `http` loopback issuer, a local authorization
+/// server, keeps loopback endpoints ([`require_https_or_loopback`]).
+fn require_client_secret_endpoint(
+    target: &McpServerIdentity,
+    issuer: &str,
+    token_endpoint: &str,
+) -> Result<(), McpOAuthError> {
+    require_https_or_loopback(target, token_endpoint, "token endpoint")?;
+    let https_endpoint =
+        reqwest::Url::parse(token_endpoint).is_ok_and(|url| url.scheme() == "https");
+    let local_issuer = reqwest::Url::parse(issuer)
+        .is_ok_and(|url| url.scheme() == "http" && is_loopback_url(&url));
+    if https_endpoint || local_issuer {
+        return Ok(());
+    }
+    Err(McpOAuthError::DiscoveryFailed {
+        server_name: target.server_name().to_string(),
+        reason: "token endpoint must use https under an https issuer".to_string(),
+    })
 }
 
 #[derive(Debug, Deserialize)]
@@ -7310,6 +7362,149 @@ mod tests {
             .unwrap();
         assert_eq!(refreshed.as_deref(), Some("access-token"));
         assert_eq!(state.token_requests.lock().len(), 1);
+    }
+
+    /// Under an https issuer a host-registered client's secret goes only to
+    /// an https token endpoint. Metadata naming a plaintext loopback token
+    /// endpoint is refused at discovery, typed; a credential minted under
+    /// the profile whose stored token endpoint is such an endpoint is closed
+    /// at its refresh as needing a new login, and nothing reaches that
+    /// endpoint. A plain http loopback issuer keeps loopback endpoints, and a
+    /// dynamically registered (public) client keeps them as before.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_https_issuer_never_sends_the_client_secret_to_a_plaintext_endpoint() {
+        struct AdmitAll;
+        impl meerkat_core::AdministrationEntry for AdmitAll {
+            fn enter(
+                &self,
+            ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal>
+            {
+                Ok(meerkat_core::EnteredAdministration::admitted())
+            }
+        }
+        const ISSUER: &str = "https://as.example.test";
+        let (base, state) = spawn_oauth_fixture().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        // The fixture's token endpoint, as plaintext loopback.
+        let plaintext = format!("http://localhost:{port}/token");
+        let target = McpServerIdentity::from_server_config("fixed-https", format!("{base}/mcp"))
+            .with_expected_account("subject-1")
+            .unwrap();
+
+        // Discovery: the token endpoint the issuer's metadata names.
+        for (issuer, endpoint) in [
+            (ISSUER, plaintext.as_str()),
+            (ISSUER, "http://127.0.0.1:8443/token"),
+            ("https://localhost:8443", "http://localhost:8443/token"),
+            ("http://127.0.0.1:8443", "http://as.example.test/token"),
+        ] {
+            let refused = require_client_secret_endpoint(&target, issuer, endpoint);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(McpOAuthError::DiscoveryFailed { reason, .. }) if reason.contains("must use https")
+                ),
+                "{issuer} {endpoint}: {refused:?}"
+            );
+        }
+        for (issuer, endpoint) in [
+            (ISSUER, "https://as.example.test/token"),
+            ("http://127.0.0.1:8443", "http://127.0.0.1:8443/token"),
+            ("http://localhost:8443", "https://as.example.test/token"),
+        ] {
+            require_client_secret_endpoint(&target, issuer, endpoint)
+                .unwrap_or_else(|error| panic!("{issuer} {endpoint}: {error:?}"));
+        }
+        require_https_or_loopback(&target, &plaintext, "token endpoint")
+            .expect("a public client sends no secret: loopback stays allowed");
+
+        // Refresh: the stored token endpoint of a credential minted under the
+        // profile.
+        let store = Arc::new(EphemeralTokenStore::new());
+        let authority = ce_refresh_authority(store.clone(), test_auth_lease());
+        authority
+            .install_client_profile_entered(
+                &target,
+                McpOAuthClientProfile::new(
+                    ISSUER,
+                    "registered-client",
+                    "http://127.0.0.1:3118/callback",
+                    McpOAuthClientAuthMethod::ClientSecretPost,
+                    McpOAuthClientSecret::new("client-secret-canary"),
+                ),
+                Arc::new(AdmitAll),
+            )
+            .await
+            .unwrap();
+        let profile = load_client_profile(store.as_ref(), &target, TokenStoreAccess::Unattended)
+            .await
+            .unwrap()
+            .expect("the profile is installed");
+        let discovery = StoredMcpOAuthDiscovery {
+            resource: target.server_url().to_string(),
+            resource_metadata_url: format!("{base}/.well-known/oauth-protected-resource/mcp"),
+            authorization_server: ISSUER.to_string(),
+            authorization_metadata_url: format!("{ISSUER}/.well-known/oauth-authorization-server"),
+            authorization_endpoint: format!("{ISSUER}/authorize"),
+            token_endpoint: plaintext,
+            registration_endpoint: None,
+            scopes: vec!["mcp.read".to_string()],
+        };
+        let result = OAuthTokenResult {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            id_token: None,
+            expires_in_secs: Some(3600),
+            scope: Some("mcp.read".to_string()),
+        };
+        let mut tokens = persisted_tokens_from_result_with_binding(
+            &result,
+            &discovery,
+            &profile.stored_client(),
+            &target,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        tokens.account_id = Some("subject-1".to_string());
+        crate::save_tokens_and_publish_lifecycle(
+            authority.provider_auth_persistence.clone(),
+            authority.auth_lease.clone(),
+            target.auth_binding_ref().unwrap().into(),
+            tokens,
+        )
+        .await
+        .unwrap();
+        republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+
+        let refused = authority.stored_bearer_token(&target).await;
+        assert!(
+            matches!(refused, Err(McpOAuthError::ReauthRequired { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            state.token_requests.lock().is_empty(),
+            "nothing reached the plaintext token endpoint"
+        );
+        assert_eq!(
+            authority
+                .auth_lease
+                .snapshot(&target.lease_key().unwrap())
+                .phase,
+            Some(meerkat_core::handles::AuthLeasePhase::ReauthRequired)
+        );
+        assert!(
+            store
+                .load(&target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the credential is closed for a new login"
+        );
     }
 
     /// Discovery is admitted URL by URL: a protected resource outside the

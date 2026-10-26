@@ -534,27 +534,43 @@ ask its user.
   profile installed, a login of that server registers nothing and needs no
   registration endpoint. The server's protected resource metadata must name
   the profile's issuer (and its resource), or the start is refused
-  (`configuration_invalid`) before any attempt exists. The authorization
-  request carries the profile's client id and redirect, with PKCE S256. A
-  start on any other redirect is refused (`invalid_target`); a loopback login
-  through `mcp_begin_loopback_login` binds exactly the profile's port and
-  path. The code exchange and every refresh authenticate the client by the
-  profile's method, and a refresh token the server rotates is stored and
-  presented by the next refresh. Without a profile nothing changes: dynamic
-  registration as before.
+  (`configuration_invalid`) before any attempt exists. Under an `https`
+  issuer, the token endpoint its metadata names, where the secret is sent,
+  must use `https` as well, loopback included, or discovery refuses it
+  (`upstream_failure`) and nothing is sent there; only an `http` loopback
+  issuer, a local authorization server, keeps loopback endpoints. A refresh
+  checks its stored token endpoint the same way and never sends the secret
+  to one that does not fit: the credential is closed for a new login
+  (`reauth_required`). The authorization request carries the profile's
+  client id and redirect, with PKCE S256. A start on any other redirect is
+  refused (`invalid_target`); a loopback login through
+  `mcp_begin_loopback_login` binds exactly the profile's port and path. The
+  code exchange and every refresh authenticate the client by the profile's
+  method, and a refresh token the server rotates is stored and presented by
+  the next refresh. Without a profile nothing changes: dynamic registration
+  as before.
 
   The attempt and the credential are bound to the profile's facts, not to
   its secret. Replacing the profile with the same facts and a new secret
-  rotates the secret: the next code exchange or refresh uses it. Removing
-  the profile or replacing it with other facts ends what was bound to it: a
-  pending attempt's completion is refused (`attempt_mismatch`) and the
-  attempt retired, and a credential's next refresh is refused as
-  `reauth_required` and the credential removed, so the user logs in again. A
-  refresh the server refuses for the client (for example a secret it no
-  longer accepts) ends the same way. Nothing is ever refreshed as a public
-  client or through dynamic registration instead. A credential minted before
-  the profile was installed keeps refreshing as the client it was registered
-  as; a new login over it needs a logout first.
+  keeps existing credentials refreshing with the new secret (and the next
+  code exchange uses it); a secret the server rejects ends the credential.
+  Removing the profile or replacing it with other facts ends what was bound
+  to it: a pending attempt's completion is refused (`attempt_mismatch`) and
+  the attempt retired, and a credential's next refresh is refused as
+  `reauth_required` and the credential removed, so the user logs in again.
+  Removal is not a revocation: the current access token stays usable until
+  it expires, and `mcp_status` reports the credential `Authorized` until the
+  refresh that ends it. To stop its use at once, call
+  `HostAuthService::mcp_logout`, which removes the credential from the host
+  (it revokes nothing at the authorization server). Ending the credential on
+  a refresh the server rejects holds for standard OAuth error responses (for
+  example `invalid_client` for a secret the server no longer accepts): a
+  server that reports errors with HTTP 200 keeps the credential, every use
+  retries the refresh and fails with a typed error, and `mcp_status` can keep
+  reporting `Authorized`, as with Core's other OAuth refreshes. Nothing is
+  ever refreshed as a public client or through dynamic registration instead.
+  A credential minted before the profile was installed keeps refreshing as
+  the client it was registered as; a new login over it needs a logout first.
 
   Host obligations: install a profile only from the host's own
   administration, never from agent input, a tool, an MCP server definition

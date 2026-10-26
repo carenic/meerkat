@@ -138,7 +138,9 @@ impl Drop for McpOAuthClientSecret {
 /// [`McpOAuthAuthority::install_client_profile_entered`].
 ///
 /// - `issuer`: the authorization server the client is registered with. The
-///   server's protected resource metadata must name it.
+///   server's protected resource metadata must name it. Under an `https`
+///   issuer the token endpoint, where the secret is sent, must use `https`
+///   too; only an `http` loopback issuer keeps loopback endpoints.
 /// - `client_id` and `redirect_uri`: the registered client and its exact
 ///   registered redirect, either the target's registered `https` callback
 ///   ([`McpOAuthAuthority::registered_redirect_uri`]) or an `http` loopback
