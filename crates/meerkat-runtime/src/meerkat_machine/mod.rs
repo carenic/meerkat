@@ -4104,15 +4104,21 @@ impl PendingRuntimeExecutorAttachment {
         // The expired run whose tail repair requires the session to reload.
         let mut reload_for_run = None;
         // The runtime-termination carriers the expired run's settlement
-        // committed, published once the driver is released.
+        // committed, and the run's own terminal, published once the driver
+        // is released.
         let mut settled_batches = Vec::new();
+        let mut settled_terminal = None;
         let expired = {
             let mut driver = driver.lock().await;
             let mut expired = Vec::new();
             if let Some(run_id) = driver.resumable_run_id()
                 && driver.resumable_run_stop_requeue_expired(&run_id, now)
             {
-                let (settled, batches) = driver
+                let crate::meerkat_machine::driver::SettledResumableRun {
+                    abandoned: settled,
+                    batches,
+                    terminal,
+                } = driver
                     .settle_resumable_run_with_terminals(
                         &run_id,
                         crate::input_state::InputAbandonReason::RequeueExpired,
@@ -4120,6 +4126,7 @@ impl PendingRuntimeExecutorAttachment {
                     )
                     .await?;
                 settled_batches = batches;
+                settled_terminal = terminal;
                 tracing::info!(
                     session_id = %self.witness.session_id(),
                     %run_id,
@@ -4179,13 +4186,14 @@ impl PendingRuntimeExecutorAttachment {
             );
         }
         // This runs after the runtime loop's startup drain, so the carriers
-        // the settlement committed are published here, through the
-        // publisher the attachment already carries. Detached: the session
-        // actor answers a publication only once this attachment is served,
-        // and this attachment is not served until this returns. A failed or
-        // missing publication leaves each directed outbox as its durable
-        // retry anchor for the next drain.
-        if !settled_batches.is_empty() {
+        // the settlement committed, and then the run's own terminal, are
+        // published here, through the publisher the attachment already
+        // carries. Detached: the session actor answers a publication only
+        // once this attachment is served, and this attachment is not served
+        // until this returns. A failed or missing publication leaves each
+        // directed outbox as its durable retry anchor for the next drain;
+        // the run's terminal is not durable and is then lost.
+        if !settled_batches.is_empty() || settled_terminal.is_some() {
             let publication_handle = self
                 .machine
                 .sessions
@@ -4212,6 +4220,13 @@ impl PendingRuntimeExecutorAttachment {
                         %error,
                         "the expired kept run's terminals were not published; their outboxes stay for the next drain"
                     );
+                }
+                if let Some(terminal) = settled_terminal.as_ref() {
+                    crate::control_plane::publish_settled_run_terminal(
+                        publication_handle.as_deref(),
+                        terminal,
+                    )
+                    .await;
                 }
             }));
         }

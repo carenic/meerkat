@@ -725,6 +725,7 @@ pub(crate) async fn terminalize_async_stop_once(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     runless_terminal: &mut crate::meerkat_machine::RunlessTerminalAnnouncement,
 ) -> Result<(), RuntimeDriverError> {
+    let mut settled_run_terminal = None;
     let (settled_resumable_input_ids, terminal_batches, requeued_input_ids, termination_reason) = {
         let mut driver = driver.lock().await;
         // Inputs a store-owned durable-tail recovery consumed are not
@@ -741,8 +742,13 @@ pub(crate) async fn terminalize_async_stop_once(
             Some(run_id) if !driver.stop_keeps_queued_work() => {
                 // The kept run's inputs get the runtime-termination carrier
                 // in the same commit, so a directed caller hears that the
-                // run ended with the stop.
-                let (settled, batches) = driver
+                // run ended with the stop; the run's own terminal is
+                // published after the commit.
+                let crate::meerkat_machine::driver::SettledResumableRun {
+                    abandoned: settled,
+                    batches,
+                    terminal,
+                } = driver
                     .settle_resumable_run_with_terminals(
                         &run_id,
                         crate::input_state::InputAbandonReason::Cancelled,
@@ -750,6 +756,7 @@ pub(crate) async fn terminalize_async_stop_once(
                     )
                     .await?;
                 settled_resumable_batches = batches;
+                settled_run_terminal = terminal;
                 // Its provisional tail is repaired as an interrupted run,
                 // after the abandonment committed: every committed round
                 // stays. A tail the repair leaves standing is the next
@@ -832,14 +839,42 @@ pub(crate) async fn terminalize_async_stop_once(
         }
     }
 
-    publish_and_resolve_runless_runtime_terminations(
+    let published = publish_and_resolve_runless_runtime_terminations(
         driver,
         completions,
         publication_handle,
         &terminal_batches,
         &termination_reason,
     )
-    .await
+    .await;
+    if let Some(terminal) = settled_run_terminal.as_ref() {
+        publish_settled_run_terminal(publication_handle, terminal).await;
+    }
+    published
+}
+
+/// Publish the run terminal of a run the runtime settled without resuming
+/// it, through `publication_handle`, after the settlement committed. Best
+/// effort: the settlement stands either way, and a failed publication only
+/// loses the event, which is logged.
+pub(crate) async fn publish_settled_run_terminal(
+    publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    terminal: &meerkat_core::lifecycle::SettledRunTerminal,
+) {
+    let published = match publication_handle {
+        Some(handle) => handle.publish_settled_run_terminal(terminal).await,
+        None => Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
+            "no publication capability is attached".to_string(),
+        )),
+    };
+    if let Err(error) = published {
+        tracing::warn!(
+            session_id = %terminal.session_id(),
+            run_id = %terminal.run_id(),
+            %error,
+            "the settled run's terminal was not published"
+        );
+    }
 }
 
 /// Converge only a runless terminal whose exact committed carrier survived the

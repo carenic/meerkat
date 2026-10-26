@@ -7199,7 +7199,9 @@ async fn settle_refused_resumed_run(
         Err(_) => return ResumedRunAdmissionLap::Exit(true),
     };
     // The kept inputs get the runtime-termination carrier in the same
-    // commit; the drain below publishes a directed caller's terminal.
+    // commit; the drain below publishes a directed caller's terminal, and
+    // the run's own terminal is published once the queue authority is
+    // released.
     let settled = driver
         .lock()
         .await
@@ -7209,8 +7211,8 @@ async fn settle_refused_resumed_run(
             &format!("the resumed run was refused: {detail}"),
         )
         .await;
-    let abandoned = match settled {
-        Ok((abandoned, _batches)) => abandoned,
+    let (abandoned, settled_terminal) = match settled {
+        Ok(settled) => (settled.abandoned, settled.terminal),
         Err(error) => {
             tracing::error!(%run_id, %error, "failed to settle a refused resumed run");
             drop(queue_authority_guard);
@@ -7240,8 +7242,15 @@ async fn settle_refused_resumed_run(
         .await
         .repair_settled_run_tail(&authority_binding.session_id, run_id)
         .await;
+    drop(queue_authority_guard);
+    if let Some(terminal) = settled_terminal.as_ref() {
+        crate::control_plane::publish_settled_run_terminal(
+            executor.publication_handle().as_deref(),
+            terminal,
+        )
+        .await;
+    }
     if reload {
-        drop(queue_authority_guard);
         authority_binding
             .require_session_durability_reload(
                 "settled_resumable_run_tail_repair",
@@ -7250,7 +7259,6 @@ async fn settle_refused_resumed_run(
             .await;
         return ResumedRunAdmissionLap::Exit(true);
     }
-    drop(queue_authority_guard);
     if !abandoned.is_empty()
         && drain_recovered_interaction_terminal_outboxes_until_clear(
             driver,
