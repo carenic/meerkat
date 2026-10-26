@@ -1145,9 +1145,9 @@ async fn the_store_level_reader_refuses_foreign_files_and_writes_nothing() {
     }
 }
 
-/// Require two member binding history reads to answer the same: the
-/// cursor, each identity's last binding and intent-row fact, each session's
-/// binding, and both durable-identity lists.
+/// Require two member binding history reads of one journal that nothing
+/// wrote to in between to answer the same: the cursor, and every binding
+/// [`assert_same_bindings`] compares.
 fn assert_same_history(
     read: &MemberBindingHistory,
     reference: &MemberBindingHistory,
@@ -1159,6 +1159,19 @@ fn assert_same_history(
         reference.journal_cursor(),
         "the journal cursor"
     );
+    assert_same_bindings(read, reference, identities, sessions);
+}
+
+/// Require two member binding history reads to answer the same bindings:
+/// each identity's last binding and intent-row fact, each session's
+/// binding, and both durable-identity lists. A running mob's journal can
+/// move between two reads, so this leaves the cursor out.
+fn assert_same_bindings(
+    read: &MemberBindingHistory,
+    reference: &MemberBindingHistory,
+    identities: &[&AgentIdentity],
+    sessions: &[&SessionId],
+) {
     for identity in identities {
         assert_eq!(
             read.last_binding(identity),
@@ -1350,7 +1363,7 @@ async fn the_storage_reader_reads_a_host_store_storage_before_any_mob_is_built()
         .member_binding_history()
         .await
         .expect("read the running mob's history");
-    assert_same_history(
+    assert_same_bindings(
         &storage
             .member_binding_history()
             .await
