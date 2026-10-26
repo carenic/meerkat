@@ -64,7 +64,16 @@ them.
   its session left open, and an autonomous member's kickoff stays open. A
   member whose registration served live work is stopped, as under `Stop`.
   For a host that boots over a store another host serves, holds its
-  members' run starts, and must hand the store back unchanged.
+  members' run starts, and must hand the store back unchanged. While a
+  member's host holds its run starts, a kickoff an earlier Shutdown kept in
+  flight is re-attached at the host's release
+  (`MobHandle::release_member_run_starts`) instead of at the member's
+  restore, so the restore serves the member no work and a `Keep` Shutdown
+  keeps the kickoff open.
+- `meerkat-runtime`: `MeerkatMachine::registration_run_start_hold_staged`
+  answers whether a run-start hold reason is staged for a session's
+  registration, as a host's hold on a member's run starts stays until the
+  host releases it.
 
 ### Fixed
 

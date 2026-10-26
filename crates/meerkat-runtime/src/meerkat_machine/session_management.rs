@@ -13701,6 +13701,26 @@ Ok::<(), RuntimeDriverError>(())
         }
     }
 
+    /// Whether `reason` is staged for `session_id`'s registration (#1500):
+    /// [`Self::stage_registration_run_start_hold`] or
+    /// [`Self::stage_registration_run_start_hold_only`] staged it, and
+    /// neither [`Self::release_run_starts`] nor
+    /// [`Self::unstage_registration_run_start_hold`] has removed it since. An
+    /// owner that holds a session's run starts until its own release (a host
+    /// whose member's tools are not published yet) stages its reason this
+    /// way, so this answers whether that owner still holds them.
+    pub fn registration_run_start_hold_staged(
+        &self,
+        session_id: &SessionId,
+        reason: super::RunStartHoldReason,
+    ) -> bool {
+        self.registration_run_start_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|reasons| reasons.contains(&reason.dsl()))
+    }
+
     /// The run-start holds `session_id`'s registration applies (#1500).
     /// Read under the session's mutation gate.
     pub(super) fn registration_run_start_holds(

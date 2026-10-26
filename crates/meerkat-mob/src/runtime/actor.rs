@@ -21959,7 +21959,8 @@ impl MobActor {
             // A kickoff a Shutdown kept in flight: its run resumes on this
             // start (once a Stopped mob resumes, its held run starts release),
             // and its waiter is re-attached at the first readiness pass that
-            // observes the member's runtime.
+            // observes the member's runtime, or at its host's release of the
+            // member's run starts when the host holds them.
             #[cfg(feature = "runtime-adapter")]
             if stage == super::state::LifecycleProgressStage::AutonomousRuntimeReadiness
                 && self
@@ -22007,6 +22008,12 @@ impl MobActor {
     /// answers from its receipt. A member with no such input (its kickoff
     /// never reached the runtime, or an earlier version admitted it without a
     /// key) keeps its kickoff as it is.
+    ///
+    /// Not while the member's host holds its run starts (#1500): the
+    /// re-attach is a deduplicated resubmission, live work after which a
+    /// `QueuedInputsOnShutdown::Keep` Shutdown of the registration keeps
+    /// nothing and settles the kept kickoff. The host's release re-attaches
+    /// it ([`Self::rearm_kept_kickoff_after_release`]).
     #[cfg(feature = "runtime-adapter")]
     async fn rearm_kept_kickoff(&mut self, entry: &RosterEntry) {
         use meerkat_runtime::SessionServiceRuntimeExt as _;
@@ -22024,6 +22031,17 @@ impl MobActor {
                 .await
                 .contains_key(&entry.agent_identity)
         {
+            return;
+        }
+        if super::stop_report::HostRunStartHoldReason::ALL
+            .into_iter()
+            .any(|reason| adapter.registration_run_start_hold_staged(&session_id, reason.runtime()))
+        {
+            tracing::debug!(
+                agent_identity = %entry.agent_identity,
+                "the member's host holds its run starts; its kept kickoff is re-attached at the \
+                 host's release"
+            );
             return;
         }
         let agent_identity = entry.agent_identity.clone();
@@ -22066,6 +22084,31 @@ impl MobActor {
             agent_identity = %agent_identity,
             "re-attached the kept kickoff's waiter"
         );
+    }
+
+    /// After a host released a hold on `agent_identity`'s run starts,
+    /// re-attach the kickoff a Shutdown kept in flight, which
+    /// [`Self::rearm_kept_kickoff`] left for this release. A hold of another
+    /// host reason still standing defers it to that reason's release. A
+    /// member whose runtime has not registered yet finds no input here, and
+    /// its first readiness pass re-attaches the kickoff.
+    #[cfg(feature = "runtime-adapter")]
+    async fn rearm_kept_kickoff_after_release(&mut self, agent_identity: &AgentIdentity) {
+        if !self
+            .dsl_authority
+            .state()
+            .member_kickoff_starting
+            .contains(&mob_dsl::AgentIdentity::from_domain(agent_identity))
+        {
+            return;
+        }
+        let Some(entry) = self.roster.read().await.get(agent_identity).cloned() else {
+            return;
+        };
+        if entry.runtime_mode != crate::MobRuntimeMode::AutonomousHost {
+            return;
+        }
+        self.rearm_kept_kickoff(&entry).await;
     }
 
     // ------------------------------------------------------------------
@@ -30007,6 +30050,10 @@ impl MobActor {
                     let result = self
                         .release_member_run_start_hold(&agent_identity, reason)
                         .await;
+                    #[cfg(feature = "runtime-adapter")]
+                    if result.is_ok() {
+                        Box::pin(self.rearm_kept_kickoff_after_release(&agent_identity)).await;
+                    }
                     let _ = reply_tx.send(result);
                 }
                 MobCommand::ProjectMemberStatusObserved {

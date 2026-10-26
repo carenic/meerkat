@@ -5446,3 +5446,147 @@ async fn a_kept_kickoff_whose_input_already_ended_resolves_from_its_receipt() {
         .expect("mob shutdown finishes")
         .expect("mob shutdown");
 }
+
+/// The Keep row of a member whose kickoff run is still in flight at the
+/// first process's requeue Shutdown, which keeps the kickoff and its run. The
+/// second process restores the mob with the member's run starts held by its
+/// host and shuts down with Keep. While the host holds the member, its kept
+/// kickoff is not re-attached (a re-attach is a deduplicated resubmission,
+/// live work after which the Keep keeps nothing and settles the kickoff), so
+/// every input row of the member is the same before and after the Keep, and
+/// its model saw no request. The third process holds the member again until
+/// its host releases it: the release re-attaches the kickoff, whose run
+/// resumes and resolves it as started under the same objective, its prompt
+/// asked of the model once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_release() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("keep-kickoff")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(1).await;
+    let before = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is in the roster")
+        .kickoff
+        .expect("the member has a kickoff");
+    let report = tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    assert_eq!(
+        report.runs.get(&identity),
+        None,
+        "the first process keeps the kickoff and its run"
+    );
+    let rows_before = member_input_rows(&host.runtime_store, &session_id).await;
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The second process holds the member and serves it nothing.
+    let held_client = ScriptedClient::new(true);
+    let held = open_stop_host_holding(
+        &root_path,
+        &held_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = held.adapter.run_start_held_parks();
+    // Hang guard only: the park is the positive event.
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    assert!(
+        held.adapter.resumable_run_id(&session_id).await.is_some(),
+        "the held registration keeps the kickoff's run marked"
+    );
+    tokio::time::timeout(
+        WAIT,
+        held.handle.shutdown_with_report(
+            crate::ShutdownOptions::default()
+                .with_queued_inputs(crate::QueuedInputsOnShutdown::Keep),
+        ),
+    )
+    .await
+    .expect("the keep stop finishes")
+    .expect("keep stop");
+    let rows_after = member_input_rows(&held.runtime_store, &session_id).await;
+    assert_eq!(
+        (held_client.requests().len(), rows_after),
+        (0, rows_before),
+        "a keep stop of a held member leaves the rows of its kept kickoff as they were, and the \
+         member ran nothing"
+    );
+    drop(held);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The third process holds the member until its host releases it.
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host_holding(
+        &root_path,
+        &restarted_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = restarted.adapter.run_start_held_parks();
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    let requests_while_held = restarted_client.requests().len();
+    restarted
+        .handle
+        .release_member_run_starts(&identity, crate::HostRunStartHoldReason::ToolsNotPublished)
+        .await
+        .expect("the host releases the member's run starts");
+    tokio::time::timeout(WAIT, restarted.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kept kickoff resolves after the release")
+        .expect("kickoff wait");
+    let after = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restarts")
+        .kickoff
+        .expect("the member keeps its kickoff");
+    assert_eq!(
+        (
+            requests_while_held,
+            after.phase,
+            after.objective_id == before.objective_id,
+            requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
+        ),
+        (0, crate::roster::MobMemberKickoffPhase::Started, true, 1),
+        "the host's release re-attaches the kept kickoff: its run resumes once and resolves it \
+         under the same objective"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}

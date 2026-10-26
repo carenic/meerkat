@@ -1401,7 +1401,11 @@ with no requeue mark, and the run its session left open, and an autonomous
 member's kickoff stays open: the next start recovers and resumes them as if
 this host had never run. A member whose registration served live work (an
 admitted input, a deduplicated resubmission or a recycled registration) is
-stopped, as under `Stop`.
+stopped, as under `Stop`. While the host holds a member's run starts, a
+kickoff an earlier Shutdown kept in flight is not re-attached at the
+member's restore but at the host's `release_member_run_starts`, so a host
+that never releases the member serves it no work and its `Keep` Shutdown
+keeps the kickoff open.
 
 Under `Requeue` the Shutdown holds a member's run starts and does not cancel
 its running turn. The member's runtime stop suspends a run that commits
