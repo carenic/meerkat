@@ -84,7 +84,14 @@ them.
   The host store reference and `ScopeFamily` now state that Core never uses
   a scope family tag starting with `x` or `mx`, so a layer above Core can
   keep scopes of its own in a realm without colliding with a later Core
-  family.
+  family. The reference also states how Core settles a commit whose outcome
+  is unknown or unavailable (the same batch again, with the same commit id,
+  within `SpiRealmConfig::commit_retry_budget`; past it, the batch's scopes
+  are poisoned until the realm is opened again), what
+  `FenceTiming::max_commit_latency` bounds (the backoff of a session write
+  fenced by a mob's identity authority, which waits for every batch of the
+  identity scope's commit, chunk batches included, and not for a session
+  document's chunk batches), and that Core sets no deadline on a commit.
 
 ### Fixed
 

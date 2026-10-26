@@ -139,6 +139,26 @@ Answer `Unavailable` only when nothing was applied. When you cannot tell
 whether a commit landed, answer `Indeterminate`: Core then settles it by
 retrying the same batch or by loading the head.
 
+### How Core Settles A Commit
+
+After `Indeterminate`, Core first loads the head of the batch's first scope:
+when the head names the batch's commit id (for a deleting update, when the
+scope is gone), the batch landed. Otherwise, and after `Unavailable`, Core
+sends the same batch again, with the same commit id (obligation 3), after a
+pause that starts at 100 ms and doubles up to 3.2 s, until the batch lands
+or its retry budget runs out (`SpiRealmConfig::commit_retry_budget`, 30 s by
+default). Any other error ends the commit at once. The chunk batches of a
+large value are settled the same way.
+
+A commit that does not settle within its budget, or ends in another error,
+fails the call that made it with a write error, and every scope the batch
+would have changed is poisoned; `FencedOut` poisons the whole realm. A
+poisoned scope refuses every later call on it, reads included, and calls
+that read across scopes, such as listings, refuse while any scope is
+poisoned; calls on other scopes keep serving. Only opening the realm again
+lifts the poison: the next open loads what your store holds, so a batch that
+did land after all is part of the realm, and one that did not is not.
+
 ## Obligations
 
 These nine obligations, with the self-fence margin rule under
@@ -227,11 +247,37 @@ margin larger by twice that. A shorter lease shortens the wait for the next
 process after a holder died, and at a takeover. A longer renew interval
 renews less often.
 
-The longest commit is how long one `commit` can take on your backend
-(`FenceTiming::max_commit_latency`). A fenced write of Core's that meets a
-commit still in flight on the fence it checks waits up to that long before
-it reports the write as backed off, so a store whose commits are slower
-declares a longer bound instead of failing those writes.
+The longest commit is how long one `commit` can take on your backend, the
+retries your store makes inside the call included
+(`FenceTiming::max_commit_latency`). Core uses it for one kind of write: a
+write to a mob member's session that Core fences with the mob's identity
+authority, as its identity reconciler does. Such a write first checks that
+the mob's identity scope has no commit in flight. While one is in flight,
+Core checks again, after pauses that start at 5 ms and double up to 50 ms,
+for up to the longest commit, and then reports the write as backed off
+(`RuntimeStoreError::WriteFenceBackoff`, or a `FenceBackoff` outcome): the
+write changed nothing, nothing is poisoned, and the reconciler tries it
+again later. A store whose commits are slower declares a longer bound so
+that those writes do not back off.
+
+The wait covers the whole commit of the call that holds the identity scope:
+the chunk batches of that call's large values (see [Limits](#limits)), the
+batch that refers to them, and Core's retries of an unknown or unavailable
+answer ([How Core Settles A Commit](#how-core-settles-a-commit)). Size the
+bound for the chunk batches and the batch at their slowest; while your
+store is in trouble the retries outlast it, and those writes back off. A
+session document's chunk batches are not part of the wait: they belong to
+the commit of the session write itself, which Core sends after the identity
+check has released the identity scope. When no value written with the
+identity scope is large enough to be chunked, the bound only has to cover
+one batch.
+
+Core sets no deadline on a `commit` call itself. A commit that runs longer
+than the longest commit is waited for: Core does not fail it, does not
+retry it, and poisons nothing. The call that made it waits for its answer,
+later calls on the scopes it holds wait for those scopes, and a run waits
+for its round commit, since the runtime store over a host store declares no
+commit outcome deadline (`RuntimeStore::commit_outcome_deadline` is `None`).
 
 ### Core's Writer Rules
 
