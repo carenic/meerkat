@@ -32,7 +32,8 @@ pub use core_executor::{
     CoreExecutorInterruptHandle, CoreExecutorPostStopCleanupHandle, CoreExecutorPreDequeueHandle,
     CoreExecutorPublicationHandle, CoreExecutorTeardownReason, CoreExecutorTranscriptNoticeHandle,
     CoreExecutorTurnFinalizationBoundaryHandle, CoreExecutorTurnFinalizationGuard,
-    CoreInteractionTerminalPublicationReceipt, CorePreDequeueOutcome,
+    CoreInteractionTerminalPublicationReceipt, CorePreDequeueOutcome, SettledRunCause,
+    SettledRunTerminal,
 };
 pub use identifiers::{InputId, RunId, WaitRequestId};
 pub use run_event::RunEvent;

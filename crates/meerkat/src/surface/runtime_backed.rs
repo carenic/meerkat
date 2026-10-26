@@ -2108,6 +2108,17 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
+
+    async fn publish_settled_run_terminal(
+        &self,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), CoreExecutorError> {
+        let witness = self.actor.witness()?;
+        self.service
+            .publish_settled_run_terminal_for_actor(&witness, settled)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
 }
 
 #[async_trait::async_trait]

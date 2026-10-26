@@ -38,7 +38,7 @@ use long_run_support::{
     Store, WHOLE_BLOB, WORKER, await_supervisor_route_release, discard_provisional_tail,
     fail_model_call, fresh_root, kill_orphaned_process, other_writer, read_killed,
     read_killed_member, read_plan, restart, restart_deploy, restart_workers,
-    run_resumed_until_killed, run_until_killed, wait_converged, write_plan,
+    run_resumed_until_killed, run_until_killed, settled_run_report, wait_converged, write_plan,
 };
 use meerkat_core::types::SessionId;
 use meerkat_store_conformance::{
@@ -816,7 +816,8 @@ fn check_resumed(
 
 /// A worker whose kept run's requeue bound passed before the restart: the
 /// run is settled as expired instead of resumed, nothing of it runs again,
-/// and a new input still runs.
+/// its session's stream ends it with one cancelled `RunFailed`, and a new
+/// input still runs.
 fn check_expired(restarted: &DeployRestart) -> Result<(), String> {
     let member = restarted.member;
     let report = &restarted.report;
@@ -843,6 +844,13 @@ fn check_expired(restarted: &DeployRestart) -> Result<(), String> {
             report.model_call_rounds,
             report.dispatched,
             report.receipts
+        ));
+    }
+    let expired = settled_run_report(meerkat_core::lifecycle::SettledRunCause::RequeueExpired);
+    if restarted.killed_run_failures != [expired.clone()] {
+        return Err(format!(
+            "{member}'s expired run ended on its stream with {:?}, expected exactly {expired:?}",
+            restarted.killed_run_failures
         ));
     }
     if !restarted.follow_up_consumed {
@@ -1091,7 +1099,8 @@ fn check_tail_repaired(plan: &LongRunPlan, restarted: &DeployRestart) -> Result<
 }
 
 /// A durable worker killed in round 2's tools whose resume the gate
-/// refuses (superseded) settles its input as refused and has its tail
+/// refuses (superseded) settles its input as refused, ends the run on its
+/// session's stream with one cancelled `RunFailed`, and has its tail
 /// repaired, never discarded, and its session's next run takes its round
 /// commits.
 async fn a_refused_resume_repairs_the_tail(backend: Backend) {
@@ -1127,6 +1136,13 @@ async fn a_refused_resume_repairs_the_tail(backend: Backend) {
             None,
         ),
         "the refused run's input ends refused and nothing resumes"
+    );
+    assert_eq!(
+        restarted.killed_run_failures,
+        [settled_run_report(
+            meerkat_core::lifecycle::SettledRunCause::ResumeRefused
+        )],
+        "the refused run ends once on its session's stream, as refused"
     );
     if let Err(error) = check_tail_repaired(&plan, restarted) {
         panic!("{error}");
@@ -1382,17 +1398,18 @@ async fn a_resumed_rebased_runs_failure_consumes_its_input_over_the_reference_ho
         restarted.prompts, 1,
         "the user message is in the committed transcript once"
     );
-    // The run has one conversational turn, so the compaction before round 3
-    // keeps no complete turn: it folds rounds 0 to 2 into its one summary
-    // and keeps only the pinned prompt. The committed transcript then holds
-    // that summary, round 3 and each of its calls' results, and nothing of
-    // the run was repaired. A run that never compacted, and so never
-    // re-based, fails here.
+    // Nothing comes before the run, so the compaction before round 3 folds
+    // the run's own completed rounds, 0 and 1, into its one summary and keeps
+    // the run's prompt and its newest round, 2, verbatim. The committed
+    // transcript then holds that summary, rounds 2 and 3 and each of their
+    // calls' results, and nothing of the run was repaired. A run that never
+    // compacted, and so never re-based, fails here.
     let rounds = &report.transcript_rounds;
     assert_eq!(
         (rounds.clone(), restarted.summaries),
-        (vec![plan.kill_round], 1),
-        "the committed transcript holds the compaction's one summary and only the resumed round"
+        (vec![plan.kill_round - 1, plan.kill_round], 1),
+        "the committed transcript holds the compaction's one summary, the round it kept and the \
+         resumed round"
     );
     let mut results = report.transcript_results.clone();
     results.sort();

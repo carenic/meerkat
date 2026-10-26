@@ -2180,18 +2180,23 @@ impl MeerkatMachine {
         // The kept run's inputs get the runtime-termination carrier in the
         // same commit, as the queued inputs below do: a nondirected batch is
         // finalized here, a directed one is the archive's to converge from
-        // its durable outbox after it releases the lease.
+        // its durable outbox after it releases the lease. The run's own
+        // terminal is not published: the archive serves no live actor to
+        // publish it through, and the session's stream ends with it.
         let (settled, settled_batches) = {
             let mut driver = lease.driver.lock().await;
             match driver.resumable_run_id() {
-                Some(run_id) => driver
-                    .settle_resumable_run_with_terminals(
-                        &run_id,
-                        InputAbandonReason::Cancelled,
-                        reason,
-                    )
-                    .await
-                    .map_err(internal)?,
+                Some(run_id) => {
+                    let settled = driver
+                        .settle_resumable_run_with_terminals(
+                            &run_id,
+                            InputAbandonReason::Cancelled,
+                            reason,
+                        )
+                        .await
+                        .map_err(internal)?;
+                    (settled.abandoned, settled.batches)
+                }
                 None => (Vec::new(), Vec::new()),
             }
         };

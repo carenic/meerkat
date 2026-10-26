@@ -8948,6 +8948,49 @@ impl MobSessionService for LocalSessionService {
         Ok(())
     }
 
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        if settled.session_id() != actor_witness.session_id() {
+            return Err(SessionError::Agent(
+                meerkat_core::error::AgentError::InternalError(
+                    "settled run terminal session does not match the exact actor".to_string(),
+                ),
+            ));
+        }
+        // Hold the registry boundary through publication so a predecessor
+        // cannot resolve the event channel of a replacement actor.
+        let sessions = self.sessions.read().await;
+        let actor = sessions
+            .get(actor_witness.session_id())
+            .filter(|actor| actor.witness.eq(actor_witness) && actor_witness.is_live())
+            .ok_or_else(|| SessionError::NotFound {
+                id: actor_witness.session_id().clone(),
+            })?;
+        let event_txs = self.event_txs.read().await;
+        let event_tx =
+            event_txs
+                .get(actor_witness.session_id())
+                .ok_or_else(|| SessionError::NotFound {
+                    id: actor_witness.session_id().clone(),
+                })?;
+        let mut next_seq = actor
+            .next_event_seq
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let event = EventEnvelope::new_session(
+            actor_witness.session_id().clone(),
+            *next_seq,
+            None,
+            settled.run_failed_event(),
+        );
+        *next_seq += 1;
+        let _ = event_tx.send(event);
+        Ok(())
+    }
+
     async fn fork_persisted_session_at_turn_boundary(
         &self,
         _source_session_id: &meerkat_core::SessionId,

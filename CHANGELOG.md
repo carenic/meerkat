@@ -106,6 +106,20 @@ them.
   identity scope's commit, chunk batches included, and not for a session
   document's chunk batches), and that Core sets no deadline on a commit.
 
+- `meerkat-core`, `meerkat-session`, `meerkat-mob`: a run the runtime
+  settles without resuming it has a typed terminal payload,
+  `meerkat_core::lifecycle::SettledRunTerminal` (the session id, the run's
+  transcript identity under its run id, and a `SettledRunCause`:
+  `RequeueExpired`, `ResumeRefused` or `Cancelled`), and its
+  `run_failed_event` is the existing `AgentEvent::RunFailed` of class
+  `Cancelled`, with no reason or cause kind. `CoreExecutorPublicationHandle`
+  gains `publish_settled_run_terminal`, which publishes that event through
+  the handle's exact live actor and answers unsupported by default.
+  `EphemeralSessionService` and `PersistentSessionService` gain
+  `publish_settled_run_terminal_for_actor`, and `MobSessionService` gains the
+  same method, unsupported by default. The publication handles of the
+  `meerkat` surfaces, `meerkat-rpc` and `meerkat-mob` implement it.
+
 - `meerkat-core`: `BoundOperationReview::consent_notice_issuer` returns the
   approval owner that issues the review's human consent, present exactly
   when R3 routes to human consent, as `consent_owner_loss_settlement` is. A
@@ -123,6 +137,53 @@ them.
   (`MobMcpState::with_host_job_source`).
 
 ### Fixed
+
+- `meerkat-core`, `meerkat-session`: a compaction inside an open run no longer
+  folds the run's request or its newest round. Before, a run whose own rows
+  exceeded the compactor's retention budget kept only its request, and the
+  model, seeing a summary of a tool call it had already made, could make it
+  again. Now, at a round boundary after the run's first response, the agent
+  finds the run's first row (the input rows before its first response: the
+  prompt, injected context and the notices a peer, flow, external or job
+  input arrives as, found from the run id its assistant rows carry) and
+  compacts in two stages:
+  1. While the rows before the run hold a turn, only they are handed to the
+     compactor (and to a curator), and the run's own rows follow the summary
+     verbatim, for any compactor.
+  2. When nothing before the run is left, the run's own completed rounds are
+     folded, with any earlier summary, by the runtime itself; the run's
+     request and its newest round (its tool calls, their results and any
+     rows a tool appended after them) stay verbatim, and the summary ends by
+     naming every call the run's earlier rounds made, those an earlier fold
+     took out included, as already run (a call whose result was an error as
+     ran and failed, so it may still be made again). That list is kept in
+     the session metadata key `open_run_folded_calls` for the open run,
+     committed with each fold, and never read back from a summary's text;
+     each call's outcome comes from its own round, since some providers reuse
+     call ids in every round. The line names the newest 200 calls and counts
+     older ones by tool name. A long single run therefore keeps compacting,
+     one boundary later than before, and always sees the calls it made last.
+     A fold that would take out only one row is skipped.
+
+  A run whose newest round is its only one has nothing to fold: the attempt
+  is skipped before its summary call and recorded for cadence. A run's first
+  boundary, before its first response, compacts as before. Custom compactors:
+  inside a run the rows a compactor gets end with a complete turn, so a
+  rebuild that keeps the last user row and puts the summary first is now
+  refused there (the summary must stand at the first discarded row);
+  `CompactionWindow` and `CompactionCurator` document what they get.
+  `DefaultCompactor` keeps a newest turn's request verbatim only while that
+  turn has no final answer, so an answered turn is kept or folded whole and
+  never left reading as pending. `compaction_started` and
+  `compaction_completed` keep reporting over the whole transcript. When the
+  open run's own tool results push a request past the provider cap (also
+  after a model fallback, against the fallback's cap), that request (never
+  the stored transcript) carries each oversized result of the run, found
+  after the run's first row so a reused call id of an earlier run is never
+  cut, with its identity and the head of its text and a marker naming the
+  call; the compaction trigger and its post-compaction check still see the
+  unbounded size, and a request that still does not fit fails as
+  `RequestTooLarge`.
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
   start (`UnregisterQueuedInputs::Requeue`, which the graceful shutdowns of
@@ -161,6 +222,27 @@ them.
   attachment's publication capability, so a crash in between, or a surface
   without that capability, leaves the committed carrier for the next stop or
   start to publish.
+
+- `meerkat-runtime`: a run left open across a restart (kept by a graceful
+  stop, or cut by a crash after a round commit) that the runtime settles
+  instead of resuming now ends on the session's event stream: its live
+  actor publishes one `RunFailed` of class `Cancelled` under the run's id
+  and the transcript identity its rounds carry (its interaction, merged
+  from its inputs as its resume would have merged them). The run's
+  execution ended in an earlier process, which published no terminal, so a
+  client that followed the run by its events never saw it end, whether its
+  input was directed or a plain prompt. This covers a start that finds the
+  run past its stop's max age, a refused resume, and a stop that keeps no
+  work. The event is published after the settlement commits and is not
+  part of it. A start that settles an expired run retries it for up to a
+  minute while its attachment comes to serve. A crash in between, or a
+  start whose tail repair leaves a tail standing (so the session reloads
+  instead of serving), loses it, and no later start publishes it. The event
+  needs the attachment's publication capability: a surface without one, or
+  one that does not support the publication, publishes none. An archive
+  that settles a kept run publishes no run terminal, since it serves no live
+  actor; nor do a retire, a destroy or a reset, which end a kept run without
+  settling it; nor does a suspension the runtime refuses.
 
 - `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
   schedules are included; the tool lists active and paused schedules only, and

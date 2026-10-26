@@ -58,6 +58,23 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 filter = 'test(=machines::tests::machine_workflow_red_ok_detects_missing_and_stale_generated_artifacts)'
 threads-required = "num-cpus"
 
+[[profile.ci-unit.overrides]]
+# The SQLite rows of meerkat-runtime's terminal-completion batch-bound tests
+# each drive a 300-input backlog through the SQLite store. They measured about
+# 215 s on GitHub-hosted runners against the four-period bound (240 s), so give
+# only these exact cases additional headroom without weakening the unit lane's
+# general four-minute attribution bound.
+filter = '''
+package(meerkat-runtime) and (
+    test(=meerkat_machine::tests::terminal_completion_batch_bound::held_loop_stop_completes_every_input::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::held_loop_stop_publishes_every_directed_batch::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retire_after_a_wake_burst_returns::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retirement_cleanup_answers_the_batch_a_failed_publication_leaves::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retirement_cleanup_publishes_every_directed_batch::sqlite)
+)
+'''
+slow-timeout = { period = "60s", terminate-after = 8 }
+
 # Pull-request and main CI unit lanes (ci.yml). `fast` plus a hang bound:
 # nothing is excluded from the lanes. The profile exists so the lane has its own name
 # for a PR-lane-only adjustment, and so that any such adjustment is a
@@ -101,6 +118,22 @@ slow-timeout = { period = "60s", terminate-after = 8 }
 
 [[profile.ci-pr.overrides]]
 filter = 'test(=drift_check_reports_missing_and_stale_generated_files_for_canonical_selection)'
+slow-timeout = { period = "60s", terminate-after = 8 }
+
+[[profile.ci-pr.overrides]]
+# The same exact-case headroom ci-unit grants the terminal-completion
+# batch-bound SQLite rows: the meerkat-runtime unit lane (ci.yml `unit` on a
+# pull request, `main-unit` on a push) runs them in this profile, where one
+# hit the four-period bound (240.019 s, run 40329787417, attempt 1).
+filter = '''
+package(meerkat-runtime) and (
+    test(=meerkat_machine::tests::terminal_completion_batch_bound::held_loop_stop_completes_every_input::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::held_loop_stop_publishes_every_directed_batch::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retire_after_a_wake_burst_returns::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retirement_cleanup_answers_the_batch_a_failed_publication_leaves::sqlite)
+    or test(=meerkat_machine::tests::terminal_completion_batch_bound::retirement_cleanup_publishes_every_directed_batch::sqlite)
+)
+'''
 slow-timeout = { period = "60s", terminate-after = 8 }
 
 [profile.ci-integration]
