@@ -3201,6 +3201,83 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .map(|_| ())
     }
 
+    /// Create-only: the document, its authority, its catalog entry and its
+    /// pending intents' outbox rows land under one lock acquisition, after
+    /// every check that can refuse.
+    async fn import_whole_blob_session(
+        &self,
+        runtime_id: &LogicalRuntimeId,
+        snapshot: SerializedSessionSnapshot,
+    ) -> Result<super::WholeBlobSessionImport, RuntimeStoreError> {
+        let prepared = parsed_whole_blob_snapshot(snapshot)?;
+        if &LogicalRuntimeId::for_session(prepared.session().id()) != runtime_id {
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: runtime_id.to_string(),
+                detail: format!(
+                    "imported WholeBlob session {} does not bind this runtime",
+                    prepared.session().id()
+                ),
+            });
+        }
+        let intents = super::validated_compaction_projection_intents(prepared.session())?;
+        let mut inner = self.inner.lock().await;
+        if let Some(current) = inner.session_authorities.get(&runtime_id.0) {
+            if current.session_id() == prepared.session().id()
+                && current.blob_sha256() == prepared.blob_sha256()
+            {
+                return Ok(super::WholeBlobSessionImport::AlreadyCurrent(
+                    current.clone(),
+                ));
+            }
+            return Err(RuntimeStoreError::SessionPersistenceAuthorityConflict {
+                runtime_id: runtime_id.to_string(),
+                detail: format!(
+                    "the runtime already has another committed session document (store \
+                     revision {}, {}); an import never overwrites it",
+                    current.store_revision(),
+                    current.blob_sha256()
+                ),
+            });
+        }
+        if let Some(existing) = inner.compaction_projection_outbox.get(&runtime_id.0) {
+            for intent in &intents {
+                if let Some(entry) = existing.get(&intent.projection) {
+                    if entry.finalized {
+                        return Err(RuntimeStoreError::WriteFailed(format!(
+                            "imported session replays finalized compaction intent {}",
+                            intent.projection.revision()
+                        )));
+                    }
+                    if entry.intent != *intent {
+                        return Err(RuntimeStoreError::WriteFailed(format!(
+                            "conflicting compaction outbox intent for rewrite {}",
+                            intent.projection.revision()
+                        )));
+                    }
+                }
+            }
+        }
+        // The document write is the last step that can refuse; the outbox
+        // rows below land with it under this lock.
+        let authority =
+            commit_prepared_whole_blob_snapshot_locked(&mut inner, runtime_id, prepared)?;
+        if !intents.is_empty() {
+            let outbox = inner
+                .compaction_projection_outbox
+                .entry(runtime_id.0.clone())
+                .or_default();
+            for intent in intents {
+                outbox
+                    .entry(intent.projection.clone())
+                    .or_insert(CompactionOutboxEntry {
+                        intent,
+                        finalized: false,
+                    });
+            }
+        }
+        Ok(super::WholeBlobSessionImport::Created(authority))
+    }
+
     async fn commit_prepared_whole_blob_rewrite_boundary(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -4596,7 +4673,7 @@ impl RuntimeStore for InMemoryRuntimeStore {
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::RuntimeState;
     use crate::store::MachineLifecycleBindingFacts;
@@ -5506,7 +5583,9 @@ mod tests {
         format!("sha256:{:x}", Sha256::digest(canonical))
     }
 
-    fn session_with_compaction_intent() -> (
+    /// A session whose document carries one pending compaction projection
+    /// intent, and that intent. The host store adapter's rows use it too.
+    pub(crate) fn session_with_compaction_intent() -> (
         meerkat_core::Session,
         meerkat_core::CompactionProjectionIntent,
     ) {
@@ -5930,6 +6009,274 @@ mod tests {
         );
         assert!(
             store
+                .load_pending_compaction_projections(&rid)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    // An import into a store that does not hold the session creates its
+    // document, store authority and catalog entry; the same bytes again
+    // answer AlreadyCurrent and write nothing.
+    #[tokio::test]
+    async fn import_creates_a_session_once_and_the_same_bytes_are_already_current() {
+        let store = InMemoryRuntimeStore::new();
+        let session = session_with_user("imported");
+        let rid = LogicalRuntimeId::for_session(session.id());
+        let bytes = serde_json::to_vec(&session).unwrap();
+        let created = store
+            .import_whole_blob_session(
+                &rid,
+                SerializedSessionSnapshot {
+                    session_snapshot: bytes.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let authority = match created {
+            crate::store::WholeBlobSessionImport::Created(authority) => authority,
+            other => panic!("the first import creates the session: {other:?}"),
+        };
+        assert_eq!(authority.store_revision(), 1);
+        let committed = store
+            .load_committed_whole_blob_snapshot(&rid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.bytes(), bytes.as_slice());
+        assert_eq!(committed.authority(), &authority);
+        assert_eq!(
+            store
+                .load_runtime_session_catalog_entry(&rid)
+                .await
+                .unwrap()
+                .map(|entry| entry.session_id().clone()),
+            Some(session.id().clone())
+        );
+        assert_eq!(
+            store
+                .import_whole_blob_session(
+                    &rid,
+                    SerializedSessionSnapshot {
+                        session_snapshot: bytes.into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::store::WholeBlobSessionImport::AlreadyCurrent(authority.clone())
+        );
+        assert_eq!(
+            store.load_whole_blob_store_authority(&rid).await.unwrap(),
+            Some(authority),
+            "the second import wrote nothing"
+        );
+    }
+
+    // An import never overwrites: over another committed document (imported
+    // or committed by the ordinary path) it refuses with a typed conflict
+    // and writes nothing, and a document of another session is refused for
+    // the runtime it does not bind.
+    #[tokio::test]
+    async fn import_refuses_other_bytes_and_writes_nothing() {
+        let store = InMemoryRuntimeStore::new();
+        let session = session_with_user("first");
+        let rid = LogicalRuntimeId::for_session(session.id());
+        let first = serde_json::to_vec(&session).unwrap();
+        let crate::store::WholeBlobSessionImport::Created(authority) = store
+            .import_whole_blob_session(
+                &rid,
+                SerializedSessionSnapshot {
+                    session_snapshot: first.clone().into(),
+                },
+            )
+            .await
+            .unwrap()
+        else {
+            panic!("the first import creates the session");
+        };
+        let mut later = session.clone();
+        later.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("a later turn"),
+        ));
+        let refused = store
+            .import_whole_blob_session(
+                &rid,
+                SerializedSessionSnapshot {
+                    session_snapshot: serde_json::to_vec(&later).unwrap().into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                refused,
+                Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { .. })
+            ),
+            "{refused:?}"
+        );
+        let committed = store
+            .load_committed_whole_blob_snapshot(&rid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(committed.bytes(), first.as_slice());
+        assert_eq!(committed.authority(), &authority);
+
+        // A document the ordinary path committed: the same bytes are
+        // current, other bytes conflict.
+        let ordinary = session_with_user("ordinary");
+        let ordinary_rid = LogicalRuntimeId::for_session(ordinary.id());
+        let ordinary_bytes = serde_json::to_vec(&ordinary).unwrap();
+        store
+            .commit_session_snapshot(
+                &ordinary_rid,
+                SerializedSessionSnapshot {
+                    session_snapshot: ordinary_bytes.clone().into(),
+                },
+            )
+            .await
+            .unwrap();
+        let current = store
+            .load_whole_blob_store_authority(&ordinary_rid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            store
+                .import_whole_blob_session(
+                    &ordinary_rid,
+                    SerializedSessionSnapshot {
+                        session_snapshot: ordinary_bytes.clone().into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::store::WholeBlobSessionImport::AlreadyCurrent(current.clone())
+        );
+        let mut changed = ordinary.clone();
+        changed.push(meerkat_core::types::Message::User(
+            meerkat_core::types::UserMessage::text("changed"),
+        ));
+        assert!(matches!(
+            store
+                .import_whole_blob_session(
+                    &ordinary_rid,
+                    SerializedSessionSnapshot {
+                        session_snapshot: serde_json::to_vec(&changed).unwrap().into(),
+                    },
+                )
+                .await,
+            Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { .. })
+        ));
+        assert_eq!(
+            store
+                .load_session_snapshot(&ordinary_rid)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(&ordinary_bytes)
+        );
+
+        // A document of another session does not bind this runtime.
+        let stranger = LogicalRuntimeId::for_session(session_with_user("stranger").id());
+        assert!(matches!(
+            store
+                .import_whole_blob_session(
+                    &stranger,
+                    SerializedSessionSnapshot {
+                        session_snapshot: first.into(),
+                    },
+                )
+                .await,
+            Err(RuntimeStoreError::SessionPersistenceAuthorityConflict { .. })
+        ));
+        assert_eq!(store.load_session_snapshot(&stranger).await.unwrap(), None);
+    }
+
+    // The ordinary snapshot commit refuses a document whose compaction
+    // intents are not in the outbox; the import writes them there, pending,
+    // with the document. An intent the outbox already finalized refuses the
+    // import, and nothing is written.
+    #[tokio::test]
+    async fn import_outboxes_the_documents_pending_compaction_intents_with_it() {
+        let store = InMemoryRuntimeStore::new();
+        let (session, intent) = session_with_compaction_intent();
+        let rid = LogicalRuntimeId::for_session(session.id());
+        let bytes = serde_json::to_vec(&session).unwrap();
+        assert!(
+            store
+                .commit_session_snapshot(
+                    &rid,
+                    SerializedSessionSnapshot {
+                        session_snapshot: bytes.clone().into(),
+                    },
+                )
+                .await
+                .is_err()
+        );
+        assert!(matches!(
+            store
+                .import_whole_blob_session(
+                    &rid,
+                    SerializedSessionSnapshot {
+                        session_snapshot: bytes.clone().into(),
+                    },
+                )
+                .await
+                .unwrap(),
+            crate::store::WholeBlobSessionImport::Created(_)
+        ));
+        assert_eq!(
+            store.load_session_snapshot(&rid).await.unwrap(),
+            Some(Arc::new(bytes.clone()))
+        );
+        assert_eq!(
+            store
+                .load_pending_compaction_projections(&rid)
+                .await
+                .unwrap(),
+            vec![intent.clone()]
+        );
+
+        // The outbox finalized the intent and the session's document is
+        // gone: importing the document again replays a finalized intent.
+        let replayed = InMemoryRuntimeStore::new();
+        replayed
+            .atomic_apply(
+                &rid,
+                Some(SerializedSessionSnapshot {
+                    session_snapshot: bytes.clone().into(),
+                }),
+                make_receipt(RunId::new(), 1),
+                vec![],
+                Some(session.id().clone()),
+            )
+            .await
+            .unwrap();
+        replayed
+            .mark_compaction_projection_finalized(&rid, &intent.projection)
+            .await
+            .unwrap();
+        replayed.clear_session_snapshot(&rid).await.unwrap();
+        let refused = replayed
+            .import_whole_blob_session(
+                &rid,
+                SerializedSessionSnapshot {
+                    session_snapshot: bytes.into(),
+                },
+            )
+            .await;
+        assert!(
+            matches!(
+                &refused,
+                Err(RuntimeStoreError::WriteFailed(detail))
+                    if detail.contains("finalized compaction intent")
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(replayed.load_session_snapshot(&rid).await.unwrap(), None);
+        assert!(
+            replayed
                 .load_pending_compaction_projections(&rid)
                 .await
                 .unwrap()
