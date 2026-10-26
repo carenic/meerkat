@@ -2740,6 +2740,76 @@ async fn a_steer_a_round_commit_listed_is_consumed_once_with_the_run_head_canoni
     a_steer_a_round_commit_listed_is_consumed_once_with_the_run(true).await;
 }
 
+/// No in-place settle a hosted loop runs leaves a recovered boundary's
+/// terminal batch pending under that loop. The cancelled run's settle is
+/// that settle here: it commits A's tail as interrupted and consumes the
+/// steer A's round commit listed while A's own cancellation batch still
+/// waits for its publication, so the recovered boundary stages no batch for
+/// the steer beside it. Once the loop has published A's terminal and run a
+/// later turn to its end, no input of the session holds a terminal whose
+/// receipt is still pending: the next start never meets a later run's
+/// pending batch beside one this settle left. A pin, written to show
+/// whether such a batch is reachable under a live loop.
+async fn an_in_place_settle_leaves_no_terminal_batch_pending_under_the_loop(head_canonical: bool) {
+    use meerkat_runtime::terminal_status::{InputTerminalReceiptObservation, InteractionSelector};
+
+    let root = TempDir::new().expect("temp");
+    let stores = Stores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let start = Start::open(&stores, &root, &client);
+    let id = start.materialize(None).await;
+    client.push(Step::Tool);
+    client.push(Step::Tool);
+    client.push(Step::Held);
+    let (turn_a, _run_a, steered, _steer_id) =
+        a_steer_joins_run_a_at_its_next_model_boundary(&start, &client, &id).await;
+    interrupt_run_a(&start, &id, turn_a).await;
+    let _ = steered.await.expect("steer waiter task");
+    assert_eq!(
+        start.tail_run(&id).await,
+        None,
+        "the cancelled run's settle committed A's tail"
+    );
+
+    client.push(Step::Text("after the interrupt"));
+    let outcome = start.turn(&id, "later").await;
+    assert!(
+        matches!(outcome, Some(CompletionOutcome::Completed(ref run)) if run.text == "after the interrupt"),
+        "the later turn completes: {outcome:?}"
+    );
+    start.wait_runtime_settled(&id).await;
+    for row in input_rows(start.runtime_store.as_ref(), &id).await {
+        let input_id = row.state.input_id.clone();
+        let observed = start
+            .machine
+            .input_terminal_receipt_observation(&id, InteractionSelector::InputId(input_id.clone()))
+            .await;
+        assert!(
+            !matches!(
+                &observed,
+                Ok(Some(sourced)) if matches!(
+                    sourced.report,
+                    InputTerminalReceiptObservation::Pending {
+                        terminal: Some(_),
+                        ..
+                    }
+                )
+            ),
+            "input {input_id} still waits for its terminal's receipt: {observed:?}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn an_in_place_settle_leaves_no_terminal_batch_pending_under_the_loop_whole_blob() {
+    an_in_place_settle_leaves_no_terminal_batch_pending_under_the_loop(false).await;
+}
+
+#[tokio::test]
+async fn an_in_place_settle_leaves_no_terminal_batch_pending_under_the_loop_head_canonical() {
+    an_in_place_settle_leaves_no_terminal_batch_pending_under_the_loop(true).await;
+}
+
 /// How the forced-hold row repairs the held session.
 #[derive(Clone, Copy, Debug)]
 enum HeldSettleRepair {
