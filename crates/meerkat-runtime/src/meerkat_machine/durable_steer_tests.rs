@@ -2976,6 +2976,13 @@ async fn request_only_steer_lands_beside_the_runs_whole_blob_provisional_tail() 
     rig.script.step(RunnerStep::BoundaryThenToolCalls);
     rig.wait_for_phase(&continuation_id, InputLifecycleState::Consumed)
         .await;
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while rig.script.request_only_taken.lock().unwrap().is_empty() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the runner took the request-only context");
     assert_eq!(*rig.script.request_only_taken.lock().unwrap(), vec![1]);
     let receipts = store
         .load_committed_boundary_receipts(&runtime_id, &run_id)

@@ -1433,9 +1433,10 @@ Keeping queued inputs is guaranteed only for a member whose run starts the
 Shutdown holds (`MemberRunStarts::Held`): a member that cannot hold them may
 start a queued input once its running turn is cancelled, and that input then
 belongs to the cancelled run. 0.9.4 cannot open a store that holds a kept
-input still queued or a kept run, and cannot read a kept or expired input's
-row after it ran or expired (see [Upgrading](/guides/upgrading)): shut a mob
-down with `QueuedInputsOnShutdown::Stop` before you downgrade it.
+input still queued or a kept run, and cannot read an expired input's row, or
+the row of a kept queued prompt that 0.9.5 ran, after that (see
+[Upgrading](/guides/upgrading)): shut a mob down with
+`QueuedInputsOnShutdown::Stop` before you downgrade it.
 
 A mob restored with an unfinished destroy starts with admission closed before
 `MobBuilder::resume` returns its handle, so nothing is spawned into it while the

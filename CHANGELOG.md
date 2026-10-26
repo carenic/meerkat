@@ -35,6 +35,26 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
+  start (`UnregisterQueuedInputs::Requeue`, which the graceful shutdowns of
+  `rkat-rpc`, the REST server and a mob use by default for durable
+  sessions) no longer carries the stop's mark once that start runs it. The
+  mark stayed on the prompt while its run was open, so when the process
+  then ended without a graceful stop (a crash or a power cut) after the run
+  had committed a round, the next start after the stop's max age, counted
+  from the prompt's admission, ended the run's inputs as `RequeueExpired`
+  and closed the run as interrupted instead of resuming it. The mark is now
+  cleared, durably, when the prompt is staged for its run, as it already was
+  when a run the stop kept resumes; a kept prompt still queued keeps its
+  mark. Once its run has started, such a prompt's row is written as stored
+  input state version 7 again, which 0.9.4 reads. Rows 0.9.5 already wrote
+  keep the mark: a run that 0.9.5 started from a kept queued prompt and a
+  crash cut before the upgrade still has its inputs ended as
+  `RequeueExpired`, and is closed as interrupted, by a start past the max
+  age.
+
 ## [0.9.5] - 2026-10-23
 
 ### Breaking
