@@ -99,13 +99,24 @@ impl DiskStores {
 
     /// One process start over the stores.
     fn open(&self, root: &TempDir, client: &Arc<ScriptedModel>) -> Start {
-        self.open_with(root, client, None)
+        self.open_with(root, client, None, None)
+    }
+
+    /// One process start over the stores that publishes its sessions' events
+    /// to the durable event log under `events`, which every start shares.
+    fn open_with_events(
+        &self,
+        root: &TempDir,
+        client: &Arc<ScriptedModel>,
+        events: &Path,
+    ) -> Start {
+        self.open_with(root, client, None, Some(events))
     }
 
     /// One process start over the stores that hosts their sessions with
     /// cross-process claims, its own under `root`.
     fn open_hosted(&self, root: &TempDir, client: &Arc<ScriptedModel>) -> Start {
-        self.open_with(root, client, Some(hosting_paths(root)))
+        self.open_with(root, client, Some(hosting_paths(root)), None)
     }
 
     fn open_with(
@@ -113,6 +124,7 @@ impl DiskStores {
         root: &TempDir,
         client: &Arc<ScriptedModel>,
         hosting: Option<meerkat_runtime::HostingPaths>,
+        events: Option<&Path>,
     ) -> Start {
         let persistence = crate::PersistenceBundle::new(
             self.session_store(),
@@ -127,10 +139,19 @@ impl DiskStores {
                 .session_store(sessions.clone()),
             client: client.clone(),
         };
-        let service = Arc::new(
-            PersistentSessionService::new(builder, 4, sessions, runtime_store.clone(), blobs)
-                .with_canonical_runtime_adapter(machine.clone()),
-        );
+        let mut service =
+            PersistentSessionService::new(builder, 4, sessions, runtime_store.clone(), blobs);
+        if let Some(events) = events {
+            service = service.with_event_projection(
+                Arc::new(meerkat_session::event_store::FileEventStore::new(
+                    events.join("events"),
+                )),
+                Arc::new(meerkat_session::projector::SessionProjector::new(
+                    events.join("projection"),
+                )),
+            );
+        }
+        let service = Arc::new(service.with_canonical_runtime_adapter(machine.clone()));
         Start {
             service,
             machine,
@@ -1402,4 +1423,252 @@ async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_a
 #[tokio::test]
 async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age_whole_blob() {
     the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age(false).await;
+}
+
+// ---------------------------------------------------------------------------
+// A directed run a graceful stop kept, settled past the stop's max age.
+// ---------------------------------------------------------------------------
+
+/// The max age of the graceful stop that keeps the directed run. It spans
+/// the run's admission, its tool round and the stop; the next start waits it
+/// out before it opens the session.
+const KEPT_RUN_MAX_AGE: Duration = Duration::from_secs(3);
+
+/// A directed peer message, as a host-residency-fenced bridge delivers it:
+/// its interaction, input, correlation and idempotency ids agree and it
+/// names the sending runtime. It runs its own turn and owns an interaction
+/// terminal.
+fn directed_peer_message(body: &str) -> (Input, meerkat_core::interaction::InteractionId) {
+    let id = meerkat_core::InputId::new();
+    let interaction = meerkat_core::interaction::InteractionId(id.0);
+    let input = Input::Peer(meerkat_runtime::input::PeerInput {
+        header: meerkat_runtime::input::InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id,
+            timestamp: chrono::Utc::now(),
+            source: meerkat_runtime::input::InputOrigin::Peer {
+                peer_id: "kept-run-peer".into(),
+                display_identity: None,
+                runtime_id: Some(LogicalRuntimeId("kept-run-peer-runtime".into())),
+            },
+            durability: meerkat_runtime::input::InputDurability::Durable,
+            visibility: meerkat_runtime::input::InputVisibility::default(),
+            idempotency_key: Some(meerkat_runtime::identifiers::IdempotencyKey::new(
+                interaction.to_string(),
+            )),
+            supersession_key: None,
+            correlation_id: Some(meerkat_runtime::identifiers::CorrelationId::from_uuid(
+                interaction.0,
+            )),
+        },
+        directed_interaction_id: Some(interaction),
+        convention: Some(meerkat_runtime::input::PeerConvention::Message),
+        content: body.into(),
+        payload: None,
+        handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+        sender_taint: None,
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        in_reply_to: None,
+    });
+    (input, interaction)
+}
+
+/// The interaction failures the durable event log under `events` holds for
+/// `interaction`, read the way a fresh process reads it.
+async fn interaction_failures(
+    events: &Path,
+    id: &SessionId,
+    interaction: meerkat_core::interaction::InteractionId,
+) -> usize {
+    use meerkat_session::event_store::EventStore as _;
+    meerkat_session::event_store::FileEventStore::new(events.join("events"))
+        .read_from(id, 0)
+        .await
+        .expect("read the durable event log")
+        .into_iter()
+        .filter(|stored| {
+            matches!(
+                &stored.event,
+                meerkat_core::event::AgentEvent::InteractionFailed { interaction_id, .. }
+                    if *interaction_id == interaction
+            )
+        })
+        .count()
+}
+
+/// A graceful stop keeps a directed peer message's run open for the next
+/// start (the requeue disposition), and the next start opens the session
+/// only after the stop's max age has passed. The start settles the kept run
+/// as expired instead of resuming it: its input ends `RequeueExpired`, and,
+/// since the input is directed, the caller hears it as exactly one
+/// `InteractionFailed` for its interaction. A later start publishes nothing
+/// more. RED before: settling a kept run staged no interaction terminal, so
+/// the input ended `RequeueExpired` while its interaction never ended.
+async fn a_kept_directed_run_settled_past_the_stops_max_age_fails_its_interaction_once(
+    head_canonical: bool,
+) {
+    let root = TempDir::new().expect("temp");
+    let events = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let first = stores.open_with_events(&root, &client, events.path());
+    let id = materialize_session(&first, meerkat_core::Session::new()).await;
+
+    // The directed run commits its tool round and waits on the model.
+    client.push(Step::Tool);
+    client.push(Step::Held);
+    let (directed, interaction) = directed_peer_message("directed");
+    let kept = directed.id().clone();
+    let (accepted, waiter) = first
+        .machine
+        .accept_input_with_completion(&id, directed)
+        .await
+        .expect("the runtime admits the directed message");
+    assert!(
+        accepted.is_accepted(),
+        "the directed message is admitted: {accepted:?}"
+    );
+    tokio::time::timeout(DEADLINE, client.entered.acquire())
+        .await
+        .expect("the directed run reaches its second model call")
+        .expect("model gate")
+        .forget();
+    let run_a = tail_run(&first, &id)
+        .await
+        .expect("the directed run's round commit stands as the provisional tail");
+
+    // The graceful stop keeps the run for the next start.
+    let registration = first
+        .machine
+        .current_session_registration_witnesses()
+        .await
+        .into_iter()
+        .find(|registration| registration.session_id() == &id)
+        .expect("the session's registration");
+    let unregistered = first
+        .machine
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                max_age: KEPT_RUN_MAX_AGE,
+            },
+        )
+        .await
+        .expect("the graceful stop");
+    assert!(unregistered, "the graceful stop ends the registration");
+    let waited = tokio::time::timeout(DEADLINE, waiter.expect("the run's waiter").wait())
+        .await
+        .expect("the run's waiter is answered at the stop");
+    assert!(
+        matches!(&waited, Err(error) if error.is_requeued_across_stop()),
+        "the stop keeps the run: {waited:?}"
+    );
+    first.service.try_shutdown().await.expect("shutdown");
+    let stopped = kept_prompt_row(&first, &id, &kept).await;
+    let admitted_at = stopped
+        .state
+        .persisted_input
+        .as_ref()
+        .expect("the kept input keeps its payload")
+        .header()
+        .timestamp;
+    assert_eq!(
+        (
+            stopped.seed.terminal_outcome.as_ref(),
+            stopped.seed.last_run_id.as_ref(),
+            stopped.state.stop_requeue.is_some(),
+        ),
+        (None, Some(&run_a), true),
+        "the stop keeps the input bound to its open run and marked for the next start"
+    );
+    assert_eq!(
+        interaction_failures(events.path(), &id, interaction).await,
+        0,
+        "a kept run's interaction does not end with the stop"
+    );
+
+    // The next start opens the session once the stop's max age has passed.
+    let past_the_max_age = admitted_at
+        + chrono::Duration::from_std(KEPT_RUN_MAX_AGE + Duration::from_millis(500))
+            .expect("the max age is a chrono duration");
+    if let Ok(wait) = (past_the_max_age - chrono::Utc::now()).to_std() {
+        tokio::time::sleep(wait).await;
+    }
+    let after_the_stop = TempDir::new().expect("temp");
+    let restarted = stores.power_cut_copy(&after_the_stop);
+    let second_client = Arc::new(ScriptedModel::new());
+    let second = restarted.open_with_events(&after_the_stop, &second_client, events.path());
+    materialize_session(&second, restarted.stored_session(&second, &id).await).await;
+    let settled = kept_prompt_row(&second, &id, &kept).await;
+    assert_eq!(
+        settled.seed.terminal_outcome,
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        }),
+        "the kept run is settled as expired, not resumed"
+    );
+    let deadline = tokio::time::Instant::now() + DEADLINE;
+    loop {
+        let failures = interaction_failures(events.path(), &id, interaction).await;
+        if failures == 1 {
+            break;
+        }
+        assert!(
+            failures == 0 && tokio::time::Instant::now() < deadline,
+            "the expired kept run fails its directed interaction exactly once, \
+             {failures} failure(s) so far"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        second_client.requests.load(Ordering::SeqCst),
+        0,
+        "nothing of the expired run reaches the model"
+    );
+    second.service.try_shutdown().await.expect("shutdown");
+
+    // A later start publishes nothing more for the interaction.
+    let after_the_settle = TempDir::new().expect("temp");
+    let reopened = restarted.power_cut_copy(&after_the_settle);
+    let third_client = Arc::new(ScriptedModel::new());
+    let third = reopened.open_with_events(&after_the_settle, &third_client, events.path());
+    materialize_session(&third, reopened.stored_session(&third, &id).await).await;
+    third_client.push(Step::Text("after the settle"));
+    let outcome = turn(&third, &id, "after the settle").await;
+    assert!(
+        matches!(outcome, Some(CompletionOutcome::Completed(_))),
+        "the session's next turn commits: {outcome:?}"
+    );
+    assert_eq!(
+        (
+            kept_prompt_row(&third, &id, &kept)
+                .await
+                .seed
+                .terminal_outcome,
+            interaction_failures(events.path(), &id, interaction).await,
+        ),
+        (
+            Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+            }),
+            1,
+        ),
+        "a later start leaves the row expired and publishes no second terminal"
+    );
+}
+
+#[tokio::test]
+async fn a_kept_directed_run_settled_past_the_stops_max_age_fails_its_interaction_once_head_canonical()
+ {
+    a_kept_directed_run_settled_past_the_stops_max_age_fails_its_interaction_once(true).await;
+}
+
+#[tokio::test]
+async fn a_kept_directed_run_settled_past_the_stops_max_age_fails_its_interaction_once_whole_blob()
+{
+    a_kept_directed_run_settled_past_the_stops_max_age_fails_its_interaction_once(false).await;
 }

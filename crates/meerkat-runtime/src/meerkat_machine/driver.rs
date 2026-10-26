@@ -5203,6 +5203,40 @@ impl DriverEntry {
         }
     }
 
+    /// Settle the resumable run `run_id` as [`Self::settle_resumable_run`]
+    /// does, and stage, in the same durable commit, the runless
+    /// runtime-termination carrier its kept inputs are owed
+    /// (`termination_reason`), as a stop or an archive stages for the queued
+    /// inputs it ends. A directed kept input then gets its interaction
+    /// terminal (an `InteractionFailed`) from the committed outbox, exactly
+    /// once, whoever drains it; a nondirected one gets its terminal
+    /// completion batch. Every settle site goes through here: settling a
+    /// kept run used to stage nothing, so a directed caller of the run never
+    /// learned that it ended. Returns the abandoned inputs and the committed
+    /// batches for the caller to publish after it releases the driver.
+    pub(crate) async fn settle_resumable_run_with_terminals(
+        &mut self,
+        run_id: &RunId,
+        reason: crate::input_state::InputAbandonReason,
+        termination_reason: &str,
+    ) -> Result<(Vec<InputId>, Vec<RunlessTerminalBatch>), RuntimeDriverError> {
+        let kept = self.ended_resumable_run_kept_inputs(run_id);
+        let prepared = self.prepare_runless_runtime_terminated_interaction_outboxes(
+            &kept,
+            termination_reason.to_string(),
+        )?;
+        match self.settle_resumable_run(run_id, reason).await {
+            Ok(abandoned) => Ok((
+                abandoned,
+                Self::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+            )),
+            Err(error) => {
+                self.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
+                Err(error)
+            }
+        }
+    }
+
     /// End the resumable run `run_id` without touching its inputs: for
     /// retire, destroy and reset, whose own sweeps terminalize them.
     pub(crate) fn end_resumable_run(

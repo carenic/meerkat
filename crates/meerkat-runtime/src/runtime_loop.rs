@@ -7198,16 +7198,19 @@ async fn settle_refused_resumed_run(
         Ok(guard) => guard,
         Err(_) => return ResumedRunAdmissionLap::Exit(true),
     };
+    // The kept inputs get the runtime-termination carrier in the same
+    // commit; the drain below publishes a directed caller's terminal.
     let settled = driver
         .lock()
         .await
-        .settle_resumable_run(
+        .settle_resumable_run_with_terminals(
             run_id,
             crate::input_state::InputAbandonReason::ResumeRefused,
+            &format!("the resumed run was refused: {detail}"),
         )
         .await;
     let abandoned = match settled {
-        Ok(abandoned) => abandoned,
+        Ok((abandoned, _batches)) => abandoned,
         Err(error) => {
             tracing::error!(%run_id, %error, "failed to settle a refused resumed run");
             drop(queue_authority_guard);
