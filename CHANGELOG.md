@@ -55,6 +55,17 @@ them.
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
 
+- `meerkat-runtime`: a run a graceful stop kept open now resumes when a
+  run-start hold on its session is released after the session registered.
+  A host that holds a restored member's run starts until it is ready
+  (`MobBuilder::hold_restored_member_run_starts`, released with
+  `MobHandle::release_member_run_starts`) left the kept run waiting for the
+  member's next input: the registration's wake for the run came while the
+  hold stood, and `MeerkatMachine::release_run_starts` woke the runtime
+  loop only for queued input, while the kept run's inputs are bound to the
+  run. The release now also wakes the loop when it leaves no hold and the
+  session keeps a resumable run.
+
 ## [0.9.5] - 2026-10-23
 
 ### Breaking

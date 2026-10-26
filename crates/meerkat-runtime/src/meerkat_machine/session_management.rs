@@ -13537,12 +13537,15 @@ Ok::<(), RuntimeDriverError>(())
     /// [`Self::stage_registration_run_start_hold`] or
     /// [`Self::stage_registration_run_start_hold_only`]. Runs start again
     /// once no reason holds the runtime: a runtime loop that parked on the
-    /// hold is woken when input is queued. Releasing a reason that does not
-    /// hold is a no-op, and so is releasing on a session not registered yet:
-    /// its registration then applies no hold for `reason`. A registration
-    /// whose unregister is owed ([`Self::unregister_owed`]) refuses the
-    /// release, after the reason is unstaged, with that refusal's own type,
-    /// as [`Self::hold_run_starts`] does.
+    /// hold is woken when input is queued, or when the registration keeps a
+    /// run a graceful stop left open (its inputs are bound to the run, never
+    /// queued, so nothing else would start it before the next input).
+    /// Releasing a reason that does not hold is a no-op, and so is releasing
+    /// on a session not registered yet: its registration then applies no hold
+    /// for `reason`. A registration whose unregister is owed
+    /// ([`Self::unregister_owed`]) refuses the release, after the reason is
+    /// unstaged, with that refusal's own type, as [`Self::hold_run_starts`]
+    /// does.
     pub async fn release_run_starts(
         &self,
         session_id: &SessionId,
@@ -13574,15 +13577,28 @@ Ok::<(), RuntimeDriverError>(())
             )
             .await
             .map_err(RuntimeDriverError::Internal)?;
-        let queued = effects.as_slice().iter().any(|effect| {
-            matches!(
-                effect,
-                crate::meerkat_machine::dsl::MeerkatMachineEffect::RunStartsReleased {
-                    queued: true
-                }
-            )
+        let released = effects.as_slice().iter().find_map(|effect| match effect {
+            crate::meerkat_machine::dsl::MeerkatMachineEffect::RunStartsReleased { queued } => {
+                Some(*queued)
+            }
+            _ => None,
         });
-        let wake_tx = if queued {
+        // The machine's `queued` counts Queued inputs only. A run a graceful
+        // stop kept open holds its inputs bound to the run, so a release that
+        // lets runs start again must wake the loop for that run too, or it
+        // waits for the next input (the registration's own commit wake ran
+        // while the hold stood, and the loop parked on it). Read under the
+        // mutation gate: a run that has already resumed, or that a settlement
+        // ended, carries no resumable mark, and the machine's ResumeRun guard
+        // refuses a second start of the same run whatever wakes the loop.
+        let wake = match released {
+            Some(true) => true,
+            Some(false) => self.session_dsl_state(session_id).await.is_ok_and(|state| {
+                state.run_start_holds.is_empty() && state.resumable_run_id.is_some()
+            }),
+            None => false,
+        };
+        let wake_tx = if wake {
             self.sessions
                 .read()
                 .await
