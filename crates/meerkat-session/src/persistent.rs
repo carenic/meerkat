@@ -3984,15 +3984,53 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
                 "exact interaction terminal publication requires an EventStore".to_string(),
             ))
         })?;
+        // The session's event line outlives its actors: reconcile it with the
+        // durable stream tail (an EventStore read, so never under R) and
+        // allocate this batch from it, so the rows land above every number an
+        // earlier actor of this service allocated and every later actor
+        // allocates above them.
+        let durable_tail = read_durable_event_stream_tail(event_store.as_ref(), &self.session_id)
+            .await
+            .map_err(|error| {
+                CoreExecutorError::apply_failed_from_session_error(SessionError::Store(Box::new(
+                    error,
+                )))
+            })?;
+        let line = self
+            .inner
+            .stored_only_event_line(&self.session_id, durable_tail)
+            .await;
         publish_interaction_terminals_stored_only_exact_batch_components(
             event_store,
             &self.event_projection_faults,
             &self.session_id,
             events,
+            &line,
         )
         .await
         .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
+}
+
+/// The newest envelope sequence a session's durable event log recorded (the
+/// maximum `stream_seq` among its last rows), or `None` for an empty log.
+async fn read_durable_event_stream_tail(
+    event_store: &dyn EventStore,
+    id: &SessionId,
+) -> Result<Option<u64>, crate::event_store::EventStoreError> {
+    let last = event_store.last_seq(id).await?;
+    if last == 0 {
+        return Ok(None);
+    }
+    let from = last.saturating_sub(EVENT_STREAM_TAIL_ROWS - 1).max(1);
+    let rows = event_store
+        .read_from_bounded(
+            id,
+            from,
+            usize::try_from(EVENT_STREAM_TAIL_ROWS).unwrap_or(16),
+        )
+        .await?;
+    Ok(rows.iter().map(|row| row.stream_seq).max())
 }
 
 async fn publish_interaction_terminals_stored_only_exact_batch_components(
@@ -4000,6 +4038,7 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
     event_projection_faults: &EventProjectionFaultRegistry,
     id: &SessionId,
     events: &[meerkat_core::event::AgentEvent],
+    line: &crate::ephemeral::StoredOnlyEventLine,
 ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, SessionError> {
     use crate::event_store::{EventStoreError, ExactInteractionAppend};
     use meerkat_core::event::{EventEnvelope, EventSourceIdentity};
@@ -4066,18 +4105,37 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
     crate::event_store::validate_exact_interaction_terminal_batch(&terminals)
         .map_err(|error| SessionError::Store(Box::new(error)))?;
 
-    let stream_seq_floor = event_store
-        .read_from(id, 1)
-        .await
-        .map_err(|error| SessionError::Store(Box::new(error)))?
-        .into_iter()
-        .map(|stored| stored.stream_seq)
-        .max()
-        .unwrap_or(0);
-    let appends = event_store
+    // Reserve the batch's sequences from the session's reconciled line, as a
+    // live actor's exact batch does: the store stamps a missing suffix
+    // strictly after the floor and any replayed prefix. The unused end of
+    // the reservation (all of it for an exact replay, which inserts nothing)
+    // is given back unless another allocation followed it, and the line then
+    // records the canonical rows.
+    let batch_len = u64::try_from(terminals.len()).unwrap_or(u64::MAX);
+    let stream_seq_floor = line.reserve(batch_len);
+    let reserved_end = stream_seq_floor.saturating_add(batch_len);
+    let appends = match event_store
         .append_interaction_terminals_exact_batch(id, stream_seq_floor, &terminals)
         .await
-        .map_err(|error| SessionError::Store(Box::new(error)))?;
+    {
+        Ok(appends) => appends,
+        Err(error) => {
+            line.release_reservation(reserved_end, stream_seq_floor);
+            return Err(SessionError::Store(Box::new(error)));
+        }
+    };
+    // Whatever the store returned is durable: the line covers it before any
+    // validation can fail, so no later allocation can stamp below it.
+    let durable_tail = appends
+        .iter()
+        .map(|append| match append {
+            ExactInteractionAppend::Inserted(stored) | ExactInteractionAppend::Replayed(stored) => {
+                stored.stream_seq
+            }
+        })
+        .max()
+        .unwrap_or(stream_seq_floor);
+    line.advance_to(durable_tail);
     if appends.len() != terminals.len() {
         return Err(SessionError::Agent(AgentError::InternalError(format!(
             "stored-only exact batch returned {} receipts for {} terminals",
@@ -4090,6 +4148,7 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
     let mut saw_inserted = false;
     let mut replay_tail = None;
     let mut inserted_tail = None;
+    let mut canonical_tail = stream_seq_floor;
     for ((interaction_id, requested), append) in terminals.iter().zip(appends) {
         let (inserted, stored) = match append {
             ExactInteractionAppend::Inserted(stored) => (true, stored),
@@ -4111,8 +4170,7 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
         if inserted {
             saw_inserted = true;
             let expected = inserted_tail
-                .or(replay_tail)
-                .unwrap_or(stream_seq_floor)
+                .unwrap_or_else(|| stream_seq_floor.max(replay_tail.unwrap_or(0)))
                 .checked_add(1)
                 .ok_or_else(|| {
                     SessionError::Store(Box::new(
@@ -4134,6 +4192,11 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
                     "stored-only exact batch replayed after an inserted suffix".to_string(),
                 )));
             }
+            if stored.stream_seq == 0 {
+                return Err(SessionError::Agent(AgentError::InternalError(
+                    "stored-only exact replay returned zero stream sequence".to_string(),
+                )));
+            }
             if let Some(previous) = replay_tail {
                 let expected = previous.checked_add(1).ok_or_else(|| {
                     SessionError::Agent(AgentError::InternalError(
@@ -4149,12 +4212,15 @@ async fn publish_interaction_terminals_stored_only_exact_batch_components(
             }
             replay_tail = Some(stored.stream_seq);
         }
+        canonical_tail = canonical_tail.max(stored.stream_seq);
         receipts.push(
             CoreInteractionTerminalPublicationReceipt::try_new(&stored.event, stored.seq).map_err(
                 |error| SessionError::Agent(AgentError::InternalError(error.to_string())),
             )?,
         );
     }
+    line.release_reservation(reserved_end, inserted_tail.unwrap_or(stream_seq_floor));
+    line.advance_to(canonical_tail);
     Ok(receipts)
 }
 
@@ -17676,21 +17742,10 @@ const EVENT_STREAM_TAIL_ROWS: u64 = 16;
 #[async_trait]
 impl crate::ephemeral::SessionEventTailSource for EventStoreStreamTail {
     async fn durable_stream_tail(&self, id: &SessionId) -> Option<u64> {
-        let last = self.0.last_seq(id).await.ok()?;
-        if last == 0 {
-            return None;
-        }
-        let from = last.saturating_sub(EVENT_STREAM_TAIL_ROWS - 1).max(1);
-        let rows = self
-            .0
-            .read_from_bounded(
-                id,
-                from,
-                usize::try_from(EVENT_STREAM_TAIL_ROWS).unwrap_or(16),
-            )
+        read_durable_event_stream_tail(self.0.as_ref(), id)
             .await
-            .ok()?;
-        rows.iter().map(|row| row.stream_seq).max()
+            .ok()
+            .flatten()
     }
 }
 
@@ -51190,6 +51245,228 @@ mod tests {
             }),
             "stored-only predecessor publication must not append into a live successor actor"
         );
+    }
+
+    /// A stored-only publisher in a service where an earlier actor of the
+    /// session left numbers on the session's event line that it allocated
+    /// but never published: the publisher reconciles the line with the
+    /// durable tail, reserves its batch from the line and appends above every
+    /// number the line holds, the line ends at that row, and the next
+    /// allocation in the same service (a later actor's) lands strictly beyond
+    /// it. A replay of the same publication inserts nothing, and the line
+    /// neither regresses nor moves past the canonical rows.
+    #[tokio::test]
+    async fn stored_only_publication_allocates_from_the_services_event_line() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let event_store = Arc::new(RecordingEventStore::default());
+        let event_store_trait: Arc<dyn EventStore> = event_store.clone();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::clone(&store),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        )
+        .with_event_projection(
+            Arc::clone(&event_store_trait),
+            Arc::new(SessionProjector::new(dir.path().join(".rkat"))),
+        );
+        let created = service
+            .create_session(create_request_with_metadata(
+                "earlier actor",
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create the earlier actor");
+        let session_id = created.session_id;
+        let actor_witness = service
+            .live_session_actor_witness(&session_id)
+            .await
+            .expect("the earlier actor is live");
+        let live_terminal = [AgentEvent::InteractionComplete {
+            interaction_id: meerkat_core::interaction::InteractionId(
+                meerkat_core::time_compat::new_uuid_v7(),
+            ),
+            result: "published by the earlier actor".to_string(),
+            structured_output: None,
+        }];
+        service
+            .publish_interaction_terminals_exact_batch_for_actor(&actor_witness, &live_terminal)
+            .await
+            .expect("the earlier actor publishes");
+        // The earlier actor allocated numbers it never published.
+        const UNUSED: u64 = 5;
+        let line = service
+            .inner
+            .stored_only_event_line(&session_id, None)
+            .await;
+        let allocated_before = line.reserve(UNUSED) + UNUSED;
+        assert_eq!(line.allocated(), allocated_before);
+        service
+            .discard_live_session(&session_id)
+            .await
+            .expect("the earlier actor is removed");
+
+        let publisher = StoredOnlyArchiveTerminalPublisher {
+            inner: Arc::clone(&service.inner),
+            session_id: session_id.clone(),
+            recovery_gate: service.recovery_gate_for_session(&session_id).await,
+            event_store: service.event_store.clone(),
+            event_projection_faults: Arc::clone(&service.event_projection_faults),
+            event_projection_drains: Arc::clone(&service.event_projection_drains),
+        };
+        let stored_only_id =
+            meerkat_core::interaction::InteractionId(meerkat_core::time_compat::new_uuid_v7());
+        let stored_only = [AgentEvent::InteractionFailed {
+            interaction_id: stored_only_id,
+            reason: InteractionFailureReason::Cancelled,
+        }];
+        let receipts = publisher
+            .publish_interaction_terminals(&stored_only)
+            .await
+            .expect("the stored-only terminal publishes");
+        let stored_row = |rows: &[StoredEvent]| {
+            rows.iter()
+                .find(|row| {
+                    matches!(
+                        row.source,
+                        meerkat_core::event::EventSourceIdentity::Interaction { interaction_id }
+                            if interaction_id == stored_only_id
+                    )
+                })
+                .map(|row| row.stream_seq)
+                .expect("the stored-only row")
+        };
+        let rows = event_store
+            .read_from(&session_id, 0)
+            .await
+            .expect("read the event log");
+        let stored_seq = stored_row(&rows);
+        assert_eq!(
+            stored_seq,
+            allocated_before + 1,
+            "the stored-only row lands above every number the line holds"
+        );
+        assert!(
+            rows.iter()
+                .filter(|row| row.stream_seq != stored_seq)
+                .all(|row| row.stream_seq < stored_seq),
+            "the stored-only row is above every durable row"
+        );
+        assert_eq!(
+            line.allocated(),
+            stored_seq,
+            "the line ends at the stored row"
+        );
+
+        let replayed = publisher
+            .publish_interaction_terminals(&stored_only)
+            .await
+            .expect("the same publication replays");
+        assert_eq!(replayed, receipts);
+        let rows_after_replay = event_store
+            .read_from(&session_id, 0)
+            .await
+            .expect("read the event log again");
+        assert_eq!(
+            rows_after_replay.len(),
+            rows.len(),
+            "a replay inserts nothing"
+        );
+        assert_eq!(
+            line.allocated(),
+            stored_seq,
+            "a replay neither regresses the line nor moves it past the canonical rows"
+        );
+
+        // The next allocation in this service (a later actor of the session
+        // allocates from the same line) lands strictly beyond the stored row.
+        let next = line.reserve(1) + 1;
+        assert!(next > stored_seq);
+    }
+
+    /// A fresh service over the same stores creates the session's event line
+    /// from the durable stream tail, which already covers the stored-only
+    /// rows: its first allocation lands strictly beyond them.
+    #[tokio::test]
+    async fn a_fresh_service_starts_the_event_line_above_stored_only_rows() {
+        let store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+        let event_store = Arc::new(RecordingEventStore::default());
+        let event_store_trait: Arc<dyn EventStore> = event_store.clone();
+        let runtime_store = Arc::new(InMemoryRuntimeStore::new());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let service = |label: &str| {
+            PersistentSessionService::new(
+                DummyBuilder,
+                4,
+                Arc::clone(&store),
+                runtime_store.clone(),
+                memory_blob_store(),
+            )
+            .with_event_projection(
+                Arc::clone(&event_store_trait),
+                Arc::new(SessionProjector::new(dir.path().join(label))),
+            )
+        };
+        let first = service("first");
+        let created = first
+            .create_session(create_request_with_metadata(
+                "stored-only rows",
+                InitialTurnPolicy::Defer,
+            ))
+            .await
+            .expect("create the session");
+        let session_id = created.session_id;
+        first
+            .discard_live_session(&session_id)
+            .await
+            .expect("no actor is hosted");
+        let publisher = StoredOnlyArchiveTerminalPublisher {
+            inner: Arc::clone(&first.inner),
+            session_id: session_id.clone(),
+            recovery_gate: first.recovery_gate_for_session(&session_id).await,
+            event_store: first.event_store.clone(),
+            event_projection_faults: Arc::clone(&first.event_projection_faults),
+            event_projection_drains: Arc::clone(&first.event_projection_drains),
+        };
+        let terminals = [
+            AgentEvent::InteractionComplete {
+                interaction_id: meerkat_core::interaction::InteractionId(
+                    meerkat_core::time_compat::new_uuid_v7(),
+                ),
+                result: String::new(),
+                structured_output: None,
+            },
+            AgentEvent::InteractionFailed {
+                interaction_id: meerkat_core::interaction::InteractionId(
+                    meerkat_core::time_compat::new_uuid_v7(),
+                ),
+                reason: InteractionFailureReason::Cancelled,
+            },
+        ];
+        publisher
+            .publish_interaction_terminals(&terminals)
+            .await
+            .expect("the stored-only rows publish");
+        let durable_tail = event_store
+            .read_from(&session_id, 0)
+            .await
+            .expect("read the event log")
+            .iter()
+            .map(|row| row.stream_seq)
+            .max()
+            .expect("the stored-only rows are durable");
+
+        let fresh = service("fresh");
+        let line = fresh.inner.stored_only_event_line(&session_id, None).await;
+        assert_eq!(
+            line.allocated(),
+            durable_tail,
+            "the fresh service's line starts at the durable tail"
+        );
+        let next = line.reserve(1) + 1;
+        assert!(next > durable_tail);
     }
 
     /// The non-waiting turn boundary lease and controller pin: while the
