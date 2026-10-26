@@ -1363,15 +1363,13 @@ async fn the_storage_reader_reads_a_host_store_storage_before_any_mob_is_built()
         .member_binding_history()
         .await
         .expect("read the running mob's history");
-    assert_same_bindings(
-        &storage
-            .member_binding_history()
-            .await
-            .expect("read the storage"),
-        &running,
-        &identities,
-        &sessions,
-    );
+    let storage_read = storage
+        .member_binding_history()
+        .await
+        .expect("read the storage");
+    assert_same_bindings(&storage_read, &running, &identities, &sessions);
+    // The journal only grows between the two reads.
+    assert!(storage_read.journal_cursor() >= running.journal_cursor());
     tokio::time::timeout(WAIT, handle.shutdown())
         .await
         .expect("mob shutdown finishes")
