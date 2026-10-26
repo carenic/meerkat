@@ -13780,6 +13780,19 @@ impl meerkat_mob::MobSessionService for RunMobSessionService {
         .await
     }
 
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        meerkat_mob::MobSessionService::publish_settled_run_terminal_for_actor(
+            self.inner.as_ref(),
+            actor_witness,
+            settled,
+        )
+        .await
+    }
+
     async fn publish_interaction_terminals_for_actor(
         &self,
         actor_witness: &meerkat::LiveSessionActorWitness,
@@ -17782,6 +17795,19 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
             self.inner.as_ref(),
             actor_witness,
             discarded,
+        )
+        .await
+    }
+
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), meerkat_core::service::SessionError> {
+        meerkat_mob::MobSessionService::publish_settled_run_terminal_for_actor(
+            self.inner.as_ref(),
+            actor_witness,
+            settled,
         )
         .await
     }

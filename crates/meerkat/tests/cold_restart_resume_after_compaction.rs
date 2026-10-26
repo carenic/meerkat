@@ -2825,9 +2825,12 @@ mod tests {
     }
 
     /// One run of `TOOL_TURNS` tool calls compacts before every model call
-    /// after the first, and checkpoints only when it ends. A HeadCanonical
-    /// session keeps the rewrite bodies its durable head does not cover yet;
-    /// the run must still keep, and commit, no more than the retention.
+    /// after the second, and checkpoints only when it ends. Nothing comes
+    /// before the run, so each compaction folds the run's own completed
+    /// rounds and keeps its newest; before the second call the only round is
+    /// the newest, so nothing is folded there. A HeadCanonical session keeps
+    /// the rewrite bodies its durable head does not cover yet; the run must
+    /// still keep, and commit, no more than the retention.
     #[cfg(feature = "session-compaction")]
     #[tokio::test]
     async fn a_long_run_commits_its_history_within_the_retention() {
@@ -2881,8 +2884,8 @@ mod tests {
             .expect("the run compacted");
         assert_eq!(
             graph.commit_count(),
-            TOOL_TURNS,
-            "one compaction rewrite before each model call after the first"
+            TOOL_TURNS - 1,
+            "one compaction rewrite before each model call after the second"
         );
         let retained = graph.commit_count() - graph.retired_count();
         assert!(
@@ -2890,6 +2893,201 @@ mod tests {
             "after {} compactions in one run the committed session keeps {retained} rewrite \
              bodies; the retention is {RETAINED}",
             graph.commit_count()
+        );
+    }
+
+    /// Answers "hello" to "hi". For any other prompt it calls
+    /// `retention_probe` once and answers "done" once it sees the call's
+    /// result. A compaction request gets a short summary, counted.
+    #[cfg(feature = "session-compaction")]
+    struct AnsweredThenLargeResultClient {
+        summary_requests: AtomicUsize,
+        tool_calls: AtomicUsize,
+    }
+
+    #[cfg(feature = "session-compaction")]
+    #[async_trait::async_trait]
+    impl LlmClient for AnsweredThenLargeResultClient {
+        fn project_replay_messages(
+            &self,
+            messages: &[meerkat_core::Message],
+        ) -> Result<Vec<meerkat_core::Message>, LlmError> {
+            Ok(messages.to_vec())
+        }
+
+        fn stream<'a>(&'a self, request: &'a LlmRequest) -> LlmStream<'a> {
+            let last_user = request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    meerkat_core::Message::User(user) => Some(user.text_content()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = |text: &str| {
+                (
+                    LlmEvent::TextDelta {
+                        delta: text.to_string(),
+                        meta: None,
+                    },
+                    meerkat_core::StopReason::EndTurn,
+                )
+            };
+            let sees_a_result = request
+                .messages
+                .iter()
+                .any(|message| matches!(message, meerkat_core::Message::ToolResults { .. }));
+            let (first, stop) = if last_user.contains("CONTEXT COMPACTION") {
+                self.summary_requests.fetch_add(1, Ordering::SeqCst);
+                text("summary")
+            } else if last_user == "hi" {
+                text("hello")
+            } else if sees_a_result {
+                text("done")
+            } else {
+                self.tool_calls.fetch_add(1, Ordering::SeqCst);
+                (
+                    LlmEvent::ToolCallComplete {
+                        id: "probe-large".to_string(),
+                        name: "retention_probe".to_string(),
+                        args: serde_json::json!({}),
+                        meta: None,
+                    },
+                    meerkat_core::StopReason::ToolUse,
+                )
+            };
+            Box::pin(futures::stream::iter(
+                [
+                    first,
+                    normalized_openai_usage(request),
+                    LlmEvent::Done {
+                        outcome: LlmDoneOutcome::success(stop),
+                    },
+                ]
+                .into_iter()
+                .map(Ok),
+            ))
+        }
+
+        fn provider(&self) -> meerkat_core::Provider {
+            meerkat_core::Provider::Other
+        }
+
+        async fn health_check(&self) -> Result<(), LlmError> {
+            Ok(())
+        }
+    }
+
+    /// `retention_probe`, answering with a 600 KB listing.
+    #[cfg(feature = "session-compaction")]
+    struct LargeResultProbeTool;
+
+    #[cfg(feature = "session-compaction")]
+    #[async_trait::async_trait]
+    impl meerkat_core::AgentToolDispatcher for LargeResultProbeTool {
+        fn tools(&self) -> Arc<[Arc<meerkat_core::ToolDef>]> {
+            Arc::from([Arc::new(meerkat_core::ToolDef::new(
+                "retention_probe",
+                "returns a large listing",
+                serde_json::json!({ "type": "object" }),
+            ))])
+        }
+
+        async fn dispatch(
+            &self,
+            call: meerkat_core::ToolCallView<'_>,
+        ) -> Result<meerkat_core::ToolDispatchOutcome, meerkat_core::ToolError> {
+            Ok(
+                meerkat_core::ToolResult::new(call.id.to_string(), "r".repeat(600_000), false)
+                    .into(),
+            )
+        }
+    }
+
+    /// The field shape with the default compactor: one short exchange, then
+    /// a run whose one tool result is 600 KB. The result pushes the history
+    /// over the threshold at the run's round boundary, and the compaction
+    /// folds the earlier exchange, which is complete, whole: it commits with
+    /// one summary request, and the run's prompt, call and result stay
+    /// verbatim, so the call runs once. Before, the default compactor kept
+    /// the answered exchange's request verbatim when handed the rows before
+    /// the run, the rebuild did not shrink, and the compaction failed.
+    #[cfg(feature = "session-compaction")]
+    #[tokio::test]
+    async fn a_large_result_after_a_short_exchange_compacts_the_exchange_once() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let mut config = Config::default();
+        config.compaction.auto_compact_threshold = 100_000;
+        config.compaction.auto_compact_threshold_explicit = true;
+        config.compaction.recent_turn_budget = 4;
+        let client = Arc::new(AnsweredThenLargeResultClient {
+            summary_requests: AtomicUsize::new(0),
+            tool_calls: AtomicUsize::new(0),
+        });
+        let (service, adapter, _raw_store) =
+            build_plain_sqlite_service_with(temp.path(), config, client.clone());
+        let session = Session::new();
+        let session_id = session.id().clone();
+        let mut request = create_request();
+        let build = request
+            .build
+            .as_mut()
+            .expect("compaction request must carry build options");
+        build.external_tools = Some(Arc::new(LargeResultProbeTool));
+        build.override_builtins = meerkat_core::ToolCategoryOverride::Disable;
+        let service_for_executor = Arc::clone(&service);
+        let adapter_for_executor = Arc::clone(&adapter);
+        Box::pin(materialize_session(
+            &service,
+            &adapter,
+            session,
+            request,
+            move |session_id| {
+                default_persistent_executor(service_for_executor, adapter_for_executor, session_id)
+            },
+        ))
+        .await
+        .expect("materialize session");
+
+        run_prompt(&adapter, &session_id, "hi").await;
+        run_prompt(&adapter, &session_id, "list everything").await;
+
+        let committed = service
+            .load_authoritative_session(&session_id)
+            .await
+            .expect("authoritative load after the run")
+            .expect("session should exist");
+        assert_eq!(
+            client.summary_requests.load(Ordering::SeqCst),
+            1,
+            "one compaction"
+        );
+        assert_eq!(
+            client.tool_calls.load(Ordering::SeqCst),
+            1,
+            "the call ran once"
+        );
+        assert!(
+            has_compaction_summary(&committed),
+            "the compaction committed"
+        );
+        let texts = user_texts(&committed);
+        assert!(
+            !texts.iter().any(|text| text == "hi"),
+            "the answered exchange is folded whole: {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|text| text == "list everything"),
+            "the run's prompt stays: {texts:?}"
+        );
+        assert!(
+            committed.messages().iter().any(|message| matches!(
+                message,
+                meerkat_core::Message::ToolResults { results, .. }
+                    if results[0].text_content().len() == 600_000
+            )),
+            "the run's result stays whole"
         );
     }
 

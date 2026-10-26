@@ -30,6 +30,12 @@ use serde_json::value::RawValue;
 
 const RETAINED_REWRITES: usize = 2;
 const TOOL_TURNS: usize = 7;
+/// The compactions of one run of `TOOL_TURNS` tool turns that compacts at
+/// every model boundary after the first. Nothing comes before the run, so
+/// each folds the run's own completed rounds and keeps its prompt and newest
+/// round; at the first of those boundaries the run's only round is its
+/// newest, so that attempt folds nothing and is skipped.
+const COMPACTIONS: usize = TOOL_TURNS - 1;
 const COMPACTION_PROMPT: &str = "COMPACT NOW";
 
 fn mock_usage() -> Usage {
@@ -126,7 +132,9 @@ impl AgentToolDispatcher for ProbeTool {
 }
 
 /// Compacts at every model boundary after the first: the System rows stay,
-/// everything else becomes one summary row.
+/// everything else it is given becomes one summary row. Inside a run with
+/// nothing before it, the agent folds the run's completed rounds itself and
+/// does not call this rebuild.
 struct EveryBoundaryCompactor;
 
 impl Compactor for EveryBoundaryCompactor {
@@ -431,7 +439,7 @@ async fn run_long_compacting_run(
     agent.session().clone()
 }
 
-/// One run compacts at each of its `TOOL_TURNS` tool turns. Its session was
+/// One run compacts at each of its tool turns after the first. Its session was
 /// materialized from a durable HeadCanonical head that covers no rewrite, and
 /// the run checkpoints only at its end: before the fix, retirement waited for
 /// that checkpoint, so the run held every compaction's body until it ended.
@@ -446,8 +454,8 @@ async fn a_long_run_keeps_its_history_within_the_retention_while_it_compacts() {
         .expect("graph present");
     assert_eq!(
         graph.commit_count(),
-        TOOL_TURNS,
-        "one compaction rewrite per tool turn"
+        COMPACTIONS,
+        "one compaction rewrite per tool turn after the first"
     );
     let retained = graph.commit_count() - graph.retired_count();
     assert!(
@@ -469,9 +477,10 @@ async fn a_long_run_keeps_its_history_within_the_retention_while_it_compacts() {
 /// A long compacting run commits each of its tool rounds twice. The first
 /// commit, after the model call, stages the round's assistant message in the
 /// cursor and writes no row, so its tail is the run's input in the first
-/// round and the compaction summary after that: the cursor names the run.
-/// The second commit follows the run's own tool call and results. The run's
-/// end saves its answer without a cursor.
+/// round and, after that, the round before it, which every compaction keeps
+/// verbatim as the run's newest: the cursor names the run. The second commit
+/// follows the run's own tool call and results. The run's end saves its
+/// answer without a cursor.
 #[tokio::test]
 async fn a_long_run_commits_each_tool_round_twice() {
     let checkpointer = Arc::new(HeadCanonicalCheckpointer::default());
@@ -485,7 +494,7 @@ async fn a_long_run_commits_each_tool_round_twice() {
         expected_tails.push(if round == 0 {
             CheckpointTail::Other
         } else {
-            CheckpointTail::CompactionSummary
+            CheckpointTail::RunToolUseThenResults
         });
         expected_cursors.push(Some((round, CursorPoint::ToolsPending)));
         expected_tails.push(CheckpointTail::RunToolUseThenResults);
@@ -500,8 +509,8 @@ async fn a_long_run_commits_each_tool_round_twice() {
 /// A session no durable HeadCanonical head describes (WholeBlob) is
 /// recovered only from a strict continuation of its committed transcript, so
 /// with a checkpointer that does not re-base, its run takes no round commit
-/// after its first rewrite: the first round's two commits, then only the
-/// end-of-run save.
+/// after its first rewrite, which comes before its third round: the first
+/// two rounds' commits, then only the end-of-run save.
 #[tokio::test]
 async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewrite() {
     let checkpointer = Arc::new(HeadCanonicalCheckpointer::whole_blob(false));
@@ -513,6 +522,8 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
         vec![
             CheckpointTail::Other,
             CheckpointTail::RunToolUseThenResults,
+            CheckpointTail::RunToolUseThenResults,
+            CheckpointTail::RunToolUseThenResults,
             CheckpointTail::RunAnswer,
         ]
     );
@@ -522,6 +533,8 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
         vec![
             Some((0, CursorPoint::ToolsPending)),
             Some((0, CursorPoint::AwaitingModel)),
+            Some((1, CursorPoint::ToolsPending)),
+            Some((1, CursorPoint::AwaitingModel)),
             None,
         ]
     );
@@ -529,7 +542,7 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
         .transcript_history_state()
         .expect("graph decodes")
         .expect("graph present");
-    assert_eq!(graph.commit_count(), TOOL_TURNS);
+    assert_eq!(graph.commit_count(), COMPACTIONS);
     assert!(graph.commit_count() - graph.retired_count() <= RETAINED_REWRITES);
     assert!(
         session
@@ -542,8 +555,9 @@ async fn a_long_run_without_a_durable_head_stops_round_commits_at_its_first_rewr
 
 /// With a checkpointer that re-bases runs, a WholeBlob run keeps committing
 /// its rounds after a rewrite: the first round commit after each rewrite is
-/// a re-base (here every round's first commit, since the run compacts at
-/// every boundary after the first), and the second commit chains on it. The
+/// a re-base (here the first commit of every round from the third on: the
+/// run compacts at every boundary after the first, and the first of those
+/// folds nothing), and the second commit chains on it. The
 /// end-of-run save after the final boundary's compaction is a re-base too,
 /// without a cursor, so no tail recovery would refuse is ever written. From
 /// the run's first re-base on, every cursor says the run re-based, so a
@@ -561,11 +575,11 @@ async fn a_long_run_without_a_durable_head_rebases_after_each_rewrite() {
     let mut expected_cursor_rebased = Vec::new();
     for round in 0..TOOL_TURNS as u64 {
         expected_cursors.push(Some((round, CursorPoint::ToolsPending)));
-        expected_rebased.push(round > 0);
-        expected_cursor_rebased.push(Some(round > 0));
+        expected_rebased.push(round > 1);
+        expected_cursor_rebased.push(Some(round > 1));
         expected_cursors.push(Some((round, CursorPoint::AwaitingModel)));
         expected_rebased.push(false);
-        expected_cursor_rebased.push(Some(round > 0));
+        expected_cursor_rebased.push(Some(round > 1));
     }
     expected_cursors.push(None);
     expected_rebased.push(true);
@@ -585,7 +599,7 @@ async fn a_long_run_without_a_checkpointer_keeps_what_its_durable_head_lacks() {
         .transcript_history_state()
         .expect("graph decodes")
         .expect("graph present");
-    assert_eq!(graph.commit_count(), TOOL_TURNS);
+    assert_eq!(graph.commit_count(), COMPACTIONS);
     assert_eq!(
         graph.retired_count(),
         0,
@@ -633,14 +647,14 @@ async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
         .expect("graph present");
     assert_eq!(
         (graph.commit_count(), graph.retired_count()),
-        (TOOL_TURNS, 0),
+        (COMPACTIONS, 0),
         "the durable head held every body back"
     );
 
     // The same graph as bytes without verified authority: retirement does not
     // parse it, and every checkpoint still refuses it.
     let mut unverified = held.clone();
-    unverified.note_durable_transcript_rewrites(TOOL_TURNS as u64);
+    unverified.note_durable_transcript_rewrites(COMPACTIONS as u64);
     unverified.set_metadata_unchecked_for_test(
         crate::session::SESSION_TRANSCRIPT_HISTORY_STATE_KEY,
         serde_json::to_value(&graph).expect("graph value"),
@@ -672,7 +686,7 @@ async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
         .expect("graph present");
     assert_eq!(
         (cached.commit_count(), cached.retired_count()),
-        (TOOL_TURNS, 0),
+        (COMPACTIONS, 0),
         "the unverified graph is unchanged"
     );
     assert!(
@@ -681,12 +695,12 @@ async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
     );
 
     let mut covered = held;
-    covered.note_durable_transcript_rewrites(TOOL_TURNS as u64);
+    covered.note_durable_transcript_rewrites(COMPACTIONS as u64);
     assert_eq!(
         covered
             .retire_transcript_history_after_checkpoint(retention)
             .expect("no error"),
-        Some(TOOL_TURNS - RETAINED_REWRITES),
+        Some(COMPACTIONS - RETAINED_REWRITES),
         "a held graph the durable head covers retires to the retention"
     );
     let retired = covered
@@ -695,7 +709,7 @@ async fn retirement_after_a_checkpoint_needs_a_durable_head_and_a_held_graph() {
         .expect("graph present");
     assert_eq!(
         (retired.commit_count(), retired.retired_count()),
-        (TOOL_TURNS, TOOL_TURNS - RETAINED_REWRITES),
+        (COMPACTIONS, COMPACTIONS - RETAINED_REWRITES),
         "retirement keeps every commit and drops only the bodies past the retention"
     );
 }

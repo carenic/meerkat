@@ -1717,6 +1717,96 @@ pub trait CoreExecutorInterruptHandle: Send + Sync {
     }
 }
 
+/// Why the runtime settled a run left open across a restart instead of
+/// resuming it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SettledRunCause {
+    /// The graceful stop that kept the run had outlived its max age when a
+    /// later start found the run.
+    RequeueExpired,
+    /// The runtime refused to resume the run.
+    ResumeRefused,
+    /// A stop that keeps no work ended the run before it resumed.
+    Cancelled,
+}
+
+/// The run terminal owed for a run the runtime settled without resuming it
+/// (a run a graceful stop kept, or a crash cut after a round commit). The
+/// run's own execution ended in an earlier process, which published no
+/// terminal for it, so the session's event stream would otherwise never say
+/// that the run ended. The exact live session actor publishes it as the
+/// existing [`AgentEvent::RunFailed`] ([`Self::run_failed_event`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettledRunTerminal {
+    session_id: SessionId,
+    run_id: RunId,
+    identity: crate::types::TranscriptMessageIdentity,
+    cause: SettledRunCause,
+}
+
+impl SettledRunTerminal {
+    /// The terminal of `run_id` in `session_id`, under the transcript
+    /// identity its rounds carry; the identity's run id is the settled run's.
+    pub fn new(
+        session_id: SessionId,
+        run_id: RunId,
+        identity: crate::types::TranscriptMessageIdentity,
+        cause: SettledRunCause,
+    ) -> Self {
+        let identity = identity.with_run_id(run_id.clone());
+        Self {
+            session_id,
+            run_id,
+            identity,
+            cause,
+        }
+    }
+
+    pub fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub fn run_id(&self) -> &RunId {
+        &self.run_id
+    }
+
+    pub fn identity(&self) -> &crate::types::TranscriptMessageIdentity {
+        &self.identity
+    }
+
+    pub fn cause(&self) -> SettledRunCause {
+        self.cause
+    }
+
+    /// The run's terminal event: a [`AgentEvent::RunFailed`] of class
+    /// `Cancelled`, as the terminal of a run whose execution was dropped,
+    /// with no typed reason or cause kind and the settlement named in its
+    /// message.
+    pub fn run_failed_event(&self) -> AgentEvent {
+        let message = match self.cause {
+            SettledRunCause::RequeueExpired => {
+                "the run was settled instead of resumed: the graceful stop that kept it \
+                 outlived its max age"
+            }
+            SettledRunCause::ResumeRefused => {
+                "the run was settled instead of resumed: its resume was refused"
+            }
+            SettledRunCause::Cancelled => "the run was cancelled before it resumed",
+        };
+        AgentEvent::RunFailed {
+            session_id: self.session_id.clone(),
+            identity: self.identity.clone(),
+            error_report: crate::event::AgentErrorReport {
+                class: crate::event::AgentErrorClass::Cancelled,
+                reason: None,
+                message: message.to_string(),
+            },
+            terminal_cause_kind: None,
+        }
+    }
+}
+
 /// Cloneable capability for exact durable interaction-terminal publication.
 ///
 /// Runtime control paths may need to terminalize queued or staged directed
@@ -1761,6 +1851,22 @@ pub trait CoreExecutorPublicationHandle: Send + Sync {
     ) -> Result<crate::ControllerModelClient, CoreExecutorError> {
         Err(CoreExecutorError::control_failed_runtime(
             "executor surface cannot pin its actor's controller under the turn boundary",
+        ))
+    }
+
+    /// Publish the run terminal of a run the runtime settled without
+    /// resuming it, through the exact live actor this capability is bound
+    /// to, as its [`SettledRunTerminal::run_failed_event`]. Called after the
+    /// settlement committed. Implementations must publish through the
+    /// original live actor witness and never resolve the session id to a
+    /// successor actor. The default publishes nothing and answers
+    /// unsupported.
+    async fn publish_settled_run_terminal(
+        &self,
+        _settled: &SettledRunTerminal,
+    ) -> Result<(), CoreExecutorError> {
+        Err(CoreExecutorError::Internal(
+            "settled run terminal publication is unsupported by this executor".to_string(),
         ))
     }
 }
@@ -2226,6 +2332,45 @@ mod tests {
 
     // Verify CoreExecutor is object-safe
     fn _assert_object_safe(_: &dyn CoreExecutor) {}
+
+    #[test]
+    fn a_settled_runs_terminal_is_a_cancelled_run_failed_under_the_runs_identity() {
+        let session_id = SessionId::new();
+        let run_id = RunId::new();
+        let interaction = InteractionId(uuid::Uuid::now_v7());
+        let identity = crate::types::TranscriptMessageIdentity {
+            interaction_id: Some(interaction),
+            ..Default::default()
+        };
+        for cause in [
+            SettledRunCause::RequeueExpired,
+            SettledRunCause::ResumeRefused,
+            SettledRunCause::Cancelled,
+        ] {
+            let settled = SettledRunTerminal::new(
+                session_id.clone(),
+                run_id.clone(),
+                identity.clone(),
+                cause,
+            );
+            let AgentEvent::RunFailed {
+                session_id: failed_session,
+                identity: failed_identity,
+                error_report,
+                terminal_cause_kind,
+            } = settled.run_failed_event()
+            else {
+                panic!("a settled run's terminal is a RunFailed");
+            };
+            assert_eq!(failed_session, session_id);
+            assert_eq!(failed_identity.run_id.as_ref(), Some(&run_id));
+            assert_eq!(failed_identity.interaction_id, Some(interaction));
+            assert_eq!(error_report.class, crate::event::AgentErrorClass::Cancelled);
+            assert_eq!(error_report.reason, None);
+            assert!(!error_report.message.is_empty());
+            assert_eq!(terminal_cause_kind, None);
+        }
+    }
 
     #[test]
     fn prepared_session_boundary_serializes_exactly_once_across_clones() {

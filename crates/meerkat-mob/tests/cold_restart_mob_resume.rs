@@ -3950,8 +3950,11 @@ async fn mob_cold_restart_after_a_kill_following_a_mid_run_checkpoint_does_not_r
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
 
     // Compact at every model boundary after the session's first, keep one
-    // rewrite: the run's third tool round leaves two rewrites its durable
-    // head does not cover, so the fourth model boundary checkpoints first.
+    // rewrite. Nothing comes before the run, so each compaction folds the
+    // run's own completed rounds and keeps its newest; the boundary after
+    // its first round has nothing to fold. The run's fourth tool round
+    // therefore leaves two rewrites its durable head does not cover, so the
+    // fifth model boundary checkpoints first.
     let mut config = Config::default();
     config.compaction.history_retained_rewrites = 1;
     config.compaction.min_turns_between_compactions = 1;
@@ -3964,7 +3967,7 @@ async fn mob_cold_restart_after_a_kill_following_a_mid_run_checkpoint_does_not_r
     }
 
     // ---------------- Lifetime 1 ----------------
-    let client_1 = Arc::new(HoldingToolLoopClient::new(4));
+    let client_1 = Arc::new(HoldingToolLoopClient::new(5));
     let (service_1, store_1) = persistent_head_canonical_service_with(
         &paths,
         runtime_store.clone(),
@@ -11121,6 +11124,24 @@ async fn stop_gracefully_over_an_open_member_run(
     runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
     head_canonical: bool,
 ) -> RequeuedMemberRun {
+    stop_gracefully_over_an_open_member_run_with(
+        paths,
+        runtime_store,
+        head_canonical,
+        meerkat_mob::ShutdownOptions::default(),
+    )
+    .await
+}
+
+/// [`stop_gracefully_over_an_open_member_run`], shutting the mob down with
+/// `shutdown` (a requeue bound of its own, for one).
+#[cfg(feature = "test-support")]
+async fn stop_gracefully_over_an_open_member_run_with(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    head_canonical: bool,
+    shutdown: meerkat_mob::ShutdownOptions,
+) -> RequeuedMemberRun {
     let client_1 = Arc::new(HoldingToolLoopClient::new(2));
     let service_1 = requeue_service(
         paths,
@@ -11185,7 +11206,7 @@ async fn stop_gracefully_over_an_open_member_run(
         .await
         .expect("the mob stops");
     handle_1
-        .shutdown_with_report(meerkat_mob::ShutdownOptions::default())
+        .shutdown_with_report(shutdown)
         .await
         .expect("the mob shuts down");
     service_1
@@ -11507,6 +11528,168 @@ async fn held_members_open_run_resumes_on_release(
     )
     .await;
     let _ = handle.shutdown().await;
+}
+
+/// A host's graceful shutdown with a requeue bound suspends a member's run
+/// at its last round commit, and the next start comes after the bound has
+/// passed. The start settles the kept run as expired instead of resuming it
+/// and repairs its tail, and the member's session stream ends the run once:
+/// one `RunFailed` under the run's identity (the identity its committed
+/// rounds carry), with the expired settlement's report. RED before: the
+/// settlement published no run terminal, so a client following the run by
+/// its events never saw it end.
+#[cfg(feature = "test-support")]
+async fn a_members_kept_run_settled_past_its_bound_ends_with_one_run_failed(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    head_canonical: bool,
+    context: &str,
+) {
+    use futures::StreamExt as _;
+
+    let max_age = Duration::from_secs(2);
+    let run = stop_gracefully_over_an_open_member_run_with(
+        paths,
+        runtime_store.clone(),
+        head_canonical,
+        meerkat_mob::ShutdownOptions::default().with_queued_inputs(
+            meerkat_mob::QueuedInputsOnShutdown::Requeue(
+                meerkat_mob::RequeueMaxAge::new(max_age).expect("an accepted requeue bound"),
+            ),
+        ),
+    )
+    .await;
+    // The bound, measured from the input's admission, passes before the
+    // next start.
+    sleep(max_age + Duration::from_secs(1)).await;
+
+    let client_2 = Arc::new(HoldingToolLoopClient::new(0));
+    let service_2 = requeue_service(
+        paths,
+        runtime_store.clone(),
+        head_canonical,
+        client_2.clone(),
+    );
+    let handle = start_again(paths, service_2.clone(), client_2.clone())
+        .await
+        .unwrap_or_else(|error| panic!("[{context}] the start restores the member: {error}"));
+    handle.resume().await.expect("the mob resumes");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, head_canonical)
+        .await
+        .is_some()
+    {
+        assert!(
+            Instant::now() < deadline,
+            "[{context}] the settled run's tail is repaired"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // The identity the run's committed rounds carry.
+    let session = service_2
+        .load_authoritative_session(&run.w1_sid)
+        .await
+        .unwrap_or_else(|error| panic!("[{context}] read w-1's committed session: {error}"))
+        .unwrap_or_else(|| panic!("[{context}] w-1's session is committed"));
+    let run_identity = session
+        .messages()
+        .iter()
+        .find_map(|message| match message {
+            meerkat_core::Message::BlockAssistant(assistant)
+                if assistant.identity.run_id.as_ref() == Some(&run.run_id) =>
+            {
+                Some(assistant.identity.clone())
+            }
+            _ => None,
+        })
+        .unwrap_or_else(|| panic!("[{context}] the run's committed round is kept"));
+    let meerkat_core::AgentEvent::RunFailed {
+        error_report: expired_report,
+        terminal_cause_kind: expired_cause_kind,
+        ..
+    } = meerkat_core::lifecycle::SettledRunTerminal::new(
+        run.w1_sid.clone(),
+        run.run_id.clone(),
+        run_identity.clone(),
+        meerkat_core::lifecycle::SettledRunCause::RequeueExpired,
+    )
+    .run_failed_event()
+    else {
+        panic!("a settled run's terminal is a RunFailed");
+    };
+
+    // The member's session stream, read from its start until it stays idle.
+    let mut stream = service_2
+        .subscribe_session_events_from(
+            &run.w1_sid,
+            meerkat_core::comms::SessionEventCursor::Earliest,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("[{context}] replay w-1's events: {error}"))
+        .stream;
+    let mut failures = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        match tokio::time::timeout(Duration::from_secs(2), stream.next()).await {
+            Ok(Some(envelope)) => {
+                if let meerkat_core::AgentEvent::RunFailed {
+                    identity,
+                    error_report,
+                    terminal_cause_kind,
+                    ..
+                } = envelope.payload
+                    && identity.run_id.as_ref() == Some(&run.run_id)
+                {
+                    failures.push((identity, error_report, terminal_cause_kind));
+                }
+            }
+            Ok(None) => break,
+            // Idle: done once the run's terminal is in, else keep waiting.
+            Err(_) if !failures.is_empty() || Instant::now() >= deadline => break,
+            Err(_) => {}
+        }
+    }
+    assert_eq!(
+        failures,
+        vec![(run_identity, expired_report, expired_cause_kind)],
+        "[{context}] the expired kept run ends once on the member's stream, under its identity"
+    );
+    let _ = handle.shutdown().await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_kept_run_settled_past_its_bound_ends_with_one_run_failed_head_canonical() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    a_members_kept_run_settled_past_its_bound_ends_with_one_run_failed(
+        &paths,
+        runtime_store,
+        true,
+        "head-canonical",
+    )
+    .await;
+}
+
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_members_kept_run_settled_past_its_bound_ends_with_one_run_failed_whole_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+            .expect("open durable runtime store"),
+    );
+    a_members_kept_run_settled_past_its_bound_ends_with_one_run_failed(
+        &paths,
+        runtime_store,
+        false,
+        "whole-blob",
+    )
+    .await;
 }
 
 /// The same graceful stop and cold start on WholeBlob: a committed read is
