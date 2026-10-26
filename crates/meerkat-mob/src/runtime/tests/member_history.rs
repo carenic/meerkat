@@ -1144,3 +1144,301 @@ async fn the_store_level_reader_refuses_foreign_files_and_writes_nothing() {
         );
     }
 }
+
+/// Require two member binding history reads to answer the same: the
+/// cursor, each identity's last binding and intent-row fact, each session's
+/// binding, and both durable-identity lists.
+fn assert_same_history(
+    read: &MemberBindingHistory,
+    reference: &MemberBindingHistory,
+    identities: &[&AgentIdentity],
+    sessions: &[&SessionId],
+) {
+    assert_eq!(
+        read.journal_cursor(),
+        reference.journal_cursor(),
+        "the journal cursor"
+    );
+    for identity in identities {
+        assert_eq!(
+            read.last_binding(identity),
+            reference.last_binding(identity),
+            "the last binding of {identity}"
+        );
+        assert_eq!(
+            read.identity_management(identity),
+            reference.identity_management(identity),
+            "the intent-row fact of {identity}"
+        );
+    }
+    for session in sessions {
+        assert_eq!(
+            read.binding_for_session(session),
+            reference.binding_for_session(session),
+            "the binding of session {session}"
+        );
+    }
+    assert_eq!(
+        read.durable_identity_members().collect::<Vec<_>>(),
+        reference.durable_identity_members().collect::<Vec<_>>(),
+        "the live durable-identity members"
+    );
+    assert_eq!(
+        read.durable_identity_bindings().collect::<Vec<_>>(),
+        reference.durable_identity_bindings().collect::<Vec<_>>(),
+        "the durable-identity bindings"
+    );
+}
+
+// The storage reader folds what the path reader folds: over a stopped mob's
+// store reopened as a storage, it answers the path reader's cursor,
+// bindings and intent-row facts for a live durable member, a retired one, a
+// host-adopted one and an identity that never spawned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_storage_reader_agrees_with_the_path_reader() {
+    let fixture =
+        Fixture::create("member-history-storage", Some("member history base prompt")).await;
+    let handle = &fixture.handle;
+    let live = unique_identity("live");
+    let retired = unique_identity("retired");
+    let adopted = unique_identity("adopted");
+    let live_session = wake(handle, &live).await;
+    let retired_session = wake(handle, &retired).await;
+    retire_to_terminal(handle, &retired)
+        .await
+        .expect("retire the member to its terminal");
+    handle
+        .spawn_spec(SpawnMemberSpec::new("lead", adopted.clone()))
+        .await
+        .expect("spawn the member a host adopts");
+    let adopted_session = handle
+        .resolve_bridge_session_id(&adopted)
+        .await
+        .expect("a session-backed member");
+    adopt_existing_member(handle, &adopted, &adopted_session, "lead").await;
+
+    let mob_db = fixture.mob_db();
+    let _root = fixture.stop().await;
+    let by_path = MobStorage::read_member_binding_history(&mob_db)
+        .await
+        .expect("read the store file");
+    let by_storage = MobStorage::persistent(&mob_db)
+        .expect("reopen the mob store")
+        .member_binding_history()
+        .await
+        .expect("read the storage");
+    let never = unique_identity("never-spawned");
+    assert_same_history(
+        &by_storage,
+        &by_path,
+        &[&live, &retired, &adopted, &never],
+        &[&live_session, &retired_session, &adopted_session],
+    );
+    // Each fact the comparison covers is there.
+    assert!(by_storage.journal_cursor() > 0);
+    assert_eq!(
+        by_storage
+            .last_binding(&live)
+            .map(|binding| binding.state()),
+        Some(MemberBindingState::Live)
+    );
+    assert_eq!(
+        by_storage
+            .last_binding(&retired)
+            .map(|binding| binding.state()),
+        Some(MemberBindingState::Retired)
+    );
+    assert_eq!(
+        by_storage.identity_management(&adopted),
+        MemberIdentityManagement::IntentManaged
+    );
+    assert_eq!(
+        by_storage.identity_management(&live),
+        MemberIdentityManagement::CommandDriven
+    );
+}
+
+/// One process's mob storage in a host store realm: the realm, its mob
+/// store host and the storage a mob uses.
+async fn open_host_store_storage(
+    host: &Arc<meerkat_store_conformance::InMemoryHostStore>,
+) -> (
+    Arc<meerkat_runtime::store::spi::SpiRealm>,
+    crate::store::SpiMobStoreHost,
+    MobStorage,
+) {
+    let realm = meerkat_runtime::store::spi::SpiRealm::open(
+        Arc::clone(host) as Arc<dyn meerkat_core::host_store::HostStore>,
+        meerkat_runtime::store::spi::SpiRealmConfig::default(),
+    )
+    .await
+    .expect("open the host store realm");
+    let mobs = crate::store::SpiMobStoreHost::for_realm(&realm)
+        .await
+        .expect("claim the mob families");
+    let storage = mobs
+        .open("root")
+        .await
+        .expect("open the mob's storage")
+        .storage();
+    (realm, mobs, storage)
+}
+
+// The storage reader reads a mob storage kept in a host store (Core's
+// published reference host store): the running mob's history, and after a
+// restart, before any mob is built, the same history from the reopened
+// storage, read from the host store alone.
+#[tokio::test]
+async fn the_storage_reader_reads_a_host_store_storage_before_any_mob_is_built() {
+    let host = Arc::new(meerkat_store_conformance::InMemoryHostStore::new());
+    let (realm, mobs, storage) = open_host_store_storage(&host).await;
+    assert_eq!(
+        storage
+            .member_binding_history()
+            .await
+            .expect("read the empty storage")
+            .journal_cursor(),
+        0,
+        "an empty storage answers an empty history"
+    );
+    let session_store: Arc<dyn SessionStore> = Arc::new(MemoryStore::new());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::new());
+    let service = Arc::new(meerkat_session::PersistentSessionService::new(
+        PersistentMockBuilder,
+        16,
+        session_store,
+        runtime_store,
+        blob_store,
+    ));
+    let definition = with_unique_mob_id(sample_definition(), "member-history-host-store");
+    let mob_id = definition.id.clone();
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service)
+        .create()
+        .await
+        .expect("create the mob over the host store");
+    let durable = unique_identity("durable");
+    let retired = unique_identity("retired");
+    for identity in [&durable, &retired] {
+        let mut spec = SpawnMemberSpec::new("worker", identity.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        spec.continuity_intent = SpawnContinuityIntent::DurableIdentity {
+            continuity_key: identity.to_string(),
+        };
+        handle
+            .spawn_spec(spec)
+            .await
+            .expect("spawn a durable-identity member");
+    }
+    let durable_session = handle
+        .resolve_bridge_session_id(&durable)
+        .await
+        .expect("a session-backed member");
+    let retired_session = handle
+        .resolve_bridge_session_id(&retired)
+        .await
+        .expect("a session-backed member");
+    retire_to_terminal(&handle, &retired)
+        .await
+        .expect("retire the member to its terminal");
+    let identities = [&durable, &retired];
+    let sessions = [&durable_session, &retired_session];
+    let running = handle
+        .member_binding_history()
+        .await
+        .expect("read the running mob's history");
+    assert_same_history(
+        &storage
+            .member_binding_history()
+            .await
+            .expect("read the storage"),
+        &running,
+        &identities,
+        &sessions,
+    );
+    tokio::time::timeout(WAIT, handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+    drop(handle);
+    await_supervisor_route_release(&mob_id).await;
+    let stopped = storage
+        .member_binding_history()
+        .await
+        .expect("read the stopped mob's storage");
+    assert_eq!(
+        stopped
+            .last_binding(&durable)
+            .map(|binding| binding.state()),
+        Some(MemberBindingState::Live)
+    );
+    assert_eq!(
+        stopped
+            .last_binding(&retired)
+            .map(|binding| binding.state()),
+        Some(MemberBindingState::Retired)
+    );
+
+    // A restart: the next process opens the realm and reads the history
+    // before it builds any mob.
+    drop((storage, mobs, realm));
+    host.lapse_fence_leases();
+    let (_realm, _mobs, reopened) = open_host_store_storage(&host).await;
+    assert_same_history(
+        &reopened
+            .member_binding_history()
+            .await
+            .expect("read the reopened storage"),
+        &stopped,
+        &identities,
+        &sessions,
+    );
+}
+
+// The storage reader answers an empty history for a storage that holds no
+// mob, as the path reader does for an empty store file, and refuses a
+// storage without the built-in identity member store as the running mob's
+// read refuses.
+#[tokio::test]
+async fn the_storage_reader_answers_an_empty_storage_and_refuses_a_custom_composition() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mob_db = dir.path().join("mob.db");
+    let empty_file = MobStorage::persistent(&mob_db)
+        .expect("create an empty mob store")
+        .member_binding_history()
+        .await
+        .expect("read the empty storage");
+    let by_path = MobStorage::read_member_binding_history(&mob_db)
+        .await
+        .expect("read the empty store file");
+    let anyone = unique_identity("anyone");
+    assert_same_history(&empty_file, &by_path, &[&anyone], &[]);
+    let empty_memory = MobStorage::in_memory()
+        .member_binding_history()
+        .await
+        .expect("read an empty in-memory storage");
+    for empty in [&empty_file, &empty_memory] {
+        assert_eq!(empty.journal_cursor(), 0);
+        assert!(empty.last_binding(&anyone).is_none());
+        assert_eq!(empty.durable_identity_bindings().count(), 0);
+        assert_eq!(
+            empty.identity_management(&anyone),
+            MemberIdentityManagement::CommandDriven
+        );
+    }
+
+    let custom = MobStorage::with_events(Arc::new(InMemoryMobEventStore::new()));
+    let refused = custom.member_binding_history().await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MemberBindingHistoryReadError::Read(
+                MobStoreError::IdentityMemberAtomicPersistenceUnavailable
+            ))
+        ),
+        "a storage without the identity member store is refused: {refused:?}"
+    );
+}

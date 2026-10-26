@@ -458,8 +458,7 @@ impl MobStorage {
     ) -> Result<MemberBindingHistory, MemberBindingHistoryReadError> {
         let mut read =
             crate::store::read_member_binding_store_at(path.as_ref().to_path_buf()).await?;
-        let mob_id = Self::current_definition_snapshot_for_log(&read.events)?
-            .map(|snapshot| snapshot.definition.id);
+        let mob_id = Self::member_binding_history_mob(&read.events)?;
         let intent_rows = mob_id
             .as_ref()
             .and_then(|mob_id| read.intent_rows.remove(mob_id))
@@ -469,6 +468,58 @@ impl MobStorage {
             intent_rows,
             mob_id.as_ref(),
         ))
+    }
+
+    /// The member binding history of this storage's mob, read with no
+    /// running mob and no path, through this storage's identity member
+    /// store: the fold [`Self::read_member_binding_history`] makes of a
+    /// store file, and [`crate::MobHandle::member_binding_history`] of a
+    /// running mob, of the same journal and identity intent rows, read
+    /// together in one store read. It works over every storage that has the
+    /// built-in identity member store, whatever holds it (a store file, a
+    /// host store, memory).
+    ///
+    /// The mob is the one whose definition is current in the storage's
+    /// journal, selected as the path reader selects it. A storage that holds
+    /// no mob answers an empty history. A storage without the built-in
+    /// identity member store (a custom store composition) is refused as the
+    /// running mob's read refuses:
+    /// [`MemberBindingHistoryReadError::Read`] of
+    /// [`crate::store::MobStoreError::IdentityMemberAtomicPersistenceUnavailable`].
+    /// It only reads, and a failed read is an error, never an empty history.
+    pub async fn member_binding_history(
+        &self,
+    ) -> Result<MemberBindingHistory, MemberBindingHistoryReadError> {
+        let identity_member = self
+            .identity_member
+            .as_ref()
+            .ok_or(crate::store::MobStoreError::IdentityMemberAtomicPersistenceUnavailable)?;
+        let events = self.events.replay_all().await?;
+        let Some(mob_id) = Self::member_binding_history_mob(&events)? else {
+            return Ok(MemberBindingHistory::from_journal(
+                &events,
+                Default::default(),
+                None,
+            ));
+        };
+        // The journal and the mob's intent rows come from one store read,
+        // as the running mob's read takes them.
+        let read = identity_member.read_member_binding_journal(&mob_id).await?;
+        Ok(MemberBindingHistory::from_journal(
+            &read.events,
+            read.intent_rows,
+            Some(&mob_id),
+        ))
+    }
+
+    /// The mob a member binding history folds: the one whose definition is
+    /// current in the store's journal (`events`, in cursor order), if any.
+    /// Both member binding history readers select it here.
+    fn member_binding_history_mob(
+        events: &[MobEvent],
+    ) -> Result<Option<crate::MobId>, crate::store::MobStoreError> {
+        Ok(Self::current_definition_snapshot_for_log(events)?
+            .map(|snapshot| snapshot.definition.id))
     }
 
     /// Read the canonical definition together with its sealed resume precondition.

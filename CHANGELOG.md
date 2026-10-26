@@ -57,6 +57,18 @@ them.
   documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
   limit it already followed.
 
+- `meerkat-mob`: `MobStorage::member_binding_history` reads the member
+  binding history of a storage's mob with no running mob and no file path,
+  through the storage's own identity member store, so it serves every
+  storage that has one, a mob storage kept in a host store included. It
+  folds the journal and the identity intent rows as
+  `MobStorage::read_member_binding_history` folds a store file, answers an
+  empty history for a storage that holds no mob, and refuses a custom store
+  composition without the built-in identity member store as
+  `MobHandle::member_binding_history` does
+  (`MemberBindingHistoryReadError::Read` of
+  `MobStoreError::IdentityMemberAtomicPersistenceUnavailable`).
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
