@@ -6012,10 +6012,27 @@ async fn stored_outbox_phase(
         .find(|row| &row.state.input_id == input_id)?;
     let image = serde_json::to_value(&row).unwrap();
     image
-        .pointer("/state/interaction_terminal_outbox/phase/phase")
-        .or_else(|| image.pointer("/state/interaction_terminal_outbox/phase"))
+        .pointer("/interaction_terminal_outbox/phase/phase")
         .and_then(|phase| phase.as_str())
         .map(str::to_string)
+}
+
+/// Wait, bounded, until the outbox of `input_id`'s stored row reads
+/// published: the receipts are written back after the publisher recorded
+/// the event, by the publication's own handoff.
+async fn wait_for_published_outbox(
+    store: &InMemoryRuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    input_id: &InputId,
+) -> Option<String> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let phase = stored_outbox_phase(store, runtime_id, input_id).await;
+        if phase.as_deref() == Some("published") || tokio::time::Instant::now() >= deadline {
+            return phase;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
 }
 
 /// A start over a kept directed run whose stop's max age has passed settles
@@ -6054,6 +6071,11 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
         Some(run_id.clone()),
         "the registration keeps the run resumable"
     );
+    // A directed terminal names the runtime placement it is published from.
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bind the runtime placement");
     let executor = PublishingRuns::new();
     machine
         .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
@@ -6078,7 +6100,7 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
         executor.publications.events()
     );
     assert_eq!(
-        stored_outbox_phase(&store, &runtime_id, input.id())
+        wait_for_published_outbox(&store, &runtime_id, input.id())
             .await
             .as_deref(),
         Some("published"),
@@ -6183,6 +6205,11 @@ async fn a_refused_resume_of_a_kept_directed_run_fails_its_interaction_once() {
         .bind_resumed_run_admission(&registration, Arc::new(SupersededResume) as _)
         .await
         .expect("bind the admission");
+    // A directed terminal names the runtime placement it is published from.
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("bind the runtime placement");
     let executor = PublishingRuns::new();
     machine
         .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
@@ -6207,7 +6234,7 @@ async fn a_refused_resume_of_a_kept_directed_run_fails_its_interaction_once() {
         executor.publications.events()
     );
     assert_eq!(
-        stored_outbox_phase(&store, &runtime_id, input.id())
+        wait_for_published_outbox(&store, &runtime_id, input.id())
             .await
             .as_deref(),
         Some("published"),
