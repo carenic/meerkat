@@ -3827,8 +3827,9 @@ impl std::fmt::Debug for PendingRuntimeExecutorAttachment {
     }
 }
 
-/// How long a start that settled an expired kept run keeps retrying the
-/// run's terminal while its attachment comes to serve.
+/// How long a start that settled an expired kept run keeps publishing the
+/// run's carriers and retrying its terminal while its attachment comes to
+/// serve: one deadline for the whole detached task.
 const SETTLED_RUN_TERMINAL_PUBLICATION_BOUND: std::time::Duration =
     std::time::Duration::from_secs(60);
 
@@ -4236,14 +4237,19 @@ impl PendingRuntimeExecutorAttachment {
             let session_id = self.witness.session_id().clone();
             let driver = Arc::clone(&driver);
             let completions = Arc::clone(&completions);
+            // One deadline bounds the whole task, the carriers' publication
+            // included, so it ends even if that publication never answers.
+            let deadline =
+                meerkat_core::time_compat::Instant::now() + SETTLED_RUN_TERMINAL_PUBLICATION_BOUND;
             drop(crate::tokio::spawn(async move {
                 if let Err(error) =
-                    crate::control_plane::publish_and_resolve_runless_runtime_terminations(
+                    crate::control_plane::publish_and_resolve_runless_runtime_terminations_before(
                         &driver,
                         Some(&completions),
                         publication_handle.as_deref(),
                         &settled_batches,
                         EXPIRED_KEPT_RUN_TERMINATION_REASON,
+                        Some(deadline),
                     )
                     .await
                 {
@@ -4257,10 +4263,7 @@ impl PendingRuntimeExecutorAttachment {
                     crate::control_plane::publish_settled_run_terminal_before(
                         publication_handle.as_deref(),
                         terminal,
-                        Some(
-                            meerkat_core::time_compat::Instant::now()
-                                + SETTLED_RUN_TERMINAL_PUBLICATION_BOUND,
-                        ),
+                        Some(deadline),
                     )
                     .await;
                 }
