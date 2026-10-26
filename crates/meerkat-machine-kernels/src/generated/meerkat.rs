@@ -23585,12 +23585,6 @@ pub enum TransitionId {
     ResolveRuntimeCompletionResultRuntimeTerminatedRetired,
     ResolveRuntimeCompletionResultRuntimeTerminatedStopped,
     ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed,
-    ResolveRuntimeCompletionResultOutcomeUnknownInitializing,
-    ResolveRuntimeCompletionResultOutcomeUnknownIdle,
-    ResolveRuntimeCompletionResultOutcomeUnknownAttached,
-    ResolveRuntimeCompletionResultOutcomeUnknownRunning,
-    ResolveRuntimeCompletionResultOutcomeUnknownRetired,
-    ResolveRuntimeCompletionResultOutcomeUnknownStopped,
     ResolveRuntimeCompletionCleanupArchivedInitializing,
     ResolveRuntimeCompletionCleanupArchivedIdle,
     ResolveRuntimeCompletionCleanupArchivedAttached,
@@ -25786,6 +25780,12 @@ pub enum TransitionId {
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentRunning,
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentStopped,
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentDestroyed,
+    ResolveRuntimeCompletionResultOutcomeUnknownInitializing,
+    ResolveRuntimeCompletionResultOutcomeUnknownIdle,
+    ResolveRuntimeCompletionResultOutcomeUnknownAttached,
+    ResolveRuntimeCompletionResultOutcomeUnknownRunning,
+    ResolveRuntimeCompletionResultOutcomeUnknownRetired,
+    ResolveRuntimeCompletionResultOutcomeUnknownStopped,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
