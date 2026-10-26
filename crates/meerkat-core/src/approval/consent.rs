@@ -2043,6 +2043,15 @@ impl ApprovalService {
     /// into the resumed run staged with that input when one is open (or
     /// when it opens); when that input's only run already closed, or the
     /// notice can never be delivered, the parked consent is withdrawn.
+    ///
+    /// The delivery owner records the receipt. When a governed admission of
+    /// the notice commits, the notice's committed job source (the `meerkat`
+    /// crate's `ConsentNoticeJobSource`) records `Admitted` for that session
+    /// and input before the delivery row is acknowledged, so a retry reports
+    /// the same receipt. The projector's rounds record the receipt a
+    /// committed row's own status proves when no admission recorded it:
+    /// `Admitted` for an applied admission, and `Failed` for a settled
+    /// refusal or a retired owner.
     pub fn settle_consent_delivery(
         &self,
         approval_id: &ApprovalId,

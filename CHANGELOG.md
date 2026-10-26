@@ -63,6 +63,11 @@ them.
   crash cut before the upgrade still has its inputs ended as
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
+- `meerkat`: consent-notice admissions now record their delivery receipt
+  (the governed admission reports each committed admission to the job's
+  committed owner through the new provided
+  `RetainedJobSource::admission_committed`), so approved parked consent
+  moves into the resumed run its notice starts.
 
 ## [0.9.5] - 2026-10-23
 

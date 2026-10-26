@@ -184,7 +184,8 @@ pub trait RuntimeDeliveryHost: Send + Sync {
     /// ([`Self::project_owed_continuations`]). For such a host a source
     /// change starts a projection round whether or not anything is blocked,
     /// so an obligation committed after the owner armed is projected on its
-    /// hint. Run settlements and attachments never start one.
+    /// hint, and so does a pass that settled a continuation row as refused.
+    /// Run settlements and attachments never start one.
     fn projects_owed_continuations(&self) -> bool {
         false
     }
@@ -209,12 +210,13 @@ pub trait RuntimeDeliveryHost: Send + Sync {
     ///
     /// The owner calls it once per pass, before it collects the inbox, so
     /// the rows committed here drain in the same pass. A round starts on the
-    /// arming reconcile, on every reconcile and on every source change, and
-    /// continues page by page, one per pass, until a page reports no
-    /// [`OwedContinuationProjection::next`]; it is never repeated because
-    /// a page committed rows. The enumeration must be in a stable order and
-    /// each page's `next` past its start, so that a round reaches its end
-    /// and visits every obligation owed throughout it.
+    /// arming reconcile, on every reconcile, on every source change and after
+    /// a pass that settled a continuation row as refused (whose status the
+    /// round can then read), and continues page by page, one per pass, until
+    /// a page reports no [`OwedContinuationProjection::next`]; it is never
+    /// repeated because a page committed rows. The enumeration must be in a
+    /// stable order and each page's `next` past its start, so that a round
+    /// reaches its end and visits every obligation owed throughout it.
     async fn project_owed_continuations(
         &self,
         after: Option<&OwedContinuationCursor>,
@@ -808,18 +810,19 @@ struct OwnerLoop {
 }
 
 /// One enumeration of a host's owed continuations, a page per pass, from
-/// its first page to a page that reports no next one. Started by a reconcile
-/// or a source change; each following pass continues it without waiting for
-/// a signal. Obligations stay owed until their admission, so a round is
-/// never repeated because a page committed rows: it ends at the end of the
-/// enumeration, and only a later reconcile or source change starts another.
+/// its first page to a page that reports no next one. Started by a reconcile,
+/// a source change, or a pass that settled a continuation row as refused;
+/// each following pass continues it without waiting for a signal.
+/// Obligations stay owed until their admission, so a round is never repeated
+/// because a page committed rows: it ends at the end of the enumeration, and
+/// only a later reconcile, source change or refusal starts another.
 #[derive(Debug, Default)]
 struct OwedRound {
     /// Where the next page starts; `None` for the first.
     after: Option<OwedContinuationCursor>,
-    /// A reconcile or source change arrived after this round started. What
-    /// it announces may sit before the cursor, so one more round follows
-    /// this one, from the first page.
+    /// A reconcile, source change or refusal arrived after this round
+    /// started. What it announces may sit before the cursor, so one more
+    /// round follows this one, from the first page.
     again: bool,
 }
 
@@ -1045,7 +1048,8 @@ async fn run_owner(mut owner: OwnerLoop) {
 
         // A reconcile (the arming one first) or a source change starts a
         // round of the host's owed continuations, or asks for one more after
-        // the round in progress. Run settlements and attachments never do.
+        // the round in progress, as a pass that settles a refusal does at its
+        // end (`run_pass`). Run settlements and attachments never do.
         if owner.projects_owed && (wake.reconcile || wake.source_change) {
             match owner.owed_round.as_mut() {
                 Some(round) => round.again = true,
@@ -1457,6 +1461,17 @@ async fn run_pass(
                     break;
                 }
             }
+        }
+    }
+    // A continuation row this pass settled as refused can never be
+    // delivered, which a projecting host's round reads from the row's status
+    // (a consent notice records it as its receipt): one more round follows
+    // now, never waiting for an incidental wake. A refused row is passed for
+    // good, so this ends.
+    if owner.projects_owed && pass.refused > 0 {
+        match owner.owed_round.as_mut() {
+            Some(round) => round.again = true,
+            None => owner.owed_round = Some(OwedRound::default()),
         }
     }
     Some(PassOutcome {

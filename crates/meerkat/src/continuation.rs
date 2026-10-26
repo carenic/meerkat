@@ -1271,6 +1271,25 @@ pub trait RetainedJobSource: Send + Sync {
         let _ = namespace;
         None
     }
+
+    /// The governed admission of `producer`'s job `job_id`, which this owner
+    /// confirmed ([`Self::retained_job`]), is committed as `input_id` of
+    /// `session`: that session's input ledger and the admission index both
+    /// hold it, and its delivery row is not acknowledged yet. Every drain
+    /// that finds the row admitted reports it, a retry after a crash or a
+    /// failure included, so one admission can be reported more than once.
+    /// `Err` leaves the row unacknowledged (blocked, and retried on a later
+    /// wake), never refused. The default records nothing.
+    async fn admission_committed(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        let _ = (producer, job_id, session, input_id);
+        Ok(())
+    }
 }
 
 /// What the committed owner of a host namespace holds about one host
@@ -2224,6 +2243,13 @@ pub fn governed_admission_outcome(
 /// from the reserved session's ledger ([`settle_retired_reservation`]). The
 /// caller acknowledges the row on `Ok`.
 ///
+/// On a governed runtime the job's committed owner confirms the row before
+/// anything is reserved, and hears the committed admission
+/// ([`RetainedJobSource::admission_committed`]) before the caller
+/// acknowledges the row, from every exit: a fresh admission, an exact replay
+/// and a row the index already records as applied. When it fails, the row
+/// stays pending and the next drain reports the same admission again.
+///
 /// With an `observer`, the drain observes the address after its reservation
 /// (a Reserve or Repoint) and before the admission: an address that retired
 /// since the pass resolved it gets its reservation released and nothing
@@ -2267,7 +2293,9 @@ pub(crate) async fn admit_continuation_row(
             };
             return admit_host_original(&target, record, job_source, row).await;
         }
-        let retained = if sink.governs_work_authority() {
+        // On a governed runtime, the job owner that confirmed the row, with
+        // the job it confirmed: it hears the admission once it commits.
+        let (retained, confirmed) = if sink.governs_work_authority() {
             // Only a Meerkat-minted completion carries a native work
             // binding, and only its committed job owner can confirm it.
             let Some(identity) = row.retained_work.clone() else {
@@ -2281,9 +2309,13 @@ pub(crate) async fn admit_continuation_row(
                 )
             })?;
             verify_committed_job(source, &row.delivery, &identity, session).await?;
-            Some(identity)
+            let job = (
+                row.delivery.result.producer.clone(),
+                row.delivery.result.producer_id.clone(),
+            );
+            (Some(identity), Some((source, job)))
         } else {
-            None
+            (None, None)
         };
         let target = AdmissionTarget {
             inbox,
@@ -2292,7 +2324,26 @@ pub(crate) async fn admit_continuation_row(
             session,
             observer,
         };
-        admit_continuation(&target, record, row.delivery, retained).await
+        let (admitted_session, admitted_input) =
+            admit_continuation(&target, record, row.delivery, retained).await?;
+        // The session's input ledger and the admission index hold the
+        // admission, and the row is not acknowledged yet: the job owner hears
+        // it now, from every exit of the admission (a fresh one, an exact
+        // replay, or a row the index already records as applied). A crash or
+        // a failure before the acknowledgement leaves the row pending, so the
+        // next drain reports the same admission again.
+        if let Some((source, (producer, job_id))) = confirmed {
+            source
+                .admission_committed(&producer, &job_id, &admitted_session, &admitted_input)
+                .await
+                .map_err(|error| {
+                    ContinuationAdmitError::Failed(format!(
+                        "the committed owner of job {job_id} did not record its admission: \
+                         {error}"
+                    ))
+                })?;
+        }
+        Ok(())
     }
     .await;
     match outcome {
@@ -2626,7 +2677,9 @@ async fn admit_host_original(
     }
     if !sink.governs_work_authority() {
         // Ungoverned: the plain admission it always was.
-        return admit_continuation(target, record, delivery, None).await;
+        return admit_continuation(target, record, delivery, None)
+            .await
+            .map(|_| ());
     }
     if delivery.handling != ContinuationHandling::Queue || !sink.admits_governed() {
         return Err(refused_host_original(
@@ -2870,12 +2923,17 @@ struct AdmissionTarget<'a> {
     observer: Option<&'a dyn crate::RuntimeDeliveryHost>,
 }
 
+/// Admit `delivery`'s row into the target session through the admission
+/// index (see [`admit_continuation_row`]), and return the admission the index
+/// then holds as applied: the session and input, from every exit. A row the
+/// index already records as applied returns that entry; an exact replay the
+/// reserved (or serving) session already holds returns that input.
 async fn admit_continuation(
     target: &AdmissionTarget<'_>,
     record: &meerkat_runtime::RuntimeDeliveryRecord,
     delivery: ContinuationDelivery,
     retained: Option<meerkat_core::retained_work::RetainedWorkIdentity>,
-) -> Result<(), ContinuationAdmitError> {
+) -> Result<(SessionId, InputId), ContinuationAdmitError> {
     let AdmissionTarget {
         inbox,
         address,
@@ -2891,7 +2949,12 @@ async fn admit_continuation(
         .await
         .map_err(|error| error.to_string())?
     {
-        Some(ContinuationAdmission::Applied { .. }) => return Ok(()),
+        // Already applied: a retry after a crash or a failure that left the
+        // row unacknowledged.
+        Some(ContinuationAdmission::Applied {
+            session_id,
+            input_id,
+        }) => return Ok((session_id, input_id)),
         Some(ContinuationAdmission::Reserved {
             session_id: reserved,
             input_id,
@@ -2899,16 +2962,17 @@ async fn admit_continuation(
             if let Some(admitted) =
                 exact_admission(sink, &reserved, &delivery, &admission_key, retained_work).await?
             {
-                return Ok(transition_admission(
+                transition_admission(
                     inbox,
                     address,
                     delivery_id,
                     ContinuationAdmissionTransition::Apply {
-                        session_id: reserved,
-                        input_id: admitted,
+                        session_id: reserved.clone(),
+                        input_id: admitted.clone(),
                     },
                 )
-                .await?);
+                .await?;
+                return Ok((reserved, admitted));
             }
             if reserved != *session {
                 transition_admission(
@@ -2941,16 +3005,17 @@ async fn admit_continuation(
                     },
                 )
                 .await?;
-                return Ok(transition_admission(
+                transition_admission(
                     inbox,
                     address,
                     delivery_id,
                     ContinuationAdmissionTransition::Apply {
                         session_id: session.clone(),
-                        input_id: admitted,
+                        input_id: admitted.clone(),
                     },
                 )
-                .await?);
+                .await?;
+                return Ok((session.clone(), admitted));
             }
             let input_id = InputId::new();
             transition_admission(
@@ -3015,11 +3080,11 @@ async fn admit_continuation(
         delivery_id,
         ContinuationAdmissionTransition::Apply {
             session_id: session.clone(),
-            input_id: admitted,
+            input_id: admitted.clone(),
         },
     )
     .await?;
-    Ok(())
+    Ok((session.clone(), admitted))
 }
 
 /// Reserve, then observe: the pass resolved `target`'s address before the
