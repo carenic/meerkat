@@ -3375,10 +3375,12 @@ impl MeerkatMachine {
             .reserve_consent_owner_loss(&entry._hosting_claim)
             .map_err(SettlementRegistrationRefused::Runtime)?;
         let mut sessions = self.sessions.write().await;
-        if let Some(existing) = sessions.get(&session_id) {
-            // The reservation returns to its lineage as it drops.
+        // Never a reuse branch: any entry the session already has refuses
+        // the publication. The reservation returns to its lineage as it
+        // drops.
+        if let Some(current) = sessions.get(&session_id) {
             return Err(
-                match existing.registration_blocked_by_unregister(&session_id) {
+                match current.registration_blocked_by_unregister(&session_id) {
                     Some(error) => SettlementRegistrationRefused::Runtime(error),
                     None => SettlementRegistrationRefused::Registered,
                 },
