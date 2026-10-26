@@ -7206,7 +7206,9 @@ async fn settle_refused_resumed_run(
         .settle_resumable_run_with_terminals(
             run_id,
             crate::input_state::InputAbandonReason::ResumeRefused,
-            &format!("the resumed run was refused: {detail}"),
+            // A fixed, host-neutral reason: the admission's detail is
+            // logged above and stays out of the cross-runtime terminal.
+            "the resumed run was refused",
         )
         .await;
     let abandoned = match settled {
