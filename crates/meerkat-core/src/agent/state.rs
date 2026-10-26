@@ -7007,9 +7007,9 @@ where
     /// consent moved into the run (the boundary's first step,
     /// [`Self::enrol_moved_run_consent`]) yields and the boundary looks
     /// again, so a hold at that read never costs the run that consent; a
-    /// hold met later in the step (the decided read, or the attempt's
+    /// hold met later in the boundary (the decided read, or the attempt's
     /// resolve or spend) acts as for consent the run requested itself, and
-    /// moved consent the run then never attempts is withdrawn at its close.
+    /// moved consent the run then never spends is withdrawn at its close.
     /// The run can still close, or be dropped, before or during an attempt;
     /// its run scope then parks or withdraws what it admitted, and an
     /// attempt that entered keeps its own outcome. Asynchronous work the
@@ -38509,7 +38509,7 @@ mod tests {
                         }
                         1 => {
                             let (release, writer) = held.lock().unwrap().take().expect("held");
-                            release.send(()).expect("end the hold");
+                            let _ = release.send(());
                             writer.join().expect("the write ends");
                         }
                         _ => {}
