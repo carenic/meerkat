@@ -11443,6 +11443,10 @@ async fn held_members_open_run_resumes_on_release(
         head_canonical,
         client_2.clone(),
     );
+    let runtime = service_2
+        .canonical_runtime_adapter()
+        .expect("the session service's runtime owner");
+    let mut parks = runtime.run_start_held_parks();
     let worker = AgentIdentity::from("w-1");
     let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
@@ -11460,15 +11464,18 @@ async fn held_members_open_run_resumes_on_release(
     // Resume releases the mob Stop's hold and materializes the member; the
     // host's hold still stands, so the registration parks the kept run.
     handle.resume().await.expect("the mob resumes");
-    let deadline = Instant::now() + Duration::from_secs(30);
-    while service_2.comms_runtime(&run.w1_sid).await.is_none() {
-        assert!(
-            Instant::now() < deadline,
-            "[{context}] the held member's runtime registers before the release"
-        );
-        sleep(Duration::from_millis(50)).await;
-    }
-    sleep(Duration::from_millis(500)).await;
+    // The release must land after the loop parked on the hold: a release
+    // before the first lap would let the run resume without the fix. Only
+    // w-1's loop has work to park on.
+    tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the held member's runtime loop parks on the host's hold")
+        .expect("the park counter stays open");
+    assert_eq!(
+        runtime.run_starts_held_for_test(&run.w1_sid).await,
+        Some(true),
+        "[{context}] the host's hold applies to the restored member's registration"
+    );
     assert_eq!(
         provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, head_canonical).await,
         Some(run.run_id.clone()),
