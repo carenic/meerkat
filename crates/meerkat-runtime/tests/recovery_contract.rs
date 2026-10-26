@@ -2627,6 +2627,80 @@ async fn an_archive_ends_the_unresumed_work_then_commits_the_kept_runs_tail_as_i
     );
 }
 
+/// What a graceful stop that kept a durable run leaves, archived in the
+/// order a session archive runs: the archive's lease registers the runtime
+/// (the run's input recovered, still bound to the kept run), the archive's
+/// own recovery then commits the kept run's tail as interrupted and consumes
+/// that input outside the lease's driver, and the archive observes the
+/// lease's pending terminals before it retires. The observation adopts the
+/// recovery's terminal before it scans, finds no runless carrier, and the
+/// retire commits with the input consumed. A pin of that order; the scan
+/// itself runs only for a lease whose driver is stopped, retired or
+/// destroyed.
+#[tokio::test]
+async fn a_kept_run_archived_after_its_lease_registers_retires_with_its_input_consumed() {
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome,
+        recover_durable_tail_for_session_archive,
+    };
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (session_id, run_id, input) = a_kept_run(&store, InputLifecycleState::Staged).await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let machine =
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine");
+    let deadline = meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10);
+    let lease = machine
+        .prepare_session_archive_lease_before(&session_id, deadline)
+        .await
+        .expect("the archive's lease prepares")
+        .expect("a durable session leaves the archive a runtime to retire");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        Some(run_id),
+        "instrument: the lease's registration keeps the run resumable"
+    );
+
+    let (DurableTailRecoveryOutcome::Committed { disposition, .. }, _) =
+        recover_durable_tail_for_session_archive(store.as_ref(), &session_id)
+            .await
+            .expect("the archive's recovery answers")
+    else {
+        panic!("the archive's recovery commits the kept run's tail");
+    };
+    assert_eq!(
+        disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        CONSUMED_ROW,
+        "the archive's recovery consumes the kept run's input"
+    );
+
+    let pending = machine
+        .session_archive_lease_has_pending_terminals(&lease)
+        .await
+        .expect("the archive observes its lease's pending terminals");
+    assert!(!pending, "no runless carrier is owed");
+    machine
+        .retire_session_with_archive_lease_before(lease, deadline)
+        .await
+        .expect("the archive's runtime retire commits");
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        CONSUMED_ROW,
+        "the retire leaves the input consumed"
+    );
+    assert_eq!(
+        load_runtime_state(store.as_ref(), &runtime_id)
+            .await
+            .unwrap(),
+        Some(RuntimeState::Retired)
+    );
+}
+
 /// The archive of a session no start registered again commits the kept
 /// run's tail at once beside an input queued behind the run that names no
 /// run.
