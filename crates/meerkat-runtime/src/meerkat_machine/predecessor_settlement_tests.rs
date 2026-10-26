@@ -2363,6 +2363,72 @@ async fn a_restart_after_the_sweep_rehydrates_both_batches_and_answers_each_requ
     assert_eq!(publisher.events().len(), 2, "nothing is published twice");
 }
 
+/// An outcome-unknown answer a stopped settlement left owed is a blocked
+/// repair to the runless convergence an archive or a stop runs, not
+/// corruption: the refusal names the repeat of the settlement, which alone
+/// publishes the answer.
+#[tokio::test]
+async fn an_owed_outcome_unknown_answer_blocks_the_runless_convergence_for_the_repeat() {
+    let host = Host::head_canonical();
+    let (session_id, _) = durable_session(&host, None).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let left_run = RunId::new();
+    let l1 = directed_step("consumed without a receipt");
+    commit_left_boundary(&host, &session_id, &left_run, &[&l1]).await;
+    let claim = host.claim(&session_id);
+
+    let mut first = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut first)
+        .await
+        .expect("the drive answers");
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut first, deadline())
+        .await
+        .expect("the sweep commits the outcome-unknown batch");
+    assert_eq!(work.answered, vec![l1.id().clone()]);
+    host.machine
+        .remove_predecessor_settlement_registration_before(first, deadline())
+        .await
+        .expect("the registration goes without a drain");
+
+    host.machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session registers with its owed answer");
+    let driver = {
+        let sessions = host.machine.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .expect("the session's registration")
+            .driver
+            .clone()
+    };
+    let refused =
+        crate::control_plane::converge_known_committed_runless_runtime_terminations_before(
+            &driver,
+            None,
+            None,
+            Some(deadline()),
+        )
+        .await
+        .expect_err("the convergence does not publish the owed answer");
+    assert!(
+        matches!(
+            &refused,
+            RuntimeDriverError::RecoveryRepairBlocked { reason, .. }
+                if reason.contains("repeat the settlement")
+        ),
+        "{refused:?}"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Deadlines and publication inside the process-owned task
 // ---------------------------------------------------------------------------
