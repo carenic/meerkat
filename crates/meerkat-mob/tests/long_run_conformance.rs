@@ -38,7 +38,7 @@ use long_run_support::{
     Store, WHOLE_BLOB, WORKER, await_supervisor_route_release, discard_provisional_tail,
     fail_model_call, fresh_root, kill_orphaned_process, other_writer, read_killed,
     read_killed_member, read_plan, restart, restart_deploy, restart_workers,
-    run_resumed_until_killed, run_until_killed, wait_converged, write_plan,
+    run_resumed_until_killed, run_until_killed, settled_run_report, wait_converged, write_plan,
 };
 use meerkat_core::types::SessionId;
 use meerkat_store_conformance::{
@@ -846,10 +846,10 @@ fn check_expired(restarted: &DeployRestart) -> Result<(), String> {
             report.receipts
         ));
     }
-    if restarted.killed_run_failures != [meerkat_core::event::AgentErrorClass::Cancelled] {
+    let expired = settled_run_report(meerkat_core::lifecycle::SettledRunCause::RequeueExpired);
+    if restarted.killed_run_failures != [expired.clone()] {
         return Err(format!(
-            "{member}'s expired run ended on its stream with {:?}, expected one cancelled \
-             RunFailed",
+            "{member}'s expired run ended on its stream with {:?}, expected exactly {expired:?}",
             restarted.killed_run_failures
         ));
     }
@@ -1139,8 +1139,10 @@ async fn a_refused_resume_repairs_the_tail(backend: Backend) {
     );
     assert_eq!(
         restarted.killed_run_failures,
-        [meerkat_core::event::AgentErrorClass::Cancelled],
-        "the refused run ends once on its session's stream"
+        [settled_run_report(
+            meerkat_core::lifecycle::SettledRunCause::ResumeRefused
+        )],
+        "the refused run ends once on its session's stream, as refused"
     );
     if let Err(error) = check_tail_repaired(&plan, restarted) {
         panic!("{error}");

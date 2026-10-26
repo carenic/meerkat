@@ -1806,14 +1806,14 @@ impl Incarnation {
             .count())
     }
 
-    /// The error class of every `RunFailed` `session`'s event stream holds
+    /// The error report of every `RunFailed` `session`'s event stream holds
     /// for `run`, in order. The stream is read until it stays idle for half
     /// a second, so a terminal published just after the read began is seen.
     pub async fn run_failures(
         &self,
         session: &SessionId,
         run: &RunId,
-    ) -> Result<Vec<meerkat_core::event::AgentErrorClass>, String> {
+    ) -> Result<Vec<meerkat_core::event::AgentErrorReport>, String> {
         let mut stream = match self
             .service
             .subscribe_session_events_from(session, meerkat_core::SessionEventCursor::Earliest)
@@ -1834,7 +1834,7 @@ impl Incarnation {
             } = envelope.payload
                 && identity.run_id.as_ref() == Some(run)
             {
-                failures.push(error_report.class);
+                failures.push(error_report);
             }
         }
         Ok(failures)
@@ -2775,6 +2775,25 @@ async fn report_from(
     })
 }
 
+/// The error report of the `RunFailed` a run settled without resuming ends
+/// with, for `cause`.
+pub fn settled_run_report(
+    cause: meerkat_core::lifecycle::SettledRunCause,
+) -> meerkat_core::event::AgentErrorReport {
+    let AgentEvent::RunFailed { error_report, .. } =
+        meerkat_core::lifecycle::SettledRunTerminal::new(
+            SessionId::new(),
+            RunId::new(),
+            Default::default(),
+            cause,
+        )
+        .run_failed_event()
+    else {
+        panic!("a settled run's terminal is a RunFailed");
+    };
+    error_report
+}
+
 /// What one worker of a deploy row's restart did.
 pub struct DeployRestart {
     pub member: &'static str,
@@ -2790,9 +2809,9 @@ pub struct DeployRestart {
     /// Whether an input accepted on its session after the restart ran to
     /// its end: no stop mark or resume mark outlives the restart.
     pub follow_up_consumed: bool,
-    /// The error class of every `RunFailed` the restarted session's event
+    /// The error report of every `RunFailed` the restarted session's event
     /// stream holds for the killed run.
-    pub killed_run_failures: Vec<meerkat_core::event::AgentErrorClass>,
+    pub killed_run_failures: Vec<meerkat_core::event::AgentErrorReport>,
 }
 
 /// The input a restart runs on each worker's session after reading it.

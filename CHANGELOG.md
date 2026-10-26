@@ -116,8 +116,10 @@ them.
   input was directed or a plain prompt. This covers a start that finds the
   run past its stop's max age, a refused resume, and a stop that keeps no
   work. The event is published after the settlement commits and is not
-  part of it: a crash in between, or a start whose tail repair requires a
-  reload before it serves, loses it, and no later start publishes it. An
+  part of it. A start that settles an expired run retries it for up to a
+  minute while its attachment comes to serve. A crash in between, or a
+  start whose tail repair leaves a tail standing (so the session reloads
+  instead of serving), loses it, and no later start publishes it. An
   archive that settles a kept run publishes no run terminal, since it
   serves no live actor, and neither does a suspension the runtime refuses.
 

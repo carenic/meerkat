@@ -861,19 +861,45 @@ pub(crate) async fn publish_settled_run_terminal(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     terminal: &meerkat_core::lifecycle::SettledRunTerminal,
 ) {
-    let published = match publication_handle {
-        Some(handle) => handle.publish_settled_run_terminal(terminal).await,
-        None => Err(meerkat_core::lifecycle::CoreExecutorError::Internal(
-            "no publication capability is attached".to_string(),
-        )),
-    };
-    if let Err(error) = published {
+    publish_settled_run_terminal_before(publication_handle, terminal, None).await;
+}
+
+/// [`publish_settled_run_terminal`], retried with backoff until `deadline`
+/// when one is given. A start that settles a kept run before it serves
+/// publishes through an actor whose surface may publish its exact witness
+/// only as the attachment commits; until then a publication is refused, so
+/// it is retried instead of lost.
+pub(crate) async fn publish_settled_run_terminal_before(
+    publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
+    terminal: &meerkat_core::lifecycle::SettledRunTerminal,
+    deadline: Option<Instant>,
+) {
+    let Some(handle) = publication_handle else {
         tracing::warn!(
             session_id = %terminal.session_id(),
             run_id = %terminal.run_id(),
-            %error,
-            "the settled run's terminal was not published"
+            "the settled run's terminal was not published: no publication capability is attached"
         );
+        return;
+    };
+    let mut delay_ms = 25_u64;
+    loop {
+        let Err(error) = handle.publish_settled_run_terminal(terminal).await else {
+            return;
+        };
+        let retry =
+            deadline.and_then(|deadline| retry_delay_before_deadline(delay_ms, Some(deadline)));
+        let Some(sleep_for) = retry else {
+            tracing::warn!(
+                session_id = %terminal.session_id(),
+                run_id = %terminal.run_id(),
+                %error,
+                "the settled run's terminal was not published"
+            );
+            return;
+        };
+        crate::tokio::time::sleep(sleep_for).await;
+        delay_ms = delay_ms.saturating_mul(2).min(1_000);
     }
 }
 

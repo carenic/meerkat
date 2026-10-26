@@ -3827,6 +3827,11 @@ impl std::fmt::Debug for PendingRuntimeExecutorAttachment {
     }
 }
 
+/// How long a start that settled an expired kept run keeps retrying the
+/// run's terminal while its attachment comes to serve.
+const SETTLED_RUN_TERMINAL_PUBLICATION_BOUND: std::time::Duration =
+    std::time::Duration::from_secs(60);
+
 /// The runtime-termination reason a kept run settled past its stop's max age
 /// carries to its interaction terminals.
 const EXPIRED_KEPT_RUN_TERMINATION_REASON: &str =
@@ -4191,8 +4196,11 @@ impl PendingRuntimeExecutorAttachment {
         // carries. Detached: the session actor answers a publication only
         // once this attachment is served, and this attachment is not served
         // until this returns. A failed or missing publication leaves each
-        // directed outbox as its durable retry anchor for the next drain;
-        // the run's terminal is not durable and is then lost.
+        // directed outbox as its durable retry anchor for the next drain.
+        // The run's terminal is not durable, so it is retried for a bounded
+        // time while the attachment comes to serve (a surface may publish
+        // its exact actor witness only as the attachment commits), and is
+        // lost after that.
         if !settled_batches.is_empty() || settled_terminal.is_some() {
             let publication_handle = self
                 .machine
@@ -4222,9 +4230,13 @@ impl PendingRuntimeExecutorAttachment {
                     );
                 }
                 if let Some(terminal) = settled_terminal.as_ref() {
-                    crate::control_plane::publish_settled_run_terminal(
+                    crate::control_plane::publish_settled_run_terminal_before(
                         publication_handle.as_deref(),
                         terminal,
+                        Some(
+                            meerkat_core::time_compat::Instant::now()
+                                + SETTLED_RUN_TERMINAL_PUBLICATION_BOUND,
+                        ),
                     )
                     .await;
                 }
