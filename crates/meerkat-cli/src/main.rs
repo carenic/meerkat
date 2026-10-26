@@ -17245,6 +17245,25 @@ impl meerkat_mob::MobSessionService for MobCliSessionService {
         .await
     }
 
+    /// A mob host settles a cold member's predecessor through the inner
+    /// persistent service and its canonical machine; the trait default would
+    /// refuse it `Unsupported`.
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<meerkat_runtime::ColdPredecessorSettlement, meerkat::ColdPredecessorSettleError>
+    {
+        <meerkat::PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+            &self.inner,
+            session_id,
+            claim,
+            deadline,
+        )
+        .await
+    }
+
     async fn discard_live_session_under_runtime_turn_boundary(
         &self,
         session_id: &SessionId,
@@ -34819,6 +34838,61 @@ default_model = "gpt-5.4"
             .await
             .unwrap();
         assert_boundary_discard_wrapper_publication(&wrapper, witness).await;
+    }
+
+    /// The CLI's persistent mob session wrapper forwards the cold predecessor
+    /// settlement to its inner service: the settlement's own checks answer (a
+    /// claim of another session refused `ClaimNotOwned`, nothing touched),
+    /// not the trait default's `Unsupported`.
+    #[cfg(all(feature = "mob", feature = "session-store"))]
+    #[tokio::test]
+    async fn mob_cli_session_service_forwards_the_cold_predecessor_settlement() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = sqlite_session_store(&temp);
+        let persistence = PersistenceBundle::new(
+            Arc::clone(&store),
+            Arc::new(meerkat_runtime::InMemoryRuntimeStore::new()),
+            Arc::new(meerkat_store::MemoryBlobStore::default()),
+        )
+        .expect("construct runtime authority");
+        let factory = AgentFactory::new(temp.path().join("sessions"))
+            .session_store(store)
+            .builtins(false)
+            .shell(false);
+        let (inner, _runtime_adapter) = build_cli_runtime_backed_service_with_defaults(
+            factory,
+            Config::default(),
+            persistence,
+            temp.path().join("config_state.json"),
+            None,
+            None,
+            None,
+        )
+        .expect("compose the CLI runtime-backed service");
+        let wrapper = MobCliSessionService::new(Arc::clone(&inner));
+        let settled = SessionId::new();
+        let other_session_claim = inner
+            .grant_session_hosting(&SessionId::new())
+            .expect("a hosting claim of another session");
+
+        let refused =
+            meerkat_mob::MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                &wrapper,
+                &settled,
+                &other_session_claim,
+                meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a claim of another session settles nothing");
+        assert!(
+            matches!(
+                refused.refusal,
+                meerkat::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::ClaimNotOwned
+                )
+            ),
+            "the CLI wrapper must forward the cold predecessor settlement: {refused:?}"
+        );
     }
 
     /// #1813: the CLI's persistent mob session wrapper forwards the

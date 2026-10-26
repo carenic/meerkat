@@ -82,8 +82,9 @@ them.
   settled input with its finalized receipt and, for a directed input, the
   sequence of its published terminal, the owner-loss outcome, the number of
   durable input rows read closed, and the rows whose receipt a migration made
-  permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`)
-  carries only final evidence; a deadline, a cancelled call or an error
+  permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`,
+  which the facade re-exports with its refusal enum) carries only final
+  evidence; a deadline, a cancelled call or an error
   certifies nothing, and a repeat converges from the store. A settlement that
   stops after its sweep commit can leave an outcome-unknown answer owed:
   until a repeat converges it, an archive or a stop of the session refuses,
@@ -97,7 +98,8 @@ them.
   a service with an event store repeats the call.
   `MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`
   is the same call for a mob's session service (the persistent service
-  forwards it; the default refuses `Unsupported`). The service composes the
+  forwards it, as the mob session services of `rkat-rpc` and the CLI do; the
+  default refuses `Unsupported`). The service composes the
   runtime's settlement steps, which hosts do not call themselves:
   `MeerkatMachine::begin_predecessor_settlement_before`,
   `settle_predecessor_tail_with_lease`,
