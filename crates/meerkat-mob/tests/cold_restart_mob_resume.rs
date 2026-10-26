@@ -11391,6 +11391,124 @@ async fn a_mob_start_after_a_graceful_stop_resumes_a_members_open_run_head_canon
     let _ = handle.shutdown().await;
 }
 
+/// A host that holds a restored member's run starts until it is ready (for
+/// example until it has published the member's tools) releases the hold after
+/// the member's runtime registered. The registration's own wake for the kept
+/// run came while the hold stood, so the loop parked on it, and the release
+/// woke the loop only for queued input: the run's inputs are bound to the run,
+/// never queued, so the run waited for the member's next input. The release
+/// now wakes the loop for the kept run too: with no new input, the run
+/// resumes from its last round commit, once, as soon as nothing holds it.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_members_open_run_resumes_when_the_host_releases_its_hold_without_new_input() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    held_members_open_run_resumes_on_release(&paths, runtime_store, true, "held-head-canonical")
+        .await;
+}
+
+/// The same host hold and release on WholeBlob.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_members_open_run_resumes_on_release_whole_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+            .expect("open durable runtime store"),
+    );
+    held_members_open_run_resumes_on_release(&paths, runtime_store, false, "held-whole-blob").await;
+}
+
+/// Restart over a graceful stop's kept run with the member's run starts held
+/// by the host, then release the hold with no new input: the run resumes from
+/// its last round commit, once.
+#[cfg(feature = "test-support")]
+async fn held_members_open_run_resumes_on_release(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    head_canonical: bool,
+    context: &str,
+) {
+    let run =
+        stop_gracefully_over_an_open_member_run(paths, runtime_store.clone(), head_canonical).await;
+
+    let client_2 = Arc::new(HoldingToolLoopClient::new(0));
+    let service_2 = requeue_service(
+        paths,
+        runtime_store.clone(),
+        head_canonical,
+        client_2.clone(),
+    );
+    let runtime = service_2
+        .canonical_runtime_adapter()
+        .expect("the session service's runtime owner");
+    let mut parks = runtime.run_start_held_parks();
+    let worker = AgentIdentity::from("w-1");
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(client_2.clone())
+    .notify_orchestrator_on_resume(false)
+    .hold_restored_member_run_starts(
+        meerkat_mob::HostRunStartHoldReason::ToolsNotPublished,
+        [worker.clone()],
+    )
+    .resume()
+    .await
+    .unwrap_or_else(|error| panic!("the start restores the held member: {error}"));
+    // Resume releases the mob Stop's hold and materializes the member; the
+    // host's hold still stands, so the registration parks the kept run.
+    handle.resume().await.expect("the mob resumes");
+    // The release must land after the loop parked on the hold: a release
+    // before the first lap would let the run resume without the fix. Only
+    // w-1's loop has work to park on.
+    tokio::time::timeout(Duration::from_secs(30), parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the held member's runtime loop parks on the host's hold")
+        .expect("the park counter stays open");
+    assert_eq!(
+        runtime.run_starts_held_for_test(&run.w1_sid).await,
+        Some(true),
+        "[{context}] the host's hold applies to the restored member's registration"
+    );
+    assert_eq!(
+        provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, head_canonical).await,
+        Some(run.run_id.clone()),
+        "[{context}] the held member's kept run waits for the host's release"
+    );
+    assert_eq!(
+        client_2
+            .loop_requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "[{context}] no model request while the host holds the member"
+    );
+
+    // The host is ready: it releases its hold and sends nothing else.
+    handle
+        .release_member_run_starts(
+            &worker,
+            meerkat_mob::HostRunStartHoldReason::ToolsNotPublished,
+        )
+        .await
+        .expect("the host releases its hold");
+    assert_the_open_run_resumes_once_and_completes(
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        client_2.as_ref(),
+        &run,
+        head_canonical,
+        context,
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
 /// The same graceful stop and cold start on WholeBlob: a committed read is
 /// not refused under a WholeBlob provisional tail, so the start restores the
 /// member and the run resumes from its last round commit, once.

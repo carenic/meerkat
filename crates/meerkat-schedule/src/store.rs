@@ -319,6 +319,8 @@ pub struct OccurrenceFilter {
     pub include_terminal: bool,
     pub due_after_utc: Option<DateTime<Utc>>,
     pub due_before_utc: Option<DateTime<Utc>>,
+    /// At most this many rows: the first `limit` matching rows in the
+    /// listing's `(due_at, schedule_revision, occurrence_ordinal)` order.
     pub limit: Option<usize>,
 }
 
@@ -643,6 +645,10 @@ pub trait ScheduleStore: Send + Sync {
         occurrence_id: &OccurrenceId,
     ) -> Result<Option<Occurrence>, ScheduleStoreError>;
 
+    /// The occurrences matching `filter`, in `(due_at, schedule_revision,
+    /// occurrence_ordinal)` order, with `filter.limit` applied to that order.
+    /// Paged readers (`meerkat_schedule_occurrences` with a cursor) rely on
+    /// both: a custom store must keep this order and cut by it.
     async fn list_occurrences(
         &self,
         filter: OccurrenceFilter,

@@ -3827,6 +3827,11 @@ impl std::fmt::Debug for PendingRuntimeExecutorAttachment {
     }
 }
 
+/// The runtime-termination reason a kept run settled past its stop's max age
+/// carries to its interaction terminals.
+const EXPIRED_KEPT_RUN_TERMINATION_REASON: &str =
+    "a kept run outlived the stop's max age and was settled instead of resumed";
+
 impl PendingRuntimeExecutorAttachment {
     /// The driver and completion registry of this exact pending (non-serving)
     /// attachment, under its retained mutation guard.
@@ -4098,18 +4103,26 @@ impl PendingRuntimeExecutorAttachment {
             .await?;
         // The expired run whose tail repair requires the session to reload.
         let mut reload_for_run = None;
+        // The expired run whose tail is repaired once the queued inputs are
+        // swept.
+        let mut settled_run = None;
+        // The runtime-termination carriers the expired run's settlement
+        // committed, published once the driver is released.
+        let mut settled_batches = Vec::new();
         let expired = {
             let mut driver = driver.lock().await;
             let mut expired = Vec::new();
             if let Some(run_id) = driver.resumable_run_id()
                 && driver.resumable_run_stop_requeue_expired(&run_id, now)
             {
-                let settled = driver
-                    .settle_resumable_run(
+                let (settled, batches) = driver
+                    .settle_resumable_run_with_terminals(
                         &run_id,
                         crate::input_state::InputAbandonReason::RequeueExpired,
+                        EXPIRED_KEPT_RUN_TERMINATION_REASON,
                     )
                     .await?;
+                settled_batches = batches;
                 tracing::info!(
                     session_id = %self.witness.session_id(),
                     %run_id,
@@ -4122,18 +4135,7 @@ impl PendingRuntimeExecutorAttachment {
                     self.runless_terminal.owe();
                 }
                 expired.extend(settled);
-                // The settled run never resumes, so its provisional tail is
-                // repaired as an interrupted run, after the abandonment
-                // committed: its rows stay in the transcript, and the
-                // session's next run commits its first round over the
-                // repaired body (the session layer resynchronizes the seeded
-                // actor from it at its next step).
-                if driver
-                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
-                    .await
-                {
-                    reload_for_run = Some(run_id);
-                }
+                settled_run = Some(run_id);
             }
             let candidates =
                 crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
@@ -4157,6 +4159,21 @@ impl PendingRuntimeExecutorAttachment {
                         "an input a stop kept queued was not queued at its expiry settlement; left as is"
                     );
                 }
+            }
+            // The settled run never resumes, so its provisional tail is
+            // repaired as an interrupted run, after the abandonment
+            // committed: its rows stay in the transcript, and the session's
+            // next run commits its first round over the repaired body (the
+            // session layer resynchronizes the seeded actor from it at its
+            // next step). After the queued sweep, so an expired queued input
+            // naming an earlier run is terminal by then and cannot hold the
+            // repair.
+            if let Some(run_id) = settled_run
+                && driver
+                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
+                    .await
+            {
+                reload_for_run = Some(run_id);
             }
             expired
         };
@@ -4184,6 +4201,43 @@ impl PendingRuntimeExecutorAttachment {
             return Err(RuntimeDriverError::Internal(format!(
                 "{reason}; the session reloads before it serves"
             )));
+        }
+        // The attachment serves. This runs after the runtime loop's startup
+        // drain, so the carriers the settlement committed are published
+        // here, through the publisher the attachment already carries.
+        // Detached: the session actor answers a publication only once this
+        // attachment is served, and this attachment is not served until this
+        // returns. A failed or missing publication leaves each directed
+        // outbox as its durable retry anchor for the next drain.
+        if !settled_batches.is_empty() {
+            let publication_handle = self
+                .machine
+                .sessions
+                .read()
+                .await
+                .get(self.witness.session_id())
+                .and_then(RuntimeSessionEntry::publication_handle);
+            let session_id = self.witness.session_id().clone();
+            let driver = Arc::clone(&driver);
+            let completions = Arc::clone(&completions);
+            drop(crate::tokio::spawn(async move {
+                if let Err(error) =
+                    crate::control_plane::publish_and_resolve_runless_runtime_terminations(
+                        &driver,
+                        Some(&completions),
+                        publication_handle.as_deref(),
+                        &settled_batches,
+                        EXPIRED_KEPT_RUN_TERMINATION_REASON,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "the expired kept run's terminals were not published; their outboxes stay for the next drain"
+                    );
+                }
+            }));
         }
         Ok(expired)
     }

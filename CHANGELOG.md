@@ -48,6 +48,64 @@ them.
 
 ### Added
 
+- `meerkat-schedule`: `meerkat_schedule_occurrences` takes optional bounded
+  read arguments. `occurrence_id` returns one occurrence with all of its
+  delivery receipts and answers not found when it belongs to another
+  schedule. `due_after_utc` / `due_before_utc` (inclusive, RFC 3339 with any
+  offset) and `phase` filter in the store query. `limit` (default 100 once any
+  of these options or `view: "summary"` is given, maximum 500) pages the rows
+  in due order with a `page` object (`returned`, `has_more`, `next_cursor`),
+  and `cursor` (opaque) continues after the last row, stable while new
+  occurrences are planned or a revision supersedes old ones; a cursor page
+  reads a bounded number of rows, never the rest of the history.
+  `view: "summary"` drops the trigger, the target action and prompt and the
+  machine state, in both the list and the exact read (whose receipts are
+  summarized too), and adds the due time in a calendar trigger's own
+  timezone. A call with only `schedule_id`, or with only `view: "full"`,
+  returns exactly what it returned before. `ScheduleService` gains
+  `list_occurrences_matching`, `get_schedule_occurrence` and
+  `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
+  documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
+  limit it already followed.
+
+- `meerkat-mob`: `MobStorage::member_binding_history` reads the member
+  binding history of a storage's mob with no running mob and no file path,
+  through the storage's own identity member store, so it serves every
+  storage that has one, a mob storage kept in a host store included. It
+  folds the journal and the identity intent rows as
+  `MobStorage::read_member_binding_history` folds a store file, answers an
+  empty history for a storage that holds no mob, and refuses a custom store
+  composition without the built-in identity member store as
+  `MobHandle::member_binding_history` does
+  (`MemberBindingHistoryReadError::Read` of
+  `MobStoreError::IdentityMemberAtomicPersistenceUnavailable`).
+
+- `meerkat-runtime`: `RuntimeStore::import_whole_blob_session` imports a
+  whole-blob session document into a store, create-only, as ordinary
+  writes. When the runtime has no committed document, it commits this one
+  in one atomic write (one batch on a host store, after the chunk batches of
+  a large document) together with its catalog entry and, as pending outbox
+  rows, the document's pending compaction projection intents, which
+  `commit_session_snapshot` refuses, and answers
+  `WholeBlobSessionImport::Created`. The same bytes again answer
+  `WholeBlobSessionImport::AlreadyCurrent` and write nothing; other bytes
+  are refused with `RuntimeStoreError::SessionPersistenceAuthorityConflict`
+  and nothing is written. `InMemoryRuntimeStore` and the host store adapter
+  `SpiRuntimeStore` implement it; the provided default answers
+  `Unsupported`, so a store decorator forwards it to the store it wraps.
+
+- `meerkat-runtime`: the host store reference and `ScopeFamily` now state
+  that Core never uses a scope family tag starting with `x` or `mx`, so a
+  layer above Core can keep scopes of its own in a realm without colliding
+  with a later Core family. The reference also states how Core settles a
+  commit whose outcome is unknown or unavailable (the same batch again, with
+  the same commit id, within `SpiRealmConfig::commit_retry_budget`; past it,
+  the batch's scopes are poisoned until the realm is opened again), what
+  `FenceTiming::max_commit_latency` bounds (the backoff of a session write
+  fenced by a mob's identity authority, which waits for every batch of the
+  identity scope's commit, chunk batches included, and not for a session
+  document's chunk batches), and that Core sets no deadline on a commit.
+
 - `meerkat-core`: `BoundOperationReview::consent_notice_issuer` returns the
   approval owner that issues the review's human consent, present exactly
   when R3 routes to human consent, as `consent_owner_loss_settlement` is. A
@@ -83,6 +141,55 @@ them.
   crash cut before the upgrade still has its inputs ended as
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
+
+- `meerkat-runtime`: a run that a graceful stop kept open for the next start
+  now tells its callers when it is settled instead of resumed. A kept run is
+  settled when the next start finds it past the stop's max age
+  (`RequeueExpired`), when its resume is refused, when a stop that keeps no
+  work ends it, or when the session is archived. Each of these ended the
+  run's inputs but staged no terminal for them, so the caller of a directed
+  input (a directed peer message or a tracked flow step) never saw its
+  interaction end. The settlement now stages the runtime-termination carrier
+  for the run's inputs in the same durable commit that ends them, as a stop
+  already does for the queued inputs it ends: a directed input's interaction
+  fails exactly once with an `InteractionFailed`. A nondirected kept input
+  now carries a runtime-termination receipt too: its receipt reads move from
+  pending to finalized with the runtime-terminated outcome and the
+  settlement's reason, where they used to read as a terminal without a
+  receipt (rows 0.9.5 settled still read that way). A start that settles an
+  expired kept run publishes after it releases the session, through the
+  attachment's publication capability, so a crash in between, or a surface
+  without that capability, leaves the committed carrier for the next stop or
+  start to publish.
+
+- `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
+  schedules are included; the tool lists active and paused schedules only, and
+  the description now says so.
+
+- `meerkat-runtime`: an executor attachment whose startup fails keeps the
+  inputs its registration recovered from the store, as the cleanup of a
+  failed startup has asked since 0.9.5. The runtime loop's own teardown
+  could act on the failed attachment before the owner that started it
+  retired it, and stopped those inputs: a queued prompt that a crash left
+  behind ended as stopped, and the next start ran without it. In rare cases
+  the race stalled the failed attachment's teardown instead. The loop's
+  teardown now leaves an attachment that never served to that owner, whose
+  unregister keeps every input the registration recovered for the next
+  start, unless the registration served live work. A retire or an archive
+  that meets an unserved attachment still stops every input.
+
+- `meerkat-runtime`: a run left open across a restart (kept by a graceful
+  stop, or cut by a crash after a round commit) now resumes when a run-start
+  hold on its session is released after the session registered. A host that
+  holds a restored member's run starts until it is ready
+  (`MobBuilder::hold_restored_member_run_starts`, released with
+  `MobHandle::release_member_run_starts`) left the open run waiting for the
+  member's next input: the registration's wake for the run came while the
+  hold stood, and `MeerkatMachine::release_run_starts` woke the runtime
+  loop only for queued input, while the open run's inputs are bound to the
+  run. The release now also wakes the loop when it leaves no hold and the
+  session keeps a resumable run.
+
 - `meerkat`: consent notices now record their delivery receipts. The
   governed admission of an Approved, Denied or Withdrawn notice records
   `Admitted` for its session and input (reported through
