@@ -61,6 +61,39 @@ impl Host {
         }
     }
 
+    /// The same stores as a new process opens them: the runtime store
+    /// reopened from its file with the same hosting paths, and a new machine
+    /// that holds nothing this one held in memory.
+    fn reopened(self) -> Self {
+        let Self {
+            _dir,
+            store,
+            machine,
+        } = self;
+        drop(machine);
+        let path = store.path().to_path_buf();
+        drop(store);
+        let store = Arc::new(
+            crate::store::SqliteRuntimeStore::new_head_canonical(path)
+                .unwrap()
+                .with_hosting_paths(HostingPaths {
+                    hosting_lock_dir: _dir.path().join("hosting"),
+                    cold_delivery_lock: _dir.path().join("delivery").join("cold-delivery.lock"),
+                    database: None,
+                }),
+        );
+        let machine = MeerkatMachine::persistent(
+            Arc::clone(&store) as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        )
+        .unwrap();
+        Self {
+            _dir,
+            store,
+            machine,
+        }
+    }
+
     fn claim(&self, session_id: &SessionId) -> HostingClaim {
         let claim = self
             .machine
@@ -2212,6 +2245,124 @@ async fn an_outcome_unknown_batch_a_stopped_settlement_left_is_converged_by_the_
     ));
 }
 
+/// A process restart after the sweep commit, before the drain: the queued
+/// directed input the sweep ended carries an outbox placed by the witness,
+/// which the lifecycle row no longer records, and the inputs it answered
+/// carry the pending outcome-unknown batch. A new process over the same
+/// stores settles again: its internal registration rehydrates both
+/// batches, the repeat ends and answers nothing more, every input converges
+/// (the ended one as a pending terminal, the answered ones outcome unknown,
+/// naming their run), each requester is answered once, and a further repeat
+/// publishes nothing.
+#[tokio::test]
+async fn a_restart_after_the_sweep_rehydrates_both_batches_and_answers_each_requester_once() {
+    let host = Host::head_canonical();
+    let left_run = RunId::new();
+    let l1 = directed_step("consumed without a receipt");
+    let l2 = prompt("consumed without a receipt too");
+    let left_inputs: [&Input; 2] = [&l1, &l2];
+    let (session_id, _) =
+        durable_session_built(&host, Some((&left_run, &left_inputs[..])), None).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let d2 = directed_step("queued directed by the predecessor");
+    host.persist(&session_id, queued(&d2, 1)).await;
+    let claim = host.claim(&session_id);
+
+    let mut first = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the first attempt begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut first)
+        .await
+        .expect("the first drive answers");
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut first, deadline())
+        .await
+        .expect("the sweep commits");
+    assert_eq!(work.ended, vec![d2.id().clone()]);
+    assert_eq!(sorted(work.answered), sorted_ids(&[&l1, &l2]));
+    // The process ends here: the registration goes without a drain.
+    drop(first);
+    let rows = host.rows(&session_id).await;
+    let outbox = stored_row(&rows, &d2)
+        .state
+        .interaction_terminal_outbox
+        .as_ref()
+        .expect("the ended directed input's outbox is durable");
+    assert_eq!(
+        outbox.owner_agent_runtime_id.as_deref(),
+        Some(PLACED_RUNTIME),
+        "instrument: the outbox names the witness's placement"
+    );
+    let (version, witness) = lifecycle_record(&host, &session_id).await;
+    assert_ne!(
+        version, 7,
+        "instrument: the sweep commit wrote the row back"
+    );
+    assert_eq!(witness, None, "instrument: the row no longer records it");
+    drop(claim);
+    lineage_ended(&host, &session_id).await;
+
+    let host = host.reopened();
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let repeat = settle_whole(&host, &claim, &publisher).await;
+
+    assert!(repeat.tail.is_none());
+    assert!(repeat.work.ended.is_empty(), "the repeat ends nothing");
+    assert!(
+        repeat.work.answered.is_empty(),
+        "the repeat answers nothing again"
+    );
+    let publication = repeat
+        .publication
+        .expect("the census finds every row closed");
+    assert!(publication.owed.is_empty());
+    assert_eq!(publication.durable_rows_closed, 3);
+    assert_eq!(
+        settled_input(&publication, &d2).settled_by,
+        SettledBy::PendingTerminalConverged
+    );
+    for input in [&l1, &l2] {
+        let settled = settled_input(&publication, input);
+        assert_eq!(settled.settled_by, SettledBy::OutcomeUnknown);
+        assert!(matches!(
+            settled.receipt.outcome(),
+            CompletionOutcome::OutcomeUnknown { run_id } if run_id == &left_run
+        ));
+    }
+    let events = publisher.events();
+    assert_eq!(events.len(), 2, "{events:?}");
+    assert!(matches!(
+        published_for(&events, &d2),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::Abandoned { detail },
+            ..
+        } if detail == "runtime stopped"
+    ));
+    assert!(matches!(
+        published_for(&events, &l1),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::OutcomeUnknown,
+            ..
+        }
+    ));
+
+    let again = settle_whole(&host, &claim, &publisher).await;
+    assert!(
+        again
+            .publication
+            .expect("a further repeat finds every row closed")
+            .converged
+            .is_empty()
+    );
+    assert_eq!(publisher.events().len(), 2, "nothing is published twice");
+}
+
 // ---------------------------------------------------------------------------
 // Deadlines and publication inside the process-owned task
 // ---------------------------------------------------------------------------
@@ -2659,8 +2810,9 @@ async fn a_terminal_appended_before_its_receipt_is_replayed_once_by_the_repeat()
 // The mixed predecessor
 // ---------------------------------------------------------------------------
 
-/// Everything at once (R1's predecessor plus the inputs an earlier boundary
-/// of another run consumed without a receipt): the writer drive commits the
+/// Everything at once (a tail with its contributors, queued and cancelled
+/// work beside it, and the inputs an earlier boundary of another run
+/// consumed without a receipt): the writer drive commits the
 /// tail with its contributors' batch (the earlier run left no batch, so the
 /// tail's is the only run-scoped one); one sweep commit ends the queued
 /// inputs `Stopped`, answers the earlier run's inputs outcome unknown and
