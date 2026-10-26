@@ -67,6 +67,27 @@ them.
   `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
   documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
   limit it already followed.
+- `meerkat-mob`: `QueuedInputsOnShutdown::Keep` (the enum is
+  `#[non_exhaustive]`, so the variant is additive). A mob Shutdown with it
+  unregisters each member with the runtime's `UnregisterQueuedInputs::Keep`,
+  and changes nothing it finds: a member whose registration served no live
+  work keeps every input it recovered as the Shutdown finds it, with no
+  requeue mark, and the run its session left open, and an autonomous
+  member's kickoff stays open. The boot's ordinary recovery may still
+  normalize a staged input whose run cannot continue to queued, as every
+  start does; the Keep leaves that as it is. A member whose registration
+  served live work is stopped, as under `Stop`. For a host that boots over
+  a store another host serves, holds its members' run starts, and must
+  hand back unchanged what it finds. While a
+  member's host holds its run starts, a kickoff an earlier Shutdown kept in
+  flight is re-attached at the host's release
+  (`MobHandle::release_member_run_starts`) instead of at the member's
+  restore, so the restore serves the member no work and a `Keep` Shutdown
+  keeps the kickoff open.
+- `meerkat-runtime`: `MeerkatMachine::registration_run_start_hold_staged`
+  answers whether a run-start hold reason is staged for a session's
+  registration, as a host's hold on a member's run starts stays until the
+  host releases it.
 
 - `meerkat-mob`: `MobStorage::member_binding_history` reads the member
   binding history of a storage's mob with no running mob and no file path,

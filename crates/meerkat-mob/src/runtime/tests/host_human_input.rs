@@ -40,6 +40,9 @@ fn llm_identity(session: &Session) -> SessionLlmIdentity {
 struct ScriptedClient {
     requests: Arc<Mutex<Vec<meerkat_client::LlmRequest>>>,
     released: tokio::sync::watch::Sender<bool>,
+    /// How many of the next requests answer at once with a `peers` tool
+    /// call, released or not ([`Self::call_a_tool_next`]).
+    tool_rounds: Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl ScriptedClient {
@@ -48,7 +51,16 @@ impl ScriptedClient {
         Self {
             requests: Arc::new(Mutex::new(Vec::new())),
             released,
+            tool_rounds: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
         }
+    }
+
+    /// Answer the next request at once with a `peers` tool call, released or
+    /// not: the run commits that round and asks the model again, so a run
+    /// blocked on that next request has a committed round to continue from.
+    fn call_a_tool_next(&self) {
+        self.tool_rounds
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 
     fn requests(&self) -> Vec<meerkat_client::LlmRequest> {
@@ -95,17 +107,34 @@ impl meerkat_client::LlmClient for ScriptedClient {
             requests.push(request.clone());
             requests.len()
         };
+        let tool_round = self
+            .tool_rounds
+            .fetch_update(
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+                |rounds| rounds.checked_sub(1),
+            )
+            .is_ok();
         let mut released = self.released.subscribe();
         Box::pin(async_stream::try_stream! {
-            while !*released.borrow_and_update() {
-                if released.changed().await.is_err() {
-                    break;
+            if tool_round {
+                yield meerkat_client::LlmEvent::ToolCallComplete {
+                    id: format!("round-call-{sequence}"),
+                    name: "peers".to_string(),
+                    args: serde_json::json!({}),
+                    meta: None,
+                };
+            } else {
+                while !*released.borrow_and_update() {
+                    if released.changed().await.is_err() {
+                        break;
+                    }
                 }
+                yield meerkat_client::LlmEvent::TextDelta {
+                    delta: format!("executor-answer-{sequence}"),
+                    meta: None,
+                };
             }
-            yield meerkat_client::LlmEvent::TextDelta {
-                delta: format!("executor-answer-{sequence}"),
-                meta: None,
-            };
             yield meerkat_client::LlmEvent::UsageUpdate {
                 usage: meerkat_core::TurnUsage::host_declared(
                     Provider::OpenAI,
@@ -113,8 +142,13 @@ impl meerkat_client::LlmClient for ScriptedClient {
                     Usage::default(),
                 ),
             };
+            let stop = if tool_round {
+                meerkat_core::StopReason::ToolUse
+            } else {
+                meerkat_core::StopReason::EndTurn
+            };
             yield meerkat_client::LlmEvent::Done {
-                outcome: meerkat_client::LlmDoneOutcome::success(meerkat_core::StopReason::EndTurn),
+                outcome: meerkat_client::LlmDoneOutcome::success(stop),
             };
         })
     }
@@ -1884,6 +1918,18 @@ async fn open_stop_host(
     client: &ScriptedClient,
     label: Option<&str>,
 ) -> StopHost {
+    open_stop_host_holding(root, client, label, &[]).await
+}
+
+/// [`open_stop_host`], with the run starts of the `held` members the resume
+/// restores held by their host (`ToolsNotPublished`): they register held and
+/// start no run.
+async fn open_stop_host_holding(
+    root: &std::path::Path,
+    client: &ScriptedClient,
+    label: Option<&str>,
+    held: &[AgentIdentity],
+) -> StopHost {
     let factory = meerkat::AgentFactory::new(root.join("factory-store"))
         .user_config_root(root.join("config"))
         .runtime_root(root.join("runtime"))
@@ -1951,6 +1997,10 @@ async fn open_stop_host(
                 .with_session_service(service.clone())
                 .with_default_llm_client(Arc::new(client.clone()))
                 .notify_orchestrator_on_resume(false)
+                .hold_restored_member_run_starts(
+                    crate::HostRunStartHoldReason::ToolsNotPublished,
+                    held.iter().cloned(),
+                )
                 .resume(),
         )
         .await
@@ -2890,6 +2940,207 @@ async fn keeps_a_queued_human_input_across_the_shutdown(
         .expect("mob shutdown");
 }
 
+/// Every durable input row of `session_id`'s runtime as its stored wire
+/// image, in input id order.
+async fn member_input_rows(
+    runtime_store: &Arc<dyn RuntimeStore>,
+    session_id: &SessionId,
+) -> Vec<(String, serde_json::Value)> {
+    let mut rows = runtime_store
+        .load_input_states(&LogicalRuntimeId::for_session(session_id))
+        .await
+        .expect("runtime-owned input rows")
+        .into_iter()
+        .map(|row| match row {
+            meerkat_runtime::store::InputStateRow::Decoded(stored) => (
+                stored.state.input_id.to_string(),
+                serde_json::to_value(&*stored).expect("the row's stored wire image"),
+            ),
+            meerkat_runtime::store::InputStateRow::Corrupt { input_id, detail } => {
+                panic!("input row {input_id} does not decode: {detail}")
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+/// A Shutdown with `QueuedInputsOnShutdown::Keep` over a member whose
+/// registration served nothing changes nothing it finds. The first process
+/// shuts down with a requeue while a turn runs, its first round committed (a
+/// tool call) and its second request blocked, and a second input waits
+/// behind it, so the store holds the member's open run with a round to
+/// continue from and its requeued input. The second process restores the mob
+/// with the member's run starts held by its host, so the member's
+/// registration recovers both and runs nothing, and shuts down with Keep:
+/// every input row of the member reads the same before the Keep (after the
+/// held restore, whose ordinary recovery may normalize an input as every
+/// start does) and after it, and its model saw no request. The third process
+/// resumes the run and runs the queued input, once each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("keep-shutdown")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    // The running turn's first request calls a tool, which commits that
+    // round; its second request blocks, so the run stays open with a round
+    // to continue from, which a held restart marks as resumable.
+    client.call_a_tool_next();
+    let requests_before = client.requests().len();
+    let running_key = delivery("keep-running");
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &running_key,
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 2).await;
+    let running_id = admitted_input_id(&host.runtime_store, &session_id, &running_key).await;
+    let key = delivery("keep-queued-behind");
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = start_stop_input(&host, &entry, spec.clone(), HandlingMode::Queue, &key)
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    assert_eq!(
+        (
+            stop_answer(running, &session_id).await,
+            stop_answer(queued, &session_id).await,
+        ),
+        (
+            StopAnswer::RequeuedAcrossStop(running_id.clone()),
+            StopAnswer::RequeuedAcrossStop(input_id.clone()),
+        ),
+        "the first process keeps the running turn and the queued input"
+    );
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The second process holds the member and serves it nothing.
+    let held_client = ScriptedClient::new(true);
+    let held = open_stop_host_holding(
+        &root_path,
+        &held_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = held.adapter.run_start_held_parks();
+    // Hang guard only: the park is the positive event.
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    assert!(
+        held.adapter.resumable_run_id(&session_id).await.is_some(),
+        "the held registration keeps the open run marked"
+    );
+    // The baseline is the store as the held restore left it: the boot's
+    // ordinary recovery, which every start runs, may already have
+    // normalized an input. The Keep is measured across its own Shutdown.
+    let rows_before = member_input_rows(&held.runtime_store, &session_id).await;
+    let digests_before = (
+        stop_row(&held.runtime_store, &session_id, &running_key, &running_id)
+            .await
+            .digest,
+        stop_row(&held.runtime_store, &session_id, &key, &input_id)
+            .await
+            .digest,
+    );
+    tokio::time::timeout(
+        WAIT,
+        held.handle.shutdown_with_report(
+            crate::ShutdownOptions::default()
+                .with_queued_inputs(crate::QueuedInputsOnShutdown::Keep),
+        ),
+    )
+    .await
+    .expect("the keep stop finishes")
+    .expect("keep stop");
+    let rows_after = member_input_rows(&held.runtime_store, &session_id).await;
+    let digests_after = (
+        stop_row(&held.runtime_store, &session_id, &running_key, &running_id)
+            .await
+            .digest,
+        stop_row(&held.runtime_store, &session_id, &key, &input_id)
+            .await
+            .digest,
+    );
+    assert_eq!(
+        held_client.requests().len(),
+        0,
+        "the held member ran nothing"
+    );
+    assert_eq!(
+        (rows_after, digests_after),
+        (rows_before, digests_before),
+        "the Keep itself changes no input row: a keep stop of a registration that served \
+         nothing leaves every row as the held restore left it"
+    );
+    drop(held);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The third process runs the kept run and the queued input, once each.
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_requeued_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+        QUEUED_HUMAN,
+    )
+    .await;
+    let running_phase = stop_row(
+        &restarted.runtime_store,
+        &session_id,
+        &running_key,
+        &running_id,
+    )
+    .await
+    .stored
+    .seed
+    .phase;
+    assert_eq!(
+        (after_restart, running_phase),
+        (
+            RequeuedAfterRestart {
+                replay: StopAnswer::Succeeded,
+                phase: InputLifecycleState::Consumed,
+                outcome: serde_json::json!({"outcome_type": "consumed"}),
+                payload_kept: false,
+                requests_carrying: 1,
+                runs_started: 1,
+            },
+            InputLifecycleState::Consumed,
+        ),
+        "the next start resumes the kept run and runs the queued input once"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
 /// A requeued input older than the requeue bound when the next start
 /// recovers it ends as expired instead of running: payload retired, no run,
 /// no model request, and a same-key replay answers the expiry. A later start
@@ -3789,7 +4040,8 @@ fn requeue_max_age_refuses_zero_and_over_the_cap() {
 
 /// The default Shutdown choice is `RequeueDurable`. It resolves per session:
 /// a requeue with the default bound for a session that commits each round
-/// durably, a stop for any other. An explicit choice applies as given.
+/// durably, a stop for any other. An explicit choice applies as given, and a
+/// keep is the runtime's keep for every session.
 #[test]
 fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
     use crate::{QueuedInputsOnShutdown, RequeueMaxAge, ShutdownOptions};
@@ -3812,6 +4064,8 @@ fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
             QueuedInputsOnShutdown::RequeueDurable.unregister_queued_inputs(false),
             QueuedInputsOnShutdown::Stop.unregister_queued_inputs(true),
             QueuedInputsOnShutdown::Requeue(bound).unregister_queued_inputs(false),
+            QueuedInputsOnShutdown::Keep.unregister_queued_inputs(true),
+            QueuedInputsOnShutdown::Keep.unregister_queued_inputs(false),
         ],
         [
             UnregisterQueuedInputs::Requeue {
@@ -3822,6 +4076,8 @@ fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
             UnregisterQueuedInputs::Requeue {
                 max_age: Duration::from_secs(90),
             },
+            UnregisterQueuedInputs::Keep,
+            UnregisterQueuedInputs::Keep,
         ]
     );
 }
@@ -5229,6 +5485,197 @@ async fn a_kept_kickoff_whose_input_already_ended_resolves_from_its_receipt() {
         ),
         (crate::roster::MobMemberKickoffPhase::Started, true, 0),
         "the ended kickoff input's receipt resolves the kickoff, and nothing is admitted again"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
+/// The Keep row of a member whose kickoff run is still in flight at the
+/// first process's requeue Shutdown, its first round committed (a tool call)
+/// and its second request blocked, which keeps the kickoff and its run. The
+/// second process restores the mob with the member's run starts held by its
+/// host and shuts down with Keep. While the host holds the member, its kept
+/// kickoff is not re-attached (a re-attach is a deduplicated resubmission,
+/// live work after which the Keep keeps nothing and settles the kickoff), so
+/// every input row of the member is the same before and after the Keep, and
+/// its model saw no request. The third process holds the member again until
+/// its host releases it: the release re-attaches the kickoff, whose run
+/// resumes and resolves it as started under the same objective, its prompt
+/// asked of the model once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_release() {
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(false);
+    let host = open_stop_host(&root_path, &client, Some("keep-kickoff")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let identity = AgentIdentity::from(format!("host-human-stop-{}", Uuid::new_v4().simple()));
+    // The kickoff run's first request calls a tool, which commits that
+    // round; its second request blocks, so the run stays open with a round
+    // to continue from, which a held restart marks as resumable.
+    client.call_a_tool_next();
+    let session_id = host
+        .handle
+        .spawn(
+            ProfileName::from("lead"),
+            identity.clone(),
+            Some(KEPT_KICKOFF.into()),
+        )
+        .await
+        .expect("spawn autonomous member")
+        .bridge_session_id()
+        .expect("local session member")
+        .clone();
+    client.wait_for_requests(2).await;
+    let before = host
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is in the roster")
+        .kickoff
+        .expect("the member has a kickoff");
+    let report = tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
+    assert_eq!(
+        (report.runs.get(&identity), kickoff_run.is_some()),
+        (None, true),
+        "the first process keeps the kickoff and its run"
+    );
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The second process holds the member and serves it nothing.
+    let held_client = ScriptedClient::new(true);
+    let held = open_stop_host_holding(
+        &root_path,
+        &held_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = held.adapter.run_start_held_parks();
+    // Hang guard only: the park is the positive event.
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    let held_kickoff = held
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is restored")
+        .kickoff
+        .expect("the member has a kickoff");
+    assert_eq!(
+        (
+            held.adapter.resumable_run_id(&session_id).await,
+            held_kickoff.phase,
+        ),
+        (
+            kickoff_run.clone(),
+            crate::roster::MobMemberKickoffPhase::Starting,
+        ),
+        "the held registration keeps the kickoff's run marked, and the kickoff is still starting"
+    );
+    // The baseline is the store as the held restore left it: the boot's
+    // ordinary recovery, which every start runs, may already have
+    // normalized an input. The Keep is measured across its own Shutdown.
+    let rows_before = member_input_rows(&held.runtime_store, &session_id).await;
+    tokio::time::timeout(
+        WAIT,
+        held.handle.shutdown_with_report(
+            crate::ShutdownOptions::default()
+                .with_queued_inputs(crate::QueuedInputsOnShutdown::Keep),
+        ),
+    )
+    .await
+    .expect("the keep stop finishes")
+    .expect("keep stop");
+    let rows_after = member_input_rows(&held.runtime_store, &session_id).await;
+    assert_eq!(
+        (held_client.requests().len(), rows_after),
+        (0, rows_before),
+        "the Keep itself changes no input row: a keep stop of a held member leaves the rows of \
+         its kept kickoff as the held restore left them, and the member ran nothing"
+    );
+    drop(held);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The third process holds the member until its host releases it.
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host_holding(
+        &root_path,
+        &restarted_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = restarted.adapter.run_start_held_parks();
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    let requests_while_held = restarted_client.requests().len();
+    let run_while_held = restarted.adapter.resumable_run_id(&session_id).await;
+    let phase_while_held = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is restored")
+        .kickoff
+        .expect("the member has a kickoff")
+        .phase;
+    restarted
+        .handle
+        .release_member_run_starts(&identity, crate::HostRunStartHoldReason::ToolsNotPublished)
+        .await
+        .expect("the host releases the member's run starts");
+    tokio::time::timeout(WAIT, restarted.handle.wait_for_kickoff_complete(Some(WAIT)))
+        .await
+        .expect("the kept kickoff resolves after the release")
+        .expect("kickoff wait");
+    let after = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member survives the restarts")
+        .kickoff
+        .expect("the member keeps its kickoff");
+    assert_eq!(
+        (
+            requests_while_held,
+            run_while_held,
+            phase_while_held,
+            after.phase,
+            after.objective_id == before.objective_id,
+            requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
+        ),
+        (
+            0,
+            kickoff_run,
+            crate::roster::MobMemberKickoffPhase::Starting,
+            crate::roster::MobMemberKickoffPhase::Started,
+            true,
+            1,
+        ),
+        "the Keep left the kickoff starting with its run marked; the host's release re-attaches \
+         it, and its run resumes once and resolves it under the same objective"
     );
     tokio::time::timeout(WAIT, restarted.handle.shutdown())
         .await

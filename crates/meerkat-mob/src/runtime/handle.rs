@@ -9006,6 +9006,10 @@ impl MobHandle {
     /// that does not hold `reason` is an Ok no-op; a non-member is
     /// [`MobError::MemberNotFound`].
     ///
+    /// A kickoff a Shutdown kept in flight for the member waits for this
+    /// release while the host holds the member: the release re-attaches it,
+    /// so it resolves once its resumed run ends.
+    ///
     /// Known limit: this release is a send-class command, so a mob whose
     /// admission is closed refuses it with [`MobError::AdmissionClosed`]. A
     /// member still held when admission closes (for example by an
@@ -15918,7 +15922,10 @@ impl MobHandle {
     /// round, and its eligible queued inputs run after it), and ends them as
     /// stopped for any other member;
     /// [`QueuedInputsOnShutdown::Stop`](super::QueuedInputsOnShutdown::Stop)
-    /// ends them as stopped for every member, as before 0.9.5.
+    /// ends them as stopped for every member, as before 0.9.5;
+    /// [`QueuedInputsOnShutdown::Keep`](super::QueuedInputsOnShutdown::Keep)
+    /// changes nothing of the members' work it finds, for a host that served
+    /// its members nothing.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,
