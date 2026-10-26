@@ -1914,14 +1914,23 @@ impl MeerkatMachine {
         }
     }
 
+    /// The registration's runtime authority, from the session's converged
+    /// lifecycle row. `placement_witness` is a predecessor settlement's: the
+    /// converged row also carries it until the settlement's sweep commit.
     async fn runtime_authority_for_registration(
         &self,
         runtime_id: &LogicalRuntimeId,
         session_id: &SessionId,
         runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<super::driver::ReconciledRuntimeAuthority, RuntimeDriverError> {
         let mut reconciled = self
-            .unheld_runtime_authority_for_registration(runtime_id, session_id, runtime_epoch_id)
+            .unheld_runtime_authority_for_registration(
+                runtime_id,
+                session_id,
+                runtime_epoch_id,
+                placement_witness,
+            )
             .await?;
         // A new entry's authority carries the staged run-start holds (#1500)
         // before any runtime loop exists for it.
@@ -1945,6 +1954,7 @@ impl MeerkatMachine {
         runtime_id: &LogicalRuntimeId,
         session_id: &SessionId,
         runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<super::driver::ReconciledRuntimeAuthority, RuntimeDriverError> {
         let Some(store) = self.store.as_ref() else {
             return Ok(super::driver::ReconciledRuntimeAuthority {
@@ -1961,11 +1971,12 @@ impl MeerkatMachine {
                 unregister_progress: None,
             });
         };
-        super::driver::reconcile_runtime_authority_for_cold_recovery(
+        super::driver::reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
             store.as_ref(),
             runtime_id,
             session_id,
             runtime_epoch_id,
+            placement_witness,
         )
         .await
     }
@@ -3226,7 +3237,7 @@ impl MeerkatMachine {
             .ops_state_for_registration(&session_id, &runtime_id)
             .await?;
         let recovery = self
-            .runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
+            .runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1, None)
             .await?;
         let (mut entry, cold_recovered_generated_draining) = self
             .prepare_registered_session_entry(
@@ -3422,9 +3433,14 @@ impl MeerkatMachine {
                 // prepared entry stay boxed until the call that consumes them,
                 // instead of being copied through this frame and the caller's.
                 let recovery = crate::stack_relief::box_in_own_frame(|| async {
-                    self.runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
-                        .await
-                        .map(Box::new)
+                    self.runtime_authority_for_registration(
+                        &runtime_id,
+                        &session_id,
+                        &ops_state.1,
+                        None,
+                    )
+                    .await
+                    .map(Box::new)
                 })
                 .await?;
                 tracing::debug!(
@@ -5051,7 +5067,12 @@ impl MeerkatMachine {
                     }
                 };
                 let recovery = match self
-                    .runtime_authority_for_registration(&runtime_id, &session_id, &recovered_epoch)
+                    .runtime_authority_for_registration(
+                        &runtime_id,
+                        &session_id,
+                        &recovered_epoch,
+                        None,
+                    )
                     .await
                 {
                     Ok(recovery) => recovery,

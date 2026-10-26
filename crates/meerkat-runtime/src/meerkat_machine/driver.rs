@@ -8914,11 +8914,39 @@ pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
     session_id: &SessionId,
     runtime_epoch_id: &meerkat_core::RuntimeEpochId,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
+    reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+        store,
+        runtime_id,
+        session_id,
+        runtime_epoch_id,
+        None,
+    )
+    .await
+}
+
+/// [`reconcile_runtime_authority_for_cold_recovery`] for a predecessor
+/// settlement whose directed work still needs a terminal outbox: the
+/// converged row also carries `placement_witness`, the session's last
+/// runtime placement, as a placement witness (record version 7), so a crash
+/// before the settlement's sweep commit keeps the only durable copy of it.
+/// The classifier never reads the witness, so a row that carries it is
+/// converged as it is and written once; every later writer that builds its
+/// row from its own authority drops it.
+pub(crate) async fn reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+    placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
+) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     reconcile_runtime_authority_for_cold_recovery_id(
         store,
         runtime_id,
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
         &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
+        placement_witness
+            .map(crate::input_state::InteractionTerminalPlacement::lifecycle_binding)
+            .as_ref(),
     )
     .await
 }
@@ -8928,6 +8956,7 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     runtime_id: &LogicalRuntimeId,
     session_id: &crate::meerkat_machine::dsl::SessionId,
     runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
+    placement_witness: Option<&crate::store::MachineLifecycleBindingFacts>,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     loop {
         let observed = match store.observe_machine_lifecycle(runtime_id).await {
@@ -8962,12 +8991,29 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
         };
         match runtime_authority_reconcile_decision_for_observation(&observed)? {
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::Converged => {
-                let crate::store::MachineLifecycleObservation::Decoded { record, .. } = observed
+                let crate::store::MachineLifecycleObservation::Decoded { record, version } =
+                    observed
                 else {
                     return Err(RuntimeDriverError::Internal(
                         "runtime-authority classifier converged a non-decoded row".to_string(),
                     ));
                 };
+                if let Some(witness) = placement_witness
+                    && record.placement_witness() != Some(witness)
+                {
+                    // The converged row keeps its shape and gains the
+                    // witness, written once, fenced on the row just read.
+                    let replacement =
+                        converged_lifecycle_commit_with_placement_witness(&record, witness)?;
+                    compare_and_swap_reconciled_lifecycle(
+                        store,
+                        runtime_id,
+                        crate::store::MachineLifecycleExpectedVersion::Version(version),
+                        replacement,
+                    )
+                    .await?;
+                    continue;
+                }
                 return registered_runtime_authority_from_converged_record_id(
                     session_id,
                     runtime_epoch_id,
@@ -9009,35 +9055,10 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
                         supervisor_authority,
                         unregister_progress,
                         live_bridge_recovery,
-                    );
-                match store
-                    .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
-                    .await
-                {
-                    Ok(crate::store::MachineLifecycleCasOutcome::Applied { .. }) => continue,
-                    Ok(crate::store::MachineLifecycleCasOutcome::Conflict { .. }) => {
-                        // A concurrent writer won the target-local CAS. The
-                        // caller owns scheduling: return a typed requeue rather
-                        // than spinning inside one recovery invocation.
-                        return Err(RuntimeDriverError::RecoveryBackoff {
-                            reason: "runtime lifecycle CAS conflicted; re-observe on the next reconciliation pass".to_string(),
-                        });
-                    }
-                    Err(crate::store::RuntimeStoreError::MachineLifecycleRepairBlocked {
-                        evidence_digest,
-                        detail,
-                    }) => {
-                        return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                            evidence_digest,
-                            reason: detail,
-                        });
-                    }
-                    Err(error) => {
-                        return Err(RuntimeDriverError::RecoveryBackoff {
-                            reason: error.to_string(),
-                        });
-                    }
-                }
+                    )
+                    .with_placement_witness(placement_witness.cloned());
+                compare_and_swap_reconciled_lifecycle(store, runtime_id, expected, replacement)
+                    .await?;
             }
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::RepairBlocked
             | crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::Quarantine => {
@@ -9055,6 +9076,67 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     }
 }
 
+/// Apply one reconcile replacement of the lifecycle row, fenced on the row
+/// the pass observed. `Ok` means the replacement landed and the caller
+/// observes again; a lost race answers a typed requeue rather than spinning
+/// inside one recovery invocation.
+async fn compare_and_swap_reconciled_lifecycle(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    expected: crate::store::MachineLifecycleExpectedVersion,
+    replacement: crate::store::MachineLifecycleCommit,
+) -> Result<(), RuntimeDriverError> {
+    match store
+        .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+        .await
+    {
+        Ok(crate::store::MachineLifecycleCasOutcome::Applied { .. }) => Ok(()),
+        Ok(crate::store::MachineLifecycleCasOutcome::Conflict { .. }) => {
+            // A concurrent writer won the target-local CAS. The caller owns
+            // scheduling: return a typed requeue rather than spinning inside
+            // one recovery invocation.
+            Err(RuntimeDriverError::RecoveryBackoff {
+                reason:
+                    "runtime lifecycle CAS conflicted; re-observe on the next reconciliation pass"
+                        .to_string(),
+            })
+        }
+        Err(crate::store::RuntimeStoreError::MachineLifecycleRepairBlocked {
+            evidence_digest,
+            detail,
+        }) => Err(RuntimeDriverError::RecoveryRepairBlocked {
+            evidence_digest,
+            reason: detail,
+        }),
+        Err(error) => Err(RuntimeDriverError::RecoveryBackoff {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The converged row `record` exactly as it is, carrying `witness`.
+fn converged_lifecycle_commit_with_placement_witness(
+    record: &crate::store::DecodedMachineLifecycleObservation,
+    witness: &crate::store::MachineLifecycleBindingFacts,
+) -> Result<crate::store::MachineLifecycleCommit, RuntimeDriverError> {
+    let runtime_state = record.runtime_state().ok_or_else(|| {
+        RuntimeDriverError::Internal(
+            "runtime-authority classifier converged a row without a lifecycle phase".to_string(),
+        )
+    })?;
+    Ok(
+        crate::store::MachineLifecycleCommit::new_with_binding_run_unregister_progress_and_live_bridge(
+            runtime_state,
+            record.binding().clone(),
+            record.run().clone(),
+            record.supervisor_authority().clone(),
+            record.unregister_progress().cloned(),
+            record.live_bridge_recovery().clone(),
+        )
+        .with_placement_witness(Some(witness.clone())),
+    )
+}
+
 #[cfg(test)]
 pub(crate) async fn machine_recover_persistent_driver(
     store: &dyn crate::store::RuntimeStore,
@@ -9069,6 +9151,7 @@ pub(crate) async fn machine_recover_persistent_driver(
         &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
             &meerkat_core::RuntimeEpochId::new(),
         ),
+        None,
     )
     .await?;
     let recovered_unregister_progress = reconciled.unregister_progress;
@@ -14647,6 +14730,134 @@ mod recovery_tests {
         );
         assert_eq!(record.supervisor_authority(), &supervisor);
         assert_eq!(record.unregister_progress(), Some(&unregister_progress));
+    }
+
+    /// A predecessor settlement's reconcile keeps its placement witness in
+    /// the clean row it converges to (record version 7), whether it
+    /// normalizes a bound row or finds the row converged without it, and
+    /// writes it once: a converged row that already carries it is left as it
+    /// is, by the settlement's repeat and by a plain registration alike.
+    #[tokio::test]
+    async fn a_settlement_reconcile_keeps_its_placement_witness_in_the_converged_row() {
+        use crate::store::{MachineLifecycleObservation, RuntimeStore};
+
+        let placement = crate::input_state::InteractionTerminalPlacement {
+            agent_runtime_id: "predecessor-runtime".to_string(),
+            fence_token: 41,
+            runtime_generation: 9,
+            runtime_epoch_id: Some("predecessor-epoch".to_string()),
+        };
+        let observe = |store: &crate::store::memory::InMemoryRuntimeStore,
+                       runtime_id: &LogicalRuntimeId| {
+            let store = store.clone();
+            let runtime_id = runtime_id.clone();
+            async move {
+                let MachineLifecycleObservation::Decoded { record, version } = store
+                    .observe_machine_lifecycle(&runtime_id)
+                    .await
+                    .expect("observe the lifecycle row")
+                else {
+                    panic!("the lifecycle row decodes");
+                };
+                (record, version)
+            }
+        };
+
+        // A bound row: normalization writes the clean row with the witness.
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let store = crate::store::memory::InMemoryRuntimeStore::new();
+        store
+            .commit_machine_lifecycle(
+                &runtime_id,
+                crate::store::MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Idle,
+                    placement.lifecycle_binding(),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
+            .await
+            .expect("persist the predecessor's bound row");
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the settlement's reconcile converges");
+        let (record, version) = observe(&store, &runtime_id).await;
+        assert_eq!(record.runtime_state(), Some(RuntimeState::Idle));
+        assert_eq!(
+            record.binding(),
+            &crate::store::MachineLifecycleBindingFacts::default()
+        );
+        assert_eq!(
+            record.record_version(),
+            crate::store::PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        );
+        assert_eq!(
+            record.placement_witness(),
+            Some(&placement.lifecycle_binding())
+        );
+
+        // Converged with the witness: the repeat and a plain registration
+        // write nothing.
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the repeat converges");
+        reconcile_runtime_authority_for_cold_recovery(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("a plain registration converges");
+        assert_eq!(observe(&store, &runtime_id).await.1, version);
+
+        // A clean row without the witness: the settlement writes it once.
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let store = crate::store::memory::InMemoryRuntimeStore::new();
+        store
+            .commit_machine_lifecycle(
+                &runtime_id,
+                crate::store::MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Idle,
+                    crate::store::MachineLifecycleBindingFacts::default(),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
+            .await
+            .expect("persist a clean row");
+        let (clean, clean_version) = observe(&store, &runtime_id).await;
+        assert_eq!(clean.placement_witness(), None);
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the settlement's reconcile converges");
+        let (witnessed, witnessed_version) = observe(&store, &runtime_id).await;
+        assert_ne!(witnessed_version, clean_version);
+        assert_eq!(
+            witnessed.placement_witness(),
+            Some(&placement.lifecycle_binding())
+        );
+        assert_eq!(witnessed.binding(), clean.binding());
     }
 
     #[tokio::test]

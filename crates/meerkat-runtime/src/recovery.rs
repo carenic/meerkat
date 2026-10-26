@@ -2110,6 +2110,9 @@ struct ObservedPersistedLifecycle {
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<crate::store::MachineUnregisterProgressSnapshot>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    /// The placement witness the row carries (record version 7), which the
+    /// commit re-asserts with the rest of the observed record.
+    placement_witness: Option<MachineLifecycleBindingFacts>,
     /// An operator reads this `Stopped` row as the clean `Idle` row a
     /// start's registration replaces it with (`observe_persisted_lifecycle`).
     normalizes_stopped: bool,
@@ -2168,6 +2171,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
         MachineLifecycleObservation::Decoded { record, version } => {
@@ -2220,6 +2224,7 @@ fn observe_persisted_lifecycle(
                 supervisor_authority: record.supervisor_authority().clone(),
                 unregister_progress: record.unregister_progress().cloned(),
                 live_bridge_recovery: record.live_bridge_recovery().clone(),
+                placement_witness: record.placement_witness().cloned(),
                 normalizes_stopped,
             }
         }
@@ -2233,6 +2238,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
     };
@@ -2259,6 +2265,7 @@ fn durable_tail_lifecycle_reassertion(
         observed.unregister_progress.clone(),
         observed.live_bridge_recovery.clone(),
     )
+    .with_placement_witness(observed.placement_witness.clone())
     .with_expected_version(observed.expected_version.clone())
 }
 
@@ -3098,6 +3105,7 @@ async fn recover_durable_tail_capturing(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
         Err(error) => return Err(error.into()),
@@ -3500,7 +3508,10 @@ async fn recover_durable_tail_capturing(
         &candidate,
         disposition,
         &attributed,
-        &observed.binding,
+        crate::input_state::InteractionTerminalPlacement::from_lifecycle_row(
+            &observed.binding,
+            observed.placement_witness.as_ref(),
+        ),
     )
     .await?;
     let mut input_updates = terminalize_attributed_inputs(
@@ -3925,9 +3936,10 @@ fn recovered_boundary_terminal_candidate(
 /// `Run { candidate run }`, owner the first contributor in canonical order,
 /// no session checkpoint (the boundary and its document commit in this same
 /// transaction, so no later checkpoint exists). A directed contributor gets a
-/// `Candidate` outbox naming `placement`, the runtime placement the session's
-/// lifecycle row records (the drive's observed binding): a later drain adopts
-/// it as it adopts any outbox an earlier incarnation left.
+/// `Candidate` outbox naming `placement`, the runtime placement the row the
+/// drive observed records (its complete binding, else its placement witness):
+/// a later drain adopts it as it adopts any outbox an earlier incarnation
+/// left.
 ///
 /// `None` stages nothing, which leaves the contributors as every earlier
 /// release left them (consumed, with no receipt and no requester terminal,
@@ -3955,7 +3967,7 @@ async fn recovered_boundary_terminal_batch(
     candidate: &PreparedRecoveryCandidate,
     disposition: DurableTailRecoveryDisposition,
     attributed: &[(StoredInputState, String)],
-    placement: &MachineLifecycleBindingFacts,
+    placement: Option<crate::input_state::InteractionTerminalPlacement>,
 ) -> Result<Option<RecoveredBoundaryTerminalBatch>, DurableTailRecoveryError> {
     if attributed.is_empty() {
         return Ok(None);
@@ -4044,9 +4056,7 @@ async fn recovered_boundary_terminal_batch(
             return Ok(None);
         }
     }
-    let observed_placement =
-        crate::input_state::InteractionTerminalPlacement::from_lifecycle_binding(placement);
-    let input_ids = match observed_placement {
+    let input_ids = match placement {
         Some(_) => attributed
             .iter()
             .map(|(bundle, _)| bundle.state.input_id.clone())
@@ -4088,7 +4098,7 @@ async fn recovered_boundary_terminal_batch(
     let candidate_digest = owner.candidate_digest.clone();
     let completion_input_ids_digest = owner.completion_input_ids_digest.clone();
     let mut outboxes = HashMap::new();
-    if let (Some(placement), false) = (observed_placement.as_ref(), directed.is_empty()) {
+    if let (Some(placement), false) = (placement.as_ref(), directed.is_empty()) {
         directed.sort_by_key(|(input_id, _)| input_id.0);
         let directed_rows = recovered_boundary_directed_outboxes(
             session_id,

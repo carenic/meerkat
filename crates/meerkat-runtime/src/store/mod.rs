@@ -52,6 +52,13 @@ pub(crate) const MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 5;
 /// byte, and an older reader refuses such a record as an unsupported
 /// version instead of stopping its kept inputs.
 pub(crate) const REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 6;
+/// A record that carries a placement witness: the version 6 shape plus the
+/// complete runtime placement a predecessor settlement keeps in the row
+/// between its internal registration and its sweep commit. Only such
+/// records carry it, so every other record stays version 5 or 6 byte for
+/// byte, and an older reader refuses such a record as an unsupported version
+/// and writes nothing.
+pub(crate) const PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION: u16 = 7;
 
 /// Maximum number of exact input-state rows admitted by one compare-and-swap
 /// boundary. Directed-terminal outbox batches share the same 256-row bound as
@@ -6305,6 +6312,7 @@ pub struct DecodedMachineLifecycleObservation {
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<MachineUnregisterProgressSnapshot>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    placement_witness: Option<MachineLifecycleBindingFacts>,
 }
 
 impl DecodedMachineLifecycleObservation {
@@ -6340,6 +6348,15 @@ impl DecodedMachineLifecycleObservation {
 
     pub(crate) fn live_bridge_recovery(&self) -> &crate::live_execution::LiveBridgeRecoveryImage {
         &self.live_bridge_recovery
+    }
+
+    /// The complete runtime placement a predecessor settlement keeps in the
+    /// row between its internal registration and its sweep commit (record
+    /// version 7); `None` for every other row. The lifecycle classifier
+    /// never reads it.
+    #[must_use]
+    pub fn placement_witness(&self) -> Option<&MachineLifecycleBindingFacts> {
+        self.placement_witness.as_ref()
     }
 }
 
@@ -6745,6 +6762,7 @@ pub struct MachineLifecycleSnapshot {
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<MachineUnregisterProgressSnapshot>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    placement_witness: Option<MachineLifecycleBindingFacts>,
 }
 
 /// Durable generated unregister-saga progress needed to resume an interrupted
@@ -6895,7 +6913,20 @@ impl MachineLifecycleSnapshot {
             supervisor_authority,
             unregister_progress,
             live_bridge_recovery,
+            placement_witness: None,
         }
+    }
+
+    /// This snapshot carrying `placement_witness`, the complete runtime
+    /// placement a predecessor settlement keeps in the row between its
+    /// internal registration and its sweep commit.
+    #[must_use]
+    pub(crate) fn with_placement_witness(
+        mut self,
+        placement_witness: Option<MachineLifecycleBindingFacts>,
+    ) -> Self {
+        self.placement_witness = placement_witness;
+        self
     }
 
     /// Runtime state selected by the owning MeerkatMachine transition.
@@ -6923,6 +6954,11 @@ impl MachineLifecycleSnapshot {
 
     pub(crate) fn live_bridge_recovery(&self) -> &crate::live_execution::LiveBridgeRecoveryImage {
         &self.live_bridge_recovery
+    }
+
+    /// The placement witness this snapshot carries, if any.
+    pub fn placement_witness(&self) -> Option<&MachineLifecycleBindingFacts> {
+        self.placement_witness.as_ref()
     }
 }
 
@@ -7037,6 +7073,9 @@ struct MachineLifecycleSnapshotStoreWire {
     supervisor_authority: SupervisorAuthoritySnapshotStoreWire,
     unregister_progress: Option<MachineUnregisterProgressSnapshotStoreWire>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    /// Present only on a version 7 record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    placement_witness: Option<MachineLifecycleBindingFactsStoreWire>,
 }
 
 #[derive(serde::Deserialize)]
@@ -7070,6 +7109,9 @@ struct MachineLifecycleObservationStoreWireV5 {
     #[serde(default, deserialize_with = "deserialize_present_nullable")]
     unregister_progress: Option<Option<MachineUnregisterProgressSnapshotStoreWire>>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    /// Required on a version 7 record, refused on every other.
+    #[serde(default)]
+    placement_witness: Option<MachineLifecycleBindingFactsStoreWire>,
 }
 
 #[derive(serde::Deserialize)]
@@ -7899,7 +7941,9 @@ impl From<&MachineLifecycleSnapshot> for MachineLifecycleSnapshotStoreWire {
             .unregister_progress()
             .is_some_and(MachineUnregisterProgressSnapshot::keeps_inputs);
         Self {
-            record_version: if keeps_inputs {
+            record_version: if snapshot.placement_witness().is_some() {
+                PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+            } else if keeps_inputs {
                 REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
             } else {
                 MACHINE_LIFECYCLE_STORE_RECORD_VERSION
@@ -7911,6 +7955,7 @@ impl From<&MachineLifecycleSnapshot> for MachineLifecycleSnapshotStoreWire {
             supervisor_authority: snapshot.supervisor_authority().into(),
             unregister_progress: snapshot.unregister_progress().map(Into::into),
             live_bridge_recovery: snapshot.live_bridge_recovery().clone(),
+            placement_witness: snapshot.placement_witness().map(Into::into),
         }
     }
 }
@@ -7942,11 +7987,15 @@ fn validate_unregister_progress_snapshot(
 
 /// A disposition that keeps inputs (a requeue or a keep) is a version 6
 /// fact: an older record version cannot carry it, and a version 6 record
-/// must.
+/// must. A version 7 record is the version 6 shape plus a placement witness,
+/// and may carry either.
 fn validate_unregister_progress_requeue_version(
     record_version: u16,
     progress: Option<&MachineUnregisterProgressSnapshot>,
 ) -> Result<(), RuntimeStoreError> {
+    if record_version == PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION {
+        return Ok(());
+    }
     let requeues = progress.is_some_and(MachineUnregisterProgressSnapshot::keeps_inputs);
     match (
         record_version == REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
@@ -8019,11 +8068,13 @@ fn decode_machine_lifecycle_observation_v4(
         supervisor_authority: record.supervisor_authority.try_into()?,
         unregister_progress,
         live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+        placement_witness: None,
     })
 }
 
-/// Decode a version 5 record, or a version 6 one: the same shape, whose
-/// unregister progress keeps queued inputs for the next start.
+/// Decode a version 5 record, a version 6 one (the same shape, whose
+/// unregister progress keeps queued inputs for the next start), or a version
+/// 7 one (the version 6 shape plus a placement witness).
 fn decode_machine_lifecycle_observation_v5(
     bytes: &[u8],
 ) -> Result<DecodedMachineLifecycleObservation, RuntimeStoreError> {
@@ -8031,12 +8082,15 @@ fn decode_machine_lifecycle_observation_v5(
         .map_err(|err| RuntimeStoreError::ReadFailed(err.to_string()))?;
     if record.record_version != MACHINE_LIFECYCLE_STORE_RECORD_VERSION
         && record.record_version != REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        && record.record_version != PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
     {
         return Err(RuntimeStoreError::ReadFailed(format!(
             "unsupported machine lifecycle store record version {}",
             record.record_version
         )));
     }
+    let placement_witness =
+        decode_placement_witness(record.record_version, record.placement_witness)?;
     let runtime_state = require_present_nullable(record.runtime_state, "runtime_state")?;
     let current_run_id = require_present_nullable(record.current_run_id, "current_run_id")?;
     let pre_run_phase = require_present_nullable(record.pre_run_phase, "pre_run_phase")?;
@@ -8060,7 +8114,41 @@ fn decode_machine_lifecycle_observation_v5(
         supervisor_authority: record.supervisor_authority.try_into()?,
         unregister_progress,
         live_bridge_recovery: record.live_bridge_recovery,
+        placement_witness,
     })
+}
+
+/// A placement witness is a version 7 fact: that version must carry one,
+/// every other must not, and the one it carries names a complete runtime
+/// placement (agent runtime id, fence token and generation; the epoch is
+/// optional).
+fn decode_placement_witness(
+    record_version: u16,
+    witness: Option<MachineLifecycleBindingFactsStoreWire>,
+) -> Result<Option<MachineLifecycleBindingFacts>, RuntimeStoreError> {
+    let carries = record_version == PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION;
+    match (carries, witness) {
+        (false, None) => Ok(None),
+        (false, Some(_)) => Err(RuntimeStoreError::ReadFailed(format!(
+            "machine lifecycle record version {record_version} cannot carry a placement witness"
+        ))),
+        (true, None) => Err(RuntimeStoreError::ReadFailed(format!(
+            "machine lifecycle record version {record_version} must carry a placement witness"
+        ))),
+        (true, Some(witness)) => {
+            let witness = MachineLifecycleBindingFacts::try_from(witness)?;
+            if witness.agent_runtime_id().is_none()
+                || witness.fence_token().is_none()
+                || witness.runtime_generation().is_none()
+            {
+                return Err(RuntimeStoreError::ReadFailed(
+                    "machine lifecycle placement witness must name a complete runtime placement"
+                        .to_string(),
+                ));
+            }
+            Ok(Some(witness))
+        }
+    }
 }
 
 fn decoded_machine_lifecycle_from_snapshot(
@@ -8075,6 +8163,7 @@ fn decoded_machine_lifecycle_from_snapshot(
         supervisor_authority: snapshot.supervisor_authority,
         unregister_progress: snapshot.unregister_progress,
         live_bridge_recovery: snapshot.live_bridge_recovery,
+        placement_witness: snapshot.placement_witness,
     }
 }
 
@@ -8136,7 +8225,9 @@ fn decode_machine_lifecycle_store_record(
                 ),
             )
         }
-        MACHINE_LIFECYCLE_STORE_RECORD_VERSION | REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
+        MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        | REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        | PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION => {
             let record = decode_machine_lifecycle_observation_v5(bytes)?;
             let runtime_state = record.runtime_state.ok_or_else(|| {
                 RuntimeStoreError::ReadFailed(
@@ -8151,7 +8242,8 @@ fn decode_machine_lifecycle_store_record(
                     record.supervisor_authority,
                     record.unregister_progress,
                     record.live_bridge_recovery,
-                ),
+                )
+                .with_placement_witness(record.placement_witness),
             )
         }
         unsupported => Err(RuntimeStoreError::ReadFailed(format!(
@@ -8195,6 +8287,7 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
         u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
         u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
+        u64::from(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION),
     ];
     if !supported.contains(&record_version) {
         return MachineLifecycleObservation::Unsupported {
@@ -8206,6 +8299,7 @@ fn classify_machine_lifecycle_record(bytes: &[u8]) -> MachineLifecycleObservatio
 
     let decoded = if record_version == u64::from(MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
         || record_version == u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        || record_version == u64::from(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
     {
         decode_machine_lifecycle_observation_v5(bytes)
     } else if record_version == u64::from(RUN_MACHINE_LIFECYCLE_STORE_RECORD_VERSION) {
@@ -8666,6 +8760,20 @@ impl MachineLifecycleCommit {
             ),
             expected_version: None,
         }
+    }
+
+    /// This commit carrying `placement_witness`: the complete runtime
+    /// placement a predecessor settlement keeps in the row between its
+    /// internal registration and its sweep commit (record version 7).
+    /// Every other writer builds its commit from its own authority, without
+    /// one, and so drops it.
+    #[must_use]
+    pub(crate) fn with_placement_witness(
+        mut self,
+        placement_witness: Option<MachineLifecycleBindingFacts>,
+    ) -> Self {
+        self.snapshot = self.snapshot.with_placement_witness(placement_witness);
+        self
     }
 
     /// Fence this commit on the exact lifecycle row version it was derived
@@ -11996,13 +12104,123 @@ mod lifecycle_record_compatibility_tests {
         assert_decode_fails(version_6_without_requeue);
         let mut future = requeue_value;
         future["record_version"] =
-            serde_json::json!(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1);
+            serde_json::json!(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1);
         let future_bytes = serde_json::to_vec(&future).expect("serialize future record");
         assert!(matches!(
             classify_machine_lifecycle_record(&future_bytes),
             MachineLifecycleObservation::Unsupported { record_version, .. }
-                if record_version == u64::from(REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1)
+                if record_version
+                    == u64::from(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION + 1)
         ));
+    }
+
+    /// A placement witness is a version 7 fact. A snapshot that carries one
+    /// is written as version 7 (the version 6 shape plus the witness) and
+    /// round-trips, keep-inputs progress included; a snapshot without one
+    /// stays version 5. Versions 5 and 6 cannot carry a witness, version 7
+    /// must, and its witness must name a complete runtime placement.
+    #[test]
+    fn a_placement_witness_is_a_version_7_record_and_its_absence_stays_version_5() {
+        let unbound = || MachineLifecycleBindingFacts::new(None, None, None, None);
+        let witness = MachineLifecycleBindingFacts::new(
+            Some("witnessed-runtime".to_string()),
+            Some(7),
+            Some(2),
+            None,
+        );
+        let clean = MachineLifecycleSnapshot::new(
+            RuntimeState::Idle,
+            unbound(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+        );
+        let clean_value = encoded_value(&clean);
+        assert_eq!(
+            clean_value["record_version"],
+            serde_json::json!(MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert!(clean_value.get("placement_witness").is_none());
+
+        let witnessed = clean.clone().with_placement_witness(Some(witness.clone()));
+        let witnessed_bytes = encode_snapshot(&witnessed);
+        let witnessed_value: serde_json::Value =
+            serde_json::from_slice(&witnessed_bytes).expect("witnessed record is JSON");
+        assert_eq!(
+            witnessed_value["record_version"],
+            serde_json::json!(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert_eq!(
+            witnessed_value["placement_witness"],
+            serde_json::json!({
+                "agent_runtime_id": "witnessed-runtime",
+                "fence_token": 7,
+                "runtime_generation": 2,
+                "runtime_epoch_id": null
+            })
+        );
+        assert_eq!(
+            decode_machine_lifecycle_store_record(&witnessed_bytes)
+                .expect("a version 7 record decodes"),
+            witnessed
+        );
+        let MachineLifecycleObservation::Decoded { record, .. } =
+            classify_machine_lifecycle_record(&witnessed_bytes)
+        else {
+            panic!("a version 7 record is observed decoded");
+        };
+        assert_eq!(
+            record.record_version(),
+            PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        );
+        assert_eq!(record.placement_witness(), Some(&witness));
+
+        let keep_witnessed = MachineLifecycleSnapshot::new_with_unregister_progress(
+            RuntimeState::Idle,
+            unbound(),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            Some(
+                MachineUnregisterProgressSnapshot::new(true, true, true, false, false)
+                    .with_keeps_recovered_inputs(true),
+            ),
+        )
+        .with_placement_witness(Some(witness));
+        let keep_bytes = encode_snapshot(&keep_witnessed);
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&keep_bytes)
+                .expect("witnessed keep record is JSON")["record_version"],
+            serde_json::json!(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION)
+        );
+        assert_eq!(
+            decode_machine_lifecycle_store_record(&keep_bytes)
+                .expect("a version 7 keep record decodes"),
+            keep_witnessed
+        );
+
+        let refused = |value: serde_json::Value| {
+            let bytes = serde_json::to_vec(&value).expect("serialize refused record");
+            assert!(
+                matches!(
+                    classify_machine_lifecycle_record(&bytes),
+                    MachineLifecycleObservation::Malformed { .. }
+                ),
+                "a refused record is observed malformed: {value}"
+            );
+            assert_decode_fails(value);
+        };
+        for older in [
+            MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
+            REQUEUE_MACHINE_LIFECYCLE_STORE_RECORD_VERSION,
+        ] {
+            let mut carries = witnessed_value.clone();
+            carries["record_version"] = serde_json::json!(older);
+            refused(carries);
+        }
+        let mut without = clean_value;
+        without["record_version"] =
+            serde_json::json!(PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION);
+        refused(without);
+        let mut incomplete = witnessed_value;
+        incomplete["placement_witness"]["fence_token"] = serde_json::Value::Null;
+        refused(incomplete);
     }
 
     /// The keep of a materialization rollback is a version 6 fact too: its

@@ -545,3 +545,71 @@ async fn a_boundary_beside_another_runs_pending_batch_stages_nothing() {
         Some(InputTerminalCompletionPhase::Pending)
     ));
 }
+
+/// The placement the drive observes is the row's complete binding, else the
+/// placement witness the row carries. A row a predecessor settlement left
+/// with its witness (clean, unbound, record version 7) places the directed
+/// contributor's outbox by the witness, and the recovery commit re-asserts
+/// the row with its witness.
+#[tokio::test]
+async fn a_boundary_takes_the_rows_placement_witness_when_the_row_records_no_binding() {
+    let directed = directed_step("witnessed");
+    let seeded = seeded(&[directed.clone()], completed_tail, false).await;
+    let witness = MachineLifecycleBindingFacts::new(
+        Some(PLACED_RUNTIME.to_string()),
+        Some(PLACED_FENCE),
+        Some(PLACED_GENERATION),
+        Some(PLACED_EPOCH.to_string()),
+    );
+    seeded
+        .store
+        .commit_machine_lifecycle(
+            &seeded.runtime_id,
+            MachineLifecycleCommit::new_with_binding_run_unregister_progress_and_live_bridge(
+                RuntimeState::Idle,
+                MachineLifecycleBindingFacts::default(),
+                MachineLifecycleRunFacts::default(),
+                SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                None,
+                crate::live_execution::LiveBridgeRecoveryImage::default(),
+            )
+            .with_placement_witness(Some(witness.clone())),
+            &[],
+        )
+        .await
+        .expect("the settlement's clean row with its witness");
+
+    assert_eq!(
+        seeded.recover().await,
+        DurableTailRecoveryDisposition::CommitCompleted
+    );
+
+    let rows = seeded.rows().await;
+    let outbox = row(&rows, &directed)
+        .state
+        .interaction_terminal_outbox
+        .as_ref()
+        .expect("the witness places the directed contributor's outbox");
+    assert_eq!(
+        outbox.owner_agent_runtime_id.as_deref(),
+        Some(PLACED_RUNTIME)
+    );
+    assert_eq!(outbox.owner_fence_token, Some(PLACED_FENCE));
+    assert_eq!(outbox.owner_runtime_generation, Some(PLACED_GENERATION));
+    assert_eq!(outbox.owner_runtime_epoch_id.as_deref(), Some(PLACED_EPOCH));
+
+    let MachineLifecycleObservation::Decoded { record, .. } = seeded
+        .store
+        .observe_machine_lifecycle(&seeded.runtime_id)
+        .await
+        .expect("the lifecycle row reads")
+    else {
+        panic!("the lifecycle row decodes");
+    };
+    assert_eq!(
+        record.placement_witness(),
+        Some(&witness),
+        "the recovery commit re-asserts the row with its witness"
+    );
+    assert_eq!(record.binding(), &MachineLifecycleBindingFacts::default());
+}

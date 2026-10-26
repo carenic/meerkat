@@ -843,8 +843,9 @@ pub(crate) const WITHHELD_PAYLOAD_DIGEST: &str = "withheld";
 /// A path that stages an outbox without a placed runtime (a recovered
 /// boundary's commit, a predecessor settlement's internal registration)
 /// takes it from the session's last durable placement, its lifecycle row's
-/// binding: the placement of the runtime whose work it ends. A later drain
-/// adopts such an outbox exactly as it adopts one that runtime left.
+/// binding or the placement witness the row carries: the placement of the
+/// runtime whose work it ends. A later drain adopts such an outbox exactly
+/// as it adopts one that runtime left.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct InteractionTerminalPlacement {
     pub(crate) agent_runtime_id: String,
@@ -865,6 +866,28 @@ impl InteractionTerminalPlacement {
             runtime_generation: binding.runtime_generation()?,
             runtime_epoch_id: binding.runtime_epoch_id().map(str::to_string),
         })
+    }
+
+    /// The placement a session's lifecycle row records: its binding when
+    /// that is a complete placement, else the placement witness a
+    /// predecessor settlement keeps in the row (record version 7), else
+    /// none. The one rule every unplaced path selects its placement by.
+    pub(crate) fn from_lifecycle_row(
+        binding: &crate::store::MachineLifecycleBindingFacts,
+        placement_witness: Option<&crate::store::MachineLifecycleBindingFacts>,
+    ) -> Option<Self> {
+        Self::from_lifecycle_binding(binding)
+            .or_else(|| placement_witness.and_then(Self::from_lifecycle_binding))
+    }
+
+    /// The binding facts that record this placement.
+    pub(crate) fn lifecycle_binding(&self) -> crate::store::MachineLifecycleBindingFacts {
+        crate::store::MachineLifecycleBindingFacts::new(
+            Some(self.agent_runtime_id.clone()),
+            Some(self.fence_token),
+            Some(self.runtime_generation),
+            self.runtime_epoch_id.clone(),
+        )
     }
 }
 
