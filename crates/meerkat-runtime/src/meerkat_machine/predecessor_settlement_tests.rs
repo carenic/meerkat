@@ -1919,11 +1919,15 @@ async fn lifecycle_record(
     }
 }
 
-/// The contract's held-tail shape: an open run at a committed round (its
-/// round commit's cursor binds a directed and a nondirected input), with a
-/// queued input beside it that no run bound. The writer drive holds the
-/// tail (a store-only writer never continues a run, and the unbound input
-/// keeps it from closing the run as interrupted). The internal registration
+/// The held-tail shape: an open run at a committed round (its round
+/// commit's cursor binds a directed and a nondirected input), with a queued
+/// input beside it that an earlier run left (requeued, still naming that
+/// run). The cursor does not list it, but nothing proves it is not in the
+/// tail, so the writer drive holds the tail (a store-only writer never
+/// continues a run, and the unbound input keeps it from closing the run as
+/// interrupted). A queued input that names no run would not hold it: the
+/// cursor proves such an input outside the tail, and the drive commits the
+/// run interrupted at once. The internal registration
 /// marks the run resumable; the sweep ends the mark and every input
 /// `Stopped` in one commit; the second drive then finds the cursor's inputs
 /// settled and commits the tail as interrupted, with no contributor left to
@@ -1944,7 +1948,8 @@ async fn an_open_run_held_beside_unbound_work_is_ended_and_then_committed_interr
         .await;
     host.persist(&session_id, applied_to(&b1, &run_id)).await;
     host.persist(&session_id, applied_to(&b2, &run_id)).await;
-    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued_after_an_earlier_run(&q1, 1))
+        .await;
     let claim = host.claim(&session_id);
     let publisher = Arc::new(RecordingPublisher::default());
 
@@ -2013,6 +2018,15 @@ async fn an_open_run_held_beside_unbound_work_is_ended_and_then_committed_interr
     assert!(!host.machine.contains_session(&session_id).await);
 }
 
+/// `input` queued again after an earlier run that never committed it: its
+/// row still names that run, admitted `admission`-th.
+fn queued_after_an_earlier_run(input: &Input, admission: u64) -> StoredInputState {
+    let mut stored = queued(input, admission);
+    stored.seed.last_run_id = Some(RunId::new());
+    stored.seed.attempt_count = 1;
+    stored
+}
+
 /// The held-tail shape again, with a crash after the internal registration
 /// wrote the clean lifecycle row with the placement witness and before the
 /// sweep commit (the first attempt's drive held; its registration's row is
@@ -2038,7 +2052,8 @@ async fn a_retry_after_a_crash_between_registration_and_sweep_finishes_by_the_wi
         .await;
     host.persist(&session_id, applied_to(&b1, &run_id)).await;
     host.persist(&session_id, applied_to(&b2, &run_id)).await;
-    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued_after_an_earlier_run(&q1, 1))
+        .await;
     let claim = host.claim(&session_id);
 
     let mut first = host
