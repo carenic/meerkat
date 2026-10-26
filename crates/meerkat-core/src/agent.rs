@@ -4564,11 +4564,12 @@ impl RunLifecyclePublication {
     }
 }
 
-/// The human consent the current run requested itself, and which of it the
-/// run already attempted. Scheduling and notice suppression only: at most
-/// one in-run attempt per decision per run, and only the run's own requests
-/// are examined. Spend and withdrawal authority stays with the approval
-/// owner. Reset with each work-authorized run scope.
+/// The human consent the current run requested itself or that its staged
+/// notice inputs moved into it, and which of it the run already attempted.
+/// Scheduling and notice suppression only: at most one in-run attempt per
+/// decision per run, and only the run's own requests and the consent moved
+/// into it are examined. Spend and withdrawal authority stays with the
+/// approval owner. Reset with each work-authorized run scope.
 #[derive(Debug, Default)]
 pub(crate) struct RunConsentAttempts {
     requested: BTreeSet<crate::ApprovalId>,
@@ -4581,7 +4582,15 @@ impl RunConsentAttempts {
         self.requested.insert(approval_id.clone());
     }
 
-    /// The consent this run requested and has not attempted yet.
+    /// The approval owner moved `approval_id`'s consent into this resumed
+    /// run by the committed receipt of one of its staged notice inputs: the
+    /// run examines it as its own, and still attempts it at most once.
+    pub(crate) fn moved_in(&mut self, approval_id: &crate::ApprovalId) {
+        self.requested.insert(approval_id.clone());
+    }
+
+    /// The consent this run requested, or that moved into it, and has not
+    /// attempted yet.
     pub(crate) fn unattempted(&self) -> Vec<crate::ApprovalId> {
         self.requested
             .difference(&self.attempted)
@@ -4889,7 +4898,8 @@ where
     /// dispatch context with this agent's session. Host-only: it never
     /// reaches the event stream or the model.
     pub(crate) refusal_observer: Option<Arc<dyn crate::authorization::OperationRefusalObserver>>,
-    /// Human consent the current run requested, and its in-run attempts.
+    /// Human consent the current run requested or that moved into it, and
+    /// its in-run attempts.
     pub(crate) run_consent_attempts: RunConsentAttempts,
     /// Exact per-operation dispatch authority for a noncommitting live bridge
     /// run. Ordinary turns always leave this absent.

@@ -24,9 +24,10 @@
 //! whose notices have an exact native destination is parked for a resumed
 //! run of its origin work (custody kept, nothing spends it); the rest is
 //! withdrawn. Parked consent moves into the resumed run its approved
-//! notice's admitted input is staged with; when that input ends without a
-//! run taking the consent over, the delivery composition reads its native
-//! terminal and the consent is withdrawn, its cause naming the input.
+//! notice's admitted input is staged with, whose boundaries attempt it
+//! once; when that input ends without a run taking the consent over, the
+//! delivery composition reads its native terminal and the consent is
+//! withdrawn, its cause naming the input.
 //!
 //! Not covered here: owner-attributed presentation of the native review
 //! context, a native approver-eligibility owner, remote authenticated
@@ -456,6 +457,10 @@ pub(crate) struct DecidedConsent {
     pub(crate) approval_id: ApprovalId,
     pub(crate) tool_call_id: Arc<str>,
     pub(crate) tool_name: Option<String>,
+    /// The staged notice input this consent moved into the run with (its
+    /// custody `Transferred { input_id }`); `None` for consent the run
+    /// requested itself.
+    pub(crate) moved_from: Option<String>,
 }
 
 /// What a run's boundary finds of the decided consent it requested.
@@ -466,6 +471,17 @@ pub(crate) enum DecidedConsentScan {
     Deferred,
     /// The requested consent the run can spend now (possibly none).
     Decided(Vec<DecidedConsent>),
+}
+
+/// What a resumed run's boundary finds of the consent the approval owner
+/// moved into it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MovedConsentScan {
+    /// The approval owner is held or unavailable: nothing was examined and
+    /// the run's next boundary looks again.
+    Deferred,
+    /// The live consent moved into the run, by approval (possibly none).
+    Moved(Vec<ApprovalId>),
 }
 
 /// Everything a retained candidate needs except its attempt, which the owner
@@ -1178,14 +1194,14 @@ impl ApprovalService {
     }
 
     /// The decided consent among `requested` (consent the run `run_id` of
-    /// `work` requested itself) that the run can spend now, in approval
-    /// order: live custody of a candidate admitted under exactly that work
-    /// and run, decided Approved with its allowance published, neither
-    /// parked nor expired, and unspent. Only the requested candidates are
-    /// examined, and the owner is never waited for: a held or unavailable
-    /// owner is [`DecidedConsentScan::Deferred`], never "none decided". It
-    /// only names candidates; each spend still resolves, checks and enters
-    /// through its own fresh attempt.
+    /// `work` requested itself, or that a receipt moved into it) that the
+    /// run can spend now, in approval order: live custody of a candidate
+    /// admitted under exactly that work and run, decided Approved with its
+    /// allowance published, neither parked nor expired, and unspent. Only
+    /// the requested candidates are examined, and the owner is never waited
+    /// for: a held or unavailable owner is [`DecidedConsentScan::Deferred`],
+    /// never "none decided". It only names candidates; each spend still
+    /// resolves, checks and enters through its own fresh attempt.
     pub(crate) fn decided_consent_for_run(
         &self,
         work: &WorkAuthorizationContext,
@@ -1204,12 +1220,13 @@ impl ApprovalService {
             .filter_map(|approval_id| {
                 let candidate = state.consent.get(approval_id)?;
                 let binding = candidate.admitted.binding();
+                let record = state.records.get(approval_id);
                 let spendable = !state.unpublished.contains(approval_id)
                     && !state.parked.contains(approval_id)
                     && !candidate.expired()
                     && candidate.attempt.bound_to(binding, work)
                     && binding.facts().run_id.as_ref() == run_id
-                    && state.records.get(approval_id).is_some_and(|record| {
+                    && record.is_some_and(|record| {
                         record.status == ApprovalStatus::Approved
                             && record.expires_at.is_none_or(|expires_at| expires_at > now)
                             && record
@@ -1224,6 +1241,7 @@ impl ApprovalService {
                         .admitted
                         .tool_dispatch_parts()
                         .map(|(call, _)| call.name.to_owned()),
+                    moved_from: record.and_then(moved_input),
                 })
             })
             .collect();
@@ -1231,6 +1249,60 @@ impl ApprovalService {
         // A reader may have made a disposer's try-lock fail; settle after it.
         self.settle_owner_now().run();
         DecidedConsentScan::Decided(decided)
+    }
+
+    /// The live consent this owner moved into the open resumed run `run_id`
+    /// of `work`, by the committed receipts of its staged notice inputs:
+    /// the approvals whose transfer into exactly that run's entry it
+    /// committed, still in live, unexpired custody recorded as `Transferred`
+    /// to one of that run's own staged inputs. Withdrawn, spent or expired
+    /// consent, consent moved into another run, and parked or pending
+    /// consent are never named; nothing is matched by tool or arguments.
+    /// The owner is never waited for: a held or unavailable owner is
+    /// [`MovedConsentScan::Deferred`], and the run's next boundary looks
+    /// again. It only names candidates for the run's own consent attempts.
+    pub(crate) fn consent_moved_into_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+    ) -> MovedConsentScan {
+        if self.ensure_available().is_err() {
+            return MovedConsentScan::Deferred;
+        }
+        let Some(state) = self.state.try_read() else {
+            return MovedConsentScan::Deferred;
+        };
+        let staged: Vec<String> = work
+            .resumed_inputs()
+            .iter()
+            .map(|resumed| resumed.input_id.to_string())
+            .collect();
+        let moved = state
+            .resumed_runs
+            .iter()
+            .find(|open| open.work.same_context(work) && Some(&open.run_id) == run_id)
+            .map(|open| {
+                open.moved
+                    .iter()
+                    .filter(|approval_id| {
+                        state
+                            .consent
+                            .get(*approval_id)
+                            .is_some_and(|candidate| !candidate.expired())
+                            && state
+                                .records
+                                .get(*approval_id)
+                                .and_then(moved_input)
+                                .is_some_and(|input_id| staged.contains(&input_id))
+                    })
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        drop(state);
+        // A reader may have made a disposer's try-lock fail; settle after it.
+        self.settle_owner_now().run();
+        MovedConsentScan::Moved(moved)
     }
 
     /// Spend one authenticated consent once at the candidate's physical
@@ -1656,8 +1728,9 @@ impl ApprovalService {
     /// through staged inputs, it is registered until its close, and every
     /// parked candidate one of those inputs carries by its committed notice
     /// receipt moves into it now; a receipt committed while it runs moves
-    /// its candidate then ([`Self::transfer_parked_consent`]). A context
-    /// whose identity names another run moves nothing.
+    /// its candidate then ([`Self::transfer_parked_consent`]). The run's
+    /// boundaries read what moved ([`Self::consent_moved_into_run`]). A
+    /// context whose identity names another run moves nothing.
     pub(crate) fn open_consent_for_run(&self, work: &WorkAuthorizationContext, run_id: &RunId) {
         if work.resumed_inputs().is_empty()
             || work
@@ -1677,6 +1750,7 @@ impl ApprovalService {
             state.resumed_runs.push(ResumedRun {
                 work: work.clone(),
                 run_id: run_id.clone(),
+                moved: std::collections::BTreeSet::new(),
             });
         }
         self.release_state(state).run();
@@ -1808,6 +1882,15 @@ impl ApprovalService {
             state.records.insert(approval_id.clone(), transferred);
             state.parked.remove(&approval_id);
             prune_closed_inputs(state);
+            // The owner's own binding of the moved consent to this run's
+            // work, run and receipt input, which the run's boundaries read.
+            if let Some(open) = state
+                .resumed_runs
+                .iter_mut()
+                .find(|open| open.work.same_context(&run.work) && open.run_id == run.run_id)
+            {
+                open.moved.insert(approval_id.clone());
+            }
             state.consent.insert(
                 approval_id,
                 Arc::new(candidate.transferred(admitted, run.work)),
@@ -2682,6 +2765,12 @@ struct Resolved<'a> {
 pub(super) struct ResumedRun {
     work: WorkAuthorizationContext,
     run_id: RunId,
+    /// The consent whose transfer into this run this owner committed, by the
+    /// receipt of one of the run's staged inputs: the owner's own binding of
+    /// that consent to this work, run and input, read by the run's
+    /// boundaries ([`ApprovalService::consent_moved_into_run`]). It ends with
+    /// the run's entry.
+    moved: std::collections::BTreeSet<ApprovalId>,
 }
 
 /// One parked candidate ready to move into an open resumed run, as read.
@@ -2724,6 +2813,15 @@ fn transfer_input(record: &ApprovalRecord, work: &WorkAuthorizationContext) -> O
             resumed.input_id.to_string() == *input_id && resumed.resumes == origin.retained_work
         }))
     .then(|| input_id.clone())
+}
+
+/// The staged notice input `record`'s consent moved into a resumed run with:
+/// its custody `Transferred { input_id }`, when the row records one.
+fn moved_input(record: &ApprovalRecord) -> Option<String> {
+    match record.consent.as_ref()?.custody.as_ref()? {
+        ApprovalConsentCustody::Transferred { input_id } => Some(input_id.clone()),
+        ApprovalConsentCustody::Parked => None,
+    }
 }
 
 /// The destination and admitted input that `record`'s approved notice
@@ -6982,6 +7080,75 @@ mod tests {
             "custody history stays"
         );
         assert!(is_parked(&w, &pending));
+    }
+
+    /// The consent a resumed run's boundaries read as moved into it: only
+    /// the consent whose transfer into that exact run the owner committed,
+    /// in live, unexpired custody recorded as `Transferred` to one of the
+    /// run's own staged inputs. Another run's consent, a run id the owner
+    /// never opened for the work, a pending consent, and spent or expired
+    /// consent are never named, and a held owner defers the read.
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_run_reads_only_the_consent_moved_into_it() {
+        let mut w = world_with(
+            ApprovalService::with_store(Arc::new(InMemoryApprovalStore::new())).expect("service"),
+        );
+        w.work = routed(w.work.clone());
+        let first = parked_approval(&w).await;
+        let second = parked_approval(&w).await;
+        let pending = w.request(&w.check()).await;
+        w.review.close_consent_for_work(&w.work);
+        let (first_input, second_input) = (InputId::new(), InputId::new());
+        admit_notice(&w, &first, &first_input);
+        admit_notice(&w, &second, &second_input);
+        let (first_work, first_run) = resumed(&w, &[&first_input]);
+        let (second_work, second_run) = resumed(&w, &[&second_input]);
+        let moved = |work: &WorkAuthorizationContext, run_id: &RunId| {
+            w.approvals.consent_moved_into_run(work, Some(run_id))
+        };
+        assert_eq!(
+            moved(&first_work, &first_run),
+            MovedConsentScan::Moved(Vec::new()),
+            "nothing moved before the run opened"
+        );
+
+        w.review.open_consent_for_run(&first_work, &first_run);
+        w.review.open_consent_for_run(&second_work, &second_run);
+        assert_eq!(
+            moved(&first_work, &first_run),
+            MovedConsentScan::Moved(vec![first.clone()])
+        );
+        assert_eq!(
+            moved(&second_work, &second_run),
+            MovedConsentScan::Moved(vec![second])
+        );
+        assert_eq!(
+            moved(&first_work, &second_run),
+            MovedConsentScan::Moved(Vec::new()),
+            "a run id the owner never opened for this work reads nothing"
+        );
+        assert!(is_parked(&w, &pending), "a pending consent moves nowhere");
+        {
+            let _held = w.approvals.state.write();
+            assert_eq!(
+                moved(&first_work, &first_run),
+                MovedConsentScan::Deferred,
+                "a held owner defers the read"
+            );
+        }
+
+        assert_eq!(spend_in(&w, &first, &first_work, &first_run), Ok(()));
+        assert_eq!(
+            moved(&first_work, &first_run),
+            MovedConsentScan::Moved(Vec::new()),
+            "spent consent is never named again"
+        );
+        tokio::time::advance(VALIDITY + Duration::from_secs(1)).await;
+        assert_eq!(
+            moved(&second_work, &second_run),
+            MovedConsentScan::Moved(Vec::new()),
+            "expired custody is never named"
+        );
     }
 
     /// A receipt published through the owner while the resumed run staged

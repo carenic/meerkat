@@ -710,6 +710,21 @@ impl BoundOperationReview {
             .decided_consent_for_run(work, run_id, requested)
     }
 
+    /// The human consent the approval owner moved into the resumed run
+    /// `run_id` of `work` by the committed receipts of its staged notice
+    /// inputs (see [`super::ApprovalService::consent_moved_into_run`]); none
+    /// without a human route.
+    pub(crate) fn consent_moved_into_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+    ) -> crate::approval::consent::MovedConsentScan {
+        if self.human_consent.is_none() {
+            return crate::approval::consent::MovedConsentScan::Moved(Vec::new());
+        }
+        self.approvals.consent_moved_into_run(work, run_id)
+    }
+
     fn observation(
         handle: &ReviewAttemptHandle,
         tool_call_id: &Arc<str>,

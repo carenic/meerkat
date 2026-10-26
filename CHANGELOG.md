@@ -68,6 +68,14 @@ them.
   committed owner through the new provided
   `RetainedJobSource::admission_committed`), so approved parked consent
   moves into the resumed run its notice starts.
+- `meerkat-core`: a resumed run now spends, once, the human consent the
+  approval owner moved into it by the receipt of one of its staged notice
+  inputs: a boundary of the run attempts the exact retained call, as for
+  consent the run requested itself, and its `consent_attempt` notice also
+  names that input (`resumed_input_id`). A receipt that commits after the
+  run's first model request can let the model call the operation again
+  first, which asks for fresh consent once more; the moved consent still
+  runs once, at the next boundary.
 
 ## [0.9.5] - 2026-10-23
 
