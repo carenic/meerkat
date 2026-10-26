@@ -168,6 +168,14 @@ stops: `UnregisterQueuedInputs::default()` is `Stop`. The suspend does not
 wait for the round, so a long tool call does not hold up a shutdown, and a
 process killed during it leaves the run as a crash would.
 
+A host that boots over a store another host serves, holds its members' run
+starts and must hand the store back unchanged shuts down with
+`with_queued_inputs(QueuedInputsOnShutdown::Keep)`, which unregisters each
+member with `UnregisterQueuedInputs::Keep`: a registration that served no
+live work keeps every input it recovered and the run its session left open
+exactly as the store holds them, with no requeue mark, and one that served
+live work is stopped (see [Mobs](/guides/mobs)).
+
 - **The stop does not wait for the round.** It stops the turn at once. The
   run continues from its last committed round, and the work since that
   commit is redone: an uncommitted model response is asked for again, and
