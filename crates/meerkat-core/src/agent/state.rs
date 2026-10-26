@@ -4655,6 +4655,21 @@ where
                                     ),
                                     scope,
                                     projection: &model_messages,
+                                    earlier_folded_calls: match (
+                                        scope,
+                                        self.runtime_started_run_id.as_ref(),
+                                    ) {
+                                        (
+                                            crate::agent::compact::CompactionScope::OpenRunRounds {
+                                                ..
+                                            },
+                                            Some(run_id),
+                                        ) => crate::agent::compact::open_run_folded_calls(
+                                            &self.session,
+                                            run_id,
+                                        ),
+                                        _ => Vec::new(),
+                                    },
                                 };
                                 // The compactor's warnings (a bounded source,
                                 // a rewrite keeping no complete turn) name the
@@ -4801,6 +4816,24 @@ where
                             // session value. Its exact TranscriptRewriteCommit
                             // becomes the identity of any paired memory stage.
                             let mut compacted_session = self.session.clone();
+                            // The open run's folded-call list goes into the
+                            // same prepared value as the rewrite, so it
+                            // commits, rolls back and persists with it.
+                            if let (Some(calls), Some(run_id)) = (
+                                outcome.folded_run_calls.as_deref(),
+                                self.runtime_started_run_id.as_ref(),
+                            ) && let Err(error) =
+                                crate::agent::compact::persist_open_run_folded_calls(
+                                    &mut compacted_session,
+                                    run_id,
+                                    calls,
+                                )
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    "the open run's folded-call list could not be stored"
+                                );
+                            }
                             let retention = compactor.transcript_history_retention();
                             let prepared_rewrite = compacted_session
                                 .replace_messages_for_compaction_internal(
