@@ -1435,7 +1435,7 @@ mod tests {
         let realm = RealmId::parse("mcp-oauth").expect("valid realm");
         let binding = BindingId::parse("remote-AbC123dEf456GhI7").expect("valid binding");
         let client = TokenKey::mcp_oauth_client(realm.clone(), binding.clone());
-        let credential = TokenKey::new(realm.clone(), binding.clone());
+        let credential = TokenKey::new(realm.clone(), binding);
         assert_ne!(client, credential);
         assert!(client.is_mcp_oauth_client());
         assert!(!credential.is_mcp_oauth_client());
