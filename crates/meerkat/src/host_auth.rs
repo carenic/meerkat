@@ -1081,7 +1081,8 @@ impl HostAuthService {
 
     /// Serve MCP logins through the host's own `https` callback under
     /// `base` as well as through loopback redirects. Host configuration
-    /// only: each target's exact redirect is derived from it
+    /// only: each target's exact redirect is derived from it, or is the base
+    /// itself for a slot whose client profile names it
     /// ([`Self::mcp_registered_redirect_uri`]).
     pub fn with_mcp_registered_redirect_base(mut self, base: McpRegisteredRedirectBase) -> Self {
         self.mcp_registered_redirect_base = Some(base);
@@ -1101,21 +1102,28 @@ impl HostAuthService {
         self
     }
 
-    /// The exact registered `https` redirect of `target` in this service's
-    /// realm, when the host serves a registered base: the URI the
-    /// authorization server redirects to, which the host routes to its
-    /// callback endpoint. Local and secret-free.
-    pub fn mcp_registered_redirect_uri(
+    /// The exact registered `https` redirect a registered-callback login of
+    /// `target` in this service's realm uses, when the host serves a
+    /// registered base: the URI the authorization server redirects to, which
+    /// the host registers with it and routes to its callback endpoint. A
+    /// slot with a client profile uses the profile's redirect: the base
+    /// itself (one central callback for every slot of the client) or the
+    /// slot's derived redirect. Without a profile it is the derived
+    /// redirect, the base followed by the slot's binding segment. `None`
+    /// without a registered base, or for a slot whose profile is a loopback
+    /// client. Secret-free; an unattended read of the credential store (see
+    /// [`McpOAuthAuthority::registered_login_redirect_uri`]).
+    pub async fn mcp_registered_redirect_uri(
         &self,
         target: &McpServerIdentity,
     ) -> Result<Option<String>, HostAuthError> {
         let Some(base) = &self.mcp_registered_redirect_base else {
             return Ok(None);
         };
-        Ok(Some(
-            self.mcp_oauth_authority()?
-                .registered_redirect_uri(target, base)?,
-        ))
+        Ok(self
+            .mcp_oauth_authority()?
+            .registered_login_redirect_uri(target, base)
+            .await?)
     }
 
     /// Replace the provider protocols client-auth profiles may name. The
@@ -1502,14 +1510,18 @@ impl HostAuthService {
     /// confidential) OAuth client of `target`'s MCP credential slot in this
     /// service's realm, for an authorization server without dynamic client
     /// registration ([`McpOAuthClientProfile`]). From then on, the slot's
-    /// logins (the registered `https` callback, whose redirect the profile
-    /// must name exactly, as [`Self::mcp_registered_redirect_uri`] derives
-    /// it, and the loopback route alike) use that client, and its code
-    /// exchange and every refresh authenticate it by the profile's method.
-    /// Refused when a profile is already installed. The secret lives only in
-    /// the credential store; it never appears in configuration, errors,
-    /// `Debug` or logs. The update is admitted as the host's own
-    /// administration; [`Self::mcp_install_client_profile_entered`]
+    /// logins (the registered `https` callback and the loopback route alike)
+    /// use that client, and its code exchange and every refresh authenticate
+    /// it by the profile's method. A registered `https` redirect in the
+    /// profile must be exactly this service's registered base (the central
+    /// callback every slot of the client may share) or the slot's own
+    /// redirect derived from it (the base followed by the slot's binding
+    /// segment), byte for byte; any other is refused.
+    /// [`Self::mcp_registered_redirect_uri`] then answers the profile's
+    /// redirect. Refused when a profile is already installed. The secret
+    /// lives only in the credential store; it never appears in
+    /// configuration, errors, `Debug` or logs. The update is admitted as the
+    /// host's own administration; [`Self::mcp_install_client_profile_entered`]
     /// re-checks an authenticated caller at the update's entry.
     pub async fn mcp_install_client_profile(
         &self,
@@ -1534,7 +1546,12 @@ impl HostAuthService {
     ) -> Result<(), HostAuthError> {
         Ok(self
             .mcp_oauth_authority()?
-            .install_client_profile_entered(target, profile, entry)
+            .install_client_profile_entered(
+                target,
+                profile,
+                self.mcp_registered_redirect_base.as_ref(),
+                entry,
+            )
             .await?)
     }
 
@@ -1564,7 +1581,12 @@ impl HostAuthService {
     ) -> Result<(), HostAuthError> {
         Ok(self
             .mcp_oauth_authority()?
-            .replace_client_profile_entered(target, profile, entry)
+            .replace_client_profile_entered(
+                target,
+                profile,
+                self.mcp_registered_redirect_base.as_ref(),
+                entry,
+            )
             .await?)
     }
 
@@ -2390,6 +2412,7 @@ mod tests {
             .expect("target");
         let redirect = service
             .mcp_registered_redirect_uri(&target)
+            .await
             .expect("redirect")
             .expect("a registered base");
         let profile = |client: &str| {
@@ -2460,10 +2483,78 @@ mod tests {
                 .as_deref(),
             Some("client-b")
         );
+        assert_eq!(
+            service
+                .mcp_registered_redirect_uri(&target)
+                .await
+                .expect("redirect"),
+            Some(redirect.clone()),
+            "a profile on the slot's derived redirect logs in there"
+        );
+        // The central callback: the profile names the base itself.
+        let on_redirect = |redirect: &str| {
+            McpOAuthClientProfile::new(
+                "https://mcp.example",
+                "client-b",
+                redirect,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                McpOAuthClientSecret::new(SECRET),
+            )
+        };
+        service
+            .mcp_replace_client_profile(
+                &target,
+                on_redirect("https://host.example/mcp/oauth/callback"),
+            )
+            .await
+            .expect("the base itself is one of the slot's registered redirects");
+        assert_eq!(
+            service
+                .mcp_registered_redirect_uri(&target)
+                .await
+                .expect("redirect")
+                .as_deref(),
+            Some("https://host.example/mcp/oauth/callback")
+        );
+        // The same client's slot in another realm shares the central
+        // callback: both describe exactly the base.
+        let service_b = in_realm("realm-b");
+        service_b
+            .mcp_install_client_profile(
+                &target,
+                on_redirect("https://host.example/mcp/oauth/callback"),
+            )
+            .await
+            .expect("installed in realm-b");
+        assert_eq!(
+            service_b
+                .mcp_registered_redirect_uri(&target)
+                .await
+                .expect("redirect")
+                .as_deref(),
+            Some("https://host.example/mcp/oauth/callback")
+        );
+        refusals.push(
+            service
+                .mcp_replace_client_profile(
+                    &target,
+                    on_redirect("https://host.example/mcp/oauth/other"),
+                )
+                .await
+                .expect_err("neither the base nor the slot's derived redirect"),
+        );
         service
             .mcp_remove_client_profile(&target)
             .await
             .expect("removed");
+        assert_eq!(
+            service
+                .mcp_registered_redirect_uri(&target)
+                .await
+                .expect("redirect"),
+            Some(redirect.clone()),
+            "without a profile the slot logs in on its derived redirect"
+        );
         assert_eq!(
             service.mcp_client_profile(&target).await.expect("read"),
             None

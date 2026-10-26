@@ -1477,6 +1477,8 @@ struct ReadyAttempt<'a> {
     client: StoredMcpOAuthClient,
     offline_access: bool,
     identity: OAuthBrowserFlowIdentity,
+    /// The attempt's exact redirect.
+    redirect_uri: String,
 }
 
 impl std::fmt::Debug for McpOAuthLoginStart {
@@ -1525,7 +1527,11 @@ impl std::fmt::Debug for McpOAuthCallback {
 /// segment, the target's credential binding slug
 /// ([`McpOAuthAuthority::registered_redirect_uri`]). So every server, realm
 /// and account selection has its own exact redirect, and a callback compares
-/// byte for byte: no normalization, prefix or pattern matching.
+/// byte for byte: no normalization, prefix or pattern matching. A slot with
+/// a host-registered client profile may instead name the base itself, one
+/// central callback shared by every such slot of the client
+/// ([`McpOAuthAuthority::registered_login_redirect_uri`]); its attempts are
+/// told apart by their state and custody, never by the redirect.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct McpRegisteredRedirectBase(String);
 
@@ -1606,6 +1612,24 @@ enum RedirectMode {
     /// The target's registered `https` redirect: the host's own callback,
     /// completed only from the host's retained custody.
     Registered,
+}
+
+/// The redirect a start asks for: the loopback redirect the host bound, or
+/// the host's registered base, under which the slot's exact redirect is
+/// resolved ([`registered_login_redirect`]).
+#[derive(Clone, Copy)]
+enum AttemptRedirect<'a> {
+    Loopback(&'a str),
+    Registered(&'a McpRegisteredRedirectBase),
+}
+
+impl AttemptRedirect<'_> {
+    fn mode(self) -> RedirectMode {
+        match self {
+            Self::Loopback(_) => RedirectMode::Loopback,
+            Self::Registered(_) => RedirectMode::Registered,
+        }
+    }
 }
 
 /// What a completion proves about the attempt it completes.
@@ -2440,8 +2464,7 @@ impl McpOAuthAuthority {
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
         self.admit_attempt(
             target,
-            redirect_uri,
-            RedirectMode::Loopback,
+            AttemptRedirect::Loopback(redirect_uri),
             www_authenticate,
         )
         .await
@@ -2450,7 +2473,9 @@ impl McpOAuthAuthority {
     /// The exact registered redirect of `target` under `base`: the base
     /// followed by the target's credential binding slug, for the target as
     /// this authority serves it (its realm and account selection included).
-    /// Local and secret-free; it admits nothing.
+    /// Local and secret-free; it admits nothing. A slot with a client profile
+    /// logs in on the profile's redirect, which may be the base itself
+    /// ([`Self::registered_login_redirect_uri`]).
     pub fn registered_redirect_uri(
         &self,
         target: &McpServerIdentity,
@@ -2464,14 +2489,42 @@ impl McpOAuthAuthority {
         Ok(redirect)
     }
 
+    /// The exact registered redirect a registered-callback login of `target`
+    /// uses under `base` ([`Self::login_start_registered`]): the redirect of
+    /// the slot's client profile when one is installed, which is either the
+    /// base itself (one central callback for every slot of the client) or
+    /// the slot's derived redirect; without a profile, the derived redirect
+    /// ([`Self::registered_redirect_uri`]). `None` when the slot's profile is
+    /// a loopback client, which has no registered redirect; a profile naming
+    /// any other redirect is refused
+    /// ([`McpOAuthClientProfileRefusal::RedirectMismatch`]). The URI to
+    /// register with the authorization server; an unattended read of the
+    /// credential store that admits nothing.
+    pub async fn registered_login_redirect_uri(
+        &self,
+        target: &McpServerIdentity,
+        base: &McpRegisteredRedirectBase,
+    ) -> Result<Option<String>, McpOAuthError> {
+        let target = self.scoped(target)?;
+        let profile = load_client_profile(
+            self.token_store().as_ref(),
+            &target,
+            TokenStoreAccess::Unattended,
+        )
+        .await?;
+        registered_login_redirect(&target, base, profile.as_ref())
+    }
+
     /// [`Self::login_start`] for a host whose users' browsers cannot reach
     /// its loopback address: the attempt redirects to the target's registered
-    /// `https` callback under `base` ([`Self::registered_redirect_uri`]), the
-    /// host's own endpoint. Everything else is the same admission: realm,
-    /// account selection, discovery, preflight, client registration (as a
-    /// `web` public PKCE client registering exactly that redirect), PKCE and
-    /// one-time state through the AuthMachine-owned flow owner, the same
-    /// window and the same start-or-join.
+    /// `https` callback under `base` ([`Self::registered_login_redirect_uri`]:
+    /// a slot with a client profile uses exactly the profile's redirect, the
+    /// base itself or the slot's derived one), the host's own endpoint.
+    /// Everything else is the same admission: realm, account selection,
+    /// discovery, preflight, client registration (as a `web` public PKCE
+    /// client registering exactly that redirect), PKCE and one-time state
+    /// through the AuthMachine-owned flow owner, the same window and the same
+    /// start-or-join.
     ///
     /// A started attempt returns [`McpOAuthLoginStart::host_attempt_handle`]:
     /// a host-only secret its completion
@@ -2503,16 +2556,8 @@ impl McpOAuthAuthority {
         base: &McpRegisteredRedirectBase,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
-        let redirect = self
-            .registered_redirect_uri(target, base)
-            .map_err(McpOAuthStartFailure::not_admitted)?;
-        self.admit_attempt(
-            target,
-            &redirect,
-            RedirectMode::Registered,
-            www_authenticate,
-        )
-        .await
+        self.admit_attempt(target, AttemptRedirect::Registered(base), www_authenticate)
+            .await
     }
 
     /// Admit one attempt, or join the one pending. Every step before the
@@ -2521,12 +2566,11 @@ impl McpOAuthAuthority {
     async fn admit_attempt(
         &self,
         target: &McpServerIdentity,
-        redirect_uri: &str,
-        mode: RedirectMode,
+        redirect: AttemptRedirect<'_>,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
         let ready = match self
-            .prepare_attempt(target, redirect_uri, mode, www_authenticate)
+            .prepare_attempt(target, redirect, www_authenticate)
             .await
         {
             Ok(PreparedAttempt::Joined(joined)) => return Ok(joined),
@@ -2543,13 +2587,14 @@ impl McpOAuthAuthority {
             client,
             offline_access,
             identity,
+            redirect_uri,
         } = ready;
         let pkce = PkcePair::generate_s256();
         let state = authority
             .start_with_admission(
                 credential_identity,
                 identity.clone(),
-                redirect_uri.to_owned(),
+                redirect_uri.clone(),
                 pkce.verifier.secret().to_owned(),
             )
             .map_err(|failure| McpOAuthStartFailure {
@@ -2562,13 +2607,13 @@ impl McpOAuthAuthority {
         let expires_at = std::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
         let authorize_url = authorize_endpoints(&discovery, &client, offline_access)
             .authorize_url_with_pkce(&pkce.challenge, &state);
-        let host_attempt_handle = (mode == RedirectMode::Registered)
-            .then(|| mcp_remote_attempt_handle(&binding, &state, redirect_uri));
+        let host_attempt_handle = (redirect.mode() == RedirectMode::Registered)
+            .then(|| mcp_remote_attempt_handle(&binding, &state, &redirect_uri));
         Ok(McpOAuthLoginStart {
             target,
             authorize_url,
             state,
-            redirect_uri: redirect_uri.to_owned(),
+            redirect_uri,
             disposition: McpOAuthLoginDisposition::Started,
             host_attempt_handle,
             identity,
@@ -2582,8 +2627,7 @@ impl McpOAuthAuthority {
     async fn prepare_attempt(
         &self,
         target: &McpServerIdentity,
-        redirect_uri: &str,
-        mode: RedirectMode,
+        redirect: AttemptRedirect<'_>,
         www_authenticate: Option<&str>,
     ) -> Result<PreparedAttempt<'_>, McpOAuthError> {
         let target = &self.scoped(target)?;
@@ -2593,12 +2637,9 @@ impl McpOAuthAuthority {
             .as_ref()
             .ok_or(ConnectorOAuthRefusal::VerificationUnavailable)?;
         self.require_bound_strategy(target, strategy.as_ref())?;
-        match mode {
-            RedirectMode::Loopback => require_loopback_redirect(redirect_uri)?,
-            // Only a redirect derived from a host's registered base gets here.
-            RedirectMode::Registered => {
-                McpRegisteredRedirectBase::parse(redirect_uri)?;
-            }
+        let mode = redirect.mode();
+        if let AttemptRedirect::Loopback(redirect_uri) = redirect {
+            require_loopback_redirect(redirect_uri)?;
         }
         // The slot's host-registered client, when one is installed: the
         // attempt is its client's, on exactly its registered redirect, and
@@ -2609,6 +2650,22 @@ impl McpOAuthAuthority {
             TokenStoreAccess::Interactive,
         )
         .await?;
+        // The attempt's exact redirect: the loopback redirect the host bound,
+        // or the slot's registered redirect under the host's base (the
+        // profile's, when one is installed).
+        let redirect_uri = match redirect {
+            AttemptRedirect::Loopback(redirect_uri) => redirect_uri.to_owned(),
+            AttemptRedirect::Registered(base) => {
+                let redirect_uri = registered_login_redirect(target, base, profile.as_ref())?
+                    .ok_or_else(|| McpOAuthError::ClientProfile {
+                        server_name: target.server_name().to_owned(),
+                        refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+                    })?;
+                McpRegisteredRedirectBase::parse(&redirect_uri)?;
+                redirect_uri
+            }
+        };
+        let redirect_uri = redirect_uri.as_str();
         if let Some(profile) = &profile
             && profile.redirect_uri() != redirect_uri
         {
@@ -2772,6 +2829,7 @@ impl McpOAuthAuthority {
             client,
             offline_access: requested.offline_access,
             identity: descriptor.into(),
+            redirect_uri: redirect_uri.to_owned(),
         }))
     }
 
@@ -5100,6 +5158,43 @@ fn valid_registered_redirect(redirect_uri: &str) -> bool {
             && url.fragment().is_none()
             && url.as_str() == redirect_uri
     })
+}
+
+/// Whether `redirect` is one of `target`'s registered redirects under
+/// `base`, byte for byte: the slot's own derived redirect, or the base
+/// itself, the central callback a host-registered client may name for every
+/// slot it serves.
+fn registered_redirect_fits(
+    target: &McpServerIdentity,
+    base: &McpRegisteredRedirectBase,
+    redirect: &str,
+) -> bool {
+    redirect == base.as_str() || redirect == base.redirect_for(&target.binding_slug())
+}
+
+/// The redirect a registered-callback attempt of `target` uses under `base`:
+/// exactly the redirect of the slot's client `profile` when one is
+/// installed, which must be one of the slot's registered redirects
+/// ([`registered_redirect_fits`]); without a profile, the slot's derived
+/// redirect, as before. `None` for a profile on a loopback redirect, which
+/// has no registered redirect.
+fn registered_login_redirect(
+    target: &McpServerIdentity,
+    base: &McpRegisteredRedirectBase,
+    profile: Option<&BoundClientProfile>,
+) -> Result<Option<String>, McpOAuthError> {
+    match profile {
+        None => Ok(Some(base.redirect_for(&target.binding_slug()))),
+        // A loopback client has no registered redirect.
+        Some(profile) if !is_https_redirect(profile.redirect_uri()) => Ok(None),
+        Some(profile) if registered_redirect_fits(target, base, profile.redirect_uri()) => {
+            Ok(Some(profile.redirect_uri().to_owned()))
+        }
+        Some(_) => Err(McpOAuthError::ClientProfile {
+            server_name: target.server_name().to_owned(),
+            refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+        }),
+    }
 }
 
 /// The host-only handle of an attempt admitted on a registered redirect: an
@@ -7433,6 +7528,7 @@ mod tests {
                     McpOAuthClientAuthMethod::ClientSecretPost,
                     McpOAuthClientSecret::new("client-secret-canary"),
                 ),
+                None,
                 Arc::new(AdmitAll),
             )
             .await

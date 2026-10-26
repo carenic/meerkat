@@ -457,8 +457,10 @@ ask its user.
   Agents, MCP server definitions and mob profiles cannot set it. Each
   server's exact redirect is the base followed by one path segment, its
   credential binding, so every server, realm and account selection has its
-  own redirect. `auth/login/start` with `redirect_uri` set to the base (or
-  to that server's derived redirect) starts on it and adds two fields:
+  own redirect (a slot whose pre-registered client names the base itself
+  uses the base: see the central callback below). `auth/login/start` with
+  `redirect_uri` set to the base (or to that server's derived redirect)
+  starts on it and adds two fields:
 
   ```json
   {"authorize_url": "https://idp.example/authorize?...",
@@ -516,16 +518,42 @@ ask its user.
   An `McpOAuthClientProfile` names the authorization server's issuer, the
   client id, the client's exact registered redirect and its token endpoint
   authentication, `client_secret_basic` or `client_secret_post`, with the
-  client secret. The redirect is either the server's registered `https`
-  callback (exactly as `HostAuthService::mcp_registered_redirect_uri`
-  derives it: register that URI with the authorization server) or an `http`
-  loopback redirect on `127.0.0.1` or `localhost` with an explicit port.
+  client secret. The redirect is the host's registered base itself (the
+  central callback, below), the server's own registered `https` callback
+  (the base followed by the slot's binding segment), or an `http` loopback
+  redirect on `127.0.0.1` or `localhost` with an explicit port. A registered
+  `https` redirect that is neither this host's base nor the slot's own
+  derived redirect, byte for byte, is refused at install and replace
+  (`configuration_invalid`). `HostAuthService::mcp_registered_redirect_uri`
+  answers the exact URI a slot logs in on (its profile's, or its derived
+  redirect without a profile): register that URI with the authorization
+  server.
   Two optional fields cover servers whose metadata does not fit the
   defaults: `with_scopes` requests (and requires) the scopes the client is
   registered for in place of the ones the server names (`offline_access` is
   never required), and `with_resource` accepts the resource identifier the
   server's protected resource metadata names when it is not the configured
   URL (only its origin or a path above it).
+
+  Central callback: a host that serves many slots of one pre-registered
+  client (several users, realms or account selections) registers one
+  callback URI for all of them. Each slot's profile names the host's
+  registered base itself, and every login of those slots is admitted on
+  exactly that URI, byte for byte: a base such as
+  `https://host.example/services/mcp/callback` stays exactly that, with no
+  slash added or removed. The slots' attempts are told apart only by their
+  `state` and `host_attempt_handle`, so the host must route each callback
+  by its `state` to the ceremony it retained when it started the login (the
+  target and its `host_attempt_handle`) and complete it for exactly that
+  target; it never takes the realm or account from the callback, the
+  browser or a model. A callback presented for another slot is refused
+  without consuming or retiring any attempt: a `state` that is not an
+  attempt of that slot (`attempt_missing`) and a handle that is not that
+  attempt's custody (`invalid_target`, detail `remote_custody_required`)
+  alike, so a misrouted or injected callback cannot cancel a user's login.
+  Only a callback that passes both checks and then fails (its redirect,
+  issuer or code exchange) retires its attempt. A slot without a profile
+  keeps its derived redirect.
 
   The profile belongs to one credential slot: the server as configured (name
   and URL), the realm the host serves and the account selection. It is never

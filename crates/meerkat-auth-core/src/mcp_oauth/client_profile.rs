@@ -32,8 +32,9 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::{
-    McpOAuthAuthority, McpOAuthError, McpServerIdentity, StoredMcpOAuthClient, is_loopback_url,
-    map_coordinated_login_error, mcp_store_error, valid_registered_redirect,
+    McpOAuthAuthority, McpOAuthError, McpRegisteredRedirectBase, McpServerIdentity,
+    StoredMcpOAuthClient, is_loopback_url, map_coordinated_login_error, mcp_store_error,
+    registered_redirect_fits, valid_registered_redirect,
 };
 use crate::auth_oauth::OAuthClientAuthentication;
 use crate::auth_store::{
@@ -142,10 +143,12 @@ impl Drop for McpOAuthClientSecret {
 ///   issuer the token endpoint, where the secret is sent, must use `https`
 ///   too; only an `http` loopback issuer keeps loopback endpoints.
 /// - `client_id` and `redirect_uri`: the registered client and its exact
-///   registered redirect, either the target's registered `https` callback
-///   ([`McpOAuthAuthority::registered_redirect_uri`]) or an `http` loopback
+///   registered redirect: the host's registered `https` redirect base itself
+///   (one central callback for every slot of the client, told apart by
+///   state), the target's own registered `https` callback
+///   ([`McpOAuthAuthority::registered_redirect_uri`]), or an `http` loopback
 ///   redirect on `127.0.0.1` or `localhost` with an explicit port. A login
-///   uses exactly this redirect.
+///   uses exactly this redirect, byte for byte.
 /// - `auth_method` and the secret: how the code exchange and every refresh
 ///   authenticate the client.
 /// - [`Self::with_scopes`]: the scopes the client requests, in place of the
@@ -585,12 +588,26 @@ fn client_profile_row(
 fn profile_record(
     target: &McpServerIdentity,
     profile: &McpOAuthClientProfile,
+    registered_base: Option<&McpRegisteredRedirectBase>,
 ) -> Result<ClientProfileRecord, McpOAuthError> {
     if !target.is_selected() {
         return Err(McpOAuthError::AccountSelectionRequired);
     }
-    ClientProfileRecord::for_target(target, profile)
-        .map_err(|refusal| profile_refusal(target, refusal))
+    let record = ClientProfileRecord::for_target(target, profile)
+        .map_err(|refusal| profile_refusal(target, refusal))?;
+    // A registered `https` redirect is one of this host's registered
+    // redirects for the slot: its base itself (the central callback) or the
+    // slot's derived redirect. A host that serves no base has none.
+    if loopback_redirect_parts(&record.redirect_uri).is_none()
+        && !registered_base
+            .is_some_and(|base| registered_redirect_fits(target, base, &record.redirect_uri))
+    {
+        return Err(profile_refusal(
+            target,
+            McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        ));
+    }
+    Ok(record)
 }
 
 /// One profile update of a slot.
@@ -614,6 +631,13 @@ impl McpOAuthAuthority {
     /// never dynamic registration. Refused when a profile is already
     /// installed ([`McpOAuthClientProfileRefusal::AlreadyInstalled`]).
     ///
+    /// `registered_base` is the host's registered redirect base, when it
+    /// serves one. A profile whose redirect is a registered `https` redirect
+    /// must name exactly that base (the central callback every slot of the
+    /// client may share) or the slot's redirect derived from it
+    /// ([`Self::registered_redirect_uri`]), byte for byte; any other is
+    /// refused ([`McpOAuthClientProfileRefusal::Invalid`]).
+    ///
     /// The update runs under the credential mutation owner's exclusion for
     /// the slot's profile key. `entry` admits the caller there, after the
     /// slot's current profile was read and immediately before anything is
@@ -627,10 +651,11 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
         profile: McpOAuthClientProfile,
+        registered_base: Option<&McpRegisteredRedirectBase>,
         entry: Arc<dyn AdministrationEntry>,
     ) -> Result<(), McpOAuthError> {
         let target = self.scoped(target)?;
-        let record = profile_record(&target, &profile)?;
+        let record = profile_record(&target, &profile, registered_base)?;
         let McpOAuthClientProfile { secret, .. } = profile;
         self.update_client_profile(&target, ProfileUpdate::Install(record, secret), entry)
             .await
@@ -638,7 +663,8 @@ impl McpOAuthAuthority {
 
     /// Replace the client profile installed for `target`'s credential slot
     /// with `profile`, as [`Self::install_client_profile_entered`] installs
-    /// one; refused when none is installed
+    /// one (its redirect checked against `registered_base` the same way);
+    /// refused when none is installed
     /// ([`McpOAuthClientProfileRefusal::NotInstalled`]).
     ///
     /// The same facts with a new secret rotate the secret: attempts and
@@ -651,10 +677,11 @@ impl McpOAuthAuthority {
         &self,
         target: &McpServerIdentity,
         profile: McpOAuthClientProfile,
+        registered_base: Option<&McpRegisteredRedirectBase>,
         entry: Arc<dyn AdministrationEntry>,
     ) -> Result<(), McpOAuthError> {
         let target = self.scoped(target)?;
-        let record = profile_record(&target, &profile)?;
+        let record = profile_record(&target, &profile, registered_base)?;
         let McpOAuthClientProfile { secret, .. } = profile;
         self.update_client_profile(&target, ProfileUpdate::Replace(record, secret), entry)
             .await

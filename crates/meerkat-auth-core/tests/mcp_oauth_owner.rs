@@ -8465,6 +8465,7 @@ async fn install_registered_fixed_client(
         .install_client_profile_entered(
             target,
             fixed_client_profile(issuer, &redirect, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -8794,6 +8795,7 @@ async fn a_fixed_client_is_bound_to_its_server_issuer_and_owner() {
                 method,
                 FIXED_CLIENT_SECRET,
             ),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -8834,7 +8836,7 @@ async fn the_client_secret_never_appears_in_errors_debug_or_display() {
     let mut errors = vec![
         // An install over the installed profile.
         authority
-            .install_client_profile_entered(&target, profile, admit_all())
+            .install_client_profile_entered(&target, profile, Some(&registered_base()), admit_all())
             .await
             .unwrap_err(),
         // An invalid profile.
@@ -8842,6 +8844,7 @@ async fn the_client_secret_never_appears_in_errors_debug_or_display() {
             .install_client_profile_entered(
                 &split_target(&base, "fixed-invalid"),
                 fixed_client_profile(&base, "http://127.0.0.1/", method, FIXED_CLIENT_SECRET),
+                Some(&registered_base()),
                 admit_all(),
             )
             .await
@@ -8914,6 +8917,8 @@ async fn fixed_client_custody_survives_a_store_reopen() {
     let temp = tempfile::tempdir().unwrap();
     let credentials = temp.path().join("credentials");
     let target = split_target(&base, "fixed-reopen");
+    // Two slots of the client in two realms on the central callback.
+    let central_target = split_target(&base, "fixed-reopen-central");
     let redirect = {
         let installing = FixtureAuthority::with_fixture_http(
             ProviderAuthPersistence::new(
@@ -8924,6 +8929,7 @@ async fn fixed_client_custody_survives_a_store_reopen() {
             no_redirect_client(),
             test_auth_lease(),
         );
+        central_callback_slots(&installing, &base, &central_target).await;
         install_registered_fixed_client(&installing, &base, &target, method).await
     };
 
@@ -8954,6 +8960,24 @@ async fn fixed_client_custody_survives_a_store_reopen() {
             .iter()
             .any(TokenKey::is_mcp_oauth_client)
     );
+    // Each central slot reads back its own profile on the central callback,
+    // secret-free.
+    for realm in ["realm-a", "realm-b"] {
+        let installed = reopened
+            .native
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap())
+            .client_profile(&central_target)
+            .await
+            .unwrap()
+            .expect("the central profile survives the reopen");
+        assert_eq!(installed.redirect_uri, REGISTERED_BASE, "{realm}");
+        assert_eq!(installed.client_id, FIXED_CLIENT_ID, "{realm}");
+        assert!(
+            !format!("{installed:?}").contains(FIXED_CLIENT_SECRET),
+            "{realm}: {installed:?}"
+        );
+    }
     registered_fixed_client_login(&reopened, &target).await;
     assert_fixed_client_authenticated(&state, 0, method, FIXED_CLIENT_SECRET);
     assert!(state.registration_requests.lock().is_empty());
@@ -9008,6 +9032,7 @@ async fn a_removed_replaced_or_unaccepted_profile_ends_the_credential_without_fa
                         method,
                         McpOAuthClientSecret::new(FIXED_CLIENT_SECRET),
                     ),
+                    Some(&registered_base()),
                     admit_all(),
                 )
                 .await
@@ -9016,6 +9041,7 @@ async fn a_removed_replaced_or_unaccepted_profile_ends_the_credential_without_fa
                 .replace_client_profile_entered(
                     &target,
                     fixed_client_profile(&base, &redirect, method, ROTATED_CLIENT_SECRET),
+                    Some(&registered_base()),
                     admit_all(),
                 )
                 .await
@@ -9089,6 +9115,7 @@ async fn a_rotated_secret_authenticates_the_next_refresh() {
         .replace_client_profile_entered(
             &target,
             fixed_client_profile(&base, &redirect, method, ROTATED_CLIENT_SECRET),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -9138,6 +9165,7 @@ async fn a_completion_whose_profile_changed_refuses_and_retires_the_attempt() {
                         method,
                         McpOAuthClientSecret::new(FIXED_CLIENT_SECRET),
                     ),
+                    Some(&registered_base()),
                     admit_all(),
                 )
                 .await
@@ -9189,6 +9217,7 @@ async fn loopback_fixed_client_binds_its_registered_redirect_and_authenticates()
         .install_client_profile_entered(
             &target,
             fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -9267,6 +9296,7 @@ async fn a_profile_accepts_the_resource_and_requests_the_scopes_it_names() {
             &target,
             fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET)
                 .with_resource(base.clone()),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -9293,6 +9323,7 @@ async fn a_profile_accepts_the_resource_and_requests_the_scopes_it_names() {
             fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET)
                 .with_resource(base.clone())
                 .with_scopes(["mcp.write"]),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -9347,7 +9378,12 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
     assert_eq!(
         client_profile_refusal(
             authority
-                .replace_client_profile_entered(&target, profile("client-a"), admit_all())
+                .replace_client_profile_entered(
+                    &target,
+                    profile("client-a"),
+                    Some(&registered_base()),
+                    admit_all()
+                )
                 .await
         ),
         McpOAuthClientProfileRefusal::NotInstalled
@@ -9358,6 +9394,7 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
                 .install_client_profile_entered(
                     &target,
                     fixed_client_profile(&base, "http://127.0.0.1/", method, FIXED_CLIENT_SECRET),
+                    Some(&registered_base()),
                     admit_all(),
                 )
                 .await
@@ -9367,7 +9404,12 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
     assert_eq!(
         client_profile_refusal(
             authority
-                .install_client_profile_entered(&target, profile("client-a"), Arc::new(RefuseEntry))
+                .install_client_profile_entered(
+                    &target,
+                    profile("client-a"),
+                    Some(&registered_base()),
+                    Arc::new(RefuseEntry)
+                )
                 .await
         ),
         McpOAuthClientProfileRefusal::NotAdmitted(
@@ -9383,19 +9425,34 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
     let legacy = McpServerIdentity::from_server_config("fixed-legacy", format!("{base}/mcp"));
     assert!(matches!(
         authority
-            .install_client_profile_entered(&legacy, profile("client-a"), admit_all())
+            .install_client_profile_entered(
+                &legacy,
+                profile("client-a"),
+                Some(&registered_base()),
+                admit_all()
+            )
             .await,
         Err(McpOAuthError::AccountSelectionRequired)
     ));
 
     authority
-        .install_client_profile_entered(&target, profile("client-a"), admit_all())
+        .install_client_profile_entered(
+            &target,
+            profile("client-a"),
+            Some(&registered_base()),
+            admit_all(),
+        )
         .await
         .unwrap();
     assert_eq!(
         client_profile_refusal(
             authority
-                .install_client_profile_entered(&target, profile("client-b"), admit_all())
+                .install_client_profile_entered(
+                    &target,
+                    profile("client-b"),
+                    Some(&registered_base()),
+                    admit_all()
+                )
                 .await
         ),
         McpOAuthClientProfileRefusal::AlreadyInstalled
@@ -9403,7 +9460,12 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
     assert_eq!(
         client_profile_refusal(
             authority
-                .replace_client_profile_entered(&target, profile("client-b"), Arc::new(RefuseEntry))
+                .replace_client_profile_entered(
+                    &target,
+                    profile("client-b"),
+                    Some(&registered_base()),
+                    Arc::new(RefuseEntry)
+                )
                 .await
         ),
         McpOAuthClientProfileRefusal::NotAdmitted(
@@ -9415,7 +9477,12 @@ async fn profile_updates_are_refused_typed_and_write_nothing() {
         Some("client-a")
     );
     authority
-        .replace_client_profile_entered(&target, profile("client-b"), admit_all())
+        .replace_client_profile_entered(
+            &target,
+            profile("client-b"),
+            Some(&registered_base()),
+            admit_all(),
+        )
         .await
         .unwrap();
     assert_eq!(
@@ -9486,6 +9553,7 @@ async fn a_dynamically_registered_credential_is_untouched_by_a_later_profile() {
                 McpOAuthClientAuthMethod::ClientSecretPost,
                 FIXED_CLIENT_SECRET,
             ),
+            Some(&registered_base()),
             admit_all(),
         )
         .await
@@ -9512,5 +9580,459 @@ async fn a_dynamically_registered_credential_is_untouched_by_a_later_profile() {
     assert!(
         matches!(refused, Err(McpOAuthError::DisconnectRequired { .. })),
         "{refused:?}"
+    );
+}
+
+// --- Central callback: one registered redirect for every slot ----------------
+
+fn authorize_query(start: &McpOAuthLoginStart) -> HashMap<String, String> {
+    reqwest::Url::parse(&start.authorize_url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// Two credential slots of one host-registered client, the same server in two
+/// realms, whose profiles both name the host's registered base itself: the
+/// central callback.
+async fn central_callback_slots(
+    authority: &FixtureAuthority,
+    base: &str,
+    target: &McpServerIdentity,
+) -> [McpOAuthAuthority; 2] {
+    let slots = ["realm-a", "realm-b"].map(|realm| {
+        authority
+            .native
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap())
+    });
+    for slot in &slots {
+        slot.install_client_profile_entered(
+            target,
+            fixed_client_profile(
+                base,
+                REGISTERED_BASE,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("each slot names the central callback");
+    }
+    slots
+}
+
+/// The central callback: two slots of one host-registered client (the same
+/// server in two realms) both name the host's registered base itself. Each
+/// login is admitted on exactly the base, with its own state and custody,
+/// and both complete through that one callback URI into their own slots.
+#[tokio::test]
+async fn two_realm_slots_complete_through_one_central_callback() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-central");
+    let [slot_a, slot_b] = central_callback_slots(&authority, &base, &target).await;
+
+    let mut starts = Vec::new();
+    for slot in [&slot_a, &slot_b] {
+        assert_eq!(
+            slot.registered_login_redirect_uri(&target, &registered_base())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(REGISTERED_BASE)
+        );
+        let start = slot
+            .login_start_registered(&target, &registered_base(), None)
+            .await
+            .expect("the slot starts on the central callback");
+        assert_eq!(start.disposition, McpOAuthLoginDisposition::Started);
+        assert_eq!(start.redirect_uri, REGISTERED_BASE);
+        let query = authorize_query(&start);
+        assert_eq!(query["redirect_uri"], REGISTERED_BASE);
+        assert_eq!(query["client_id"], FIXED_CLIENT_ID);
+        starts.push(start);
+    }
+    assert_ne!(starts[0].state, starts[1].state);
+    assert_ne!(handle_of(&starts[0]), handle_of(&starts[1]));
+
+    for (slot, start) in [&slot_a, &slot_b].into_iter().zip(&starts) {
+        let callback = registered_callback(start, &start.state, &handle_of(start));
+        assert_eq!(callback.redirect_uri, REGISTERED_BASE);
+        slot.login_complete_registered(&target, callback)
+            .await
+            .expect("each slot completes through the central callback");
+    }
+    for realm in ["realm-a", "realm-b"] {
+        let slot_target = target
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap());
+        assert!(
+            store
+                .load(&slot_target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "{realm}: the credential lands in its own slot"
+        );
+    }
+    assert!(state.registration_requests.lock().is_empty());
+    let requests = state.token_requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["redirect_uri"] == REGISTERED_BASE),
+        "each code exchange names the central callback"
+    );
+}
+
+/// On the central callback the host routes each callback by its state to
+/// the ceremony it retained. A callback delivered to another slot, with its
+/// own custody or the other slot's, is refused: nothing is exchanged and no
+/// attempt is consumed, so each slot still completes with its own callback.
+#[tokio::test]
+async fn a_central_callback_routed_to_another_slot_is_refused_and_consumes_nothing() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-misrouted");
+    let [slot_a, slot_b] = central_callback_slots(&authority, &base, &target).await;
+    let start_a = slot_a
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+    let start_b = slot_b
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+
+    for (slot, misrouted) in [
+        // A's callback and custody, delivered to B's slot.
+        (
+            &slot_b,
+            registered_callback(&start_a, &start_a.state, &handle_of(&start_a)),
+        ),
+        // A's state with B's custody.
+        (
+            &slot_b,
+            registered_callback(&start_b, &start_a.state, &handle_of(&start_b)),
+        ),
+        // B's callback and custody, delivered to A's slot.
+        (
+            &slot_a,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_b)),
+        ),
+    ] {
+        let refused = slot.login_complete_registered(&target, misrouted).await;
+        assert!(
+            matches!(refused, Err(McpOAuthError::Flow(OAuthFlowError::Missing))),
+            "{refused:?}"
+        );
+    }
+    // B's own state with A's custody: refused at the custody check, which
+    // leaves B's attempt pending as well.
+    let refused = slot_b
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_a)),
+        )
+        .await;
+    assert!(is_custody_refusal(&refused), "{refused:?}");
+    assert!(
+        state.token_requests.lock().is_empty(),
+        "nothing was exchanged"
+    );
+    for slot in [&slot_a, &slot_b] {
+        assert!(
+            slot.pending_attempt(&target).unwrap().is_some(),
+            "the slot's attempt is still pending"
+        );
+    }
+
+    slot_a
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_a, &start_a.state, &handle_of(&start_a)),
+        )
+        .await
+        .expect("A's attempt was not consumed");
+    slot_b
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_b)),
+        )
+        .await
+        .expect("B's attempt was not consumed");
+    assert_eq!(state.token_requests.lock().len(), 2);
+}
+
+/// A profile's registered redirect is one of the host's own for its slot:
+/// the base itself or the slot's derived redirect, byte for byte. Any other
+/// (another path or host, the base with a slash added, another slot's
+/// redirect) is refused at install and at replace and writes nothing, and a
+/// host that serves no base takes no registered redirect.
+#[tokio::test]
+async fn a_profile_redirect_other_than_the_base_or_its_slot_redirect_is_refused() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-redirects");
+    let derived = authority
+        .registered_redirect_uri(&target, &registered_base())
+        .unwrap();
+    let other_slot = authority
+        .registered_redirect_uri(
+            &split_target(&base, "fixed-redirects-other"),
+            &registered_base(),
+        )
+        .unwrap();
+    let slashed = format!("{REGISTERED_BASE}/");
+    let refused_redirects = [
+        "https://host.example/mcp/oauth/other",
+        "https://other.example/mcp/oauth/callback",
+        slashed.as_str(),
+        other_slot.as_str(),
+    ];
+    for redirect in refused_redirects {
+        assert_eq!(
+            client_profile_refusal(
+                authority
+                    .install_client_profile_entered(
+                        &target,
+                        fixed_client_profile(&base, redirect, method, FIXED_CLIENT_SECRET),
+                        Some(&registered_base()),
+                        admit_all(),
+                    )
+                    .await
+            ),
+            McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, REGISTERED_BASE, method, FIXED_CLIENT_SECRET),
+                    None,
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a host that serves no base has no registered redirect"
+    );
+    assert_eq!(
+        authority.client_profile(&target).await.unwrap(),
+        None,
+        "nothing was written"
+    );
+
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, REGISTERED_BASE, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("the base itself is the slot's");
+    authority
+        .replace_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, &derived, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("the slot's derived redirect is the slot's");
+    for redirect in refused_redirects {
+        assert_eq!(
+            client_profile_refusal(
+                authority
+                    .replace_client_profile_entered(
+                        &target,
+                        fixed_client_profile(&base, redirect, method, FIXED_CLIENT_SECRET),
+                        Some(&registered_base()),
+                        admit_all(),
+                    )
+                    .await
+            ),
+            McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        authority
+            .client_profile(&target)
+            .await
+            .unwrap()
+            .map(|installed| installed.redirect_uri),
+        Some(derived)
+    );
+}
+
+/// A slot without a profile is unchanged: its registered login uses its own
+/// derived redirect (the base followed by its binding slug), registered
+/// dynamically for exactly that redirect, while another slot's profile
+/// names the base itself.
+#[tokio::test]
+async fn a_dynamic_slot_keeps_its_derived_redirect_beside_a_central_profile() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let central = split_target(&base, "central-profile");
+    let dynamic = split_target(&base, "dynamic-slot");
+    authority
+        .install_client_profile_entered(
+            &central,
+            fixed_client_profile(
+                &base,
+                REGISTERED_BASE,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&central, &registered_base())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(REGISTERED_BASE)
+    );
+
+    let derived = authority
+        .registered_redirect_uri(&dynamic, &registered_base())
+        .unwrap();
+    assert_eq!(
+        derived
+            .strip_prefix(&format!("{REGISTERED_BASE}/"))
+            .map(|segment| !segment.is_empty() && !segment.contains('/')),
+        Some(true),
+        "the base followed by one path segment: {derived}"
+    );
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&dynamic, &registered_base())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(derived.as_str())
+    );
+    let start = authority
+        .login_start_registered(&dynamic, &registered_base(), None)
+        .await
+        .expect("a dynamic slot starts on its derived redirect");
+    assert_eq!(start.redirect_uri, derived);
+    let registration = state.registration_requests.lock()[0].clone();
+    assert_eq!(registration["redirect_uris"], serde_json::json!([derived]));
+}
+
+/// The central callback is the host's configured base byte for byte. A base
+/// with a path and no trailing slash is admitted, sent in the authorization
+/// request and the code exchange, and completed exactly as configured, never
+/// with a slash added; a base configured with a trailing slash keeps it, and
+/// the form without it is not the base.
+#[tokio::test]
+async fn a_central_callback_is_the_configured_base_byte_for_byte() {
+    const CENTRAL: &str = "https://host.example/services/mcp/callback";
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let central = McpRegisteredRedirectBase::parse(CENTRAL).unwrap();
+    assert_eq!(central.as_str(), CENTRAL);
+    let target = split_target(&base, "fixed-exact");
+    let slashed = format!("{CENTRAL}/");
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, &slashed, method, FIXED_CLIENT_SECRET),
+                    Some(&central),
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a slash added is not the base"
+    );
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, CENTRAL, method, FIXED_CLIENT_SECRET),
+            Some(&central),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&target, &central)
+            .await
+            .unwrap()
+            .as_deref()
+            .map(str::as_bytes),
+        Some(CENTRAL.as_bytes())
+    );
+    let start = authority
+        .login_start_registered(&target, &central, None)
+        .await
+        .unwrap();
+    assert_eq!(start.redirect_uri.as_bytes(), CENTRAL.as_bytes());
+    assert_eq!(authorize_query(&start)["redirect_uri"], CENTRAL);
+    authority
+        .login_complete_registered(
+            &target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        )
+        .await
+        .expect("the login completes on exactly the configured base");
+    assert_eq!(state.token_requests.lock()[0]["redirect_uri"], CENTRAL);
+
+    // A base configured with a trailing slash: the slash is part of it.
+    let slashed_base = McpRegisteredRedirectBase::parse(&slashed).unwrap();
+    let other = split_target(&base, "fixed-exact-slashed");
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &other,
+                    fixed_client_profile(&base, CENTRAL, method, FIXED_CLIENT_SECRET),
+                    Some(&slashed_base),
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a slash removed is not the base"
+    );
+    authority
+        .install_client_profile_entered(
+            &other,
+            fixed_client_profile(&base, &slashed, method, FIXED_CLIENT_SECRET),
+            Some(&slashed_base),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&other, &slashed_base)
+            .await
+            .unwrap(),
+        Some(slashed)
     );
 }
