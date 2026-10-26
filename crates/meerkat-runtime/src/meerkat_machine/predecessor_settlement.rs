@@ -1316,6 +1316,11 @@ impl MeerkatMachine {
         let census = std::mem::take(&mut lease.census);
         // M, L, then T: the task takes T, then M, after the drain.
         drop(lease.mutation_guard.take());
+        #[allow(
+            clippy::drop_non_drop,
+            reason = "with the live feature the lease holds L's guard and this drop releases it in \
+                      order; without it the lease is uninhabited and the drop does nothing"
+        )]
         drop(lease.live_lifecycle_lease.take());
         drop(lease.registration_guard.take());
         lease.runless_terminal.release();
