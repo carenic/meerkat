@@ -57,6 +57,44 @@ them.
   documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
   limit it already followed.
 
+- `meerkat-mob`: `MobStorage::member_binding_history` reads the member
+  binding history of a storage's mob with no running mob and no file path,
+  through the storage's own identity member store, so it serves every
+  storage that has one, a mob storage kept in a host store included. It
+  folds the journal and the identity intent rows as
+  `MobStorage::read_member_binding_history` folds a store file, answers an
+  empty history for a storage that holds no mob, and refuses a custom store
+  composition without the built-in identity member store as
+  `MobHandle::member_binding_history` does
+  (`MemberBindingHistoryReadError::Read` of
+  `MobStoreError::IdentityMemberAtomicPersistenceUnavailable`).
+
+- `meerkat-runtime`: `RuntimeStore::import_whole_blob_session` imports a
+  whole-blob session document into a store, create-only, as ordinary
+  writes. When the runtime has no committed document, it commits this one
+  in one atomic write (one batch on a host store, after the chunk batches of
+  a large document) together with its catalog entry and, as pending outbox
+  rows, the document's pending compaction projection intents, which
+  `commit_session_snapshot` refuses, and answers
+  `WholeBlobSessionImport::Created`. The same bytes again answer
+  `WholeBlobSessionImport::AlreadyCurrent` and write nothing; other bytes
+  are refused with `RuntimeStoreError::SessionPersistenceAuthorityConflict`
+  and nothing is written. `InMemoryRuntimeStore` and the host store adapter
+  `SpiRuntimeStore` implement it; the provided default answers
+  `Unsupported`, so a store decorator forwards it to the store it wraps.
+
+- `meerkat-runtime`: the host store reference and `ScopeFamily` now state
+  that Core never uses a scope family tag starting with `x` or `mx`, so a
+  layer above Core can keep scopes of its own in a realm without colliding
+  with a later Core family. The reference also states how Core settles a
+  commit whose outcome is unknown or unavailable (the same batch again, with
+  the same commit id, within `SpiRealmConfig::commit_retry_budget`; past it,
+  the batch's scopes are poisoned until the realm is opened again), what
+  `FenceTiming::max_commit_latency` bounds (the backoff of a session write
+  fenced by a mob's identity authority, which waits for every batch of the
+  identity scope's commit, chunk batches included, and not for a session
+  document's chunk batches), and that Core sets no deadline on a commit.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
