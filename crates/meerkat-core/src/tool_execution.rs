@@ -391,7 +391,9 @@ pub enum ToolProgressPolicy {
 ///
 /// This type intentionally has no serialization implementation. It is
 /// pre-dispatch TOCTOU fencing only, never durable job, restart, or recovery
-/// authority. A reconstructed dispatcher must resolve a fresh plan.
+/// authority. A reconstructed dispatcher must resolve a fresh plan. A
+/// retained consent re-resolves its call that way rather than reusing its
+/// plan ([`crate::dispatch_retained_consent_attempt`]).
 ///
 /// ```compile_fail
 /// fn requires_durable_serialization<T: serde::Serialize>() {}
@@ -456,6 +458,22 @@ pub fn ephemeral_tool_catalog_binding_fingerprint(
 }
 
 impl EphemeralToolBindingFingerprint {
+    /// The durable digest of the declaration this binding advertised
+    /// ([`ToolBindingDigest`]): its live authorities and its current
+    /// callability play no part.
+    pub(crate) fn declaration_digest(&self) -> ToolBindingDigest {
+        ToolBindingDigest::of_declaration(&ToolDeclaration {
+            name: self.tool_name.as_str(),
+            description: &self.description,
+            input_schema: &self.input_schema,
+            provenance: self.provenance.as_ref(),
+            audience: self.audience,
+            plane: self.plane,
+            deferred_eligibility: &self.deferred_eligibility,
+            execution: &self.execution,
+        })
+    }
+
     #[must_use]
     pub fn with_live_authority(mut self, authority_instance: usize, epoch: u64) -> Self {
         self.authority_chain.push((authority_instance, epoch));
@@ -498,21 +516,47 @@ const TOOL_BINDING_DIGEST_DOMAIN: &[u8] = b"meerkat.tool-binding-digest.v1\0";
 #[error("not a tool binding digest: expected `sha256:` and 64 lowercase hex digits")]
 pub struct ToolBindingDigestParseError;
 
+/// The declared facets of one tool binding that [`ToolBindingDigest`]
+/// hashes, wherever they are read from.
+struct ToolDeclaration<'a> {
+    name: &'a str,
+    description: &'a str,
+    input_schema: &'a serde_json::Value,
+    provenance: Option<&'a crate::ToolProvenance>,
+    audience: crate::ToolAudience,
+    plane: crate::ToolPlaneClass,
+    deferred_eligibility: &'a crate::ToolCatalogDeferredEligibility,
+    execution: &'a ToolExecutionContract,
+}
+
 impl ToolBindingDigest {
     /// The digest of what `entry` declares.
     #[must_use]
     pub fn of_catalog_entry(entry: &crate::ToolCatalogEntry) -> Self {
+        Self::of_declaration(&ToolDeclaration {
+            name: entry.tool.name.as_str(),
+            description: &entry.tool.description,
+            input_schema: &entry.tool.input_schema,
+            provenance: entry.tool.provenance.as_ref(),
+            audience: entry.tool.audience,
+            plane: entry.plane,
+            deferred_eligibility: &entry.deferred_eligibility,
+            execution: &entry.execution,
+        })
+    }
+
+    fn of_declaration(declaration: &ToolDeclaration<'_>) -> Self {
         let mut encoder = BindingDigestEncoder::new();
-        encoder.text("tool.name", entry.tool.name.as_str());
-        encoder.text("tool.description", &entry.tool.description);
+        encoder.text("tool.name", declaration.name);
+        encoder.text("tool.description", declaration.description);
         encoder.text(
             "tool.input_schema",
-            &canonical_json_text(&entry.tool.input_schema),
+            &canonical_json_text(declaration.input_schema),
         );
-        encoder.provenance("tool.provenance", entry.tool.provenance.as_ref());
+        encoder.provenance("tool.provenance", declaration.provenance);
         encoder.text(
             "tool.audience",
-            match entry.tool.audience {
+            match declaration.audience {
                 crate::ToolAudience::Model => "model",
                 crate::ToolAudience::App => "app",
                 crate::ToolAudience::ModelAndApp => "model_and_app",
@@ -521,12 +565,12 @@ impl ToolBindingDigest {
         );
         encoder.text(
             "plane",
-            match entry.plane {
+            match declaration.plane {
                 crate::ToolPlaneClass::Session => "session",
                 crate::ToolPlaneClass::Control => "control",
             },
         );
-        match &entry.deferred_eligibility {
+        match declaration.deferred_eligibility {
             crate::ToolCatalogDeferredEligibility::InlineOnly => {
                 encoder.text("deferred_eligibility", "inline_only");
             }
@@ -535,7 +579,7 @@ impl ToolBindingDigest {
                 encoder.provenance("deferred_eligibility.provenance", Some(provenance));
             }
         }
-        encoder.execution(&entry.execution);
+        encoder.execution(declaration.execution);
         Self(encoder.finish())
     }
 
@@ -901,6 +945,62 @@ pub enum BuiltinToolOperation {
 }
 
 impl ToolOperationTarget {
+    /// Whether `other` is this same operation as it stays across a
+    /// reconnection: equal in everything but an MCP server's live connection
+    /// generation. The registration (server or route), the raw operation,
+    /// the connector approval and the account still have to be equal, and
+    /// every other target is compared whole.
+    pub(crate) fn same_durable_target(&self, other: &Self) -> bool {
+        match (self, other) {
+            (
+                Self::McpServerOperation {
+                    server,
+                    connection_generation: _,
+                    raw_operation,
+                    connector,
+                    account,
+                },
+                Self::McpServerOperation {
+                    server: other_server,
+                    connection_generation: _,
+                    raw_operation: other_raw_operation,
+                    connector: other_connector,
+                    account: other_account,
+                },
+            ) => {
+                server == other_server
+                    && raw_operation == other_raw_operation
+                    && connector == other_connector
+                    && account == other_account
+            }
+            (
+                Self::CheckedMcpServerOperation {
+                    route,
+                    server,
+                    connection_generation: _,
+                    raw_operation,
+                    connector,
+                    account,
+                },
+                Self::CheckedMcpServerOperation {
+                    route: other_route,
+                    server: other_server,
+                    connection_generation: _,
+                    raw_operation: other_raw_operation,
+                    connector: other_connector,
+                    account: other_account,
+                },
+            ) => {
+                route == other_route
+                    && server == other_server
+                    && raw_operation == other_raw_operation
+                    && connector == other_connector
+                    && account == other_account
+            }
+            (left, right) => left == right,
+        }
+    }
+
     /// The account the owner states this exact operation acts with: `None`
     /// for the session's own catalog control, comms deliveries, peer
     /// directory and memory operations, which act with the session's own
@@ -1628,6 +1728,7 @@ impl ToolExecutionContract {
             owner_witnesses: Vec::new(),
             resolved_call: None,
             root_dispatcher: None,
+            resolution_context: None,
             core_deadline: self.core_deadline,
         })
     }
@@ -1732,8 +1833,16 @@ pub struct ResolvedToolExecutionPlan {
     owner_witnesses: Vec<ToolExecutionOwnerWitness>,
     resolved_call: Option<ResolvedToolCallIdentity>,
     root_dispatcher: Option<RootDispatcherLease>,
+    /// The caller's resolution context the fenced root resolution used, so
+    /// the same call can be resolved afresh against another allocation.
+    resolution_context: Option<ToolExecutionResolutionContext>,
     core_deadline: CoreDispatchDeadline,
 }
+
+/// The authority key of the owner witness the fenced root resolution
+/// attaches for the root dispatcher (see
+/// [`crate::resolve_tool_execution_plan_fenced`]).
+pub(crate) const ROOT_DISPATCHER_WITNESS: &str = "root-dispatcher";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedToolCallIdentity {
@@ -1784,6 +1893,7 @@ impl std::fmt::Debug for ResolvedToolExecutionPlan {
             .field("owner_witnesses", &self.owner_witnesses)
             .field("resolved_call", &self.resolved_call)
             .field("has_root_dispatcher_lease", &self.root_dispatcher.is_some())
+            .field("resolution_context", &self.resolution_context)
             .finish()
     }
 }
@@ -1941,10 +2051,64 @@ impl ResolvedToolExecutionPlan {
         mut self,
         dispatcher: Arc<T>,
         call: crate::ToolCallView<'_>,
+        resolution_context: &ToolExecutionResolutionContext,
     ) -> Result<Self, ToolExecutionResolutionError> {
         self.resolved_call = Some(ResolvedToolCallIdentity::from_call(call)?);
         self.root_dispatcher = Some(RootDispatcherLease::new(dispatcher));
+        self.resolution_context = Some(resolution_context.clone());
         Ok(self)
+    }
+
+    /// The caller's resolution context the fenced root resolution used.
+    pub(crate) fn resolution_context(&self) -> Option<&ToolExecutionResolutionContext> {
+        self.resolution_context.as_ref()
+    }
+
+    /// Whether `fresh`, the same call resolved again by another live
+    /// allocation of the session's dispatcher in this process, is the same
+    /// durable execution as this plan: the same call (its tool use id, name
+    /// and canonical arguments), the same declaration digest
+    /// ([`ToolBindingDigest`]) of the tool its root resolution resolved
+    /// against, the same execution mode with every mode-derived facet
+    /// (runner, restart class, idempotency scope, credential references,
+    /// output and progress policies), and the same durable operation targets
+    /// of its owners ([`ToolOperationTarget::same_durable_target`]: live
+    /// connection generations excluded). The mode is part of it, so a hybrid
+    /// tool that selects another mode for the call is not the same
+    /// execution. Live allocations, witnesses and deadlines are not compared:
+    /// `fresh` proves those itself.
+    pub(crate) fn same_durable_execution(&self, fresh: &Self) -> bool {
+        fn declaration(plan: &ResolvedToolExecutionPlan) -> Option<ToolBindingDigest> {
+            plan.owner_witness(ROOT_DISPATCHER_WITNESS)
+                .map(|witness| witness.binding_fingerprint().declaration_digest())
+        }
+        fn durable_targets(
+            plan: &ResolvedToolExecutionPlan,
+        ) -> impl Iterator<Item = (&str, &ToolOperationTarget)> {
+            plan.owner_witnesses.iter().filter_map(|witness| {
+                witness
+                    .operation_target()
+                    .map(|target| (witness.authority_key(), target))
+            })
+        }
+        let declared = declaration(self);
+        self.resolved_call.is_some()
+            && self.resolved_call == fresh.resolved_call
+            && declared.is_some()
+            && declared == declaration(fresh)
+            && self.kind == fresh.kind
+            && self.runner == fresh.runner
+            && self.restart_class == fresh.restart_class
+            && self.idempotency_scope == fresh.idempotency_scope
+            && self.credential_context_refs == fresh.credential_context_refs
+            && self.output_policy == fresh.output_policy
+            && self.progress_policy == fresh.progress_policy
+            && durable_targets(self).count() == durable_targets(fresh).count()
+            && durable_targets(self).zip(durable_targets(fresh)).all(
+                |((key, target), (fresh_key, fresh_target))| {
+                    key == fresh_key && target.same_durable_target(fresh_target)
+                },
+            )
     }
 
     pub(crate) fn validate_root_dispatch<T: ?Sized + Send + Sync + 'static>(
@@ -2916,6 +3080,199 @@ mod tests {
         for (facet, entry) in changed {
             assert_ne!(digest(&entry), base, "a changed {facet} changes the digest");
         }
+    }
+
+    /// A tool that runs inline by default and may run detached.
+    fn hybrid_contract() -> ToolExecutionContract {
+        ToolExecutionContract::new(
+            BTreeSet::from([ToolExecutionMode::Fast, ToolExecutionMode::Detached]),
+            ToolExecutionMode::Fast,
+            None,
+            Some(
+                DetachedToolExecutionPolicy::new(
+                    RunnerIdentity::new("host-runner", "1").expect("valid runner"),
+                    RestartClass::Replayable,
+                    IdempotencyScope::ToolCall,
+                    Duration::from_secs(30),
+                )
+                .expect("valid detached policy"),
+            ),
+        )
+        .expect("valid hybrid contract")
+    }
+
+    /// One MCP server operation acting with `subject`'s account, on the
+    /// server's connection `generation`.
+    fn mcp_target(server: &str, generation: u64, subject: &str) -> ToolOperationTarget {
+        ToolOperationTarget::McpServerOperation {
+            server: server.to_string(),
+            connection_generation: generation,
+            raw_operation: "deploy".to_string(),
+            connector: crate::mcp_config::McpConnectorApproval::NoConnector,
+            account: Arc::new(crate::OperationAccount::Selected(
+                crate::QualifiedAccount::new("idp.example", subject).expect("valid account"),
+            )),
+        }
+    }
+
+    /// One fenced root resolution of `call` through the allocation
+    /// `dispatcher`, against the hybrid tool `description` declares, in
+    /// `mode`, with its root witness and an owner witness naming `target`.
+    fn fenced_plan(
+        dispatcher: &Arc<u8>,
+        call: crate::ToolCallView<'_>,
+        description: &str,
+        mode: ToolExecutionMode,
+        target: ToolOperationTarget,
+    ) -> ResolvedToolExecutionPlan {
+        let entry = crate::ToolCatalogEntry::session_inline(
+            Arc::new(crate::ToolDef::new(
+                "deploy",
+                description,
+                serde_json::json!({"type": "object"}),
+            )),
+            true,
+        )
+        .with_execution_contract(hybrid_contract());
+        let fingerprint = ephemeral_tool_catalog_binding_fingerprint(&entry)
+            .with_live_authority(usize::from(**dispatcher), 1);
+        let context = ToolExecutionResolutionContext::new(
+            ToolDeadlineChain::new(vec![finite(ToolDeadlineOwner::CoreToolDispatch, 600)])
+                .expect("valid deadline"),
+        );
+        entry
+            .execution
+            .resolve(mode, context.deadlines().clone())
+            .expect("the advertised mode resolves")
+            .with_owner_witness(
+                ToolExecutionOwnerWitness::new(
+                    ROOT_DISPATCHER_WITNESS,
+                    call.name,
+                    fingerprint.clone(),
+                )
+                .expect("root witness"),
+            )
+            .expect("root witness accepted")
+            .with_owner_witness(
+                ToolExecutionOwnerWitness::new("mcp-router", "deploy-owner", fingerprint)
+                    .expect("owner witness")
+                    .with_operation_target(target),
+            )
+            .expect("owner witness accepted")
+            .bind_root_dispatch(Arc::clone(dispatcher), call, &context)
+            .expect("bound to the allocation")
+    }
+
+    /// A retained call resolved afresh by another live allocation of the
+    /// session's dispatcher is the same durable execution only for the same
+    /// call, declaration, execution mode and durable owner targets: a
+    /// reconnection's new connection generation and the new allocation's
+    /// live authorities alone keep it. The old plan still never enters
+    /// through the new allocation.
+    #[test]
+    fn a_reresolved_plan_is_the_same_durable_execution_only_for_the_same_call_and_owner() {
+        let arguments = serde_json::value::RawValue::from_string(r#"{"build":"1"}"#.to_string())
+            .expect("arguments");
+        let other_arguments =
+            serde_json::value::RawValue::from_string(r#"{"build":"2"}"#.to_string())
+                .expect("arguments");
+        let call = crate::ToolCallView {
+            id: "call-1",
+            name: "deploy",
+            args: &arguments,
+        };
+        let (original, rebuilt) = (Arc::new(1_u8), Arc::new(2_u8));
+        let declared = "Deploy a build";
+        let fast = ToolExecutionMode::Fast;
+        let retained = fenced_plan(
+            &original,
+            call,
+            declared,
+            fast,
+            mcp_target("ci", 1, "alice"),
+        );
+
+        for (kept, fresh) in [
+            (
+                "another allocation",
+                fenced_plan(&rebuilt, call, declared, fast, mcp_target("ci", 1, "alice")),
+            ),
+            (
+                "a new connection generation",
+                fenced_plan(&rebuilt, call, declared, fast, mcp_target("ci", 2, "alice")),
+            ),
+        ] {
+            assert!(retained.same_durable_execution(&fresh), "{kept}");
+        }
+        for (differs, fresh) in [
+            (
+                "tool use id",
+                fenced_plan(
+                    &rebuilt,
+                    crate::ToolCallView {
+                        id: "call-2",
+                        ..call
+                    },
+                    declared,
+                    fast,
+                    mcp_target("ci", 1, "alice"),
+                ),
+            ),
+            (
+                "arguments",
+                fenced_plan(
+                    &rebuilt,
+                    crate::ToolCallView {
+                        args: &other_arguments,
+                        ..call
+                    },
+                    declared,
+                    fast,
+                    mcp_target("ci", 1, "alice"),
+                ),
+            ),
+            (
+                "declaration",
+                fenced_plan(
+                    &rebuilt,
+                    call,
+                    "Deploy anything",
+                    fast,
+                    mcp_target("ci", 1, "alice"),
+                ),
+            ),
+            (
+                "execution mode",
+                fenced_plan(
+                    &rebuilt,
+                    call,
+                    declared,
+                    ToolExecutionMode::Detached,
+                    mcp_target("ci", 1, "alice"),
+                ),
+            ),
+            (
+                "account",
+                fenced_plan(&rebuilt, call, declared, fast, mcp_target("ci", 1, "bob")),
+            ),
+            (
+                "registration",
+                fenced_plan(&rebuilt, call, declared, fast, mcp_target("cd", 1, "alice")),
+            ),
+        ] {
+            assert!(
+                !retained.same_durable_execution(&fresh),
+                "a different {differs}"
+            );
+        }
+        assert_eq!(
+            retained.validate_root_dispatch(&rebuilt, call),
+            Err(ToolExecutionResolutionError::RootDispatcherChanged {
+                tool_name: "deploy".to_string(),
+            }),
+            "the old plan never enters through the new allocation"
+        );
+        assert_eq!(retained.validate_root_dispatch(&original, call), Ok(()));
     }
 
     #[test]

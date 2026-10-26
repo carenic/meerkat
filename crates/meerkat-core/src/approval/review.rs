@@ -725,6 +725,27 @@ impl BoundOperationReview {
         self.approvals.consent_moved_into_run(work, run_id)
     }
 
+    /// Rebind the live consent custody of `approval_id` to its retained call
+    /// re-resolved as `fresh` by the session's agent this process rebuilt
+    /// (see [`super::ApprovalService::rebind_consent_to_reresolved_plan`]);
+    /// nothing to rebind without a human route.
+    pub(crate) fn rebind_consent_to_reresolved_plan(
+        &self,
+        approval_id: &ApprovalId,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+        old: &PreparedOperationCheck,
+        fresh: crate::ResolvedToolExecutionPlan,
+    ) -> crate::approval::consent::ConsentRebind {
+        if self.human_consent.is_none() {
+            return crate::approval::consent::ConsentRebind::Refused(
+                crate::approval::consent::ConsentRefusal::NoConsent,
+            );
+        }
+        self.approvals
+            .rebind_consent_to_reresolved_plan(approval_id, work, run_id, old, fresh)
+    }
+
     fn observation(
         handle: &ReviewAttemptHandle,
         tool_call_id: &Arc<str>,

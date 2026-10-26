@@ -93,6 +93,18 @@ them.
   boundary, it acts as for consent the run requested itself. Moved consent
   the run never spends (it has no later boundary, or its attempt was
   refused) is withdrawn unspent at the run's close.
+- `meerkat-core`: a decided consent moved into a resumed run is now spent
+  once even when the session's agent was rebuilt in the same process (for
+  example a session unregistered with its queued inputs kept, then resumed).
+  The retained call is resolved afresh against the rebuilt dispatcher, and
+  the approval owner rebinds the consent to that plan only as the same
+  durable execution: the same call, tool declaration digest, execution mode
+  and durable operation targets, decided R3 again by the run's owners. A
+  plan that is not the same durable execution (a hybrid tool that selects
+  another mode included) refuses before entry and withdraws the consent. A
+  tool the rebuilt agent has not published yet does not use up the run's one
+  attempt: the run's next boundary attempts it again. A process restart
+  still ends the consent, and the next call asks for fresh consent.
 
 ## [0.9.5] - 2026-10-23
 

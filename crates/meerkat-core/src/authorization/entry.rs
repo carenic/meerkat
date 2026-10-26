@@ -291,6 +291,37 @@ impl PreparedOperationCheck {
         Self::prepare(work, PreparedAuthorizationBinding::new(facts))
     }
 
+    /// This exact retained tool operation with its call kept (its id and
+    /// arguments by identity) and its plan replaced by `fresh`, the same call
+    /// resolved afresh by the session's agent this process rebuilt, and
+    /// decided afresh by `work`'s own owners under the same operation id,
+    /// execution scope and run. The caller has checked that `fresh` is the
+    /// same durable execution
+    /// ([`crate::ResolvedToolExecutionPlan::same_durable_execution`]); only
+    /// the consent owner rebinds custody this way. A review child's or a
+    /// tool delegate's operation is never rebound.
+    pub(crate) fn with_reresolved_plan(
+        &self,
+        work: WorkAuthorizationContext,
+        fresh: crate::ResolvedToolExecutionPlan,
+    ) -> Result<Self, OperationAuthorizationError> {
+        let malformed = || OperationRefused::new(OperationRefusalKind::MalformedFacts).into();
+        if self.0.binding.review_attribution().is_some()
+            || self.0.binding.delegate_attribution().is_some()
+        {
+            return Err(malformed());
+        }
+        let mut facts = self.0.binding.facts().clone();
+        let super::AuthorizationOperation::Tool(tool) = &mut facts.operation else {
+            return Err(malformed());
+        };
+        let super::ToolAuthorizationTarget::Dispatcher(plan) = &mut tool.target else {
+            return Err(malformed());
+        };
+        *plan = Arc::new(fresh);
+        Self::prepare(work, PreparedAuthorizationBinding::new(facts))
+    }
+
     pub(crate) fn tool_dispatch_parts(
         &self,
     ) -> Option<(crate::ToolCallView<'_>, &crate::ResolvedToolExecutionPlan)> {

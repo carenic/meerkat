@@ -380,15 +380,12 @@ impl ConsentCandidate {
         tokio::time::Instant::now() >= self.deadline
     }
 
-    /// This candidate's custody moved into a resumed run: the same attempt
-    /// (its id and generated status), validity, route and observer, bound to
-    /// that run's work and its fresh decision of the exact original
-    /// operation.
-    fn transferred(
-        &self,
-        admitted: PreparedOperationCheck,
-        work: WorkAuthorizationContext,
-    ) -> Self {
+    /// This candidate's custody bound to a fresh decision of its exact
+    /// original operation under `work`: moved into a resumed run, or rebound
+    /// to the plan the session's agent this process rebuilt resolved afresh.
+    /// The same attempt (its id and generated status), validity, route and
+    /// observer.
+    fn rebound(&self, admitted: PreparedOperationCheck, work: WorkAuthorizationContext) -> Self {
         Self {
             attempt: self.attempt.rebound(admitted.binding().clone(), work),
             admitted,
@@ -396,8 +393,8 @@ impl ConsentCandidate {
             tool_call_id: Arc::clone(&self.tool_call_id),
             route: Arc::clone(&self.route),
             observer: self.observer.clone(),
-            // The moved custody is still custody of the same row and scope:
-            // it keeps the session's claim lineage it was admitted under.
+            // Still custody of the same row and scope: it keeps the
+            // session's claim lineage it was admitted under.
             hosting: self.hosting.clone(),
         }
     }
@@ -482,6 +479,22 @@ pub(crate) enum MovedConsentScan {
     Deferred,
     /// The live consent moved into the run, by approval (possibly none).
     Moved(Vec<ApprovalId>),
+}
+
+/// What rebinding one live custody to its re-resolved plan did
+/// ([`ApprovalService::rebind_consent_to_reresolved_plan`]).
+#[derive(Debug)]
+pub(crate) enum ConsentRebind {
+    /// The custody now holds the fresh decision of the same durable
+    /// execution; a new attempt of this run resolves it.
+    Rebound,
+    /// Not decided now: the owner is held, or the fresh decision's owners
+    /// are unavailable. Nothing changed, and the consent stays spendable.
+    NotReady,
+    /// Refused with zero entry: no live custody of this work and run, or a
+    /// fresh plan that is not the same durable execution (which withdraws
+    /// the consent).
+    Refused(ConsentRefusal),
 }
 
 /// Everything a retained candidate needs except its attempt, which the owner
@@ -1306,6 +1319,144 @@ impl ApprovalService {
         MovedConsentScan::Moved(moved)
     }
 
+    /// Rebind the live custody of `approval_id`, admitted as `old` under
+    /// `work` and run `run_id`, to the same retained call resolved afresh as
+    /// `fresh` by the session's agent this process rebuilt after the plan
+    /// was resolved. As a transfer moves custody, in three steps: a
+    /// non-waiting read of the live candidate, the fresh plan's checks and
+    /// decision outside every lock, and a re-checked replacement of the
+    /// candidate (its attempt rebound, its generated status untouched). No
+    /// row is written: the custody stays as recorded. `fresh` is accepted
+    /// only as the same durable execution
+    /// ([`crate::ResolvedToolExecutionPlan::same_durable_execution`]: the
+    /// same call, declaration digest, execution mode and durable operation
+    /// targets) of the same operation, decided afresh by the run's own
+    /// owners as R3. A proven mismatch, or a refusal of the fresh decision,
+    /// withdraws the consent; a held owner or a fresh decision that cannot
+    /// be made now leaves it spendable. The owner is never waited for.
+    pub(crate) fn rebind_consent_to_reresolved_plan(
+        &self,
+        approval_id: &ApprovalId,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+        old: &PreparedOperationCheck,
+        fresh: crate::ResolvedToolExecutionPlan,
+    ) -> ConsentRebind {
+        if self.ensure_available().is_err() {
+            return ConsentRebind::Refused(ConsentRefusal::OwnerUnavailable);
+        }
+        // 1. The live candidate exactly as this run's attempt admitted it.
+        let Some(state) = self.state.try_read() else {
+            return ConsentRebind::NotReady;
+        };
+        let candidate = state
+            .consent
+            .get(approval_id)
+            .filter(|candidate| {
+                !state.parked.contains(approval_id)
+                    && !state.unpublished.contains(approval_id)
+                    && candidate.admitted.same_check(old)
+                    && candidate.attempt.bound_to(old.binding(), work)
+                    && old.binding().facts().run_id.as_ref() == run_id
+            })
+            .cloned();
+        let record = state.records.get(approval_id).cloned();
+        drop(state);
+        // A reader may have made a disposer's try-lock fail; settle after it.
+        self.settle_owner_now().run();
+        let Some(candidate) = candidate else {
+            return ConsentRebind::Refused(ConsentRefusal::without_custody(record.as_ref()));
+        };
+        let now = self.now();
+        let Some(record) = record.filter(|record| {
+            record.status == ApprovalStatus::Approved
+                && !candidate.expired()
+                && record.expires_at.is_none_or(|expires_at| expires_at > now)
+                && record
+                    .consent
+                    .as_ref()
+                    .is_some_and(|consent| consent.consumed_at.is_none())
+        }) else {
+            return ConsentRebind::Refused(ConsentRefusal::NoConsent);
+        };
+        // 2. Outside every lock: the same durable execution, decided afresh
+        // by the run's own owners.
+        let same = old
+            .tool_dispatch_parts()
+            .is_some_and(|(_, retained)| retained.same_durable_execution(&fresh));
+        let (reason, refusal) = if same {
+            match old.with_reresolved_plan(work.clone(), fresh) {
+                Ok(admitted)
+                    if admitted.review_tier() == crate::authorization::OperationReviewTier::R3 =>
+                {
+                    return self.commit_rebind(approval_id, &candidate, &record, admitted, work);
+                }
+                // No longer the reviewed R3 operation the human consented to.
+                Ok(_) => (
+                    ReviewRetirementReason::ContextChanged,
+                    ConsentRefusal::ContextChanged,
+                ),
+                Err(OperationAuthorizationError::Refused(refusal))
+                    if refusal.kind() == OperationRefusalKind::Denied =>
+                {
+                    (
+                        ReviewRetirementReason::AuthorityChanged,
+                        ConsentRefusal::AuthorityChanged {
+                            check: old.clone(),
+                            error: OperationAuthorizationError::Refused(refusal),
+                        },
+                    )
+                }
+                Err(OperationAuthorizationError::Refused(_)) => (
+                    ReviewRetirementReason::ContextChanged,
+                    ConsentRefusal::ContextChanged,
+                ),
+                // Readiness or observation unavailable: still spendable.
+                Err(_) => return ConsentRebind::NotReady,
+            }
+        } else {
+            (
+                ReviewRetirementReason::ContextChanged,
+                ConsentRefusal::ContextChanged,
+            )
+        };
+        self.try_retire_consent(approval_id, &candidate, reason)
+            .run();
+        ConsentRebind::Refused(refusal)
+    }
+
+    /// Step 3 of [`Self::rebind_consent_to_reresolved_plan`]: replace the
+    /// same live candidate, on the same row, with its rebound custody.
+    fn commit_rebind(
+        &self,
+        approval_id: &ApprovalId,
+        candidate: &Arc<ConsentCandidate>,
+        record: &ApprovalRecord,
+        admitted: PreparedOperationCheck,
+        work: &WorkAuthorizationContext,
+    ) -> ConsentRebind {
+        let Some(mut state) = self.state.try_write() else {
+            return ConsentRebind::NotReady;
+        };
+        self.count_review_lock();
+        let rebound = is_live(&state, approval_id, candidate)
+            && !state.parked.contains(approval_id)
+            && state.records.get(approval_id) == Some(record);
+        let outcome = if rebound {
+            state.consent.insert(
+                approval_id.clone(),
+                Arc::new(candidate.rebound(admitted, work.clone())),
+            );
+            ConsentRebind::Rebound
+        } else {
+            ConsentRebind::Refused(ConsentRefusal::without_custody(
+                state.records.get(approval_id),
+            ))
+        };
+        self.release_state(state).run();
+        outcome
+    }
+
     /// Spend one authenticated consent once at the candidate's physical
     /// entry, under ONE non-blocking reservation: identity, the retained
     /// decision's coherent currentness and validity are rechecked there; then
@@ -1892,10 +2043,9 @@ impl ApprovalService {
             {
                 open.moved.insert(approval_id.clone());
             }
-            state.consent.insert(
-                approval_id,
-                Arc::new(candidate.transferred(admitted, run.work)),
-            );
+            state
+                .consent
+                .insert(approval_id, Arc::new(candidate.rebound(admitted, run.work)));
         }
     }
 

@@ -2831,13 +2831,17 @@ pub fn resolve_tool_execution_plan_fenced<T: AgentToolDispatcher + ?Sized + 'sta
             reason: crate::ToolUnavailableReason::ExecutionOwnerChanged,
         });
     }
-    let witness = crate::ToolExecutionOwnerWitness::new("root-dispatcher", call.name, before)
-        .map_err(crate::ToolExecutionResolutionError::from)?;
+    let witness = crate::ToolExecutionOwnerWitness::new(
+        crate::tool_execution::ROOT_DISPATCHER_WITNESS,
+        call.name,
+        before,
+    )
+    .map_err(crate::ToolExecutionResolutionError::from)?;
     let plan = plan.with_owner_witness(witness)?;
     if let Some(binding) = dispatch_context.application_binding() {
         binding.validate_execution_plan(call.name, &plan)?;
     }
-    plan.bind_root_dispatch(Arc::clone(dispatcher), call)
+    plan.bind_root_dispatch(Arc::clone(dispatcher), call, resolution_context)
 }
 
 /// The plan still names this exact root allocation, the exact canonical call
@@ -2852,12 +2856,14 @@ fn validate_fenced_root_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     if let Some(binding) = context.application_binding() {
         binding.validate_execution_plan(call.name, plan)?;
     }
-    let witness = plan.owner_witness("root-dispatcher").ok_or_else(|| {
-        crate::error::ToolError::unavailable(
-            call.name,
-            crate::ToolUnavailableReason::ExecutionOwnerChanged,
-        )
-    })?;
+    let witness = plan
+        .owner_witness(crate::tool_execution::ROOT_DISPATCHER_WITNESS)
+        .ok_or_else(|| {
+            crate::error::ToolError::unavailable(
+                call.name,
+                crate::ToolUnavailableReason::ExecutionOwnerChanged,
+            )
+        })?;
     if witness.binding_fingerprint() != &dispatcher.execution_binding_fingerprint(call.name)? {
         return Err(crate::error::ToolError::unavailable(
             call.name,
@@ -3231,30 +3237,103 @@ async fn fenced_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
 /// before the dispatcher is invoked is certified
 /// [`crate::authorization::RefusalDispatch::NotDispatched`] at this entry's
 /// one boundary, and the dispatcher's own result is forwarded unchanged.
+///
+/// When this process rebuilt the agent after the plan was resolved, the
+/// retained call is resolved afresh against the current dispatcher, and the
+/// approval owner rebinds the custody to that plan only as the same durable
+/// execution (call identity, declaration digest, durable operation targets,
+/// tier); anything else refuses with zero entry. The old plan is never
+/// dispatched through another allocation. The execution mode is part of
+/// that identity: a hybrid tool that selects another mode after the rebuild
+/// is a mismatch. A resolution that is not ready yet (the tool not published
+/// again, or its owner unavailable now) refuses here with zero entry and
+/// leaves the consent spendable; a run's own attempt then counts as not
+/// made, and the run's next boundary attempts it again.
 pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
 ) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
+    let (result, retained_call, _not_ready) =
+        attempt_retained_consent(dispatcher, context, approval_id).await;
+    observe_retained_consent_refusal(context, &result, retained_call);
+    result
+}
+
+/// How one run's retained consent attempt ended.
+pub(crate) enum RetainedConsentAttempt {
+    /// It ran to its outcome: the dispatcher's own result, or a refusal with
+    /// zero entry.
+    Settled(Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>),
+    /// The session's rebuilt agent could not resolve the retained call yet:
+    /// nothing entered, the consent stays spendable, and the attempt counts
+    /// as not made.
+    NotReady,
+}
+
+/// [`dispatch_retained_consent_attempt`] for a run's own attempt, which
+/// tells a resolution that is not ready yet apart from a refusal.
+pub(crate) async fn dispatch_retained_consent_in_run<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    context: &ToolDispatchContext,
+    approval_id: &crate::ApprovalId,
+) -> RetainedConsentAttempt {
+    let (result, retained_call, not_ready) =
+        attempt_retained_consent(dispatcher, context, approval_id).await;
+    if not_ready && result.is_err() {
+        return RetainedConsentAttempt::NotReady;
+    }
+    observe_retained_consent_refusal(context, &result, retained_call);
+    RetainedConsentAttempt::Settled(result)
+}
+
+/// One retained attempt through its certification boundary, with the
+/// retained call it resolved and whether it found its resolution not ready.
+async fn attempt_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    context: &ToolDispatchContext,
+    approval_id: &crate::ApprovalId,
+) -> (
+    Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>,
+    Option<(String, crate::OperationId)>,
+    bool,
+) {
     let mut retained_call = None;
-    let result = retained_consent_dispatch(dispatcher, context, approval_id, &mut retained_call)
-        .await
-        .unwrap_or_else(|refused| Err(refused.not_dispatched()));
-    if let (Err(error), Some((tool_use_id, operation_id))) = (&result, retained_call) {
+    let mut not_ready = false;
+    let result = retained_consent_dispatch(
+        dispatcher,
+        context,
+        approval_id,
+        &mut retained_call,
+        &mut not_ready,
+    )
+    .await
+    .unwrap_or_else(|refused| Err(refused.not_dispatched()));
+    (result, retained_call, not_ready)
+}
+
+/// Report a retained attempt's refusal to the host's refusal observer.
+fn observe_retained_consent_refusal(
+    context: &ToolDispatchContext,
+    result: &Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>,
+    retained_call: Option<(String, crate::OperationId)>,
+) {
+    if let (Err(error), Some((tool_use_id, operation_id))) = (result, retained_call) {
         context.observe_tool_refusal(&tool_use_id, Some(operation_id), error);
     }
-    result
 }
 
 /// [`dispatch_retained_consent_attempt`] before its certification boundary
 /// ([`FencedOutcome`]). Once the retained candidate resolves, its call id and
 /// operation id are left in `retained_call`, for the attempt's refusal
-/// report.
+/// report; `not_ready` is set when it refuses because the rebuilt agent
+/// could not resolve the retained call yet.
 async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
     retained_call: &mut Option<(String, crate::OperationId)>,
+    not_ready: &mut bool,
 ) -> FencedOutcome {
     let malformed = || crate::ToolError::AuthorizationRefused {
         refusal: crate::authorization::OperationRefused::new(
@@ -3264,7 +3343,7 @@ async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     let Some(work) = context.work_authorization() else {
         return Err(malformed());
     };
-    let (review_entry, retained) = crate::approval::review::admit_consent_attempt(
+    let (mut review_entry, mut retained) = crate::approval::review::admit_consent_attempt(
         context.operation_review(),
         approval_id,
         work,
@@ -3275,6 +3354,30 @@ async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
         call.id.to_owned(),
         retained.binding().facts().operation_id.clone(),
     ));
+    // This process rebuilt the session's agent after the retained plan was
+    // resolved: its root allocation is gone, and only a fresh resolution the
+    // approval owner accepts as the same durable execution goes on.
+    if matches!(
+        plan.validate_root_dispatch(dispatcher, call),
+        Err(crate::ToolExecutionResolutionError::RootDispatcherChanged { .. })
+    ) {
+        match rebind_retained_consent(dispatcher, context, work, approval_id, &retained) {
+            RetainedRebind::Rebound => {
+                (review_entry, retained) = crate::approval::review::admit_consent_attempt(
+                    context.operation_review(),
+                    approval_id,
+                    work,
+                    context.run_id(),
+                )?;
+            }
+            RetainedRebind::NotReady(error) => {
+                *not_ready = true;
+                return Err(error);
+            }
+            RetainedRebind::Refused(error) => return Err(error),
+        }
+    }
+    let (call, plan) = retained.tool_dispatch_parts().ok_or_else(malformed)?;
     if dispatcher.review_entry_support(call.name)
         != crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
     {
@@ -3311,6 +3414,75 @@ async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
         Ok(admitted) => admitted.settled(),
         // The timeout may have ended a running dispatcher: no claim.
         Err(_) => Ok(Err(crate::error::ToolError::timeout(call.name, timeout_ms))),
+    }
+}
+
+/// What re-resolving a retained consent attempt for a rebuilt agent did.
+enum RetainedRebind {
+    /// The approval owner rebound the custody to the fresh plan.
+    Rebound,
+    /// Not ready now: nothing changed, and the consent stays spendable.
+    NotReady(crate::error::ToolError),
+    /// Refused with zero entry.
+    Refused(crate::error::ToolError),
+}
+
+/// Resolve `retained`'s call afresh against `dispatcher`, with the retained
+/// plan's own resolution context, and have the approval owner rebind the
+/// custody to that plan, only as the same durable execution. A tool the
+/// rebuilt agent has not published yet, or one unavailable now, is not
+/// ready, as is an approval owner that is held now; any other resolution
+/// failure refuses.
+fn rebind_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
+    dispatcher: &Arc<T>,
+    context: &ToolDispatchContext,
+    work: &crate::WorkAuthorizationContext,
+    approval_id: &crate::ApprovalId,
+    retained: &crate::authorization::PreparedOperationCheck,
+) -> RetainedRebind {
+    let owner_changed = |name: &str| {
+        RetainedRebind::Refused(crate::error::ToolError::unavailable(
+            name,
+            crate::ToolUnavailableReason::ExecutionOwnerChanged,
+        ))
+    };
+    let Some((call, plan)) = retained.tool_dispatch_parts() else {
+        return RetainedRebind::Refused(crate::ToolError::AuthorizationRefused {
+            refusal: crate::authorization::OperationRefused::new(
+                crate::authorization::OperationRefusalKind::MalformedFacts,
+            ),
+        });
+    };
+    let (Some(resolution_context), Some(review)) =
+        (plan.resolution_context(), context.operation_review())
+    else {
+        return owner_changed(call.name);
+    };
+    let fresh =
+        match resolve_tool_execution_plan_fenced(dispatcher, call, context, resolution_context) {
+            Ok(fresh) => fresh,
+            Err(
+                error @ (crate::ToolExecutionResolutionError::NotFound { .. }
+                | crate::ToolExecutionResolutionError::Unavailable { .. }),
+            ) => return RetainedRebind::NotReady(error.into()),
+            Err(error) => return RetainedRebind::Refused(error.into()),
+        };
+    match review.rebind_consent_to_reresolved_plan(
+        approval_id,
+        work,
+        context.run_id(),
+        retained,
+        fresh,
+    ) {
+        crate::approval::consent::ConsentRebind::Rebound => RetainedRebind::Rebound,
+        crate::approval::consent::ConsentRebind::NotReady => {
+            RetainedRebind::NotReady(crate::error::ToolError::ReviewUnavailable {
+                kind: crate::approval::review::ReviewUnavailableKind::OwnerUnavailable,
+            })
+        }
+        crate::approval::consent::ConsentRebind::Refused(refusal) => {
+            RetainedRebind::Refused(refusal.into_tool_error())
+        }
     }
 }
 
@@ -4567,9 +4739,10 @@ impl RunLifecyclePublication {
 /// The human consent the current run requested itself or that its staged
 /// notice inputs moved into it, and which of it the run already attempted.
 /// Scheduling and notice suppression only: at most one in-run attempt per
-/// decision per run, and only the run's own requests and the consent moved
-/// into it are examined. Spend and withdrawal authority stays with the
-/// approval owner. Reset with each work-authorized run scope.
+/// decision per run (an attempt the session's rebuilt agent could not
+/// resolve yet does not count), and only the run's own requests and the
+/// consent moved into it are examined. Spend and withdrawal authority stays
+/// with the approval owner. Reset with each work-authorized run scope.
 #[derive(Debug, Default)]
 pub(crate) struct RunConsentAttempts {
     requested: BTreeSet<crate::ApprovalId>,
@@ -4602,6 +4775,13 @@ impl RunConsentAttempts {
     /// already attempted it.
     pub(crate) fn first_attempt(&mut self, approval_id: &crate::ApprovalId) -> bool {
         self.attempted.insert(approval_id.clone())
+    }
+
+    /// The attempt of `approval_id` was not ready (the session's rebuilt
+    /// agent could not resolve its retained call yet): it does not count,
+    /// and a later boundary of the run attempts it again.
+    pub(crate) fn not_attempted(&mut self, approval_id: &crate::ApprovalId) {
+        self.attempted.remove(approval_id);
     }
 }
 
