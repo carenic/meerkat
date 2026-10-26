@@ -84,8 +84,11 @@ them.
   durable input rows read closed, and the rows whose receipt a migration made
   permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`)
   carries only final evidence; a deadline, a cancelled call or an error
-  certifies nothing, and a repeat converges from the store. A host that
-  governs consents registers the session only on the owner-loss outcome
+  certifies nothing, and a repeat converges from the store. A settlement that
+  stops after its sweep commit can leave an outcome-unknown answer owed:
+  until a repeat converges it, an archive or a stop of the session refuses,
+  typed, so repeat the settlement first. A host that governs consents
+  registers the session only on the owner-loss outcome
   `Completed` or `NotOwed`: `NoConsentOwner` means no issuing consent owner
   is installed on the runtime, a composition defect, so install it and
   repeat the call. Directed work needs the service's event store

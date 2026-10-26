@@ -17774,7 +17774,10 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// closed. A refusal's progress reports final evidence only. A deadline,
     /// a cancelled call, an error or a commit with an unknown outcome
     /// certifies nothing: the host repeats the call before it registers, and
-    /// a repeat converges from the store.
+    /// a repeat converges from the store. A settlement that stops after its
+    /// sweep commit can leave an outcome-unknown answer owed; until a repeat
+    /// converges it, an archive or a stop of the session refuses, typed, so
+    /// the host repeats the settlement first.
     ///
     /// A host that governs consents registers the session only on the
     /// owner-loss outcome `Completed` or `NotOwed`; `NoConsentOwner` means
