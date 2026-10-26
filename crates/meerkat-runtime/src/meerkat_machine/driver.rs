@@ -235,7 +235,9 @@ impl InputTerminalCompletionAuthorizationWitness {
     }
 }
 
-enum InteractionTerminalBatchScope<'a> {
+/// The scope of one terminal-completion batch: the run whose contributors it
+/// answers, or a runless runtime termination.
+pub(crate) enum InteractionTerminalBatchScope<'a> {
     Run(&'a RunId),
     RuntimeTermination,
 }
@@ -1181,68 +1183,16 @@ impl DriverEntry {
         candidate: crate::input_state::InteractionTerminalCandidate,
         requires_session_checkpoint: bool,
     ) -> Result<StagedInputTerminalCompletionBatch, RuntimeDriverError> {
-        use crate::input_state::{
-            InputTerminalCompletion, InputTerminalCompletionBatchKey, InputTerminalCompletionPhase,
-            interaction_terminal_payload_digest,
-        };
-        if input_ids.is_empty()
-            || input_ids.len() > crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS
-        {
-            return Err(RuntimeDriverError::ValidationFailed {
-                reason: "terminal completion recipient batch has invalid size".to_string(),
-            });
-        }
-        let completion_input_ids = canonical_completion_input_ids(input_ids);
-        if completion_input_ids
+        let completions = build_input_terminal_completion_rows(
+            scope,
+            input_ids,
+            candidate,
+            requires_session_checkpoint,
+        )?;
+        let completion_input_ids = completions
             .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != completion_input_ids.len()
-        {
-            return Err(RuntimeDriverError::ValidationFailed {
-                reason: "terminal completion recipient batch contains duplicate inputs".to_string(),
-            });
-        }
-        let owner_input_id = completion_input_ids[0].clone();
-        let batch_key = match scope {
-            InteractionTerminalBatchScope::Run(run_id) => InputTerminalCompletionBatchKey::Run {
-                run_id: run_id.clone(),
-            },
-            InteractionTerminalBatchScope::RuntimeTermination => {
-                InputTerminalCompletionBatchKey::RuntimeTermination {
-                    owner_input_id: owner_input_id.clone(),
-                }
-            }
-        };
-        let candidate_digest = interaction_terminal_payload_digest(&candidate)
-            .map_err(RuntimeDriverError::Internal)?;
-        let completion_input_ids_digest =
-            interaction_terminal_payload_digest(&completion_input_ids)
-                .map_err(RuntimeDriverError::Internal)?;
-        let completions = completion_input_ids
-            .iter()
-            .enumerate()
-            .map(|(ordinal, input_id)| {
-                let owns_payload = input_id == &owner_input_id;
-                let completion = InputTerminalCompletion {
-                    input_id: input_id.clone(),
-                    batch_ordinal: ordinal as u16,
-                    batch_key: batch_key.clone(),
-                    owner_input_id: owner_input_id.clone(),
-                    candidate_digest: candidate_digest.clone(),
-                    completion_input_ids_digest: completion_input_ids_digest.clone(),
-                    requires_session_checkpoint,
-                    candidate: owns_payload.then(|| candidate.clone()),
-                    completion_input_ids: owns_payload.then(|| completion_input_ids.clone()),
-                    outcome: None,
-                    phase: InputTerminalCompletionPhase::Pending,
-                };
-                completion
-                    .validate_row()
-                    .map_err(RuntimeDriverError::Internal)?;
-                Ok(completion)
-            })
-            .collect::<Result<Vec<_>, RuntimeDriverError>>()?;
+            .map(|completion| completion.input_id.clone())
+            .collect::<Vec<_>>();
         let ledger = self.shell_driver_mut().ledger_mut();
         let mut missing = Vec::new();
         // Validate the entire batch before writing its first row. In
@@ -6557,6 +6507,90 @@ fn canonical_completion_input_ids(input_ids: &[InputId]) -> Vec<InputId> {
     let mut canonical = input_ids.to_vec();
     canonical.sort_by_key(|input_id| input_id.0);
     canonical
+}
+
+/// Build, without writing anything, the rows of one terminal-completion
+/// batch: one `Pending` row per recipient in canonical order, the canonical
+/// owner (the first recipient) holding the batch's single candidate and its
+/// recipient set, every row validated.
+///
+/// The live terminal paths stage these rows into the driver's ledger
+/// (`DriverEntry::stage_input_terminal_completion_batch`); a recovered
+/// boundary's commit writes them in its own fenced transaction
+/// (`crate::recovery`). Both build them here, so a recovered batch is
+/// byte-for-byte the batch a live run with the same recipients and candidate
+/// stages.
+pub(crate) fn build_input_terminal_completion_rows(
+    scope: InteractionTerminalBatchScope<'_>,
+    input_ids: &[InputId],
+    candidate: crate::input_state::InteractionTerminalCandidate,
+    requires_session_checkpoint: bool,
+) -> Result<Vec<crate::input_state::InputTerminalCompletion>, RuntimeDriverError> {
+    use crate::input_state::{
+        InputTerminalCompletion, InputTerminalCompletionBatchKey, InputTerminalCompletionPhase,
+        interaction_terminal_payload_digest,
+    };
+    if input_ids.is_empty()
+        || input_ids.len() > crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS
+    {
+        return Err(RuntimeDriverError::ValidationFailed {
+            reason: "terminal completion recipient batch has invalid size".to_string(),
+        });
+    }
+    let completion_input_ids = canonical_completion_input_ids(input_ids);
+    if completion_input_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != completion_input_ids.len()
+    {
+        return Err(RuntimeDriverError::ValidationFailed {
+            reason: "terminal completion recipient batch contains duplicate inputs".to_string(),
+        });
+    }
+    let owner_input_id = completion_input_ids[0].clone();
+    let batch_key = match scope {
+        InteractionTerminalBatchScope::Run(run_id) => InputTerminalCompletionBatchKey::Run {
+            run_id: run_id.clone(),
+        },
+        InteractionTerminalBatchScope::RuntimeTermination => {
+            InputTerminalCompletionBatchKey::RuntimeTermination {
+                owner_input_id: owner_input_id.clone(),
+            }
+        }
+    };
+    let candidate_digest =
+        interaction_terminal_payload_digest(&candidate).map_err(RuntimeDriverError::Internal)?;
+    let completion_input_ids_digest = interaction_terminal_payload_digest(&completion_input_ids)
+        .map_err(RuntimeDriverError::Internal)?;
+    completion_input_ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, input_id)| {
+            let owns_payload = input_id == &owner_input_id;
+            let batch_ordinal =
+                u16::try_from(ordinal).map_err(|_| RuntimeDriverError::ValidationFailed {
+                    reason: "terminal completion recipient batch has invalid size".to_string(),
+                })?;
+            let completion = InputTerminalCompletion {
+                input_id: input_id.clone(),
+                batch_ordinal,
+                batch_key: batch_key.clone(),
+                owner_input_id: owner_input_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+                completion_input_ids_digest: completion_input_ids_digest.clone(),
+                requires_session_checkpoint,
+                candidate: owns_payload.then(|| candidate.clone()),
+                completion_input_ids: owns_payload.then(|| completion_input_ids.clone()),
+                outcome: None,
+                phase: InputTerminalCompletionPhase::Pending,
+            };
+            completion
+                .validate_row()
+                .map_err(RuntimeDriverError::Internal)?;
+            Ok(completion)
+        })
+        .collect()
 }
 
 /// Whether [`machine_begin_run`] established the run or found run starts held.

@@ -817,6 +817,38 @@ pub(crate) struct InteractionTerminalOutbox {
 /// validation of a stored or decoded row refuses it.
 pub(crate) const WITHHELD_PAYLOAD_DIGEST: &str = "withheld";
 
+/// A complete runtime placement a directed terminal outbox names as its
+/// owner: the placement triple every outbox row requires, plus the optional
+/// epoch.
+///
+/// A path that stages an outbox without a placed runtime (a recovered
+/// boundary's commit, a predecessor settlement's internal registration)
+/// takes it from the session's last durable placement, its lifecycle row's
+/// binding: the placement of the runtime whose work it ends. A later drain
+/// adopts such an outbox exactly as it adopts one that runtime left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractionTerminalPlacement {
+    pub(crate) agent_runtime_id: String,
+    pub(crate) fence_token: u64,
+    pub(crate) runtime_generation: u64,
+    pub(crate) runtime_epoch_id: Option<String>,
+}
+
+impl InteractionTerminalPlacement {
+    /// The placement `binding` records, or `None` when it lacks any of the
+    /// runtime id, fence token and generation.
+    pub(crate) fn from_lifecycle_binding(
+        binding: &crate::store::MachineLifecycleBindingFacts,
+    ) -> Option<Self> {
+        Some(Self {
+            agent_runtime_id: binding.agent_runtime_id()?.to_string(),
+            fence_token: binding.fence_token()?,
+            runtime_generation: binding.runtime_generation()?,
+            runtime_epoch_id: binding.runtime_epoch_id().map(str::to_string),
+        })
+    }
+}
+
 pub(crate) fn interaction_terminal_payload_digest<T: Serialize>(
     payload: &T,
 ) -> Result<String, String> {

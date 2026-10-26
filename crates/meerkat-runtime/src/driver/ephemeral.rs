@@ -3878,6 +3878,7 @@ impl EphemeralRuntimeDriver {
                 if let Some(state) = self.ledger.get_mut(input_id) {
                     state.persisted_input = stored.state.persisted_input.clone();
                 }
+                self.adopt_durable_terminal_carriers(stored);
                 if let Some(run_id) = stored.seed.last_run_id.clone() {
                     self.events
                         .push(self.make_envelope(RuntimeEvent::InputLifecycle(
@@ -3915,6 +3916,7 @@ impl EphemeralRuntimeDriver {
                 if let Some(state) = self.ledger.get_mut(input_id) {
                     state.persisted_input = stored.state.persisted_input.clone();
                 }
+                self.adopt_durable_terminal_carriers(stored);
                 self.events
                     .push(self.make_envelope(RuntimeEvent::InputLifecycle(
                         InputLifecycleEvent::Abandoned {
@@ -3933,6 +3935,25 @@ impl EphemeralRuntimeDriver {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Carry the terminal work the outside writer staged with an adopted
+    /// terminal (a recovered boundary stages its contributors' completion
+    /// batch and directed outboxes in its own commit) into this driver's row,
+    /// so a later write of the row keeps it and the pending-terminal index
+    /// names it. A row that already holds terminal work keeps its own.
+    fn adopt_durable_terminal_carriers(&mut self, stored: &StoredInputState) {
+        let input_id = &stored.state.input_id;
+        let Some(state) = self.ledger.get_mut(input_id) else {
+            return;
+        };
+        if state.terminal_completion.is_none() {
+            state.terminal_completion = stored.state.terminal_completion.clone();
+        }
+        if state.interaction_terminal_outbox.is_none() {
+            state.interaction_terminal_outbox = stored.state.interaction_terminal_outbox.clone();
+        }
+        self.ledger.refresh_pending_terminal_owner(input_id);
     }
 
     pub(crate) fn machine_normalize_live_boundary_unavailable(
