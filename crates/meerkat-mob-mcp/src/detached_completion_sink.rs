@@ -306,6 +306,35 @@ impl RetainedJobSource for ComposedJobSource {
             _ => None,
         }
     }
+
+    /// A committed admission is reported to the owner that confirmed its
+    /// job, routed exactly as [`Self::retained_job`]: the host's source for
+    /// its declared namespaces, the state's own owner for fork_off and
+    /// council jobs. Any other host namespace was confirmed by no one here,
+    /// so there is nothing to report.
+    async fn admission_committed(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &meerkat_core::lifecycle::InputId,
+    ) -> Result<(), String> {
+        match producer {
+            ContinuationProducer::Host { .. } => match &self.host {
+                Some(host) if host.owns(producer) => {
+                    host.source
+                        .admission_committed(producer, job_id, session, input_id)
+                        .await
+                }
+                _ => Ok(()),
+            },
+            _ => {
+                self.native
+                    .admission_committed(producer, job_id, session, input_id)
+                    .await
+            }
+        }
+    }
 }
 
 /// The committed owner of this host's fork_off and council jobs: the mob

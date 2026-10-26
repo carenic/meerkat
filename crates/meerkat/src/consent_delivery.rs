@@ -9,14 +9,17 @@
 //!
 //! - [`ConsentNoticeJobSource`] is the approval owner as the job's committed
 //!   owner. A governed admission confirms the notice against it, exactly as
-//!   it confirms a fork_off or council completion against theirs.
+//!   it confirms a fork_off or council completion against theirs, and
+//!   reports the committed admission back to it, which records the notice's
+//!   receipt.
 //! - [`ConsentNoticeProjector`] commits the owed notices of one hosting
 //!   domain as continuation rows, idempotently by key, one finite page at a
 //!   time, when the host's delivery owner runs a round
 //!   ([`crate::RuntimeDeliveryHost::project_owed_continuations`]): on its
-//!   arming reconcile, every reconcile and every source change. An
-//!   obligation committed without a source change (an unannounced write)
-//!   waits for the next of those; the store watch never finds it.
+//!   arming reconcile, every reconcile, every source change and every pass
+//!   that settled a continuation row as refused. An obligation committed
+//!   without a source change (an unannounced write) waits for the next of
+//!   those; the store watch never finds it.
 //!
 //! The same rounds watch the issuing owner's parked consent whose approved
 //! notice was admitted as an input of one of this domain's sessions: when
@@ -28,19 +31,35 @@
 //! report changes nothing.
 //!
 //! There is no consent producer variant and no mirrored job table. The
-//! obligation stays owed until its admission is recorded; this module never
-//! settles it.
+//! obligation stays owed until its receipt is recorded
+//! ([`ApprovalService::settle_consent_delivery`]). The governed admission
+//! records it: once the admission is committed, and before its row is
+//! acknowledged, the delivery owner reports it
+//! ([`crate::RetainedJobSource::admission_committed`]), and the job source
+//! records the notice's `Admitted` receipt for that session and input. A
+//! retry reports the same admission, whose receipt changes nothing again,
+//! and a newly recorded receipt is announced, which starts one more round.
+//! A round also records the receipt a committed row's own status proves
+//! when no admission recorded it (a row acknowledged before admissions were
+//! reported, or one applied for a retired address, which no drain reaches
+//! again): `Admitted` for an applied admission, and `Failed` for a row the
+//! drain settled as refused. A row still undecided, and a status that cannot
+//! be read now, record nothing. The projector reads statuses through the
+//! session address resolver, which never reports a session address retired,
+//! so a notice whose address a host retired before its admission stays
+//! owed.
 
 use std::sync::{Arc, Weak};
 
 use meerkat_core::approval::consent::{
-    CONSENT_DELIVERY_NAMESPACE, ConsentDeliveryFacts, ParkedNoticeInput, consent_delivery_job_id,
-    parse_consent_delivery_job_id,
+    CONSENT_DELIVERY_NAMESPACE, ConsentDeliveryFacts, ConsentDeliveryReceipt, ConsentReceiptError,
+    ParkedNoticeInput, consent_delivery_job_id, parse_consent_delivery_job_id,
 };
+use meerkat_core::lifecycle::InputId;
 use meerkat_core::session_hosting::HostingDomainRef;
 use meerkat_core::types::{SystemNoticeKind, SystemNoticeMessage};
 use meerkat_core::{
-    ApprovalConsentDeliveryState, ApprovalConsentTransition, ApprovalId, ApprovalService,
+    ApprovalConsentDeliveryState, ApprovalConsentTransition, ApprovalId, ApprovalService, SessionId,
 };
 use meerkat_runtime::input_state::InputTerminalOutcome;
 use meerkat_runtime::terminal_status::InteractionSelector;
@@ -51,8 +70,9 @@ use meerkat_runtime::{
 use crate::{
     ContinuationBody, ContinuationDelivery, ContinuationHandling, ContinuationKey,
     ContinuationObservation, ContinuationOwner, ContinuationOwnerService, ContinuationProducer,
-    ContinuationResultRef, OwedContinuationCursor, OwedContinuationProjection, RetainedJobFacts,
-    RetainedJobLookup, RetainedJobRecord, RetainedJobSource, SessionAddressResolver,
+    ContinuationResultRef, ContinuationStatus, OwedContinuationCursor, OwedContinuationProjection,
+    RetainedJobFacts, RetainedJobLookup, RetainedJobRecord, RetainedJobSource,
+    SessionAddressResolver,
 };
 
 /// The continuation producer of consent notices.
@@ -116,6 +136,38 @@ impl RetainedJobSource for ConsentNoticeJobSource {
             Err(error) => RetainedJobLookup::Unavailable(error.to_string()),
         }
     }
+
+    /// The governed admission of this owner's notice committed as `input_id`
+    /// of `session`: record the notice's own receipt, `Admitted` there
+    /// ([`ApprovalService::settle_consent_delivery`]). The same receipt again
+    /// changes nothing; another receipt that already stands, and a notice
+    /// that is no longer owed, are left as they are. An owner that cannot
+    /// record it now, or a session other than the notice's destination, is
+    /// an error, so the row stays unacknowledged and its next drain reports
+    /// the admission again. Any other producer's job is not this owner's.
+    async fn admission_committed(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        if *producer != consent_notice_producer() {
+            return Ok(());
+        }
+        let Some((approval_id, transition)) = parse_consent_delivery_job_id(job_id) else {
+            return Ok(());
+        };
+        record_receipt(
+            &self.approvals,
+            &approval_id,
+            transition,
+            ConsentDeliveryReceipt::Admitted {
+                session_id: session.clone(),
+                input_id: input_id.clone(),
+            },
+        )
+    }
 }
 
 /// Why a consent-aware host answers no other owner yet.
@@ -170,6 +222,32 @@ impl RetainedJobSource for ConsentAwareJobSource {
             return None;
         }
         self.others.as_ref()?.host_original_binder(namespace)
+    }
+
+    /// A consent notice's admission goes to the approval owner, any other
+    /// job's to the host's bound source. Unbound, no other job was confirmed
+    /// here, so there is nothing to report.
+    async fn admission_committed(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        if *producer == consent_notice_producer() {
+            return self
+                .consent
+                .admission_committed(producer, job_id, session, input_id)
+                .await;
+        }
+        match &self.others {
+            Some(others) => {
+                others
+                    .admission_committed(producer, job_id, session, input_id)
+                    .await
+            }
+            None => Ok(()),
+        }
     }
 }
 
@@ -259,7 +337,8 @@ impl ConsentNoticeProjector {
     }
 
     /// The committed owner of this projector's notices, for the host's
-    /// retained-job confirmation.
+    /// retained-job confirmation: it also records each notice's receipt once
+    /// its governed admission commits.
     pub fn job_source(&self) -> ConsentNoticeJobSource {
         ConsentNoticeJobSource::new(Arc::clone(&self.approvals), self.domain.clone())
     }
@@ -267,10 +346,12 @@ impl ConsentNoticeProjector {
     /// One page of a round: discover what the owner owes, then act on at
     /// most `limit` entries after `after` in the round's order. A notice
     /// whose row is already committed counts nothing and stays owed until
-    /// its admission. An unavailable owner fails the page, never reports
-    /// nothing owed; rows the owner could not reconcile are carried as
-    /// failures (on the round's first page), so the owner's next wake starts
-    /// another round and its discovery reconciles them again.
+    /// its receipt, which its admission records; a receipt the row's own
+    /// status proves without one is recorded here. An unavailable owner
+    /// fails the page, never reports nothing owed; rows the owner could not
+    /// reconcile are carried as failures (on the round's first page), so the
+    /// owner's next wake starts another round and its discovery reconciles
+    /// them again.
     pub async fn project(
         &self,
         after: Option<&OwedContinuationCursor>,
@@ -349,7 +430,7 @@ impl ConsentNoticeProjector {
                     Ok(true) => projection.committed += 1,
                     Ok(false) => {}
                     Err(error) => projection.failures.push(format!(
-                        "consent notice {} was not committed: {error}",
+                        "consent notice {} was not projected: {error}",
                         consent_delivery_job_id(approval_id, *transition)
                     )),
                 },
@@ -413,6 +494,11 @@ impl ConsentNoticeProjector {
     /// is the one place that decides a notice is this domain's: reading the
     /// notice's record through it finds no other domain's notice, and
     /// neither does an admission's confirmation.
+    ///
+    /// A committed row whose own status proves a receipt no admission
+    /// recorded ([`settled_receipt`]) has it recorded here; the row's content
+    /// is bound to this notice's, so no other row settles it. A status that
+    /// proves nothing, or that cannot be read now, records nothing.
     async fn project_notice(
         &self,
         continuations: &ContinuationOwnerService,
@@ -445,7 +531,12 @@ impl ConsentNoticeProjector {
             .await
         {
             Ok(ContinuationObservation::NotSubmitted) => {}
-            Ok(ContinuationObservation::Matched { .. }) => return Ok(false),
+            Ok(ContinuationObservation::Matched { status, .. }) => {
+                if let Some(receipt) = settled_receipt(status) {
+                    record_receipt(&self.approvals, approval_id, transition, receipt)?;
+                }
+                return Ok(false);
+            }
             Err(error) => return Err(error.to_string()),
         }
         continuations
@@ -453,6 +544,59 @@ impl ConsentNoticeProjector {
             .await
             .map(|_| true)
             .map_err(|error| error.to_string())
+    }
+}
+
+/// The receipt a committed notice row's own status proves: `Admitted` as one
+/// input of a session once the admission index applied it (acknowledged or
+/// not yet), and `Failed` once the drain settled the row as refused, which
+/// is final. A row still pending without an applied admission proves
+/// nothing. A stranded row records nothing either: the projector reads
+/// statuses through the session address resolver, which never reports a
+/// session address retired, so it never reads a notice's row as stranded.
+///
+/// A refused row is read as never delivered: within one composition the
+/// drain confirms the job again before it reads the admission index. Only a
+/// changed composition (another hosting domain, or a host without consent
+/// notices draining the same inbox) can refuse a row whose admission
+/// applied; its `Failed` receipt then withdraws approved parked consent,
+/// which fails safe.
+fn settled_receipt(status: ContinuationStatus) -> Option<ConsentDeliveryReceipt> {
+    match status {
+        ContinuationStatus::Applied { session, input, .. }
+        | ContinuationStatus::Pending {
+            admitted: Some((session, input)),
+            ..
+        } => Some(ConsentDeliveryReceipt::Admitted {
+            session_id: session,
+            input_id: input,
+        }),
+        ContinuationStatus::Refused { reason, .. } => Some(ConsentDeliveryReceipt::Failed {
+            reason: format!("its delivery was settled as refused ({reason:?})"),
+        }),
+        ContinuationStatus::Pending { admitted: None, .. }
+        | ContinuationStatus::Stranded { .. }
+        | ContinuationStatus::NotCommitted => None,
+    }
+}
+
+/// Record `receipt` for `approval_id`'s `transition` notice. The same receipt
+/// again changes nothing; another receipt that already stands, and a notice
+/// that is not owed, are left as they are. A receipt naming another
+/// destination, or an owner that cannot record it now, is an error: nothing
+/// is recorded.
+fn record_receipt(
+    approvals: &ApprovalService,
+    approval_id: &ApprovalId,
+    transition: ApprovalConsentTransition,
+    receipt: ConsentDeliveryReceipt,
+) -> Result<(), String> {
+    match approvals.settle_consent_delivery(approval_id, transition, receipt) {
+        Ok(_)
+        | Err(ConsentReceiptError::Conflicting { .. } | ConsentReceiptError::NotOwed { .. }) => {
+            Ok(())
+        }
+        Err(error) => Err(error.to_string()),
     }
 }
 

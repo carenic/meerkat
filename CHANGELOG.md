@@ -37,6 +37,15 @@ them.
 
 ### Breaking
 
+- Behaviour-only (not measured by the gate): `meerkat-core`:
+  `dispatch_retained_consent_attempt`, which hosts call directly, now
+  resolves a retained call afresh when its plan names another dispatcher
+  allocation (the session's agent rebuilt in this process), where it refused
+  before and left the consent spendable. A fresh plan that is the same
+  durable execution is rebound and spent once. One that is not, or a
+  re-decision the run's owners refuse or no longer review as R3, now
+  withdraws the consent instead of leaving it spendable.
+
 - `meerkat-runtime`: `meerkat_runtime::completion::CompletionOutcome` gains
   `OutcomeUnknown { run_id }`, the finalized answer to an input that run
   `run_id` consumed at a boundary a recovery committed without the input's
@@ -134,6 +143,22 @@ them.
   `publish_settled_run_terminal_for_actor`, and `MobSessionService` gains the
   same method, unsupported by default. The publication handles of the
   `meerkat` surfaces, `meerkat-rpc` and `meerkat-mob` implement it.
+
+- `meerkat-core`: `BoundOperationReview::consent_notice_issuer` returns the
+  approval owner that issues the review's human consent, present exactly
+  when R3 routes to human consent, as `consent_owner_loss_settlement` is. A
+  host composes it into its delivery owner's consent notice projection
+  (`ConsentNoticeProjector`), so the notices that owner owes are projected
+  for exactly the owner that issued the consent.
+- `meerkat`: the provided `RetainedJobSource::admission_committed` (by
+  default it records nothing). The governed admission of a retained
+  completion reports each committed admission (its session and input) to
+  the job source that confirmed the job, before the delivery row is
+  acknowledged and again on a retry; an error leaves the row unacknowledged
+  and retried later. A composed source forwards it to the source that
+  confirmed the job, routed as `retained_job`, as the `meerkat-mob-mcp`
+  composition now does for a host source's declared namespaces
+  (`MobMcpState::with_host_job_source`).
 
 - `meerkat-runtime`, `meerkat-session`, `meerkat-mob`: a host that takes
   over a durable session whose earlier process ended without unregistering
@@ -352,6 +377,48 @@ them.
   loop only for queued input, while the open run's inputs are bound to the
   run. The release now also wakes the loop when it leaves no hold and the
   session keeps a resumable run.
+
+- `meerkat`: consent notices now record their delivery receipts. The
+  governed admission of an Approved, Denied or Withdrawn notice records
+  `Admitted` for its session and input (reported through
+  `RetainedJobSource::admission_committed`), so delivered notices no longer
+  stay owed forever, and approved parked consent moves into the resumed run
+  its notice starts. A notice whose delivery was settled as refused records
+  `Failed`, which withdraws approved parked consent. A round also records
+  the receipt of a notice whose admission applied without one.
+- `meerkat-core`: a resumed run now spends, once, the human consent the
+  approval owner moved into it by the receipt of one of its staged notice
+  inputs: a boundary of the run attempts the exact retained call, as for
+  consent the run requested itself, and its `consent_attempt` notice also
+  names that input (`resumed_input_id`). A receipt that commits after the
+  run's first boundary read the consent moved into it can let the model
+  call the operation again first, which asks for fresh consent once more
+  (approving it runs the operation again); the moved consent still runs
+  once, at the run's next boundary. An approval owner held when a boundary
+  reads the moved consent makes that boundary look again; held later in the
+  boundary, it acts as for consent the run requested itself. Moved consent
+  the run never spends (it has no later boundary, or its attempt was
+  refused) is withdrawn unspent at the run's close.
+- `meerkat-core`: a decided consent moved into a resumed run is now spent
+  once even when the session's agent was rebuilt in the same process (for
+  example a session unregistered with its queued inputs kept, then resumed).
+  The retained call is resolved afresh against the rebuilt dispatcher, the
+  fresh plan passes the checks every call passes after its resolution, and
+  the approval owner rebinds the consent to that plan only as the same
+  durable execution: the same call, tool declaration digest, execution mode
+  and durable operation targets, decided R3 again by the run's owners. A
+  plan that is not the same durable execution (a hybrid tool that selects
+  another mode included), and a re-decision the run's owners refuse or no
+  longer review as R3, refuse before entry and withdraw the consent. A tool
+  the rebuilt agent has not published yet does not use up the run's one
+  attempt: the run's next boundary attempts it again, and a failure that is
+  in fact permanent but reads as not ready is attempted once per boundary
+  until the run's close withdraws the consent. Accepted limits: an MCP
+  server is compared by its configured name, so a name re-pointed to another
+  endpoint compares equal when the account does not name the endpoint, and
+  an account the owner cannot state compares equal to another such account.
+  A process restart still ends the consent, and the next call asks for fresh
+  consent.
 
 - `meerkat-session`: the terminals an archive publishes for a session with no
   live actor (the stored-only publisher) take their event sequences from the

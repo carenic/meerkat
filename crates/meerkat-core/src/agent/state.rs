@@ -6700,6 +6700,12 @@ where
         if let Some(resumed) = self.pending_resumed_round.take() {
             return Box::pin(self.run_resumed_tool_round(ctx, resumed)).await;
         }
+        // Before anything of this boundary commits (its notices first): a
+        // held approval owner makes the boundary look again with nothing of
+        // it delivered yet.
+        if !self.enrol_moved_run_consent().await {
+            return Ok(CallingLlmStep::Repoll);
+        }
         match self.refresh_calling_llm_boundary_notices(ctx).await? {
             CallingLlmBoundaryGate::Deferred => return Ok(CallingLlmStep::Repoll),
             CallingLlmBoundaryGate::Proceed => {}
@@ -7055,21 +7061,83 @@ where
         }
         Ok(CallingLlmBoundaryGate::Proceed)
     }
+    /// The first step of a boundary, before its notices: a run that resumes
+    /// retained work under a consent scope enrols the consent the approval
+    /// owner moved into it, at every boundary, since a receipt can commit,
+    /// and move its consent here, after the run opened. Each is still
+    /// attempted at most once in this run, by step 3c. Without a consent
+    /// scope nothing can move into the run, and the owner is not read. A
+    /// held owner yields, as the notice gate does: `false` means the
+    /// boundary must repoll, with nothing of it delivered yet.
+    async fn enrol_moved_run_consent(&mut self) -> bool {
+        // A noncommitting live bridge run executes against a retained
+        // snapshot and never spends consent.
+        if self.noncommitting_live_bridge_run {
+            return true;
+        }
+        if let (Some(review), Some(work)) = (
+            self.operation_review.as_ref(),
+            self.tool_dispatch_context.work_authorization(),
+        ) && !work.resumed_inputs().is_empty()
+            && work.consent_scope().is_some()
+        {
+            match review.consent_moved_into_run(work, self.tool_dispatch_context.run_id()) {
+                crate::approval::consent::MovedConsentScan::Moved(moved) => {
+                    for approval_id in &moved {
+                        self.run_consent_attempts.moved_in(approval_id);
+                    }
+                }
+                crate::approval::consent::MovedConsentScan::Deferred => {
+                    tokio::task::yield_now().await;
+                    return false;
+                }
+            }
+        }
+        true
+    }
+
     /// Boundary step 3c: in-run human consent (ADR-001). An authenticated
-    /// decision that reached this still-open run is spent here by the run's
-    /// own owner, before tool capture and request preparation. Only consent
-    /// this run requested itself is examined, so a run that requested none
-    /// pays one empty-set check and never touches the approval owner. Each
-    /// approved candidate gets one fresh retained attempt in this run: the
-    /// exact original call and plan, with this run's work and run, through
-    /// the common fenced entry whose leaf spends the decision once. Nothing
-    /// waits: a held owner defers to the next boundary. The run can still
+    /// decision that reached this still-open run is spent here by the run's own
+    /// owner, before tool capture and request preparation. Only consent this
+    /// run requested itself, and consent the approval owner moved into this run
+    /// by the committed receipt of one of its staged notice inputs (before the
+    /// run opened or at any later boundary), is examined: a run that requested
+    /// none, and resumes no retained work under a consent scope, pays one
+    /// empty-set check and never touches the approval owner. A receipt that
+    /// commits after the run's first boundary read the consent moved into it
+    /// can let the model call the operation again first, which asks for fresh
+    /// consent once more (approving it runs the operation again); the moved
+    /// consent still runs once, at the run's next boundary, and the run's close
+    /// withdraws it unspent when there is none. Each approved candidate gets
+    /// one fresh retained attempt in this run: the exact original call and
+    /// plan, with this run's work and run, through the common fenced entry
+    /// whose leaf spends the decision once. When this process rebuilt the
+    /// session's agent after the plan was resolved, the attempt resolves the
+    /// call afresh and spends only the same durable execution
+    /// ([`crate::dispatch_retained_consent_attempt`]); an attempt whose call
+    /// the rebuilt agent cannot resolve yet (its tool not published again, or
+    /// its owner unavailable now) does not count, and the run's next boundary
+    /// attempts it again. A failure that is in fact permanent but reads as not
+    /// ready is attempted once per boundary until the run's close withdraws the
+    /// consent. Two limits of that sameness are accepted: an MCP server is
+    /// compared by its configured name, so a name re-pointed to another
+    /// endpoint between the park and the resume compares equal when the account
+    /// does not name the endpoint; and an account the owner cannot state
+    /// compares equal to another such account (only a host with its own policy
+    /// can issue R3 consent on one). Nothing waits for the owner: when it is
+    /// held, the run's own decided consent waits for the next boundary, and the
+    /// read of the consent moved into the run (the boundary's first step,
+    /// [`Self::enrol_moved_run_consent`]) yields and the boundary looks again,
+    /// so a hold at that read never costs the run that consent; a hold met
+    /// later in the boundary (the decided read, or the attempt's resolve or
+    /// spend) acts as for consent the run requested itself, and moved consent
+    /// the run then never spends is withdrawn at its close. The run can still
     /// close, or be dropped, before or during an attempt; its run scope then
     /// parks or withdraws what it admitted, and an attempt that entered keeps
     /// its own outcome. Asynchronous work the attempts started is registered
     /// with this turn through the turn owner, with its exact refs and wait
-    /// policies, as a tool batch's is; `true` means the turn now waits for
-    /// it and the boundary must repoll.
+    /// policies, as a tool batch's is; `true` means the turn now waits for it
+    /// and the boundary must repoll.
     async fn spend_decided_run_consent(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
@@ -7097,11 +7165,15 @@ where
         };
         let mut pending_op_refs = Vec::new();
         for decided in decided {
-            if self
-                .run_consent_attempts
-                .first_attempt(&decided.approval_id)
-            {
-                pending_op_refs.extend(self.attempt_decided_consent(ctx, &review, decided).await?);
+            let approval_id = decided.approval_id.clone();
+            if self.run_consent_attempts.first_attempt(&approval_id) {
+                match self.attempt_decided_consent(ctx, &review, decided).await? {
+                    Some(op_refs) => pending_op_refs.extend(op_refs),
+                    // Not ready: the rebuilt agent could not resolve its
+                    // retained call yet. The attempt does not count, and the
+                    // run's next boundary attempts it again.
+                    None => self.run_consent_attempts.not_attempted(&approval_id),
+                }
             }
         }
         if pending_op_refs.is_empty() {
@@ -7132,24 +7204,30 @@ where
     /// refusal and drops the attempt's assistant blocks, while entered
     /// non-transcript effects, asynchronous work and settlement custody
     /// stand. Returns the attempt's asynchronous work, exactly as it started
-    /// it, for the turn to register.
+    /// it, for the turn to register; `None` when the session's rebuilt agent
+    /// could not resolve the retained call yet, which leaves no feedback and
+    /// nothing entered.
     async fn attempt_decided_consent(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
         review: &Arc<crate::approval::review::BoundOperationReview>,
         decided: crate::approval::consent::DecidedConsent,
-    ) -> Result<Vec<crate::ops::AsyncOpRef>, AgentError> {
+    ) -> Result<Option<Vec<crate::ops::AsyncOpRef>>, AgentError> {
         let tool_use_id = decided.tool_call_id.to_string();
         let tool_name = decided.tool_name.clone().unwrap_or_default();
         // A writer past its self-fence window starts no tool, a decided
         // consent's retained attempt included: the refusal ends the run.
         self.check_dispatch_fence()?;
-        let dispatched = dispatch_retained_consent_boxed(
+        let dispatched = match dispatch_retained_consent_boxed(
             Arc::clone(&self.tools),
             self.observed_tool_dispatch_context(Some(Arc::clone(review))),
             decided.approval_id.clone(),
         )
-        .await;
+        .await
+        {
+            super::RetainedConsentAttempt::Settled(dispatched) => dispatched,
+            super::RetainedConsentAttempt::NotReady => return Ok(None),
+        };
         let (mut result, mut effects, async_ops) = match dispatched {
             Ok(mut outcome) => {
                 outcome.clear_terminal_cause();
@@ -7282,7 +7360,7 @@ where
         }
         self.budget.record_tool_call();
         ctx.tool_call_count += 1;
-        Ok(async_ops)
+        Ok(Some(async_ops))
     }
     /// Boundary step 4: apply tool scope staged updates atomically at
     /// the CallingLlm boundary and project the visible tool set.
@@ -10629,7 +10707,9 @@ fn requested_consent(error: &ToolError) -> Option<&crate::ApprovalId> {
 /// The model-facing feedback of one in-run consent attempt: one durable
 /// runtime notice naming the original call and carrying the attempt's final
 /// published result (or its refusal) as typed content. The original call
-/// already holds its local result; this is never a second result for it.
+/// already holds its local result; this is never a second result for it. An
+/// attempt of consent moved into the run also names the staged notice input
+/// it moved with (`resumed_input_id`).
 fn consent_attempt_notice(
     decided: &crate::approval::consent::DecidedConsent,
     result: &crate::types::ToolResult,
@@ -10646,6 +10726,9 @@ fn consent_attempt_notice(
         "tool_name": decided.tool_name,
         "is_error": result.is_error,
     });
+    if let Some(resumed_input_id) = &decided.moved_from {
+        payload["resumed_input_id"] = serde_json::json!(resumed_input_id);
+    }
     if !result.settlement_failures.is_empty() {
         payload["settlement_failures"] = serde_json::json!(result.settlement_failures);
     }
@@ -10666,19 +10749,11 @@ fn consent_attempt_notice(
 
 #[cfg(not(target_arch = "wasm32"))]
 type RetainedConsentDispatchFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<crate::ops::ToolDispatchOutcome, ToolError>>
-            + Send
-            + 'static,
-    >,
+    Box<dyn std::future::Future<Output = super::RetainedConsentAttempt> + Send + 'static>,
 >;
 #[cfg(target_arch = "wasm32")]
-type RetainedConsentDispatchFuture = std::pin::Pin<
-    Box<
-        dyn std::future::Future<Output = Result<crate::ops::ToolDispatchOutcome, ToolError>>
-            + 'static,
-    >,
->;
+type RetainedConsentDispatchFuture =
+    std::pin::Pin<Box<dyn std::future::Future<Output = super::RetainedConsentAttempt> + 'static>>;
 
 /// One decided consent's fresh retained attempt, built and polled in its own
 /// boxed frame (outside the agent run-loop poll frame, like a tool batch).
@@ -10688,7 +10763,7 @@ fn dispatch_retained_consent_boxed<T: AgentToolDispatcher + ?Sized + 'static>(
     approval_id: crate::ApprovalId,
 ) -> RetainedConsentDispatchFuture {
     Box::pin(async move {
-        crate::dispatch_retained_consent_attempt(&tools, &context, &approval_id).await
+        super::dispatch_retained_consent_in_run(&tools, &context, &approval_id).await
     })
 }
 
@@ -38071,6 +38146,1838 @@ mod tests {
             );
             assert!(observation.operation_id().is_some());
             assert_completed_without_failure(&mut rx);
+        }
+
+        /// A resumed run spends, once, the human consent the approval owner
+        /// moved into it by the committed receipt of one of its staged
+        /// notice inputs. Run 1 of the origin work calls an R3 operation,
+        /// which requests consent, and closes, which parks it; the human
+        /// approves it after the close. The approved notice's receipt is
+        /// recorded here as the delivery owner records it, naming the input
+        /// the resumed run is staged with.
+        #[cfg(feature = "workspace-tests")]
+        mod moved_consent {
+            use super::*;
+            use crate::TurnExecutionInput;
+            use crate::approval::consent::{
+                AuthenticatedApprover, AuthenticatedConsentDecision, ConsentDeliveryReceipt,
+                MovedConsentScan,
+            };
+            use crate::approval::{
+                ApprovalAssurance, ApprovalConsentCustody, ApprovalConsentRecord,
+                ApprovalConsentScope, ApprovalConsentTransition, ApprovalConsentWithdrawalReason,
+                ApprovalDecision, ApprovalService, ApprovalStatus, ApprovalStore,
+            };
+            use crate::lifecycle::InputId;
+            use crate::retained_work::{ResumedInput, RetainedWorkIdentity};
+
+            const RESTRICTED: &str = "restricted_action";
+            const OTHER: &str = "restricted_other";
+            const BENIGN: &str = "benign_read";
+            /// Hang guard of one run; never a pacing mechanism.
+            const RUN_GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+
+            /// One scripted model reply.
+            #[derive(Debug, Clone, Copy)]
+            enum Reply {
+                /// One call of `tool`, with empty arguments.
+                Call {
+                    id: &'static str,
+                    tool: &'static str,
+                },
+                /// A final answer.
+                Answer,
+            }
+
+            /// A governed model that replies as scripted, then answers, and
+            /// records every request it receives.
+            #[derive(Default)]
+            struct ScriptedModel {
+                replies: Mutex<std::collections::VecDeque<Reply>>,
+                requests: Mutex<Vec<Vec<Message>>>,
+            }
+
+            impl ScriptedModel {
+                fn script(&self, replies: impl IntoIterator<Item = Reply>) {
+                    self.replies.lock().unwrap().extend(replies);
+                }
+
+                fn requests(&self) -> Vec<Vec<Message>> {
+                    self.requests.lock().unwrap().clone()
+                }
+            }
+
+            struct ScriptedAttempt {
+                model: Arc<ScriptedModel>,
+                messages: Arc<Vec<Message>>,
+                authorization: crate::LlmRequestAuthorization,
+            }
+
+            #[async_trait]
+            impl AgentLlmRequestAttempt for ScriptedAttempt {
+                fn request_pressure(
+                    &self,
+                ) -> Result<Option<crate::ProviderRequestPressure>, AgentError> {
+                    Ok(None)
+                }
+
+                async fn stream_response(
+                    &self,
+                    _assistant_message_id: crate::AssistantMessageId,
+                ) -> Result<crate::LlmStreamResult, AgentError> {
+                    let checked = self
+                        .authorization
+                        .prepare(fixture_model_facts(false))
+                        .map_err(AgentError::from)?;
+                    checked.current().map_err(AgentError::from)?;
+                    self.model
+                        .requests
+                        .lock()
+                        .unwrap()
+                        .push(self.messages.as_ref().clone());
+                    let reply = self
+                        .model
+                        .replies
+                        .lock()
+                        .unwrap()
+                        .pop_front()
+                        .unwrap_or(Reply::Answer);
+                    let (blocks, stop) = match reply {
+                        Reply::Call { id, tool } => (
+                            vec![AssistantBlock::ToolUse {
+                                id: id.into(),
+                                name: tool.into(),
+                                args: serde_json::value::RawValue::from_string("{}".into())
+                                    .unwrap(),
+                                meta: None,
+                            }],
+                            StopReason::ToolUse,
+                        ),
+                        Reply::Answer => (
+                            vec![AssistantBlock::Text {
+                                text: "answered".into(),
+                                meta: None,
+                            }],
+                            StopReason::EndTurn,
+                        ),
+                    };
+                    Ok(crate::LlmStreamResult::new(
+                        blocks,
+                        stop,
+                        normalized_test_usage(self.model.as_ref(), Usage::default()),
+                    ))
+                }
+            }
+
+            #[async_trait]
+            impl AgentLlmClient for ScriptedModel {
+                fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                    Some(fixture_controller_selection())
+                }
+
+                fn prepare_request_attempt_authorized(
+                    self: Arc<Self>,
+                    messages: Arc<Vec<Message>>,
+                    _tools: Arc<[Arc<ToolDef>]>,
+                    _max_tokens: u32,
+                    _temperature: Option<f32>,
+                    _provider_params: Option<ProviderParamsOverride>,
+                    authorization: Option<crate::LlmRequestAuthorization>,
+                ) -> Result<Arc<dyn AgentLlmRequestAttempt>, AgentError> {
+                    Ok(Arc::new(ScriptedAttempt {
+                        model: self,
+                        messages,
+                        authorization: authorization
+                            .expect("governed context must reach the provider"),
+                    }))
+                }
+
+                async fn stream_response(
+                    &self,
+                    _messages: &[Message],
+                    _tools: &[Arc<ToolDef>],
+                    _max_tokens: u32,
+                    _temperature: Option<f32>,
+                    _provider_params: Option<&ProviderParamsOverride>,
+                ) -> Result<crate::LlmStreamResult, AgentError> {
+                    panic!("governed execution must not use the raw provider path")
+                }
+
+                fn provider(&self) -> crate::Provider {
+                    crate::Provider::OpenAI
+                }
+                fn model(&self) -> &'static str {
+                    "fixture-model"
+                }
+            }
+
+            /// The work owner: the two restricted actions are R3 and every
+            /// other operation R1. It can withdraw one tool's permission.
+            #[derive(Default)]
+            struct Owner {
+                withdrawn: Mutex<std::collections::BTreeSet<&'static str>>,
+            }
+
+            impl Owner {
+                fn withdraw(&self, tool: &'static str) {
+                    self.withdrawn.lock().unwrap().insert(tool);
+                }
+            }
+
+            struct Policy(Arc<Owner>);
+
+            struct Decision {
+                binding: PreparedAuthorizationBinding,
+                owner: Arc<Owner>,
+            }
+
+            impl Decision {
+                fn tool(&self) -> Option<&str> {
+                    match &self.binding.facts().operation {
+                        AuthorizationOperation::Tool(tool) => Some(tool.name.as_str()),
+                        _ => None,
+                    }
+                }
+            }
+
+            impl WorkAuthorization for Policy {
+                fn controller_model_selection(&self) -> Option<crate::ControllerModelSelection> {
+                    Some(fixture_controller_selection())
+                }
+
+                fn review_operation_context(
+                    &self,
+                    _binding: &PreparedAuthorizationBinding,
+                ) -> Result<
+                    crate::authorization::ReviewOperationContextResolution,
+                    crate::OperationAuthorizationError,
+                > {
+                    Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+                }
+
+                fn prepare(
+                    &self,
+                    binding: &PreparedAuthorizationBinding,
+                ) -> Result<
+                    Arc<dyn PreparedOperationAuthorization>,
+                    crate::OperationAuthorizationError,
+                > {
+                    Ok(Arc::new(Decision {
+                        binding: binding.clone(),
+                        owner: Arc::clone(&self.0),
+                    }))
+                }
+            }
+
+            impl PreparedOperationAuthorization for Decision {
+                fn review_tier(&self) -> crate::authorization::OperationReviewTier {
+                    if matches!(self.tool(), Some(RESTRICTED | OTHER)) {
+                        crate::authorization::OperationReviewTier::R3
+                    } else {
+                        crate::authorization::OperationReviewTier::R1
+                    }
+                }
+
+                fn check_current(
+                    &self,
+                    binding: &PreparedAuthorizationBinding,
+                ) -> Result<(), crate::OperationAuthorizationError> {
+                    if !self.binding.same_operation(binding) {
+                        return Err(
+                            OperationRefused::new(OperationRefusalKind::MalformedFacts).into()
+                        );
+                    }
+                    if self
+                        .tool()
+                        .is_some_and(|tool| self.owner.withdrawn.lock().unwrap().contains(tool))
+                    {
+                        return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
+                    }
+                    Ok(())
+                }
+            }
+
+            /// The two restricted actions, whose leaf spends the reviewed
+            /// entry once before its body and records each body it runs, and
+            /// one benign read.
+            #[derive(Default)]
+            struct Actions {
+                bodies: Mutex<Vec<String>>,
+                /// When set, the first restricted body signals here after its
+                /// spend and then never finishes: a run cut between the spend
+                /// and the commit of its result.
+                hold_first_body: Option<Arc<Notify>>,
+                held: std::sync::atomic::AtomicBool,
+                /// The first restricted action's declared description, when
+                /// it is not the fixture's own.
+                restricted_description: Option<&'static str>,
+                /// The account the restricted actions' operations act with,
+                /// stated as a bundle operation target of every plan, when set.
+                account: Option<&'static str>,
+                /// While set, the first restricted action is not published.
+                restricted_unpublished: std::sync::atomic::AtomicBool,
+                /// When set, the resolver drops the caller's deadline chain
+                /// for one of its own.
+                own_deadline: bool,
+            }
+
+            impl Actions {
+                fn bodies(&self) -> Vec<String> {
+                    self.bodies.lock().unwrap().clone()
+                }
+            }
+
+            #[async_trait]
+            impl AgentToolDispatcher for Actions {
+                fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+                    let unpublished = self.restricted_unpublished.load(Ordering::SeqCst);
+                    [RESTRICTED, OTHER, BENIGN]
+                        .into_iter()
+                        .filter(|name| !unpublished || *name != RESTRICTED)
+                        .map(|name| {
+                            let description = match self.restricted_description {
+                                Some(description) if name == RESTRICTED => description,
+                                _ => "fixture",
+                            };
+                            Arc::new(ToolDef::new(
+                                name,
+                                description,
+                                serde_json::json!({"type":"object"}),
+                            ))
+                        })
+                        .collect::<Vec<_>>()
+                        .into()
+                }
+
+                fn resolve_execution_plan(
+                    &self,
+                    call: ToolCallView<'_>,
+                    _dispatch_context: &ToolDispatchContext,
+                    resolution_context: &crate::ToolExecutionResolutionContext,
+                ) -> Result<crate::ResolvedToolExecutionPlan, crate::ToolExecutionResolutionError>
+                {
+                    let catalog = self.tool_catalog();
+                    let entry = catalog
+                        .iter()
+                        .find(|entry| entry.tool.name == call.name)
+                        .ok_or_else(|| crate::ToolExecutionResolutionError::NotFound {
+                            tool_name: call.name.to_string(),
+                        })?;
+                    let deadlines = if self.own_deadline {
+                        crate::ToolDeadlineChain::new(vec![
+                            crate::ToolDeadlineContributor::finite(
+                                crate::ToolDeadlineOwner::Dispatcher,
+                                std::time::Duration::from_secs(60),
+                            ),
+                        ])?
+                    } else {
+                        resolution_context.deadlines().clone()
+                    };
+                    let plan = entry.execution.resolve_default(deadlines)?;
+                    let Some(subject) = self.account else {
+                        return Ok(plan);
+                    };
+                    let target = crate::ToolOperationTarget::RegisteredToolBundleOperation {
+                        bundle: "actions".to_string(),
+                        operation: call.name.to_string(),
+                        account: Arc::new(crate::OperationAccount::Selected(
+                            crate::QualifiedAccount::new("idp.example", subject).unwrap(),
+                        )),
+                    };
+                    plan.with_owner_witness(
+                        crate::ToolExecutionOwnerWitness::new(
+                            "actions-bundle",
+                            "actions",
+                            self.execution_binding_fingerprint(call.name)?,
+                        )?
+                        .with_operation_target(target),
+                    )
+                }
+
+                fn review_entry_support(
+                    &self,
+                    _tool_name: &str,
+                ) -> crate::approval::review::ReviewEntrySupport {
+                    crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
+                }
+
+                async fn dispatch(
+                    &self,
+                    call: ToolCallView<'_>,
+                ) -> Result<crate::ToolDispatchOutcome, ToolError> {
+                    self.dispatch_with_context(call, &ToolDispatchContext::default())
+                        .await
+                }
+
+                async fn dispatch_with_context(
+                    &self,
+                    call: ToolCallView<'_>,
+                    context: &ToolDispatchContext,
+                ) -> Result<crate::ToolDispatchOutcome, ToolError> {
+                    if call.name == BENIGN {
+                        return Ok(ToolResult::new(call.id.into(), "read".into(), false).into());
+                    }
+                    // The leaf spends the reviewed entry once, before its body.
+                    context.enter_reviewed_effect(call, None)?;
+                    self.bodies.lock().unwrap().push(call.name.to_string());
+                    if let Some(entered) = &self.hold_first_body
+                        && !self.held.swap(true, Ordering::SeqCst)
+                    {
+                        entered.notify_one();
+                        std::future::pending::<()>().await;
+                    }
+                    Ok(ToolResult::new(call.id.into(), "ran".into(), false).into())
+                }
+            }
+
+            /// One host of the runs: its approval owner, consent route and
+            /// review, and its agent over the shared model and tools.
+            struct Host {
+                approvals: ApprovalService,
+                route: Arc<ConsentRoute>,
+                review: Arc<crate::approval::review::BoundOperationReview>,
+                agent: crate::agent::Agent<ScriptedModel, Actions, NoopStore>,
+            }
+
+            async fn compose_host(
+                approvals: ApprovalService,
+                model: &Arc<ScriptedModel>,
+                tools: &Arc<Actions>,
+            ) -> Host {
+                let route = Arc::new(ConsentRoute::default());
+                let review = Arc::new(
+                    crate::approval::review::BoundOperationReview::new(
+                        Arc::new(NoModelReview),
+                        approvals.clone(),
+                        std::time::Duration::from_secs(30),
+                    )
+                    .with_human_consent(route.clone(), std::time::Duration::from_secs(4 * 60 * 60)),
+                );
+                let agent = agent_over(&review, model, tools).await;
+                Host {
+                    approvals,
+                    route,
+                    review,
+                    agent,
+                }
+            }
+
+            /// An agent over `review`, the shared model and `tools`.
+            async fn agent_over(
+                review: &Arc<crate::approval::review::BoundOperationReview>,
+                model: &Arc<ScriptedModel>,
+                tools: &Arc<Actions>,
+            ) -> crate::agent::Agent<ScriptedModel, Actions, NoopStore> {
+                with_test_turn_state_handle(
+                    AgentBuilder::new()
+                        .model("fixture-model")
+                        .with_operation_review(Arc::clone(review)),
+                )
+                .build_standalone(model.clone(), tools.clone(), Arc::new(NoopStore))
+                .await
+            }
+
+            /// The destination of every consent of these runs: the hosting
+            /// domain and `session`.
+            fn destination(session: &crate::SessionId) -> ApprovalConsentScope {
+                ApprovalConsentScope {
+                    domain: crate::session_hosting::HostingPaths {
+                        hosting_lock_dir: "realm-a/hosting".into(),
+                        cold_delivery_lock: "realm-a/hosting/cold-delivery.lock".into(),
+                        database: None,
+                    }
+                    .domain_ref(),
+                    session_id: session.clone(),
+                }
+            }
+
+            /// The retained work identity of the run `run_id`.
+            fn identity(run_id: &RunId) -> RetainedWorkIdentity {
+                RetainedWorkIdentity::new(
+                    "runtime-a",
+                    run_id.clone(),
+                    Vec::new(),
+                    std::collections::BTreeMap::new(),
+                    None,
+                )
+            }
+
+            /// The work of one run `run_id` under `owner`'s policy on `model`,
+            /// routed to `scope`, staged with `resumed` inputs, each resuming
+            /// the work it names.
+            fn run_work(
+                owner: &Arc<Owner>,
+                model: &Arc<ScriptedModel>,
+                scope: &ApprovalConsentScope,
+                run_id: &RunId,
+                resumed: &[(InputId, RetainedWorkIdentity)],
+            ) -> WorkAuthorizationContext {
+                let work = WorkAuthorizationContext::new(
+                    Arc::new(Policy(Arc::clone(owner))),
+                    crate::exact_operation::OperationExecutionScope::Domain,
+                )
+                .with_controller_client(crate::ControllerModelClient::new(
+                    fixture_controller_selection(),
+                    model.clone(),
+                ))
+                .unwrap()
+                .with_consent_scope(scope.clone())
+                .with_retained_work(identity(run_id));
+                if resumed.is_empty() {
+                    return work;
+                }
+                work.with_resumed_inputs(
+                    resumed
+                        .iter()
+                        .map(|(input_id, resumes)| ResumedInput {
+                            input_id: input_id.clone(),
+                            resumes: resumes.clone(),
+                        })
+                        .collect(),
+                )
+            }
+
+            /// One governed run of `agent` under `work`, started as `run_id`,
+            /// as the runtime starts the run it staged.
+            async fn run_as(
+                agent: &mut crate::agent::Agent<ScriptedModel, Actions, NoopStore>,
+                run_id: &RunId,
+                work: WorkAuthorizationContext,
+            ) {
+                agent
+                    .apply_turn_input(TurnExecutionInput::StartConversationRun {
+                        run_id: run_id.clone(),
+                        primitive_kind: TurnPrimitiveKind::ConversationTurn,
+                        admitted_content_shape: ContentShape::Conversation,
+                        vision_enabled: false,
+                        image_tool_results_enabled: false,
+                        max_extraction_retries: 0,
+                    })
+                    .expect("the run starts as its staged id");
+                let (tx, mut rx) = mpsc::channel(128);
+                let _result = tokio::time::timeout(
+                    RUN_GUARD,
+                    agent.run_with_events_and_work_authorization(
+                        "go".to_string().into(),
+                        vec![],
+                        vec![],
+                        None,
+                        tx,
+                        Some(work),
+                    ),
+                )
+                .await
+                .expect("the run never hangs")
+                .expect("the run completes");
+                assert_completed_without_failure(&mut rx);
+            }
+
+            /// Run 1, the admitting run `origin_run`: the model calls each of
+            /// `calls` in a step of its own, then answers. Every call is R3,
+            /// so each requests its own consent, and the run's close parks
+            /// them all. Returns the approvals this run requested, in call
+            /// order.
+            async fn admitting_run(
+                host: &mut Host,
+                model: &Arc<ScriptedModel>,
+                owner: &Arc<Owner>,
+                scope: &ApprovalConsentScope,
+                origin_run: &RunId,
+                calls: &[(&'static str, &'static str)],
+            ) -> Vec<crate::ApprovalId> {
+                let before = host.route.0.lock().unwrap().len();
+                model.script(calls.iter().map(|&(id, tool)| Reply::Call { id, tool }));
+                run_as(
+                    &mut host.agent,
+                    origin_run,
+                    run_work(owner, model, scope, origin_run, &[]),
+                )
+                .await;
+                let requested = host.route.0.lock().unwrap()[before..].to_vec();
+                assert_eq!(requested.len(), calls.len(), "one consent per call");
+                for approval_id in &requested {
+                    assert_eq!(
+                        record(&host.approvals, approval_id).custody,
+                        Some(ApprovalConsentCustody::Parked),
+                        "the run's close parked it"
+                    );
+                }
+                requested
+            }
+
+            /// An authenticated eligible human approves `approval_id`.
+            fn approve(approvals: &ApprovalService, approval_id: &crate::ApprovalId) {
+                let approver = AuthenticatedApprover::new(
+                    crate::PrincipalRef::in_domain(
+                        crate::PrincipalKind::Human,
+                        "lead-1",
+                        crate::TrustDomainId::new("team").expect("domain"),
+                    )
+                    .expect("principal"),
+                    ApprovalAssurance::PersonAuthenticated,
+                )
+                .expect("qualified approver");
+                approvals
+                    .decide_consent(
+                        approval_id,
+                        AuthenticatedConsentDecision {
+                            approver,
+                            decision: ApprovalDecision::Approve,
+                            reason: None,
+                        },
+                    )
+                    .expect("approved after its run closed");
+            }
+
+            /// The receipt of `approval_id`'s approved notice, admitted into
+            /// its destination as `input`.
+            fn receipt(
+                approvals: &ApprovalService,
+                approval_id: &crate::ApprovalId,
+                scope: &ApprovalConsentScope,
+                input: &InputId,
+            ) {
+                approvals
+                    .settle_consent_delivery(
+                        approval_id,
+                        ApprovalConsentTransition::Approved,
+                        ConsentDeliveryReceipt::Admitted {
+                            session_id: scope.session_id.clone(),
+                            input_id: input.clone(),
+                        },
+                    )
+                    .expect("the receipt commits");
+            }
+
+            fn record(
+                approvals: &ApprovalService,
+                approval_id: &crate::ApprovalId,
+            ) -> ApprovalConsentRecord {
+                approvals
+                    .get(approval_id)
+                    .expect("row")
+                    .consent
+                    .expect("consent")
+            }
+
+            /// The payload of every consent attempt notice among `messages`.
+            fn consent_attempts(messages: &[Message]) -> Vec<serde_json::Value> {
+                messages
+                    .iter()
+                    .filter_map(|message| match message {
+                        Message::SystemNotice(notice) => Some(notice),
+                        _ => None,
+                    })
+                    .flat_map(|notice| notice.blocks.iter())
+                    .filter_map(|block| match block {
+                        crate::SystemNoticeBlock::RuntimeNotice {
+                            category,
+                            payload: Some(payload),
+                            ..
+                        } if category == "consent_attempt" => Some(payload.clone()),
+                        _ => None,
+                    })
+                    .collect()
+            }
+
+            /// The receipt precedes the resumed run. The run's first boundary,
+            /// before its first model request, spends the consent moved into
+            /// it once: the dispatcher runs the original call (its id and its
+            /// retained arguments) once, the spend is recorded, the custody
+            /// names the receipt input, and the first model request carries
+            /// the attempt's notice naming that call and that input. The run
+            /// completes with an answer.
+            #[tokio::test]
+            async fn a_resumed_run_spends_the_consent_moved_in_before_it_opened() {
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &tools).await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&host.approvals, &consent);
+                let input = InputId::new();
+                receipt(&host.approvals, &consent, &scope, &input);
+
+                let run = RunId::new();
+                let resumed = [(input.clone(), identity(&origin_run))];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the original call ran once"
+                );
+                let spent = record(&host.approvals, &consent);
+                assert!(spent.consumed_at.is_some(), "the spend is recorded");
+                assert_eq!(
+                    spent.custody,
+                    Some(ApprovalConsentCustody::Transferred {
+                        input_id: input.to_string(),
+                    })
+                );
+                let requests = model.requests();
+                assert_eq!(
+                    requests.len(),
+                    3,
+                    "two requests of run 1, one of the resumed run"
+                );
+                let attempts = consent_attempts(&requests[2]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["approval_id"], serde_json::json!(consent));
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+                assert_eq!(attempts[0]["resumed_input_id"], input.to_string());
+                assert_eq!(attempts[0]["is_error"], false);
+            }
+
+            /// The resumed run opens before the receipt: its first boundary
+            /// finds nothing moved, and its first model request carries no
+            /// attempt. The receipt commits at a later boundary, moving the
+            /// consent into the open run, and that boundary spends it once.
+            #[tokio::test]
+            async fn a_resumed_run_spends_the_consent_moved_in_after_it_opened() {
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &tools).await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&host.approvals, &consent);
+                let input = InputId::new();
+                // At the first boundary after the run's first model request
+                // the receipt commits.
+                let late_receipt = {
+                    let model = Arc::clone(&model);
+                    let approvals = host.approvals.clone();
+                    let consent = consent.clone();
+                    let scope = scope.clone();
+                    let input = input.clone();
+                    let fired = std::sync::atomic::AtomicBool::new(false);
+                    move || {
+                        if model.requests.lock().unwrap().len() > 2
+                            && !fired.swap(true, Ordering::SeqCst)
+                        {
+                            receipt(&approvals, &consent, &scope, &input);
+                        }
+                    }
+                };
+                host.agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(late_receipt)));
+                model.script([Reply::Call {
+                    id: "read-call",
+                    tool: BENIGN,
+                }]);
+
+                let run = RunId::new();
+                let resumed = [(input.clone(), identity(&origin_run))];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(tools.bodies(), vec![RESTRICTED.to_string()]);
+                let spent = record(&host.approvals, &consent);
+                assert!(spent.consumed_at.is_some(), "the spend is recorded");
+                assert_eq!(
+                    spent.custody,
+                    Some(ApprovalConsentCustody::Transferred {
+                        input_id: input.to_string(),
+                    })
+                );
+                let requests = model.requests();
+                assert_eq!(requests.len(), 4, "{} requests", requests.len());
+                assert!(
+                    consent_attempts(&requests[2]).is_empty(),
+                    "nothing moved before the receipt"
+                );
+                let attempts = consent_attempts(&requests[3]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+                assert_eq!(attempts[0]["resumed_input_id"], input.to_string());
+            }
+
+            /// The resumed run spends only the consent moved into it, by its
+            /// approval and binding, never by tool or arguments. Its twin
+            /// (the same operation with identical arguments, parked awaiting
+            /// its own receipt) is never attempted, and when the model calls
+            /// the operation again that call is reviewed as new: it requests
+            /// fresh consent and runs no body.
+            #[tokio::test]
+            async fn a_resumed_run_spends_only_its_moved_consent_never_a_twin_or_a_new_call() {
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &tools).await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED), ("twin-call", RESTRICTED)],
+                )
+                .await;
+                let (consent, twin) = (ids[0].clone(), ids[1].clone());
+                approve(&host.approvals, &consent);
+                approve(&host.approvals, &twin);
+                let input = InputId::new();
+                receipt(&host.approvals, &consent, &scope, &input);
+                model.script([Reply::Call {
+                    id: "again-call",
+                    tool: RESTRICTED,
+                }]);
+
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "only the moved consent's call ran"
+                );
+                assert!(record(&host.approvals, &consent).consumed_at.is_some());
+                let twin_record = record(&host.approvals, &twin);
+                assert_eq!(twin_record.custody, Some(ApprovalConsentCustody::Parked));
+                assert!(twin_record.consumed_at.is_none(), "the twin is never spent");
+                let requested = host.route.0.lock().unwrap().clone();
+                assert_eq!(requested.len(), 3, "the new call requested fresh consent");
+                let fresh = requested[2].clone();
+                assert!(fresh != consent && fresh != twin);
+                let fresh_row = host.approvals.get(&fresh).expect("row");
+                assert_eq!(fresh_row.status, ApprovalStatus::Pending);
+                assert!(
+                    fresh_row
+                        .consent
+                        .is_some_and(|consent| consent.consumed_at.is_none())
+                );
+                let requests = model.requests();
+                let attempts = consent_attempts(requests.last().expect("a request"));
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+            }
+
+            /// The moved consent is attempted once whatever boundaries
+            /// follow: two more boundaries of the resumed run leave the body
+            /// count and the recorded spend as they were, and an attempt of it
+            /// again, by its approval in the same run, is refused as already
+            /// spent.
+            #[tokio::test]
+            async fn a_moved_consent_is_attempted_once_whatever_boundaries_follow() {
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &tools).await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&host.approvals, &consent);
+                let input = InputId::new();
+                receipt(&host.approvals, &consent, &scope, &input);
+                // The spend as the boundary after the attempt reads it.
+                let after_attempt = Arc::new(Mutex::new(None));
+                let observe = {
+                    let model = Arc::clone(&model);
+                    let approvals = host.approvals.clone();
+                    let consent = consent.clone();
+                    let after_attempt = Arc::clone(&after_attempt);
+                    move || {
+                        if model.requests.lock().unwrap().len() > 2 {
+                            let mut seen = after_attempt.lock().unwrap();
+                            if seen.is_none() {
+                                *seen = Some(record(&approvals, &consent).consumed_at);
+                            }
+                        }
+                    }
+                };
+                host.agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(observe)));
+                model.script([
+                    Reply::Call {
+                        id: "read-1",
+                        tool: BENIGN,
+                    },
+                    Reply::Call {
+                        id: "read-2",
+                        tool: BENIGN,
+                    },
+                ]);
+
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                let work = run_work(&owner, &model, &scope, &run, &resumed);
+                run_as(&mut host.agent, &run, work.clone()).await;
+
+                assert_eq!(
+                    model.requests().len(),
+                    5,
+                    "three requests of the resumed run"
+                );
+                assert_eq!(tools.bodies(), vec![RESTRICTED.to_string()]);
+                let spent = record(&host.approvals, &consent).consumed_at;
+                assert!(spent.is_some());
+                assert_eq!(
+                    *after_attempt.lock().unwrap(),
+                    Some(spent),
+                    "the later boundaries leave the spend as recorded"
+                );
+                let mut context = ToolDispatchContext::default()
+                    .with_work_authorization(Some(work))
+                    .with_operation_review(Some(Arc::clone(&host.review)));
+                context.bind_run_id(run);
+                assert_eq!(
+                    crate::dispatch_retained_consent_attempt(&tools, &context, &consent)
+                        .await
+                        .err(),
+                    Some(ToolError::ReviewUnsatisfied {
+                        kind: crate::approval::review::ReviewUnsatisfiedKind::AlreadyConsumed,
+                        approval_id: None,
+                    }),
+                    "an attempt again by its approval is refused"
+                );
+                assert_eq!(tools.bodies().len(), 1);
+            }
+
+            /// Consent withdrawn between its move and the boundary that would
+            /// spend it is never attempted: the work owner withdrew the
+            /// operation's permission, and the approval's read observed it
+            /// before the boundary. No body runs for it and nothing is spent,
+            /// while the other consent moved into the same run is still spent
+            /// once.
+            #[tokio::test]
+            async fn a_moved_consent_withdrawn_before_its_boundary_is_never_attempted() {
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &tools).await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED), ("other-call", OTHER)],
+                )
+                .await;
+                let (withdrawn, other) = (ids[0].clone(), ids[1].clone());
+                approve(&host.approvals, &withdrawn);
+                approve(&host.approvals, &other);
+                let (withdrawn_input, other_input) = (InputId::new(), InputId::new());
+                receipt(&host.approvals, &withdrawn, &scope, &withdrawn_input);
+                receipt(&host.approvals, &other, &scope, &other_input);
+                // At the run's first boundary, before its consent step, the
+                // owner withdraws one operation and its approval is read.
+                let withdraw = {
+                    let owner = Arc::clone(&owner);
+                    let approvals = host.approvals.clone();
+                    let withdrawn = withdrawn.clone();
+                    let fired = std::sync::atomic::AtomicBool::new(false);
+                    move || {
+                        if !fired.swap(true, Ordering::SeqCst) {
+                            owner.withdraw(RESTRICTED);
+                            approvals.get(&withdrawn).expect("row");
+                        }
+                    }
+                };
+                host.agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(withdraw)));
+
+                let run = RunId::new();
+                let resumed = [
+                    (withdrawn_input.clone(), identity(&origin_run)),
+                    (other_input.clone(), identity(&origin_run)),
+                ];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    tools.bodies(),
+                    vec![OTHER.to_string()],
+                    "only the live moved consent ran"
+                );
+                let withdrawn_record = record(&host.approvals, &withdrawn);
+                assert!(withdrawn_record.consumed_at.is_none(), "nothing spent");
+                assert_eq!(
+                    withdrawn_record
+                        .withdrawal
+                        .map(|withdrawal| withdrawal.reason),
+                    Some(ApprovalConsentWithdrawalReason::AuthorityChanged)
+                );
+                assert_eq!(
+                    withdrawn_record.custody,
+                    Some(ApprovalConsentCustody::Transferred {
+                        input_id: withdrawn_input.to_string(),
+                    }),
+                    "it had moved before the withdrawal"
+                );
+                assert!(record(&host.approvals, &other).consumed_at.is_some());
+                let requests = model.requests();
+                let attempts = consent_attempts(requests.last().expect("a request"));
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "other-call");
+                assert_eq!(attempts[0]["resumed_input_id"], other_input.to_string());
+            }
+
+            /// A run cut between the spend and the commit of its result never
+            /// runs the operation again. The first host's leaf spends the
+            /// moved consent and is cut inside its body, so the attempt's
+            /// result never reaches the session. A second host restores the
+            /// same approval store; its resumed run of the same work, staged
+            /// with the same input, finds nothing moved at its first boundary
+            /// while it is open, and the spent row resolves no attempt there
+            /// (already consumed), since a restored spent row is history,
+            /// never custody. The body ran once across both hosts, the spend
+            /// stands as first recorded, and the model's new call of the
+            /// operation requests fresh consent.
+            #[tokio::test]
+            async fn a_run_cut_between_the_spend_and_its_result_never_runs_the_operation_again() {
+                let store = Arc::new(crate::approval::InMemoryApprovalStore::new());
+                let model = Arc::new(ScriptedModel::default());
+                let entered = Arc::new(Notify::new());
+                let tools = Arc::new(Actions {
+                    hold_first_body: Some(Arc::clone(&entered)),
+                    ..Actions::default()
+                });
+                let owner = Arc::new(Owner::default());
+                let mut first = compose_host(
+                    ApprovalService::with_store(store.clone()).expect("service"),
+                    &model,
+                    &tools,
+                )
+                .await;
+                let scope = destination(first.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut first,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&first.approvals, &consent);
+                let input = InputId::new();
+                receipt(&first.approvals, &consent, &scope, &input);
+                let resumed = [(input, identity(&origin_run))];
+
+                let run = RunId::new();
+                {
+                    let cut = run_as(
+                        &mut first.agent,
+                        &run,
+                        run_work(&owner, &model, &scope, &run, &resumed),
+                    );
+                    tokio::pin!(cut);
+                    tokio::select! {
+                        () = entered.notified() => {}
+                        () = &mut cut => {
+                            panic!("the run cannot finish while the operation's body is held")
+                        }
+                    }
+                }
+                assert_eq!(tools.bodies(), vec![RESTRICTED.to_string()]);
+                let spent = record(&first.approvals, &consent).consumed_at;
+                assert!(
+                    spent.is_some(),
+                    "the leaf spent the consent before its body"
+                );
+                drop(first);
+
+                let mut second = compose_host(
+                    ApprovalService::with_store(store).expect("the restored service"),
+                    &model,
+                    &tools,
+                )
+                .await;
+                model.script([Reply::Call {
+                    id: "again-call",
+                    tool: RESTRICTED,
+                }]);
+                let rerun = RunId::new();
+                let rework = run_work(&owner, &model, &scope, &rerun, &resumed);
+                // At the rerun's first boundary, before its consent step, the
+                // restored owner is read for the open rerun.
+                let restored = Arc::new(Mutex::new(None));
+                let read_restored = {
+                    let approvals = second.approvals.clone();
+                    let rework = rework.clone();
+                    let rerun = rerun.clone();
+                    let consent = consent.clone();
+                    let restored = Arc::clone(&restored);
+                    move || {
+                        let mut seen = restored.lock().unwrap();
+                        if seen.is_none() {
+                            *seen = Some((
+                                approvals.consent_moved_into_run(&rework, Some(&rerun)),
+                                matches!(
+                                    approvals.resolve_consent_attempt(
+                                        &consent,
+                                        &rework,
+                                        Some(&rerun)
+                                    ),
+                                    Err(crate::approval::consent::ConsentRefusal::AlreadyConsumed)
+                                ),
+                            ));
+                        }
+                    }
+                };
+                second
+                    .agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(read_restored)));
+                run_as(&mut second.agent, &rerun, rework).await;
+
+                assert_eq!(
+                    tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the body ran once across both hosts"
+                );
+                assert_eq!(
+                    record(&second.approvals, &consent).consumed_at,
+                    spent,
+                    "the spend stands as first recorded"
+                );
+                assert_eq!(
+                    *restored.lock().unwrap(),
+                    Some((MovedConsentScan::Moved(Vec::new()), true)),
+                    "in the open rerun nothing moved, and the restored spent row is refused \
+                     as already consumed"
+                );
+                let requested = second.route.0.lock().unwrap().clone();
+                assert_eq!(requested.len(), 1, "the new call requested fresh consent");
+                assert_ne!(requested[0], consent);
+            }
+
+            /// Bound of one armed write's hold: it ends then even when no one
+            /// releases it, so a run that never looks again still closes.
+            const HOLD_GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
+            /// An approval store whose next write, once armed, reports that
+            /// it entered and then waits for its release (at most
+            /// [`HOLD_GUARD`]): the approval owner holds its write lock for
+            /// that long.
+            #[derive(Default)]
+            struct GatedStore {
+                inner: crate::approval::InMemoryApprovalStore,
+                gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+            }
+
+            impl ApprovalStore for GatedStore {
+                fn load_all(
+                    &self,
+                ) -> Result<Vec<crate::ApprovalRecord>, crate::ApprovalStoreError> {
+                    self.inner.load_all()
+                }
+
+                fn get(
+                    &self,
+                    approval_id: &crate::ApprovalId,
+                ) -> Result<Option<crate::ApprovalRecord>, crate::ApprovalStoreError>
+                {
+                    self.inner.get(approval_id)
+                }
+
+                fn put_if_current(
+                    &self,
+                    expected: Option<&crate::ApprovalRecord>,
+                    record: &crate::ApprovalRecord,
+                ) -> Result<(), crate::ApprovalStoreError> {
+                    let gate = self.gate.lock().unwrap().take();
+                    if let Some((entered, release)) = gate {
+                        entered.send(()).unwrap();
+                        let _released = release.recv_timeout(HOLD_GUARD);
+                    }
+                    self.inner.put_if_current(expected, record)
+                }
+
+                fn is_persistent(&self) -> bool {
+                    false
+                }
+            }
+
+            /// An approval request of the host's own, unrelated to the runs.
+            fn unrelated_request() -> crate::ApprovalRequest {
+                crate::ApprovalRequest {
+                    requester: crate::ApprovalPrincipalId::new("agent:other").expect("principal"),
+                    owner: crate::ApprovalOwnerRef::Session {
+                        session_id: crate::SessionId::new(),
+                    },
+                    resource: crate::ApprovalResourceRef {
+                        kind: crate::ApprovalResourceKind::ShellCommand,
+                        id: crate::ApprovalResourceId::new("shell:other"),
+                    },
+                    proposed_action: crate::ApprovalProposedAction {
+                        kind: crate::ApprovalActionKind::ShellCommand,
+                        summary: "another action".to_string(),
+                        body: None,
+                    },
+                    risk: crate::ApprovalRisk::High,
+                    request_body: None,
+                    allowed_decisions: std::collections::BTreeSet::from([
+                        ApprovalDecision::Approve,
+                        ApprovalDecision::Deny,
+                    ]),
+                    expires_at: None,
+                    metadata: crate::SurfaceMetadata::default(),
+                    request_provenance: None,
+                }
+            }
+
+            /// A held approval owner never costs a resumed run the consent
+            /// moved into it. At the run's only boundary another write holds
+            /// the owner's lock, so the boundary's read of the moved consent
+            /// finds the owner held: the boundary yields and looks again, and
+            /// once the hold has ended it spends the consent, before the run's
+            /// first model request, which carries the attempt's notice.
+            #[tokio::test]
+            async fn a_held_approval_owner_makes_the_boundary_look_again_for_moved_consent() {
+                let store = Arc::new(GatedStore::default());
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(
+                    ApprovalService::with_store(store.clone()).expect("service"),
+                    &model,
+                    &tools,
+                )
+                .await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&host.approvals, &consent);
+                let input = InputId::new();
+                receipt(&host.approvals, &consent, &scope, &input);
+                // At the boundary's first look another write takes the
+                // owner's lock and holds it; at its next look the hold ends.
+                let looks = Arc::new(AtomicUsize::new(0));
+                let held = Arc::new(Mutex::new(None));
+                let hold = {
+                    let store = Arc::clone(&store);
+                    let approvals = host.approvals.clone();
+                    let looks = Arc::clone(&looks);
+                    let held = Arc::clone(&held);
+                    move || match looks.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            let (entered, entered_rx) = std::sync::mpsc::channel();
+                            let (release, released) = std::sync::mpsc::channel();
+                            *store.gate.lock().unwrap() = Some((entered, released));
+                            let approvals = approvals.clone();
+                            let writer = std::thread::spawn(move || {
+                                approvals
+                                    .request(unrelated_request())
+                                    .expect("the write commits");
+                            });
+                            entered_rx
+                                .recv_timeout(HOLD_GUARD)
+                                .expect("the write holds the owner");
+                            *held.lock().unwrap() = Some((release, writer));
+                        }
+                        1 => {
+                            let (release, writer) = held.lock().unwrap().take().expect("held");
+                            let _ = release.send(());
+                            writer.join().expect("the write ends");
+                        }
+                        _ => {}
+                    }
+                };
+                host.agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(hold)));
+
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert!(
+                    looks.load(Ordering::SeqCst) >= 2,
+                    "the held boundary looked again"
+                );
+                assert_eq!(
+                    tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the boundary spent the moved consent once the hold ended"
+                );
+                assert!(record(&host.approvals, &consent).consumed_at.is_some());
+                let requests = model.requests();
+                assert_eq!(requests.len(), 3, "one request of the resumed run");
+                let attempts = consent_attempts(&requests[2]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+            }
+
+            /// One approved consent of the first restricted action, parked at
+            /// the close of the admitting run `origin_run` on `host`, whose
+            /// approved notice's receipt names `input`.
+            async fn approved_and_received(
+                host: &mut Host,
+                model: &Arc<ScriptedModel>,
+                owner: &Arc<Owner>,
+                scope: &ApprovalConsentScope,
+                origin_run: &RunId,
+                input: &InputId,
+            ) -> crate::ApprovalId {
+                let consent = admitting_run(
+                    host,
+                    model,
+                    owner,
+                    scope,
+                    origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await
+                .remove(0);
+                approve(&host.approvals, &consent);
+                receipt(&host.approvals, &consent, scope, input);
+                consent
+            }
+
+            /// The session's agent rebuilt in this process (a new agent and a
+            /// new dispatcher allocation over the same approval owner and
+            /// review) spends the consent moved into its resumed run once. The
+            /// retained call is resolved afresh against the rebuilt
+            /// dispatcher, the approval owner rebinds the custody to that same
+            /// durable execution, and only the rebuilt dispatcher runs the
+            /// body. The custody still names the receipt input, nothing is
+            /// withdrawn, and the run's first model request carries the
+            /// attempt's notice naming the original call and that input.
+            #[tokio::test]
+            async fn a_rebuilt_agent_spends_the_consent_moved_into_its_resumed_run_once() {
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &original).await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+
+                let rebuilt_tools = Arc::new(Actions::default());
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                let run = RunId::new();
+                let resumed = [(input.clone(), identity(&origin_run))];
+                run_as(
+                    &mut rebuilt,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    rebuilt_tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the rebuilt dispatcher ran the original call once"
+                );
+                assert!(
+                    original.bodies().is_empty(),
+                    "the old allocation ran nothing"
+                );
+                let spent = record(&host.approvals, &consent);
+                assert!(spent.consumed_at.is_some(), "the spend is recorded");
+                assert_eq!(
+                    spent.custody,
+                    Some(ApprovalConsentCustody::Transferred {
+                        input_id: input.to_string(),
+                    })
+                );
+                assert_eq!(spent.withdrawal, None);
+                let requests = model.requests();
+                assert_eq!(requests.len(), 3, "one request of the resumed run");
+                let attempts = consent_attempts(&requests[2]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+                assert_eq!(attempts[0]["resumed_input_id"], input.to_string());
+                assert_eq!(attempts[0]["is_error"], false);
+            }
+
+            /// The resumed run of a rebuilt agent whose dispatcher reaches the
+            /// tool other than the run that requested the consent: the attempt
+            /// is refused before entry, nothing is spent, neither allocation
+            /// runs the body, and the consent ends `withdrawn`.
+            async fn rebuilt_agent_refuses(
+                original: Actions,
+                rebuilt: Actions,
+                withdrawn: ApprovalConsentWithdrawalReason,
+            ) {
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(original);
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &original).await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+
+                let rebuilt_tools = Arc::new(rebuilt);
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut rebuilt,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert!(
+                    rebuilt_tools.bodies().is_empty(),
+                    "the rebuilt allocation ran nothing"
+                );
+                assert!(
+                    original.bodies().is_empty(),
+                    "the old allocation ran nothing"
+                );
+                let refused = record(&host.approvals, &consent);
+                assert!(refused.consumed_at.is_none(), "nothing spent");
+                assert_eq!(
+                    refused.withdrawal.map(|withdrawal| withdrawal.reason),
+                    Some(withdrawn)
+                );
+                let requests = model.requests();
+                let attempts = consent_attempts(&requests[2]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["is_error"], true, "refused before entry");
+            }
+
+            /// A rebuilt agent whose dispatcher serves the tool with another
+            /// declaration never spends the moved consent.
+            #[tokio::test]
+            async fn a_rebuilt_agent_serving_another_declaration_never_spends_the_moved_consent() {
+                rebuilt_agent_refuses(
+                    Actions::default(),
+                    Actions {
+                        restricted_description: Some("rebuilt with another declaration"),
+                        ..Actions::default()
+                    },
+                    ApprovalConsentWithdrawalReason::ContextChanged,
+                )
+                .await;
+            }
+
+            /// A rebuilt agent whose owner states the same tool and arguments
+            /// acting with another account never spends the moved consent.
+            #[tokio::test]
+            async fn a_rebuilt_agent_reaching_another_account_never_spends_the_moved_consent() {
+                rebuilt_agent_refuses(
+                    Actions {
+                        account: Some("alice"),
+                        ..Actions::default()
+                    },
+                    Actions {
+                        account: Some("bob"),
+                        ..Actions::default()
+                    },
+                    ApprovalConsentWithdrawalReason::ContextChanged,
+                )
+                .await;
+            }
+
+            /// A rebuilt agent whose resolver drops the caller's deadline
+            /// chain for one of its own fails the root seam every call passes
+            /// after its resolution: the attempt is refused before entry,
+            /// nothing is spent, and the run's close withdraws the consent.
+            #[tokio::test]
+            async fn a_rebuilt_agent_failing_the_root_seam_never_spends_the_moved_consent() {
+                rebuilt_agent_refuses(
+                    Actions::default(),
+                    Actions {
+                        own_deadline: true,
+                        ..Actions::default()
+                    },
+                    ApprovalConsentWithdrawalReason::RunEnded,
+                )
+                .await;
+            }
+
+            /// A rebuilt agent spends only the consent moved into its resumed
+            /// run, by its approval and binding. A twin with identical
+            /// arguments, parked for another origin and received with another
+            /// input, stays parked and unspent; the model's new call of the
+            /// operation in the resumed run asks for fresh consent and runs no
+            /// body.
+            #[tokio::test]
+            async fn a_rebuilt_agent_spends_only_its_moved_consent_never_a_twin_or_a_new_call() {
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &original).await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+                let (other_origin, other_input) = (RunId::new(), InputId::new());
+                let twin = approved_and_received(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &other_origin,
+                    &other_input,
+                )
+                .await;
+
+                let rebuilt_tools = Arc::new(Actions::default());
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                model.script([Reply::Call {
+                    id: "again-call",
+                    tool: RESTRICTED,
+                }]);
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut rebuilt,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    rebuilt_tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "only the moved consent's call ran"
+                );
+                assert!(original.bodies().is_empty());
+                assert!(record(&host.approvals, &consent).consumed_at.is_some());
+                let twin_record = record(&host.approvals, &twin);
+                assert_eq!(twin_record.custody, Some(ApprovalConsentCustody::Parked));
+                assert!(twin_record.consumed_at.is_none(), "the twin is never spent");
+                assert_eq!(twin_record.withdrawal, None);
+                let requested = host.route.0.lock().unwrap().clone();
+                assert_eq!(requested.len(), 3, "the new call requested fresh consent");
+                let fresh = host.approvals.get(&requested[2]).expect("row");
+                assert!(requested[2] != consent && requested[2] != twin);
+                assert_eq!(fresh.status, ApprovalStatus::Pending);
+            }
+
+            /// A process restart instead of a rebuild ends the custody: the
+            /// restored owner holds the row as history only, so its resumed run
+            /// staged with the receipt's input finds nothing moved, and the
+            /// model's new call of the operation asks for fresh consent. No
+            /// allocation runs the body.
+            #[tokio::test]
+            async fn a_process_restart_instead_of_a_rebuild_moves_nothing_into_the_resumed_run() {
+                let store = Arc::new(crate::approval::InMemoryApprovalStore::new());
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(
+                    ApprovalService::with_store(store.clone()).expect("service"),
+                    &model,
+                    &original,
+                )
+                .await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+                drop(host);
+
+                let restarted_tools = Arc::new(Actions::default());
+                let mut restarted = compose_host(
+                    ApprovalService::with_store(store).expect("the restored service"),
+                    &model,
+                    &restarted_tools,
+                )
+                .await;
+                model.script([Reply::Call {
+                    id: "again-call",
+                    tool: RESTRICTED,
+                }]);
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut restarted.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert!(restarted_tools.bodies().is_empty());
+                assert!(original.bodies().is_empty());
+                assert!(record(&restarted.approvals, &consent).consumed_at.is_none());
+                let requests = model.requests();
+                assert!(
+                    requests[2..]
+                        .iter()
+                        .all(|request| consent_attempts(request).is_empty()),
+                    "nothing was attempted"
+                );
+                let requested = restarted.route.0.lock().unwrap().clone();
+                assert_eq!(requested.len(), 1, "the new call requested fresh consent");
+                assert_ne!(requested[0], consent);
+            }
+
+            /// A rebuilt agent's run cut between the spend and the commit of
+            /// its result never runs the operation again. The rebuilt leaf
+            /// spends the moved consent and is cut inside its body; the next
+            /// lifetime restores the same approval store, finds nothing moved
+            /// into its resumed run, and asks for fresh consent for the
+            /// model's new call. The body ran once across both lifetimes, and
+            /// the spend stands as first recorded.
+            #[tokio::test]
+            async fn a_rebuilt_agent_cut_between_the_spend_and_its_result_never_runs_it_again() {
+                let store = Arc::new(crate::approval::InMemoryApprovalStore::new());
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(
+                    ApprovalService::with_store(store.clone()).expect("service"),
+                    &model,
+                    &original,
+                )
+                .await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+                let resumed = [(input, identity(&origin_run))];
+
+                let entered = Arc::new(Notify::new());
+                let rebuilt_tools = Arc::new(Actions {
+                    hold_first_body: Some(Arc::clone(&entered)),
+                    ..Actions::default()
+                });
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                let run = RunId::new();
+                {
+                    let cut = run_as(
+                        &mut rebuilt,
+                        &run,
+                        run_work(&owner, &model, &scope, &run, &resumed),
+                    );
+                    tokio::pin!(cut);
+                    tokio::select! {
+                        () = entered.notified() => {}
+                        () = &mut cut => {
+                            panic!("the run cannot finish while the operation's body is held")
+                        }
+                    }
+                }
+                assert_eq!(rebuilt_tools.bodies(), vec![RESTRICTED.to_string()]);
+                let spent = record(&host.approvals, &consent).consumed_at;
+                assert!(
+                    spent.is_some(),
+                    "the rebuilt leaf spent the consent before its body"
+                );
+                drop(rebuilt);
+                drop(host);
+
+                let later_tools = Arc::new(Actions::default());
+                let mut later = compose_host(
+                    ApprovalService::with_store(store).expect("the restored service"),
+                    &model,
+                    &later_tools,
+                )
+                .await;
+                model.script([Reply::Call {
+                    id: "again-call",
+                    tool: RESTRICTED,
+                }]);
+                let rerun = RunId::new();
+                run_as(
+                    &mut later.agent,
+                    &rerun,
+                    run_work(&owner, &model, &scope, &rerun, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    rebuilt_tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the body ran once across both lifetimes"
+                );
+                assert!(later_tools.bodies().is_empty());
+                assert!(original.bodies().is_empty());
+                assert_eq!(
+                    record(&later.approvals, &consent).consumed_at,
+                    spent,
+                    "the spend stands as first recorded"
+                );
+                let requested = later.route.0.lock().unwrap().clone();
+                assert_eq!(requested.len(), 1, "the new call requested fresh consent");
+                assert_ne!(requested[0], consent);
+            }
+
+            /// Moved consent whose notice input ended before the session's
+            /// agent was rebuilt (the input abandoned, as a requeue past its
+            /// max age ends it) is withdrawn, naming the input, and the
+            /// rebuilt agent's resumed run spends nothing.
+            #[tokio::test]
+            async fn a_consent_whose_notice_input_ended_is_never_spent_by_a_rebuilt_agent() {
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &original).await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+                assert!(matches!(
+                    host.approvals
+                        .settle_consent_notice_input_ended(&consent, &scope, &input),
+                    Ok(crate::approval::consent::NoticeInputEndedSettlement::Withdrawn)
+                ));
+
+                let rebuilt_tools = Arc::new(Actions::default());
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                let run = RunId::new();
+                let resumed = [(input.clone(), identity(&origin_run))];
+                run_as(
+                    &mut rebuilt,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert!(rebuilt_tools.bodies().is_empty());
+                assert!(original.bodies().is_empty());
+                let ended = record(&host.approvals, &consent);
+                assert!(ended.consumed_at.is_none());
+                assert_eq!(
+                    ended.withdrawal.map(|withdrawal| withdrawal.reason),
+                    Some(ApprovalConsentWithdrawalReason::NoticeInputEnded {
+                        input_id: input.to_string(),
+                    })
+                );
+                assert!(
+                    consent_attempts(&model.requests()[2]).is_empty(),
+                    "nothing was attempted"
+                );
+            }
+
+            /// A rebuilt agent that has not published the tool again at its
+            /// resumed run's first boundary cannot resolve the retained call
+            /// yet: that attempt does not count, leaves no feedback and enters
+            /// nothing. The run's next boundary, once the tool is published,
+            /// spends the moved consent once.
+            #[tokio::test]
+            async fn a_rebuilt_agent_not_ready_at_its_first_boundary_spends_at_the_next() {
+                let model = Arc::new(ScriptedModel::default());
+                let original = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(ApprovalService::new(), &model, &original).await;
+                let scope = destination(host.agent.session.id());
+                let (origin_run, input) = (RunId::new(), InputId::new());
+                let consent =
+                    approved_and_received(&mut host, &model, &owner, &scope, &origin_run, &input)
+                        .await;
+
+                let rebuilt_tools = Arc::new(Actions::default());
+                rebuilt_tools
+                    .restricted_unpublished
+                    .store(true, Ordering::SeqCst);
+                let mut rebuilt = agent_over(&host.review, &model, &rebuilt_tools).await;
+                // The tool is published again at the run's second boundary.
+                let publish = {
+                    let model = Arc::clone(&model);
+                    let tools = Arc::clone(&rebuilt_tools);
+                    move || {
+                        if model.requests.lock().unwrap().len() > 2 {
+                            tools.restricted_unpublished.store(false, Ordering::SeqCst);
+                        }
+                    }
+                };
+                rebuilt.__test_set_model_preparation_observer(Some(Arc::new(publish)));
+                model.script([Reply::Call {
+                    id: "read-call",
+                    tool: BENIGN,
+                }]);
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut rebuilt,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert_eq!(
+                    rebuilt_tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "spent once, at the next boundary"
+                );
+                assert!(original.bodies().is_empty());
+                let spent = record(&host.approvals, &consent);
+                assert!(spent.consumed_at.is_some());
+                assert_eq!(spent.withdrawal, None);
+                let requests = model.requests();
+                assert_eq!(requests.len(), 4, "two requests of the resumed run");
+                assert!(
+                    consent_attempts(&requests[2]).is_empty(),
+                    "the attempt that was not ready left no feedback"
+                );
+                let attempts = consent_attempts(&requests[3]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
+            }
         }
 
         #[cfg(feature = "workspace-tests")]

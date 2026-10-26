@@ -777,7 +777,11 @@ struct ApprovalServiceState {
     records: BTreeMap<ApprovalId, ApprovalRecord>,
     authority: ApprovalLifecycleMachineAuthority,
     /// Process-local custody of retained R3 candidates, by approval. Never
-    /// persisted or restored: spendable consent dies with the process.
+    /// persisted or restored: spendable consent dies with the process. It
+    /// survives an in-process rebuild of the session's agent (the same
+    /// owner, the session's claim lineage joined), whose fresh resolution of
+    /// the retained call it is rebound to only as the same durable
+    /// execution; a process restart still drops it.
     consent: BTreeMap<ApprovalId, Arc<consent::ConsentCandidate>>,
     /// Consent approvals this service issued itself. A consent row loaded
     /// from a shared store without such an entry may still be held by
