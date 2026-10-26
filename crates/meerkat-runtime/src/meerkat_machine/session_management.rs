@@ -8603,6 +8603,11 @@ impl MeerkatMachine {
     /// This is the watcher's kickoff only. It returns what is left to wait
     /// for, so the watcher waits after releasing the machine and the session
     /// driver it observed (see [`RuntimeLoopTeardownWait`]).
+    ///
+    /// An attachment that exited before it served (`UnservedAttachment`) is
+    /// its exact startup or pending owner's to retire: the watcher joins an
+    /// unregister or stop already begun, and never claims that attachment's
+    /// cleanup itself.
     pub(crate) async fn observe_runtime_loop_teardown(
         &self,
         session_id: &SessionId,
@@ -8718,6 +8723,16 @@ impl MeerkatMachine {
                     });
                 }
             }
+        } else if disposition
+            == crate::runtime_loop::RuntimeLoopTeardownDisposition::UnservedAttachment
+        {
+            // An attachment that never served is retired by its exact startup
+            // or pending owner, whose unregister keeps every input the
+            // registration recovered from the store, unless the registration
+            // served live work. A cleanup claimed here first would run the
+            // stop before that unregister began, and so end those inputs as
+            // stopped.
+            return Ok(RuntimeLoopTeardownWait::Settled);
         } else {
             // A spontaneous loop exit can hand off a machine-managed executor
             // that still retains M from its stop hook. Installing a coordinator

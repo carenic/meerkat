@@ -4,7 +4,7 @@ description: "Use Meta as a Rust library: bootstrap runtimes, route module calls
 icon: "code"
 ---
 
-*Mirrored from MobKit main at [3d6c065ce699](https://github.com/lukacf/meerkat-meta/commit/3d6c065ce69971ef49183728acc5fad2609266ae) on 2026-10-25; MobKit workspace version 0.9.5 at that commit.*
+*Mirrored from MobKit main at [cb88d10df2f9](https://github.com/lukacf/meerkat-meta/commit/cb88d10df2f92fa153872e94ecd35db690de6820) on 2026-10-26; MobKit workspace version 0.9.5 at that commit.*
 
 The Rust crate `meerkat-meta` is the primary interface for Meta. All other interfaces (JSON-RPC, SDKs, console) are built on top of it.
 
@@ -288,13 +288,46 @@ service built on that factory to `MobBootstrapSpec::new`.
 A host composing the stdio gateway answers
 `GatewayHostComposition::operation_refusal_observer`. The gateway asks once
 per member factory, with the construction it offers `compose_member_factory`,
-before either answer is installed. `Ok(None)` (the default) installs nothing,
+before any answer is installed. `Ok(None)` (the default) installs nothing,
 and `Err` refuses init. The observer sees every agent that factory builds:
 roster members, spawned helpers and forks, and the child mobs and councils
 agents create.
 
 `observe` is synchronous and must not block, and a panic in it propagates on
 the deciding task (the member's turn).
+
+### Operation review on a host-composed gateway
+
+A host composing the stdio gateway can install Meerkat's operation review
+(`meerkat_core::approval::review::BoundOperationReview`: its reviewer,
+approval owner and deadline) on the gateway's member agents by answering
+`GatewayHostComposition::operation_review`. The gateway asks once per member
+factory, with the construction it offers `compose_member_factory` and
+`operation_refusal_observer`, before any answer is installed and before any
+session exists on the gateway's runtime. Each launch builds one member factory
+on its own runtime, so the gateway asks once per runtime.
+
+```rust
+fn operation_review(
+    &self,
+    _construction: &GatewayFactoryConstruction<'_>,
+) -> Result<Option<Arc<BoundOperationReview>>, GatewayHostError> {
+    let review = BoundOperationReview::new(reviewer, approvals, deadline)
+        .with_human_consent(consent_route, consent_validity);
+    Ok(Some(Arc::new(review)))
+}
+```
+
+When the review routes R3 to human consent (`with_human_consent`), the gateway
+first installs the review's consent owner-loss settlement, the approval owner
+that issues that consent, on the gateway's runtime, and then installs the
+review on the factory. A review without a consent route is installed on the
+factory alone. The review covers every agent that factory builds: roster
+members, spawned helpers and forks, and the child mobs and councils agents
+create. `Ok(None)` (the default) installs nothing, and `Err` refuses init. The
+settlement goes on the runtime the gateway has just built, before any session;
+should that runtime refuse it, init fails with
+`GatewayHostError::ConsentSettlementRefused`.
 
 ### Agent customizer on a host-composed gateway
 

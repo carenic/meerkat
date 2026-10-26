@@ -4,7 +4,7 @@ description: "JSON-RPC 2.0 protocol for Meta runtime operations: gating, memory,
 icon: "plug"
 ---
 
-*Mirrored from MobKit main at [3d6c065ce699](https://github.com/lukacf/meerkat-meta/commit/3d6c065ce69971ef49183728acc5fad2609266ae) on 2026-10-25; MobKit workspace version 0.9.5 at that commit.*
+*Mirrored from MobKit main at [cb88d10df2f9](https://github.com/lukacf/meerkat-meta/commit/cb88d10df2f92fa153872e94ecd35db690de6820) on 2026-10-26; MobKit workspace version 0.9.5 at that commit.*
 
 Meta exposes its operational API over JSON-RPC 2.0. SDK gateways use JSON lines over stdio, while the embedded console uses `POST /console/rpc` for console-specific methods and explicitly implemented runtime operations. The HTTP dispatcher is not a general stdio passthrough; check `meta/capabilities` on the surface you use.
 
@@ -2356,7 +2356,10 @@ one never moves it back.
 
 Errors: `-32602` for a missing or empty principal; `-32004` when the runtime
 has no durable session fence record (no persistent state directory), so the
-revocation would not survive a restart.
+revocation would not survive a restart; `-32603` when the record could not
+be written (nothing changed), or when, on Unix, its directory could not be
+synced after the record's file was replaced: the revocation then took effect
+but may not survive a power loss, and revoking again confirms it.
 
 The console's `/console/rpc` serves the same method. With an access
 controller, enforced or not, only an access admin may call it, as for the
