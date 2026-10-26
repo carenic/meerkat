@@ -220,7 +220,13 @@ it must not be resubmitted. Keep the claim until the session's next
 registration has published: that registration joins the claim's lineage and
 does not settle the lost owner's consents again. `Ok` is a complete census of
 the session's input rows; a refusal, a deadline or a cancelled call certifies
-nothing, and repeating the call converges.
+nothing, and repeating the call converges. A host that governs consents
+registers the session only when the census reports the owner-loss outcome
+`Completed` or `NotOwed`. `NoConsentOwner` means the runtime has no issuing
+consent owner installed, a composition defect: install it, then repeat the
+call. Directed work needs the service's event store: without one, publishing
+a directed input's terminal refuses after the input ended, and the terminal
+stays owed until a service with an event store repeats the call.
 
 The claims and delivery coordination live under the realm root in `hosting/`
 and `delivery/`. They are derived runtime files, reported by

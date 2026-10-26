@@ -17775,6 +17775,15 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
     /// a cancelled call, an error or a commit with an unknown outcome
     /// certifies nothing: the host repeats the call before it registers, and
     /// a repeat converges from the store.
+    ///
+    /// A host that governs consents registers the session only on the
+    /// owner-loss outcome `Completed` or `NotOwed`; `NoConsentOwner` means
+    /// the runtime has no issuing consent owner installed, a composition
+    /// defect: install it, then repeat the call. Directed work needs this
+    /// service's event store ([`Self::with_event_projection`]): without one,
+    /// publishing a directed input's terminal refuses after the input ended,
+    /// and the terminal stays owed until a service with an event store
+    /// repeats the call.
     pub async fn settle_cold_predecessor_before(
         &self,
         id: &SessionId,

@@ -84,14 +84,23 @@ them.
   durable input rows read closed, and the rows whose receipt a migration made
   permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`)
   carries only final evidence; a deadline, a cancelled call or an error
-  certifies nothing, and a repeat converges from the store.
+  certifies nothing, and a repeat converges from the store. A host that
+  governs consents registers the session only on the owner-loss outcome
+  `Completed` or `NotOwed`: `NoConsentOwner` means no issuing consent owner
+  is installed on the runtime, a composition defect, so install it and
+  repeat the call. Directed work needs the service's event store
+  (`with_event_projection`): without one, publishing a directed input's
+  terminal refuses after the input ended, and the terminal stays owed until
+  a service with an event store repeats the call.
   `MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`
   is the same call for a mob's session service (the persistent service
-  forwards it; the default refuses `Unsupported`). The runtime steps are
+  forwards it; the default refuses `Unsupported`). The service composes the
+  runtime's settlement steps, which hosts do not call themselves:
   `MeerkatMachine::begin_predecessor_settlement_before`,
   `settle_predecessor_tail_with_lease`,
-  `end_predecessor_work_with_lease_before` and
-  `finish_predecessor_settlement_before`.
+  `end_predecessor_work_with_lease_before`,
+  `finish_predecessor_settlement_before`, and, for a settlement that stops
+  before its drain, `remove_predecessor_settlement_registration_before`.
 
 - `meerkat-runtime`, `meerkat-core`, `meerkat-mob`, SDKs: an input that a run
   consumed at a boundary a recovery committed without the input's receipt is
@@ -127,7 +136,9 @@ them.
   receipt: its exact receipt read answered corruption, and a directed
   input's requester never got a terminal. A process-local completion waiter
   is unchanged: it still fails `AuthorityUnavailable` when its registration
-  adopts the recovered terminal.
+  adopts the recovered terminal. An archive's own recovery that commits such
+  a boundary leaves the batch pending in the archived session: an archive
+  drains no run-scoped batch.
 
 ### Fixed
 

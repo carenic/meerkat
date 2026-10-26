@@ -246,12 +246,13 @@ pub enum PredecessorSettlementRefusal {
     )]
     PlacementWitnessMissing { directed: Vec<InputId> },
     /// The closing census found durable input rows that are not closed.
-    /// `open` holds rows still non-terminal, `unreceipted` terminal rows
-    /// with neither a finalized receipt nor a carrier, outside the machine's
-    /// receipt-less transitions and the migration marker; neither implies a
-    /// durable terminal or carrier. A terminal row whose receipt or append is
-    /// pending is an owed id of the progress instead, so both lists may be
-    /// empty.
+    /// `open` holds rows still non-terminal, `unreceipted` terminal rows the
+    /// exact receipt reader cannot account for (neither a finalized receipt
+    /// nor a carrier, or a finalized directed receipt without its outbox),
+    /// outside the machine's receipt-less transitions and the migration
+    /// marker; neither implies a durable terminal or carrier. A terminal row
+    /// whose receipt or append is pending is an owed id of the progress
+    /// instead, so both lists may be empty.
     #[error(
         "the closing census found input rows not closed ({} open, {} unreceipted)",
         open.len(),
