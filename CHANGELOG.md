@@ -69,6 +69,19 @@ them.
   (`MemberBindingHistoryReadError::Read` of
   `MobStoreError::IdentityMemberAtomicPersistenceUnavailable`).
 
+- `meerkat-runtime`: `RuntimeStore::import_whole_blob_session` imports a
+  whole-blob session document into a store, create-only, as ordinary
+  writes. When the runtime has no committed document, it commits this one
+  in one atomic write (one batch on a host store) together with its catalog
+  entry and, as pending outbox rows, the document's pending compaction
+  projection intents, which `commit_session_snapshot` refuses, and answers
+  `WholeBlobSessionImport::Created`. The same bytes again answer
+  `WholeBlobSessionImport::AlreadyCurrent` and write nothing; other bytes
+  are refused with `RuntimeStoreError::SessionPersistenceAuthorityConflict`
+  and nothing is written. `InMemoryRuntimeStore` and the host store adapter
+  `SpiRuntimeStore` implement it; the provided default answers
+  `Unsupported`, so a store decorator forwards it to the store it wraps.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next

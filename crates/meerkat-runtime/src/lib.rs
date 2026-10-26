@@ -1176,7 +1176,7 @@ pub use store::{
     RuntimeStoreWriteFenceOutcome, SerializedSessionSnapshot, ServiceCallAuditBatch,
     ServiceCallAuditKey, ServiceCallAuditRecord, VerifiedCommittedWholeBlobPayload,
     WholeBlobCommittedTranscriptFacts, WholeBlobProvisionalTailAuthority,
-    WholeBlobRunRebaseOutcome, WholeBlobStoreAuthority,
+    WholeBlobRunRebaseOutcome, WholeBlobSessionImport, WholeBlobStoreAuthority,
     reuse_or_load_committed_whole_blob_snapshot,
 };
 #[cfg(feature = "sqlite-store")]
