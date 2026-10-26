@@ -22,6 +22,8 @@ pub(crate) mod generated;
 mod live_durable_source;
 mod live_transcript_authority;
 pub mod maintenance;
+#[cfg(feature = "runtime-machine")]
+pub mod predecessor_settlement;
 pub mod staged_registry;
 pub(crate) mod turn_admission;
 
@@ -47,6 +49,8 @@ pub use ephemeral::{
 };
 pub use live_durable_source::LiveDurableSourceObservation;
 pub use live_transcript_authority::LiveAssistantPlaybackObservationResult;
+#[cfg(feature = "runtime-machine")]
+pub use predecessor_settlement::{ColdPredecessorSettleError, ColdPredecessorSettleRefusal};
 pub use staged_registry::{AdmissionOutcome, MaterializationStatus, StagedSessionRegistry};
 
 /// Metadata key used to store session labels in the `Session.metadata` map.

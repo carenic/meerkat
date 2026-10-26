@@ -1914,14 +1914,23 @@ impl MeerkatMachine {
         }
     }
 
+    /// The registration's runtime authority, from the session's converged
+    /// lifecycle row. `placement_witness` is a predecessor settlement's: the
+    /// converged row also carries it until the settlement's sweep commit.
     async fn runtime_authority_for_registration(
         &self,
         runtime_id: &LogicalRuntimeId,
         session_id: &SessionId,
         runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<super::driver::ReconciledRuntimeAuthority, RuntimeDriverError> {
         let mut reconciled = self
-            .unheld_runtime_authority_for_registration(runtime_id, session_id, runtime_epoch_id)
+            .unheld_runtime_authority_for_registration(
+                runtime_id,
+                session_id,
+                runtime_epoch_id,
+                placement_witness,
+            )
             .await?;
         // A new entry's authority carries the staged run-start holds (#1500)
         // before any runtime loop exists for it.
@@ -1945,6 +1954,7 @@ impl MeerkatMachine {
         runtime_id: &LogicalRuntimeId,
         session_id: &SessionId,
         runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<super::driver::ReconciledRuntimeAuthority, RuntimeDriverError> {
         let Some(store) = self.store.as_ref() else {
             return Ok(super::driver::ReconciledRuntimeAuthority {
@@ -1961,11 +1971,12 @@ impl MeerkatMachine {
                 unregister_progress: None,
             });
         };
-        super::driver::reconcile_runtime_authority_for_cold_recovery(
+        super::driver::reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
             store.as_ref(),
             runtime_id,
             session_id,
             runtime_epoch_id,
+            placement_witness,
         )
         .await
     }
@@ -2585,8 +2596,7 @@ impl MeerkatMachine {
             // A storeless machine is the only possible host: its claim is
             // unclaimed and proves no owner loss.
             owner_loss_proof: None,
-            archive_recovered_registration: false,
-            archive_recovered_from_quiescent: false,
+            mechanical_registration: None,
             mutation_gate: SessionMutationGate::new(None),
             durability_health: None,
             #[cfg(feature = "live")]
@@ -2762,8 +2772,7 @@ impl MeerkatMachine {
             // A storeless machine is the only possible host: its claim is
             // unclaimed and proves no owner loss.
             owner_loss_proof: None,
-            archive_recovered_registration: false,
-            archive_recovered_from_quiescent: false,
+            mechanical_registration: None,
             mutation_gate: SessionMutationGate::new(None),
             durability_health: None,
             #[cfg(feature = "live")]
@@ -3142,8 +3151,7 @@ impl MeerkatMachine {
             // Taken only by the winning publication, after every fallible
             // step of the preparation.
             owner_loss_proof: None,
-            archive_recovered_registration: false,
-            archive_recovered_from_quiescent: false,
+            mechanical_registration: None,
             mutation_gate: SessionMutationGate::new(durability_health.clone()),
             durability_health: durability_health.clone(),
             #[cfg(feature = "live")]
@@ -3220,13 +3228,54 @@ impl MeerkatMachine {
         durable_lifecycle_was_quiescent: bool,
         operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
     ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
+        let mut prepared = self
+            .prepare_mechanical_session_registration(session_id, operation_preservation, None)
+            .await?;
+        prepared.entry.mechanical_registration = Some(super::MechanicalRegistration::Archive {
+            from_quiescent: durable_lifecycle_was_quiescent,
+        });
+        Ok(prepared)
+    }
+
+    /// Recover one persistent session entry without serving it, as archive
+    /// preparation does, for a predecessor settlement. The caller publishes
+    /// it only through
+    /// [`Self::commit_prepared_predecessor_settlement_registration_under_transaction`],
+    /// which marks it unless it came back as a cold-recovered unregister
+    /// drain. With `placement_witness`, the converged lifecycle row carries
+    /// it until the settlement's sweep commit.
+    pub(super) async fn prepare_predecessor_settlement_registration(
+        &self,
+        session_id: SessionId,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
+    ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
+        self.prepare_mechanical_session_registration(session_id, None, placement_witness)
+            .await
+    }
+
+    /// The preparation archive and predecessor settlement share: recover one
+    /// persistent session entry mechanically (its claim granted, its ops
+    /// state and runtime authority reconciled, its durable input work
+    /// recovered), without serving it and without its purpose, which the
+    /// caller sets.
+    async fn prepare_mechanical_session_registration(
+        &self,
+        session_id: SessionId,
+        operation_preservation: Option<meerkat_core::OperationRetentionRequest>,
+        placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
+    ) -> Result<super::PreparedArchiveSessionRegistration, RuntimeDriverError> {
         let hosting_claim = self.grant_registration_hosting(&session_id)?;
         let runtime_id = Self::logical_runtime_id(&session_id);
         let ops_state = self
             .ops_state_for_registration(&session_id, &runtime_id)
             .await?;
         let recovery = self
-            .runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
+            .runtime_authority_for_registration(
+                &runtime_id,
+                &session_id,
+                &ops_state.1,
+                placement_witness,
+            )
             .await?;
         let (mut entry, cold_recovered_generated_draining) = self
             .prepare_registered_session_entry(
@@ -3287,8 +3336,6 @@ impl MeerkatMachine {
         } else {
             None
         };
-        entry.archive_recovered_registration = true;
-        entry.archive_recovered_from_quiescent = durable_lifecycle_was_quiescent;
         Ok(super::PreparedArchiveSessionRegistration {
             session_id,
             runtime_id,
@@ -3296,6 +3343,127 @@ impl MeerkatMachine {
             cold_recovered_generated_draining,
             ops_lifecycle_persistence_receiver,
         })
+    }
+
+    /// Publish a predecessor settlement's prepared registration while the
+    /// settlement holds T. It never adopts: an entry the session already has
+    /// refuses the publication. The claim lineage's consent owner-loss
+    /// settlement is reserved and settled by the installed issuing consent
+    /// owner before the table lock, and completed at this publication, as
+    /// every registration's is. The entry is marked as the settlement's own,
+    /// unless it came back as a cold-recovered unregister drain, which is
+    /// published unmarked so the ordinary unregister concludes it first.
+    pub(super) async fn commit_prepared_predecessor_settlement_registration_under_transaction(
+        &self,
+        prepared: super::PreparedArchiveSessionRegistration,
+    ) -> Result<
+        super::predecessor_settlement::PublishedSettlementRegistration,
+        super::predecessor_settlement::SettlementRegistrationRefused,
+    > {
+        use super::predecessor_settlement::{
+            PublishedSettlementRegistration, SettlementRegistrationRefused,
+        };
+        let super::PreparedArchiveSessionRegistration {
+            session_id,
+            runtime_id,
+            entry,
+            cold_recovered_generated_draining,
+            ops_lifecycle_persistence_receiver,
+        } = prepared;
+        let consent_owner_installed = self.consent_owner_loss_settlement.get().is_some();
+        let owner_loss = self
+            .reserve_consent_owner_loss(&entry._hosting_claim)
+            .map_err(SettlementRegistrationRefused::Runtime)?;
+        let mut sessions = self.sessions.write().await;
+        // Never a reuse branch: any entry the session already has refuses
+        // the publication. The reservation returns to its lineage as it
+        // drops.
+        if let Some(current) = sessions.get(&session_id) {
+            return Err(
+                match current.registration_blocked_by_unregister(&session_id) {
+                    Some(error) => SettlementRegistrationRefused::Runtime(error),
+                    None => SettlementRegistrationRefused::Registered,
+                },
+            );
+        }
+        let mut entry = entry;
+        entry.ops_lifecycle_persistence_worker =
+            match (self.store.as_ref(), ops_lifecycle_persistence_receiver) {
+                (Some(store), Some(receiver)) => Some(
+                    spawn_ops_lifecycle_persistence_worker(
+                        Arc::clone(store),
+                        runtime_id.clone(),
+                        receiver,
+                        Ok(self.execution_custody.clone()),
+                    )
+                    .map_err(SettlementRegistrationRefused::Runtime)?,
+                ),
+                (None, None) => None,
+                _ => {
+                    return Err(SettlementRegistrationRefused::Runtime(
+                        RuntimeDriverError::Internal(format!(
+                            "prepared settlement registration for {session_id} had mismatched ops \
+                         persistence authority"
+                        )),
+                    ));
+                }
+            };
+        entry.mechanical_registration = if cold_recovered_generated_draining {
+            None
+        } else {
+            Some(super::MechanicalRegistration::PredecessorSettlement)
+        };
+        entry.complete_owner_loss(owner_loss);
+        let published = PublishedSettlementRegistration {
+            runtime_id: runtime_id.clone(),
+            driver: Arc::clone(&entry.driver),
+            completions: Arc::clone(&entry.completions),
+            post_commit_hooks: Arc::clone(&entry.post_commit_hooks),
+            mutation_gate: entry.mutation_gate.clone(),
+            epoch_id: entry.epoch_id.clone(),
+            registration: RuntimeSessionRegistrationWitness::new(
+                Arc::downgrade(&self.shared),
+                session_id.clone(),
+                entry.epoch_id.clone(),
+                entry.mutation_gate.downgrade(),
+            ),
+            registration_use: entry.registration_use(),
+            consent_owner_installed,
+            completed_owner_loss: entry.owner_loss_proof.clone(),
+            cold_recovered_draining: cold_recovered_generated_draining,
+        };
+        if let Some(displaced) = sessions.insert(session_id, entry) {
+            displaced.agent_binding.retire();
+        }
+        tracing::debug!(
+            %runtime_id,
+            cold_recovered_draining = cold_recovered_generated_draining,
+            "MeerkatMachine published a predecessor settlement's registration"
+        );
+        Ok(published)
+    }
+
+    /// Conclude a cold-recovered unregister drain the predecessor left, as
+    /// every registration concludes it before it registers: the ordinary
+    /// unregister teardown of that exact epoch, awaited until `deadline`.
+    /// The caller released T first; the teardown takes it.
+    pub(super) async fn conclude_cold_recovered_unregister_drain_before(
+        &self,
+        session_id: &SessionId,
+        epoch_id: &meerkat_core::RuntimeEpochId,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<(), RuntimeDriverError> {
+        self.join_or_start_unregister_teardown_with_admission(
+            session_id,
+            Some(epoch_id),
+            UnregisterTeardownCaller::Explicit,
+            UnregisterTeardownAdmission::AnyCurrentRegistration,
+            None,
+            UnregisterTeardownWait::CallerGrace(deadline),
+        )
+        .await?
+        .require_completed()
+        .map(|_| ())
     }
 
     /// Publish an already recovered archive candidate while T is held. This
@@ -3422,9 +3590,14 @@ impl MeerkatMachine {
                 // prepared entry stay boxed until the call that consumes them,
                 // instead of being copied through this frame and the caller's.
                 let recovery = crate::stack_relief::box_in_own_frame(|| async {
-                    self.runtime_authority_for_registration(&runtime_id, &session_id, &ops_state.1)
-                        .await
-                        .map(Box::new)
+                    self.runtime_authority_for_registration(
+                        &runtime_id,
+                        &session_id,
+                        &ops_state.1,
+                        None,
+                    )
+                    .await
+                    .map(Box::new)
                 })
                 .await?;
                 tracing::debug!(
@@ -4810,6 +4983,16 @@ impl MeerkatMachine {
                     if !entry.mutation_gate.same_gate(&gate) {
                         continue;
                     }
+                    // A predecessor settlement's internal registration is
+                    // never claimed for an executor, degraded or not: decided
+                    // before any unregister join or degraded reload.
+                    if entry.is_predecessor_settlement() {
+                        break ExistingExecutorClaim::Blocked(
+                            RuntimeDriverError::UnregisterInProgress {
+                                runtime_id: entry.runtime_id.clone(),
+                            },
+                        );
+                    }
                     let unregister_settlement_required = entry
                         .dsl_authority
                         .lock()
@@ -5051,7 +5234,12 @@ impl MeerkatMachine {
                     }
                 };
                 let recovery = match self
-                    .runtime_authority_for_registration(&runtime_id, &session_id, &recovered_epoch)
+                    .runtime_authority_for_registration(
+                        &runtime_id,
+                        &session_id,
+                        &recovered_epoch,
+                        None,
+                    )
                     .await
                 {
                     Ok(recovery) => recovery,
@@ -5167,8 +5355,7 @@ impl MeerkatMachine {
                         runtime_id,
                         _hosting_claim: hosting_claim,
                         owner_loss_proof,
-                        archive_recovered_registration: false,
-                        archive_recovered_from_quiescent: false,
+                        mechanical_registration: None,
                         mutation_gate: mutation_gate.clone(),
                         durability_health: durability_health.clone(),
                         #[cfg(feature = "live")]
@@ -5820,7 +6007,9 @@ impl MeerkatMachine {
         // First, the terminals a recovery wrote after this registration
         // recovered its inputs (a materialization's own durable-tail
         // recovery) are adopted, so nothing below or after ends or stages an
-        // input the store already ended.
+        // input the store already ended. The loop's startup drain adopted
+        // them already, before it read the batches such a recovery stages;
+        // this finds only what a recovery committed since.
         pending.adopt_recovered_input_terminals().await?;
         if let Some(evidence) = self.session_interrupted_tool_evidence(&session_id).await? {
             pending.settle_interrupted_tool_evidence(evidence).await?;
@@ -6326,6 +6515,10 @@ impl MeerkatMachine {
             && entry.post_stop_cleanup_handle.is_none()
             && entry.post_stop_cleanup_attachment_id.is_none()
             && materialization_is_vacant
+            // A predecessor settlement's internal registration is owned by
+            // its settlement: exact preparation and ownerless actor cleanup
+            // never claim, adopt or tear it down.
+            && !entry.is_predecessor_settlement()
     }
 
     /// Fence exact service-actor cleanup after a reload has published an
@@ -6506,6 +6699,14 @@ impl MeerkatMachine {
             };
             if entry.epoch_id != *witness.epoch_id() || !witness.matches_entry(entry) {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
+            }
+            // A predecessor settlement's internal registration is removed by
+            // the settlement alone, exactly, a degraded one included: no
+            // reload discards or replaces it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
             }
             if let Some(attachment) = attachment
                 && (!attachment.belongs_to(self)
@@ -7036,8 +7237,7 @@ impl MeerkatMachine {
         // not archive-only reconstruction. Archive ownership remains with the
         // caller's normal retire protocol after the exact degraded shell has
         // been replaced.
-        recovered_entry.archive_recovered_registration = false;
-        recovered_entry.archive_recovered_from_quiescent = false;
+        recovered_entry.mechanical_registration = None;
 
         let registration_transaction_guard = self
             .lock_session_registration_transaction(witness.session_id())
@@ -8159,6 +8359,13 @@ impl MeerkatMachine {
             if entry.unregister_coordinator.is_some() {
                 return Ok(RuntimeSessionQuiescentClose::AlreadyClosing);
             }
+            // A predecessor settlement's internal registration leaves only
+            // through the settlement's exact removal: no close starts on it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
+            }
             (
                 Arc::clone(&entry.driver),
                 entry.pending_unregister_finalization.is_some(),
@@ -9048,6 +9255,14 @@ impl MeerkatMachine {
                     })
                 };
             };
+            // A predecessor settlement's internal registration has no
+            // executor to stop and leaves only through the settlement's
+            // exact removal: no stop cleanup starts on it or joins it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
+            }
             if entry.reload_required_discard_coordinator.is_some() {
                 return Err(RuntimeDriverError::RecoveryRepairBlocked {
                     evidence_digest: None,
@@ -9808,6 +10023,14 @@ impl MeerkatMachine {
                                 || !Self::is_stopped_attachment_residue(session_id, entry)) =>
                     {
                         CoordinatorDecision::NotStoppedResidue
+                    }
+                    // A predecessor settlement's internal registration leaves
+                    // only through the settlement's exact removal: no
+                    // unregister starts on it or joins it.
+                    Some(entry) if entry.is_predecessor_settlement() => {
+                        return Err(RuntimeDriverError::UnregisterInProgress {
+                            runtime_id: entry.runtime_id.clone(),
+                        });
                     }
                     Some(entry) => {
                         if entry.reload_required_discard_coordinator.is_some() {
@@ -13699,6 +13922,26 @@ Ok::<(), RuntimeDriverError>(())
                 staged.remove(session_id);
             }
         }
+    }
+
+    /// Whether `reason` is staged for `session_id`'s registration (#1500):
+    /// [`Self::stage_registration_run_start_hold`] or
+    /// [`Self::stage_registration_run_start_hold_only`] staged it, and
+    /// neither [`Self::release_run_starts`] nor
+    /// [`Self::unstage_registration_run_start_hold`] has removed it since. An
+    /// owner that holds a session's run starts until its own release (a host
+    /// whose member's tools are not published yet) stages its reason this
+    /// way, so this answers whether that owner still holds them.
+    pub fn registration_run_start_hold_staged(
+        &self,
+        session_id: &SessionId,
+        reason: super::RunStartHoldReason,
+    ) -> bool {
+        self.registration_run_start_holds
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .is_some_and(|reasons| reasons.contains(&reason.dsl()))
     }
 
     /// The run-start holds `session_id`'s registration applies (#1500).

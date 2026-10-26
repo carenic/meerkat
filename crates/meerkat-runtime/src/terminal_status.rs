@@ -119,6 +119,12 @@ pub enum InputTerminalReceiptScope {
     /// No run answered the input: the runtime terminalized it outside any
     /// run, in one runless batch (stop, reset, retire, destroy, executor
     /// attachment replacement, or cancellation of the still-queued input).
+    ///
+    /// A predecessor settlement also commits a runless batch for an input a
+    /// recovered boundary consumed without staging its receipt: the input's
+    /// terminal stays `Consumed`, and the outcome
+    /// ([`CompletionOutcome::OutcomeUnknown`]) names the run that consumed
+    /// it, because what that run did for the input is not known.
     RuntimeTermination,
 }
 
@@ -1046,6 +1052,12 @@ mod tests {
                     error: failure(),
                 },
                 CompletionClass::RuntimeTerminated,
+            ),
+            (
+                CompletionOutcome::OutcomeUnknown {
+                    run_id: meerkat_core::lifecycle::RunId::new(),
+                },
+                CompletionClass::OutcomeUnknown,
             ),
         ];
         for (outcome, class) in cases {

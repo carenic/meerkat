@@ -2245,6 +2245,35 @@ pub trait MobSessionService:
         .await
     }
 
+    /// Settle, before the session's next registration, the runtime work an
+    /// earlier incarnation of `session_id` left, under `claim`, without a
+    /// serving registration; leave the session unregistered and registrable.
+    /// `claim` is this service's own cross-process hosting claim of the
+    /// session, which the caller keeps until its fresh registration
+    /// published. The default refuses typed (`Unsupported`), touching
+    /// nothing: only a runtime-backed persistent service settles, and a
+    /// wrapper forwards this method exactly.
+    #[cfg(feature = "runtime-adapter")]
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<
+        meerkat_runtime::ColdPredecessorSettlement,
+        meerkat_session::ColdPredecessorSettleError,
+    > {
+        let _ = (claim, deadline);
+        Err(meerkat_session::ColdPredecessorSettleError::untouched(
+            session_id.clone(),
+            meerkat_session::ColdPredecessorSettleRefusal::Session(SessionError::Unsupported(
+                format!(
+                    "session service cannot settle the cold predecessor of session {session_id}"
+                ),
+            )),
+        ))
+    }
+
     async fn apply_runtime_turn(
         &self,
         _session_id: &SessionId,
@@ -4068,6 +4097,22 @@ where
         }
 
         <Self as SessionService>::archive(self, session_id).await
+    }
+
+    #[cfg(feature = "runtime-adapter")]
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<
+        meerkat_runtime::ColdPredecessorSettlement,
+        meerkat_session::ColdPredecessorSettleError,
+    > {
+        meerkat_session::PersistentSessionService::<B>::settle_cold_predecessor_before(
+            self, session_id, claim, deadline,
+        )
+        .await
     }
 
     #[cfg(feature = "runtime-adapter")]

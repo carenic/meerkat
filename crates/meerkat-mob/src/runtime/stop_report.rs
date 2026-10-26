@@ -179,6 +179,10 @@ pub enum HostRunStartHoldReason {
 }
 
 impl HostRunStartHoldReason {
+    /// Every reason a host holds a member's run starts for.
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) const ALL: [Self; 1] = [Self::ToolsNotPublished];
+
     pub(crate) fn runtime(self) -> meerkat_runtime::RunStartHoldReason {
         match self {
             Self::ToolsNotPublished => meerkat_runtime::RunStartHoldReason::ToolsNotPublished,

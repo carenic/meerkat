@@ -2110,6 +2110,9 @@ struct ObservedPersistedLifecycle {
     supervisor_authority: SupervisorAuthoritySnapshot,
     unregister_progress: Option<crate::store::MachineUnregisterProgressSnapshot>,
     live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage,
+    /// The placement witness the row carries (record version 7), which the
+    /// commit re-asserts with the rest of the observed record.
+    placement_witness: Option<MachineLifecycleBindingFacts>,
     /// An operator reads this `Stopped` row as the clean `Idle` row a
     /// start's registration replaces it with (`observe_persisted_lifecycle`).
     normalizes_stopped: bool,
@@ -2168,6 +2171,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
         MachineLifecycleObservation::Decoded { record, version } => {
@@ -2220,6 +2224,7 @@ fn observe_persisted_lifecycle(
                 supervisor_authority: record.supervisor_authority().clone(),
                 unregister_progress: record.unregister_progress().cloned(),
                 live_bridge_recovery: record.live_bridge_recovery().clone(),
+                placement_witness: record.placement_witness().cloned(),
                 normalizes_stopped,
             }
         }
@@ -2233,6 +2238,7 @@ fn observe_persisted_lifecycle(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
     };
@@ -2259,6 +2265,7 @@ fn durable_tail_lifecycle_reassertion(
         observed.unregister_progress.clone(),
         observed.live_bridge_recovery.clone(),
     )
+    .with_placement_witness(observed.placement_witness.clone())
     .with_expected_version(observed.expected_version.clone())
 }
 
@@ -3098,6 +3105,7 @@ async fn recover_durable_tail_capturing(
             supervisor_authority: SupervisorAuthoritySnapshot::UnboundNoReceipt,
             unregister_progress: None,
             live_bridge_recovery: crate::live_execution::LiveBridgeRecoveryImage::default(),
+            placement_witness: None,
             normalizes_stopped: false,
         },
         Err(error) => return Err(error.into()),
@@ -3489,8 +3497,29 @@ async fn recover_durable_tail_capturing(
                     .to_string(),
             )
         })?;
-    let mut input_updates =
-        terminalize_attributed_inputs(attributed, &candidate.candidate_run_id, boundary_sequence)?;
+    // The contributors this boundary consumes get their terminal in the same
+    // fenced commit: one run-scoped terminal-completion batch, and a directed
+    // outbox for each directed contributor, which the next drain finalizes
+    // and publishes. Without it a consumed contributor has no receipt to read
+    // and its requester no terminal.
+    let terminal_batch = recovered_boundary_terminal_batch(
+        store,
+        &runtime_id,
+        &candidate,
+        disposition,
+        &attributed,
+        crate::input_state::InteractionTerminalPlacement::from_lifecycle_row(
+            &observed.binding,
+            observed.placement_witness.as_ref(),
+        ),
+    )
+    .await?;
+    let mut input_updates = terminalize_attributed_inputs(
+        attributed,
+        &candidate.candidate_run_id,
+        boundary_sequence,
+        terminal_batch,
+    )?;
     let contributing_input_ids: Vec<InputId> = input_updates
         .iter()
         .map(|record| record.as_stored().state.input_id.clone())
@@ -3814,11 +3843,17 @@ async fn observe_candidate_run_inputs(
 /// Realize pass: terminalize the observed rows the recovered boundary
 /// consumed, fenced on the exact row bytes the observation read. Called only
 /// after a commit verdict, and only over rows the observation attributed.
+/// Each row carries its part of `terminal_batch` when the commit stages one.
 fn terminalize_attributed_inputs(
     attributed: Vec<(StoredInputState, String)>,
     candidate_run_id: &meerkat_core::RunId,
     boundary_sequence: u64,
+    terminal_batch: Option<RecoveredBoundaryTerminalBatch>,
 ) -> Result<Vec<InputStatePersistenceRecord>, DurableTailRecoveryError> {
+    let (mut completions, mut outboxes) = match terminal_batch {
+        Some(batch) => (batch.completions, batch.outboxes),
+        None => (HashMap::new(), HashMap::new()),
+    };
     let mut updates = Vec::with_capacity(attributed.len());
     for (mut bundle, row_digest) in attributed {
         bundle.seed.phase = InputLifecycleState::Consumed;
@@ -3828,11 +3863,20 @@ fn terminalize_attributed_inputs(
         bundle.seed.recovery_lane = None;
         bundle.seed.last_run_id = Some(candidate_run_id.clone());
         bundle.seed.last_boundary_sequence = Some(boundary_sequence);
+        let input_id = bundle.state.input_id.clone();
+        if let Some(completion) = completions.remove(&input_id) {
+            bundle.state.terminal_completion = Some(completion);
+        }
+        if let Some(outbox) = outboxes.remove(&input_id) {
+            bundle.state.interaction_terminal_outbox = Some(outbox);
+        }
         // The same fenced recovery transaction installs the recovered
         // boundary receipt and this terminal row. Once attributed, ordinary
         // content is neither redeliverable nor needed to identify a future
-        // durable tail. A directed input without its terminal outbox is kept
-        // fail-closed because its payload still owns the Interaction identity.
+        // durable tail. A row whose staged terminal is still pending keeps it
+        // until its drain closes it, and a directed input without its
+        // terminal outbox is kept fail-closed because its payload still owns
+        // the Interaction identity.
         if crate::store::input_state_payload_is_retirable(&bundle) {
             bundle.state.persisted_input = None;
         }
@@ -3841,7 +3885,366 @@ fn terminalize_attributed_inputs(
             .with_expected_row_digest(row_digest);
         updates.push(record);
     }
+    if !completions.is_empty() || !outboxes.is_empty() {
+        return Err(DurableTailRecoveryError::Authority(
+            "a recovered boundary's terminal batch names an input the boundary does not consume"
+                .to_string(),
+        ));
+    }
     Ok(updates)
+}
+
+/// The terminal a recovered boundary stages for the contributors it consumes:
+/// one run-scoped terminal-completion batch over all of them and, for each
+/// directed contributor, a directed outbox row of that batch, every row keyed
+/// by its input.
+struct RecoveredBoundaryTerminalBatch {
+    completions: HashMap<InputId, crate::input_state::InputTerminalCompletion>,
+    outboxes: HashMap<InputId, crate::input_state::InteractionTerminalOutbox>,
+}
+
+/// The candidate a recovered boundary's terminal batch carries.
+///
+/// A completed tail answers its contributors `CompletedWithoutResult`: their
+/// answer is the committed history, and no result payload is rebuilt. An
+/// interrupted tail (including a continuable run a writer or an archive
+/// repairs) answers them `Cancelled`, the class the live path gives a run
+/// that ends before it completes. A disposition that commits nothing stages
+/// nothing.
+fn recovered_boundary_terminal_candidate(
+    disposition: DurableTailRecoveryDisposition,
+) -> Option<crate::input_state::InteractionTerminalCandidate> {
+    match disposition {
+        DurableTailRecoveryDisposition::CommitCompleted
+        | DurableTailRecoveryDisposition::CommitCompletedRetainInputs => {
+            Some(crate::input_state::InteractionTerminalCandidate::CompletedWithoutResult)
+        }
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+        | DurableTailRecoveryDisposition::OperatorRepairAndCommitInterrupted => {
+            Some(crate::input_state::InteractionTerminalCandidate::Cancelled)
+        }
+        DurableTailRecoveryDisposition::RefuseRecovery
+        | DurableTailRecoveryDisposition::HoldIntact
+        | DurableTailRecoveryDisposition::ContinueRun => None,
+    }
+}
+
+/// Build the terminal batch a recovered boundary stages for `attributed`, the
+/// rows it consumes, in its own fenced commit.
+///
+/// The batch is the one the live path stages for a run's contributors: key
+/// `Run { candidate run }`, owner the first contributor in canonical order,
+/// no session checkpoint (the boundary and its document commit in this same
+/// transaction, so no later checkpoint exists). A directed contributor gets a
+/// `Candidate` outbox naming `placement`, the runtime placement the row the
+/// drive observed records (its complete binding, else its placement witness):
+/// a later drain adopts it as it adopts any outbox an earlier incarnation
+/// left.
+///
+/// `None` stages nothing, which leaves the contributors as every earlier
+/// release left them (consumed, with no receipt and no requester terminal,
+/// for a predecessor settlement to answer):
+/// - nothing is consumed, or the disposition commits nothing;
+/// - the contributors exceed one batch, or a row already carries terminal
+///   work or is a migrated row without completion evidence;
+/// - a directed contributor's payload does not validate;
+/// - another run-scoped batch of the session has not finished (its
+///   completion pending or its directed outbox unpublished): the generated
+///   completion authority recovers one pending run-scoped batch at a time, so
+///   a second one would block that batch's recovery;
+/// - the store cannot say whether such a batch is pending.
+///
+/// Without a complete placement no directed outbox can be staged, so the
+/// batch holds the nondirected contributors only, and each directed
+/// contributor is left as before, keeping the payload that owns its
+/// interaction. Its receipt is never finalized without its outbox: the drain
+/// would compact the candidate a later outbox binds to, and its requester
+/// could never be answered. With no nondirected contributor nothing is
+/// staged.
+async fn recovered_boundary_terminal_batch(
+    store: &dyn RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    candidate: &PreparedRecoveryCandidate,
+    disposition: DurableTailRecoveryDisposition,
+    attributed: &[(StoredInputState, String)],
+    placement: Option<crate::input_state::InteractionTerminalPlacement>,
+) -> Result<Option<RecoveredBoundaryTerminalBatch>, DurableTailRecoveryError> {
+    if attributed.is_empty() {
+        return Ok(None);
+    }
+    let Some(terminal_candidate) = recovered_boundary_terminal_candidate(disposition) else {
+        return Ok(None);
+    };
+    let session_id = &candidate.session_id;
+    let run_id = &candidate.candidate_run_id;
+    if attributed.len() > crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS {
+        tracing::warn!(
+            %session_id,
+            %run_id,
+            contributors = attributed.len(),
+            "a recovered boundary's contributors exceed one terminal batch; they keep no receipt"
+        );
+        return Ok(None);
+    }
+    let mut directed = Vec::new();
+    let mut nondirected = Vec::new();
+    for (bundle, _) in attributed {
+        let input_id = &bundle.state.input_id;
+        if bundle.state.terminal_completion.is_some()
+            || bundle.state.interaction_terminal_outbox.is_some()
+            || bundle.state.terminal_completion_unavailable
+        {
+            tracing::warn!(
+                %session_id,
+                %run_id,
+                %input_id,
+                "a recovered boundary's contributor already carries terminal work; the boundary \
+                 stages no terminal batch"
+            );
+            return Ok(None);
+        }
+        let Some(input) = bundle.state.persisted_input.as_ref() else {
+            nondirected.push(input_id.clone());
+            continue;
+        };
+        match crate::input::validated_directed_interaction_id(input) {
+            Ok(None) => nondirected.push(input_id.clone()),
+            Ok(Some(interaction_id)) if interaction_id.0 == input_id.0 => {
+                directed.push((input_id.clone(), interaction_id));
+            }
+            Ok(Some(_)) => {
+                tracing::warn!(
+                    %session_id,
+                    %run_id,
+                    %input_id,
+                    "a recovered boundary's directed contributor names another interaction; the \
+                     boundary stages no terminal batch"
+                );
+                return Ok(None);
+            }
+            Err(reason) => {
+                tracing::warn!(
+                    %session_id,
+                    %run_id,
+                    %input_id,
+                    %reason,
+                    "a recovered boundary's directed contributor does not validate; the boundary \
+                     stages no terminal batch"
+                );
+                return Ok(None);
+            }
+        }
+    }
+    match run_scoped_terminal_batch_pending(store, runtime_id).await? {
+        Some(false) => {}
+        Some(true) => {
+            tracing::info!(
+                %session_id,
+                %run_id,
+                "another run's terminal batch is still pending; the recovered boundary stages \
+                 none beside it"
+            );
+            return Ok(None);
+        }
+        None => {
+            tracing::info!(
+                %session_id,
+                %run_id,
+                "the store cannot report pending terminal batches; the recovered boundary stages \
+                 none"
+            );
+            return Ok(None);
+        }
+    }
+    let input_ids = match placement {
+        Some(_) => attributed
+            .iter()
+            .map(|(bundle, _)| bundle.state.input_id.clone())
+            .collect::<Vec<_>>(),
+        None => {
+            if !directed.is_empty() {
+                tracing::info!(
+                    %session_id,
+                    %run_id,
+                    directed = directed.len(),
+                    "the session's lifecycle row records no runtime placement; the recovered \
+                     boundary stages its nondirected contributors' receipts only and leaves its \
+                     directed contributors without one"
+                );
+                directed.clear();
+            }
+            nondirected
+        }
+    };
+    if input_ids.is_empty() {
+        return Ok(None);
+    }
+    let rows = crate::meerkat_machine::driver::build_input_terminal_completion_rows(
+        crate::meerkat_machine::driver::InteractionTerminalBatchScope::Run(run_id),
+        &input_ids,
+        terminal_candidate.clone(),
+        false,
+    )
+    .map_err(|error| {
+        DurableTailRecoveryError::Authority(format!(
+            "a recovered boundary's terminal batch could not be built: {error}"
+        ))
+    })?;
+    let owner = rows.first().ok_or_else(|| {
+        DurableTailRecoveryError::Authority(
+            "a recovered boundary's terminal batch lost its owner row".to_string(),
+        )
+    })?;
+    let candidate_digest = owner.candidate_digest.clone();
+    let completion_input_ids_digest = owner.completion_input_ids_digest.clone();
+    let mut outboxes = HashMap::new();
+    if let (Some(placement), false) = (placement.as_ref(), directed.is_empty()) {
+        directed.sort_by_key(|(input_id, _)| input_id.0);
+        let directed_rows = recovered_boundary_directed_outboxes(
+            session_id,
+            run_id,
+            &directed,
+            placement,
+            &candidate_digest,
+            &completion_input_ids_digest,
+            &terminal_candidate,
+        )?;
+        for outbox in directed_rows {
+            outboxes.insert(outbox.input_id.clone(), outbox);
+        }
+    }
+    Ok(Some(RecoveredBoundaryTerminalBatch {
+        completions: rows
+            .into_iter()
+            .map(|completion| (completion.input_id.clone(), completion))
+            .collect(),
+        outboxes,
+    }))
+}
+
+/// The `Candidate` outbox rows of a recovered boundary's directed
+/// contributors (`directed`, in canonical order): ordinal zero owns the
+/// batch's candidate, every row names `placement` and binds back to the
+/// completion batch by its two digests, as the live path's rows do.
+fn recovered_boundary_directed_outboxes(
+    session_id: &SessionId,
+    run_id: &RunId,
+    directed: &[(InputId, meerkat_core::interaction::InteractionId)],
+    placement: &crate::input_state::InteractionTerminalPlacement,
+    candidate_digest: &str,
+    completion_input_ids_digest: &str,
+    terminal_candidate: &crate::input_state::InteractionTerminalCandidate,
+) -> Result<Vec<crate::input_state::InteractionTerminalOutbox>, DurableTailRecoveryError> {
+    let candidate_owner_input_id = directed
+        .first()
+        .map(|(input_id, _)| input_id.clone())
+        .ok_or_else(|| {
+            DurableTailRecoveryError::Authority(
+                "a recovered boundary's directed batch lost its owner".to_string(),
+            )
+        })?;
+    let batch_key = crate::input_state::InteractionTerminalBatchKey::Run {
+        run_id: run_id.clone(),
+    };
+    let outboxes = directed
+        .iter()
+        .enumerate()
+        .map(|(ordinal, (input_id, interaction_id))| {
+            let batch_ordinal = u16::try_from(ordinal).map_err(|_| {
+                DurableTailRecoveryError::Authority(
+                    "a recovered boundary's directed batch exceeds one terminal batch".to_string(),
+                )
+            })?;
+            Ok(crate::input_state::InteractionTerminalOutbox {
+                interaction_id: *interaction_id,
+                input_id: input_id.clone(),
+                batch_ordinal,
+                batch_key: batch_key.clone(),
+                owner_session_id: session_id.clone(),
+                owner_agent_runtime_id: Some(placement.agent_runtime_id.clone()),
+                owner_fence_token: Some(placement.fence_token),
+                owner_runtime_generation: Some(placement.runtime_generation),
+                owner_runtime_epoch_id: placement.runtime_epoch_id.clone(),
+                candidate_owner_input_id: candidate_owner_input_id.clone(),
+                released_0831_candidate: None,
+                candidate_digest: candidate_digest.to_string(),
+                released_0831_completion_input_ids: None,
+                completion_input_ids_digest: completion_input_ids_digest.to_string(),
+                phase: crate::input_state::InteractionTerminalOutboxPhase::Candidate,
+            })
+        })
+        .collect::<Result<Vec<_>, DurableTailRecoveryError>>()?;
+    crate::input_state::validate_unpublished_interaction_terminal_outbox_batch(&outboxes)
+        .map_err(DurableTailRecoveryError::Authority)?;
+    crate::input_state::validate_interaction_terminal_outbox_batch_against_candidate(
+        &outboxes,
+        terminal_candidate,
+    )
+    .map_err(DurableTailRecoveryError::Authority)?;
+    Ok(outboxes)
+}
+
+/// Whether the session holds a run-scoped terminal batch that has not
+/// finished: a pending completion, or an unpublished directed outbox, of any
+/// run. Read from the store's pending-owner index, after the recovery's input
+/// observation, so a batch staged after that observation fails the
+/// recovery's input-set fence instead. `None` when the store cannot answer.
+async fn run_scoped_terminal_batch_pending(
+    store: &dyn RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+) -> Result<Option<bool>, DurableTailRecoveryError> {
+    let limit = crate::store::MAX_PENDING_TERMINAL_OWNER_PAGE;
+    let mut after: Option<InputId> = None;
+    loop {
+        let page = match store
+            .load_pending_terminal_owner_ids_page(runtime_id, after.as_ref(), limit)
+            .await
+        {
+            Ok(page) => page,
+            Err(RuntimeStoreError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if page.is_empty() {
+            return Ok(Some(false));
+        }
+        let owners = match store.load_input_states_by_ids(runtime_id, &page).await {
+            Ok(owners) => owners,
+            Err(RuntimeStoreError::Unsupported(_)) => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        for owner in owners.into_iter().flatten() {
+            let completion_pending =
+                owner
+                    .state
+                    .terminal_completion
+                    .as_ref()
+                    .is_some_and(|completion| {
+                        completion.batch_key.run_id().is_some()
+                            && matches!(
+                                completion.phase,
+                                crate::input_state::InputTerminalCompletionPhase::Pending
+                            )
+                    });
+            let outbox_unpublished = owner
+                .state
+                .interaction_terminal_outbox
+                .as_ref()
+                .is_some_and(|outbox| {
+                    outbox.batch_key.run_id().is_some()
+                        && !matches!(
+                            outbox.phase,
+                            crate::input_state::InteractionTerminalOutboxPhase::Published { .. }
+                        )
+                });
+            if completion_pending || outbox_unpublished {
+                return Ok(Some(true));
+            }
+        }
+        if page.len() < limit {
+            return Ok(Some(false));
+        }
+        after = page.last().cloned();
+    }
 }
 
 /// Operator pass: the inputs of another run stranded beside an interrupted
@@ -3977,6 +4380,10 @@ fn requeue_stranded_inputs(
     }
     Ok(updates)
 }
+
+#[cfg(test)]
+#[path = "recovery_boundary_batch_tests.rs"]
+mod recovery_boundary_batch_tests;
 
 #[cfg(test)]
 mod store_authority_tests {

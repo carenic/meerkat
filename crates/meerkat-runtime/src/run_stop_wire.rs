@@ -61,13 +61,13 @@ fn wire_run_stop_contributor(
     };
     Ok(WireRunStopContributor {
         input_id: contributor.input_id.to_string(),
-        completion: wire_run_stop_completion(&contributor.outcome),
+        completion: wire_run_stop_completion(&contributor.outcome)?,
         terminal,
     })
 }
 
-fn wire_run_stop_completion(outcome: &CompletionOutcome) -> WireRunStopCompletion {
-    match outcome {
+fn wire_run_stop_completion(outcome: &CompletionOutcome) -> Result<WireRunStopCompletion, String> {
+    Ok(match outcome {
         CompletionOutcome::Completed(_) => WireRunStopCompletion::Completed,
         CompletionOutcome::CompletedWithoutResult => WireRunStopCompletion::CompletedWithoutResult,
         CompletionOutcome::CallbackPending { .. }
@@ -79,7 +79,20 @@ fn wire_run_stop_completion(outcome: &CompletionOutcome) -> WireRunStopCompletio
             WireRunStopCompletion::CompletedWithFinalizationFailure
         }
         CompletionOutcome::RuntimeTerminated { .. } => WireRunStopCompletion::RuntimeTerminated,
-    }
+        // Unreachable, so an internal error and never a completion class. A
+        // run stop reports the live completion waiters of its own run's
+        // staged contributors (`MeerkatMachine::stop_run`), and a live waiter
+        // never receives this answer. Only a predecessor settlement stages
+        // it: one runless batch for inputs an earlier recovered boundary
+        // consumed without a receipt, on an unattached registration that
+        // never runs a run, so no stop is ever staged beside it.
+        CompletionOutcome::OutcomeUnknown { run_id } => {
+            return Err(format!(
+                "a run stop reported an outcome-unknown answer of run {run_id}, which no stop \
+                 contributor can carry"
+            ));
+        }
+    })
 }
 
 fn wire_input_terminal_outcome(outcome: InputPublicTerminalOutcome) -> WireInputTerminalOutcome {

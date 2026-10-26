@@ -4439,6 +4439,15 @@ pub enum BoundedTurnFailure {
         session_id: SessionId,
         input_id: meerkat_core::lifecycle::InputId,
     },
+    /// Run `run_id` consumed the turn's input at a boundary that a recovery
+    /// committed without the input's receipt, and a settlement answered it
+    /// later: what the run did for the input is not known. It is not a
+    /// result and not a failure to retry; do not resubmit the input, since
+    /// its run may have acted on it.
+    OutcomeUnknown {
+        session_id: SessionId,
+        run_id: meerkat_core::lifecycle::RunId,
+    },
 }
 
 impl std::fmt::Display for BoundedTurnFailure {
@@ -4551,6 +4560,10 @@ impl std::fmt::Display for BoundedTurnFailure {
             } => write!(
                 f,
                 "input '{input_id}' for session '{session_id}' was requeued across a stop but expired before it ran; resubmit it"
+            ),
+            Self::OutcomeUnknown { session_id, run_id } => write!(
+                f,
+                "turn for session '{session_id}' has an unknown outcome: run '{run_id}' consumed its input without a receipt; do not resubmit it"
             ),
         }
     }
@@ -5034,6 +5047,9 @@ pub(super) fn bounded_runtime_turn_result(
                 error: Box::new(error),
             });
         }
+        meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { run_id } => {
+            return Err(BoundedTurnFailure::OutcomeUnknown { session_id, run_id });
+        }
     };
     if result.session_id != session_id {
         return Err(BoundedTurnFailure::ResultAttributionMismatch {
@@ -5192,6 +5208,14 @@ pub(crate) fn legacy_exact_turn_result(
         ))),
         meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, .. } => {
             Err(MobError::Internal(format!("runtime terminated: {reason}")))
+        }
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { run_id } => {
+            Err(MobError::Internal(format!(
+                "outcome unknown: run {run_id} consumed the turn's input without a receipt; do \
+                 not resubmit it"
+            )))
         }
     }
 }
@@ -9005,6 +9029,10 @@ impl MobHandle {
     /// has registered cancels the hold its registration would apply. A member
     /// that does not hold `reason` is an Ok no-op; a non-member is
     /// [`MobError::MemberNotFound`].
+    ///
+    /// A kickoff a Shutdown kept in flight for the member waits for this
+    /// release while the host holds the member: the release re-attaches it,
+    /// so it resolves once its resumed run ends.
     ///
     /// Known limit: this release is a send-class command, so a mob whose
     /// admission is closed refuses it with [`MobError::AdmissionClosed`]. A
@@ -15918,7 +15946,10 @@ impl MobHandle {
     /// round, and its eligible queued inputs run after it), and ends them as
     /// stopped for any other member;
     /// [`QueuedInputsOnShutdown::Stop`](super::QueuedInputsOnShutdown::Stop)
-    /// ends them as stopped for every member, as before 0.9.5.
+    /// ends them as stopped for every member, as before 0.9.5;
+    /// [`QueuedInputsOnShutdown::Keep`](super::QueuedInputsOnShutdown::Keep)
+    /// changes nothing of the members' work it finds, for a host that served
+    /// its members nothing.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,

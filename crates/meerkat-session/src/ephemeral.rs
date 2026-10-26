@@ -590,6 +590,41 @@ impl SessionEventLine {
     }
 }
 
+/// A session's event line as a stored-only publication holds it
+/// ([`EphemeralSessionService::stored_only_event_line`]): the publication
+/// reserves its batch's sequences from the line, appends with the
+/// reservation's floor, gives back what it did not use, and records the
+/// canonical rows, exactly as a live actor's exact terminal batch does.
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+pub(crate) struct StoredOnlyEventLine {
+    line: Arc<SessionEventLine>,
+}
+
+#[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+impl StoredOnlyEventLine {
+    /// Reserve `count` sequences; returns the sequence just below the range.
+    pub(crate) fn reserve(&self, count: u64) -> u64 {
+        self.line.reserve(count)
+    }
+
+    /// Give back the unused end `(keep, reserved_end]` of a reservation, if
+    /// nothing was allocated after it.
+    pub(crate) fn release_reservation(&self, reserved_end: u64, keep: u64) {
+        self.line.release_reservation(reserved_end, keep);
+    }
+
+    /// Record sequences the durable event store assigned.
+    pub(crate) fn advance_to(&self, seq: u64) {
+        self.line.advance_to(seq);
+    }
+
+    /// Newest allocated sequence.
+    #[cfg(test)]
+    pub(crate) fn allocated(&self) -> u64 {
+        self.line.allocated()
+    }
+}
+
 /// Tail of a session's durable event stream: the newest envelope sequence
 /// the session published durably, possibly before a restart. A new sequence
 /// space for such a session starts above it, so sequences stay monotonic
@@ -4832,6 +4867,30 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
             line.advance_to(tail);
         }
         line
+    }
+
+    /// The session's event line for a stored-only publication, reconciled
+    /// with `durable_tail`, the session's durable stream tail the caller read
+    /// after it proved no actor of the session is hosted here.
+    ///
+    /// A line outlives the actors that used it, and a line that already
+    /// exists is returned without consulting the durable log, so it may be
+    /// behind rows appended outside it, or hold numbers an earlier actor
+    /// allocated and never published. Advancing it to the durable tail first,
+    /// then reserving the publication's sequences from it, keeps a stored-only
+    /// row above both, and keeps every later actor of the session in this
+    /// service allocating above the stored-only rows.
+    #[cfg(all(feature = "session-store", not(target_arch = "wasm32")))]
+    pub(crate) async fn stored_only_event_line(
+        &self,
+        id: &SessionId,
+        durable_tail: Option<u64>,
+    ) -> StoredOnlyEventLine {
+        let line = self.session_event_line(id).await;
+        if let Some(tail) = durable_tail {
+            line.advance_to(tail);
+        }
+        StoredOnlyEventLine { line }
     }
 
     /// Start new sequence spaces above the session's durable stream tail.

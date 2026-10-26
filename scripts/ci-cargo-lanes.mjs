@@ -143,15 +143,19 @@
 // The pull-request unit plan must stay under PR_UNIT_BUDGET_MINUTES, a
 // surrogate packing cap and not a measured timing. It is 20, since the
 // runtime lane models 18.3 minutes at 8ef2d8b939 (17.1 when the cap became
-// 18). Measured, the runtime lane alone took 790 and 839 s on the last two
-// green release pull-request runs (40055499505 and 40073579948), about 0.78
-// of its modelled time at a model of about 18 minutes; earlier pull-request
-// runs took 359-715 s (39337274765, 39360046041, 39388235216 and
-// 39394366439). At that ratio the heaviest lane the 20-minute cap packs at
-// 8ef2d8b939 (runtime+3, modelled 19.5) projects to about 915-945 s of
-// execution path, under the gate's 1080 s. The cap sits above the gate's
-// 18-minute execution budget because it is a model threshold; the gate
-// itself is unchanged.
+// 18). Measured, the runtime lane alone took 790 and 839 s on the green
+// release pull-request runs 40055499505 and 40073579948, about 0.78 of its
+// modelled time at a model of about 18 minutes; earlier pull-request runs
+// took 359-715 s (39337274765, 39360046041, 39388235216 and 39394366439).
+// At that ratio a 19.5-minute lane (runtime+3 at 8ef2d8b939) projected to
+// about 915-945 s of execution path, under the gate's 1080 s. The ratio did
+// not hold for runtime: on pull request run 40399556131 its lane alone took
+// 1114 and 1173 s at a model of 18.3 minutes (a ratio of 1.01-1.07),
+// 448-488 s of it running tests the model does not count, and its execution
+// path reached 1146 and 1207 s. Runtime's lane therefore runs as two hash
+// partitions (PARTITIONED_UNIT_PACKAGES below). The cap sits above the
+// gate's 18-minute execution budget because it is a model threshold; the
+// gate itself is unchanged.
 // The enforced limits are the CI gate's: 1080 s of lane execution and 1200 s
 // push-to-terminal, runner queue excluded (CI_MAX_EXEC_SECONDS and
 // CI_MAX_TERMINAL_SECONDS in ci.yml); ordinary hosted runs supply the
@@ -301,6 +305,22 @@ export const PR_UNIT_BUDGET_MINUTES = 20;
 // crates took 933 s, 488 s of it building. The lane counts toward the
 // plan's shard cap.
 export const UNIT_SOLO_PACKAGES = ["xtask"];
+// Packages whose unit lane of their own runs as `partitions` rows: each row
+// builds what the one row would (the same `-p` set and targets) and runs one
+// `--partition hash:k/n` share of its tests, so the rows together run every
+// test once and the CI gate times each row as a lane. For these the test
+// run, which the model does not count, put the lane over the gate's 1080 s:
+// meerkat-runtime's lane alone took 1114 and 1173 s on pull request run
+// 40399556131 (625-649 s of compile, then 2747 tests in 448-488 s), and
+// 938 s on run 40354257839 before that change. Its test run waits on the
+// five SQLite batch-bound rows of about 215 s each (.config/nextest.toml),
+// which four test threads run in two rounds. A hash partition is fixed by
+// the test name: of the five, two partitions take two and three, three
+// partitions would put four in one. Every row compiles the crate itself: an
+// ARCHIVED_UNIT_LANES archive builds it once, but runs on the push only and
+// would add a second job's setup and an artifact transfer to the path. The
+// lane counts once toward the plan's shard cap.
+export const PARTITIONED_UNIT_PACKAGES = [{ package: "meerkat-runtime", partitions: 2 }];
 const HEAVY_ANCHOR = "meerkat-mob";
 
 // Hook-parity rows (see the header). Every row runs on the hook's test-thread
@@ -2252,6 +2272,17 @@ function plan(args) {
       return [lane.package, lane];
     }),
   );
+  const partitionedUnits = new Map(
+    PARTITIONED_UNIT_PACKAGES.map((lane) => {
+      if (!byName.has(lane.package)) {
+        throw new Error(`partitioned unit lane names unknown package ${lane.package}`);
+      }
+      if (!Number.isInteger(lane.partitions) || lane.partitions < 2) {
+        throw new Error(`partitioned unit lane ${lane.package} needs at least two partitions`);
+      }
+      return [lane.package, lane.partitions];
+    }),
+  );
 
   if (releaseProjection) {
     result.mode = RELEASE_PROJECTION_MODE;
@@ -2373,11 +2404,14 @@ function plan(args) {
     }
     // Pull-request unit lanes: the changed packages outside the heavy chain,
     // packed so that no lane models over the budget; the chain is deferred
-    // to the push-to-main run and reported.
+    // to the push-to-main run and reported. A partitioned package's lane of
+    // its own is one row per partition.
     const runsInPullRequest = (name) => !heavyChain.has(name);
     result.unit_deferred = result.packages.filter((name) => !runsInPullRequest(name));
     result.unit_packages = result.packages.filter(runsInPullRequest).sort();
-    const soloUnits = result.unit_packages.filter((name) => UNIT_SOLO_PACKAGES.includes(name));
+    const soloUnits = result.unit_packages.filter(
+      (name) => UNIT_SOLO_PACKAGES.includes(name) || partitionedUnits.has(name),
+    );
     result.unit_shards = [
       ...packWithinBudget(
         result.unit_packages.filter((name) => !soloUnits.includes(name)),
@@ -2385,7 +2419,7 @@ function plan(args) {
         Math.max(1, shardCap - soloUnits.length),
         model,
       ),
-      ...soloUnits.map((name) => packShards([name], weights, 1, model)[0]),
+      ...soloUnits.flatMap((name) => partitionRows(packShards([name], weights, 1, model)[0], partitionedUnits.get(name))),
     ];
     for (const shard of result.unit_shards) {
       if (shard.estimated_minutes > PR_UNIT_BUDGET_MINUTES) {
@@ -2745,6 +2779,19 @@ function archivedLanes(archivedPackages, featureSuites) {
   return { builds, runs };
 }
 
+// A unit lane's rows: the lane, or for a PARTITIONED_UNIT_PACKAGES lane one
+// copy per `--partition hash:k/n`. The row name holds no slash: the unit
+// jobs name the row's sccache log artifact after it, and an artifact name
+// cannot hold one.
+function partitionRows(lane, partitions) {
+  if (partitions === undefined) return [lane];
+  return Array.from({ length: partitions }, (_, index) => ({
+    ...lane,
+    name: `${lane.name} ${index + 1} of ${partitions}`,
+    partition: `hash:${index + 1}/${partitions}`,
+  }));
+}
+
 // Pack, then widen the shard count until every shard models under the
 // pull-request unit budget (a single package over budget cannot be split and
 // is reported by the caller).
@@ -2784,6 +2831,7 @@ function matrixOf(shards, { placeholder = true } = {}) {
     ...(shard.targets ? { targets: shard.targets } : {}),
     ...(shard.test_flags ? { tests: shard.test_flags } : {}),
     ...(shard.rust_min_stack ? { rust_min_stack: String(shard.rust_min_stack) } : {}),
+    ...(shard.partition ? { partition: shard.partition } : {}),
   }));
   if (include.length === 0 && placeholder) include.push({ name: "none", packages: "" });
   return JSON.stringify({ include });

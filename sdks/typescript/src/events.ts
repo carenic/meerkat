@@ -658,6 +658,12 @@ export type InteractionFailureReason =
     }
   | { readonly kind: "abandoned"; readonly detail: string }
   | { readonly kind: "finalization_failed"; readonly detail: string }
+  /**
+   * The run that consumed the interaction's input left no receipt for it, and
+   * a later settlement answered it: what the run did is not known. Not a
+   * completion; do not resubmit the interaction because of it.
+   */
+  | { readonly kind: "outcome_unknown" }
   | {
       readonly kind: "unknown";
       readonly rawKind: string;
@@ -1597,6 +1603,7 @@ function parseInteractionFailureReason(raw: unknown): InteractionFailureReason {
   const kind = requireStringField(raw, "kind");
   switch (kind) {
     case "cancelled":
+    case "outcome_unknown":
       return { kind };
     case "extraction_failed":
       return {

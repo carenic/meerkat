@@ -2284,6 +2284,9 @@ pub enum RuntimeCompletionObservedOutcome {
     RuntimeApplyFailed,
     FinalizationFailed,
     RuntimeTerminated,
+    /// A recovered boundary consumed the input without staging its receipt;
+    /// what its run did for the input is not known. Never cleans up a runtime.
+    OutcomeUnknown,
 }
 
 /// Typed observation of the terminal payload shape produced by runtime-loop
@@ -2297,6 +2300,9 @@ pub enum RuntimeCompletionTerminalObservation {
     CallbackPending,
     MachineTerminal,
     RuntimeTerminated,
+    /// The runless answer to an input a recovered boundary consumed without
+    /// staging its receipt: it names the run, not what the run did.
+    OutcomeUnknown,
 }
 
 /// Typed observation of whether runtime finalization completed after the
@@ -2348,6 +2354,7 @@ pub enum RuntimeCompletionResultClass {
     AbandonedWithError,
     CompletedWithFinalizationFailure,
     RuntimeTerminated,
+    OutcomeUnknown,
 }
 
 /// Correlation owner for one validated durable completion batch.

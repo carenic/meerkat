@@ -185,6 +185,13 @@ pub(crate) enum InteractionTerminalCandidate {
     RuntimeTerminated {
         reason: String,
     },
+    /// A predecessor settlement's runless answer to an input that a recovered
+    /// boundary consumed without staging its receipt: the input was consumed
+    /// by `run_id` at that boundary, and what the run did for it is not
+    /// known. It carries no result payload and is never a completion.
+    RecoveredBoundaryOutcomeUnknown {
+        run_id: RunId,
+    },
 }
 
 impl InteractionTerminalCandidate {
@@ -196,6 +203,16 @@ impl InteractionTerminalCandidate {
             Self::RunResult { .. }
                 | Self::CallbackPending { .. }
                 | Self::CallbackBatchPending { .. }
+        )
+    }
+
+    /// Whether this candidate belongs to a runless (runtime-termination)
+    /// batch: a runtime termination, or a settlement's outcome-unknown
+    /// answer. Every other candidate belongs to a run.
+    pub(crate) fn is_runless(&self) -> bool {
+        matches!(
+            self,
+            Self::RuntimeTerminated { .. } | Self::RecoveredBoundaryOutcomeUnknown { .. }
         )
     }
 }
@@ -281,7 +298,9 @@ impl InteractionTerminalCandidate {
                     error: error.clone(),
                 })
             }
-            Self::Cancelled | Self::RuntimeTerminated { .. } => None,
+            Self::Cancelled
+            | Self::RuntimeTerminated { .. }
+            | Self::RecoveredBoundaryOutcomeUnknown { .. } => None,
         }
     }
 
@@ -296,6 +315,9 @@ impl InteractionTerminalCandidate {
             }
             Self::RuntimeTerminated { .. } => {
                 RuntimeCompletionTerminalObservation::RuntimeTerminated
+            }
+            Self::RecoveredBoundaryOutcomeUnknown { .. } => {
+                RuntimeCompletionTerminalObservation::OutcomeUnknown
             }
             Self::MachineTerminalFailure { .. } | Self::Cancelled => {
                 RuntimeCompletionTerminalObservation::MachineTerminal
@@ -373,7 +395,10 @@ impl InteractionTerminalCandidate {
             | Self::CompletedWithoutResult
             | Self::CallbackPending { .. }
             | Self::CallbackBatchPending { .. }
-            | Self::RuntimeTerminated { .. } => Ok(RuntimeCompletionTerminalRecovery::NonMachine),
+            | Self::RuntimeTerminated { .. }
+            | Self::RecoveredBoundaryOutcomeUnknown { .. } => {
+                Ok(RuntimeCompletionTerminalRecovery::NonMachine)
+            }
         }
     }
 }
@@ -527,19 +552,13 @@ impl InputTerminalCompletion {
         if interaction_terminal_payload_digest(candidate)? != self.candidate_digest {
             return Err("terminal completion candidate digest mismatch".into());
         }
-        match (&self.batch_key, candidate) {
-            (
-                InputTerminalCompletionBatchKey::RuntimeTermination { .. },
-                InteractionTerminalCandidate::RuntimeTerminated { .. },
-            ) => {}
-            (
-                InputTerminalCompletionBatchKey::Run { .. },
-                InteractionTerminalCandidate::RuntimeTerminated { .. },
-            )
-            | (InputTerminalCompletionBatchKey::RuntimeTermination { .. }, _) => {
+        match (&self.batch_key, candidate.is_runless()) {
+            (InputTerminalCompletionBatchKey::RuntimeTermination { .. }, true)
+            | (InputTerminalCompletionBatchKey::Run { .. }, false) => {}
+            (InputTerminalCompletionBatchKey::RuntimeTermination { .. }, false)
+            | (InputTerminalCompletionBatchKey::Run { .. }, true) => {
                 return Err("terminal completion scope does not match its candidate".into());
             }
-            (InputTerminalCompletionBatchKey::Run { .. }, _) => {}
         }
         Ok(())
     }
@@ -817,6 +836,61 @@ pub(crate) struct InteractionTerminalOutbox {
 /// validation of a stored or decoded row refuses it.
 pub(crate) const WITHHELD_PAYLOAD_DIGEST: &str = "withheld";
 
+/// A complete runtime placement a directed terminal outbox names as its
+/// owner: the placement triple every outbox row requires, plus the optional
+/// epoch.
+///
+/// A path that stages an outbox without a placed runtime (a recovered
+/// boundary's commit, a predecessor settlement's internal registration)
+/// takes it from the session's last durable placement, its lifecycle row's
+/// binding or the placement witness the row carries: the placement of the
+/// runtime whose work it ends. A later drain adopts such an outbox exactly
+/// as it adopts one that runtime left.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct InteractionTerminalPlacement {
+    pub(crate) agent_runtime_id: String,
+    pub(crate) fence_token: u64,
+    pub(crate) runtime_generation: u64,
+    pub(crate) runtime_epoch_id: Option<String>,
+}
+
+impl InteractionTerminalPlacement {
+    /// The placement `binding` records, or `None` when it lacks any of the
+    /// runtime id, fence token and generation.
+    pub(crate) fn from_lifecycle_binding(
+        binding: &crate::store::MachineLifecycleBindingFacts,
+    ) -> Option<Self> {
+        Some(Self {
+            agent_runtime_id: binding.agent_runtime_id()?.to_string(),
+            fence_token: binding.fence_token()?,
+            runtime_generation: binding.runtime_generation()?,
+            runtime_epoch_id: binding.runtime_epoch_id().map(str::to_string),
+        })
+    }
+
+    /// The placement a session's lifecycle row records: its binding when
+    /// that is a complete placement, else the placement witness a
+    /// predecessor settlement keeps in the row (record version 7), else
+    /// none. The one rule every unplaced path selects its placement by.
+    pub(crate) fn from_lifecycle_row(
+        binding: &crate::store::MachineLifecycleBindingFacts,
+        placement_witness: Option<&crate::store::MachineLifecycleBindingFacts>,
+    ) -> Option<Self> {
+        Self::from_lifecycle_binding(binding)
+            .or_else(|| placement_witness.and_then(Self::from_lifecycle_binding))
+    }
+
+    /// The binding facts that record this placement.
+    pub(crate) fn lifecycle_binding(&self) -> crate::store::MachineLifecycleBindingFacts {
+        crate::store::MachineLifecycleBindingFacts::new(
+            Some(self.agent_runtime_id.clone()),
+            Some(self.fence_token),
+            Some(self.runtime_generation),
+            self.runtime_epoch_id.clone(),
+        )
+    }
+}
+
 pub(crate) fn interaction_terminal_payload_digest<T: Serialize>(
     payload: &T,
 ) -> Result<String, String> {
@@ -939,16 +1013,21 @@ impl InteractionTerminalOutbox {
                 {
                     return Err("interaction terminal candidate session/owner mismatch".into());
                 }
+                // That release wrote runtime terminations as its only runless
+                // candidate.
                 match (&self.batch_key, candidate) {
                     (
                         InteractionTerminalBatchKey::RuntimeTermination { .. },
                         InteractionTerminalCandidate::RuntimeTerminated { .. },
                     ) => {}
-                    (
-                        InteractionTerminalBatchKey::Run { .. },
-                        InteractionTerminalCandidate::RuntimeTerminated { .. },
-                    )
-                    | (InteractionTerminalBatchKey::RuntimeTermination { .. }, _) => {
+                    (InteractionTerminalBatchKey::RuntimeTermination { .. }, _) => {
+                        return Err(
+                            "released 0.8.31 interaction terminal scope/candidate mismatch".into(),
+                        );
+                    }
+                    (InteractionTerminalBatchKey::Run { .. }, candidate)
+                        if candidate.is_runless() =>
+                    {
                         return Err(
                             "released 0.8.31 interaction terminal scope/candidate mismatch".into(),
                         );
@@ -1089,21 +1168,15 @@ pub(crate) fn validate_interaction_terminal_outbox_batch_against_candidate(
     if interaction_terminal_payload_digest(candidate)? != owner.candidate_digest {
         return Err("interaction terminal batch candidate digest mismatch".into());
     }
-    match (&owner.batch_key, candidate) {
-        (
-            InteractionTerminalBatchKey::RuntimeTermination { .. },
-            InteractionTerminalCandidate::RuntimeTerminated { .. },
-        ) => {}
-        (
-            InteractionTerminalBatchKey::Run { .. },
-            InteractionTerminalCandidate::RuntimeTerminated { .. },
-        ) => {
-            return Err("run-scoped terminal batch carried runtime termination".into());
+    match (&owner.batch_key, candidate.is_runless()) {
+        (InteractionTerminalBatchKey::RuntimeTermination { .. }, true)
+        | (InteractionTerminalBatchKey::Run { .. }, false) => {}
+        (InteractionTerminalBatchKey::Run { .. }, true) => {
+            return Err("run-scoped terminal batch carried a runless candidate".into());
         }
-        (InteractionTerminalBatchKey::RuntimeTermination { .. }, _) => {
+        (InteractionTerminalBatchKey::RuntimeTermination { .. }, false) => {
             return Err("runtime-termination batch carried a run-scoped candidate".into());
         }
-        (InteractionTerminalBatchKey::Run { .. }, _) => {}
     }
     if let InteractionTerminalCandidate::RunResult { result } = candidate
         && result.session_id != owner.owner_session_id
@@ -1269,6 +1342,9 @@ pub(crate) fn interaction_terminal_candidate_matches_event(
                 ..
             },
         ) => reason == detail,
+        (InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown { .. }, event) => {
+            crate::completion::is_outcome_unknown_interaction_terminal(event)
+        }
         _ => false,
     }
 }
@@ -3249,6 +3325,50 @@ mod tests {
                 RuntimeCompletionTerminalRecovery::MachineFailure { outcome, cause }
             );
         }
+    }
+
+    /// The outcome-unknown candidate belongs to a runless batch only: it
+    /// pairs with a runtime-termination key and never with a run's key, it
+    /// carries no result payload, and it observes its own terminal.
+    #[test]
+    fn outcome_unknown_candidate_pairs_with_a_runless_batch_only() {
+        use crate::meerkat_machine::driver::{
+            InteractionTerminalBatchScope, build_input_terminal_completion_rows,
+        };
+        let run_id = RunId::new();
+        let candidate = InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+            run_id: run_id.clone(),
+        };
+        assert!(candidate.is_runless());
+        assert!(!candidate.carries_result_payload());
+        assert!(candidate.core_apply_terminal().is_none());
+        assert_eq!(
+            candidate.terminal_observation(),
+            crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::OutcomeUnknown
+        );
+        assert_eq!(
+            candidate.runtime_completion_terminal_recovery().unwrap(),
+            RuntimeCompletionTerminalRecovery::NonMachine
+        );
+        let input_id = InputId::new();
+        let runless = build_input_terminal_completion_rows(
+            InteractionTerminalBatchScope::RuntimeTermination,
+            std::slice::from_ref(&input_id),
+            candidate.clone(),
+            false,
+        )
+        .unwrap();
+        assert!(runless[0].validate_row().is_ok());
+        assert!(
+            build_input_terminal_completion_rows(
+                InteractionTerminalBatchScope::Run(&run_id),
+                std::slice::from_ref(&input_id),
+                candidate,
+                false,
+            )
+            .is_err(),
+            "a run's batch never carries the outcome-unknown candidate"
+        );
     }
 
     #[test]

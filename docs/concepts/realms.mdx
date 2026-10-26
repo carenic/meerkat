@@ -202,6 +202,32 @@ unwritable) is refused with a typed "hosting claim unavailable" error
 It is never served without its claim. Likewise a process that cannot take the
 cold-delivery lock applies no cold deliveries until it can.
 
+A host that takes over a session whose earlier process ended without
+unregistering it (a crash or a power cut) can settle the runtime work that
+process left before it registers the session, without serving it:
+`PersistentSessionService::settle_cold_predecessor_before` (for a mob's
+session service,
+`MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`),
+under the host's own claim of the session (`grant_session_hosting`). It needs
+OS-locked claims and a HeadCanonical runtime store. It commits the durable
+tail the earlier process left, ends every input that never ended as
+stopped and answers its requester, finalizes every terminal receipt and
+publication still owed, and answers an input that a recovered boundary
+consumed without a receipt as outcome unknown
+(`CompletionOutcome::OutcomeUnknown`; its requester gets `interaction_failed`
+with reason kind `outcome_unknown`): what its run did for it is not known, so
+it must not be resubmitted. Keep the claim until the session's next
+registration has published: that registration joins the claim's lineage and
+does not settle the lost owner's consents again. `Ok` is a complete census of
+the session's input rows; a refusal, a deadline or a cancelled call certifies
+nothing, and repeating the call converges. A host that governs consents
+registers the session only when the census reports the owner-loss outcome
+`Completed` or `NotOwed`. `NoConsentOwner` means the runtime has no issuing
+consent owner installed, a composition defect: install it, then repeat the
+call. Directed work needs the service's event store: without one, publishing
+a directed input's terminal refuses after the input ended, and the terminal
+stays owed until a service with an event store repeats the call.
+
 The claims and delivery coordination live under the realm root in `hosting/`
 and `delivery/`. They are derived runtime files, reported by
 `rkat storage doctor` as inventory, and never removed while the realm is

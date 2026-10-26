@@ -380,7 +380,7 @@ impl OwnerLossReservation {
     pub fn complete(mut self) -> HostingOwnerLossProof {
         self.held = false;
         #[cfg(not(target_arch = "wasm32"))]
-        self.lineage.complete_owner_loss();
+        self.lineage.complete_owner_loss(self.proof.clone());
         self.proof.clone()
     }
 }
@@ -466,6 +466,43 @@ impl HostingClaim {
         }
         #[cfg(target_arch = "wasm32")]
         {
+            false
+        }
+    }
+
+    /// The proof this claim's lineage settled, once a winning publication
+    /// completed its owner-loss settlement ([`Self::reserve_owner_loss`]).
+    /// `None` while the settlement is owed or in progress, and for a claim
+    /// with no cross-process lineage. A read-only observation: it grants
+    /// nothing, and the lineage settles nothing again.
+    pub fn completed_owner_loss(&self) -> Option<HostingOwnerLossProof> {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            self.held
+                .as_ref()
+                .and_then(|held| held.completed_owner_loss())
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            None
+        }
+    }
+
+    /// Whether `other` belongs to the very lineage of this claim (the same
+    /// live cross-process claim, shared by every grant that joined it), not
+    /// merely to the same session and owner. Two claims with no
+    /// cross-process lineage share none.
+    pub fn same_lineage(&self, other: &HostingClaim) -> bool {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            match (self.held.as_ref(), other.held.as_ref()) {
+                (Some(held), Some(other_held)) => std::sync::Arc::ptr_eq(held, other_held),
+                _ => false,
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = other;
             false
         }
     }
@@ -898,8 +935,8 @@ mod native {
         Owed(HostingOwnerLossProof),
         /// An attachment holds the proof (see [`OwnerLossReservation`]).
         Reserved,
-        /// A winning publication completed it.
-        Completed,
+        /// A winning publication completed it, settling this proof.
+        Completed(HostingOwnerLossProof),
     }
 
     impl ClaimInner {
@@ -932,15 +969,24 @@ mod native {
                     })
                 }
                 OwnerLossState::Reserved => OwnerLossAttachment::InProgress,
-                OwnerLossState::Completed => {
-                    *state = OwnerLossState::Completed;
+                OwnerLossState::Completed(proof) => {
+                    *state = OwnerLossState::Completed(proof);
                     OwnerLossAttachment::Settled
                 }
             }
         }
 
-        pub(super) fn complete_owner_loss(&self) {
-            *self.owner_loss() = OwnerLossState::Completed;
+        pub(super) fn complete_owner_loss(&self, proof: HostingOwnerLossProof) {
+            *self.owner_loss() = OwnerLossState::Completed(proof);
+        }
+
+        /// The proof this lineage's completed settlement settled, if it
+        /// completed.
+        pub(super) fn completed_owner_loss(&self) -> Option<HostingOwnerLossProof> {
+            match &*self.owner_loss() {
+                OwnerLossState::Completed(proof) => Some(proof.clone()),
+                OwnerLossState::Owed(_) | OwnerLossState::Reserved => None,
+            }
         }
 
         pub(super) fn return_owner_loss(&self, proof: HostingOwnerLossProof) {
@@ -1487,5 +1533,88 @@ mod domain_ref_tests {
             }
         }
         assert_ne!(paths(root.path().join("other")).domain_ref(), reference);
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+#[allow(clippy::expect_used, clippy::panic)]
+mod lineage_evidence_tests {
+    use super::*;
+
+    fn os_lock_capability(dir: &std::path::Path) -> HostingCapability {
+        HostingCapability::OsLock(Arc::new(HostingPaths {
+            hosting_lock_dir: dir.join("hosting"),
+            cold_delivery_lock: dir.join("cold-delivery.lock"),
+            database: None,
+        }))
+    }
+
+    /// A lineage keeps the proof its completed owner-loss settlement settled,
+    /// and every claim of the lineage observes it; before the settlement
+    /// completes, and after a reservation is dropped, there is none. Grants
+    /// that join a lineage share it; a lineage begun after the first one
+    /// ended is another lineage, and owes its own settlement.
+    #[test]
+    fn a_completed_lineage_keeps_the_proof_it_settled() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let capability = os_lock_capability(dir.path());
+        let owner = HostingOwner::mint();
+        let session = SessionId::new();
+        let claim = grant_session_hosting(&capability, &owner, &session).expect("the claim");
+        assert_eq!(claim.acquisition(), HostingAcquisition::AcquiredFresh);
+        let joined = grant_session_hosting(&capability, &owner, &session).expect("a joined grant");
+        assert_eq!(joined.acquisition(), HostingAcquisition::Joined);
+        assert!(
+            claim.same_lineage(&joined),
+            "a joined grant shares the lineage"
+        );
+        assert_eq!(claim.completed_owner_loss(), None, "nothing settled yet");
+
+        let OwnerLossAttachment::Reserved(reservation) = joined.reserve_owner_loss() else {
+            panic!("a fresh lineage owes its settlement");
+        };
+        assert_eq!(
+            claim.completed_owner_loss(),
+            None,
+            "a reserved settlement is in progress, not complete"
+        );
+        drop(reservation);
+        assert_eq!(
+            claim.completed_owner_loss(),
+            None,
+            "a dropped reservation completes nothing"
+        );
+
+        let OwnerLossAttachment::Reserved(reservation) = claim.reserve_owner_loss() else {
+            panic!("a dropped reservation returns the proof to its lineage");
+        };
+        let settled = reservation.complete();
+        assert_eq!(claim.completed_owner_loss(), Some(settled.clone()));
+        assert_eq!(
+            joined.completed_owner_loss(),
+            Some(settled),
+            "every claim of the lineage observes the completed proof"
+        );
+        assert!(matches!(
+            joined.reserve_owner_loss(),
+            OwnerLossAttachment::Settled
+        ));
+
+        drop(joined);
+        drop(claim);
+        let next = grant_session_hosting(&capability, &owner, &session).expect("a new lineage");
+        assert_eq!(next.acquisition(), HostingAcquisition::AcquiredFresh);
+        assert_eq!(
+            next.completed_owner_loss(),
+            None,
+            "a new lineage owes its own settlement"
+        );
+        let other = grant_session_hosting(&HostingCapability::ProcessLocal, &owner, &session)
+            .expect("a process-local grant");
+        assert!(
+            !next.same_lineage(&other),
+            "a grant without a lineage shares none"
+        );
+        assert_eq!(other.completed_owner_loss(), None);
     }
 }

@@ -3878,6 +3878,7 @@ impl EphemeralRuntimeDriver {
                 if let Some(state) = self.ledger.get_mut(input_id) {
                     state.persisted_input = stored.state.persisted_input.clone();
                 }
+                self.adopt_durable_terminal_carriers(stored)?;
                 if let Some(run_id) = stored.seed.last_run_id.clone() {
                     self.events
                         .push(self.make_envelope(RuntimeEvent::InputLifecycle(
@@ -3915,6 +3916,7 @@ impl EphemeralRuntimeDriver {
                 if let Some(state) = self.ledger.get_mut(input_id) {
                     state.persisted_input = stored.state.persisted_input.clone();
                 }
+                self.adopt_durable_terminal_carriers(stored)?;
                 self.events
                     .push(self.make_envelope(RuntimeEvent::InputLifecycle(
                         InputLifecycleEvent::Abandoned {
@@ -3933,6 +3935,47 @@ impl EphemeralRuntimeDriver {
             }
             _ => Ok(false),
         }
+    }
+
+    /// Carry the terminal work the outside writer staged with an adopted
+    /// terminal (a recovered boundary stages its contributors' completion
+    /// batch and directed outboxes in its own commit) into this driver, so a
+    /// later write of the row keeps it and the pending-terminal index names
+    /// it. The row then takes the stored row exactly: its lifecycle facts
+    /// (the run that consumed it, its boundary, its attempts and admission
+    /// order) through the machine's recovered-lifecycle authority, as a
+    /// registration recovers a terminal row, and its state as stored. The
+    /// batch belongs to the run that consumed the input, not to the run this
+    /// driver last bound it to, and the drain that finalizes the batch reads
+    /// that run and compares the row's exact bytes. A row that already holds
+    /// terminal work keeps its own, and a stored row without terminal work
+    /// changes nothing more.
+    fn adopt_durable_terminal_carriers(
+        &mut self,
+        stored: &StoredInputState,
+    ) -> Result<(), RuntimeDriverError> {
+        let input_id = &stored.state.input_id;
+        if stored.state.terminal_completion.is_none()
+            && stored.state.interaction_terminal_outbox.is_none()
+        {
+            return Ok(());
+        }
+        let Some(state) = self.ledger.get(input_id) else {
+            return Ok(());
+        };
+        if state.terminal_completion.is_some() || state.interaction_terminal_outbox.is_some() {
+            return Ok(());
+        }
+        self.apply_recovered_lifecycle(input_id, &stored.seed, None, None)?;
+        let mut adopted = stored.state.clone();
+        adopted.authorization_audit = adopted
+            .authorization_audit
+            .restore_observations_for_owner()
+            .map_err(|error| RuntimeDriverError::RecoveryCorruption {
+                reason: error.to_string(),
+            })?;
+        self.ledger.recover(adopted);
+        Ok(())
     }
 
     pub(crate) fn machine_normalize_live_boundary_unavailable(

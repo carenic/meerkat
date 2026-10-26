@@ -3632,6 +3632,20 @@ def test_parse_extraction_terminal_events():
     assert failed.reason == "Invalid JSON"
 
 
+def test_parse_interaction_failed_outcome_unknown_reason():
+    event = parse_event(
+        {
+            "type": "interaction_failed",
+            "interaction_id": "interaction-1",
+            "reason": {"kind": "outcome_unknown"},
+        }
+    )
+    assert isinstance(event, InteractionFailed)
+    assert event.interaction_id == "interaction-1"
+    assert event.reason.kind == "outcome_unknown"
+    assert event.reason.raw_kind is None
+
+
 def test_parse_run_failed_preserves_hook_denied_error_report():
     raw = {
         "type": "run_failed",
