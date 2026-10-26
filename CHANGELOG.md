@@ -43,6 +43,15 @@ them.
   host composes it into its delivery owner's consent notice projection
   (`ConsentNoticeProjector`), so the notices that owner owes are projected
   for exactly the owner that issued the consent.
+- `meerkat`: the provided `RetainedJobSource::admission_committed` (by
+  default it records nothing). The governed admission of a retained
+  completion reports each committed admission (its session and input) to
+  the job source that confirmed the job, before the delivery row is
+  acknowledged and again on a retry; an error leaves the row unacknowledged
+  and retried later. A composed source forwards it to the source that
+  confirmed the job, routed as `retained_job`, as the `meerkat-mob-mcp`
+  composition now does for a host source's declared namespaces
+  (`MobMcpState::with_host_job_source`).
 
 ### Fixed
 
@@ -63,11 +72,14 @@ them.
   crash cut before the upgrade still has its inputs ended as
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
-- `meerkat`: consent-notice admissions now record their delivery receipt
-  (the governed admission reports each committed admission to the job's
-  committed owner through the new provided
-  `RetainedJobSource::admission_committed`), so approved parked consent
-  moves into the resumed run its notice starts.
+- `meerkat`: consent notices now record their delivery receipts. The
+  governed admission of an Approved, Denied or Withdrawn notice records
+  `Admitted` for its session and input (reported through
+  `RetainedJobSource::admission_committed`), so delivered notices no longer
+  stay owed forever, and approved parked consent moves into the resumed run
+  its notice starts. A notice whose delivery was settled as refused records
+  `Failed`, which withdraws approved parked consent. A round also records
+  the receipt of a notice whose admission applied without one.
 - `meerkat-core`: a resumed run now spends, once, the human consent the
   approval owner moved into it by the receipt of one of its staged notice
   inputs: a boundary of the run attempts the exact retained call, as for

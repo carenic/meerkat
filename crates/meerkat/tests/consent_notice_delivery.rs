@@ -22,7 +22,9 @@ use meerkat::{
     RuntimeDeliveryPass, SessionAddressResolver, SessionId, consent_notice_producer,
 };
 use meerkat_core::approval::ApprovalConsentWithdrawalReason;
-use meerkat_core::approval::consent::{ConsentNoticeKind, consent_delivery_job_id};
+use meerkat_core::approval::consent::{
+    ConsentNoticeKind, consent_delivery_job_id, parse_consent_delivery_job_id,
+};
 use meerkat_core::approval::consent_test_support::ParkedRoutedConsent;
 use meerkat_core::lifecycle::{InputId, RunId};
 use meerkat_core::retained_work::RetainedWorkIdentity;
@@ -360,9 +362,13 @@ impl JobDeliverySink for NoJobs {
 
 /// A single-process host of one hosting domain that projects the consent
 /// notices its approval owner owes there and confirms them against it, as
-/// `SessionServiceDeliveryHost::with_consent_notices` composes them.
+/// `SessionServiceDeliveryHost::with_consent_notices` composes them. A host
+/// that does not project only drains: its owner runs no round, so only a
+/// drain's admission report can record a receipt there.
 struct ConsentHost {
     projector: Arc<ConsentNoticeProjector>,
+    /// Whether the host projects the owed notices on its owner's rounds.
+    projects: bool,
     sink: Arc<GovernedSink>,
     /// The committed job owner retained jobs are confirmed with and their
     /// admissions reported to: the projector's own source, or a test's
@@ -415,11 +421,12 @@ impl RuntimeDeliveryHost for ConsentHost {
     }
 
     fn projects_owed_continuations(&self) -> bool {
-        true
+        self.projects
     }
 
     fn subscribe_owed_continuation_changes(&self) -> Option<watch::Receiver<u64>> {
-        Some(self.projector.subscribe_owed_changes())
+        self.projects
+            .then(|| self.projector.subscribe_owed_changes())
     }
 
     async fn project_owed_continuations(
@@ -504,6 +511,20 @@ impl Fixture {
     fn host_with_jobs(&self, jobs: Arc<dyn RetainedJobSource>) -> Arc<dyn RuntimeDeliveryHost> {
         Arc::new(ConsentHost {
             projector: Arc::clone(&self.projector),
+            projects: true,
+            sink: Arc::clone(&self.sink),
+            jobs,
+            pages: None,
+        })
+    }
+
+    /// A host that only drains: it projects no notices, so its owner runs
+    /// no round, and it confirms retained jobs, and reports their
+    /// admissions, through `jobs`.
+    fn draining_host(&self, jobs: Arc<dyn RetainedJobSource>) -> Arc<dyn RuntimeDeliveryHost> {
+        Arc::new(ConsentHost {
+            projector: Arc::clone(&self.projector),
+            projects: false,
             sink: Arc::clone(&self.sink),
             jobs,
             pages: None,
@@ -522,6 +543,7 @@ impl Fixture {
         let (finished, pages) = watch::channel(Vec::new());
         let host = Arc::new(ConsentHost {
             projector: Arc::clone(&self.projector),
+            projects: true,
             sink: Arc::clone(&self.sink),
             jobs: Arc::new(self.projector.job_source()),
             pages: Some(PageLog { sources, finished }),
@@ -668,6 +690,76 @@ impl RetainedJobSource for FailsToHear {
                 .await?;
         }
         Err("the process ended before the row was acknowledged".to_string())
+    }
+}
+
+/// One admission reported to a job owner: the job, the session and input it
+/// was admitted as, and where the notice stood just before the report
+/// reached the approval owner.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Report {
+    job_id: String,
+    session: SessionId,
+    input: InputId,
+    before: Option<ApprovalConsentDeliveryState>,
+}
+
+/// The projector's job source, confirming and recording exactly as it does,
+/// that keeps every admission reported to it.
+struct ReportsToOwner {
+    jobs: ConsentNoticeJobSource,
+    approvals: Arc<ApprovalService>,
+    reports: Mutex<Vec<Report>>,
+}
+
+impl ReportsToOwner {
+    fn new(fixture: &Fixture) -> Self {
+        Self {
+            jobs: fixture.projector.job_source(),
+            approvals: Arc::clone(&fixture.approvals),
+            reports: Mutex::default(),
+        }
+    }
+
+    fn reports(&self) -> Vec<Report> {
+        self.reports.lock().expect("report lock").clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl RetainedJobSource for ReportsToOwner {
+    async fn retained_job(
+        &self,
+        producer: &meerkat::ContinuationProducer,
+        job_id: &str,
+    ) -> RetainedJobLookup {
+        self.jobs.retained_job(producer, job_id).await
+    }
+
+    async fn admission_committed(
+        &self,
+        producer: &meerkat::ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        let before = parse_consent_delivery_job_id(job_id).and_then(|(approval_id, transition)| {
+            self.approvals
+                .get(&approval_id)
+                .ok()?
+                .consent?
+                .delivery(transition)
+                .map(|delivery| delivery.state.clone())
+        });
+        self.reports.lock().expect("report lock").push(Report {
+            job_id: job_id.to_string(),
+            session: session.clone(),
+            input: input_id.clone(),
+            before,
+        });
+        self.jobs
+            .admission_committed(producer, job_id, session, input_id)
+            .await
     }
 }
 
@@ -1076,6 +1168,155 @@ async fn a_consent_delivery_host_hears_its_approval_owner_announce() {
     );
 }
 
+/// A host's bound job owner that holds no job and keeps every admission
+/// reported to it.
+#[cfg(feature = "session-store")]
+#[derive(Default)]
+struct HearsAdmissions {
+    heard: Mutex<Vec<(meerkat::ContinuationProducer, String, SessionId, InputId)>>,
+}
+
+#[cfg(feature = "session-store")]
+impl HearsAdmissions {
+    fn heard(&self) -> Vec<(meerkat::ContinuationProducer, String, SessionId, InputId)> {
+        self.heard.lock().expect("report lock").clone()
+    }
+}
+
+#[cfg(feature = "session-store")]
+#[async_trait::async_trait]
+impl RetainedJobSource for HearsAdmissions {
+    async fn retained_job(
+        &self,
+        _producer: &meerkat::ContinuationProducer,
+        _job_id: &str,
+    ) -> RetainedJobLookup {
+        RetainedJobLookup::Absent
+    }
+
+    async fn admission_committed(
+        &self,
+        producer: &meerkat::ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        self.heard.lock().expect("report lock").push((
+            producer.clone(),
+            job_id.to_string(),
+            session.clone(),
+            input_id.clone(),
+        ));
+        Ok(())
+    }
+}
+
+/// The job source a consent-aware session delivery host composes reports a
+/// consent notice's committed admission to the notice's approval owner,
+/// which records its receipt, and any other job's admission to the host's
+/// bound source, exactly as reported; neither reaches the other. Before the
+/// host binds, another job's report has no owner here and records nothing.
+#[cfg(feature = "session-store")]
+#[tokio::test]
+async fn the_session_delivery_host_reports_a_consent_notices_admission_to_its_approval_owner() {
+    let here = domain("realm-a/hosting");
+    let session = SessionId::new();
+    let row = approved_owing_row(None, &here, &session, &origin_work("runtime-a"));
+    let fixture = Fixture::new(
+        ApprovalService::with_store(store_with(std::slice::from_ref(&row))).expect("service"),
+        here,
+    );
+    let temp = tempfile::tempdir().expect("tempdir");
+    let service = Arc::new(meerkat::build_ephemeral_service(
+        meerkat::AgentFactory::new(temp.path().join("sessions")),
+        meerkat::Config::default(),
+        4,
+    ));
+    let bindings = Arc::new(ContinuationHostBindings::default());
+    let host = meerkat::surface::SessionServiceDeliveryHost::new(
+        &service,
+        &fixture.runtime,
+        meerkat::DetachedJobService::new(Arc::new(MemoryDetachedJobStore::new())),
+        None,
+    )
+    .with_continuation_bindings(Arc::clone(&bindings))
+    .with_consent_notices(Arc::clone(&fixture.projector));
+    let approved = ApprovalConsentTransition::Approved;
+    let job_id = consent_delivery_job_id(&row.approval_id, approved);
+    let notice = consent_notice_producer();
+    let fork_off = meerkat::ContinuationProducer::ForkOff;
+    let input = InputId::new();
+    let admitted = Some(ApprovalConsentDeliveryState::Admitted {
+        session_id: session.clone(),
+        input_id: input.to_string(),
+    });
+
+    let unbound = host
+        .retained_job_source()
+        .expect("the consent namespace is answered");
+    assert_eq!(
+        unbound
+            .admission_committed(&fork_off, "job-1", &session, &input)
+            .await,
+        Ok(()),
+        "unbound, another job's report has no owner here"
+    );
+    assert_eq!(
+        delivery_state(&fixture.approvals, &row.approval_id, approved),
+        Some(ApprovalConsentDeliveryState::Owed),
+        "and it records nothing"
+    );
+    assert!(
+        matches!(
+            unbound.retained_job(&notice, &job_id).await,
+            RetainedJobLookup::Found(_)
+        ),
+        "the approval owner confirms its notice"
+    );
+    assert_eq!(
+        unbound
+            .admission_committed(&notice, &job_id, &session, &input)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        delivery_state(&fixture.approvals, &row.approval_id, approved),
+        admitted,
+        "the notice's admission recorded its receipt"
+    );
+
+    let hears = Arc::new(HearsAdmissions::default());
+    let _binding = bindings
+        .bind(Arc::new(SessionAddressResolver), hears.clone())
+        .expect("bind");
+    let bound = host
+        .retained_job_source()
+        .expect("the consent namespace is answered");
+    assert_eq!(
+        bound
+            .admission_committed(&fork_off, "job-1", &session, &input)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        bound
+            .admission_committed(&notice, &job_id, &session, &input)
+            .await,
+        Ok(())
+    );
+    assert_eq!(
+        hears.heard(),
+        vec![(fork_off, "job-1".to_string(), session, input)],
+        "the bound source heard the other job's admission once, exactly as reported, and \
+         never the notice's"
+    );
+    assert_eq!(
+        delivery_state(&fixture.approvals, &row.approval_id, approved),
+        admitted,
+        "the same receipt again changes nothing"
+    );
+}
+
 /// The delivery owner's loop holds its host for as long as it runs, so a
 /// consent host must never keep its own runtime alive. Composed over the
 /// runtime it delivers for, with a notice to commit (which takes the runtime
@@ -1205,7 +1446,8 @@ async fn page_finished_after(
 /// finishes while the input is still queued and settles nothing, so only
 /// the cancellation's hint can start the round that settles. It ends with
 /// one withdrawal naming the input, the receipt kept, one `Withdrawn` notice
-/// delivered once and receipted in turn, and the input abandoned.
+/// delivered once and receipted in turn, and the input abandoned. The other
+/// order, an input cancelled before its receipt, has a test of its own.
 #[tokio::test]
 async fn a_cancelled_notice_input_withdraws_its_parked_consent_after_its_receipt() {
     let here = domain("realm-a/hosting");
@@ -1356,6 +1598,196 @@ async fn a_cancelled_notice_input_withdraws_its_parked_consent_after_its_receipt
             ),
         ],
         "the exact receipt naming the input stays, and the withdrawal's own notice is \
+         receipted once it is admitted"
+    );
+    assert_eq!(
+        parked
+            .notices()
+            .iter()
+            .filter(|kind| **kind == ConsentNoticeKind::Withdrawn)
+            .count(),
+        1,
+        "one Withdrawn notice"
+    );
+    assert_eq!(
+        fixture.sink.resumed(),
+        vec![(session.clone(), origin.clone()), (session.clone(), origin)],
+        "the approved notice, then the Withdrawn notice, each delivered once"
+    );
+    assert_eq!(
+        native_terminal(&fixture.runtime, &session, &notice_input).await,
+        abandoned
+    );
+}
+
+/// Parked consent whose admitted notice input the runtime cancels before
+/// any receipt names it is withdrawn once the late receipt lands. The first
+/// owner's admission commits, but the owner ends before it records the
+/// receipt (as a crash would), so the row stays unacknowledged. The runtime
+/// then cancels the queued input while no receipt names it, so nothing can
+/// withdraw the consent yet. The next owner records the receipt (its arming
+/// round reads the applied admission from the row, and its drain reports
+/// the same admission again), and its own rounds, woken by the receipt's
+/// announcement, read the input's abandoned terminal and withdraw the
+/// consent, naming the input. It ends as the other order does: the receipt
+/// kept, one `Withdrawn` notice delivered once and receipted in turn, and
+/// the input abandoned. Nothing records a receipt by hand.
+#[tokio::test]
+async fn a_notice_input_cancelled_before_its_receipt_withdraws_its_parked_consent_once_receipted() {
+    let here = domain("realm-a/hosting");
+    let session = SessionId::new();
+    let origin = origin_work("runtime-a");
+    let fixture = Fixture::admitting(
+        ApprovalService::with_store(store_with(&[])).expect("service"),
+        here.clone(),
+    );
+    fixture
+        .runtime
+        .register_session(session.clone())
+        .await
+        .expect("register the destination session");
+    let scope = ApprovalConsentScope {
+        domain: here,
+        session_id: session.clone(),
+    };
+    let parked = ParkedRoutedConsent::park(&fixture.approvals, scope, origin.clone())
+        .await
+        .expect("a routed consent parked through the owner's paths");
+    let approval_id = parked.approval_id().clone();
+    let approved = ApprovalConsentTransition::Approved;
+
+    let first = fixture
+        .owner()
+        .arm(fixture.host_with_jobs(Arc::new(FailsToHear {
+            jobs: fixture.projector.job_source(),
+            job_id: consent_delivery_job_id(&approval_id, approved),
+            after_receipt: false,
+        })))
+        .expect("arm the first owner");
+    let mut first_passes = first.subscribe_passes();
+    let notice_input = tokio::time::timeout(EVENT_GUARD, async {
+        loop {
+            if let ContinuationStatus::Pending {
+                admitted: Some((admitted, input)),
+                ..
+            } = fixture.status(&session, &approval_id).await
+            {
+                assert_eq!(admitted, session);
+                return input;
+            }
+            first_passes
+                .changed()
+                .await
+                .expect("owner pass channel open");
+        }
+    })
+    .await
+    .expect("the first owner committed the admission");
+    let _stopped = first
+        .retire()
+        .join(EVENT_GUARD)
+        .await
+        .expect("the first owner stops");
+    assert_eq!(
+        delivery_state(&fixture.approvals, &approval_id, approved),
+        Some(ApprovalConsentDeliveryState::Owed),
+        "no receipt yet"
+    );
+    let withdrawn = || {
+        fixture
+            .approvals
+            .get(&approval_id)
+            .expect("row")
+            .consent
+            .and_then(|consent| consent.withdrawal)
+            .map(|withdrawal| withdrawal.reason)
+    };
+    let abandoned = Some(InputTerminalOutcome::Abandoned {
+        reason: InputAbandonReason::Cancelled,
+    });
+
+    assert!(
+        fixture
+            .runtime
+            .cancel_input_if_present(&session, &notice_input, "the notice was withdrawn")
+            .await
+            .expect("cancel the notice input"),
+        "the queued notice input is observed"
+    );
+    assert_eq!(
+        native_terminal(&fixture.runtime, &session, &notice_input).await,
+        abandoned,
+        "the runtime abandoned the queued notice input"
+    );
+    assert_eq!(withdrawn(), None, "no receipt names the input yet");
+    assert_eq!(
+        custody(&fixture.approvals, &approval_id),
+        Some(ApprovalConsentCustody::Parked),
+        "still parked"
+    );
+
+    // The next owner records the late receipt, and its own rounds settle
+    // the parked consent and then deliver its owed Withdrawn notice.
+    let next = fixture
+        .owner()
+        .arm(fixture.host())
+        .expect("arm the next owner over the same inbox");
+    let mut passes = next.subscribe_passes();
+    tokio::time::timeout(EVENT_GUARD, async {
+        while !matches!(
+            fixture
+                .status_of(&session, &approval_id, ApprovalConsentTransition::Withdrawn)
+                .await,
+            ContinuationStatus::Applied { .. }
+        ) {
+            passes.changed().await.expect("owner pass channel open");
+        }
+    })
+    .await
+    .expect("the Withdrawn notice was delivered");
+    let withdrawn_input = match fixture
+        .status_of(&session, &approval_id, ApprovalConsentTransition::Withdrawn)
+        .await
+    {
+        ContinuationStatus::Applied { input, .. } => input,
+        other => panic!("the Withdrawn notice was not admitted: {other:?}"),
+    };
+
+    assert_eq!(
+        withdrawn(),
+        Some(ApprovalConsentWithdrawalReason::NoticeInputEnded {
+            input_id: notice_input.to_string(),
+        })
+    );
+    let deliveries: Vec<_> = fixture
+        .approvals
+        .get(&approval_id)
+        .expect("row")
+        .consent
+        .expect("consent")
+        .deliveries
+        .into_iter()
+        .map(|delivery| (delivery.transition, delivery.state))
+        .collect();
+    assert_eq!(
+        deliveries,
+        vec![
+            (
+                ApprovalConsentTransition::Approved,
+                ApprovalConsentDeliveryState::Admitted {
+                    session_id: session.clone(),
+                    input_id: notice_input.to_string(),
+                },
+            ),
+            (
+                ApprovalConsentTransition::Withdrawn,
+                ApprovalConsentDeliveryState::Admitted {
+                    session_id: session.clone(),
+                    input_id: withdrawn_input.to_string(),
+                },
+            ),
+        ],
+        "the late receipt names the cancelled input, and the withdrawal's own notice is \
          receipted once it is admitted"
     );
     assert_eq!(
@@ -1589,10 +2021,14 @@ async fn an_approved_parked_consent_moves_once_into_the_resumed_run_its_notice_s
 }
 
 /// A crash between a notice's admission and its receipt loses nothing. The
-/// admission commits, and the row stays unacknowledged; the next owner's
-/// arming drain finds the admission already applied and records the receipt
-/// naming that same input, admitting nothing again. Nothing records a
-/// receipt by hand and no other wake is sent.
+/// admission commits, and the row stays unacknowledged. The next owner only
+/// drains (its host projects no notices, so no round can record the receipt
+/// from the row first): its arming drain finds the admission already
+/// applied and reports it once, naming that same input while the notice is
+/// still owed, and that report records the receipt; nothing is admitted
+/// again. Nothing records a receipt by hand and no other wake is sent. A
+/// projecting owner's round would record the same receipt from the row
+/// first, as an admission acknowledged without its receipt shows.
 #[tokio::test]
 async fn a_crash_between_a_notices_admission_and_its_receipt_is_receipted_by_the_next_drain() {
     let here = domain("realm-a/hosting");
@@ -1648,9 +2084,10 @@ async fn a_crash_between_a_notices_admission_and_its_receipt_is_receipted_by_the
         "no receipt yet"
     );
 
+    let reports = Arc::new(ReportsToOwner::new(&fixture));
     let next = fixture
         .owner()
-        .arm(fixture.host())
+        .arm(fixture.draining_host(reports.clone()))
         .expect("arm the next owner over the same inbox");
     let mut passes = next.subscribe_passes();
     tokio::time::timeout(EVENT_GUARD, async {
@@ -1670,12 +2107,22 @@ async fn a_crash_between_a_notices_admission_and_its_receipt_is_receipted_by_the
         other => panic!("the row was not acknowledged: {other:?}"),
     }
     assert_eq!(
+        reports.reports(),
+        vec![Report {
+            job_id: consent_delivery_job_id(&row.approval_id, approved),
+            session: session.clone(),
+            input: input.clone(),
+            before: Some(ApprovalConsentDeliveryState::Owed),
+        }],
+        "the drain reported the first owner's admission once, while the notice was owed"
+    );
+    assert_eq!(
         delivery_state(&fixture.approvals, &row.approval_id, approved),
         Some(ApprovalConsentDeliveryState::Admitted {
             session_id: session.clone(),
             input_id: input.to_string(),
         }),
-        "the receipt names the first owner's input"
+        "that report recorded the receipt naming the first owner's input"
     );
     assert!(
         fixture

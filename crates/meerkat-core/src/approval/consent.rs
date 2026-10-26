@@ -2134,7 +2134,7 @@ impl ApprovalService {
     /// the same receipt. The projector's rounds record the receipt a
     /// committed row's own status proves when no admission recorded it:
     /// `Admitted` for an applied admission, and `Failed` for a settled
-    /// refusal or a retired owner.
+    /// refusal.
     pub fn settle_consent_delivery(
         &self,
         approval_id: &ApprovalId,

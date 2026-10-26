@@ -43,8 +43,11 @@
 //! when no admission recorded it (a row acknowledged before admissions were
 //! reported, or one applied for a retired address, which no drain reaches
 //! again): `Admitted` for an applied admission, and `Failed` for a row the
-//! drain settled as refused or whose owner is proven retired. A row still
-//! undecided, and a status that cannot be read now, record nothing.
+//! drain settled as refused. A row still undecided, and a status that cannot
+//! be read now, record nothing. The projector reads statuses through the
+//! session address resolver, which never reports a session address retired,
+//! so a notice whose address a host retired before its admission stays
+//! owed.
 
 use std::sync::{Arc, Weak};
 
@@ -69,7 +72,7 @@ use crate::{
     ContinuationObservation, ContinuationOwner, ContinuationOwnerService, ContinuationProducer,
     ContinuationResultRef, ContinuationStatus, OwedContinuationCursor, OwedContinuationProjection,
     RetainedJobFacts, RetainedJobLookup, RetainedJobRecord, RetainedJobSource,
-    SessionAddressResolver, StrandedCause,
+    SessionAddressResolver,
 };
 
 /// The continuation producer of consent notices.
@@ -546,9 +549,18 @@ impl ConsentNoticeProjector {
 
 /// The receipt a committed notice row's own status proves: `Admitted` as one
 /// input of a session once the admission index applied it (acknowledged or
-/// not yet), and `Failed` once the row can never be delivered (the drain
-/// settled it as refused, or its owner is proven retired, which is final). A
-/// row still pending without an applied admission proves nothing.
+/// not yet), and `Failed` once the drain settled the row as refused, which
+/// is final. A row still pending without an applied admission proves
+/// nothing. A stranded row records nothing either: the projector reads
+/// statuses through the session address resolver, which never reports a
+/// session address retired, so it never reads a notice's row as stranded.
+///
+/// A refused row is read as never delivered: within one composition the
+/// drain confirms the job again before it reads the admission index. Only a
+/// changed composition (another hosting domain, or a host without consent
+/// notices draining the same inbox) can refuse a row whose admission
+/// applied; its `Failed` receipt then withdraws approved parked consent,
+/// which fails safe.
 fn settled_receipt(status: ContinuationStatus) -> Option<ConsentDeliveryReceipt> {
     match status {
         ContinuationStatus::Applied { session, input, .. }
@@ -562,15 +574,9 @@ fn settled_receipt(status: ContinuationStatus) -> Option<ConsentDeliveryReceipt>
         ContinuationStatus::Refused { reason, .. } => Some(ConsentDeliveryReceipt::Failed {
             reason: format!("its delivery was settled as refused ({reason:?})"),
         }),
-        ContinuationStatus::Stranded {
-            cause: StrandedCause::OwnerRetired,
-            ..
-        } => Some(ConsentDeliveryReceipt::Failed {
-            reason: "its destination retired before it was admitted".to_string(),
-        }),
-        ContinuationStatus::Pending { admitted: None, .. } | ContinuationStatus::NotCommitted => {
-            None
-        }
+        ContinuationStatus::Pending { admitted: None, .. }
+        | ContinuationStatus::Stranded { .. }
+        | ContinuationStatus::NotCommitted => None,
     }
 }
 

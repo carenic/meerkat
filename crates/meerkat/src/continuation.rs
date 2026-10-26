@@ -1244,9 +1244,10 @@ pub enum RetainedJobLookup {
 /// job, and a host original, is confirmed. It answers
 /// [`RetainedJobLookup::Absent`] (and [`HostOriginalLookup::Absent`]) for any
 /// producer or namespace it does not own. A composed source forwards the host
-/// original methods for its declared namespaces only; Core refuses the
-/// reserved namespaces ([`RESERVED_HOST_NAMESPACE_PREFIX`]) whatever a source
-/// answers.
+/// original methods for its declared namespaces only, and forwards
+/// [`Self::admission_committed`] to the source that confirmed the job, routed
+/// exactly as [`Self::retained_job`]; Core refuses the reserved namespaces
+/// ([`RESERVED_HOST_NAMESPACE_PREFIX`]) whatever a source answers.
 #[async_trait::async_trait]
 pub trait RetainedJobSource: Send + Sync {
     /// What this owner committed about `producer`'s job `job_id`.
@@ -1278,8 +1279,9 @@ pub trait RetainedJobSource: Send + Sync {
     /// hold it, and its delivery row is not acknowledged yet. Every drain
     /// that finds the row admitted reports it, a retry after a crash or a
     /// failure included, so one admission can be reported more than once.
-    /// `Err` leaves the row unacknowledged (blocked, and retried on a later
-    /// wake), never refused. The default records nothing.
+    /// `Err` leaves the row unacknowledged (blocked, with the rows behind it
+    /// for the same address, and retried on a later wake), never refused.
+    /// The default records nothing.
     async fn admission_committed(
         &self,
         producer: &ContinuationProducer,
