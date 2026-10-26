@@ -1852,8 +1852,10 @@ async fn a_failed_consent_settlement_refuses_the_internal_registration_before_an
 
 /// The host drops its claim between the settlement and its registration:
 /// the lineage the settlement completed ends with it. The next grant is not
-/// a join; its registration owes, and the consent owner settles, a new
-/// owner loss with a new proof.
+/// a join; its registration owes, and the consent owner settles, the owner
+/// loss of the new lineage, a second settlement. A proof names the hosting
+/// domain, the session and how the claim was acquired, not the lineage, so
+/// the second settlement's proof can equal the first.
 #[tokio::test]
 async fn a_dropped_claim_ends_the_lineage_the_settlement_completed() {
     let host = Host::head_canonical();
@@ -1887,12 +1889,12 @@ async fn a_dropped_claim_ends_the_lineage_the_settlement_completed() {
         .await
         .expect("the session registers under the new lineage");
     let settled_proofs = owner.settled.lock().unwrap().clone();
-    assert_eq!(settled_proofs.len(), 2, "{settled_proofs:?}");
-    assert_eq!(settled_proofs[0], first);
-    assert_ne!(
-        settled_proofs[1], first,
-        "the new lineage's registration settled its own owner loss"
+    assert_eq!(
+        settled_proofs.len(),
+        2,
+        "the new lineage's registration settled its own owner loss: {settled_proofs:?}"
     );
+    assert_eq!(settled_proofs[0], first);
 }
 
 // ---------------------------------------------------------------------------
