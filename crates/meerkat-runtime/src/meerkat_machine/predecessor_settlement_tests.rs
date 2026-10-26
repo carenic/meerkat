@@ -1415,9 +1415,14 @@ async fn a_tail_an_earlier_start_committed_has_its_batch_converged() {
 
 /// A settlement that stopped after its internal registration wrote the
 /// lifecycle row with the placement witness (clean, unbound) and before its
-/// sweep: the repeat's begin takes the placement from the witness, the
-/// sweep places the directed input's outbox by it and writes the row back
-/// without it.
+/// sweep: the repeat's begin takes the placement from the witness, and the
+/// sweep places the directed input's outbox by it, the whole witness
+/// (runtime id, fence, generation and epoch), and writes the row back
+/// without it. The drain then adopts the outbox on the internal
+/// registration's unplaced shell before it publishes: the generated
+/// adoption keeps the outbox's runtime id, fence and generation there and
+/// re-stamps its epoch with the shell's own, as for every outbox an
+/// unplaced shell adopts.
 #[tokio::test]
 async fn a_repeat_takes_the_placement_from_the_witness_a_stopped_settlement_left() {
     let host = Host::head_canonical();
@@ -1433,32 +1438,80 @@ async fn a_repeat_takes_the_placement_from_the_witness_a_stopped_settlement_left
     let claim = host.claim(&session_id);
     let publisher = Arc::new(RecordingPublisher::default());
 
-    let settled = settle_whole(&host, &claim, &publisher).await;
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins from the witness");
+    assert!(
+        host.machine
+            .settle_predecessor_tail_with_lease(&mut lease)
+            .await
+            .expect("the drive answers")
+            .is_some()
+    );
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep commits");
+    assert_eq!(work.ended, vec![d2.id().clone()]);
+    let rows = host.rows(&session_id).await;
+    let staged = stored_row(&rows, &d2)
+        .state
+        .interaction_terminal_outbox
+        .clone()
+        .expect("the sweep staged the directed input's outbox");
+    assert_eq!(
+        (
+            staged.owner_agent_runtime_id.as_deref(),
+            staged.owner_fence_token,
+            staged.owner_runtime_generation,
+            staged.owner_runtime_epoch_id.as_deref(),
+        ),
+        (
+            Some(PLACED_RUNTIME),
+            Some(PLACED_FENCE),
+            Some(PLACED_GENERATION),
+            Some(PLACED_EPOCH),
+        ),
+        "the sweep places the outbox by the whole witness"
+    );
+    assert_eq!(host.placement_witness(&session_id).await, None);
 
-    assert!(settled.tail.is_some());
-    assert_eq!(settled.work.ended, vec![d2.id().clone()]);
-    let publication = settled
-        .publication
+    let publication = host
+        .machine
+        .finish_predecessor_settlement_before(
+            lease,
+            Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>,
+            deadline(),
+        )
+        .await
         .expect("the census finds every row closed");
     assert_eq!(
         settled_input(&publication, &d2).settled_by,
         SettledBy::Ended
     );
+    assert_eq!(publisher.events().len(), 1);
     let rows = host.rows(&session_id).await;
-    let outbox = stored_row(&rows, &d2)
+    let published = stored_row(&rows, &d2)
         .state
         .interaction_terminal_outbox
         .as_ref()
-        .expect("the directed input's outbox");
+        .expect("the published outbox stays with its row");
     assert_eq!(
-        outbox.owner_agent_runtime_id.as_deref(),
-        Some(PLACED_RUNTIME)
+        (
+            published.owner_agent_runtime_id.as_deref(),
+            published.owner_fence_token,
+            published.owner_runtime_generation,
+        ),
+        (
+            Some(PLACED_RUNTIME),
+            Some(PLACED_FENCE),
+            Some(PLACED_GENERATION),
+        ),
+        "the adoption keeps the witness's runtime id, fence and generation"
     );
-    assert_eq!(outbox.owner_fence_token, Some(PLACED_FENCE));
-    assert_eq!(outbox.owner_runtime_generation, Some(PLACED_GENERATION));
-    assert_eq!(outbox.owner_runtime_epoch_id.as_deref(), Some(PLACED_EPOCH));
-    assert_eq!(publisher.events().len(), 1);
-    assert_eq!(host.placement_witness(&session_id).await, None);
 }
 
 /// A terminal row a migration left without its receipt (the marker set) is
