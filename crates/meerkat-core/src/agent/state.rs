@@ -15750,6 +15750,42 @@ mod tests {
         );
     }
 
+    /// A compactor that fires at every boundary from the run's round
+    /// boundary on, over a run whose one round is huge. The first attempt
+    /// folds the earlier run; at every later boundary the rows before the
+    /// run hold no turn and the run's only round is its newest, so each
+    /// attempt is skipped before its summary call: one summary request, not
+    /// one per boundary, and the run finishes with its round intact.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_huge_newest_round_alone_does_not_compact_every_boundary() {
+        let client = Arc::new(RoundsClient::new(1));
+        let dispatcher = Arc::new(LargeListingDispatcher::new(600_000));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(FoldingCompactor::at(|boundary| boundary >= 2)))
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent.run("second".into()).await.unwrap();
+
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "only the fold of the earlier run asks for a summary"
+        );
+        assert_eq!(dispatcher.dispatches(), 1, "the tool ran once");
+        let transcript = agent.session().messages().to_vec();
+        assert_eq!(
+            (
+                rows_where(&transcript, is_tool_call).len(),
+                rows_where(&transcript, is_tool_results).len(),
+            ),
+            (1, 1),
+            "the run's round stays"
+        );
+    }
+
     /// A long single run on a fresh session compacts at every round
     /// boundary. Nothing comes before the run, so after its first round
     /// (its newest, nothing to fold) each compaction folds the run's
