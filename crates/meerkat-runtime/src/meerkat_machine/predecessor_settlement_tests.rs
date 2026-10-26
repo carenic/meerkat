@@ -3126,9 +3126,10 @@ async fn every_live_caller_is_refused_while_the_settlement_task_holds_the_regist
 
 /// A settlement task that panics frees its slot and tells its waiters: the
 /// finish answers at once that the task ended without a result, and a later
-/// begin answers at once (`Registered`: the panic left the internal
-/// registration in place) instead of waiting out its deadline on a slot no
-/// task would free.
+/// begin answers at once instead of waiting out its deadline on a slot no
+/// task would free. It answers `UnregisterInProgress`: the panic left the
+/// marked internal registration in place, which refuses every registration
+/// and repeat until the process exits.
 #[tokio::test]
 async fn a_panicking_settlement_task_frees_its_slot() {
     let host = Host::head_canonical();
@@ -3173,7 +3174,10 @@ async fn a_panicking_settlement_task_frees_its_slot() {
         .await
         .expect_err("the panic left the internal registration in place");
     assert!(
-        matches!(later, PredecessorSettlementRefusal::Registered),
+        matches!(
+            later,
+            PredecessorSettlementRefusal::Runtime(RuntimeDriverError::UnregisterInProgress { .. })
+        ),
         "{later:?}"
     );
     assert!(

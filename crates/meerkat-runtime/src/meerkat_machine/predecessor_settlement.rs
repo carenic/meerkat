@@ -453,7 +453,10 @@ pub(super) struct PendingPredecessorSettlement {
 
 /// A running settlement task's hold on its slot: dropped when the task ends,
 /// by return or by panic, it frees the slot (when it is still the task's)
-/// and tells every waiter.
+/// and tells every waiter. A task that panics before its exact removal
+/// leaves the marked internal registration in place: it refuses every
+/// registration and every repeat of the settlement (`UnregisterInProgress`)
+/// until the process exits.
 struct PredecessorSettlementSlot {
     machine: MeerkatMachine,
     session_id: SessionId,
