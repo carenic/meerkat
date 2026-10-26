@@ -1595,6 +1595,7 @@ where
                     ));
                 }
                 self.latest_run_checkpoint_receipt = Some(next);
+                self.note_tail_carries_pending_compaction();
                 // The checkpoint moved the durable head over every rewrite the
                 // run made, so the live history retires to the retention now
                 // instead of at the next compaction. The boundary commit that
@@ -2109,9 +2110,25 @@ where
             ));
         }
         self.latest_run_checkpoint_receipt = Some(receipt);
+        self.note_tail_carries_pending_compaction();
         self.round_commits.rewritten_since_base = false;
         self.round_commits.rebased = true;
         Ok(())
+    }
+
+    /// A run checkpoint just wrote the live session, so the run's provisional
+    /// tail now carries a pending compaction's rewrite and intents: the
+    /// tail's settlement, not an abort, decides them from here (see
+    /// [`Self::abort_uncommitted_compaction_projections`]).
+    fn note_tail_carries_pending_compaction(&mut self) {
+        if let Some(transaction) = self.compaction_transaction.as_mut()
+            && matches!(
+                &transaction.phase,
+                crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(_)
+            )
+        {
+            transaction.tail_carries_rewrite = true;
+        }
     }
 
     /// End the run's resumability at an exit that took no end-of-run save.
@@ -5017,6 +5034,21 @@ where
                                                                 // Stage is durable but invisible;
                                                                 // completion belongs to runtime
                                                                 // atomic_apply + finalization.
+                                                                // The intents the session already
+                                                                // carried (a run resumed from a
+                                                                // tail that holds an earlier
+                                                                // rewrite's intent) commit with
+                                                                // this one at the run's boundary.
+                                                                let carried_projections = self
+                                                                    .session
+                                                                    .validated_compaction_projection_intents()
+                                                                    .map(|intents| {
+                                                                        intents
+                                                                            .into_iter()
+                                                                            .map(|intent| intent.projection)
+                                                                            .collect::<Vec<_>>()
+                                                                    })
+                                                                    .unwrap_or_default();
                                                                 let adopted = match self
                                                                     .compaction_transaction
                                                                     .as_mut()
@@ -5036,6 +5068,8 @@ where
                                                                     None => {
                                                                         self.compaction_transaction =
                                                                             Some(crate::agent::CompactionTransaction {
+                                                                                carried_projections,
+                                                                                tail_carries_rewrite: false,
                                                                                 phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(
                                                                                     Box::new(rollback_state),
                                                                                 ),
@@ -5551,9 +5585,11 @@ where
             )
         })?;
 
+        // Every projection here is a row the runtime store committed: the
+        // coordinator fences a stale executor but needs no bound placement.
         for projection in projections {
             coordinator
-                .authorize_projection(projection)
+                .authorize_committed_projection(projection)
                 .map_err(|error| AgentError::InternalError(error.to_string()))?;
         }
         for projection in projections {
@@ -5648,7 +5684,7 @@ where
                             bookkeeping_complete: true
                         }
                     ) && Self::exact_compaction_projection_set(
-                        &transaction.projections,
+                        &transaction.committed_projections(),
                         projections,
                     )
                 });
@@ -5666,14 +5702,16 @@ where
         &mut self,
         intents: &[crate::memory::CompactionProjectionIntent],
     ) -> Result<(), AgentError> {
+        // The live transaction's own projections, and the intents the session
+        // already carried when it began: the run's boundary commits both.
         let live_transaction = match self.compaction_transaction.as_ref() {
             Some(transaction) => match &transaction.phase {
                 crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(_) => {
-                    Some((transaction.projections.clone(), false))
+                    Some((transaction.committed_projections(), false))
                 }
                 crate::agent::CompactionTransactionPhase::RuntimeCommitted {
                     bookkeeping_complete,
-                } => Some((transaction.projections.clone(), *bookkeeping_complete)),
+                } => Some((transaction.committed_projections(), *bookkeeping_complete)),
                 crate::agent::CompactionTransactionPhase::AbortPending { .. } => {
                     return Err(AgentError::InternalError(
                         "runtime compaction outbox cannot commit an abort-pending transaction"
@@ -5716,9 +5754,13 @@ where
                         .to_string(),
                 )
             })?;
+            // The outbox names only rows a runtime commit inserted. A revived
+            // mob member reconciles them at its startup, before the routed
+            // binding places its runtime, so this authorization needs the
+            // live session and epoch but no bound placement.
             for projection in &projections {
                 coordinator
-                    .authorize_projection(projection)
+                    .authorize_committed_projection(projection)
                     .map_err(|error| AgentError::InternalError(error.to_string()))?;
             }
         }
@@ -5780,7 +5822,31 @@ where
     /// open. Rollback is applied exactly once, then represented as
     /// `AbortPending`; retries perform cleanup only and never reapply usage or
     /// cadence deltas. RuntimeCommitted is permanently commit-only.
+    ///
+    /// Once a run checkpoint wrote the rewrite into the run's provisional
+    /// tail, the transaction is released instead: the rewrite and its stages
+    /// are left as they stand. The tail's settlement decides them (an
+    /// interrupted run's tail is committed with the intents, which the next
+    /// reconciliation finalizes; a discarded tail leaves the stages as
+    /// orphans, which a later reconciliation aborts). Restoring the rollback
+    /// image or aborting the stages here would leave a committed intent
+    /// without its stage.
     pub async fn abort_uncommitted_compaction_projections(&mut self) -> Result<(), AgentError> {
+        if self
+            .compaction_transaction
+            .as_ref()
+            .is_some_and(|transaction| {
+                transaction.tail_carries_rewrite
+                    && matches!(
+                        &transaction.phase,
+                        crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(_)
+                    )
+            })
+        {
+            // Only a stage still in flight, which no session or tail holds,
+            // is cleaned up below.
+            self.compaction_transaction = None;
+        }
         let rollback_state = self
             .compaction_transaction
             .as_ref()
@@ -13964,6 +14030,290 @@ mod tests {
         );
     }
 
+    /// A run resumed from a provisional tail that carries an earlier
+    /// rewrite's intent compacts again before its boundary. The new
+    /// compaction opens its own transaction while the session already
+    /// carries the earlier intent, and the run's boundary commits both: the
+    /// outbox names the earlier intent and the new one. The reconciliation
+    /// accepts that set, finalizes both stages, and removes both intents.
+    /// RED before: the live transaction expected only its own projection
+    /// and refused with "does not exactly match the live transaction
+    /// (expected 1, received 2)".
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_resumed_runs_second_compaction_commits_with_the_carried_intent() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let client = Arc::new(CompactionTerminalLlmClient::new(
+            PostCompactionOutcome::CallbackPending,
+        ));
+        // The session as seeded from the run's tail: it carries an earlier
+        // rewrite's intent, whose stage is still staged, and no transaction.
+        let mut session = crate::Session::new();
+        let carried = append_abort_test_projection(&mut session, "carried");
+        memory_store.staged.lock().unwrap().push(carried.clone());
+        let session_id = session.id().clone();
+        let mut agent = with_test_turn_state_handle_for_session(AgentBuilder::new(), session)
+            .compactor(Arc::new(DiscardingCompactor::new(1)))
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(Arc::new(AllowCompactionCoordinator { session_id }))
+            .build_standalone(
+                client,
+                Arc::new(CallbackPendingTools::new()),
+                Arc::new(NoopStore),
+            )
+            .await;
+        assert!(agent.compaction_transaction.is_none());
+
+        agent.run("first".into()).await.unwrap();
+        let error = agent.run("second".into()).await.unwrap_err();
+        assert!(matches!(error, AgentError::CallbackPending { .. }));
+        let intents = agent
+            .session()
+            .validated_compaction_projection_intents()
+            .unwrap();
+        assert_eq!(
+            intents.len(),
+            2,
+            "the session carries the earlier intent and the new one"
+        );
+        assert!(
+            intents.iter().any(|intent| intent.projection == carried),
+            "the earlier intent is still carried"
+        );
+
+        agent
+            .reconcile_runtime_compaction_projections(&intents)
+            .await
+            .expect("the boundary's outbox names both intents, and both commit");
+        assert!(agent.compaction_transaction.is_none());
+        assert!(
+            agent
+                .session()
+                .validated_compaction_projection_intents()
+                .unwrap()
+                .is_empty(),
+            "both intents are removed"
+        );
+        let finalized = memory_store.finalized.lock().unwrap().clone();
+        assert_eq!(
+            finalized.len(),
+            2,
+            "both stages are finalized: {finalized:?}"
+        );
+        assert!(finalized.contains(&carried));
+    }
+
+    /// A run checkpoint wrote a pending compaction's rewrite and intent into
+    /// the run's provisional tail, and then the run is interrupted. The abort
+    /// releases the transaction and leaves the rewrite, the intent and the
+    /// stage as they stand: the tail is committed as an interrupted run with
+    /// the intent, and the next reconciliation finalizes it once. RED before:
+    /// the abort restored the pre-compaction image and aborted the stage, so
+    /// the committed intent's finalization failed for a missing stage.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_abort_leaves_a_compaction_its_runs_tail_carries() {
+        let memory_store = Arc::new(AbortRetryMemoryStore::new());
+        let session = crate::Session::new();
+        let session_id = session.id().clone();
+        let mut agent = with_test_turn_state_handle_for_session(AgentBuilder::new(), session)
+            .memory_store(memory_store.clone())
+            .with_compaction_commit_coordinator(Arc::new(AllowCompactionCoordinator { session_id }))
+            .build_standalone(
+                Arc::new(StaticLlmClient),
+                Arc::new(NoTools),
+                Arc::new(NoopStore),
+            )
+            .await;
+        let rollback_session = agent.session().clone();
+        let rollback_last_input_tokens = agent.last_input_tokens;
+        let rollback_compaction_cadence = agent.compaction_cadence.clone();
+        let projection = append_abort_test_projection(agent.session_mut(), "tail-carried");
+        memory_store.staged.lock().unwrap().push(projection.clone());
+        agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: true,
+            phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
+                crate::agent::CompactionRollbackState {
+                    rollback_session,
+                    rollback_last_input_tokens,
+                    rollback_compaction_cadence,
+                    rollback_durable_row_floor: 0,
+                    rollback_durable_boundary_apply_ordinal: 0,
+                },
+            )),
+            projections: vec![projection.clone()],
+        });
+
+        agent
+            .abort_uncommitted_compaction_projections()
+            .await
+            .expect("the interrupted run's abort releases the tail-carried compaction");
+        assert!(agent.compaction_transaction.is_none());
+        assert!(
+            memory_store.aborted.lock().unwrap().is_empty(),
+            "the stage the tail's intent names is kept"
+        );
+        let intents = agent
+            .session()
+            .validated_compaction_projection_intents()
+            .unwrap();
+        assert_eq!(
+            intents
+                .iter()
+                .map(|intent| &intent.projection)
+                .collect::<Vec<_>>(),
+            vec![&projection],
+            "the session keeps the rewrite and the intent, as the tail does"
+        );
+
+        agent
+            .reconcile_runtime_compaction_projections(&intents)
+            .await
+            .expect("the committed tail's intent finalizes");
+        assert!(
+            agent
+                .session()
+                .validated_compaction_projection_intents()
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(*memory_store.finalized.lock().unwrap(), vec![projection]);
+    }
+
+    /// A checkpointer that issues a receipt for every write, as a store keeps
+    /// a run's provisional tail, and re-bases runs.
+    #[cfg(feature = "workspace-tests")]
+    struct TailWritingCheckpointer;
+
+    #[cfg(feature = "workspace-tests")]
+    #[async_trait]
+    impl crate::SessionCheckpointer for TailWritingCheckpointer {
+        async fn checkpoint_run(
+            &self,
+            session: &mut crate::Session,
+            run_id: &RunId,
+            previous: Option<&crate::RunCheckpointReceipt>,
+        ) -> Result<Option<crate::RunCheckpointReceipt>, AgentError> {
+            let sequence = previous.map_or(1, |previous| previous.candidate_sequence() + 1);
+            Ok(Some(tail_receipt(session, run_id, sequence)))
+        }
+
+        fn rebases_runs(&self) -> bool {
+            true
+        }
+
+        async fn rebase_run(
+            &self,
+            session: &mut crate::Session,
+            run_id: &RunId,
+            _previous: Option<&crate::RunCheckpointReceipt>,
+        ) -> Result<crate::RunCheckpointReceipt, AgentError> {
+            Ok(tail_receipt(session, run_id, 1))
+        }
+    }
+
+    #[cfg(feature = "workspace-tests")]
+    fn tail_receipt(
+        session: &crate::Session,
+        run_id: &RunId,
+        sequence: u64,
+    ) -> crate::RunCheckpointReceipt {
+        let authority = crate::HeadCanonicalProvisionalTailAuthority::issued(
+            session.id().clone(),
+            1,
+            "committed-head".to_string(),
+            1 + sequence,
+            format!("provisional-head-{sequence}"),
+            run_id.clone(),
+            sequence,
+        )
+        .unwrap();
+        crate::RunCheckpointReceipt::issued(
+            crate::RunCheckpointAuthority::HeadCanonical(authority),
+            format!("digest-{sequence}"),
+            session.messages().len() as u64,
+        )
+        .unwrap()
+    }
+
+    /// Both writes that put the live session into a run's provisional tail,
+    /// an ordinary run checkpoint and a re-base (a session recovered only
+    /// from strict continuations, after a rewrite), mark a compaction that
+    /// awaits the runtime commit as carried by the tail, so a later abort
+    /// leaves its rewrite and its stage to the tail's settlement.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn every_tail_write_marks_the_pending_compaction_it_carries() {
+        for rebase in [false, true] {
+            let memory_store = Arc::new(AbortRetryMemoryStore::new());
+            let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+                .memory_store(memory_store.clone())
+                .with_checkpointer(Arc::new(TailWritingCheckpointer))
+                .build_standalone(
+                    Arc::new(StaticLlmClient),
+                    Arc::new(NoTools),
+                    Arc::new(NoopStore),
+                )
+                .await;
+            let rollback_session = agent.session().clone();
+            let rollback_last_input_tokens = agent.last_input_tokens;
+            let rollback_compaction_cadence = agent.compaction_cadence.clone();
+            let projection = append_abort_test_projection(agent.session_mut(), "written");
+            memory_store.staged.lock().unwrap().push(projection.clone());
+            agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+                carried_projections: Vec::new(),
+                tail_carries_rewrite: false,
+                phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
+                    crate::agent::CompactionRollbackState {
+                        rollback_session,
+                        rollback_last_input_tokens,
+                        rollback_compaction_cadence,
+                        rollback_durable_row_floor: 0,
+                        rollback_durable_boundary_apply_ordinal: 0,
+                    },
+                )),
+                projections: vec![projection.clone()],
+            });
+
+            let run_id = RunId::new();
+            if rebase {
+                agent.write_round_rebase(&run_id).await.unwrap();
+            } else {
+                agent
+                    .write_session_checkpoint(&run_id, super::SessionSaveDurability::Required)
+                    .await
+                    .unwrap();
+            }
+            assert!(
+                agent
+                    .compaction_transaction
+                    .as_ref()
+                    .is_some_and(|transaction| transaction.tail_carries_rewrite),
+                "rebase={rebase}: the tail write marks the pending compaction"
+            );
+
+            agent
+                .abort_uncommitted_compaction_projections()
+                .await
+                .unwrap();
+            assert!(agent.compaction_transaction.is_none(), "rebase={rebase}");
+            assert!(
+                memory_store.aborted.lock().unwrap().is_empty(),
+                "rebase={rebase}: the stage is left to the tail's settlement"
+            );
+            assert_eq!(
+                agent
+                    .session()
+                    .validated_compaction_projection_intents()
+                    .unwrap()
+                    .len(),
+                1,
+                "rebase={rebase}: the rewrite and its intent are not rolled back"
+            );
+        }
+    }
+
     fn append_abort_test_projection(
         session: &mut crate::Session,
         label: &str,
@@ -14063,6 +14413,8 @@ mod tests {
         assert_eq!(reported_before_abort.cache_creation_tokens, Some(0));
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 crate::agent::CompactionRollbackState {
                     rollback_session,
@@ -14123,6 +14475,8 @@ mod tests {
         let projection = append_abort_test_projection(agent.session_mut(), "legacy-noop-abort");
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 crate::agent::CompactionRollbackState {
                     rollback_session,
@@ -14189,6 +14543,8 @@ mod tests {
         agent.compaction_cadence.last_rewrite_history_tokens = Some(999);
         memory_store.staged.lock().unwrap().push(projection.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 crate::agent::CompactionRollbackState {
                     rollback_session,
@@ -14282,6 +14638,8 @@ mod tests {
         let first = append_abort_test_projection(agent.session_mut(), "first");
         let second = append_abort_test_projection(agent.session_mut(), "second");
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 crate::agent::CompactionRollbackState {
                     rollback_session,
@@ -14408,6 +14766,8 @@ mod tests {
             .extend([first.clone(), second.clone()]);
         *memory_store.finalize_fail_once.lock().unwrap() = Some(second.clone());
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 rollback,
             )),
@@ -14490,6 +14850,8 @@ mod tests {
             .validated_compaction_projection_intents()
             .unwrap();
         agent.compaction_transaction = Some(crate::agent::CompactionTransaction {
+            carried_projections: Vec::new(),
+            tail_carries_rewrite: false,
             phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
                 rollback,
             )),

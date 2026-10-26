@@ -219,6 +219,21 @@ pub trait CompactionCommitCoordinator: Send + Sync {
         &self,
         projection: &CompactionProjectionId,
     ) -> Result<(), CompactionCommitCoordinationError>;
+
+    /// Authorize finalizing `projection`, whose transcript rewrite the
+    /// runtime store already committed: its outbox row exists only because a
+    /// commit inserted it, so the row is the commit authority, and the
+    /// finalization is idempotent. A coordinator still fences a stale
+    /// executor here, but need not require a bound runtime placement, which
+    /// a revived member gets only after its startup has reconciled.
+    ///
+    /// Defaults to [`Self::authorize_projection`].
+    fn authorize_committed_projection(
+        &self,
+        projection: &CompactionProjectionId,
+    ) -> Result<(), CompactionCommitCoordinationError> {
+        self.authorize_projection(projection)
+    }
 }
 
 /// Typed cause of a compaction projection-handoff refusal.

@@ -587,6 +587,8 @@ fn uncommitted_compaction_rollback(
     rollback_durable_boundary_apply_ordinal: u64,
 ) -> crate::agent::CompactionTransaction {
     crate::agent::CompactionTransaction {
+        carried_projections: Vec::new(),
+        tail_carries_rewrite: false,
         phase: crate::agent::CompactionTransactionPhase::AwaitingRuntimeCommit(Box::new(
             crate::agent::CompactionRollbackState {
                 rollback_session,

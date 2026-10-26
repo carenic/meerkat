@@ -582,8 +582,9 @@ pub(crate) enum EmptyOutboxCheckpoint {
     /// second full-document cycle after EVERY successful persisted turn, for
     /// nothing. Two obligations are still preserved on this path:
     /// - the executor reconciliation still runs with the exact empty
-    ///   authority set — the durable memory store uses it to abort stages
-    ///   left by a crash before `RuntimeStore::atomic_apply`;
+    ///   authority set, unless a run's provisional tail stands: the durable
+    ///   memory store uses it to abort stages left by a crash before
+    ///   `RuntimeStore::atomic_apply`;
     /// - the SessionStore compatibility projection is still refreshed, by
     ///   the caller's own fallback over the in-memory committed bytes, which
     ///   are exactly what a reload would return under the turn's held driver
@@ -595,8 +596,8 @@ pub(crate) enum EmptyOutboxCheckpoint {
     /// projection leaves a stale compatibility row that only this refresh
     /// heals, and these callers discard the returned checkpoint, so no
     /// fallback would project it. While a run's provisional tail stands, the
-    /// refresh waits for the run's boundary instead (see
-    /// `reconcile_loaded_compaction_projection_outbox`).
+    /// whole reconciliation, refresh included, waits for the tail to settle
+    /// instead (see `reconcile_loaded_compaction_projection_outbox`).
     RefreshFromStore,
 }
 
@@ -618,9 +619,59 @@ pub(crate) async fn reconcile_loaded_compaction_projection_outbox(
     intents: Vec<meerkat_core::CompactionProjectionIntent>,
     empty_outbox: EmptyOutboxCheckpoint,
 ) -> Result<Option<Arc<Vec<u8>>>, crate::RuntimeDriverError> {
-    // Always invoke the executor, including for an empty outbox: the durable
-    // memory store uses the exact empty authority set to abort stages left by
-    // a crash before RuntimeStore::atomic_apply.
+    // A run's provisional tail stands over the committed base: a run resumed
+    // from it, a run kept across a requeue stop, or a run whose round
+    // commits a crash or an abnormal exit left. The tail can carry the
+    // compaction projection intents of a rewrite inside the run: they reach
+    // the outbox only when the tail is committed (at the run's boundary, or
+    // by a recovery that commits it as interrupted), and leave with it when
+    // it is discarded. Until the tail settles, nothing here touches them or
+    // their memory stages:
+    // - the executor's reconciliation would refuse the live session's
+    //   tail-carried intents as missing from the outbox, would finalize
+    //   nothing that is committed, and for an empty outbox would abort the
+    //   stages the tail still owns;
+    // - a WholeBlob refresh is refused by the store under the tail, and its
+    //   checkpoint would replace the resumed actor's image with the committed
+    //   base, which lacks the run's rounds;
+    // - a finalization re-issues the committed authority under the tail, so
+    //   the tail's base no longer matches and the run's next round commit and
+    //   its promotion are refused.
+    // The run's boundary promotes the tail, and the per-run reconciliation
+    // after it finalizes the intents once. Stages a crash left without any
+    // intent are aborted by the first reconciliation after the tail settles.
+    let tail = {
+        let driver = driver.lock().await;
+        let tail_run = driver.provisional_tail_run().await?;
+        tail_run.map(|run_id| {
+            let owned = driver.resumable_run_id().as_ref() == Some(&run_id)
+                || driver.current_run_id().as_ref() == Some(&run_id);
+            (run_id, owned)
+        })
+    };
+    if let Some((run_id, owned)) = tail {
+        if owned {
+            tracing::debug!(
+                %run_id,
+                intents = intents.len(),
+                "compaction projection reconciliation deferred while the run's provisional tail stands"
+            );
+        } else {
+            // Neither the marked run nor the current one owns this tail: a run
+            // that ended without resuming left it, and its settlement did not
+            // repair it. The next registration's recovery repairs it; until
+            // then nothing reconciles, refreshes or finalizes.
+            tracing::warn!(
+                %run_id,
+                intents = intents.len(),
+                "compaction projection reconciliation deferred under a provisional tail no live run owns"
+            );
+        }
+        return Ok(None);
+    }
+    // With no tail standing, always invoke the executor, including for an
+    // empty outbox: the durable memory store uses the exact empty authority
+    // set to abort stages left by a crash before RuntimeStore::atomic_apply.
     executor
         .reconcile_committed_compaction_projections(&intents)
         .await
@@ -638,48 +689,6 @@ pub(crate) async fn reconcile_loaded_compaction_projection_outbox(
         // in-memory fallback projection instead; see
         // [`EmptyOutboxCheckpoint::SkipIdentityRefresh`] for the two
         // obligations this path keeps.
-        return Ok(None);
-    }
-    // A run's provisional tail stands over the committed base: a run resumed
-    // from it, a run kept across a requeue stop, or a run whose round
-    // commits a crash or an abnormal exit left. The outboxed intents' stages
-    // are kept by the reconciliation above, and nothing else happens here
-    // while the tail stands:
-    // - a WholeBlob refresh is refused by the store under the tail, and its
-    //   checkpoint would replace the resumed actor's image with the committed
-    //   base, which lacks the run's rounds;
-    // - a finalization re-issues the committed authority under the tail, so
-    //   the tail's base no longer matches and the run's next round commit and
-    //   its promotion are refused.
-    // The run's boundary promotes the tail, and the per-run reconciliation
-    // after it finalizes the intents once.
-    let tail = {
-        let driver = driver.lock().await;
-        let tail_run = driver.provisional_tail_run().await?;
-        tail_run.map(|run_id| {
-            let owned = driver.resumable_run_id().as_ref() == Some(&run_id)
-                || driver.current_run_id().as_ref() == Some(&run_id);
-            (run_id, owned)
-        })
-    };
-    if let Some((run_id, owned)) = tail {
-        if owned {
-            tracing::debug!(
-                %run_id,
-                intents = intents.len(),
-                "compaction projection refresh deferred while the run's provisional tail stands"
-            );
-        } else {
-            // Neither the marked run nor the current one owns this tail: a run
-            // that ended without resuming left it, and its settlement did not
-            // repair it. The next registration's recovery repairs it; until
-            // then nothing refreshes or finalizes.
-            tracing::warn!(
-                %run_id,
-                intents = intents.len(),
-                "compaction projection refresh deferred under a provisional tail no live run owns"
-            );
-        }
         return Ok(None);
     }
     let persistence_profile = {
@@ -937,7 +946,10 @@ async fn publish_committed_session_boundary(
 /// none of the boundary writes visible. Startup also drains every previously
 /// committed projection outbox before admitting work. Consequently no durable
 /// authority can retain the live transcript, context events, or compaction
-/// stages produced by this failed run: they must all be aborted.
+/// stages produced by this failed run: they must all be aborted. The one
+/// exception is a compaction a run checkpoint already wrote into the run's
+/// provisional tail: the agent leaves that rewrite and its stages to the
+/// tail's settlement, which may still commit them.
 async fn abort_rejected_run_projections_after_commit_failure(
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
 ) -> Result<(), crate::RuntimeDriverError> {

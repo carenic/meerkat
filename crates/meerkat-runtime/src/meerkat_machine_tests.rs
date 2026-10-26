@@ -55377,11 +55377,20 @@ async fn empty_compaction_outbox_skips_the_identity_checkpoint_cycle_after_commi
 
 /// While a run's provisional tail stands over the committed WholeBlob base (a
 /// run resumed from it, or kept across a requeue stop), the startup and
-/// teardown reconciliation keeps the outboxed intents' stages and does nothing
-/// else: no reload, no recommit (the store refuses one under the tail), no
-/// executor checkpoint (it would replace the resumed actor's image with the
-/// committed base) and no finalization. Once the tail is gone, the recovery
-/// form refreshes as before. Unrun: written while Cargo is not run.
+/// teardown reconciliation does nothing at all: it does not ask the executor
+/// to reconcile (the resumed actor's session can carry the tail's intents,
+/// which reach the outbox only when the tail is committed, and an empty
+/// outbox would abort stages the tail still owns), no reload, no recommit
+/// (the store refuses one under the tail), no executor checkpoint (it would
+/// replace the resumed actor's image with the committed base) and no
+/// finalization. Once the tail is gone, the recovery form reconciles and
+/// refreshes as before. RED before: the executor was asked to reconcile
+/// under the tail, and an agent whose session carried the tail's intent
+/// refused with "runtime compaction outbox omits a validated session
+/// projection intent", failing the startup. The driver owns no run here (no
+/// resumable or current run), the shape of an attachment that precedes the
+/// session's agent: there the executor's empty-outbox reconcile went to the
+/// durable memory owner, which aborted the tail's memory stage as an orphan.
 #[tokio::test]
 async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
     struct RecordingCompactionExecutor {
@@ -55494,8 +55503,9 @@ async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
     }
     assert_eq!(
         executor.reconcile_intent_counts,
-        vec![0, 0],
-        "the outboxed intents' stages are reconciled every time"
+        Vec::<usize>::new(),
+        "the executor is not asked to reconcile while the tail stands: the tail may carry \
+         intents the outbox does not hold yet, and stages it still owns"
     );
     assert_eq!(
         executor.checkpoint_calls, 0,
@@ -55534,6 +55544,11 @@ async fn compaction_reconciliation_defers_to_a_standing_provisional_tail() {
     .await
     .expect("the recovery form refreshes once no tail stands");
     assert!(checkpoint.is_some());
+    assert_eq!(
+        executor.reconcile_intent_counts,
+        vec![0],
+        "once no tail stands the executor reconciles the outbox"
+    );
     assert_eq!(executor.checkpoint_calls, 1);
     assert_eq!(store.session_snapshot_commits(), 1);
 }
