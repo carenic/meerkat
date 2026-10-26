@@ -19877,7 +19877,8 @@ impl MobActor {
     /// next start. The member's session must be local to this mob's runtime.
     /// A Stop that leaves runs running keeps it when the session commits each
     /// round; a Shutdown keeps it when its choice resolves to a requeue for
-    /// the session, which a session that commits each round gets by default.
+    /// the session, which a session that commits each round gets by default,
+    /// or to a keep.
     fn stop_keeps_durable_run(&self, entry: &RosterEntry, keep: AutonomousStopKeep) -> bool {
         #[cfg(feature = "runtime-adapter")]
         {
@@ -19894,6 +19895,7 @@ impl MobActor {
                         self.shutdown_queued_inputs
                             .unregister_queued_inputs(self.member_sessions_commit_each_round()),
                         meerkat_runtime::UnregisterQueuedInputs::Requeue { .. }
+                            | meerkat_runtime::UnregisterQueuedInputs::Keep
                     ),
                 }
         }

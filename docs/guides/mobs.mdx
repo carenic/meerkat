@@ -1392,6 +1392,17 @@ a bound under one millisecond, zero included, or over 24 hours with
 which ends every queued input as stopped and cancels running turns, as in
 0.9.4.
 
+`.with_queued_inputs(QueuedInputsOnShutdown::Keep)` hands the store back as
+the Shutdown found it, for a host that boots over a store another host
+serves, holds its members' run starts and admits nothing to them (a
+candidate launch). A member whose runtime registration served no live work
+keeps every input the registration recovered exactly as the store holds it,
+with no requeue mark, and the run its session left open, and an autonomous
+member's kickoff stays open: the next start recovers and resumes them as if
+this host had never run. A member whose registration served live work (an
+admitted input, a deduplicated resubmission or a recycled registration) is
+stopped, as under `Stop`.
+
 Under `Requeue` the Shutdown holds a member's run starts and does not cancel
 its running turn. The member's runtime stop suspends a run that commits
 every round at its last committed round: the run's inputs stay bound to it,

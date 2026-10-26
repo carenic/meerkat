@@ -691,7 +691,9 @@ impl ShutdownOptions {
     /// [`QueuedInputsOnShutdown::Requeue`] keeps only the eligible queued
     /// inputs: an input bound to an objective, such as a member's kickoff,
     /// still ends as stopped. [`QueuedInputsOnShutdown::Stop`] is the
-    /// behavior before 0.9.5.
+    /// behavior before 0.9.5. [`QueuedInputsOnShutdown::Keep`] leaves every
+    /// input as the store holds it, for a host that served its members
+    /// nothing.
     #[must_use]
     pub fn with_queued_inputs(mut self, queued_inputs: QueuedInputsOnShutdown) -> Self {
         self.queued_inputs = queued_inputs;
@@ -758,6 +760,24 @@ pub enum QueuedInputsOnShutdown {
     /// running turn is cancelled, before its runtime stops; that input then
     /// belongs to the cancelled run and is not kept.
     Requeue(RequeueMaxAge),
+    /// Leave every member's work exactly as the store holds it, for the next
+    /// start: the runtime unregister's
+    /// [`UnregisterQueuedInputs::Keep`](meerkat_runtime::UnregisterQueuedInputs::Keep).
+    /// For a host that boots over a store another host serves and must hand
+    /// it back unchanged, such as a candidate launch that holds every
+    /// member's run starts and admits nothing to them.
+    ///
+    /// For a member whose runtime registration served no live work (no input
+    /// was admitted to it, no resubmission was deduplicated and its
+    /// registration was not recycled), every input the registration
+    /// recovered from the store stays exactly as the store holds it, with no
+    /// requeue mark and no expiry, and a run its session left open stays
+    /// open: the next start recovers them again and resumes that run. An
+    /// autonomous member's kickoff stays open too, as under [`Self::Requeue`].
+    /// A member whose registration served live work is stopped instead, as
+    /// under [`Self::Stop`]: the keep is exact only for work this process
+    /// never touched.
+    Keep,
 }
 
 impl QueuedInputsOnShutdown {
@@ -780,6 +800,7 @@ impl QueuedInputsOnShutdown {
             Self::Requeue(max_age) => meerkat_runtime::UnregisterQueuedInputs::Requeue {
                 max_age: max_age.get(),
             },
+            Self::Keep => meerkat_runtime::UnregisterQueuedInputs::Keep,
         }
     }
 }

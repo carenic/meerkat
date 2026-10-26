@@ -1884,6 +1884,18 @@ async fn open_stop_host(
     client: &ScriptedClient,
     label: Option<&str>,
 ) -> StopHost {
+    open_stop_host_holding(root, client, label, &[]).await
+}
+
+/// [`open_stop_host`], with the run starts of the `held` members the resume
+/// restores held by their host (`ToolsNotPublished`): they register held and
+/// start no run.
+async fn open_stop_host_holding(
+    root: &std::path::Path,
+    client: &ScriptedClient,
+    label: Option<&str>,
+    held: &[AgentIdentity],
+) -> StopHost {
     let factory = meerkat::AgentFactory::new(root.join("factory-store"))
         .user_config_root(root.join("config"))
         .runtime_root(root.join("runtime"))
@@ -1951,6 +1963,10 @@ async fn open_stop_host(
                 .with_session_service(service.clone())
                 .with_default_llm_client(Arc::new(client.clone()))
                 .notify_orchestrator_on_resume(false)
+                .hold_restored_member_run_starts(
+                    crate::HostRunStartHoldReason::ToolsNotPublished,
+                    held.iter().cloned(),
+                )
                 .resume(),
         )
         .await
@@ -2890,6 +2906,196 @@ async fn keeps_a_queued_human_input_across_the_shutdown(
         .expect("mob shutdown");
 }
 
+/// Every durable input row of `session_id`'s runtime as its stored wire
+/// image, in input id order.
+async fn member_input_rows(
+    runtime_store: &Arc<dyn RuntimeStore>,
+    session_id: &SessionId,
+) -> Vec<(String, serde_json::Value)> {
+    let mut rows = runtime_store
+        .load_input_states(&LogicalRuntimeId::for_session(session_id))
+        .await
+        .expect("runtime-owned input rows")
+        .into_iter()
+        .map(|row| match row {
+            meerkat_runtime::store::InputStateRow::Decoded(stored) => (
+                stored.state.input_id.to_string(),
+                serde_json::to_value(&*stored).expect("the row's stored wire image"),
+            ),
+            meerkat_runtime::store::InputStateRow::Corrupt { input_id, detail } => {
+                panic!("input row {input_id} does not decode: {detail}")
+            }
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| left.0.cmp(&right.0));
+    rows
+}
+
+/// A Shutdown with `QueuedInputsOnShutdown::Keep` over a member whose
+/// registration served nothing hands the store back as it found it. The first
+/// process shuts down with a requeue while a turn runs and a second input
+/// waits behind it, so the store holds the member's open run and its requeued
+/// input. The second process restores the mob with the member's run starts
+/// held by its host, so the member's registration recovers both and runs
+/// nothing, and shuts down with Keep: every input row of the member is the
+/// same before and after it, and its model saw no request. The third process
+/// resumes the run and runs the queued input, once each.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it() {
+    use meerkat_runtime::input_state::InputLifecycleState;
+
+    let (_root, root_path) = stop_root();
+    let client = ScriptedClient::new(true);
+    let host = open_stop_host(&root_path, &client, Some("keep-shutdown")).await;
+    let mob_id = host.handle.mob_id().clone();
+    let (identity, session_id, entry) = spawn_stop_member(&host).await;
+
+    client.block();
+    let requests_before = client.requests().len();
+    let running_key = delivery("keep-running");
+    let running = start_stop_input(
+        &host,
+        &entry,
+        WorkSpec::new(HUMAN, WorkOrigin::External),
+        HandlingMode::Queue,
+        &running_key,
+    )
+    .await
+    .expect("running human admission");
+    client.wait_for_requests(requests_before + 1).await;
+    let running_id = admitted_input_id(&host.runtime_store, &session_id, &running_key).await;
+    let key = delivery("keep-queued-behind");
+    let spec = WorkSpec::new(QUEUED_HUMAN, WorkOrigin::External);
+    let queued = start_stop_input(&host, &entry, spec.clone(), HandlingMode::Queue, &key)
+        .await
+        .expect("queued human admission");
+    let input_id = admitted_input_id(&host.runtime_store, &session_id, &key).await;
+    tokio::time::timeout(
+        WAIT,
+        host.handle
+            .shutdown_with_report(requeue_options(crate::RequeueMaxAge::DEFAULT)),
+    )
+    .await
+    .expect("the requeue stop finishes")
+    .expect("requeue stop");
+    assert_eq!(
+        (
+            stop_answer(running, &session_id).await,
+            stop_answer(queued, &session_id).await,
+        ),
+        (
+            StopAnswer::RequeuedAcrossStop(running_id.clone()),
+            StopAnswer::RequeuedAcrossStop(input_id.clone()),
+        ),
+        "the first process keeps the running turn and the queued input"
+    );
+    let rows_before = member_input_rows(&host.runtime_store, &session_id).await;
+    let digests_before = (
+        stop_row(&host.runtime_store, &session_id, &running_key, &running_id)
+            .await
+            .digest,
+        stop_row(&host.runtime_store, &session_id, &key, &input_id)
+            .await
+            .digest,
+    );
+    drop(host);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The second process holds the member and serves it nothing.
+    let held_client = ScriptedClient::new(true);
+    let held = open_stop_host_holding(
+        &root_path,
+        &held_client,
+        None,
+        std::slice::from_ref(&identity),
+    )
+    .await;
+    let mut parks = held.adapter.run_start_held_parks();
+    // Hang guard only: the park is the positive event.
+    tokio::time::timeout(WAIT, parks.wait_for(|parks| *parks >= 1))
+        .await
+        .expect("the member's runtime loop parks on the hold")
+        .expect("park signal");
+    assert!(
+        held.adapter.resumable_run_id(&session_id).await.is_some(),
+        "the held registration keeps the open run marked"
+    );
+    tokio::time::timeout(
+        WAIT,
+        held.handle.shutdown_with_report(
+            crate::ShutdownOptions::default()
+                .with_queued_inputs(crate::QueuedInputsOnShutdown::Keep),
+        ),
+    )
+    .await
+    .expect("the keep stop finishes")
+    .expect("keep stop");
+    let rows_after = member_input_rows(&held.runtime_store, &session_id).await;
+    let digests_after = (
+        stop_row(&held.runtime_store, &session_id, &running_key, &running_id)
+            .await
+            .digest,
+        stop_row(&held.runtime_store, &session_id, &key, &input_id)
+            .await
+            .digest,
+    );
+    assert_eq!(
+        held_client.requests().len(),
+        0,
+        "the held member ran nothing"
+    );
+    assert_eq!(
+        (rows_after, digests_after),
+        (rows_before, digests_before),
+        "a keep stop of a registration that served nothing leaves every input row as it was"
+    );
+    drop(held);
+    await_supervisor_route_release(&mob_id).await;
+
+    // The third process runs the kept run and the queued input, once each.
+    let restarted_client = ScriptedClient::new(true);
+    let restarted = open_stop_host(&root_path, &restarted_client, None).await;
+    let after_restart = observe_requeued_after_restart(
+        &root_path,
+        &restarted,
+        &restarted_client,
+        (&key, &input_id, spec),
+        &identity,
+        &session_id,
+        QUEUED_HUMAN,
+    )
+    .await;
+    let running_phase = stop_row(
+        &restarted.runtime_store,
+        &session_id,
+        &running_key,
+        &running_id,
+    )
+    .await
+    .stored
+    .seed
+    .phase;
+    assert_eq!(
+        (after_restart, running_phase),
+        (
+            RequeuedAfterRestart {
+                replay: StopAnswer::Succeeded,
+                phase: InputLifecycleState::Consumed,
+                outcome: serde_json::json!({"outcome_type": "consumed"}),
+                payload_kept: false,
+                requests_carrying: 1,
+                runs_started: 1,
+            },
+            InputLifecycleState::Consumed,
+        ),
+        "the next start resumes the kept run and runs the queued input once"
+    );
+    tokio::time::timeout(WAIT, restarted.handle.shutdown())
+        .await
+        .expect("mob shutdown finishes")
+        .expect("mob shutdown");
+}
+
 /// A requeued input older than the requeue bound when the next start
 /// recovers it ends as expired instead of running: payload retired, no run,
 /// no model request, and a same-key replay answers the expiry. A later start
@@ -3789,7 +3995,8 @@ fn requeue_max_age_refuses_zero_and_over_the_cap() {
 
 /// The default Shutdown choice is `RequeueDurable`. It resolves per session:
 /// a requeue with the default bound for a session that commits each round
-/// durably, a stop for any other. An explicit choice applies as given.
+/// durably, a stop for any other. An explicit choice applies as given, and a
+/// keep is the runtime's keep for every session.
 #[test]
 fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
     use crate::{QueuedInputsOnShutdown, RequeueMaxAge, ShutdownOptions};
@@ -3812,6 +4019,8 @@ fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
             QueuedInputsOnShutdown::RequeueDurable.unregister_queued_inputs(false),
             QueuedInputsOnShutdown::Stop.unregister_queued_inputs(true),
             QueuedInputsOnShutdown::Requeue(bound).unregister_queued_inputs(false),
+            QueuedInputsOnShutdown::Keep.unregister_queued_inputs(true),
+            QueuedInputsOnShutdown::Keep.unregister_queued_inputs(false),
         ],
         [
             UnregisterQueuedInputs::Requeue {
@@ -3822,6 +4031,8 @@ fn the_default_shutdown_requeues_only_sessions_that_commit_each_round() {
             UnregisterQueuedInputs::Requeue {
                 max_age: Duration::from_secs(90),
             },
+            UnregisterQueuedInputs::Keep,
+            UnregisterQueuedInputs::Keep,
         ]
     );
 }

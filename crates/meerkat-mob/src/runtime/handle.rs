@@ -15918,7 +15918,10 @@ impl MobHandle {
     /// round, and its eligible queued inputs run after it), and ends them as
     /// stopped for any other member;
     /// [`QueuedInputsOnShutdown::Stop`](super::QueuedInputsOnShutdown::Stop)
-    /// ends them as stopped for every member, as before 0.9.5.
+    /// ends them as stopped for every member, as before 0.9.5;
+    /// [`QueuedInputsOnShutdown::Keep`](super::QueuedInputsOnShutdown::Keep)
+    /// leaves every member's work exactly as the store holds it, for a host
+    /// that served its members nothing.
     pub async fn shutdown_with_report(
         &self,
         options: super::ShutdownOptions,

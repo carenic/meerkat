@@ -56,6 +56,15 @@ them.
   `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
   documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
   limit it already followed.
+- `meerkat-mob`: `QueuedInputsOnShutdown::Keep` (the enum is
+  `#[non_exhaustive]`, so the variant is additive). A mob Shutdown with it
+  unregisters each member with the runtime's `UnregisterQueuedInputs::Keep`:
+  a member whose registration served no live work keeps every input it
+  recovered exactly as the store holds it, with no requeue mark, and the run
+  its session left open, and an autonomous member's kickoff stays open. A
+  member whose registration served live work is stopped, as under `Stop`.
+  For a host that boots over a store another host serves, holds its
+  members' run starts, and must hand the store back unchanged.
 
 ### Fixed
 
