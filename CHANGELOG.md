@@ -46,6 +46,24 @@ them.
   re-decision the run's owners refuse or no longer review as R3, now
   withdraws the consent instead of leaving it spendable.
 
+- `meerkat-auth-core` (pre-registered MCP OAuth clients): `McpOAuthError`
+  gains the variant `ClientProfile { server_name, refusal }`, appended last:
+  the host-registered client profile of the target's credential slot
+  refused the operation (`McpOAuthClientProfileRefusal`, non-exhaustive).
+  The semver gate reports it as an enum variant added to an exhaustive enum
+  (`McpOAuthError` stays exhaustive); a match outside the crate needs the
+  arm. Surfaces map it by its refusal: `RedirectMismatch` to the reason
+  `invalid_target`, `Changed` to `attempt_mismatch`, the others to
+  `configuration_invalid`.
+- `meerkat-core` (pre-registered MCP OAuth clients): `PersistedAuthMode`
+  gains the variant `McpOauthClient` (serialized `mcp_oauth_client`),
+  appended last: the custody row of an MCP credential slot's client
+  profile, under the new key kind `TokenKey::mcp_oauth_client`. The semver
+  gate reports it as an enum variant added to an exhaustive enum; a match
+  outside the crate needs the arm. It is not a credential: no resolver
+  accepts it, it has no AuthMachine lifecycle, and the auth profile
+  surfaces cannot create it.
+
 ### Added
 
 - `meerkat-schedule`: `meerkat_schedule_occurrences` takes optional bounded
@@ -135,6 +153,46 @@ them.
   confirmed the job, routed as `retained_job`, as the `meerkat-mob-mcp`
   composition now does for a host source's declared namespaces
   (`MobMcpState::with_host_job_source`).
+
+- `meerkat-auth-core`, `meerkat`: pre-registered (fixed, confidential) OAuth
+  clients for remote MCP servers whose authorization server offers no
+  dynamic client registration. A native host installs a client for one
+  configured server's credential slot (the server as configured, the realm
+  it serves and the account selection) with
+  `HostAuthService::mcp_install_client_profile`, replaces it with
+  `mcp_replace_client_profile` (the same facts with a new secret rotate the
+  secret and keep everything bound to the profile), removes it with
+  `mcp_remove_client_profile`, each also in an `_entered` form that
+  re-checks the host's administrator at the update's entry, and reads it
+  back without its secret with `mcp_client_profile`
+  (`McpOAuthAuthority::install_client_profile_entered`,
+  `replace_client_profile_entered`, `remove_client_profile_entered` and
+  `client_profile` beneath them). An `McpOAuthClientProfile` names the
+  issuer, the client id, the client's exact registered redirect (the
+  server's registered `https` callback, or a loopback redirect with an
+  explicit port) and `client_secret_basic` or `client_secret_post` with the
+  secret (`McpOAuthClientSecret`: no `Display`, `Clone` or serialization, a
+  redacted `Debug`, its buffer overwritten when dropped), and optionally
+  the scopes to request and the protected resource identifier the server's
+  metadata names. The secret is kept only in the credential store, under
+  the new key kind `TokenKey::mcp_oauth_client`, and never appears in
+  configuration, errors, events, logs or `Debug`. With a profile installed,
+  a login (on the registered callback and the loopback route alike)
+  registers nothing and needs no registration endpoint: the resource
+  metadata must name the profile's issuer, the authorization request uses
+  the profile's client id and redirect with PKCE S256, and the code
+  exchange and every refresh authenticate the client by its method; a
+  refresh token the server rotates is stored and presented next. Attempts
+  and credentials are bound to the profile's facts: a completion whose
+  profile was removed or replaced is refused and its attempt retired, and a
+  refresh that cannot authenticate (the profile removed or replaced, or its
+  secret refused by the server) ends the credential as `ReauthRequired`,
+  never falling back to dynamic registration or a public client. Without a
+  profile nothing changes. `auth_oauth` gains `OAuthClientAuthentication`
+  with `exchange_authorization_code_with_client_auth` and
+  `exchange_refresh_token_with_client_auth` (HTTP Basic sends the
+  form-encoded client id and secret, RFC 6749 section 2.3.1). No RPC, REST
+  or SDK method installs a profile.
 
 ### Fixed
 

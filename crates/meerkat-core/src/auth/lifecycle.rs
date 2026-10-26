@@ -239,6 +239,7 @@ pub fn persisted_auth_mode_uses_oauth_login_lifecycle(mode: PersistedAuthMode) -
         | PersistedAuthMode::ConnectorClientSecret
         | PersistedAuthMode::McpAttachmentIdentityKey
         | PersistedAuthMode::McpServiceSecret
+        | PersistedAuthMode::McpOauthClient
         | PersistedAuthMode::Command => false,
     }
 }
@@ -251,12 +252,13 @@ pub fn persisted_auth_mode_uses_oauth_login_lifecycle(mode: PersistedAuthMode) -
 /// Single owner of the "direct-secret only at create surfaces" predicate over
 /// the typed [`PersistedAuthMode`].
 pub fn persisted_auth_mode_is_directly_creatable(mode: PersistedAuthMode) -> bool {
-    // A connector client secret and an MCP service secret are server or
-    // client configuration owned by their own writers, not credentials
-    // either surface may create.
+    // A connector client secret, an MCP service secret and an MCP OAuth
+    // client are server or client configuration owned by their own writers,
+    // not credentials either surface may create.
     mode != PersistedAuthMode::ConnectorClientSecret
         && mode != PersistedAuthMode::McpAttachmentIdentityKey
         && mode != PersistedAuthMode::McpServiceSecret
+        && mode != PersistedAuthMode::McpOauthClient
         && !persisted_auth_mode_uses_oauth_login_lifecycle(mode)
 }
 
@@ -1220,6 +1222,12 @@ mod tests {
         ));
         assert!(!persisted_auth_mode_is_directly_creatable(
             PersistedAuthMode::McpServiceSecret
+        ));
+        assert!(!persisted_auth_mode_uses_oauth_login_lifecycle(
+            PersistedAuthMode::McpOauthClient
+        ));
+        assert!(!persisted_auth_mode_is_directly_creatable(
+            PersistedAuthMode::McpOauthClient
         ));
         assert!(persisted_auth_mode_is_directly_creatable(
             PersistedAuthMode::ApiKey

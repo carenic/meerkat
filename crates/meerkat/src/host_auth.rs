@@ -59,10 +59,11 @@ use meerkat_providers::connector_login::{
 use meerkat_providers::connector_oauth::{AccountSelection, ScopeEvidence};
 use meerkat_providers::mcp_oauth::{
     McpAccountSelection, McpOAuthAccountStrategy, McpOAuthAuthority, McpOAuthCallback,
-    McpOAuthError, McpOAuthLoginComplete, McpOAuthLoginStart, McpOAuthLoopbackBegin,
-    McpOAuthNetworkBounds, McpOAuthPendingAttempt, McpOAuthRegisteredCallback,
-    McpOAuthStartFailure, McpRegisteredRedirectBase, McpServerIdentity, McpStoredCredentialPhase,
-    OAuthStartAdmission, OidcUserInfoAccountStrategy,
+    McpOAuthClientProfile, McpOAuthClientProfileRefusal, McpOAuthError,
+    McpOAuthInstalledClientProfile, McpOAuthLoginComplete, McpOAuthLoginStart,
+    McpOAuthLoopbackBegin, McpOAuthNetworkBounds, McpOAuthPendingAttempt,
+    McpOAuthRegisteredCallback, McpOAuthStartFailure, McpRegisteredRedirectBase, McpServerIdentity,
+    McpStoredCredentialPhase, OAuthStartAdmission, OidcUserInfoAccountStrategy,
 };
 use meerkat_providers::oauth_flow::{
     OAuthFlowError, OAuthTargetValidationError, oauth_provider_resolution,
@@ -960,6 +961,22 @@ fn mcp_oauth_reason(error: &McpOAuthError) -> meerkat_contracts::WireAuthErrorRe
         McpOAuthError::NetworkTimedOut { .. } => R::UpstreamFailure,
         // Neither a success nor a failure: the commit may still land.
         McpOAuthError::CommitUnsettled { .. } => R::CommitUnsettled,
+        // The target's host-registered client profile refused: a login on
+        // another redirect than the profile's, an attempt whose profile was
+        // removed or replaced, or a profile that does not fit the server or
+        // the slot (or its update was refused).
+        McpOAuthError::ClientProfile { refusal, .. } => match refusal {
+            McpOAuthClientProfileRefusal::RedirectMismatch => R::InvalidTarget,
+            McpOAuthClientProfileRefusal::Changed => R::AttemptMismatch,
+            McpOAuthClientProfileRefusal::Invalid(_)
+            | McpOAuthClientProfileRefusal::AlreadyInstalled
+            | McpOAuthClientProfileRefusal::NotInstalled
+            | McpOAuthClientProfileRefusal::NotAdmitted(_)
+            | McpOAuthClientProfileRefusal::IssuerMismatch
+            | McpOAuthClientProfileRefusal::ResourceMismatch
+            | McpOAuthClientProfileRefusal::BindingMismatch => R::ConfigurationInvalid,
+            _ => R::ConfigurationInvalid,
+        },
     }
 }
 
@@ -985,6 +1002,18 @@ fn connector_reason(error: &ConnectorLoginError) -> meerkat_contracts::WireAuthE
         ConnectorLoginError::ClientConfig(_)
         | ConnectorLoginError::ClientSecretUnavailable { .. } => R::ConfigurationInvalid,
         ConnectorLoginError::CommitUnsettled => R::CommitUnsettled,
+    }
+}
+
+/// The admission of the entry-free MCP client profile updates: the host's
+/// own administration, admitted holding nothing.
+struct AdmitAllProfileUpdates;
+
+impl meerkat_core::AdministrationEntry for AdmitAllProfileUpdates {
+    fn enter(
+        &self,
+    ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal> {
+        Ok(meerkat_core::EnteredAdministration::admitted())
     }
 }
 
@@ -1467,6 +1496,112 @@ impl HostAuthService {
         target: &McpServerIdentity,
     ) -> Result<McpServerIdentity, HostAuthError> {
         Ok(target.scoped_to(self.mcp_realm.as_ref())?)
+    }
+
+    /// Install `profile` as the host-registered (pre-registered,
+    /// confidential) OAuth client of `target`'s MCP credential slot in this
+    /// service's realm, for an authorization server without dynamic client
+    /// registration ([`McpOAuthClientProfile`]). From then on, the slot's
+    /// logins (the registered `https` callback, whose redirect the profile
+    /// must name exactly, as [`Self::mcp_registered_redirect_uri`] derives
+    /// it, and the loopback route alike) use that client, and its code
+    /// exchange and every refresh authenticate it by the profile's method.
+    /// Refused when a profile is already installed. The secret lives only in
+    /// the credential store; it never appears in configuration, errors,
+    /// `Debug` or logs. The update is admitted as the host's own
+    /// administration; [`Self::mcp_install_client_profile_entered`]
+    /// re-checks an authenticated caller at the update's entry.
+    pub async fn mcp_install_client_profile(
+        &self,
+        target: &McpServerIdentity,
+        profile: McpOAuthClientProfile,
+    ) -> Result<(), HostAuthError> {
+        self.mcp_install_client_profile_entered(target, profile, Arc::new(AdmitAllProfileUpdates))
+            .await
+    }
+
+    /// [`Self::mcp_install_client_profile`] for an authenticated caller whose
+    /// host re-checks it at the update's entry: `entry` runs inside the
+    /// credential mutation owner's exclusion for the slot's profile, after
+    /// the installed profile was read and immediately before anything is
+    /// written, and its admission is held until the write's result is known
+    /// (see [`McpOAuthAuthority::install_client_profile_entered`]).
+    pub async fn mcp_install_client_profile_entered(
+        &self,
+        target: &McpServerIdentity,
+        profile: McpOAuthClientProfile,
+        entry: Arc<dyn meerkat_core::AdministrationEntry>,
+    ) -> Result<(), HostAuthError> {
+        Ok(self
+            .mcp_oauth_authority()?
+            .install_client_profile_entered(target, profile, entry)
+            .await?)
+    }
+
+    /// Replace the client profile installed for `target`'s MCP credential
+    /// slot with `profile`; refused when none is installed. The same facts
+    /// with a new secret rotate the secret, which the next code exchange or
+    /// refresh uses. Changed facts are another profile: a credential minted
+    /// under the previous one can no longer refresh, and its next refresh
+    /// ends it as needing a new login (see
+    /// [`McpOAuthAuthority::replace_client_profile_entered`]).
+    pub async fn mcp_replace_client_profile(
+        &self,
+        target: &McpServerIdentity,
+        profile: McpOAuthClientProfile,
+    ) -> Result<(), HostAuthError> {
+        self.mcp_replace_client_profile_entered(target, profile, Arc::new(AdmitAllProfileUpdates))
+            .await
+    }
+
+    /// [`Self::mcp_replace_client_profile`], admitted through `entry` as
+    /// [`Self::mcp_install_client_profile_entered`] is.
+    pub async fn mcp_replace_client_profile_entered(
+        &self,
+        target: &McpServerIdentity,
+        profile: McpOAuthClientProfile,
+        entry: Arc<dyn meerkat_core::AdministrationEntry>,
+    ) -> Result<(), HostAuthError> {
+        Ok(self
+            .mcp_oauth_authority()?
+            .replace_client_profile_entered(target, profile, entry)
+            .await?)
+    }
+
+    /// Remove the client profile of `target`'s MCP credential slot; removing
+    /// none succeeds. The slot's later logins use dynamic registration again.
+    /// A credential minted under the removed profile is used until it needs
+    /// a refresh, which ends it as needing a new login; it is never refreshed
+    /// as a public client (see
+    /// [`McpOAuthAuthority::remove_client_profile_entered`]).
+    pub async fn mcp_remove_client_profile(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<(), HostAuthError> {
+        self.mcp_remove_client_profile_entered(target, Arc::new(AdmitAllProfileUpdates))
+            .await
+    }
+
+    /// [`Self::mcp_remove_client_profile`], admitted through `entry` as
+    /// [`Self::mcp_install_client_profile_entered`] is.
+    pub async fn mcp_remove_client_profile_entered(
+        &self,
+        target: &McpServerIdentity,
+        entry: Arc<dyn meerkat_core::AdministrationEntry>,
+    ) -> Result<(), HostAuthError> {
+        Ok(self
+            .mcp_oauth_authority()?
+            .remove_client_profile_entered(target, entry)
+            .await?)
+    }
+
+    /// The secret-free facts of the client profile installed for `target`'s
+    /// MCP credential slot in this service's realm, if any.
+    pub async fn mcp_client_profile(
+        &self,
+        target: &McpServerIdentity,
+    ) -> Result<Option<McpOAuthInstalledClientProfile>, HostAuthError> {
+        Ok(self.mcp_oauth_authority()?.client_profile(target).await?)
     }
 
     /// Secret-free authorization status of one MCP target, from its stored
@@ -2211,6 +2346,148 @@ mod tests {
                 authority.selected_account(&unstated),
                 OperationAccount::Unavailable
             );
+        }
+    }
+
+    /// The host's MCP client profile updates reach exactly its realm's slot:
+    /// installed and read back secret-free, invisible to another realm,
+    /// refused typed (with a public reason) when they conflict or the
+    /// caller's entry check refuses, replaced and removed. No text carries
+    /// the secret.
+    #[tokio::test]
+    async fn the_host_installs_replaces_and_removes_an_mcp_client_profile_in_its_realm() {
+        use meerkat_providers::mcp_oauth::{McpOAuthClientAuthMethod, McpOAuthClientSecret};
+        const SECRET: &str = "host-client-secret-canary";
+        struct Refuse;
+        impl meerkat_core::AdministrationEntry for Refuse {
+            fn enter(
+                &self,
+            ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal>
+            {
+                Err(meerkat_core::AdministrationEntryRefusal::NotAuthenticated)
+            }
+        }
+
+        let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+        let persistence = ProviderAuthPersistence::new(
+            Arc::new(meerkat_providers::auth_store::EphemeralTokenStore::new()),
+            Arc::new(meerkat_providers::auth_store::InMemoryCoordinator::new()),
+        );
+        let in_realm = |realm: &str| {
+            HostAuthService::new(
+                persistence.clone(),
+                runtime.provider_auth_runtime_authority(),
+            )
+            .with_mcp_realm(RealmId::parse(realm).expect("realm"))
+            .with_mcp_registered_redirect_base(
+                McpRegisteredRedirectBase::parse("https://host.example/mcp/oauth/callback")
+                    .expect("base"),
+            )
+        };
+        let service = in_realm("realm-a");
+        let target = McpServerIdentity::from_server_config("remote", "https://mcp.example/mcp")
+            .with_expected_account("subject-1")
+            .expect("target");
+        let redirect = service
+            .mcp_registered_redirect_uri(&target)
+            .expect("redirect")
+            .expect("a registered base");
+        let profile = |client: &str| {
+            McpOAuthClientProfile::new(
+                "https://mcp.example",
+                client,
+                redirect.clone(),
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                McpOAuthClientSecret::new(SECRET),
+            )
+        };
+
+        service
+            .mcp_install_client_profile(&target, profile("client-a"))
+            .await
+            .expect("installed");
+        let installed = service
+            .mcp_client_profile(&target)
+            .await
+            .expect("read")
+            .expect("the profile is installed");
+        assert_eq!(installed.client_id, "client-a");
+        assert_eq!(installed.redirect_uri, redirect);
+        assert_eq!(
+            installed.auth_method,
+            McpOAuthClientAuthMethod::ClientSecretPost
+        );
+        assert!(!format!("{installed:?}").contains(SECRET));
+        assert_eq!(
+            in_realm("realm-b")
+                .mcp_client_profile(&target)
+                .await
+                .expect("read"),
+            None,
+            "another realm's slot has no profile"
+        );
+
+        let mut refusals = vec![
+            service
+                .mcp_install_client_profile(&target, profile("client-b"))
+                .await
+                .expect_err("already installed"),
+            service
+                .mcp_replace_client_profile_entered(&target, profile("client-b"), Arc::new(Refuse))
+                .await
+                .expect_err("not admitted"),
+        ];
+        assert_eq!(
+            service
+                .mcp_client_profile(&target)
+                .await
+                .expect("read")
+                .map(|installed| installed.client_id)
+                .as_deref(),
+            Some("client-a"),
+            "a refused update writes nothing"
+        );
+        service
+            .mcp_replace_client_profile(&target, profile("client-b"))
+            .await
+            .expect("replaced");
+        assert_eq!(
+            service
+                .mcp_client_profile(&target)
+                .await
+                .expect("read")
+                .map(|installed| installed.client_id)
+                .as_deref(),
+            Some("client-b")
+        );
+        service
+            .mcp_remove_client_profile(&target)
+            .await
+            .expect("removed");
+        assert_eq!(
+            service.mcp_client_profile(&target).await.expect("read"),
+            None
+        );
+        refusals.push(
+            service
+                .mcp_replace_client_profile(&target, profile("client-c"))
+                .await
+                .expect_err("none installed"),
+        );
+        for refusal in &refusals {
+            assert!(
+                matches!(
+                    refusal,
+                    HostAuthError::McpOAuth(McpOAuthError::ClientProfile { .. })
+                ),
+                "{refusal:?}"
+            );
+            assert_eq!(
+                refusal.reason(),
+                meerkat_contracts::WireAuthErrorReason::ConfigurationInvalid
+            );
+            let rendered = format!("{refusal} {refusal:?} {}", refusal.public_message());
+            assert!(!rendered.contains(SECRET), "{rendered}");
         }
     }
 

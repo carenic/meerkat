@@ -45,6 +45,10 @@ enum TokenKeyKind {
     /// configuration defines: server configuration, not a credential. It has
     /// no credential identity, lease or lifecycle.
     McpServiceSecret(McpServiceSecretKey),
+    /// The host-registered OAuth client of one MCP credential slot (its
+    /// secret included): client configuration, not a credential. It has no
+    /// credential identity, lease or lifecycle.
+    McpOauthClient(McpOauthClientKey),
 }
 
 /// Storage stem of a realm's MCP attachment identity key. `~` is outside the
@@ -134,6 +138,27 @@ impl McpServiceSecretKey {
     }
 }
 
+/// Where an MCP credential slot keeps its host-registered OAuth client: the
+/// slot's own token realm and binding, under a key kind of its own. Every
+/// slot (server, realm and account selection) has its own client key, so a
+/// client installed for one slot is never read for another.
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Ord, PartialOrd, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct McpOauthClientKey {
+    realm: RealmId,
+    binding: BindingId,
+}
+
+/// Storage prefix of an MCP OAuth client key. `~` is outside the
+/// binding/profile slug grammar, so no credential key can produce it.
+const MCP_OAUTH_CLIENT_STEM: &str = "mcp-oauth-client~v1~";
+
+impl McpOauthClientKey {
+    fn stem(&self) -> String {
+        format!("{MCP_OAUTH_CLIENT_STEM}{}", self.binding)
+    }
+}
+
 /// Serialized form: a credential key keeps its historical (transparent
 /// identity) encoding; a client-secret key is a distinct tagged object.
 #[derive(Serialize, Deserialize)]
@@ -147,6 +172,9 @@ enum TokenKeyWire {
     },
     McpServiceSecret {
         mcp_service_secret: McpServiceSecretKey,
+    },
+    McpOauthClient {
+        mcp_oauth_client: McpOauthClientKey,
     },
     Credential(AuthCredentialIdentity),
 }
@@ -176,6 +204,10 @@ impl Serialize for TokenKey {
             ),
             TokenKeyKind::McpServiceSecret(key) => TokenKeyWire::McpServiceSecret {
                 mcp_service_secret: key.clone(),
+            }
+            .serialize(serializer),
+            TokenKeyKind::McpOauthClient(key) => TokenKeyWire::McpOauthClient {
+                mcp_oauth_client: key.clone(),
             }
             .serialize(serializer),
         }
@@ -215,6 +247,9 @@ impl<'de> Deserialize<'de> for TokenKey {
                         "MCP service secret key has an invalid slot or meaning",
                     ))
                 }
+            }
+            TokenKeyWire::McpOauthClient { mcp_oauth_client } => {
+                Ok(Self(TokenKeyKind::McpOauthClient(mcp_oauth_client)))
             }
         }
     }
@@ -318,6 +353,29 @@ impl TokenKey {
         matches!(self.0, TokenKeyKind::McpServiceSecret(_))
     }
 
+    /// Where the MCP credential slot `realm`/`binding` (the slot's token
+    /// realm and binding) keeps its host-registered OAuth client. A distinct
+    /// key kind: no credential key, binding or account, can name it.
+    pub fn mcp_oauth_client(realm: RealmId, binding: BindingId) -> Self {
+        Self(TokenKeyKind::McpOauthClient(McpOauthClientKey {
+            realm,
+            binding,
+        }))
+    }
+
+    /// The MCP OAuth client key a storage stem names, if it names one.
+    pub fn mcp_oauth_client_from_stem(realm: &RealmId, stem: &str) -> Option<Self> {
+        let binding = stem.strip_prefix(MCP_OAUTH_CLIENT_STEM)?;
+        BindingId::parse(binding)
+            .ok()
+            .map(|binding| Self::mcp_oauth_client(realm.clone(), binding))
+    }
+
+    /// Whether this key holds an MCP credential slot's OAuth client.
+    pub fn is_mcp_oauth_client(&self) -> bool {
+        matches!(self.0, TokenKeyKind::McpOauthClient(_))
+    }
+
     /// The client-secret key a storage stem names, if it names one.
     pub fn connector_client_secret_from_stem(realm: &RealmId, stem: &str) -> Option<Self> {
         let rest = stem.strip_prefix(CONNECTOR_CLIENT_SECRET_STEM)?;
@@ -345,7 +403,8 @@ impl TokenKey {
             TokenKeyKind::ConnectorClientSecret(_)
             | TokenKeyKind::ConnectorClientUpdate { .. }
             | TokenKeyKind::McpAttachmentIdentityKey { .. }
-            | TokenKeyKind::McpServiceSecret(_) => None,
+            | TokenKeyKind::McpServiceSecret(_)
+            | TokenKeyKind::McpOauthClient(_) => None,
         }
     }
 
@@ -359,6 +418,7 @@ impl TokenKey {
             TokenKeyKind::Credential(identity) => identity.realm(),
             TokenKeyKind::ConnectorClientSecret(key) => &key.realm,
             TokenKeyKind::McpServiceSecret(key) => &key.realm,
+            TokenKeyKind::McpOauthClient(key) => &key.realm,
             TokenKeyKind::ConnectorClientUpdate { realm, .. }
             | TokenKeyKind::McpAttachmentIdentityKey { realm } => realm,
         }
@@ -427,6 +487,9 @@ impl TokenKey {
             TokenKeyKind::McpServiceSecret(key) => {
                 return format!("{}:{}", key.realm, key.stem());
             }
+            TokenKeyKind::McpOauthClient(key) => {
+                return format!("{}:{}", key.realm, key.stem());
+            }
         };
         match identity {
             AuthCredentialIdentity::Binding(binding) => match &binding.profile {
@@ -453,6 +516,7 @@ impl TokenKey {
                 return MCP_ATTACHMENT_IDENTITY_KEY_STEM.to_owned();
             }
             TokenKeyKind::McpServiceSecret(key) => return key.stem(),
+            TokenKeyKind::McpOauthClient(key) => return key.stem(),
         };
         match identity {
             AuthCredentialIdentity::Binding(binding) => match &binding.profile {
@@ -478,6 +542,9 @@ impl std::fmt::Display for TokenKey {
                 write!(formatter, "{realm}:{MCP_ATTACHMENT_IDENTITY_KEY_STEM}")
             }
             TokenKeyKind::McpServiceSecret(key) => {
+                write!(formatter, "{}:{}", key.realm, key.stem())
+            }
+            TokenKeyKind::McpOauthClient(key) => {
                 write!(formatter, "{}:{}", key.realm, key.stem())
             }
         }
@@ -522,6 +589,11 @@ pub enum PersistedAuthMode {
     ExternalTokens,
     ExternalAuthorizer,
     Command,
+    /// The host-registered OAuth client of one MCP credential slot (client
+    /// configuration with its secret, not a sign-in credential), stored
+    /// under [`TokenKey::mcp_oauth_client`]. No provider resolver accepts it
+    /// and it has no AuthMachine lifecycle.
+    McpOauthClient,
 }
 
 /// Serializable token bundle. `Debug` redacts the secret and tokens.
@@ -1355,6 +1427,54 @@ mod tests {
         assert!(
             TokenKey::connector_client_secret(realm, "desktop@not-a-digest").is_err(),
             "the meaning must be the canonical digest"
+        );
+    }
+
+    #[test]
+    fn mcp_oauth_client_keys_are_disjoint_from_their_slot_credential_key() {
+        let realm = RealmId::parse("mcp-oauth").expect("valid realm");
+        let binding = BindingId::parse("remote-AbC123dEf456GhI7").expect("valid binding");
+        let client = TokenKey::mcp_oauth_client(realm.clone(), binding.clone());
+        let credential = TokenKey::new(realm.clone(), binding.clone());
+        assert_ne!(client, credential);
+        assert!(client.is_mcp_oauth_client());
+        assert!(!credential.is_mcp_oauth_client());
+        assert!(client.credential_identity().is_none());
+        assert_eq!(client.realm(), &realm);
+        assert_eq!(
+            client.storage_stem(),
+            "mcp-oauth-client~v1~remote-AbC123dEf456GhI7"
+        );
+        assert_eq!(
+            client.keyring_account(),
+            "mcp-oauth:mcp-oauth-client~v1~remote-AbC123dEf456GhI7"
+        );
+        assert_ne!(client.storage_stem(), credential.storage_stem());
+        assert_ne!(client.keyring_account(), credential.keyring_account());
+        assert_eq!(
+            TokenKey::mcp_oauth_client_from_stem(&realm, &client.storage_stem()),
+            Some(client.clone())
+        );
+        assert_eq!(
+            TokenKey::mcp_oauth_client_from_stem(&realm, &credential.storage_stem()),
+            None
+        );
+        let encoded = serde_json::to_value(&client).expect("encode");
+        assert!(encoded.get("mcp_oauth_client").is_some(), "{encoded}");
+        assert_eq!(
+            serde_json::from_value::<TokenKey>(encoded).expect("decode"),
+            client
+        );
+        // The slot's credential key keeps its historical encoding.
+        let encoded = serde_json::to_value(&credential).expect("encode");
+        assert!(encoded.get("mcp_oauth_client").is_none());
+        assert_eq!(
+            serde_json::from_value::<TokenKey>(encoded).expect("decode"),
+            credential
+        );
+        assert_eq!(
+            serde_json::to_value(PersistedAuthMode::McpOauthClient).expect("encode"),
+            serde_json::json!("mcp_oauth_client")
         );
     }
 

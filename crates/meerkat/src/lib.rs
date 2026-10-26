@@ -457,13 +457,14 @@ pub use meerkat_providers::mcp_oauth::open_system_browser;
 pub use meerkat_providers::mcp_oauth::{
     MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH, McpAuthMode, McpOAuthAccountStrategy,
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
-    McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup,
-    McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
-    McpOAuthNetworkBounds, McpOAuthNetworkStage, McpOAuthPendingAttempt, McpOAuthPendingClose,
-    McpOAuthPendingLogin, McpOAuthRegisteredCallback, McpOAuthStartFailure,
-    McpRegisteredRedirectBase, McpServerIdentity, McpStoredCredentialPhase,
-    McpStoredCredentialStatus, OAuthStartAdmission, OidcUserInfoAccountStrategy,
-    open_system_browser_guarded, open_system_browser_trusting,
+    McpOAuthCancelHandle, McpOAuthCeremonyContext, McpOAuthClientAuthMethod, McpOAuthClientProfile,
+    McpOAuthClientProfileRefusal, McpOAuthClientSecret, McpOAuthError,
+    McpOAuthInstalledClientProfile, McpOAuthListenerCleanup, McpOAuthLoginComplete,
+    McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthNetworkBounds,
+    McpOAuthNetworkStage, McpOAuthPendingAttempt, McpOAuthPendingClose, McpOAuthPendingLogin,
+    McpOAuthRegisteredCallback, McpOAuthStartFailure, McpRegisteredRedirectBase, McpServerIdentity,
+    McpStoredCredentialPhase, McpStoredCredentialStatus, OAuthStartAdmission,
+    OidcUserInfoAccountStrategy, open_system_browser_guarded, open_system_browser_trusting,
 };
 
 pub mod help;
