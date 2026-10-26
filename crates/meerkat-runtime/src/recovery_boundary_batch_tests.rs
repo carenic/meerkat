@@ -350,7 +350,7 @@ async fn a_completed_boundary_stages_one_run_batch_for_its_contributors() {
 #[tokio::test]
 async fn an_interrupted_boundary_answers_its_contributors_cancelled() {
     let directed = directed_step("interrupted");
-    let seeded = seeded(&[directed.clone()], interrupted_tail, true).await;
+    let seeded = seeded(std::slice::from_ref(&directed), interrupted_tail, true).await;
 
     assert_eq!(
         seeded.recover().await,
@@ -458,7 +458,7 @@ async fn a_boundary_without_a_recorded_placement_stages_its_nondirected_contribu
 #[tokio::test]
 async fn a_boundary_without_a_recorded_placement_stages_nothing_for_directed_contributors_alone() {
     let directed = directed_step("unplaced alone");
-    let seeded = seeded(&[directed.clone()], completed_tail, false).await;
+    let seeded = seeded(std::slice::from_ref(&directed), completed_tail, false).await;
 
     assert_eq!(
         seeded.recover().await,
@@ -490,7 +490,7 @@ async fn a_boundary_without_a_recorded_placement_stages_nothing_for_directed_con
 #[tokio::test]
 async fn a_boundary_beside_another_runs_pending_batch_stages_nothing() {
     let nondirected = prompt("the run's prompt");
-    let seeded = seeded(&[nondirected.clone()], completed_tail, true).await;
+    let seeded = seeded(std::slice::from_ref(&nondirected), completed_tail, true).await;
 
     // An earlier run's contributor, consumed, whose receipt is still pending.
     let earlier_run = RunId::new();
@@ -554,7 +554,7 @@ async fn a_boundary_beside_another_runs_pending_batch_stages_nothing() {
 #[tokio::test]
 async fn a_boundary_takes_the_rows_placement_witness_when_the_row_records_no_binding() {
     let directed = directed_step("witnessed");
-    let seeded = seeded(&[directed.clone()], completed_tail, false).await;
+    let seeded = seeded(std::slice::from_ref(&directed), completed_tail, false).await;
     let witness = MachineLifecycleBindingFacts::new(
         Some(PLACED_RUNTIME.to_string()),
         Some(PLACED_FENCE),
