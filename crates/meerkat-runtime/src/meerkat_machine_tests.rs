@@ -60830,6 +60830,193 @@ async fn a_failed_executor_startup_keeps_the_inputs_its_registration_recovered()
     assert_prompt_kept(&store, &session_id, &prompt_id).await;
 }
 
+/// An executor whose startup projection recovery waits for the test before it
+/// refuses, so its attachment fails before it serves. While it waits, the
+/// runtime loop holds the session's mutation gate: the startup owner handed
+/// it over for the startup recovery.
+struct HeldStartupRefusalExecutor {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
+}
+
+#[async_trait::async_trait]
+impl CoreExecutor for HeldStartupRefusalExecutor {
+    async fn apply(
+        &mut self,
+        _run_id: RunId,
+        _primitive: RunPrimitive,
+    ) -> Result<CoreApplyOutput, CoreExecutorError> {
+        Err(CoreExecutorError::Internal(
+            "an executor whose startup fails runs nothing".to_string(),
+        ))
+    }
+
+    async fn reconcile_committed_compaction_projections(
+        &mut self,
+        _intents: &[meerkat_core::CompactionProjectionIntent],
+    ) -> Result<(), CoreExecutorError> {
+        self.entered.notify_one();
+        self.release.notified().await;
+        Err(CoreExecutorError::Internal(
+            "the executor refuses its startup projection recovery".to_string(),
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// How the next start attaches the executor whose startup fails.
+#[derive(Clone, Copy, Debug)]
+enum FailedStartupEntry {
+    /// `ensure_session_with_executor`: the startup owner retires the
+    /// attachment itself before it answers.
+    Plain,
+    /// The boundary-owned entry: the caller holds the service turn
+    /// finalization boundary, so the startup owner hands the retirement to a
+    /// process-owned task and answers at once.
+    UnderTurnFinalizationBoundary,
+}
+
+/// A crashed process left a prompt queued, and the next start recovers it
+/// and attaches an executor whose startup recovery fails. The failure has two
+/// parties: the startup owner, whose retirement asks to keep what the
+/// registration recovered and first takes the session's mutation gate, and
+/// the exited loop's teardown watcher, which takes no gate. The test queues
+/// on the gate behind the loop, which holds it through the startup recovery,
+/// so when the startup fails the test holds the gate, the owner's retirement
+/// waits behind the test, and the watcher acts first, every time. The watcher
+/// must leave an attachment that never served to its startup owner: once the
+/// gate is released, the registration unregisters and the recovered prompt
+/// stays queued, with no terminal outcome and no requeue mark.
+async fn a_failed_startup_with_its_loop_watcher_acting_first(entry: FailedStartupEntry) {
+    let store: Arc<dyn crate::store::RuntimeStore> =
+        Arc::new(crate::store::InMemoryRuntimeStore::new());
+    let session_id = SessionId::new();
+    let (_crashed, prompt_id) = a_crash_leaving_a_queued_prompt(&store, &session_id).await;
+    let machine = Arc::new(
+        MeerkatMachine::persistent(Arc::clone(&store), memory_blob_store())
+            .expect("the next process's runtime"),
+    );
+    machine
+        .prepare_bindings(session_id.clone())
+        .await
+        .expect("the next start registers the session");
+
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let executor = HeldStartupRefusalExecutor {
+        entered: Arc::clone(&entered),
+        release: Arc::clone(&release),
+    };
+    let attach = tokio::spawn({
+        let machine = Arc::clone(&machine);
+        let session_id = session_id.clone();
+        async move {
+            match entry {
+                FailedStartupEntry::Plain => {
+                    machine
+                        .ensure_session_with_executor(session_id, Box::new(executor))
+                        .await
+                }
+                FailedStartupEntry::UnderTurnFinalizationBoundary => machine
+                    .ensure_session_with_executor_factory_under_runtime_turn_finalization_boundary(
+                        session_id,
+                        move |_witness| Box::new(executor) as Box<dyn CoreExecutor>,
+                    )
+                    .await
+                    .map(|_| ()),
+            }
+        }
+    });
+    tokio::time::timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("the runtime loop runs the startup recovery");
+
+    // The loop holds the gate through its startup recovery: queue on it now,
+    // ahead of the startup owner, which asks for it only once the startup
+    // failed.
+    let gate = machine
+        .session_mutation_gate(&session_id)
+        .await
+        .expect("registered session gate");
+    let holder_gate = gate.clone();
+    let copies = gate.copy_count();
+    let (release_gate, release_gate_rx) = tokio::sync::oneshot::channel::<()>();
+    let gate_holder = tokio::spawn(async move {
+        let held = holder_gate.lock_settled(SettledGateWait::TestFixture).await;
+        let _ = release_gate_rx.await;
+        drop(held);
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while gate.copy_count() <= copies {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the test queues on the gate behind the runtime loop");
+    let slot = {
+        let sessions = machine.sessions.read().await;
+        Arc::clone(
+            sessions
+                .get(&session_id)
+                .and_then(|session| session.runtime_loop_teardown.as_ref())
+                .expect("the attached loop owns its teardown slot"),
+        )
+    };
+    let (watcher_kickoff, release_watcher) = slot.test_hold_next_watcher_kickoff();
+    let owner_waits = machine.arm_mutation_gate_wait_observer_for_test(session_id.clone());
+
+    // The startup fails: the loop hands the gate to the test, the startup
+    // owner's retirement waits behind it, and the exited loop's watcher runs
+    // its whole kickoff (it takes no gate) before the owner can begin.
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), owner_waits)
+        .await
+        .expect("the startup owner's retirement waits for the gate")
+        .expect("the gate wait observer stays armed until the wait");
+    tokio::time::timeout(Duration::from_secs(5), watcher_kickoff)
+        .await
+        .expect("the loop's watcher finishes its kickoff while the owner waits for the gate")
+        .expect("the watcher kickoff hold stays armed until the kickoff");
+
+    let _ = release_gate.send(());
+    gate_holder.await.expect("the test releases the gate");
+    let _ = release_watcher.send(());
+    let refused = tokio::time::timeout(Duration::from_secs(10), attach)
+        .await
+        .expect("the failed attach answers")
+        .expect("the attach task ends")
+        .expect_err("the executor's startup fails");
+    assert!(
+        refused
+            .to_string()
+            .contains("the executor refuses its startup projection recovery"),
+        "{refused}"
+    );
+    wait_unregistered(&machine, &session_id).await;
+    assert_prompt_kept(&store, &session_id, &prompt_id).await;
+}
+
+#[tokio::test]
+async fn a_failed_startup_keeps_the_recovered_prompt_when_its_loop_watcher_acts_first() {
+    a_failed_startup_with_its_loop_watcher_acting_first(FailedStartupEntry::Plain).await;
+}
+
+#[tokio::test]
+async fn a_failed_startup_under_the_turn_boundary_keeps_the_recovered_prompt_when_its_loop_watcher_acts_first()
+ {
+    a_failed_startup_with_its_loop_watcher_acting_first(
+        FailedStartupEntry::UnderTurnFinalizationBoundary,
+    )
+    .await;
+}
+
 /// The control: a retire that meets a pending attachment still stops the
 /// inputs the registration recovered. Only the attachment's own abort or
 /// cleanup asks to keep them; the retire takes the registration's mutation
