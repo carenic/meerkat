@@ -168,7 +168,11 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
   each cut marked); if that still does not fit, only the newest user requests
   that fit are sent, under a note that it carries the newest N of the M user
   requests. The discarded history becomes one `compaction_summary` user message starting "[Context compacted]"; system
-  prompts and up to `recent_turn_budget` recent complete turns stay. With a
+  prompts and up to `recent_turn_budget` recent complete turns stay. Inside a
+  run, after its first response, a compaction never folds the run's request
+  or newest round: it folds the rows before the run first, then, when
+  nothing is left there, the run's completed rounds (the summary names those
+  calls as already run); a run with only its newest round skips. With a
   memory store attached, discarded messages are indexed for `memory_search`
   (summaries, injected context, tool results, notices and empty or
   whitespace-only text, such as tool-call-only turns, are not). Forking or

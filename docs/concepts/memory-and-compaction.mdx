@@ -35,6 +35,25 @@ one typed `compaction_summary` message, retains a proven subset of source
 messages, and records the discarded source offsets. A failed summary, invalid
 rewrite, or failed memory projection leaves the original transcript intact.
 
+## Compaction inside a run
+
+A compaction never folds the open run's request or its newest round. Inside
+a run, after its first response, it folds in two stages:
+
+1. While the rows before the run still hold a turn, only those rows fold.
+   The run's request (its prompt, injected context and the notices that
+   started it, such as a peer, flow or external input) and all of its rounds
+   stay verbatim after the summary.
+2. When nothing before the run is left to fold, the run's own completed
+   rounds fold, together with any earlier summary. The run's request and its
+   newest round (its tool calls and their results) stay verbatim, and the
+   summary ends by naming the folded calls and saying that they already ran.
+
+A run whose newest round is its only one has nothing to fold, so such an
+attempt is skipped before any summary call. A custom compactor and a curator
+are handed only the rows before the run in the first stage; the second stage
+is the runtime's own rewrite.
+
 `injected_context` is also a typed transcript role. It does not start a turn,
 does not dilute the recent-turn retention budget, and stays attached to the
 conversational user message it preceded. Neither injected context nor a prior

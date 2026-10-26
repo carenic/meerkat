@@ -6,7 +6,7 @@
 use crate::Session;
 use crate::compact::{
     COMPACTION_SUMMARY_PREFIX, CompactionContext, CompactionCurator, CompactionDiscard,
-    CompactionRetained, CompactionSummary, CompactionWindow, Compactor,
+    CompactionResult, CompactionRetained, CompactionSummary, CompactionWindow, Compactor,
     SESSION_COMPACTION_CADENCE_KEY, SessionCompactionCadence,
 };
 use crate::event::AgentEvent;
@@ -675,43 +675,225 @@ pub(crate) struct CompactionInvocation<'a> {
     /// Where the summary request's owner-change waits are reported, for a
     /// host that installed an operation refusal observer.
     pub(crate) wait_report: Option<crate::authorization::WaitReport>,
-    /// The first row of the run still in flight ([`open_run_floor`]). The
-    /// rewrite folds only `window.messages[..floor]` and keeps the run's own
-    /// rows verbatim after it; `model_messages` is then the projection of
-    /// that prefix. `None` folds the whole transcript.
-    pub(crate) open_run_floor: Option<usize>,
+    /// What this attempt folds while a run is in flight
+    /// ([`compaction_scope`]); `model_messages` is the projection of the rows
+    /// the summary is written from ([`compaction_source_floor`]).
+    pub(crate) scope: CompactionScope,
+    /// The whole model projection at this boundary, which
+    /// `CompactionStarted` and `CompactionCompleted` report on whatever the
+    /// scope.
+    pub(crate) projection: &'a [Message],
 }
 
-/// The first row of the run `run_id` while it is in flight: the start of the
-/// input rows (request, injected context, typed appends) before its first
-/// assistant row. `None` before the run's first assistant row exists, so a
-/// run's first boundary compacts as it always did.
+/// What a compaction folds, given the run in flight.
 ///
-/// A compaction must not fold the open run's own rows: the model would see
-/// only a summary of tool calls it already made in this run and could make
-/// them again, and a side-effecting tool would act twice. Derived from the
-/// transcript at each boundary (assistant rows carry the run id), so a
-/// resumed run and a rewrite earlier in the same run need no remapping.
-pub(crate) fn open_run_floor(
-    messages: &[Message],
-    run_id: &crate::lifecycle::RunId,
-) -> Option<usize> {
-    let first_response = messages.iter().position(|message| {
+/// A compaction must not fold the open run's request or its newest round:
+/// the model would see only a summary of a call it just made, or of the
+/// request it is answering, and could act on it again, and a side-effecting
+/// tool would act twice. So inside a run, after its first response, the
+/// rows before the run are folded first; only when nothing is left there
+/// does a compaction fold the run's own completed rounds, and then it keeps
+/// the run's request and newest round verbatim.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CompactionScope {
+    /// No run in flight, or a run before its first response: the whole
+    /// transcript, as before.
+    Whole,
+    /// Only the rows before the open run (`messages[..floor]`), through the
+    /// compactor; the run's own rows follow verbatim.
+    BeforeOpenRun { floor: usize },
+    /// Nothing before the open run is left to fold. The run's completed
+    /// rounds (`messages[first_response..newest_round]`, System rows aside)
+    /// and every earlier compaction summary are folded into the one summary,
+    /// mechanically, whatever the compactor. Everything else stays verbatim:
+    /// the rows before the run, the run's request (`messages[floor..
+    /// first_response]`) and its newest round (`messages[newest_round..]`:
+    /// the inputs that led to it, its tool calls and their results).
+    OpenRunRounds {
+        first_response: usize,
+        newest_round: usize,
+    },
+}
+
+/// Whether `message` is an input row a run's or a round's request is made
+/// of: a user row that is not a compaction summary (a request, injected
+/// context, a typed user append) or a system notice (a peer, flow, external
+/// or job input, or a notice the run's boundary added).
+fn is_request_input_row(message: &Message) -> bool {
+    match message {
+        Message::User(user) => !user.transcript_role.is_compaction_summary(),
+        Message::SystemNotice(_) => true,
+        Message::System(_) | Message::BlockAssistant(_) | Message::ToolResults { .. } => false,
+    }
+}
+
+/// `index` moved back over the input rows right before it.
+fn back_over_inputs(messages: &[Message], mut index: usize) -> usize {
+    while index > 0 && is_request_input_row(&messages[index - 1]) {
+        index -= 1;
+    }
+    index
+}
+
+/// The first assistant row of the run `run_id`.
+fn first_run_response(messages: &[Message], run_id: &crate::lifecycle::RunId) -> Option<usize> {
+    messages.iter().position(|message| {
         matches!(
             message,
             Message::BlockAssistant(assistant) if assistant.identity.run_id.as_ref() == Some(run_id)
         )
-    })?;
-    let mut floor = first_response;
-    while floor > 0
-        && matches!(
-            &messages[floor - 1],
-            Message::User(user) if !user.transcript_role.is_compaction_summary()
-        )
-    {
-        floor -= 1;
+    })
+}
+
+/// The first row of the run `run_id` while it is in flight: the start of
+/// the input rows (request, injected context, typed appends, notices) before
+/// its first assistant row. The walk stops at a System row, a response, a
+/// tool-results row or a compaction summary. `None` before the run's first
+/// assistant row exists, so a run's first boundary compacts as it always
+/// did. Derived from the transcript at each boundary (assistant rows carry
+/// the run id), so a resumed run and a rewrite earlier in the same run need
+/// no remapping. An earlier run's trailing notices or unanswered prompt
+/// right before the run count as the run's own, which only keeps them
+/// verbatim.
+pub(crate) fn open_run_floor(
+    messages: &[Message],
+    run_id: &crate::lifecycle::RunId,
+) -> Option<usize> {
+    first_run_response(messages, run_id).map(|first| back_over_inputs(messages, first))
+}
+
+/// The first row of the run's newest round: its newest assistant row, after
+/// the input rows that led to it (a steer, a notice).
+fn newest_run_round(messages: &[Message], run_id: &crate::lifecycle::RunId) -> Option<usize> {
+    messages
+        .iter()
+        .rposition(|message| {
+            matches!(
+                message,
+                Message::BlockAssistant(assistant)
+                    if assistant.identity.run_id.as_ref() == Some(run_id)
+            )
+        })
+        .map(|newest| back_over_inputs(messages, newest))
+}
+
+/// What a compaction at this boundary folds, with `run_id` the run in
+/// flight; `None` when nothing can be folded without touching the open
+/// run's request or newest round, so the attempt is skipped before its
+/// summary call.
+pub(crate) fn compaction_scope(
+    messages: &[Message],
+    run_id: Option<&crate::lifecycle::RunId>,
+) -> Option<CompactionScope> {
+    let Some(run_id) = run_id else {
+        return Some(CompactionScope::Whole);
+    };
+    let Some(floor) = open_run_floor(messages, run_id) else {
+        return Some(CompactionScope::Whole);
+    };
+    if prefix_has_foldable_turn(&messages[..floor]) {
+        return Some(CompactionScope::BeforeOpenRun { floor });
     }
-    Some(floor)
+    let first_response = first_run_response(messages, run_id)?;
+    let newest_round = newest_run_round(messages, run_id)?;
+    (newest_round > first_response
+        && prefix_has_foldable_turn(&messages[first_response..newest_round]))
+    .then_some(CompactionScope::OpenRunRounds {
+        first_response,
+        newest_round,
+    })
+}
+
+/// The rows of the transcript the summary of `scope` is written from, when
+/// they are not all of it: only the rows before the open run when that is
+/// what folds. A fold of the run's own completed rounds is written from the
+/// whole transcript, so the summary sees where the run stands; it replaces
+/// only the completed rounds.
+pub(crate) fn compaction_source_floor(scope: CompactionScope) -> Option<usize> {
+    match scope {
+        CompactionScope::BeforeOpenRun { floor } => Some(floor),
+        CompactionScope::Whole | CompactionScope::OpenRunRounds { .. } => None,
+    }
+}
+
+/// The line a summary of the open run's own rounds ends with: the calls
+/// those rounds made, and that they ran.
+fn folded_run_calls_note(folded: &[Message]) -> Option<String> {
+    let calls = folded
+        .iter()
+        .filter_map(|message| match message {
+            Message::BlockAssistant(assistant) => Some(assistant.blocks.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            AssistantBlock::ToolUse { id, name, .. } => Some(format!("{name} ({id})")),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    (!calls.is_empty()).then(|| {
+        format!(
+            "\n\nThese tool calls of the current run were made in its earlier rounds and \
+             already ran; their results are summarized above, so do not make them again: {}.",
+            calls.join(", ")
+        )
+    })
+}
+
+/// Fold the open run's completed rounds (`messages[first_response..
+/// newest_round]`, System rows aside) and every earlier compaction summary
+/// and superseded System version into one summary at the first folded
+/// position; keep every other row verbatim.
+fn rebuild_open_run_rounds(
+    messages: &[Message],
+    first_response: usize,
+    newest_round: usize,
+    summary_text: &str,
+) -> CompactionResult {
+    let superseded = crate::types::superseded_system_prompt_offsets(messages);
+    let fold = |offset: usize, message: &Message| match message {
+        Message::System(_) => superseded.contains(&offset),
+        Message::User(user) if user.transcript_role.is_compaction_summary() => true,
+        _ => (first_response..newest_round).contains(&offset),
+    };
+    let summary_message = Message::User(crate::types::UserMessage::compaction_summary(format!(
+        "{COMPACTION_SUMMARY_PREFIX}{summary_text}"
+    )));
+    let mut rebuilt = Vec::with_capacity(messages.len());
+    let mut retained = Vec::new();
+    let mut discarded = Vec::new();
+    let mut summary = None;
+    let as_offset = |offset: usize| u64::try_from(offset).unwrap_or(u64::MAX);
+    for (offset, message) in messages.iter().enumerate() {
+        if fold(offset, message) {
+            if summary.is_none() {
+                summary = Some(CompactionSummary::new(
+                    as_offset(rebuilt.len()),
+                    summary_message.clone(),
+                ));
+                rebuilt.push(summary_message.clone());
+            }
+            discarded.push(CompactionDiscard::new(as_offset(offset), message.clone()));
+        } else {
+            retained.push(CompactionRetained::new(
+                as_offset(offset),
+                as_offset(rebuilt.len()),
+                message.clone(),
+            ));
+            rebuilt.push(message.clone());
+        }
+    }
+    let summary = summary.unwrap_or_else(|| {
+        let mapping = CompactionSummary::new(as_offset(rebuilt.len()), summary_message.clone());
+        rebuilt.push(summary_message);
+        mapping
+    });
+    CompactionResult {
+        messages: rebuilt,
+        summary,
+        retained,
+        discarded,
+    }
 }
 
 /// The least a bounded tool result of the open run keeps of its text.
@@ -721,18 +903,17 @@ const MIN_BOUNDED_RUN_RESULT_BYTES: usize = 4 * 1024;
 /// bounded, when the request (`encoded_bytes`) exceeds `max_bytes` and the
 /// run's own results are what can give way. `None` when nothing is bounded.
 ///
-/// A compaction never folds the open run's own rows, so a run whose own tool
-/// results are larger than the provider accepts would fail every request.
-/// For this request only, each result answering a tool call this run made
-/// (found through its `ToolUse` rows in `transcript`, from the run's floor)
-/// keeps its identity (`tool_use_id`, `is_error`) and the head of its text,
-/// with a marker naming the call, so the model still sees every call it made
-/// and that its result was cut. The stored transcript keeps every result
-/// whole, and the bounding is a pure function of the request, so the same
-/// rows produce the same request at every boundary.
+/// A compaction never folds the open run's newest round, so a run whose own
+/// tool results are larger than the provider accepts would fail every
+/// request. For this request only, each result in a tool-results row of the
+/// run (after the run's floor in the request, whose rows keep their
+/// identity) that answers a call the run made keeps its identity
+/// (`tool_use_id`, `is_error`) and the head of its text, with a marker
+/// naming the call, so the model still sees every call it made and that its
+/// result was cut. An earlier run's result is never bounded, even under a
+/// reused call id. The stored transcript keeps every result whole.
 pub(crate) fn bound_open_run_tool_results_for_request(
     request: &[Message],
-    transcript: &[Message],
     run_id: &crate::lifecycle::RunId,
     encoded_bytes: u64,
     max_bytes: u64,
@@ -740,8 +921,8 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     if encoded_bytes <= max_bytes {
         return None;
     }
-    let floor = open_run_floor(transcript, run_id)?;
-    let run_calls: std::collections::BTreeMap<&str, &str> = transcript[floor..]
+    let floor = open_run_floor(request, run_id)?;
+    let run_calls: std::collections::BTreeMap<&str, &str> = request[floor..]
         .iter()
         .filter_map(|message| match message {
             Message::BlockAssistant(assistant) => Some(assistant.blocks.iter()),
@@ -756,7 +937,7 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     let content_bytes = |result: &crate::types::ToolResult| {
         serde_json::to_vec(&result.content).map_or(usize::MAX, |encoded| encoded.len())
     };
-    let run_results = request
+    let run_results = request[floor..]
         .iter()
         .filter_map(|message| match message {
             Message::ToolResults { results, .. } => Some(results.iter()),
@@ -782,7 +963,8 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     let mut bounded_any = false;
     let bounded = request
         .iter()
-        .map(|message| {
+        .enumerate()
+        .map(|(offset, message)| {
             let Message::ToolResults {
                 results,
                 created_at,
@@ -790,6 +972,9 @@ pub(crate) fn bound_open_run_tool_results_for_request(
             else {
                 return message.clone();
             };
+            if offset < floor {
+                return message.clone();
+            }
             let results = results
                 .iter()
                 .map(|result| {
@@ -839,7 +1024,7 @@ fn bounded_run_tool_result(
             text: format!(
                 "[result of tool call {tool_name} ({id}) shortened for this request: it shows \
                  the first {kept} of {total} bytes of its text, media as placeholders; the \
-                 call ran once and its full result is kept in the session]",
+                 call already ran and its full result is kept in the session]",
                 id = result.tool_use_id,
                 total = text.len(),
             ),
@@ -848,12 +1033,11 @@ fn bounded_run_tool_result(
     bounded
 }
 
-/// Whether `prefix` holds anything a rewrite can fold: a response (an
+/// Whether `rows` hold anything a rewrite can fold: a response (an
 /// assistant or tool-results row). System rows, a prior summary and a
-/// request without a response leave nothing to summarize, so a compaction
-/// confined to such a prefix is skipped before its summary call.
-pub(crate) fn prefix_has_foldable_turn(prefix: &[Message]) -> bool {
-    prefix.iter().any(|message| {
+/// request without a response leave nothing to summarize.
+pub(crate) fn prefix_has_foldable_turn(rows: &[Message]) -> bool {
+    rows.iter().any(|message| {
         matches!(
             message,
             Message::BlockAssistant(_) | Message::ToolResults { .. }
@@ -972,20 +1156,18 @@ where
         parent_revision,
         summarization_budget,
         wait_report,
-        open_run_floor,
+        scope,
+        projection,
     } = invocation;
     let CompactionWindow {
         messages,
         last_input_tokens,
         session_boundary_index,
     } = window;
-    let estimated = estimate_tokens(model_messages)?;
-    // With a run in flight `model_messages` is the folded prefix only; the
-    // run's own rows are part of the transcript this compaction rewrites.
-    let message_count = model_messages.len()
-        + open_run_floor
-            .filter(|floor| *floor <= messages.len())
-            .map_or(0, |floor| messages.len() - floor);
+    // Reported over the whole projection: with a run in flight
+    // `model_messages` holds only the rows the summary is written from.
+    let estimated = estimate_tokens(projection)?;
+    let message_count = projection.len();
     let mut event_stream_open = true;
 
     // 1. Emit CompactionStarted
@@ -1233,10 +1415,32 @@ where
 
     // 4. Rebuild history. Validation below requires every ordinary System row
     // to remain verbatim at its mapped relative position. With a run in
-    // flight only the rows before it are rebuilt; the run's own rows follow
-    // verbatim, each retained at its exact offsets, whatever the compactor.
-    let result = match open_run_floor.filter(|floor| *floor <= messages.len()) {
-        Some(floor) => {
+    // flight only the rows before it are rebuilt by the compactor, and the
+    // run's own rows follow verbatim, each retained at its exact offsets;
+    // when nothing before the run is left, the run's completed rounds are
+    // folded mechanically and its request and newest round kept, whatever
+    // the compactor. That summary ends naming the calls it folded.
+    let summary_text = match scope {
+        CompactionScope::OpenRunRounds {
+            first_response,
+            newest_round,
+        } => match messages
+            .get(first_response..newest_round)
+            .and_then(folded_run_calls_note)
+        {
+            Some(note) => format!("{summary_text}{note}"),
+            None => summary_text,
+        },
+        CompactionScope::Whole | CompactionScope::BeforeOpenRun { .. } => summary_text,
+    };
+    let result = match scope {
+        CompactionScope::OpenRunRounds {
+            first_response,
+            newest_round,
+        } => rebuild_open_run_rounds(messages, first_response, newest_round, &summary_text),
+        CompactionScope::BeforeOpenRun { floor } => {
+            debug_assert!(floor <= messages.len(), "the floor lies in the transcript");
+            let floor = floor.min(messages.len());
             let mut result = compactor.rebuild_history_under_pressure(
                 &messages[..floor],
                 &summary_text,
@@ -1253,7 +1457,9 @@ where
             }
             result
         }
-        None => compactor.rebuild_history_under_pressure(messages, &summary_text, request_pressure),
+        CompactionScope::Whole => {
+            compactor.rebuild_history_under_pressure(messages, &summary_text, request_pressure)
+        }
     };
     if let Err(error) = validate_compaction_rebuild(
         messages,
@@ -1472,7 +1678,7 @@ pub struct CompactionOutcome {
 }
 
 #[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use crate::types::{
@@ -1749,7 +1955,8 @@ mod tests {
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
                 wait_report: None,
-                open_run_floor: None,
+                scope: CompactionScope::Whole,
+                projection: &model_messages,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -2259,7 +2466,8 @@ mod tests {
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
                 wait_report: None,
-                open_run_floor: None,
+                scope: CompactionScope::Whole,
+                projection: &model_messages,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -2876,48 +3084,253 @@ mod tests {
         );
     }
 
-    fn run_rows(run_id: &crate::lifecycle::RunId, result_bytes: usize) -> Vec<Message> {
+    fn call_row(run_id: Option<&crate::lifecycle::RunId>, call_id: &str) -> Message {
         let mut call = BlockAssistantMessage::new(
             vec![AssistantBlock::ToolUse {
-                id: "tc_1".into(),
+                id: call_id.into(),
                 name: "list_records".into(),
                 args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
                 meta: None,
             }],
             StopReason::ToolUse,
         );
-        call.identity.run_id = Some(run_id.clone());
+        call.identity.run_id = run_id.cloned();
+        Message::BlockAssistant(call)
+    }
+
+    fn answer_row(run_id: Option<&crate::lifecycle::RunId>, text: &str) -> Message {
+        let mut answer = BlockAssistantMessage::new(
+            vec![AssistantBlock::Text {
+                text: text.into(),
+                meta: None,
+            }],
+            StopReason::EndTurn,
+        );
+        answer.identity.run_id = run_id.cloned();
+        Message::BlockAssistant(answer)
+    }
+
+    fn result_row(call_id: &str, bytes: usize) -> Message {
+        Message::tool_results(vec![ToolResult::new(
+            call_id.into(),
+            "r".repeat(bytes),
+            false,
+        )])
+    }
+
+    fn user(text: &str) -> Message {
+        Message::User(UserMessage::text(text))
+    }
+
+    fn notice(kind: crate::types::SystemNoticeKind, body: &str) -> Message {
+        Message::SystemNotice(crate::types::SystemNoticeMessage::new(kind, body))
+    }
+
+    fn summary_row(text: &str) -> Message {
+        Message::User(UserMessage::compaction_summary(format!(
+            "{COMPACTION_SUMMARY_PREFIX}{text}"
+        )))
+    }
+
+    /// An earlier run, then the open run: its request and one tool round.
+    fn run_rows(run_id: &crate::lifecycle::RunId, result_bytes: usize) -> Vec<Message> {
         vec![
-            Message::User(UserMessage::text("an earlier request")),
-            Message::BlockAssistant(BlockAssistantMessage::new(
-                vec![AssistantBlock::Text {
-                    text: "an earlier answer".into(),
-                    meta: None,
-                }],
-                StopReason::EndTurn,
-            )),
-            Message::User(UserMessage::text("list every record")),
-            Message::BlockAssistant(call),
-            Message::tool_results(vec![ToolResult::new(
-                "tc_1".into(),
-                "r".repeat(result_bytes),
-                false,
-            )]),
+            user("an earlier request"),
+            answer_row(None, "an earlier answer"),
+            user("list every record"),
+            call_row(Some(run_id), "tc_1"),
+            result_row("tc_1", result_bytes),
         ]
     }
 
+    /// The open run's floor is the start of the input rows before its first
+    /// response, notices included: a peer, flow, external or job input
+    /// arrives as a system notice, and a run's boundary may add one before
+    /// the run's first response. The walk stops at a response, a
+    /// tool-results row, a System row or a summary.
     #[test]
     fn the_open_run_floor_is_its_request_before_its_first_response() {
-        let run_id = crate::lifecycle::RunId::new();
-        let rows = run_rows(&run_id, 10);
-        assert_eq!(open_run_floor(&rows, &run_id), Some(2));
-        assert!(prefix_has_foldable_turn(&rows[..2]));
-        assert!(!prefix_has_foldable_turn(&rows[2..3]));
+        use crate::types::SystemNoticeKind;
+        let run = crate::lifecycle::RunId::new();
+        let r = Some(&run);
+        let cases: Vec<(&str, Vec<Message>, Option<usize>)> = vec![
+            ("a prompt", run_rows(&run, 10), Some(2)),
+            (
+                "a peer-triggered run",
+                vec![
+                    user("a"),
+                    answer_row(None, "a'"),
+                    notice(SystemNoticeKind::Comms, "peer message"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                ],
+                Some(2),
+            ),
+            (
+                "a run whose first boundary added a notice",
+                vec![
+                    user("a"),
+                    answer_row(None, "a'"),
+                    Message::User(UserMessage::injected_context("ctx")),
+                    user("prompt"),
+                    notice(SystemNoticeKind::ToolScope, "tools changed"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                ],
+                Some(2),
+            ),
+            (
+                "a fork seed",
+                vec![
+                    answer_row(None, "the parent's run"),
+                    Message::User(UserMessage::injected_context("planned context")),
+                    notice(SystemNoticeKind::Generic, "fork boundary"),
+                    user("prompt"),
+                    call_row(r, "tc_1"),
+                ],
+                Some(1),
+            ),
+            (
+                "after a summary",
+                vec![
+                    Message::System(crate::types::SystemMessage::new("sys")),
+                    summary_row("earlier"),
+                    Message::User(UserMessage::injected_context("ctx")),
+                    user("prompt"),
+                    call_row(r, "tc_1"),
+                ],
+                Some(2),
+            ),
+            (
+                "an earlier run's unanswered prompt is kept with the run",
+                vec![
+                    answer_row(None, "prev"),
+                    user("orphan"),
+                    user("prompt"),
+                    call_row(r, "tc_1"),
+                ],
+                Some(1),
+            ),
+            (
+                "a run with no response yet",
+                vec![user("a"), answer_row(None, "a'"), user("prompt")],
+                None,
+            ),
+        ];
+        for (case, rows, floor) in cases {
+            assert_eq!(open_run_floor(&rows, &run), floor, "{case}");
+        }
+    }
+
+    /// The scope a compaction folds: everything without a run in flight or
+    /// before its first response; the rows before the run while they hold
+    /// a turn; then the run's completed rounds, keeping its request and its
+    /// newest round (with the inputs that led to it); and nothing at all
+    /// when the run has no completed round.
+    #[test]
+    fn a_compaction_folds_before_the_run_first_then_its_completed_rounds() {
+        use crate::types::SystemNoticeKind;
+        let run = crate::lifecycle::RunId::new();
+        let r = Some(&run);
+        let sys = Message::System(crate::types::SystemMessage::new("sys"));
         assert_eq!(
-            open_run_floor(&rows, &crate::lifecycle::RunId::new()),
-            None,
-            "a run with no response yet compacts as before"
+            compaction_scope(&run_rows(&run, 10), None),
+            Some(CompactionScope::Whole),
+            "no run in flight"
         );
+        assert_eq!(
+            compaction_scope(&[user("a"), answer_row(None, "a'"), user("p")], Some(&run)),
+            Some(CompactionScope::Whole),
+            "a run before its first response"
+        );
+        assert_eq!(
+            compaction_scope(&run_rows(&run, 10), Some(&run)),
+            Some(CompactionScope::BeforeOpenRun { floor: 2 }),
+            "the rows before the run hold a turn"
+        );
+        assert_eq!(
+            compaction_scope(
+                &[
+                    sys.clone(),
+                    user("p"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10)
+                ],
+                Some(&run)
+            ),
+            None,
+            "only the run's newest round: nothing to fold"
+        );
+        assert_eq!(
+            compaction_scope(
+                &[
+                    sys.clone(),
+                    summary_row("earlier"),
+                    user("p"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                    notice(SystemNoticeKind::Comms, "a steer"),
+                    call_row(r, "tc_2"),
+                    result_row("tc_2", 10),
+                ],
+                Some(&run)
+            ),
+            Some(CompactionScope::OpenRunRounds {
+                first_response: 3,
+                newest_round: 5,
+            }),
+            "the completed round folds; the steer stays with the newest round"
+        );
+    }
+
+    /// Folding the run's completed rounds keeps the System rows, the run's
+    /// request and its newest round verbatim, replaces the earlier summary
+    /// and the completed round with the one summary, and passes the
+    /// rebuild's validation. The summary names the calls it folded and says
+    /// they ran.
+    #[test]
+    fn folding_the_runs_completed_rounds_keeps_its_request_and_newest_round() {
+        let run = crate::lifecycle::RunId::new();
+        let r = Some(&run);
+        let messages = vec![
+            Message::System(crate::types::SystemMessage::new("sys")),
+            summary_row("earlier"),
+            user("p"),
+            call_row(r, "tc_1"),
+            result_row("tc_1", 10),
+            call_row(r, "tc_2"),
+            result_row("tc_2", 10),
+        ];
+        let note = folded_run_calls_note(&messages[3..5]).expect("the folded call is named");
+        assert!(note.contains("list_records (tc_1)") && note.contains("already ran"));
+        let summary_text = format!("summary{note}");
+        let result = rebuild_open_run_rounds(&messages, 3, 5, &summary_text);
+        assert_eq!(
+            result.messages,
+            vec![
+                messages[0].clone(),
+                result.summary.message.clone(),
+                messages[2].clone(),
+                messages[5].clone(),
+                messages[6].clone(),
+            ]
+        );
+        let Message::User(summary) = &result.summary.message else {
+            panic!("the summary is a user row");
+        };
+        assert_eq!(
+            summary.text_content(),
+            format!("{COMPACTION_SUMMARY_PREFIX}{summary_text}")
+        );
+        validate_compaction_rebuild(
+            &messages,
+            &result.messages,
+            &result.summary,
+            &summary_text,
+            &result.retained,
+            &result.discarded,
+        )
+        .expect("the rebuild is valid");
     }
 
     /// The open run's own result alone exceeds the provider cap. For that
@@ -2927,28 +3340,14 @@ mod tests {
     #[test]
     fn an_over_cap_open_run_result_is_bounded_for_the_request_only() {
         let run_id = crate::lifecycle::RunId::new();
-        let transcript = run_rows(&run_id, 600_000);
-        let request = transcript.clone();
+        let request = run_rows(&run_id, 600_000);
 
         assert!(
-            bound_open_run_tool_results_for_request(
-                &request,
-                &transcript,
-                &run_id,
-                90_000,
-                100_000
-            )
-            .is_none(),
+            bound_open_run_tool_results_for_request(&request, &run_id, 90_000, 100_000).is_none(),
             "a request within the cap is sent as composed"
         );
-        let bounded = bound_open_run_tool_results_for_request(
-            &request,
-            &transcript,
-            &run_id,
-            700_000,
-            100_000,
-        )
-        .expect("the over-cap request is bounded");
+        let bounded = bound_open_run_tool_results_for_request(&request, &run_id, 700_000, 100_000)
+            .expect("the over-cap request is bounded");
 
         assert_eq!(bounded.len(), request.len());
         for offset in 0..4 {
@@ -2969,7 +3368,7 @@ mod tests {
             ..
         } = &request[4]
         else {
-            unreachable!()
+            panic!("the source row is a tool-results row");
         };
         assert_eq!(created_at, source_created_at);
         assert_eq!(results.len(), 1);
@@ -2998,7 +3397,6 @@ mod tests {
         assert!(
             bound_open_run_tool_results_for_request(
                 &request,
-                &transcript,
                 &crate::lifecycle::RunId::new(),
                 700_000,
                 100_000
@@ -3006,5 +3404,30 @@ mod tests {
             .is_none(),
             "another run's results are never bounded"
         );
+    }
+
+    /// An earlier run and the open run both used the call id `tc_1`, as some
+    /// providers and adapters reuse ids across turns. Only the open run's
+    /// result is bounded.
+    #[test]
+    fn a_reused_call_id_bounds_only_the_open_runs_result() {
+        let earlier = crate::lifecycle::RunId::new();
+        let run = crate::lifecycle::RunId::new();
+        let request = vec![
+            user("an earlier request"),
+            call_row(Some(&earlier), "tc_1"),
+            result_row("tc_1", 300_000),
+            answer_row(Some(&earlier), "an earlier answer"),
+            user("list every record"),
+            call_row(Some(&run), "tc_1"),
+            result_row("tc_1", 300_000),
+        ];
+        let bounded = bound_open_run_tool_results_for_request(&request, &run, 700_000, 100_000)
+            .expect("the over-cap request is bounded");
+        assert_eq!(
+            bounded[2], request[2],
+            "the earlier run's result is untouched"
+        );
+        assert_ne!(bounded[6], request[6], "the open run's result is bounded");
     }
 }

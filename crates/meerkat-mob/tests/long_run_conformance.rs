@@ -1382,17 +1382,18 @@ async fn a_resumed_rebased_runs_failure_consumes_its_input_over_the_reference_ho
         restarted.prompts, 1,
         "the user message is in the committed transcript once"
     );
-    // The run has one conversational turn, so the compaction before round 3
-    // keeps no complete turn: it folds rounds 0 to 2 into its one summary
-    // and keeps only the pinned prompt. The committed transcript then holds
-    // that summary, round 3 and each of its calls' results, and nothing of
-    // the run was repaired. A run that never compacted, and so never
-    // re-based, fails here.
+    // Nothing comes before the run, so the compaction before round 3 folds
+    // the run's own completed rounds, 0 and 1, into its one summary and keeps
+    // the run's prompt and its newest round, 2, verbatim. The committed
+    // transcript then holds that summary, rounds 2 and 3 and each of their
+    // calls' results, and nothing of the run was repaired. A run that never
+    // compacted, and so never re-based, fails here.
     let rounds = &report.transcript_rounds;
     assert_eq!(
         (rounds.clone(), restarted.summaries),
-        (vec![plan.kill_round], 1),
-        "the committed transcript holds the compaction's one summary and only the resumed round"
+        (vec![plan.kill_round - 1, plan.kill_round], 1),
+        "the committed transcript holds the compaction's one summary, the round it kept and the \
+         resumed round"
     );
     let mut results = report.transcript_results.clone();
     results.sort();

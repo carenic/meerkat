@@ -571,19 +571,37 @@ pub trait Compactor: Send + Sync {
     /// it remains after the summary. Its typed role and text must match the
     /// exact summary supplied to this method. At least one source message must
     /// be discarded, and the rebuild must not grow the transcript.
+    ///
+    /// `messages` is the whole transcript, except inside a run after its first
+    /// response: the agent then hands over only the rows before that run, and
+    /// keeps the run's own rows verbatim after the rebuilt ones. The newest
+    /// turn of such a prefix is complete (it has its final answer), so it is
+    /// not a request in flight. A rebuild that keeps the last user row while
+    /// putting the summary first is refused there, because the summary must
+    /// stand at the first discarded row. When the rows before a run hold no
+    /// turn, the agent folds the run's completed rounds itself and does not
+    /// call this method.
     fn rebuild_history(&self, messages: &[Message], summary: &str) -> CompactionResult;
 }
 
 /// Borrowed view of the compaction inputs handed to a [`CompactionCurator`].
 ///
 /// This is exactly the data the agent-loop compaction flow already holds when
-/// it would otherwise run the summarization LLM call: the full current
-/// transcript (including every ordered System message and any prior typed
-/// compaction-summary user message), the last observed input token count, and
-/// the session-scoped boundary index at which compaction runs.
+/// it would otherwise run the summarization LLM call: the transcript the
+/// summary is written from (including every ordered System message and any
+/// prior typed compaction-summary user message), the last observed input
+/// token count, and the session-scoped boundary index at which compaction
+/// runs.
+///
+/// The transcript is the whole current one, except inside a run after its
+/// first response while the rows before the run still hold a turn: the
+/// compaction then folds only those rows, and the window holds only them.
+/// When nothing before the run is left, a compaction folds the run's own
+/// completed rounds and keeps its request and newest round; the window then
+/// holds the whole transcript again.
 #[derive(Debug, Clone, Copy)]
 pub struct CompactionWindow<'a> {
-    /// Full current transcript messages.
+    /// The transcript messages the summary is written from.
     pub messages: &'a [Message],
     /// Input token count from the last LLM response.
     pub last_input_tokens: u64,
@@ -642,6 +660,9 @@ pub enum CompactionCuratorError {
 /// by [`Compactor::should_compact`]; the curator substitutes summary CONTENT
 /// production only. There is no LLM fallback: a failing curator surfaces a
 /// typed `CompactionFailed` event and the original history is preserved.
+/// The window it gets is the transcript the summary is written from (see
+/// [`CompactionWindow`]): inside a run, only the rows before the run while
+/// those are what folds.
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait CompactionCurator: Send + Sync {

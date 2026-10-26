@@ -810,11 +810,21 @@ impl Compactor for DefaultCompactor {
         // summarized. A bundle that alone exceeds the retention budget
         // (a large request, or a short one behind large injected context)
         // cannot be resent as is; it is summarized instead, and the
-        // summarizer source keeps user rows to the last.
+        // summarizer source keeps user rows to the last. A newest turn that
+        // already has its final answer (a response with no tool call) is
+        // not in flight: inside a run the agent hands over only the rows
+        // before that run, whose newest turn is an earlier, answered one. It
+        // is kept whole or folded whole, never left as a request that reads
+        // as pending.
+        let newest_turn_answered = turn_starts.last().is_some_and(|start| {
+            messages[*start..].iter().any(|message| {
+                matches!(message, Message::BlockAssistant(assistant) if !assistant.has_tool_calls())
+            })
+        });
         let pinned_request = turn_starts
             .last()
             .copied()
-            .filter(|start| *start < retain_from)
+            .filter(|start| *start < retain_from && !newest_turn_answered)
             .and_then(|start| {
                 let request = (start..messages.len()).find(|offset| {
                     matches!(
@@ -1939,10 +1949,86 @@ mod tests {
         }
     }
 
-    /// This is the compactor alone. The agent never hands it the rows of a
-    /// run in flight: it folds only the rows before the open run and keeps
-    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
-    /// the "in-flight turn" here is the newest turn before that run.
+    /// The rows before an open run, as the agent hands them over inside the
+    /// run: one exchange, already answered. Nothing is in flight, so no
+    /// request is pinned: the exchange folds whole and the rebuild shrinks.
+    #[test]
+    fn an_answered_newest_turn_folds_whole() {
+        let c = DefaultCompactor::new(make_config());
+        let messages = vec![
+            Message::User(UserMessage::text("hi")),
+            Message::BlockAssistant(meerkat_core::types::BlockAssistantMessage::new(
+                vec![meerkat_core::types::AssistantBlock::Text {
+                    text: "hello".to_string(),
+                    meta: None,
+                }],
+                meerkat_core::types::StopReason::EndTurn,
+            )),
+        ];
+        let result = c.rebuild_history(&messages, "summary");
+        assert_eq!(result.messages.len(), 1, "only the summary is left");
+        assert_eq!(result.discarded.len(), 2, "the exchange folds whole");
+    }
+
+    /// An answered newest turn too large for the retention is folded whole:
+    /// its request is not kept verbatim after the summary, where it would
+    /// read as pending and could be acted on again.
+    #[test]
+    fn an_answered_newest_turn_over_the_retention_leaves_no_pending_request() {
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
+
+        let c = DefaultCompactor::new(CompactionConfig {
+            auto_compact_threshold: 100_000,
+            recent_turn_budget: 4,
+            ..make_config()
+        });
+        let text = |text: &str| {
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: text.to_string(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            ))
+        };
+        let messages = vec![
+            Message::User(UserMessage::text("a")),
+            text("a answered"),
+            Message::User(UserMessage::text("b")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tc_b".to_string(),
+                    name: "inspect".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::with_blocks(
+                "tc_b".to_string(),
+                vec![ContentBlock::Text {
+                    text: "x".repeat(200_000),
+                }],
+                false,
+            )]),
+            text("b answered"),
+        ];
+        let result = c.rebuild_history(&messages, "summary");
+        assert!(
+            !result.messages.iter().any(
+                |message| matches!(message, Message::User(user) if user.text_content() == "b")
+            ),
+            "the answered request is not left verbatim: {:?}",
+            result.messages
+        );
+    }
+
+    /// This is the compactor alone. The agent hands it a whole transcript,
+    /// open request included, only at a run's first boundary, before the
+    /// run's first response; inside a run, after its first response, it
+    /// hands over only the rows before the run, whose newest turn is
+    /// answered, and folds the run's own completed rounds itself
+    /// (`agent::compact::compaction_scope`).
     #[test]
     fn test_rebuild_zero_budget_keeps_only_the_in_flight_request() {
         let c = DefaultCompactor::new(CompactionConfig {
@@ -1964,10 +2050,12 @@ mod tests {
         assert_eq!(result.discarded.len(), 2);
     }
 
-    /// This is the compactor alone. The agent never hands it the rows of a
-    /// run in flight: it folds only the rows before the open run and keeps
-    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
-    /// the "in-flight turn" here is the newest turn before that run.
+    /// This is the compactor alone. The agent hands it a whole transcript,
+    /// open request included, only at a run's first boundary, before the
+    /// run's first response; inside a run, after its first response, it
+    /// hands over only the rows before the run, whose newest turn is
+    /// answered, and folds the run's own completed rounds itself
+    /// (`agent::compact::compaction_scope`).
     #[test]
     fn rebuild_does_not_retain_a_single_turn_larger_than_the_recovery_budget() {
         use meerkat_core::types::ToolResult;
@@ -3014,10 +3102,12 @@ mod tests {
     /// verbatim whether the whole turn fits (kept whole) or not (the request
     /// row kept, the rest of the turn summarized).
     ///
-    /// This is the compactor alone. The agent never hands it the rows of a
-    /// run in flight: it folds only the rows before the open run and keeps
-    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
-    /// the "in-flight turn" here is the newest turn before that run.
+    /// This is the compactor alone. The agent hands it a whole transcript,
+    /// open request included, only at a run's first boundary, before the
+    /// run's first response; inside a run, after its first response, it
+    /// hands over only the rows before the run, whose newest turn is
+    /// answered, and folds the run's own completed rounds itself
+    /// (`agent::compact::compaction_scope`).
     #[test]
     fn a_system_heavy_session_keeps_the_in_flight_request() {
         use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
