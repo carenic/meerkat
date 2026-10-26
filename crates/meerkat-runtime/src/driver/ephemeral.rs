@@ -3585,9 +3585,10 @@ impl EphemeralRuntimeDriver {
     }
 
     /// Clear the requeue marks a graceful stop left on `input_ids`, the
-    /// inputs of a resumed run as it starts: the run runs now, so a later
-    /// crash of it is never read as an expired stop. Returns the inputs whose
-    /// mark was cleared.
+    /// inputs of a run as it starts (a batch as it is staged for its run, or
+    /// a resumed run's bound inputs): the run runs now, so a later crash of
+    /// it is never read as an expired stop. Returns the inputs whose mark was
+    /// cleared.
     pub(crate) fn clear_stop_requeue_marks(&mut self, input_ids: &[InputId]) -> Vec<InputId> {
         let now = Utc::now();
         let mut cleared = Vec::new();
@@ -3686,6 +3687,11 @@ impl EphemeralRuntimeDriver {
                 run_id: run_id.clone(),
             }));
         }
+        // The batch runs now, as a resumed run does once it starts: a mark a
+        // graceful stop left on one of its inputs goes with the staging, so a
+        // later crash of this run is never read as an expired stop. A
+        // persistent driver's staged-binding persist writes the cleared rows.
+        self.clear_stop_requeue_marks(input_ids);
         Ok(())
     }
 

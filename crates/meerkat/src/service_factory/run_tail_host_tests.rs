@@ -185,6 +185,16 @@ impl DiskStores {
 /// Materialize `session` through the surface's materialization, with no
 /// first turn.
 async fn materialize_session(start: &Start, session: meerkat_core::Session) -> SessionId {
+    try_materialize_session(start, session)
+        .await
+        .expect("materialize the session and its executor")
+}
+
+/// [`materialize_session`], answering a refused materialization.
+async fn try_materialize_session(
+    start: &Start,
+    session: meerkat_core::Session,
+) -> Result<SessionId, crate::surface::SurfaceRuntimeMaterializeError> {
     let request = CreateSessionRequest {
         model: "claude-sonnet-4-5".into(),
         prompt: "unused".into(),
@@ -208,9 +218,8 @@ async fn materialize_session(start: &Start, session: meerkat_core::Session) -> S
             move |id| crate::surface::default_persistent_executor(service, machine, id)
         },
     ))
-    .await
-    .expect("materialize the session and its executor");
-    created.session_id
+    .await?;
+    Ok(created.session_id)
 }
 
 /// One whole turn.
@@ -1191,4 +1200,206 @@ async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_head
 #[tokio::test]
 async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_whole_blob() {
     a_claim_drive_proves_nothing_against_its_own_runtimes_registration(false).await;
+}
+
+// ---------------------------------------------------------------------------
+// The run of a prompt a graceful stop kept, cut by a power cut.
+// ---------------------------------------------------------------------------
+
+/// The max age of the graceful stop that keeps the prompt. It spans the
+/// prompt's admission, the stop, host 1's shutdown, the file copy and host 2's
+/// open up to its pre-serve age check, so a slow runner still runs the prompt
+/// inside it; the start after the power cut waits it out, idle.
+const KEPT_PROMPT_MAX_AGE: Duration = Duration::from_secs(30);
+
+/// The kept prompt's row, as `start`'s runtime store holds it.
+async fn kept_prompt_row(
+    start: &Start,
+    id: &SessionId,
+    kept: &meerkat_core::InputId,
+) -> meerkat_runtime::input_state::StoredInputState {
+    start
+        .runtime_store
+        .load_input_state(&LogicalRuntimeId::for_session(id), kept)
+        .await
+        .expect("read the kept prompt's row")
+        .expect("the kept prompt's row is durable")
+}
+
+/// A graceful stop keeps a queued prompt for the next start (the requeue
+/// disposition), and the next start, inside the stop's max age, runs it as an
+/// ordinary run, run B. The power goes out while run B waits on the model
+/// after its tool round's commit, and the next host opens the session once
+/// the stop's max age, counted from the prompt's admission, has passed. Run B
+/// resumes from its tail: it is the prompt's own run, which started, not a run
+/// the stop kept, so its crash is an ordinary one, not an expired stop. Run
+/// B's start cleared the stop's mark from the prompt, so the power cut left
+/// none. RED before: the mark stayed on the prompt while run B was open, and
+/// the host ended run B's input as `RequeueExpired` and closed run B as
+/// interrupted instead of resuming it.
+async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age(
+    head_canonical: bool,
+) {
+    let root = TempDir::new().expect("temp");
+    let stores = DiskStores::new(head_canonical, &root);
+    let client = Arc::new(ScriptedModel::new());
+    let first = stores.open(&root, &client);
+    let id = materialize_session(&first, meerkat_core::Session::new()).await;
+    client.push(Step::Text("first answer"));
+    let outcome = turn(&first, &id, "first").await;
+    assert!(
+        matches!(outcome, Some(CompletionOutcome::Completed(_))),
+        "the first turn commits: {outcome:?}"
+    );
+
+    // Run starts are held, so the prompt is still queued when the graceful
+    // stop comes, as a prompt queued behind a running turn is.
+    let hold = first
+        .machine
+        .hold_run_starts(&id, meerkat_runtime::RunStartHoldReason::MobStop)
+        .await
+        .expect("hold the session's run starts");
+    assert_eq!(hold.current_run, None, "no run is in flight");
+    let prompt = Input::Prompt(PromptInput::new("kept", None));
+    let kept = prompt.id().clone();
+    let (accepted, _kept_waiter) = first
+        .machine
+        .accept_input_with_completion(&id, prompt)
+        .await
+        .expect("the runtime admits the prompt");
+    assert!(
+        accepted.is_accepted(),
+        "the prompt is admitted: {accepted:?}"
+    );
+    let registration = first
+        .machine
+        .current_session_registration_witnesses()
+        .await
+        .into_iter()
+        .find(|registration| registration.session_id() == &id)
+        .expect("the session's registration");
+    let unregistered = first
+        .machine
+        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+            &registration,
+            meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                max_age: KEPT_PROMPT_MAX_AGE,
+            },
+        )
+        .await
+        .expect("the graceful stop");
+    assert!(unregistered, "the graceful stop ends the registration");
+    first.service.try_shutdown().await.expect("shutdown");
+    let stopped = kept_prompt_row(&first, &id, &kept).await;
+    let admitted_at = stopped
+        .state
+        .persisted_input
+        .as_ref()
+        .expect("the kept prompt keeps its payload")
+        .header()
+        .timestamp;
+    let max_age_ms =
+        u64::try_from(KEPT_PROMPT_MAX_AGE.as_millis()).expect("the max age fits in milliseconds");
+    assert_eq!(
+        (
+            stopped.seed.phase,
+            stopped.seed.terminal_outcome,
+            stopped.state.stop_requeue.map(|mark| mark.max_age_ms),
+        ),
+        (InputLifecycleState::Queued, None, Some(max_age_ms)),
+        "the stop keeps the prompt queued and marked for the next start"
+    );
+
+    // The next start, inside the max age, runs the prompt: run B commits its
+    // tool round and waits on the model.
+    let after_the_stop = TempDir::new().expect("temp");
+    let restarted = stores.power_cut_copy(&after_the_stop);
+    let run_b_client = Arc::new(ScriptedModel::new());
+    run_b_client.push(Step::Tool);
+    run_b_client.push(Step::Held);
+    let second = restarted.open(&after_the_stop, &run_b_client);
+    materialize_session(&second, restarted.stored_session(&second, &id).await).await;
+    let second_open_row = kept_prompt_row(&second, &id, &kept).await;
+    assert_ne!(
+        second_open_row.seed.terminal_outcome,
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        }),
+        "timing precondition: host 2 must open the session inside the stop's max age, counted \
+         from the prompt's admission; it opened later and expired the prompt instead of running it"
+    );
+    tokio::time::timeout(DEADLINE, run_b_client.entered.acquire())
+        .await
+        .expect("the start inside the max age runs the kept prompt to its second model call")
+        .expect("model gate")
+        .forget();
+    let run_b = tail_run(&second, &id)
+        .await
+        .expect("run B's round commit stands as the provisional tail");
+
+    // The power goes out while run B waits on the model.
+    let after_the_cut = TempDir::new().expect("temp");
+    let cut = restarted.power_cut_copy(&after_the_cut);
+    let resumed_client = Arc::new(ScriptedModel::new());
+    resumed_client.push(Step::Held);
+    let third = cut.open(&after_the_cut, &resumed_client);
+    let left_by_the_cut = kept_prompt_row(&third, &id, &kept).await;
+    assert_eq!(
+        (
+            left_by_the_cut.seed.last_run_id.as_ref(),
+            left_by_the_cut.seed.terminal_outcome.as_ref(),
+        ),
+        (Some(&run_b), None),
+        "the power cut leaves the prompt bound to run B"
+    );
+
+    // The next host opens the session once the stop's max age has passed.
+    let past_the_max_age = admitted_at
+        + chrono::Duration::from_std(KEPT_PROMPT_MAX_AGE + Duration::from_millis(500))
+            .expect("the max age is a chrono duration");
+    if let Ok(wait) = (past_the_max_age - chrono::Utc::now()).to_std() {
+        tokio::time::sleep(wait).await;
+    }
+    let opened = try_materialize_session(&third, cut.stored_session(&third, &id).await).await;
+    let opened_row = kept_prompt_row(&third, &id, &kept).await;
+    assert_eq!(
+        opened_row.seed.terminal_outcome, None,
+        "run B is not settled as an expired stop: it started, so its crash is an ordinary one"
+    );
+    opened.expect("the next host opens the session");
+    tokio::time::timeout(DEADLINE, resumed_client.entered.acquire())
+        .await
+        .expect("run B resumes and reaches the model")
+        .expect("model gate")
+        .forget();
+    assert_eq!(
+        tail_run(&third, &id).await,
+        Some(run_b.clone()),
+        "the resumed run continues run B's tail"
+    );
+    let resumed = kept_prompt_row(&third, &id, &kept).await;
+    assert_eq!(
+        resumed.seed.last_run_id.as_ref(),
+        Some(&run_b),
+        "the prompt stays bound to run B"
+    );
+    assert_eq!(
+        (
+            left_by_the_cut.state.stop_requeue,
+            resumed.state.stop_requeue
+        ),
+        (None, None),
+        "run B's start cleared the stop's mark from its input, so the power cut left none"
+    );
+}
+
+#[tokio::test]
+async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age_head_canonical()
+{
+    the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age(true).await;
+}
+
+#[tokio::test]
+async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age_whole_blob() {
+    the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age(false).await;
 }

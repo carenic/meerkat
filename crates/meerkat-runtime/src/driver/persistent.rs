@@ -2554,6 +2554,8 @@ impl PersistentRuntimeDriver {
     /// work. Recovery refuses to guess (text is content evidence, never
     /// identity) and would hold such a tail; making the binding durable at
     /// staging closes that window for every run started by this binary.
+    /// The rows written are the staged inputs' whole rows, so a requeue mark
+    /// the staging cleared is cleared durably with the binding.
     /// Fail-closed: a persist failure aborts the run start.
     pub(crate) async fn persist_staged_input_bindings(
         &self,
