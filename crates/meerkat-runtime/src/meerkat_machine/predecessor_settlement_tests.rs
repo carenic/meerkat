@@ -1400,3 +1400,409 @@ async fn a_migrated_row_is_reported_apart_and_left_as_it_is() {
     assert!(stored.state.terminal_completion_unavailable);
     assert!(stored.state.terminal_completion.is_none());
 }
+
+// ---------------------------------------------------------------------------
+// The predecessor's pending terminal and its lost consent
+// ---------------------------------------------------------------------------
+
+/// The row of `input`, a directed input that a cancel point of the
+/// predecessor (placed at the predecessor's placement) ended while it was
+/// still queued: terminal `Abandoned { Cancelled }`, its runless batch
+/// pending with `reason`, and its outbox not yet published. Built through the
+/// predecessor runtime's own staging path, on a scratch driver whose
+/// authority holds that placement.
+async fn cancelled_while_queued(
+    session_id: &SessionId,
+    input: &Input,
+    reason: &str,
+) -> StoredInputState {
+    use crate::meerkat_machine::dsl;
+    let runtime_id = LogicalRuntimeId::for_session(session_id);
+    let mut driver = crate::meerkat_machine::driver::DriverEntry::Ephemeral(
+        crate::EphemeralRuntimeDriver::new(runtime_id),
+    );
+    let epoch_id = dsl::RuntimeEpochId::from(PLACED_EPOCH.to_string());
+    let mut authority = crate::meerkat_machine::dsl_authority::new_registered_authority_id(
+        dsl::SessionId::from_domain(session_id),
+        epoch_id.clone(),
+    )
+    .expect("the predecessor's registered authority");
+    dsl::MeerkatMachineMutator::apply(
+        &mut authority,
+        dsl::MeerkatMachineInput::PrepareBindings {
+            agent_runtime_id: dsl::AgentRuntimeId::from(PLACED_RUNTIME.to_string()),
+            fence_token: dsl::FenceToken::from(PLACED_FENCE),
+            generation: Some(dsl::Generation::from(PLACED_GENERATION)),
+            runtime_epoch_id: Some(epoch_id),
+            session_id: dsl::SessionId::from_domain(session_id),
+        },
+    )
+    .expect("the predecessor's placed authority");
+    *driver
+        .shared_dsl_authority()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = authority;
+    driver.set_control_projection(crate::RuntimeState::Attached, None, None);
+    assert!(
+        driver
+            .as_driver_mut()
+            .accept_input(input.clone())
+            .await
+            .expect("the predecessor accepts the input")
+            .is_accepted()
+    );
+    let prepared = driver
+        .prepare_sole_runless_runtime_termination(input.id(), reason.to_string())
+        .expect("the cancel point prepares its runless terminal");
+    assert!(
+        driver
+            .abandon_queued_input(input.id(), InputAbandonReason::Cancelled)
+            .await
+            .expect("the cancel point ends the queued input")
+    );
+    assert_eq!(
+        crate::meerkat_machine::driver::DriverEntry::commit_prepared_sole_runless_termination(
+            prepared
+        ),
+        Some(input.id().clone())
+    );
+    driver
+        .as_driver()
+        .stored_input_state(input.id())
+        .expect("the cancelled input's row")
+}
+
+/// A consent a lost owner of the session issued for routed work in the
+/// session's scope of the host's hosting domain, approved by an
+/// authenticated human and parked at its run's close: unspent and
+/// unwithdrawn.
+async fn lost_owners_parked_consent(
+    host: &Host,
+    session_id: &SessionId,
+    approvals: &meerkat_core::approval::ApprovalService,
+) -> meerkat_core::approval::consent_test_support::ParkedRoutedConsent {
+    let domain = host
+        .store
+        .hosting_capability()
+        .domain_ref()
+        .expect("the store hosts its sessions under OS locks");
+    meerkat_core::approval::consent_test_support::ParkedRoutedConsent::park(
+        approvals,
+        meerkat_core::approval::ApprovalConsentScope {
+            domain,
+            session_id: session_id.clone(),
+        },
+        meerkat_core::retained_work::RetainedWorkIdentity::new(
+            LogicalRuntimeId::for_session(session_id).0,
+            RunId::new(),
+            Vec::new(),
+            std::collections::BTreeMap::new(),
+            None,
+        ),
+    )
+    .await
+    .expect("the lost owner's consent is parked")
+}
+
+/// Wait, bounded, until no claim of `session_id`'s lineage is alive in this
+/// process: the settlement task drops its registration's last clone of the
+/// claim right after it answers.
+async fn lineage_ended(host: &Host, session_id: &SessionId) {
+    for _ in 0..200 {
+        if matches!(
+            host.machine.session_serving(session_id),
+            crate::session_hosting::SessionServing::NotHeldInThisProcess
+        ) {
+            return;
+        }
+        crate::tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    panic!("the claim lineage of session {session_id} never ended");
+}
+
+/// An issuing consent owner that records the proof of every reservation it
+/// settles, or fails every settlement while `failing` is set.
+#[derive(Default)]
+struct RecordingConsentOwner {
+    settled: std::sync::Mutex<Vec<HostingOwnerLossProof>>,
+    failing: std::sync::atomic::AtomicBool,
+}
+
+impl meerkat_core::approval::ConsentOwnerLossSettlement for RecordingConsentOwner {
+    fn settle(
+        &self,
+        reservation: &crate::session_hosting::OwnerLossReservation,
+    ) -> Result<(), meerkat_core::ApprovalError> {
+        if self.failing.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(meerkat_core::ApprovalError::StoreUnavailable(
+                "the consent owner's store is unavailable".to_string(),
+            ));
+        }
+        self.settled
+            .lock()
+            .unwrap()
+            .push(reservation.proof().clone());
+        Ok(())
+    }
+}
+
+/// The whole predecessor: a run whose answer reached its tail before its
+/// boundary (its directed and nondirected contributors), a queued prompt
+/// and a queued directed input beside it, a directed input a cancel point
+/// ended whose runless terminal is still unpublished, and an approved,
+/// unspent consent the lost owner parked in the session's scope, with the
+/// issuing consent owner installed.
+///
+/// The settlement commits the tail with its contributors' batch, ends the
+/// queued inputs `Stopped`, converges the cancelled input's pending terminal
+/// (its requester gets the failure the cancel point owed), and the issuing
+/// consent owner settles the lost owner's consent under the claim's own
+/// reservation, which completes at the internal registration's publication:
+/// the consent keeps its decision, can no longer be spent, and owes its
+/// Withdrawn notice. A repeat on the same live lineage settles nothing
+/// again: it reports the proof the lineage settled, and the consent owes
+/// one notice still.
+#[tokio::test]
+async fn a_settlement_answers_everything_the_predecessor_left_and_settles_its_lost_consent() {
+    use meerkat_core::approval::{
+        ApprovalConsentDeliveryState, ApprovalConsentTransition, ApprovalConsentWithdrawalReason,
+        ApprovalService, ApprovalStatus,
+    };
+
+    let host = Host::head_canonical();
+    let approvals = ApprovalService::new();
+    host.machine
+        .install_consent_owner_loss_settlement(Arc::new(approvals.clone()))
+        .expect("the issuing consent owner is installed before any registration");
+    let (session_id, run_id) = durable_session(&host, Some(completed_tail)).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let d1 = directed_step("the run's directed contributor");
+    let p1 = prompt("the run's prompt contributor");
+    let q1 = prompt("queued beside the run");
+    let d2 = directed_step("queued directed beside the run");
+    let x0 = directed_step("cancelled while queued");
+    host.persist(&session_id, applied_to(&d1, &run_id)).await;
+    host.persist(&session_id, applied_to(&p1, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued(&d2, 2)).await;
+    host.persist(
+        &session_id,
+        cancelled_while_queued(&session_id, &x0, "cancelled by its caller").await,
+    )
+    .await;
+    let consent = lost_owners_parked_consent(&host, &session_id, &approvals).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let settled = settle_whole(&host, &claim, &publisher).await;
+
+    let tail = settled.tail.expect("the tail is committed");
+    assert_eq!(tail.run_id, run_id);
+    let PredecessorOwnerLoss::Completed(proof) = settled.work.owner_loss.clone() else {
+        panic!(
+            "the consent owner settled the lineage's owner loss: {:?}",
+            settled.work.owner_loss
+        );
+    };
+    assert_eq!(proof.session_id(), &session_id);
+    assert_eq!(
+        proof.acquisition(),
+        crate::session_hosting::HostingAcquisition::AcquiredFresh
+    );
+    assert_eq!(
+        Some(proof.domain()),
+        host.store.hosting_capability().domain_ref().as_ref()
+    );
+    let publication = settled
+        .publication
+        .expect("the census finds every row closed");
+    assert!(publication.owed.is_empty());
+    assert_eq!(publication.durable_rows_closed, 5);
+    for input in [&d1, &p1] {
+        assert_eq!(
+            settled_input(&publication, input).settled_by,
+            SettledBy::TailConsumed
+        );
+    }
+    for input in [&q1, &d2] {
+        assert_eq!(
+            settled_input(&publication, input).settled_by,
+            SettledBy::Ended
+        );
+    }
+    let cancelled = settled_input(&publication, &x0);
+    assert_eq!(cancelled.settled_by, SettledBy::PendingTerminalConverged);
+    assert_eq!(
+        cancelled.receipt.terminal(),
+        &InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Cancelled,
+        }
+    );
+    assert_eq!(
+        cancelled.receipt.scope(),
+        &InputTerminalReceiptScope::RuntimeTermination
+    );
+    assert!(matches!(
+        cancelled.receipt.outcome(),
+        CompletionOutcome::RuntimeTerminated { reason, .. } if reason == "cancelled by its caller"
+    ));
+    assert!(cancelled.published_terminal_seq.is_some());
+    let events = publisher.events();
+    assert_eq!(events.len(), 3, "{events:?}");
+    assert!(matches!(
+        published_for(&events, &x0),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::Abandoned { detail },
+            ..
+        } if detail == "cancelled by its caller"
+    ));
+
+    let withdrawn = |approvals: &ApprovalService| {
+        let record = approvals
+            .get(consent.approval_id())
+            .expect("the consent row reads");
+        assert_eq!(
+            record.status,
+            ApprovalStatus::Approved,
+            "the decision stays"
+        );
+        let row = record.consent.expect("a consent row");
+        assert!(row.consumed_at.is_none(), "the consent was never spent");
+        assert_eq!(
+            row.withdrawal.map(|withdrawal| withdrawal.reason),
+            Some(ApprovalConsentWithdrawalReason::Abandoned),
+            "the lost owner's consent can no longer be spent"
+        );
+        row.deliveries
+            .iter()
+            .filter(|delivery| {
+                delivery.transition == ApprovalConsentTransition::Withdrawn
+                    && delivery.state == ApprovalConsentDeliveryState::Owed
+            })
+            .count()
+    };
+    assert_eq!(
+        withdrawn(&approvals),
+        1,
+        "its Withdrawn notice is owed once"
+    );
+
+    let repeat_publisher = Arc::new(RecordingPublisher::default());
+    let repeat = settle_whole(&host, &claim, &repeat_publisher).await;
+    assert_eq!(
+        repeat.work.owner_loss,
+        PredecessorOwnerLoss::NotOwed(proof),
+        "the same live lineage settles nothing again"
+    );
+    repeat
+        .publication
+        .expect("the repeat finds every row closed");
+    assert!(repeat_publisher.events().is_empty());
+    assert_eq!(withdrawn(&approvals), 1, "no notice is owed twice");
+}
+
+/// The issuing consent owner fails the lineage's owner-loss settlement: the
+/// internal registration is refused before it publishes, typed, after the
+/// tail was committed; nothing is swept and nothing stays registered.
+#[tokio::test]
+async fn a_failed_consent_settlement_refuses_the_internal_registration_before_any_sweep() {
+    let host = Host::head_canonical();
+    let owner = Arc::new(RecordingConsentOwner::default());
+    owner
+        .failing
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    host.machine
+        .install_consent_owner_loss_settlement(owner.clone())
+        .expect("the issuing consent owner is installed before any registration");
+    let (session_id, run_id) = durable_session(&host, Some(completed_tail)).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let p1 = prompt("the run's prompt contributor");
+    let q1 = prompt("queued beside the run");
+    host.persist(&session_id, applied_to(&p1, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    let claim = host.claim(&session_id);
+
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    let tail = host
+        .machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the first drive answers")
+        .expect("the tail is committed before the registration");
+    assert_eq!(tail.run_id, run_id);
+    let refused = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect_err("an unsettled owner loss refuses the internal registration");
+    assert!(
+        matches!(
+            &refused,
+            PredecessorSettlementRefusal::Runtime(RuntimeDriverError::ConsentOwnerLossUnsettled {
+                session_id: refused_session,
+            }) if refused_session == &session_id
+        ),
+        "{refused:?}"
+    );
+    assert!(!lease.registered());
+    drop(lease);
+    assert!(!host.machine.contains_session(&session_id).await);
+    let rows = host.rows(&session_id).await;
+    assert_eq!(
+        stored_row(&rows, &q1).seed.phase,
+        InputLifecycleState::Queued,
+        "nothing was swept"
+    );
+    assert!(owner.settled.lock().unwrap().is_empty());
+}
+
+/// The host drops its claim between the settlement and its registration:
+/// the lineage the settlement completed ends with it. The next grant is not
+/// a join; its registration owes, and the consent owner settles, a new
+/// owner loss with a new proof.
+#[tokio::test]
+async fn a_dropped_claim_ends_the_lineage_the_settlement_completed() {
+    let host = Host::head_canonical();
+    let owner = Arc::new(RecordingConsentOwner::default());
+    host.machine
+        .install_consent_owner_loss_settlement(owner.clone())
+        .expect("the issuing consent owner is installed before any registration");
+    let (session_id, _) = durable_session(&host, Some(completed_tail)).await;
+    let claim = host.claim(&session_id);
+    let settled = settle_whole(&host, &claim, &Arc::new(RecordingPublisher::default())).await;
+    let PredecessorOwnerLoss::Completed(first) = settled.work.owner_loss.clone() else {
+        panic!(
+            "the settlement completed the owner loss: {:?}",
+            settled.work.owner_loss
+        );
+    };
+    settled
+        .publication
+        .expect("the census finds every row closed");
+    drop(claim);
+    lineage_ended(&host, &session_id).await;
+
+    let next = host.claim(&session_id);
+    assert_ne!(
+        next.acquisition(),
+        crate::session_hosting::HostingAcquisition::Joined,
+        "the settlement's lineage ended with its last claim"
+    );
+    host.machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session registers under the new lineage");
+    let settled_proofs = owner.settled.lock().unwrap().clone();
+    assert_eq!(settled_proofs.len(), 2, "{settled_proofs:?}");
+    assert_eq!(settled_proofs[0], first);
+    assert_ne!(
+        settled_proofs[1], first,
+        "the new lineage's registration settled its own owner loss"
+    );
+}
