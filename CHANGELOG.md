@@ -115,6 +115,26 @@ them.
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
 
+- `meerkat-runtime`: a run that a graceful stop kept open for the next start
+  now tells its callers when it is settled instead of resumed. A kept run is
+  settled when the next start finds it past the stop's max age
+  (`RequeueExpired`), when its resume is refused, when a stop that keeps no
+  work ends it, or when the session is archived. Each of these ended the
+  run's inputs but staged no terminal for them, so the caller of a directed
+  input (a directed peer message or a tracked flow step) never saw its
+  interaction end. The settlement now stages the runtime-termination carrier
+  for the run's inputs in the same durable commit that ends them, as a stop
+  already does for the queued inputs it ends: a directed input's interaction
+  fails exactly once with an `InteractionFailed`. A nondirected kept input
+  now carries a runtime-termination receipt too: its receipt reads move from
+  pending to finalized with the runtime-terminated outcome and the
+  settlement's reason, where they used to read as a terminal without a
+  receipt (rows 0.9.5 settled still read that way). A start that settles an
+  expired kept run publishes after it releases the session, through the
+  attachment's publication capability, so a crash in between, or a surface
+  without that capability, leaves the committed carrier for the next stop or
+  start to publish.
+
 - `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
   schedules are included; the tool lists active and paused schedules only, and
   the description now says so.
