@@ -12040,6 +12040,66 @@ fn compaction_stage_state(
         .ok()
 }
 
+/// The states of `projection`'s rows in the runtime's compaction outbox
+/// (`pending`, then `finalized` once its finalization completed).
+#[cfg(feature = "test-support")]
+fn compaction_outbox_states(
+    paths: &Paths,
+    projection: &meerkat_core::CompactionProjectionId,
+) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        &paths.realm_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the runtime store's database");
+    let mut statement = connection
+        .prepare(
+            "SELECT state FROM runtime_compaction_projection_outbox \
+             WHERE session_id = ?1 AND revision = ?2",
+        )
+        .expect("prepare the outbox query");
+    statement
+        .query_map(
+            [
+                projection.session_id().to_string(),
+                projection.revision().to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query the outbox")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read the outbox")
+}
+
+/// In one read of the memory store's database: how many memory records the
+/// session holds, and how many entries its finalized compaction stages
+/// published. Equal counts mean every finalized stage published its entries
+/// exactly once.
+#[cfg(feature = "test-support")]
+fn published_compaction_entries(
+    paths: &Paths,
+    session_id: &meerkat_core::types::SessionId,
+) -> (i64, i64) {
+    let db = paths
+        .runtime_root
+        .join("factory-store")
+        .join("memory")
+        .join("memory.sqlite3");
+    let connection =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the memory store's database");
+    connection
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM memory_metadata WHERE session_id = ?1), \
+               (SELECT COALESCE(SUM(indexed_entries), 0) FROM memory_compaction_stage \
+                  WHERE session_id = ?1 AND state = 'finalized')",
+            [session_id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("count the published compaction entries")
+}
+
 /// The member runtime's persisted lifecycle facts that bear on a
 /// compaction commit (its state, its current run and its runtime binding),
 /// read from the runtime store's database.
@@ -12199,6 +12259,27 @@ async fn a_member_run_kept_after_a_compaction_resumes_and_finalizes_its_intent()
             .load(std::sync::atomic::Ordering::SeqCst)
             >= 1,
         "the kept run resumed and asked the model"
+    );
+    // The intent the tail carried finalized exactly once: its one outbox row
+    // and its memory stage are finalized, and the session's memory holds
+    // each finalized stage's entries once.
+    for projection in &run.intents {
+        assert_eq!(
+            compaction_outbox_states(&paths, projection),
+            vec!["finalized".to_string()],
+            "the tail's intent has one outbox row, finalized"
+        );
+        assert_eq!(
+            compaction_stage_state(&paths, projection).as_deref(),
+            Some("finalized"),
+            "the tail's intent's memory stage is finalized"
+        );
+    }
+    let (records, published) = published_compaction_entries(&paths, &run.w1_sid);
+    assert!(published > 0, "the finalized stages published entries");
+    assert_eq!(
+        records, published,
+        "every finalized stage's entries are in the session's memory exactly once"
     );
     let _ = handle.shutdown().await;
 }

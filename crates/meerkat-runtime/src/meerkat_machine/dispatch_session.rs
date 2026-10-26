@@ -1166,6 +1166,55 @@ mod compaction_coordinator_tests {
         );
     }
 
+    /// The registration re-mints the session's epoch while the revived
+    /// member's agent still holds a coordinator from the previous one, and no
+    /// placement is bound yet. Finalizing a committed row is then authorized
+    /// under the session's CURRENT epoch: the one bounded re-derivation
+    /// samples the live epoch, and that sample finds the live session and
+    /// epoch with no placement. A cleared epoch has no current value and
+    /// refuses as retired. Staging still refuses for the absent placement.
+    #[test]
+    fn an_unplaced_committed_row_is_authorized_under_the_current_epoch() {
+        let fixture = CoordinatorFixture::new();
+        let coordinator = fixture.coordinator(true);
+        let row = projection(&fixture.session_id);
+        fixture.register();
+
+        let current_epoch = dsl::RuntimeEpochId::from_domain(&meerkat_core::RuntimeEpochId::new());
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = Some(current_epoch.clone());
+        });
+        coordinator.authorize_committed_projection(&row).expect(
+            "a committed row is authorized under the session's current epoch before placement",
+        );
+        assert!(
+            coordinator
+                .runtime_binding
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_none(),
+            "nothing is latched before a placement exists"
+        );
+        let staging = coordinator
+            .authorize_projection(&row)
+            .expect_err("staging still needs a placement");
+        assert_eq!(
+            refusal_of(&staging),
+            CompactionHandoffRefusal::RuntimeBindingAbsent
+        );
+
+        fixture.rewrite_state(|state| {
+            state.active_runtime_epoch_id = None;
+        });
+        let cleared = coordinator
+            .authorize_committed_projection(&row)
+            .expect_err("an epochless session has no current epoch to authorize under");
+        assert_eq!(
+            refusal_of(&cleared),
+            CompactionHandoffRefusal::RuntimeEpochRetired
+        );
+    }
+
     fn projection_for_other_session() -> meerkat_core::CompactionProjectionId {
         projection(&SessionId::new())
     }

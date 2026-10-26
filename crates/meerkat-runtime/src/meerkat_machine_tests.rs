@@ -55626,10 +55626,10 @@ async fn a_settled_runs_repair_reloads_only_while_a_tail_stands() {
 }
 
 /// Under a standing provisional tail the reconciliation keeps an outboxed
-/// compaction intent pending: the executor reconciles its stage, and nothing
-/// finalizes it (a finalization here would fail on an intent the store never
-/// outboxed). Its finalization belongs to the run's boundary. Unrun: written
-/// while Cargo is not run.
+/// compaction intent pending and leaves its stage alone: the executor is not
+/// asked to reconcile while the tail stands (the tail may carry intents the
+/// outbox does not hold yet), and nothing finalizes the intent. Its
+/// finalization belongs to the reconciliation after the tail settles.
 #[tokio::test]
 async fn compaction_reconciliation_keeps_an_outboxed_intent_pending_under_a_tail() {
     struct CountingExecutor {
@@ -55754,8 +55754,9 @@ async fn compaction_reconciliation_keeps_an_outboxed_intent_pending_under_a_tail
     }
     assert_eq!(
         executor.reconcile_intent_counts,
-        vec![1, 1],
-        "the intent's stage is reconciled, and kept"
+        Vec::<usize>::new(),
+        "the executor is not asked to reconcile while the tail stands, so the intent's \
+         stage is kept"
     );
     assert_eq!(executor.checkpoint_calls, 0);
 }

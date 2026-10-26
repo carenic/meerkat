@@ -2501,11 +2501,14 @@ async fn recover_committed_runtime_projections_before_teardown(
     let post_commit_hooks = recovery.authority_binding.post_commit_hooks().await;
     // A rejected atomic boundary has no committed current-run compaction
     // outbox, and startup drained every older outbox before admitting work.
-    // The whole-run abort above therefore already settled the exact live
-    // compaction stage before discarding its actor. Do not follow it with the
-    // generic empty-outbox reconciliation: custom builders may require that
-    // actor, and asking again after discard turns successful cleanup into an
-    // unrecoverable `NotFound`/unsupported failure.
+    // The whole-run abort above therefore already settled the live compaction
+    // before discarding its actor: it deleted the stage of a compaction no
+    // run checkpoint had written, and released one the run's provisional
+    // tail carries to that tail's settlement (a later reconciliation
+    // finalizes it if the tail commits, or aborts it as an orphan). Do not
+    // follow it with the generic empty-outbox reconciliation: custom builders
+    // may require that actor, and asking again after discard turns successful
+    // cleanup into an unrecoverable `NotFound`/unsupported failure.
     if !rejected_run_projection_abort_completed {
         reconcile_compaction_projection_outbox(
             driver,
