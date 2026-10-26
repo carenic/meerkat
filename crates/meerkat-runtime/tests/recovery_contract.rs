@@ -3813,10 +3813,26 @@ async fn head_canonical_recovery_uses_only_store_owned_source_and_migrates_floor
         assert_eq!(stored.seed.last_run_id, Some(candidate_run.clone()));
         assert_eq!(stored.seed.last_boundary_sequence, Some(2));
         assert!(
-            stored.state.persisted_input.is_none(),
-            "the {label} row committed its recovery receipt and must retire redelivery bytes"
+            stored.state.persisted_input.is_some(),
+            "the {label} row keeps its payload while the receipt its recovered boundary staged \
+             is pending"
         );
     }
+    // The recovered boundary staged one run batch for its two contributors:
+    // its owner, the first contributor in canonical order, owns the pending
+    // receipt the next drain finalizes.
+    let pending_owners = store
+        .load_pending_terminal_owner_ids_page(&runtime_id, None, 16)
+        .await
+        .unwrap();
+    assert_eq!(
+        [&staged_id, &receipt_id]
+            .into_iter()
+            .filter(|input_id| pending_owners.contains(*input_id))
+            .count(),
+        1,
+        "one pending receipt batch owns both contributors"
+    );
 
     let retained_after = store
         .load_input_state(&runtime_id, &retained_id)
@@ -3833,8 +3849,8 @@ async fn head_canonical_recovery_uses_only_store_owned_source_and_migrates_floor
     );
     assert!(retained_after.state.persisted_input.is_some());
 
-    // Reopen the durable store: payload retirement must not erase terminal
-    // facts, while the unrelated accepted input still carries its exact
+    // Reopen the durable store: the terminal facts and the staged receipts
+    // persist, while the unrelated accepted input still carries its exact
     // redelivery material.
     let restarted_store = SqliteRuntimeStore::new_head_canonical(&db_path).unwrap();
     for input_id in [&staged_id, &receipt_id] {
@@ -3848,7 +3864,7 @@ async fn head_canonical_recovery_uses_only_store_owned_source_and_migrates_floor
             restarted.seed.terminal_outcome,
             Some(InputTerminalOutcome::Consumed)
         );
-        assert!(restarted.state.persisted_input.is_none());
+        assert!(restarted.state.persisted_input.is_some());
     }
     let restarted_retained = restarted_store
         .load_input_state(&runtime_id, &retained_id)
