@@ -16834,6 +16834,156 @@ meerkat_ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed(arg_ru
        /\ model_step_count' = model_step_count + 1
 
 
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownInitializing(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Initializing"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Initializing"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownInitializing"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownInitializing", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Initializing"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownIdle(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Idle"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Idle"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownIdle"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownIdle", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Idle"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownAttached(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Attached"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Attached"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownAttached"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownAttached", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Attached"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownRunning(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Running"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Running"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownRunning"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownRunning", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Running"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownRetired(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Retired"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Retired"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownRetired"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownRetired", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Retired"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
+meerkat_ResolveRuntimeCompletionResultOutcomeUnknownStopped(arg_run_id, arg_terminal, arg_finalization) ==
+    /\ \E packet \in SeqElements(pending_inputs) :
+       /\ packet.machine = "meerkat"
+       /\ packet.variant = "ResolveRuntimeCompletionResult"
+       /\ packet.payload.run_id = arg_run_id
+       /\ packet.payload.terminal = arg_terminal
+       /\ packet.payload.finalization = arg_finalization
+       /\ ~HigherPriorityReady("meerkat_kernel")
+       /\ meerkat_phase = "Stopped"
+       /\ (meerkat_session_id # None)
+       /\ (packet.payload.run_id = None)
+       /\ (packet.payload.finalization = "Succeeded")
+       /\ (packet.payload.terminal = "OutcomeUnknown")
+       /\ meerkat_phase' = "Stopped"
+       /\ UnchangedFrame_3790f67f79336d77
+       /\ pending_inputs' = SeqRemove(pending_inputs, packet)
+       /\ observed_inputs' = observed_inputs
+       /\ pending_routes' = pending_routes
+       /\ delivered_routes' = delivered_routes
+       /\ emitted_effects' = emitted_effects \cup { [machine |-> "meerkat", variant |-> "RuntimeCompletionResultResolved", payload |-> [agent_runtime_id |-> meerkat_active_runtime_id, cleanup_outcome |-> "OutcomeUnknown", fence_token |-> meerkat_active_fence_token, result_class |-> "OutcomeUnknown", run_id |-> None, runtime_epoch_id |-> meerkat_active_runtime_epoch_id, runtime_generation |-> meerkat_active_runtime_generation, session_id |-> (IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None)], effect_id |-> (model_step_count + 1), source_transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownStopped"] }
+       /\ observed_transitions' = observed_transitions \cup {[machine |-> "meerkat", transition |-> "ResolveRuntimeCompletionResultOutcomeUnknownStopped", actor |-> "meerkat_kernel", step |-> (model_step_count + 1), from_phase |-> meerkat_phase, to_phase |-> "Stopped"]}
+       /\ UnchangedFrame_d2e65ac0b2ee17fd
+       /\ model_step_count' = model_step_count + 1
+
+
 meerkat_ResolveRuntimeCompletionCleanupArchivedInitializing(arg_session_id, arg_observation_session_id, arg_observation_agent_runtime_id, arg_observation_fence_token, arg_observation_runtime_generation, arg_observation_runtime_epoch_id, arg_outcome, arg_archived_by_authority, arg_live_session) ==
     /\ \E packet \in SeqElements(pending_inputs) :
        /\ packet.machine = "meerkat"
@@ -17974,7 +18124,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainInitializing(arg_session_id, arg_ob
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Initializing"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -18005,7 +18155,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainIdle(arg_session_id, arg_observatio
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Idle"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -18036,7 +18186,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainAttached(arg_session_id, arg_observ
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Attached"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -18067,7 +18217,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainRunning(arg_session_id, arg_observa
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Running"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -18098,7 +18248,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainRetired(arg_session_id, arg_observa
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Retired"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -18129,7 +18279,7 @@ meerkat_ResolveRuntimeCompletionCleanupRetainStopped(arg_session_id, arg_observa
        /\ (packet.payload.observation_session_id = packet.payload.session_id)
        /\ ((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))
        /\ (packet.payload.archived_by_authority = FALSE)
-       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))
+       /\ (IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
        /\ meerkat_phase' = "Stopped"
        /\ UnchangedFrame_3790f67f79336d77
        /\ pending_inputs' = SeqRemove(pending_inputs, packet)
@@ -120144,6 +120294,12 @@ EntryPacketAdmissible_meerkat(packet) ==
     \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Retired") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "RuntimeTerminated"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Stopped") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "RuntimeTerminated"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Destroyed") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "RuntimeTerminated"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Initializing") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Idle") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Attached") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Running") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Retired") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionResult") /\ (meerkat_phase = "Stopped") /\ ((meerkat_session_id # None)) /\ ((packet.payload.run_id = None)) /\ ((packet.payload.finalization = "Succeeded")) /\ ((packet.payload.terminal = "OutcomeUnknown"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Initializing") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = TRUE))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Idle") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = TRUE))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Attached") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = TRUE))
@@ -120180,12 +120336,12 @@ EntryPacketAdmissible_meerkat(packet) ==
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Running") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((packet.payload.outcome = "Cancelled")) /\ ((packet.payload.live_session = "Absent"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Retired") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((packet.payload.outcome = "Cancelled")) /\ ((packet.payload.live_session = "Absent"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Stopped") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((packet.payload.outcome = "Cancelled")) /\ ((packet.payload.live_session = "Absent"))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Initializing") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Idle") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Attached") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Running") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Retired") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
-    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Stopped") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent")))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Initializing") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Idle") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Attached") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Running") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Retired") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
+    \/ /\ (packet.variant = "ResolveRuntimeCompletionCleanup") /\ (meerkat_phase = "Stopped") /\ ((packet.payload.observation_session_id = packet.payload.session_id)) /\ (((meerkat_active_runtime_id = packet.payload.observation_agent_runtime_id) /\ (meerkat_active_fence_token = packet.payload.observation_fence_token) /\ (meerkat_active_runtime_generation = packet.payload.observation_runtime_generation) /\ (meerkat_active_runtime_epoch_id = packet.payload.observation_runtime_epoch_id))) /\ ((packet.payload.archived_by_authority = FALSE)) /\ ((IF (packet.payload.outcome = "Completed") THEN TRUE ELSE (IF (packet.payload.outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (packet.payload.outcome = "CallbackPending") THEN TRUE ELSE (IF (packet.payload.outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((packet.payload.outcome = "Abandoned") /\ (packet.payload.live_session # "Absent")) THEN TRUE ELSE ((packet.payload.outcome = "Cancelled") /\ (packet.payload.live_session # "Absent"))))))))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Initializing") /\ ((meerkat_session_id # None)) /\ (((IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None) = packet.payload.session_id)) /\ ((packet.payload.failure = "ChannelClosed"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Idle") /\ ((meerkat_session_id # None)) /\ (((IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None) = packet.payload.session_id)) /\ ((packet.payload.failure = "ChannelClosed"))
     \/ /\ (packet.variant = "ResolveRuntimeCompletionWaitFailure") /\ (meerkat_phase = "Attached") /\ ((meerkat_session_id # None)) /\ (((IF "value" \in DOMAIN meerkat_session_id THEN meerkat_session_id["value"] ELSE None) = packet.payload.session_id)) /\ ((packet.payload.failure = "ChannelClosed"))
@@ -125395,6 +125551,12 @@ CoreNext ==
     \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultRuntimeTerminatedRetired(arg_run_id, arg_terminal, arg_finalization)
     \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultRuntimeTerminatedStopped(arg_run_id, arg_terminal, arg_finalization)
     \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownInitializing(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownIdle(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownAttached(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownRunning(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownRetired(arg_run_id, arg_terminal, arg_finalization)
+    \/ \E arg_run_id \in OptionRunIdValues : \E arg_terminal \in RuntimeCompletionTerminalObservationValues : \E arg_finalization \in RuntimeCompletionFinalizationObservationValues : meerkat_ResolveRuntimeCompletionResultOutcomeUnknownStopped(arg_run_id, arg_terminal, arg_finalization)
     \/ \E arg_session_id \in SessionIdValues : \E arg_observation_session_id \in SessionIdValues : \E arg_observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_observation_fence_token \in OptionFenceTokenValues : \E arg_observation_runtime_generation \in OptionGenerationValues : \E arg_observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_outcome \in RuntimeCompletionObservedOutcomeValues : \E arg_live_session \in RuntimeCompletionLiveSessionObservationValues : meerkat_ResolveRuntimeCompletionCleanupArchivedInitializing(arg_session_id, arg_observation_session_id, arg_observation_agent_runtime_id, arg_observation_fence_token, arg_observation_runtime_generation, arg_observation_runtime_epoch_id, arg_outcome, TRUE, arg_live_session)
     \/ \E arg_session_id \in SessionIdValues : \E arg_observation_session_id \in SessionIdValues : \E arg_observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_observation_fence_token \in OptionFenceTokenValues : \E arg_observation_runtime_generation \in OptionGenerationValues : \E arg_observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_outcome \in RuntimeCompletionObservedOutcomeValues : \E arg_live_session \in RuntimeCompletionLiveSessionObservationValues : meerkat_ResolveRuntimeCompletionCleanupArchivedIdle(arg_session_id, arg_observation_session_id, arg_observation_agent_runtime_id, arg_observation_fence_token, arg_observation_runtime_generation, arg_observation_runtime_epoch_id, arg_outcome, TRUE, arg_live_session)
     \/ \E arg_session_id \in SessionIdValues : \E arg_observation_session_id \in SessionIdValues : \E arg_observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E arg_observation_fence_token \in OptionFenceTokenValues : \E arg_observation_runtime_generation \in OptionGenerationValues : \E arg_observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E arg_outcome \in RuntimeCompletionObservedOutcomeValues : \E arg_live_session \in RuntimeCompletionLiveSessionObservationValues : meerkat_ResolveRuntimeCompletionCleanupArchivedAttached(arg_session_id, arg_observation_session_id, arg_observation_agent_runtime_id, arg_observation_fence_token, arg_observation_runtime_generation, arg_observation_runtime_epoch_id, arg_outcome, TRUE, arg_live_session)

@@ -7789,6 +7789,72 @@ ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed(run_id, termin
     /\ UnchangedFrame_e3f95c34cc5cfe9c
 
 
+ResolveRuntimeCompletionResultOutcomeUnknownInitializing(run_id, terminal, finalization) ==
+    /\ phase = "Initializing"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Initializing"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
+ResolveRuntimeCompletionResultOutcomeUnknownIdle(run_id, terminal, finalization) ==
+    /\ phase = "Idle"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Idle"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
+ResolveRuntimeCompletionResultOutcomeUnknownAttached(run_id, terminal, finalization) ==
+    /\ phase = "Attached"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Attached"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
+ResolveRuntimeCompletionResultOutcomeUnknownRunning(run_id, terminal, finalization) ==
+    /\ phase = "Running"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Running"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
+ResolveRuntimeCompletionResultOutcomeUnknownRetired(run_id, terminal, finalization) ==
+    /\ phase = "Retired"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Retired"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
+ResolveRuntimeCompletionResultOutcomeUnknownStopped(run_id, terminal, finalization) ==
+    /\ phase = "Stopped"
+    /\ (session_id # None)
+    /\ (run_id = None)
+    /\ (finalization = "Succeeded")
+    /\ (terminal = "OutcomeUnknown")
+    /\ phase' = "Stopped"
+    /\ model_step_count' = model_step_count + 1
+    /\ UnchangedFrame_e3f95c34cc5cfe9c
+
+
 ResolveRuntimeCompletionCleanupArchivedInitializing(arg_session_id, observation_session_id, observation_agent_runtime_id, observation_fence_token, observation_runtime_generation, observation_runtime_epoch_id, outcome, archived_by_authority, live_session) ==
     /\ phase = "Initializing"
     /\ (observation_session_id = arg_session_id)
@@ -8196,7 +8262,7 @@ ResolveRuntimeCompletionCleanupRetainInitializing(arg_session_id, observation_se
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Initializing"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -8207,7 +8273,7 @@ ResolveRuntimeCompletionCleanupRetainIdle(arg_session_id, observation_session_id
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Idle"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -8218,7 +8284,7 @@ ResolveRuntimeCompletionCleanupRetainAttached(arg_session_id, observation_sessio
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Attached"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -8229,7 +8295,7 @@ ResolveRuntimeCompletionCleanupRetainRunning(arg_session_id, observation_session
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -8240,7 +8306,7 @@ ResolveRuntimeCompletionCleanupRetainRetired(arg_session_id, observation_session
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Retired"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -8251,7 +8317,7 @@ ResolveRuntimeCompletionCleanupRetainStopped(arg_session_id, observation_session
     /\ (observation_session_id = arg_session_id)
     /\ ((active_runtime_id = observation_agent_runtime_id) /\ (active_fence_token = observation_fence_token) /\ (active_runtime_generation = observation_runtime_generation) /\ (active_runtime_epoch_id = observation_runtime_epoch_id))
     /\ (archived_by_authority = FALSE)
-    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent"))))))
+    /\ (IF (outcome = "Completed") THEN TRUE ELSE (IF (outcome = "CompletedWithoutResult") THEN TRUE ELSE (IF (outcome = "CallbackPending") THEN TRUE ELSE (IF (outcome = "OutcomeUnknown") THEN TRUE ELSE (IF ((outcome = "Abandoned") /\ (live_session # "Absent")) THEN TRUE ELSE ((outcome = "Cancelled") /\ (live_session # "Absent")))))))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_e3f95c34cc5cfe9c
@@ -38085,6 +38151,12 @@ Next ==
     \/ (phase = "Retired") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultRuntimeTerminatedRetired(run_id, terminal, finalization)
     \/ (phase = "Stopped") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultRuntimeTerminatedStopped(run_id, terminal, finalization)
     \/ (phase = "Destroyed") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed(run_id, terminal, finalization)
+    \/ (phase = "Initializing") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownInitializing(run_id, terminal, finalization)
+    \/ (phase = "Idle") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownIdle(run_id, terminal, finalization)
+    \/ (phase = "Attached") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownAttached(run_id, terminal, finalization)
+    \/ (phase = "Running") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownRunning(run_id, terminal, finalization)
+    \/ (phase = "Retired") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownRetired(run_id, terminal, finalization)
+    \/ (phase = "Stopped") /\ \E run_id \in OptionRunIdValues : \E terminal \in RuntimeCompletionTerminalObservationValues : \E finalization \in RuntimeCompletionFinalizationObservationValues : ResolveRuntimeCompletionResultOutcomeUnknownStopped(run_id, terminal, finalization)
     \/ (phase = "Initializing") /\ \E arg_session_id \in SessionIdValues : \E observation_session_id \in SessionIdValues : \E observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E observation_fence_token \in OptionFenceTokenValues : \E observation_runtime_generation \in OptionGenerationValues : \E observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E outcome \in RuntimeCompletionObservedOutcomeValues : \E live_session \in RuntimeCompletionLiveSessionObservationValues : ResolveRuntimeCompletionCleanupArchivedInitializing(arg_session_id, observation_session_id, observation_agent_runtime_id, observation_fence_token, observation_runtime_generation, observation_runtime_epoch_id, outcome, TRUE, live_session)
     \/ (phase = "Idle") /\ \E arg_session_id \in SessionIdValues : \E observation_session_id \in SessionIdValues : \E observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E observation_fence_token \in OptionFenceTokenValues : \E observation_runtime_generation \in OptionGenerationValues : \E observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E outcome \in RuntimeCompletionObservedOutcomeValues : \E live_session \in RuntimeCompletionLiveSessionObservationValues : ResolveRuntimeCompletionCleanupArchivedIdle(arg_session_id, observation_session_id, observation_agent_runtime_id, observation_fence_token, observation_runtime_generation, observation_runtime_epoch_id, outcome, TRUE, live_session)
     \/ (phase = "Attached") /\ \E arg_session_id \in SessionIdValues : \E observation_session_id \in SessionIdValues : \E observation_agent_runtime_id \in OptionAgentRuntimeIdValues : \E observation_fence_token \in OptionFenceTokenValues : \E observation_runtime_generation \in OptionGenerationValues : \E observation_runtime_epoch_id \in OptionRuntimeEpochIdValues : \E outcome \in RuntimeCompletionObservedOutcomeValues : \E live_session \in RuntimeCompletionLiveSessionObservationValues : ResolveRuntimeCompletionCleanupArchivedAttached(arg_session_id, observation_session_id, observation_agent_runtime_id, observation_fence_token, observation_runtime_generation, observation_runtime_epoch_id, outcome, TRUE, live_session)

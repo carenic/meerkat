@@ -1134,6 +1134,16 @@ fn authorized_completion_outcome(
             };
             CompletionOutcome::runtime_terminated(reason)
         }
+        // Only a batch whose candidate answers outcome unknown resolves this
+        // class, and nothing stages such a batch here.
+        RuntimeCompletionResultClass::OutcomeUnknown => {
+            attempt.fail();
+            return Err(CompletionWaitError::AuthorityUnavailable(
+                "runtime completion authority resolved OutcomeUnknown for a batch that stages no \
+                 outcome-unknown answer"
+                    .to_string(),
+            ));
+        }
     };
     Ok((
         outcome,
