@@ -61,6 +61,74 @@ them.
   `ResolveRuntimeCompletionResultOutcomeUnknownRetired`,
   `ResolveRuntimeCompletionResultOutcomeUnknownStopped`.
 
+### Added
+
+- `meerkat-runtime`, `meerkat-session`, `meerkat-mob`: a host that takes
+  over a durable session whose earlier process ended without unregistering
+  it (a crash or a power cut) can settle the runtime work that process left
+  before it registers the session, without serving it.
+  `PersistentSessionService::settle_cold_predecessor_before(id, claim,
+  deadline)` runs under the caller's own cross-process hosting claim of the
+  session (`grant_session_hosting`, an OS lock) on a HeadCanonical runtime
+  store. It commits the durable tail the earlier process left; ends every
+  input that never ended `Abandoned { Stopped }`, publishing the terminal a
+  directed input's requester waits for; finalizes every terminal receipt and
+  publication still owed; and answers an input a recovered boundary consumed
+  without a receipt as outcome unknown. The session is left unregistered and
+  registrable. The caller keeps its claim until its own registration has
+  published, so that registration joins the claim's lineage and does not
+  settle the lost owner's consents a second time. `Ok` is a complete census
+  (`meerkat_runtime::ColdPredecessorSettlement`): the tail commit, every
+  settled input with its finalized receipt and, for a directed input, the
+  sequence of its published terminal, the owner-loss outcome, the number of
+  durable input rows read closed, and the rows whose receipt a migration made
+  permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`)
+  carries only final evidence; a deadline, a cancelled call or an error
+  certifies nothing, and a repeat converges from the store.
+  `MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`
+  is the same call for a mob's session service (the persistent service
+  forwards it; the default refuses `Unsupported`). The runtime steps are
+  `MeerkatMachine::begin_predecessor_settlement_before`,
+  `settle_predecessor_tail_with_lease`,
+  `end_predecessor_work_with_lease_before` and
+  `finish_predecessor_settlement_before`.
+
+- `meerkat-runtime`, `meerkat-core`, `meerkat-mob`, SDKs: an input that a run
+  consumed at a boundary a recovery committed without the input's receipt is
+  answered once a settlement reaches it. Its terminal receipt finalizes with
+  `CompletionOutcome::OutcomeUnknown { run_id }` (completion type
+  `outcome_unknown`, class `CompletionClass::OutcomeUnknown`), naming that
+  run: what the run did for the input is not known. A directed input's
+  requester gets `interaction_failed` with the new reason kind
+  `outcome_unknown` (`InteractionFailureReason::OutcomeUnknown`), which the
+  TypeScript and Python SDKs parse. A turn result that meets it answers an
+  error that says not to resubmit the input (RPC `kind: "outcome_unknown"`,
+  REST and the facade `TURN_OUTCOME_UNKNOWN`, each with `resumable: false`),
+  and a mob's bounded turn answers `BoundedTurnFailure::OutcomeUnknown {
+  session_id, run_id }`.
+
+- `meerkat-core`: `HostingClaim::completed_owner_loss` reports the owner-loss
+  proof a claim's lineage settled once a registration completed it, and
+  `HostingClaim::same_lineage` whether two claims belong to the very same
+  live cross-process lineage. Both are read-only observations.
+
+### Changed
+
+- `meerkat-runtime`: an input that a durable-tail recovery consumes at the
+  boundary it commits now gets its terminal receipt and, when directed, the
+  terminal its requester waits for, at every start where it can. The
+  boundary's commit stages the run's terminal-completion batch for its
+  contributors when no other run's terminal batch is open, and the runtime
+  loop's startup drain finalizes and publishes it before it serves. A
+  directed contributor's outbox names the runtime placement the session's
+  lifecycle row records; without one, the batch holds the nondirected
+  contributors only, and a directed one waits for a settlement's
+  outcome-unknown answer. Until now such an input stayed consumed without a
+  receipt: its exact receipt read answered corruption, and a directed
+  input's requester never got a terminal. A process-local completion waiter
+  is unchanged: it still fails `AuthorityUnavailable` when its registration
+  adopts the recovered terminal.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
@@ -92,6 +160,43 @@ them.
   unregister keeps every input the registration recovered for the next
   start, unless the registration served live work. A retire or an archive
   that meets an unserved attachment still stops every input.
+
+- `meerkat-session`: the terminals an archive publishes for a session with no
+  live actor (the stored-only publisher) take their event sequences from the
+  session's event line in the service. When an earlier actor of the session
+  had run in the same service, the archive's rows could reuse sequences that
+  actor had allocated, and a later actor of the session could allocate at or
+  below them. They now land above every sequence the line holds, a later
+  actor allocates above them, and a repeated publication inserts nothing.
+
+### Upgrade notes
+
+- A cold-predecessor settlement that stops between its internal registration
+  and its sweep commit can leave the session's runtime lifecycle row at
+  record version 7, carrying the session's last runtime placement. A binary
+  without this release reads that row as an unsupported record version:
+  registering, archiving or recovering the session is refused typed, and
+  nothing is written. Repeat the settlement with this release before a
+  downgrade; its sweep commit writes the row back at version 5 or 6. No other
+  row changes version.
+
+- An input that a settlement answers as outcome unknown carries a new
+  terminal candidate (until its terminal is published) and a new finalized
+  outcome (completion type `outcome_unknown`) in its input row. A binary
+  without this release cannot decode that row: while the terminal is pending
+  it refuses to register the session; once the terminal is published it no
+  longer reads the row to register, but its exact receipt read of that input
+  fails (as it already did for that input before the settlement), and a full
+  row scan reports the row corrupt.
+
+- The published terminal of such an input is an `interaction_failed` event
+  with reason kind `outcome_unknown`. A binary without this release fails to
+  decode that event when it reads the session's events; an SDK without this
+  release reads the reason as an unknown kind with its raw kind.
+
+- A `MobSessionService` wrapper outside this repository must forward
+  `settle_cold_predecessor_with_mob_lifecycle_authority_before`; its default
+  refuses (`Unsupported`), touching nothing.
 
 ## [0.9.5] - 2026-10-23
 

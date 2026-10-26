@@ -471,7 +471,10 @@ settles every child whose job began in a previous process:
   failure is `failed` with its error, and the child is retired as the live
   custodian retires it; an end imposed from outside (the runtime stopped or
   destroyed, the turn cancelled), an input no run answered, or one never
-  admitted is `restart_interrupted`. An input still owed a terminal is
+  admitted is `restart_interrupted`. So is an input that a settlement of the
+  child's session answered as outcome unknown (a run consumed it at a
+  boundary a recovery committed without its receipt): that receipt carries no
+  reply, so none is delivered. An input still owed a terminal is
   watched until it has one, even while the child reads idle (a requeued
   input waiting for the recovered run). A record without a delivery identity
   (written by an earlier release, or on a host without a runtime) reads the
