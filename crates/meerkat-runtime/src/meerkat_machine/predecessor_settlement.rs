@@ -38,7 +38,7 @@
 //! unregister) with `UnregisterInProgress`; only the settlement removes it,
 //! exactly and without retiring anything.
 
-use std::collections::BTreeMap;
+use std::collections::HashMap;
 
 use super::*;
 use crate::input_state::{
@@ -406,7 +406,7 @@ impl Drop for MachinePredecessorSettlementLease {
 /// each of them.
 #[derive(Debug, Clone, Default)]
 struct BeginCensus {
-    found: BTreeMap<InputId, FoundAt>,
+    found: HashMap<InputId, FoundAt>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
