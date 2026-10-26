@@ -4623,13 +4623,13 @@ mod tests {
             async fn deliver_occurrence(
                 &self,
                 occurrence: &Occurrence,
-                _identity: &ScheduleDeliveryIdentity,
+                identity: &ScheduleDeliveryIdentity,
             ) -> Result<DeliveryDispatch, ScheduleDomainError> {
                 self.deliveries.fetch_add(1, Ordering::SeqCst);
                 Ok(build_dispatch_from_accepted(
                     occurrence,
                     AcceptedScheduledInput::with_runtime_terminal(
-                        None,
+                        Some(identity.correlation_id.clone()),
                         CompletionOutcome::OutcomeUnknown {
                             run_id: meerkat_core::lifecycle::RunId::new(),
                         },
