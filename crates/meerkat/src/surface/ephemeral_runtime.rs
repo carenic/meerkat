@@ -632,6 +632,19 @@ impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
+
+    async fn publish_settled_run_terminal(
+        &self,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), CoreExecutorError> {
+        let actor = self.actor.witness().ok_or_else(|| {
+            CoreExecutorError::Internal("runtime executor lost its exact actor witness".into())
+        })?;
+        self.service
+            .publish_settled_run_terminal_for_actor(&actor, settled)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
 }
 
 struct EphemeralRuntimeExecutor<B: SessionAgentBuilder> {

@@ -2391,6 +2391,18 @@ pub trait MobSessionService:
         ))
     }
 
+    /// Publish the run terminal of a run the runtime settled without
+    /// resuming it, only through its exact actor.
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        _actor_witness: &meerkat_session::LiveSessionActorWitness,
+        _settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        Err(SessionError::Unsupported(
+            "settled run terminal publication requires actor-incarnation authority".to_string(),
+        ))
+    }
+
     /// Publish predecessor terminals only through one service-minted actor
     /// incarnation. Runtime retirement drops its mutation gate before calling
     /// arbitrary publication code, so resolving only by SessionId here would
@@ -2616,6 +2628,19 @@ where
             self,
             actor_witness,
             discarded,
+        )
+        .await
+    }
+
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::publish_settled_run_terminal_for_actor(
+            self,
+            actor_witness,
+            settled,
         )
         .await
     }
@@ -3378,6 +3403,19 @@ where
         meerkat_session::PersistentSessionService::<B>::publish_boundary_appends_discarded_for_actor(
             self, actor_witness, discarded,
         ).await
+    }
+
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat_session::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        meerkat_session::PersistentSessionService::<B>::publish_settled_run_terminal_for_actor(
+            self,
+            actor_witness,
+            settled,
+        )
+        .await
     }
 
     /// The persistent service owns durable session bodies, so it IS the

@@ -1691,6 +1691,19 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
         .await
     }
 
+    async fn publish_settled_run_terminal_for_actor(
+        &self,
+        actor_witness: &meerkat::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::publish_settled_run_terminal_for_actor(
+            &self.service,
+            actor_witness,
+            settled,
+        )
+        .await
+    }
+
     async fn publish_interaction_terminals_for_actor(
         &self,
         actor_witness: &meerkat::LiveSessionActorWitness,

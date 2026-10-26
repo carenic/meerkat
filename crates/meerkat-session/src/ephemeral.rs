@@ -2341,6 +2341,11 @@ enum SessionCommand {
         discarded: meerkat_core::event::BoundaryAppendsDiscarded,
         reply_tx: oneshot::Sender<Result<(), SessionError>>,
     },
+    PublishSettledRunTerminal {
+        expected_actor: LiveSessionActorWitness,
+        settled: meerkat_core::lifecycle::SettledRunTerminal,
+        reply_tx: oneshot::Sender<Result<(), SessionError>>,
+    },
     RecordLiveTerminalError {
         cause: meerkat_core::live_adapter::LiveAdapterErrorCode,
         reply_tx: oneshot::Sender<()>,
@@ -2588,6 +2593,7 @@ impl SessionCommand {
             | Self::ObserveSessionTranscriptAuthority { .. }
             | Self::ExportSessionIfTranscriptAuthority { .. }
             | Self::PublishBoundaryAppendsDiscarded { .. }
+            | Self::PublishSettledRunTerminal { .. }
             | Self::PublishRuntimeInteractionTerminals { .. }
             // Read-only snapshots and lookups (#1226).
             | Self::ExecutionSnapshot { .. }
@@ -6690,6 +6696,56 @@ impl<B: SessionAgentBuilder + 'static> EphemeralSessionService<B> {
         })?
     }
 
+    /// Publish the run terminal of a run the runtime settled without
+    /// resuming it, through its exact actor. The payload cannot inject
+    /// arbitrary events or choose a source sequence.
+    pub async fn publish_settled_run_terminal_for_actor(
+        &self,
+        witness: &LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        if settled.session_id() != witness.session_id() {
+            return Err(SessionError::Agent(AgentError::InternalError(
+                "settled run terminal session does not match the exact actor".to_string(),
+            )));
+        }
+        let command_tx = self
+            .sessions
+            .read(|sessions| -> Result<_, SessionError> {
+                sessions
+                    .get(witness.session_id())
+                    .filter(|handle| {
+                        witness.is_handle(handle)
+                            && witness.is_live()
+                            && !handle.command_tx.is_closed()
+                    })
+                    .map(|handle| handle.command_tx.clone())
+                    .ok_or_else(|| SessionError::NotFound {
+                        id: witness.session_id().clone(),
+                    })
+            })
+            .await?;
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(SessionCommand::PublishSettledRunTerminal {
+                expected_actor: witness.clone(),
+                settled: settled.clone(),
+                reply_tx,
+            })
+            .await
+            .map_err(|_| {
+                SessionError::Agent(AgentError::InternalError(
+                    "exact session actor exited before settled run terminal publication"
+                        .to_string(),
+                ))
+            })?;
+        reply_rx.await.map_err(|_| {
+            SessionError::Agent(AgentError::InternalError(
+                "exact session actor dropped settled run terminal publication reply".to_string(),
+            ))
+        })?
+    }
+
     /// Publish a resolved discarded application through its exact actor.
     /// The payload cannot inject arbitrary events or choose a source sequence.
     pub async fn publish_boundary_appends_discarded_for_actor(
@@ -10504,6 +10560,9 @@ async fn drain_session_task_commands<A: SessionAgent>(
             SessionCommand::PublishBoundaryAppendsDiscarded { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(SessionError::Agent(AgentError::Cancelled)));
             }
+            SessionCommand::PublishSettledRunTerminal { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(SessionError::Agent(AgentError::Cancelled)));
+            }
             SessionCommand::PublishRuntimeInteractionTerminals { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(SessionError::Agent(AgentError::Cancelled)));
             }
@@ -11886,6 +11945,26 @@ async fn session_task<A: SessionAgent>(
                         );
                         control.publish_session_event(event).await;
                     }
+                    Ok(())
+                };
+                let _ = reply_tx.send(result);
+            }
+            SessionCommand::PublishSettledRunTerminal {
+                expected_actor,
+                settled,
+                reply_tx,
+            } => {
+                let result = if *settled.session_id() != session_id
+                    || !expected_actor.same_incarnation(&control.actor_witness)
+                    || !expected_actor.is_live()
+                {
+                    Err(SessionError::NotFound {
+                        id: expected_actor.session_id().clone(),
+                    })
+                } else {
+                    let event =
+                        stamp_event_envelope(&next_seq, &source, settled.run_failed_event());
+                    control.publish_session_event(event).await;
                     Ok(())
                 };
                 let _ = reply_tx.send(result);

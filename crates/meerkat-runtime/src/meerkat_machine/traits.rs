@@ -2200,14 +2200,27 @@ impl MeerkatMachine {
         let mut runless_terminal = self.runless_terminal_announcement();
         let mut ended = Vec::new();
 
-        let settled = {
+        // The kept run's inputs get the runtime-termination carrier in the
+        // same commit, as the queued inputs below do: a nondirected batch is
+        // finalized here, a directed one is the archive's to converge from
+        // its durable outbox after it releases the lease. The run's own
+        // terminal is not published: the archive serves no live actor to
+        // publish it through, and the session's stream ends with it.
+        let (settled, settled_batches) = {
             let mut driver = lease.driver.lock().await;
             match driver.resumable_run_id() {
-                Some(run_id) => driver
-                    .settle_resumable_run(&run_id, InputAbandonReason::Cancelled)
-                    .await
-                    .map_err(internal)?,
-                None => Vec::new(),
+                Some(run_id) => {
+                    let settled = driver
+                        .settle_resumable_run_with_terminals(
+                            &run_id,
+                            InputAbandonReason::Cancelled,
+                            reason,
+                        )
+                        .await
+                        .map_err(internal)?;
+                    (settled.abandoned, settled.batches)
+                }
+                None => (Vec::new(), Vec::new()),
             }
         };
         if !settled.is_empty() {
@@ -2220,6 +2233,21 @@ impl MeerkatMachine {
                 )),
             );
             ended.extend(settled);
+        }
+        // After the waiters got their answer above: this finalizes each
+        // nondirected batch and resolves no waiter twice.
+        for batch in settled_batches.iter().filter(|batch| !batch.is_directed()) {
+            crate::control_plane::publish_and_resolve_runless_runtime_termination_before(
+                &lease.driver,
+                Some(&lease.completions),
+                None,
+                batch.input_ids(),
+                None,
+                reason,
+                Some(deadline),
+            )
+            .await
+            .map_err(internal)?;
         }
 
         let queued: Vec<meerkat_core::lifecycle::InputId> = {

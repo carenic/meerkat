@@ -13244,6 +13244,16 @@ impl CoreExecutorPublicationHandle for MobSessionTerminalPublicationHandle {
             .await
             .map_err(CoreExecutorError::apply_failed_from_session_error)
     }
+
+    async fn publish_settled_run_terminal(
+        &self,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), CoreExecutorError> {
+        self.session_service
+            .publish_settled_run_terminal_for_actor(&self.actor_witness, settled)
+            .await
+            .map_err(CoreExecutorError::apply_failed_from_session_error)
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]

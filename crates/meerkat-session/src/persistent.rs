@@ -12179,6 +12179,31 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
             .await
     }
 
+    /// Publish the run terminal of a run the runtime settled without
+    /// resuming it, through the exact live actor, as ordinary source-event
+    /// projection.
+    pub async fn publish_settled_run_terminal_for_actor(
+        &self,
+        witness: &crate::ephemeral::LiveSessionActorWitness,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), SessionError> {
+        let id = witness.session_id();
+        if let Some(event_store) = self.event_store.as_ref()
+            && let Some(cause) = event_projection_admission_fault(
+                &self.event_projection_faults,
+                &self.event_projection_gates,
+                event_store,
+                id,
+            )
+            .await
+        {
+            return Err(event_projection_halted_error(id, cause));
+        }
+        self.inner
+            .publish_settled_run_terminal_for_actor(witness, settled)
+            .await
+    }
+
     /// Publish an ordered exact-terminal batch only through the service-minted
     /// actor incarnation carried by `witness`.
     ///
