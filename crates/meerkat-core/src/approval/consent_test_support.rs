@@ -5,8 +5,11 @@
 //! The consent is issued by the review admission of one R3 operation in a
 //! routed run, decided through the authenticated consent decision, and
 //! parked by that run's close. No row is constructed, nothing is written to
-//! the store directly and no owner state is edited.
+//! the store directly and no owner state is edited. A resumed run of its
+//! origin work is opened, and the consent spent in it, through the review's
+//! own run open and consent attempt only.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use super::consent::{
@@ -15,8 +18,9 @@ use super::consent::{
     ConsentRouteUnavailable, HumanConsentRoute,
 };
 use super::review::{
-    BoundOperationReview, OperationReviewer, ReviewCandidate, ReviewEntrySupport, ReviewVerdict,
-    ReviewerFailure, admit_operation_review,
+    BoundOperationReview, OperationReviewer, ReviewCandidate, ReviewDispatchGuard,
+    ReviewEntrySupport, ReviewVerdict, ReviewerFailure, admit_consent_attempt,
+    admit_operation_review,
 };
 use super::{
     ApprovalAssurance, ApprovalConsentCustody, ApprovalConsentScope, ApprovalDecision, ApprovalId,
@@ -29,9 +33,10 @@ use crate::authorization::{
     SourceAuthorizationTarget, SourceAuthorizationUse, WorkAuthorization, WorkAuthorizationContext,
 };
 use crate::exact_operation::OperationExecutionScope;
+use crate::lifecycle::{InputId, RunId};
 use crate::memory::MemorySearchScope;
 use crate::ops::OperationId;
-use crate::retained_work::RetainedWorkIdentity;
+use crate::retained_work::{ResumedInput, RetainedWorkIdentity};
 use crate::types::SessionId;
 use crate::{PrincipalKind, PrincipalRef, SurfaceMetadata, ToolCallView, TrustDomainId};
 
@@ -45,12 +50,15 @@ const REVIEW_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
 /// One routed consent of an approval owner, approved by an authenticated
 /// human and parked at its admitting run's close, for a resumed run of its
 /// origin work. It keeps the review composition and the host route the
-/// parked candidate came from.
+/// parked candidate came from, and the destination and origin work it was
+/// issued for.
 #[doc(hidden)]
 pub struct ParkedRoutedConsent {
     approval_id: ApprovalId,
     route: Arc<NoticeRoute>,
-    _review: Arc<BoundOperationReview>,
+    review: Arc<BoundOperationReview>,
+    scope: ApprovalConsentScope,
+    origin: RetainedWorkIdentity,
 }
 
 impl std::fmt::Debug for ParkedRoutedConsent {
@@ -79,8 +87,8 @@ impl ParkedRoutedConsent {
                 .with_human_consent(Arc::clone(&route) as Arc<dyn HumanConsentRoute>, VALIDITY),
         );
         let work = WorkAuthorizationContext::new(Arc::new(R3Work), OperationExecutionScope::Domain)
-            .with_consent_scope(scope)
-            .with_retained_work(origin);
+            .with_consent_scope(scope.clone())
+            .with_retained_work(origin.clone());
         let binding = PreparedAuthorizationBinding::new(OperationAuthorizationFacts {
             operation_id: OperationId::new(),
             execution_scope: OperationExecutionScope::Domain,
@@ -156,7 +164,9 @@ impl ParkedRoutedConsent {
         Ok(Self {
             approval_id,
             route,
-            _review: review,
+            review,
+            scope,
+            origin,
         })
     }
 
@@ -174,6 +184,55 @@ impl ParkedRoutedConsent {
             .filter(|(approval_id, _)| *approval_id == self.approval_id)
             .map(|(_, kind)| *kind)
             .collect()
+    }
+
+    /// Open a resumed run of this consent's origin work, for its destination,
+    /// staged with `inputs`, each resuming that origin work, through the
+    /// review's own run open (as a run opens before its first model call):
+    /// parked consent whose committed approved-notice receipt names one of
+    /// `inputs` moves into it. Returns the run's work and id, for
+    /// [`Self::spend_in`].
+    pub fn open_resumed_run(&self, inputs: &[InputId]) -> (WorkAuthorizationContext, RunId) {
+        let run_id = RunId::new();
+        let work = WorkAuthorizationContext::new(Arc::new(R3Work), OperationExecutionScope::Domain)
+            .with_consent_scope(self.scope.clone())
+            .with_retained_work(RetainedWorkIdentity::new(
+                self.origin.runtime_id(),
+                run_id.clone(),
+                Vec::new(),
+                BTreeMap::new(),
+                None,
+            ))
+            .with_resumed_inputs(
+                inputs
+                    .iter()
+                    .map(|input_id| ResumedInput {
+                        input_id: input_id.clone(),
+                        resumes: self.origin.clone(),
+                    })
+                    .collect(),
+            );
+        self.review.open_consent_for_run(&work, &run_id);
+        (work, run_id)
+    }
+
+    /// One fresh explicit attempt of this consent in `run`, a resumed run
+    /// [`Self::open_resumed_run`] opened, that reaches its leaf and spends
+    /// there: the attempt resolves only for that run's own work and id.
+    ///
+    /// # Errors
+    /// The attempt's typed refusal, for example consent already spent.
+    pub fn spend_in(
+        &self,
+        run: &(WorkAuthorizationContext, RunId),
+    ) -> Result<(), crate::ToolError> {
+        let (work, run_id) = run;
+        let (entry, admitted) =
+            admit_consent_attempt(Some(&self.review), &self.approval_id, work, Some(run_id))?;
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let spent = entry.consume_held(&admitted).map(drop);
+        guard.complete();
+        spent
     }
 }
 

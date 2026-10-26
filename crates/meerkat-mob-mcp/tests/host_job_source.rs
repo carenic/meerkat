@@ -7,10 +7,11 @@
 
 mod support;
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use meerkat::{ContinuationProducer, RetainedJobFacts, RetainedJobLookup, RetainedJobSource};
 use meerkat_core::SessionId;
+use meerkat_core::lifecycle::InputId;
 use meerkat_mob_mcp::{HostJobSource, HostJobSourceError, MobMcpState};
 use support::{CouncilFixture, ScriptedTurn};
 
@@ -61,6 +62,40 @@ impl RetainedJobSource for ClaimsEverything {
         _namespace: &str,
     ) -> Option<Arc<dyn meerkat::HostOriginalBinder>> {
         Some(Arc::clone(&self.binder))
+    }
+}
+
+/// A host's setup store that holds no job and keeps every admission
+/// reported to it.
+#[derive(Default)]
+struct HearsAdmissions {
+    heard: Mutex<Vec<(ContinuationProducer, String, SessionId, InputId)>>,
+}
+
+#[async_trait::async_trait]
+impl RetainedJobSource for HearsAdmissions {
+    async fn retained_job(
+        &self,
+        _producer: &ContinuationProducer,
+        _job_id: &str,
+    ) -> RetainedJobLookup {
+        RetainedJobLookup::Absent
+    }
+
+    async fn admission_committed(
+        &self,
+        producer: &ContinuationProducer,
+        job_id: &str,
+        session: &SessionId,
+        input_id: &InputId,
+    ) -> Result<(), String> {
+        self.heard.lock().unwrap().push((
+            producer.clone(),
+            job_id.to_string(),
+            session.clone(),
+            input_id.clone(),
+        ));
+        Ok(())
     }
 }
 
@@ -192,6 +227,53 @@ async fn the_bound_job_source_forwards_host_originals_for_declared_namespaces_on
             "{undeclared} has no binder here"
         );
     }
+}
+
+/// The composed source reports a committed admission to the host's source
+/// for the host's declared namespaces only, exactly as reported: another
+/// namespace, and the state's own fork_off jobs, never reach it.
+#[tokio::test]
+async fn the_bound_job_source_reports_admissions_for_declared_namespaces_only() {
+    let fixture = CouncilFixture::new_runtime_backed(|_| ScriptedTurn::Text("ok".into()));
+    let hears = Arc::new(HearsAdmissions::default());
+    let host_source = HostJobSource::new(["app.setup"], hears.clone()).expect("a named namespace");
+    let state = MobMcpState::new_with_runtime_adapter(
+        fixture.service.clone(),
+        fixture.runtime_adapter.clone(),
+        meerkat_mob::MobControlPrincipal::Owner,
+    )
+    .expect("construct runtime authority")
+    .with_host_job_source(host_source)
+    .into_shared();
+    let inbox = meerkat_runtime::RuntimeDeliveryInbox::new(Arc::new(
+        meerkat_runtime::InMemoryRuntimeStore::new(),
+    ));
+    let bindings = meerkat::ContinuationHostBindings::default();
+    state
+        .bind_continuations(inbox, &bindings)
+        .expect("bind the state's continuations");
+    let bound = bindings.job_source().expect("a live binding");
+    let session = SessionId::new();
+    let input = InputId::new();
+
+    for producer in [
+        host("app.setup"),
+        host("app.other"),
+        ContinuationProducer::ForkOff,
+    ] {
+        assert_eq!(
+            bound
+                .admission_committed(&producer, "setup-1", &session, &input)
+                .await,
+            Ok(()),
+            "{producer:?}"
+        );
+    }
+    assert_eq!(
+        *hears.heard.lock().unwrap(),
+        vec![(host("app.setup"), "setup-1".to_string(), session, input)],
+        "only the declared namespace's admission reached the host's source, once"
+    );
 }
 
 fn host(namespace: &str) -> ContinuationProducer {

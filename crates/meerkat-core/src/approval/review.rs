@@ -663,6 +663,18 @@ impl BoundOperationReview {
             .map(|_| Arc::new(self.approvals.clone()) as Arc<dyn super::ConsentOwnerLossSettlement>)
     }
 
+    /// The approval owner that issues this review's human consent, as the
+    /// issuer of the consent notices it owes the hosts of the consented
+    /// sessions (a host's delivery owner projects them, through the `meerkat`
+    /// crate's `ConsentNoticeProjector`): present exactly when R3 routes to
+    /// human consent. Without a route no consent is issued here, so no
+    /// notice is owed.
+    pub fn consent_notice_issuer(&self) -> Option<Arc<super::ApprovalService>> {
+        self.human_consent
+            .as_ref()
+            .map(|_| Arc::new(self.approvals.clone()))
+    }
+
     /// The run that admitted `work` closed: park the unspent human consent it
     /// admitted for a resumed run of that work where it can be transferred,
     /// and withdraw the rest, without waiting for the approval owner.
@@ -696,6 +708,42 @@ impl BoundOperationReview {
         }
         self.approvals
             .decided_consent_for_run(work, run_id, requested)
+    }
+
+    /// The human consent the approval owner moved into the resumed run
+    /// `run_id` of `work` by the committed receipts of its staged notice
+    /// inputs (see [`super::ApprovalService::consent_moved_into_run`]); none
+    /// without a human route.
+    pub(crate) fn consent_moved_into_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+    ) -> crate::approval::consent::MovedConsentScan {
+        if self.human_consent.is_none() {
+            return crate::approval::consent::MovedConsentScan::Moved(Vec::new());
+        }
+        self.approvals.consent_moved_into_run(work, run_id)
+    }
+
+    /// Rebind the live consent custody of `approval_id` to its retained call
+    /// re-resolved as `fresh` by the session's agent this process rebuilt
+    /// (see [`super::ApprovalService::rebind_consent_to_reresolved_plan`]);
+    /// nothing to rebind without a human route.
+    pub(crate) fn rebind_consent_to_reresolved_plan(
+        &self,
+        approval_id: &ApprovalId,
+        work: &WorkAuthorizationContext,
+        run_id: Option<&RunId>,
+        old: &PreparedOperationCheck,
+        fresh: crate::ResolvedToolExecutionPlan,
+    ) -> crate::approval::consent::ConsentRebind {
+        if self.human_consent.is_none() {
+            return crate::approval::consent::ConsentRebind::Refused(
+                crate::approval::consent::ConsentRefusal::NoConsent,
+            );
+        }
+        self.approvals
+            .rebind_consent_to_reresolved_plan(approval_id, work, run_id, old, fresh)
     }
 
     fn observation(
@@ -3538,5 +3586,88 @@ mod reservation_tests {
         ] {
             assert_eq!(ReviewerFailure::from(error), ReviewerFailure::Unavailable);
         }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::expect_used)]
+mod consent_notice_issuer_tests {
+    //! The issuer of a review's consent notices is the review's own approval
+    //! owner, and only a review that routes R3 to human consent has one.
+
+    use std::time::Duration;
+
+    use super::*;
+    use crate::approval::consent::{
+        AuthenticatedApprover, ConsentEligibility, ConsentIneligible, ConsentNotice,
+        ConsentPresentation, ConsentRouteUnavailable,
+    };
+    use crate::approval::{ApprovalRecord, ApprovalService};
+
+    /// R3 is never model-reviewed.
+    struct NoModelReview;
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl OperationReviewer for NoModelReview {
+        async fn review(
+            &self,
+            _candidate: &ReviewCandidate<'_>,
+        ) -> Result<ReviewVerdict, ReviewerFailure> {
+            Err(ReviewerFailure::Unavailable)
+        }
+    }
+
+    /// A human consent route this row never reaches.
+    struct UnusedRoute;
+
+    impl HumanConsentRoute for UnusedRoute {
+        fn present(
+            &self,
+            _candidate: &ConsentPresentationCandidate<'_>,
+        ) -> Result<ConsentPresentation, ConsentRouteUnavailable> {
+            Err(ConsentRouteUnavailable)
+        }
+
+        fn eligibility(
+            &self,
+            _approver: &AuthenticatedApprover,
+            _approval: &ApprovalRecord,
+        ) -> Result<Arc<dyn ConsentEligibility>, ConsentIneligible> {
+            Err(ConsentIneligible)
+        }
+
+        fn notice(&self, _notice: ConsentNotice) {}
+    }
+
+    /// Without a consent route a review has no issuer. With one, the issuer
+    /// is the review's own approval owner: an approval that owner records is
+    /// the issuer's.
+    #[test]
+    fn a_reviews_consent_notice_issuer_is_its_own_approval_owner() {
+        let approvals = ApprovalService::new();
+        let review = BoundOperationReview::new(
+            Arc::new(NoModelReview),
+            approvals.clone(),
+            Duration::from_secs(30),
+        );
+        assert!(
+            review.consent_notice_issuer().is_none(),
+            "no consent route, no issuer"
+        );
+        let review = review.with_human_consent(Arc::new(UnusedRoute), Duration::from_secs(30));
+        let issuer = review
+            .consent_notice_issuer()
+            .expect("a review with a consent route has an issuer");
+        let recorded = approvals
+            .request(crate::approval::tests::request())
+            .expect("the review's owner records an approval");
+        assert_eq!(
+            issuer
+                .get(&recorded.approval_id)
+                .expect("the issuer holds it")
+                .approval_id,
+            recorded.approval_id
+        );
     }
 }
