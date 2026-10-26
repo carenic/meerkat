@@ -1730,9 +1730,10 @@ async fn an_attach_after_a_recovery_commit_finalizes_the_consumed_inputs_receipt
         let store = Arc::new(InMemoryRuntimeStore::new());
         let (session_id, runtime_id, input, run_id) =
             seed_run_with_pending_input(&store, tail).await;
-        let machine =
+        let machine = Arc::new(
             MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
-                .expect("persistent machine");
+                .expect("persistent machine"),
+        );
         machine
             .register_session(session_id.clone())
             .await
