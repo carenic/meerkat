@@ -686,7 +686,7 @@ pub(crate) struct CompactionInvocation<'a> {
     /// The calls the open run's earlier folds took out
     /// ([`open_run_folded_calls`]); used only when this attempt folds the
     /// run's rounds.
-    pub(crate) earlier_folded_calls: Vec<FoldedCall>,
+    pub(crate) earlier_folded_calls: FoldedCalls,
 }
 
 /// What a compaction folds, given the run in flight.
@@ -878,12 +878,44 @@ pub(crate) struct FoldedCall {
     failed: bool,
 }
 
+/// How many of the open run's folded calls the fixed line names one by one:
+/// the newest. Older ones are counted by tool name, so the line and the
+/// stored list stay bounded however long the run.
+const MAX_NAMED_FOLDED_CALLS: usize = 200;
+
+/// The calls the open run's folds took out: the newest
+/// [`MAX_NAMED_FOLDED_CALLS`], each named, in order, and how many older ones
+/// each tool made.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct FoldedCalls {
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    earlier_by_tool: std::collections::BTreeMap<String, u64>,
+    calls: Vec<FoldedCall>,
+}
+
+impl FoldedCalls {
+    /// Append `call`, moving the oldest named call into the counts once more
+    /// than [`MAX_NAMED_FOLDED_CALLS`] are named.
+    fn push(&mut self, call: FoldedCall) {
+        self.calls.push(call);
+        if self.calls.len() > MAX_NAMED_FOLDED_CALLS {
+            let oldest = self.calls.remove(0);
+            *self.earlier_by_tool.entry(oldest.name).or_default() += 1;
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.calls.is_empty() && self.earlier_by_tool.is_empty()
+    }
+}
+
 /// The folded-call list of one run, as stored under
 /// [`SESSION_OPEN_RUN_FOLDED_CALLS_KEY`].
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct OpenRunFoldedCalls {
     run_id: crate::lifecycle::RunId,
-    calls: Vec<FoldedCall>,
+    #[serde(flatten)]
+    folded: FoldedCalls,
 }
 
 /// The calls earlier folds of the run `run_id` took out, from the session's
@@ -892,26 +924,26 @@ struct OpenRunFoldedCalls {
 pub(crate) fn open_run_folded_calls(
     session: &Session,
     run_id: &crate::lifecycle::RunId,
-) -> Vec<FoldedCall> {
+) -> FoldedCalls {
     session
         .metadata()
         .get(SESSION_OPEN_RUN_FOLDED_CALLS_KEY)
         .cloned()
         .and_then(|value| serde_json::from_value::<OpenRunFoldedCalls>(value).ok())
         .filter(|stored| &stored.run_id == run_id)
-        .map(|stored| stored.calls)
+        .map(|stored| stored.folded)
         .unwrap_or_default()
 }
 
-/// Store `calls` as the folded-call list of the run `run_id`.
+/// Store `folded` as the folded-call list of the run `run_id`.
 pub(crate) fn persist_open_run_folded_calls(
     session: &mut Session,
     run_id: &crate::lifecycle::RunId,
-    calls: &[FoldedCall],
+    folded: &FoldedCalls,
 ) -> Result<(), serde_json::Error> {
     let value = serde_json::to_value(OpenRunFoldedCalls {
         run_id: run_id.clone(),
-        calls: calls.to_vec(),
+        folded: folded.clone(),
     })?;
     session.set_metadata(SESSION_OPEN_RUN_FOLDED_CALLS_KEY, value);
     Ok(())
@@ -924,23 +956,27 @@ pub(crate) fn persist_open_run_folded_calls(
 /// and is failed when its result there was an error. Call ids are matched
 /// within that row only, since some providers reuse ids in every round.
 fn folded_run_calls(
-    earlier: &[FoldedCall],
+    earlier: &FoldedCalls,
     messages: &[Message],
     first_response: usize,
     newest_round: usize,
-) -> Vec<FoldedCall> {
+) -> FoldedCalls {
     let folded = messages
         .get(first_response..newest_round)
         .unwrap_or_default();
-    let mut calls = earlier.to_vec();
+    let mut calls = earlier.clone();
     for (offset, message) in folded.iter().enumerate() {
         let Message::BlockAssistant(assistant) = message else {
             continue;
         };
-        let round_results = folded[offset + 1..].iter().find_map(|later| match later {
-            Message::ToolResults { results, .. } => Some(results.as_slice()),
-            _ => None,
-        });
+        // The round's results come before the next response.
+        let round_results = folded[offset + 1..]
+            .iter()
+            .take_while(|later| !matches!(later, Message::BlockAssistant(_)))
+            .find_map(|later| match later {
+                Message::ToolResults { results, .. } => Some(results.as_slice()),
+                _ => None,
+            });
         for block in &assistant.blocks {
             let AssistantBlock::ToolUse { id, name, .. } = block else {
                 continue;
@@ -958,12 +994,14 @@ fn folded_run_calls(
     calls
 }
 
-/// The fixed line naming `calls`, those whose result was an error listed
-/// apart as ran and failed. `None` when there is no call to name.
-fn folded_calls_line(calls: &[FoldedCall]) -> Option<String> {
-    if calls.is_empty() {
+/// The fixed line naming `folded`: its named calls, those whose result was
+/// an error listed apart as ran and failed, then the older calls counted by
+/// tool name. `None` when there is no call to name.
+fn folded_calls_line(folded: &FoldedCalls) -> Option<String> {
+    if folded.is_empty() {
         return None;
     }
+    let calls = &folded.calls;
     let list = |failed: bool| {
         calls
             .iter()
@@ -984,6 +1022,19 @@ fn folded_calls_line(calls: &[FoldedCall]) -> Option<String> {
         line.push_str(FOLDED_CALLS_FAILED);
         line.push_str(&failed);
         line.push('.');
+    }
+    if !folded.earlier_by_tool.is_empty() {
+        let mut by_tool: Vec<_> = folded.earlier_by_tool.iter().collect();
+        by_tool.sort_by(|left, right| right.1.cmp(left.1).then_with(|| left.0.cmp(right.0)));
+        let total: u64 = by_tool.iter().map(|(_, count)| **count).sum();
+        let counts = by_tool
+            .iter()
+            .map(|(name, count)| format!("{name} x{count}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        line.push_str(&format!(
+            " Before those, it already made {total} earlier calls: {counts}."
+        ));
     }
     Some(line)
 }
@@ -1578,7 +1629,7 @@ where
         )),
         CompactionScope::Whole | CompactionScope::BeforeOpenRun { .. } => None,
     };
-    let summary_text = match folded_calls.as_deref().and_then(folded_calls_line) {
+    let summary_text = match folded_calls.as_ref().and_then(folded_calls_line) {
         Some(line) => format!("{summary_text}{line}"),
         None => summary_text,
     };
@@ -1828,7 +1879,7 @@ pub struct CompactionOutcome {
     /// The open run's folded-call list after this fold, when it folded the
     /// run's rounds: the caller stores it with the rewrite
     /// ([`persist_open_run_folded_calls`]).
-    pub(crate) folded_run_calls: Option<Vec<FoldedCall>>,
+    pub(crate) folded_run_calls: Option<FoldedCalls>,
 }
 
 #[cfg(test)]
@@ -2111,7 +2162,7 @@ mod tests {
                 wait_report: None,
                 scope: CompactionScope::Whole,
                 projection: &model_messages,
-                earlier_folded_calls: Vec::new(),
+                earlier_folded_calls: FoldedCalls::default(),
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -2623,7 +2674,7 @@ mod tests {
                 wait_report: None,
                 scope: CompactionScope::Whole,
                 projection: &model_messages,
-                earlier_folded_calls: Vec::new(),
+                earlier_folded_calls: FoldedCalls::default(),
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -3509,6 +3560,61 @@ mod tests {
         Message::BlockAssistant(call)
     }
 
+    fn named(calls: Vec<FoldedCall>) -> FoldedCalls {
+        let mut folded = FoldedCalls::default();
+        for call in calls {
+            folded.push(call);
+        }
+        folded
+    }
+
+    /// A run that folded more calls than the line names one by one: the
+    /// newest 200 stay named (a failed one among them still listed apart),
+    /// and the older ones are counted by tool name, in the line and in the
+    /// stored list.
+    #[test]
+    fn a_long_runs_folded_calls_are_bounded() {
+        let mut folded = FoldedCalls::default();
+        for index in 0..600 {
+            folded.push(folded_call("read_file", &format!("r{index}"), false));
+        }
+        for index in 0..212 {
+            folded.push(folded_call("search", &format!("s{index}"), false));
+        }
+        for index in 0..199 {
+            folded.push(folded_call("read_file", &format!("n{index}"), false));
+        }
+        folded.push(folded_call("send_email", "last", true));
+        assert_eq!(folded.calls.len(), 200, "the newest 200 are named");
+        assert_eq!(folded.calls[199], folded_call("send_email", "last", true));
+        assert_eq!(
+            folded.earlier_by_tool,
+            [("read_file".to_string(), 600), ("search".to_string(), 212)]
+                .into_iter()
+                .collect()
+        );
+        let line = folded_calls_line(&folded).expect("the calls are named");
+        assert!(
+            line.contains("only if it is still needed: send_email (last).")
+                && line.contains("it already made 812 earlier calls: read_file x600, search x212."),
+            "{line}"
+        );
+        assert!(!line.contains("(r0)"), "an older call is only counted");
+        assert!(
+            line.len() < 16 * 1024,
+            "the line stays bounded: {}",
+            line.len()
+        );
+    }
+
+    fn folded_call(name: &str, id: &str, failed: bool) -> FoldedCall {
+        FoldedCall {
+            name: name.into(),
+            id: id.into(),
+            failed,
+        }
+    }
+
     fn folded(name: &str, id: &str, failed: bool) -> FoldedCall {
         FoldedCall {
             name: name.into(),
@@ -3534,8 +3640,11 @@ mod tests {
             call_row(r, "tc_2"),
             result_row("tc_2", 10),
         ];
-        let after_first = folded_run_calls(&[], &first, 2, 4);
-        assert_eq!(after_first, vec![folded("list_records", "tc_1", false)]);
+        let after_first = folded_run_calls(&FoldedCalls::default(), &first, 2, 4);
+        assert_eq!(
+            after_first.calls,
+            vec![folded("list_records", "tc_1", false)]
+        );
         let second = vec![
             sys,
             summary_row("summary"),
@@ -3547,7 +3656,7 @@ mod tests {
         ];
         let after_second = folded_run_calls(&after_first, &second, 3, 5);
         assert_eq!(
-            after_second,
+            after_second.calls,
             vec![
                 folded("list_records", "tc_1", false),
                 folded("list_records", "tc_2", true),
@@ -3583,11 +3692,15 @@ mod tests {
         persist_open_run_folded_calls(
             &mut session,
             &crate::lifecycle::RunId::new(),
-            &[folded("send_report", "x9", false)],
+            &named(vec![folded("send_report", "x9", false)]),
         )
         .unwrap();
         let earlier = open_run_folded_calls(&session, &run);
-        assert!(earlier.is_empty(), "another run's list is ignored");
+        assert_eq!(
+            earlier,
+            FoldedCalls::default(),
+            "another run's list is ignored"
+        );
         let line = folded_calls_line(&folded_run_calls(&earlier, &messages, 3, 5))
             .expect("the folded call is named");
         assert!(!line.contains("x9"), "{line}");
@@ -3600,10 +3713,10 @@ mod tests {
     fn the_folded_call_list_survives_a_restart() {
         let run = crate::lifecycle::RunId::new();
         let mut session = Session::new();
-        let calls = vec![
+        let calls = named(vec![
             folded("list_records", "tc_1", false),
             folded("send_email", "tc_2", true),
-        ];
+        ]);
         persist_open_run_folded_calls(&mut session, &run, &calls).unwrap();
         let restored =
             Session::from_persisted_bytes(&session.to_persisted_bytes().unwrap()).unwrap();
@@ -3627,7 +3740,7 @@ mod tests {
             call_row_named(&run, "fc_0", "send_email"),
             result_row("fc_0", 10),
         ];
-        let after_first = folded_run_calls(&[], &first, 2, 4);
+        let after_first = folded_run_calls(&FoldedCalls::default(), &first, 2, 4);
         let second = vec![
             sys.clone(),
             summary_row("summary"),
@@ -3638,7 +3751,7 @@ mod tests {
             result_row("fc_0", 10),
         ];
         assert_eq!(
-            folded_run_calls(&after_first, &second, 3, 5),
+            folded_run_calls(&after_first, &second, 3, 5).calls,
             vec![
                 folded("list_records", "fc_0", false),
                 folded("send_email", "fc_0", false),
@@ -3656,9 +3769,9 @@ mod tests {
             call_row_named(&run, "fc_0", "read_inbox"),
             result_row("fc_0", 10),
         ];
-        let calls = folded_run_calls(&[], &one_fold, 2, 6);
+        let calls = folded_run_calls(&FoldedCalls::default(), &one_fold, 2, 6);
         assert_eq!(
-            calls,
+            calls.calls,
             vec![
                 folded("list_records", "fc_0", true),
                 folded("send_email", "fc_0", false),
@@ -3690,7 +3803,7 @@ mod tests {
             call_row(r, "tc_2"),
             result_row("tc_2", 10),
         ];
-        let note = folded_calls_line(&folded_run_calls(&[], &messages, 3, 5))
+        let note = folded_calls_line(&folded_run_calls(&FoldedCalls::default(), &messages, 3, 5))
             .expect("the folded call is named");
         assert!(
             note.contains("do not make them again: list_records (tc_1)."),

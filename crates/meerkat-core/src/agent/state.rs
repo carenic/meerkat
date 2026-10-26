@@ -4668,7 +4668,7 @@ where
                                             &self.session,
                                             run_id,
                                         ),
-                                        _ => Vec::new(),
+                                        _ => crate::agent::compact::FoldedCalls::default(),
                                     },
                                 };
                                 // The compactor's warnings (a bounded source,
@@ -4820,7 +4820,7 @@ where
                             // same prepared value as the rewrite, so it
                             // commits, rolls back and persists with it.
                             if let (Some(calls), Some(run_id)) = (
-                                outcome.folded_run_calls.as_deref(),
+                                outcome.folded_run_calls.as_ref(),
                                 self.runtime_started_run_id.as_ref(),
                             ) && let Err(error) =
                                 crate::agent::compact::persist_open_run_folded_calls(

@@ -77,12 +77,14 @@ them.
      rows a tool appended after them) stay verbatim, and the summary ends by
      naming every call the run's earlier rounds made, those an earlier fold
      took out included, as already run (a call whose result was an error as
-     ran and failed, so it may still be made again). That list is kept in the
-     session's metadata for the open run, committed with each fold, and never
-     read back from a summary's text; each call's outcome comes from its own
-     round, since some providers reuse call ids in every round. A long single run therefore
-     keeps compacting, one boundary later than before, and always sees the
-     calls it made last. A fold that would take out only one row is skipped.
+     ran and failed, so it may still be made again). That list is kept in
+     the session metadata key `open_run_folded_calls` for the open run,
+     committed with each fold, and never read back from a summary's text;
+     each call's outcome comes from its own round, since some providers reuse
+     call ids in every round. The line names the newest 200 calls and counts
+     older ones by tool name. A long single run therefore keeps compacting,
+     one boundary later than before, and always sees the calls it made last.
+     A fold that would take out only one row is skipped.
 
   A run whose newest round is its only one has nothing to fold: the attempt
   is skipped before its summary call and recorded for cadence. A run's first
