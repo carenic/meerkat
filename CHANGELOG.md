@@ -35,6 +35,32 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-runtime`: `meerkat_runtime::completion::CompletionOutcome` gains
+  `OutcomeUnknown { run_id }`, the finalized answer to an input that run
+  `run_id` consumed at a boundary a recovery committed without the input's
+  receipt, once a cold-predecessor settlement answers it: what the run did
+  for that input is not known. `CompletionOutcome` is exhaustive, so a
+  downstream exhaustive match needs an arm. Read the new variant as not
+  completed, and never resubmit or redeliver the input because of it, since
+  its run may have acted on it. Only a terminal-receipt read meets it; a
+  live completion waiter never does.
+- `meerkat-runtime`, `meerkat-machine-schema`, `meerkat-machine-kernels`: the
+  MeerkatMachine completion vocabulary gains
+  `RuntimeCompletionObservedOutcome::OutcomeUnknown`,
+  `RuntimeCompletionTerminalObservation::OutcomeUnknown` and
+  `RuntimeCompletionResultClass::OutcomeUnknown`, each appended last (the
+  `meerkat_machine::dsl` bridge copies and the catalog and kernel types).
+  The generated runtime kernel (`generated::meerkat`) adds the new
+  transitions to `TransitionId`, appended last:
+  `ResolveRuntimeCompletionResultOutcomeUnknownInitializing`,
+  `ResolveRuntimeCompletionResultOutcomeUnknownIdle`,
+  `ResolveRuntimeCompletionResultOutcomeUnknownAttached`,
+  `ResolveRuntimeCompletionResultOutcomeUnknownRunning`,
+  `ResolveRuntimeCompletionResultOutcomeUnknownRetired`,
+  `ResolveRuntimeCompletionResultOutcomeUnknownStopped`.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
