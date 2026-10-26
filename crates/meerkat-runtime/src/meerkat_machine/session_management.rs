@@ -6005,7 +6005,9 @@ impl MeerkatMachine {
         // First, the terminals a recovery wrote after this registration
         // recovered its inputs (a materialization's own durable-tail
         // recovery) are adopted, so nothing below or after ends or stages an
-        // input the store already ended.
+        // input the store already ended. The loop's startup drain adopted
+        // them already, before it read the batches such a recovery stages;
+        // this finds only what a recovery committed since.
         pending.adopt_recovered_input_terminals().await?;
         if let Some(evidence) = self.session_interrupted_tool_evidence(&session_id).await? {
             pending.settle_interrupted_tool_evidence(evidence).await?;

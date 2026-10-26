@@ -1435,10 +1435,31 @@ async fn whole_blob_provisional_recovery_promotes_store_owned_candidate() {
 async fn seed_completed_run_with_pending_input(
     store: &InMemoryRuntimeStore,
 ) -> (SessionId, LogicalRuntimeId, Input) {
+    let (session_id, runtime_id, input, _run_id) =
+        seed_run_with_pending_input(store, RunTail::Completed).await;
+    (session_id, runtime_id, input)
+}
+
+/// How a run whose boundary is missing left its tail.
+#[derive(Clone, Copy, Debug)]
+enum RunTail {
+    /// The run answered, and its end-of-run save landed.
+    Completed,
+    /// The run was cut after a tool round: its call is answered, and no
+    /// final answer followed.
+    Interrupted,
+}
+
+/// A WholeBlob session whose run `tail` stands as the provisional tail,
+/// with the run's prompt applied and waiting for the missing boundary.
+async fn seed_run_with_pending_input(
+    store: &InMemoryRuntimeStore,
+    tail: RunTail,
+) -> (SessionId, LogicalRuntimeId, Input, RunId) {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
     use meerkat_core::types::{
-        AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
-        UserMessage,
+        AssistantBlock, BlockAssistantMessage, Message, StopReason, ToolResult,
+        TranscriptMessageIdentity, UserMessage,
     };
     use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
 
@@ -1462,18 +1483,39 @@ async fn seed_completed_run_with_pending_input(
         .cloned()
         .expect("initial boundary returns WholeBlob store authority");
 
-    // The run answered, and its end-of-run save landed; its boundary did not.
+    // The run's rows landed; its boundary did not.
     let mut answered = committed;
-    answered.push(Message::BlockAssistant(BlockAssistantMessage {
-        blocks: vec![AssistantBlock::Text {
-            text: "the answer".to_string(),
-            meta: None,
-        }],
-        stop_reason: Some(StopReason::EndTurn),
-        identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
-        created_at: meerkat_core::types::message_timestamp_now(),
-        assistant_message_id: None,
-    }));
+    match tail {
+        RunTail::Completed => answered.push(Message::BlockAssistant(BlockAssistantMessage {
+            blocks: vec![AssistantBlock::Text {
+                text: "the answer".to_string(),
+                meta: None,
+            }],
+            stop_reason: Some(StopReason::EndTurn),
+            identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+            created_at: meerkat_core::types::message_timestamp_now(),
+            assistant_message_id: None,
+        })),
+        RunTail::Interrupted => {
+            answered.push(Message::BlockAssistant(BlockAssistantMessage {
+                blocks: vec![AssistantBlock::ToolUse {
+                    id: "cut-call".to_string(),
+                    name: "cut_tool".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                stop_reason: Some(StopReason::ToolUse),
+                identity: TranscriptMessageIdentity::default().with_run_id(run_id.clone()),
+                created_at: meerkat_core::types::message_timestamp_now(),
+                assistant_message_id: None,
+            }));
+            answered.push(Message::tool_results(vec![ToolResult::new(
+                "cut-call".to_string(),
+                "the tool's result".to_string(),
+                false,
+            )]));
+        }
+    }
     store
         .write_prepared_whole_blob_provisional_tail(
             &runtime_id,
@@ -1494,7 +1536,7 @@ async fn seed_completed_run_with_pending_input(
         )
         .await
         .unwrap();
-    (session_id, runtime_id, input)
+    (session_id, runtime_id, input, run_id)
 }
 
 /// The stored phase and terminal outcome of `input_id`'s row.
@@ -1660,6 +1702,129 @@ async fn a_live_retire_after_a_recovery_commit_leaves_the_inputs_it_consumed() {
             .unwrap(),
         Some(RuntimeState::Retired)
     );
+}
+
+/// The registration recovers a run's input as pending, and then the
+/// store-owned recovery commits the run's tail (a restart's materialization
+/// recovers after its registration): the recovery consumes the input and
+/// stages its terminal batch in the store while the registered driver still
+/// holds the input queued. The executor's attach starts the runtime loop,
+/// whose startup drain adopts the store's terminals before it reads the
+/// pending batches: the attach succeeds, the input's receipt reads
+/// finalized for the run (completed without a result, or cancelled for an
+/// interrupted tail), nothing is left to run, and no run takes the input
+/// again. RED before: the startup drain found the store's pending owner
+/// still queued in the live shell and refused the start as corrupt. Unrun:
+/// written while Cargo is not run.
+#[tokio::test]
+async fn an_attach_after_a_recovery_commit_finalizes_the_consumed_inputs_receipt() {
+    use meerkat_runtime::completion::CompletionOutcome;
+    use meerkat_runtime::recovery::{
+        DurableTailRecoveryDisposition, DurableTailRecoveryOutcome, recover_durable_tail,
+    };
+    use meerkat_runtime::terminal_status::{
+        InputTerminalReceiptRead, InputTerminalReceiptScope, InteractionSelector,
+    };
+
+    for tail in [RunTail::Completed, RunTail::Interrupted] {
+        let store = Arc::new(InMemoryRuntimeStore::new());
+        let (session_id, runtime_id, input, run_id) =
+            seed_run_with_pending_input(&store, tail).await;
+        let machine =
+            MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+                .expect("persistent machine");
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("the session's runtime registers");
+        assert!(
+            machine
+                .list_active_inputs(&session_id)
+                .await
+                .unwrap()
+                .contains(input.id()),
+            "{tail:?}: the registered driver holds the run's input as pending"
+        );
+
+        let DurableTailRecoveryOutcome::Committed { disposition, .. } =
+            recover_durable_tail(store.as_ref(), &session_id)
+                .await
+                .expect("the recovery answers")
+        else {
+            panic!("{tail:?}: the recovery must commit the run's tail");
+        };
+        assert_eq!(
+            disposition,
+            match tail {
+                RunTail::Completed => DurableTailRecoveryDisposition::CommitCompleted,
+                RunTail::Interrupted => DurableTailRecoveryDisposition::RepairAndCommitInterrupted,
+            }
+        );
+        assert_eq!(
+            stored_terminal(&store, &runtime_id, input.id()).await,
+            CONSUMED_ROW,
+            "{tail:?}: the recovery consumes the run's input"
+        );
+
+        let runs = RecordedRuns::default();
+        machine
+            .ensure_session_with_executor(session_id.clone(), Box::new(runs.clone()))
+            .await
+            .expect("the attach starts: its startup drain adopts the store's terminals first");
+        let read = machine
+            .input_terminal_receipt(
+                &session_id,
+                InteractionSelector::InputId(input.id().clone()),
+            )
+            .await
+            .expect("the input's receipt reads")
+            .expect("the input has a receipt");
+        let InputTerminalReceiptRead::Finalized(receipt) = read.report else {
+            panic!(
+                "{tail:?}: the startup drain finalizes the input's receipt, not {:?}",
+                read.report
+            );
+        };
+        assert_eq!(receipt.terminal(), &InputTerminalOutcome::Consumed);
+        assert!(
+            matches!(
+                (tail, receipt.outcome()),
+                (
+                    RunTail::Completed,
+                    CompletionOutcome::CompletedWithoutResult
+                ) | (RunTail::Interrupted, CompletionOutcome::Cancelled)
+            ),
+            "{tail:?}: {:?}",
+            receipt.outcome()
+        );
+        assert!(
+            matches!(
+                receipt.scope(),
+                InputTerminalReceiptScope::Run { run_id: scoped } if *scoped == run_id
+            ),
+            "{tail:?}: the receipt is the recovered run's: {:?}",
+            receipt.scope()
+        );
+        assert!(
+            machine
+                .list_active_inputs(&session_id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "{tail:?}: nothing is left to run"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            runs.applied().is_empty(),
+            "{tail:?}: no run takes the input again: {:?}",
+            runs.applied()
+        );
+        assert_eq!(
+            stored_terminal(&store, &runtime_id, input.id()).await,
+            CONSUMED_ROW,
+            "{tail:?}: the input stays consumed"
+        );
+    }
 }
 
 #[tokio::test]

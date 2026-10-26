@@ -2090,6 +2090,22 @@ async fn drain_recovered_terminals_with(
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
     publisher: &mut TerminalPublisher<'_>,
 ) -> Result<(), InteractionTerminalPublicationError> {
+    // A store-owned durable-tail recovery can end inputs this driver still
+    // holds, with their terminal batch, after the registration recovered
+    // them (a materialization's own recovery runs between the registration
+    // and the attach). Their terminals and carriers are adopted first, so
+    // the drain finds every pending owner the store names in the live shell.
+    driver
+        .lock()
+        .await
+        .adopt_durable_consumed_inputs(completions)
+        .await
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_driver(
+                "recovered input terminal adoption failed",
+                error,
+            )
+        })?;
     drain_recovered_input_terminal_completions_with(driver, completions, publisher).await?;
     let batches = driver
         .lock()
