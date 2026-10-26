@@ -6590,6 +6590,12 @@ where
         if let Some(resumed) = self.pending_resumed_round.take() {
             return Box::pin(self.run_resumed_tool_round(ctx, resumed)).await;
         }
+        // Before anything of this boundary commits (its notices first): a
+        // held approval owner makes the boundary look again with nothing of
+        // it delivered yet.
+        if !self.enrol_moved_run_consent().await {
+            return Ok(CallingLlmStep::Repoll);
+        }
         match self.refresh_calling_llm_boundary_notices(ctx).await? {
             CallingLlmBoundaryGate::Deferred => return Ok(CallingLlmStep::Repoll),
             CallingLlmBoundaryGate::Proceed => {}
@@ -6597,9 +6603,7 @@ where
         if self.spend_decided_run_consent(ctx).await? {
             // In-run consent attempts registered asynchronous work with this
             // turn, which now waits for its barrier operations before the
-            // next model request, exactly as after a tool batch; or a held
-            // approval owner deferred the read of the consent moved into
-            // this run, and the boundary looks again.
+            // next model request, exactly as after a tool batch.
             return Ok(CallingLlmStep::Repoll);
         }
         let tool_defs = self.apply_calling_llm_tool_scope(ctx).await?;
@@ -6947,47 +6951,20 @@ where
         }
         Ok(CallingLlmBoundaryGate::Proceed)
     }
-    /// Boundary step 3c: in-run human consent (ADR-001). An authenticated
-    /// decision that reached this still-open run is spent here by the run's
-    /// own owner, before tool capture and request preparation. Only consent
-    /// this run requested itself, and consent the approval owner moved into
-    /// this run by the committed receipt of one of its staged notice inputs
-    /// (before the run opened or at any later boundary), is examined: a run
-    /// that requested none, and resumes no retained work under a consent
-    /// scope, pays one empty-set check and never touches the approval
-    /// owner. A receipt that commits after the consent step of the run's
-    /// first boundary can let the model call the operation again first,
-    /// which asks for fresh consent once more (approving it runs the
-    /// operation again); the moved consent still runs once, at the run's
-    /// next boundary, and the run's close withdraws it unspent when there
-    /// is none. Each approved candidate gets one fresh retained attempt in
-    /// this run: the exact original call and plan, with this run's work and
-    /// run, through the common fenced entry whose leaf spends the decision
-    /// once. Nothing waits for the owner: when it is held, the run's own
-    /// decided consent waits for the next boundary, and the read of the
-    /// consent moved into the run yields and the boundary looks again, so a
-    /// transient hold never costs the run that consent. The run can still
-    /// close, or be dropped, before or during an attempt; its run scope then
-    /// parks or withdraws what it admitted, and an attempt that entered keeps
-    /// its own outcome. Asynchronous work the attempts started is registered
-    /// with this turn through the turn owner, with its exact refs and wait
-    /// policies, as a tool batch's is; `true` means the turn now waits for
-    /// it, or the moved read was deferred, and the boundary must repoll.
-    async fn spend_decided_run_consent(
-        &mut self,
-        ctx: &mut CallingLlmTurnCtx<'_>,
-    ) -> Result<bool, AgentError> {
+    /// The first step of a boundary, before its notices: a run that resumes
+    /// retained work under a consent scope enrols the consent the approval
+    /// owner moved into it, at every boundary, since a receipt can commit,
+    /// and move its consent here, after the run opened. Each is still
+    /// attempted at most once in this run, by step 3c. Without a consent
+    /// scope nothing can move into the run, and the owner is not read. A
+    /// held owner yields, as the notice gate does: `false` means the
+    /// boundary must repoll, with nothing of it delivered yet.
+    async fn enrol_moved_run_consent(&mut self) -> bool {
         // A noncommitting live bridge run executes against a retained
         // snapshot and never spends consent.
         if self.noncommitting_live_bridge_run {
-            return Ok(false);
+            return true;
         }
-        // A run that resumes retained work under a consent scope enrols the
-        // consent the approval owner moved into it, at every boundary: a
-        // receipt can commit, and move its consent here, after the run
-        // opened. Each is still attempted at most once in this run. Without
-        // a consent scope nothing can move into the run, and the owner is
-        // not read.
         if let (Some(review), Some(work)) = (
             self.operation_review.as_ref(),
             self.tool_dispatch_context.work_authorization(),
@@ -7000,13 +6977,53 @@ where
                         self.run_consent_attempts.moved_in(approval_id);
                     }
                 }
-                // A held owner: yield, and the boundary looks again, as the
-                // notice gate does.
                 crate::approval::consent::MovedConsentScan::Deferred => {
                     tokio::task::yield_now().await;
-                    return Ok(true);
+                    return false;
                 }
             }
+        }
+        true
+    }
+
+    /// Boundary step 3c: in-run human consent (ADR-001). An authenticated
+    /// decision that reached this still-open run is spent here by the run's
+    /// own owner, before tool capture and request preparation. Only consent
+    /// this run requested itself, and consent the approval owner moved into
+    /// this run by the committed receipt of one of its staged notice inputs
+    /// (before the run opened or at any later boundary), is examined: a run
+    /// that requested none, and resumes no retained work under a consent
+    /// scope, pays one empty-set check and never touches the approval
+    /// owner. A receipt that commits after the run's first boundary read the
+    /// consent moved into it can let the model call the operation again
+    /// first, which asks for fresh consent once more (approving it runs the
+    /// operation again); the moved consent still runs once, at the run's
+    /// next boundary, and the run's close withdraws it unspent when there
+    /// is none. Each approved candidate gets one fresh retained attempt in
+    /// this run: the exact original call and plan, with this run's work and
+    /// run, through the common fenced entry whose leaf spends the decision
+    /// once. Nothing waits for the owner: when it is held, the run's own
+    /// decided consent waits for the next boundary, and the read of the
+    /// consent moved into the run (the boundary's first step,
+    /// [`Self::enrol_moved_run_consent`]) yields and the boundary looks
+    /// again, so a hold at that read never costs the run that consent; a
+    /// hold met later in the step (the decided read, or the attempt's
+    /// resolve or spend) acts as for consent the run requested itself, and
+    /// moved consent the run then never attempts is withdrawn at its close.
+    /// The run can still close, or be dropped, before or during an attempt;
+    /// its run scope then parks or withdraws what it admitted, and an
+    /// attempt that entered keeps its own outcome. Asynchronous work the
+    /// attempts started is registered with this turn through the turn
+    /// owner, with its exact refs and wait policies, as a tool batch's is;
+    /// `true` means the turn now waits for it and the boundary must repoll.
+    async fn spend_decided_run_consent(
+        &mut self,
+        ctx: &mut CallingLlmTurnCtx<'_>,
+    ) -> Result<bool, AgentError> {
+        // A noncommitting live bridge run executes against a retained
+        // snapshot and never spends consent.
+        if self.noncommitting_live_bridge_run {
+            return Ok(false);
         }
         let requested = self.run_consent_attempts.unattempted();
         if requested.is_empty() {
@@ -37302,7 +37319,7 @@ mod tests {
             use crate::approval::{
                 ApprovalAssurance, ApprovalConsentCustody, ApprovalConsentRecord,
                 ApprovalConsentScope, ApprovalConsentTransition, ApprovalConsentWithdrawalReason,
-                ApprovalDecision, ApprovalService, ApprovalStatus,
+                ApprovalDecision, ApprovalService, ApprovalStatus, ApprovalStore,
             };
             use crate::lifecycle::InputId;
             use crate::retained_work::{ResumedInput, RetainedWorkIdentity};
@@ -38355,6 +38372,176 @@ mod tests {
                 let requested = second.route.0.lock().unwrap().clone();
                 assert_eq!(requested.len(), 1, "the new call requested fresh consent");
                 assert_ne!(requested[0], consent);
+            }
+
+            /// Bound of one armed write's hold: it ends then even when no one
+            /// releases it, so a run that never looks again still closes.
+            const HOLD_GUARD: std::time::Duration = std::time::Duration::from_secs(5);
+
+            /// An approval store whose next write, once armed, reports that
+            /// it entered and then waits for its release (at most
+            /// [`HOLD_GUARD`]): the approval owner holds its write lock for
+            /// that long.
+            #[derive(Default)]
+            struct GatedStore {
+                inner: crate::approval::InMemoryApprovalStore,
+                gate: Mutex<Option<(std::sync::mpsc::Sender<()>, std::sync::mpsc::Receiver<()>)>>,
+            }
+
+            impl ApprovalStore for GatedStore {
+                fn load_all(
+                    &self,
+                ) -> Result<Vec<crate::ApprovalRecord>, crate::ApprovalStoreError> {
+                    self.inner.load_all()
+                }
+
+                fn get(
+                    &self,
+                    approval_id: &crate::ApprovalId,
+                ) -> Result<Option<crate::ApprovalRecord>, crate::ApprovalStoreError>
+                {
+                    self.inner.get(approval_id)
+                }
+
+                fn put_if_current(
+                    &self,
+                    expected: Option<&crate::ApprovalRecord>,
+                    record: &crate::ApprovalRecord,
+                ) -> Result<(), crate::ApprovalStoreError> {
+                    let gate = self.gate.lock().unwrap().take();
+                    if let Some((entered, release)) = gate {
+                        entered.send(()).unwrap();
+                        let _released = release.recv_timeout(HOLD_GUARD);
+                    }
+                    self.inner.put_if_current(expected, record)
+                }
+
+                fn is_persistent(&self) -> bool {
+                    false
+                }
+            }
+
+            /// An approval request of the host's own, unrelated to the runs.
+            fn unrelated_request() -> crate::ApprovalRequest {
+                crate::ApprovalRequest {
+                    requester: crate::ApprovalPrincipalId::new("agent:other").expect("principal"),
+                    owner: crate::ApprovalOwnerRef::Session {
+                        session_id: crate::SessionId::new(),
+                    },
+                    resource: crate::ApprovalResourceRef {
+                        kind: crate::ApprovalResourceKind::ShellCommand,
+                        id: crate::ApprovalResourceId::new("shell:other"),
+                    },
+                    proposed_action: crate::ApprovalProposedAction {
+                        kind: crate::ApprovalActionKind::ShellCommand,
+                        summary: "another action".to_string(),
+                        body: None,
+                    },
+                    risk: crate::ApprovalRisk::High,
+                    request_body: None,
+                    allowed_decisions: std::collections::BTreeSet::from([
+                        ApprovalDecision::Approve,
+                        ApprovalDecision::Deny,
+                    ]),
+                    expires_at: None,
+                    metadata: crate::SurfaceMetadata::default(),
+                    request_provenance: None,
+                }
+            }
+
+            /// A held approval owner never costs a resumed run the consent
+            /// moved into it. At the run's only boundary another write holds
+            /// the owner's lock, so the boundary's read of the moved consent
+            /// finds the owner held: the boundary yields and looks again, and
+            /// once the hold has ended it spends the consent, before the run's
+            /// first model request, which carries the attempt's notice.
+            #[tokio::test]
+            async fn a_held_approval_owner_makes_the_boundary_look_again_for_moved_consent() {
+                let store = Arc::new(GatedStore::default());
+                let model = Arc::new(ScriptedModel::default());
+                let tools = Arc::new(Actions::default());
+                let owner = Arc::new(Owner::default());
+                let mut host = compose_host(
+                    ApprovalService::with_store(store.clone()).expect("service"),
+                    &model,
+                    &tools,
+                )
+                .await;
+                let scope = destination(host.agent.session.id());
+                let origin_run = RunId::new();
+                let ids = admitting_run(
+                    &mut host,
+                    &model,
+                    &owner,
+                    &scope,
+                    &origin_run,
+                    &[("consent-call", RESTRICTED)],
+                )
+                .await;
+                let consent = ids[0].clone();
+                approve(&host.approvals, &consent);
+                let input = InputId::new();
+                receipt(&host.approvals, &consent, &scope, &input);
+                // At the boundary's first look another write takes the
+                // owner's lock and holds it; at its next look the hold ends.
+                let looks = Arc::new(AtomicUsize::new(0));
+                let held = Arc::new(Mutex::new(None));
+                let hold = {
+                    let store = Arc::clone(&store);
+                    let approvals = host.approvals.clone();
+                    let looks = Arc::clone(&looks);
+                    let held = Arc::clone(&held);
+                    move || match looks.fetch_add(1, Ordering::SeqCst) {
+                        0 => {
+                            let (entered, entered_rx) = std::sync::mpsc::channel();
+                            let (release, released) = std::sync::mpsc::channel();
+                            *store.gate.lock().unwrap() = Some((entered, released));
+                            let approvals = approvals.clone();
+                            let writer = std::thread::spawn(move || {
+                                approvals
+                                    .request(unrelated_request())
+                                    .expect("the write commits");
+                            });
+                            entered_rx
+                                .recv_timeout(HOLD_GUARD)
+                                .expect("the write holds the owner");
+                            *held.lock().unwrap() = Some((release, writer));
+                        }
+                        1 => {
+                            let (release, writer) = held.lock().unwrap().take().expect("held");
+                            release.send(()).expect("end the hold");
+                            writer.join().expect("the write ends");
+                        }
+                        _ => {}
+                    }
+                };
+                host.agent
+                    .__test_set_model_preparation_observer(Some(Arc::new(hold)));
+
+                let run = RunId::new();
+                let resumed = [(input, identity(&origin_run))];
+                run_as(
+                    &mut host.agent,
+                    &run,
+                    run_work(&owner, &model, &scope, &run, &resumed),
+                )
+                .await;
+
+                assert!(
+                    looks.load(Ordering::SeqCst) >= 2,
+                    "the held boundary looked again"
+                );
+                assert_eq!(
+                    tools.bodies(),
+                    vec![RESTRICTED.to_string()],
+                    "the boundary spent the moved consent once the hold ended"
+                );
+                assert!(record(&host.approvals, &consent).consumed_at.is_some());
+                let requests = model.requests();
+                assert_eq!(requests.len(), 3, "one request of the resumed run");
+                let attempts = consent_attempts(&requests[2]);
+                assert_eq!(attempts.len(), 1, "{attempts:?}");
+                assert_eq!(attempts[0]["tool_use_id"], "consent-call");
             }
         }
 

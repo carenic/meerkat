@@ -7137,6 +7137,12 @@ mod tests {
                 "a held owner defers the read"
             );
         }
+        assert_eq!(
+            ApprovalService::unavailable("closed")
+                .consent_moved_into_run(&first_work, Some(&first_run)),
+            MovedConsentScan::Moved(Vec::new()),
+            "an unavailable owner holds no custody: nothing moved, never a deferral"
+        );
 
         assert_eq!(spend_in(&w, &first, &first_work, &first_run), Ok(()));
         assert_eq!(
