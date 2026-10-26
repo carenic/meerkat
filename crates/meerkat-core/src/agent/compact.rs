@@ -675,6 +675,190 @@ pub(crate) struct CompactionInvocation<'a> {
     /// Where the summary request's owner-change waits are reported, for a
     /// host that installed an operation refusal observer.
     pub(crate) wait_report: Option<crate::authorization::WaitReport>,
+    /// The first row of the run still in flight ([`open_run_floor`]). The
+    /// rewrite folds only `window.messages[..floor]` and keeps the run's own
+    /// rows verbatim after it; `model_messages` is then the projection of
+    /// that prefix. `None` folds the whole transcript.
+    pub(crate) open_run_floor: Option<usize>,
+}
+
+/// The first row of the run `run_id` while it is in flight: the start of the
+/// input rows (request, injected context, typed appends) before its first
+/// assistant row. `None` before the run's first assistant row exists, so a
+/// run's first boundary compacts as it always did.
+///
+/// A compaction must not fold the open run's own rows: the model would see
+/// only a summary of tool calls it already made in this run and could make
+/// them again, and a side-effecting tool would act twice. Derived from the
+/// transcript at each boundary (assistant rows carry the run id), so a
+/// resumed run and a rewrite earlier in the same run need no remapping.
+pub(crate) fn open_run_floor(
+    messages: &[Message],
+    run_id: &crate::lifecycle::RunId,
+) -> Option<usize> {
+    let first_response = messages.iter().position(|message| {
+        matches!(
+            message,
+            Message::BlockAssistant(assistant) if assistant.identity.run_id.as_ref() == Some(run_id)
+        )
+    })?;
+    let mut floor = first_response;
+    while floor > 0
+        && matches!(
+            &messages[floor - 1],
+            Message::User(user) if !user.transcript_role.is_compaction_summary()
+        )
+    {
+        floor -= 1;
+    }
+    Some(floor)
+}
+
+/// The least a bounded tool result of the open run keeps of its text.
+const MIN_BOUNDED_RUN_RESULT_BYTES: usize = 4 * 1024;
+
+/// The model request `request` with the open run's oversized tool results
+/// bounded, when the request (`encoded_bytes`) exceeds `max_bytes` and the
+/// run's own results are what can give way. `None` when nothing is bounded.
+///
+/// A compaction never folds the open run's own rows, so a run whose own tool
+/// results are larger than the provider accepts would fail every request.
+/// For this request only, each result answering a tool call this run made
+/// (found through its `ToolUse` rows in `transcript`, from the run's floor)
+/// keeps its identity (`tool_use_id`, `is_error`) and the head of its text,
+/// with a marker naming the call, so the model still sees every call it made
+/// and that its result was cut. The stored transcript keeps every result
+/// whole, and the bounding is a pure function of the request, so the same
+/// rows produce the same request at every boundary.
+pub(crate) fn bound_open_run_tool_results_for_request(
+    request: &[Message],
+    transcript: &[Message],
+    run_id: &crate::lifecycle::RunId,
+    encoded_bytes: u64,
+    max_bytes: u64,
+) -> Option<Vec<Message>> {
+    if encoded_bytes <= max_bytes {
+        return None;
+    }
+    let floor = open_run_floor(transcript, run_id)?;
+    let run_calls: std::collections::BTreeMap<&str, &str> = transcript[floor..]
+        .iter()
+        .filter_map(|message| match message {
+            Message::BlockAssistant(assistant) => Some(assistant.blocks.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter_map(|block| match block {
+            AssistantBlock::ToolUse { id, name, .. } => Some((id.as_str(), name.as_str())),
+            _ => None,
+        })
+        .collect();
+    let content_bytes = |result: &crate::types::ToolResult| {
+        serde_json::to_vec(&result.content).map_or(usize::MAX, |encoded| encoded.len())
+    };
+    let run_results = request
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResults { results, .. } => Some(results.iter()),
+            _ => None,
+        })
+        .flatten()
+        .filter(|result| run_calls.contains_key(result.tool_use_id.as_str()))
+        .collect::<Vec<_>>();
+    if run_results.is_empty() {
+        return None;
+    }
+    let run_bytes = run_results
+        .iter()
+        .map(|result| content_bytes(*result))
+        .fold(0usize, usize::saturating_add);
+    let encoded = usize::try_from(encoded_bytes).unwrap_or(usize::MAX);
+    let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
+    // What the rest of the request leaves, with a tenth kept for the markers
+    // and the provider's escaping of the heads.
+    let other_bytes = encoded.saturating_sub(run_bytes);
+    let room = cap.saturating_sub(other_bytes) / 10 * 9;
+    let share = (room / run_results.len()).max(MIN_BOUNDED_RUN_RESULT_BYTES);
+    let mut bounded_any = false;
+    let bounded = request
+        .iter()
+        .map(|message| {
+            let Message::ToolResults {
+                results,
+                created_at,
+            } = message
+            else {
+                return message.clone();
+            };
+            let results = results
+                .iter()
+                .map(|result| {
+                    let Some(name) = run_calls.get(result.tool_use_id.as_str()) else {
+                        return result.clone();
+                    };
+                    if content_bytes(result) <= share {
+                        return result.clone();
+                    }
+                    bounded_any = true;
+                    bounded_run_tool_result(result, name, share)
+                })
+                .collect();
+            Message::ToolResults {
+                results,
+                created_at: *created_at,
+            }
+        })
+        .collect::<Vec<_>>();
+    bounded_any.then_some(bounded)
+}
+
+/// `result` with its content cut to the first `max_text_bytes` bytes of its
+/// text projection (media as placeholders) and a model-visible marker naming
+/// the tool call and how much of its result this request shows.
+fn bounded_run_tool_result(
+    result: &crate::types::ToolResult,
+    tool_name: &str,
+    max_text_bytes: usize,
+) -> crate::types::ToolResult {
+    let text = result
+        .content
+        .iter()
+        .map(crate::types::ContentBlock::text_projection)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let mut kept = max_text_bytes.min(text.len());
+    while !text.is_char_boundary(kept) {
+        kept -= 1;
+    }
+    let mut bounded = result.clone();
+    bounded.content = vec![
+        crate::types::ContentBlock::Text {
+            text: text.get(..kept).unwrap_or_default().to_string(),
+        },
+        crate::types::ContentBlock::Text {
+            text: format!(
+                "[result of tool call {tool_name} ({id}) shortened for this request: it shows \
+                 the first {kept} of {total} bytes of its text, media as placeholders; the \
+                 call ran once and its full result is kept in the session]",
+                id = result.tool_use_id,
+                total = text.len(),
+            ),
+        },
+    ];
+    bounded
+}
+
+/// Whether `prefix` holds anything a rewrite can fold: a response (an
+/// assistant or tool-results row). System rows, a prior summary and a
+/// request without a response leave nothing to summarize, so a compaction
+/// confined to such a prefix is skipped before its summary call.
+pub(crate) fn prefix_has_foldable_turn(prefix: &[Message]) -> bool {
+    prefix.iter().any(|message| {
+        matches!(
+            message,
+            Message::BlockAssistant(_) | Message::ToolResults { .. }
+        )
+    })
 }
 
 /// Exact canonical unmeasured transcript subset incorporated by this attempt.
@@ -788,6 +972,7 @@ where
         parent_revision,
         summarization_budget,
         wait_report,
+        open_run_floor,
     } = invocation;
     let CompactionWindow {
         messages,
@@ -795,7 +980,12 @@ where
         session_boundary_index,
     } = window;
     let estimated = estimate_tokens(model_messages)?;
-    let message_count = model_messages.len();
+    // With a run in flight `model_messages` is the folded prefix only; the
+    // run's own rows are part of the transcript this compaction rewrites.
+    let message_count = model_messages.len()
+        + open_run_floor
+            .filter(|floor| *floor <= messages.len())
+            .map_or(0, |floor| messages.len() - floor);
     let mut event_stream_open = true;
 
     // 1. Emit CompactionStarted
@@ -1042,9 +1232,29 @@ where
     };
 
     // 4. Rebuild history. Validation below requires every ordinary System row
-    // to remain verbatim at its mapped relative position.
-    let result =
-        compactor.rebuild_history_under_pressure(messages, &summary_text, request_pressure);
+    // to remain verbatim at its mapped relative position. With a run in
+    // flight only the rows before it are rebuilt; the run's own rows follow
+    // verbatim, each retained at its exact offsets, whatever the compactor.
+    let result = match open_run_floor.filter(|floor| *floor <= messages.len()) {
+        Some(floor) => {
+            let mut result = compactor.rebuild_history_under_pressure(
+                &messages[..floor],
+                &summary_text,
+                request_pressure,
+            );
+            let rebuilt_floor = result.messages.len();
+            for (index, message) in messages[floor..].iter().enumerate() {
+                result.retained.push(CompactionRetained::new(
+                    u64::try_from(floor + index).unwrap_or(u64::MAX),
+                    u64::try_from(rebuilt_floor + index).unwrap_or(u64::MAX),
+                    message.clone(),
+                ));
+                result.messages.push(message.clone());
+            }
+            result
+        }
+        None => compactor.rebuild_history_under_pressure(messages, &summary_text, request_pressure),
+    };
     if let Err(error) = validate_compaction_rebuild(
         messages,
         &result.messages,
@@ -1539,6 +1749,7 @@ mod tests {
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
                 wait_report: None,
+                open_run_floor: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -2048,6 +2259,7 @@ mod tests {
                 parent_revision: session.transcript_revision().unwrap(),
                 summarization_budget: None,
                 wait_report: None,
+                open_run_floor: None,
             },
             &None,
             &crate::event_tap::new_event_tap(),
@@ -2661,6 +2873,138 @@ mod tests {
             error
                 .to_string()
                 .contains("does not exactly match the produced summary")
+        );
+    }
+
+    fn run_rows(run_id: &crate::lifecycle::RunId, result_bytes: usize) -> Vec<Message> {
+        let mut call = BlockAssistantMessage::new(
+            vec![AssistantBlock::ToolUse {
+                id: "tc_1".into(),
+                name: "list_records".into(),
+                args: serde_json::value::RawValue::from_string("{}".into()).unwrap(),
+                meta: None,
+            }],
+            StopReason::ToolUse,
+        );
+        call.identity.run_id = Some(run_id.clone());
+        vec![
+            Message::User(UserMessage::text("an earlier request")),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::Text {
+                    text: "an earlier answer".into(),
+                    meta: None,
+                }],
+                StopReason::EndTurn,
+            )),
+            Message::User(UserMessage::text("list every record")),
+            Message::BlockAssistant(call),
+            Message::tool_results(vec![ToolResult::new(
+                "tc_1".into(),
+                "r".repeat(result_bytes),
+                false,
+            )]),
+        ]
+    }
+
+    #[test]
+    fn the_open_run_floor_is_its_request_before_its_first_response() {
+        let run_id = crate::lifecycle::RunId::new();
+        let rows = run_rows(&run_id, 10);
+        assert_eq!(open_run_floor(&rows, &run_id), Some(2));
+        assert!(prefix_has_foldable_turn(&rows[..2]));
+        assert!(!prefix_has_foldable_turn(&rows[2..3]));
+        assert_eq!(
+            open_run_floor(&rows, &crate::lifecycle::RunId::new()),
+            None,
+            "a run with no response yet compacts as before"
+        );
+    }
+
+    /// The open run's own result alone exceeds the provider cap. For that
+    /// request only, the result keeps its identity and the head of its text
+    /// with a marker naming the call; every other row is unchanged, and a
+    /// request within the cap is left alone.
+    #[test]
+    fn an_over_cap_open_run_result_is_bounded_for_the_request_only() {
+        let run_id = crate::lifecycle::RunId::new();
+        let transcript = run_rows(&run_id, 600_000);
+        let request = transcript.clone();
+
+        assert!(
+            bound_open_run_tool_results_for_request(
+                &request,
+                &transcript,
+                &run_id,
+                90_000,
+                100_000
+            )
+            .is_none(),
+            "a request within the cap is sent as composed"
+        );
+        let bounded = bound_open_run_tool_results_for_request(
+            &request,
+            &transcript,
+            &run_id,
+            700_000,
+            100_000,
+        )
+        .expect("the over-cap request is bounded");
+
+        assert_eq!(bounded.len(), request.len());
+        for offset in 0..4 {
+            assert_eq!(
+                bounded[offset], request[offset],
+                "row {offset} is unchanged"
+            );
+        }
+        let Message::ToolResults {
+            results,
+            created_at,
+        } = &bounded[4]
+        else {
+            panic!("the run's result row stays a tool-results row");
+        };
+        let Message::ToolResults {
+            created_at: source_created_at,
+            ..
+        } = &request[4]
+        else {
+            unreachable!()
+        };
+        assert_eq!(created_at, source_created_at);
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].tool_use_id, "tc_1");
+        assert!(!results[0].is_error);
+        let Some(ContentBlock::Text { text: head }) = results[0].content.first() else {
+            panic!("a bounded result starts with its text head");
+        };
+        assert!(
+            head.len() < 100_000 && head.len() >= 4 * 1024,
+            "the head fits the cap: {}",
+            head.len()
+        );
+        let Some(ContentBlock::Text { text: marker }) = results[0].content.last() else {
+            panic!("a bounded result ends with its marker");
+        };
+        assert!(
+            marker.contains("list_records") && marker.contains("tc_1"),
+            "the marker names the call: {marker}"
+        );
+        assert!(
+            marker.contains("600000"),
+            "the marker states the full size: {marker}"
+        );
+
+        assert!(
+            bound_open_run_tool_results_for_request(
+                &request,
+                &transcript,
+                &crate::lifecycle::RunId::new(),
+                700_000,
+                100_000
+            )
+            .is_none(),
+            "another run's results are never bounded"
         );
     }
 }

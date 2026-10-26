@@ -4467,6 +4467,42 @@ where
                         // A writer past its self-fence window sends no
                         // summarization request either.
                         self.check_dispatch_fence()?;
+                        // A run in flight keeps its own rows verbatim: only
+                        // the rows before it are folded. When those hold
+                        // nothing to fold, the attempt ends here, before any
+                        // summary call or CompactionStarted, and is recorded
+                        // for cadence like any other attempt.
+                        let open_run_floor =
+                            self.runtime_started_run_id.as_ref().and_then(|run_id| {
+                                crate::agent::compact::open_run_floor(
+                                    self.session.messages(),
+                                    run_id,
+                                )
+                            });
+                        if let Some(floor) = open_run_floor
+                            && !crate::agent::compact::prefix_has_foldable_turn(
+                                &self.session.messages()[..floor],
+                            )
+                        {
+                            tracing::debug!(
+                                floor,
+                                "compaction skipped: nothing before the open run to fold"
+                            );
+                            self.compaction_cadence
+                                .last_compaction_attempt_boundary_index =
+                                Some(current_boundary_index);
+                            let cadence = self.compaction_cadence.clone();
+                            crate::agent::compact::persist_compaction_cadence(
+                                &mut self.session,
+                                &cadence,
+                            )
+                            .map_err(|error| {
+                                AgentError::InternalError(format!(
+                                    "failed to persist session compaction cadence metadata: {error}"
+                                ))
+                            })?;
+                            continue;
+                        }
                         self.tool_application_observations.invalidate();
                         let rollback_state = crate::agent::CompactionRollbackState {
                             rollback_session: self.session.clone(),
@@ -4533,12 +4569,25 @@ where
                                     .map(|observations| (revision, observations))
                                 })
                                 .map_err(|error| format!("live transcript is not digestible: {error}"))
+                        })
+                        .and_then(|(revision, observations)| match open_run_floor {
+                            // The summary is written from the rows it folds.
+                            Some(floor) => self
+                                .session
+                                .messages_for_model_boundary_prefix(floor)
+                                .map(|prefix| (revision, observations, Some(prefix)))
+                                .map_err(|error| {
+                                    format!(
+                                        "the transcript before the open run cannot be projected: {error}"
+                                    )
+                                }),
+                            None => Ok((revision, observations, None)),
                         });
                         // The summary request's own operation, so a refusal
                         // the host observes names what the audit records.
                         let summary_operation = crate::OperationId::new();
                         let outcome = match compaction_source {
-                            Ok((parent_revision, observation_source)) => {
+                            Ok((parent_revision, observation_source, prefix_messages)) => {
                                 // Compaction of the admitted controller's own
                                 // context is its housekeeping: it runs on the
                                 // retained controller client (still authorized
@@ -4565,7 +4614,9 @@ where
                                         summary_operation.clone(),
                                     ),
                                     budget: Some(&self.budget),
-                                    model_messages: &model_messages,
+                                    model_messages: prefix_messages
+                                        .as_deref()
+                                        .unwrap_or(&model_messages),
                                     observation_source,
                                     window: crate::compact::CompactionWindow {
                                         messages: self.session.messages(),
@@ -4579,6 +4630,7 @@ where
                                         self.tool_dispatch_context.run_id().cloned(),
                                         crate::authorization::OperationRefusalSurface::Compaction,
                                     ),
+                                    open_run_floor,
                                 };
                                 // The compactor's warnings (a bounded source,
                                 // a rewrite keeping no complete turn) name the
@@ -7755,6 +7807,10 @@ where
             });
         }
         let mut route_stabilization_attempt = 0_u8;
+        // At most once per request: the open run's own oversized tool results
+        // give way (bounded for this request only) when they push the request
+        // past the provider cap, because no compaction folds them.
+        let mut open_run_results_bounded = false;
         let (prepared_attempt, request_pressure) = loop {
             let attempt = match self.prepare_authorized_model_attempt(
                 Arc::clone(&request_messages),
@@ -7790,7 +7846,30 @@ where
                 }
             };
             match attempt.request_pressure() {
-                Ok(pressure) => break (attempt, pressure),
+                Ok(pressure) => {
+                    if !open_run_results_bounded
+                        && let Some(measured) = pressure
+                        && let Some(max_bytes) = self
+                            .compactor
+                            .as_ref()
+                            .and_then(|compactor| compactor.request_byte_cap(measured))
+                            .or(measured.max_bytes)
+                        && let Some(run_id) = self.runtime_started_run_id.as_ref()
+                        && let Some(bounded) =
+                            crate::agent::compact::bound_open_run_tool_results_for_request(
+                                &request_messages,
+                                self.session.messages(),
+                                run_id,
+                                measured.encoded_bytes,
+                                max_bytes,
+                            )
+                    {
+                        open_run_results_bounded = true;
+                        request_messages = Arc::new(bounded);
+                        continue;
+                    }
+                    break (attempt, pressure);
+                }
                 Err(error)
                     if agent_error_is_authorization_route_changed(&error)
                         && route_stabilization_attempt
@@ -12335,6 +12414,11 @@ mod tests {
         }
     }
 
+    /// Keeps only the last user row it is given. The agent rows built on it
+    /// compact at a run's first boundary, before the run's first response,
+    /// where the whole transcript is folded as before; at a later boundary
+    /// of an open run the agent hands it only the rows before the run and
+    /// keeps the run's own rows verbatim.
     struct DiscardingCompactor {
         compact_on_boundary: u64,
         source_bound: crate::compact::SummarizationSourceBound,
@@ -15092,6 +15176,273 @@ mod tests {
                     .contains("generated MeerkatMachine tool visibility authority is required")
                 || message.contains("local tool visibility owner is read-only"),
             "expected generated visibility authority failure, got: {message}"
+        );
+    }
+
+    /// A model that lists records with one tool call, then answers. It
+    /// writes the compaction summary when asked, and records every other
+    /// request it serves. It calls the tool again whenever its request shows
+    /// no tool result: the shape of a model that only saw a summary of its
+    /// own round.
+    struct OpenRunListingClient {
+        requests: Mutex<Vec<Vec<Message>>>,
+        summary_requests: Mutex<usize>,
+        tool_calls: Mutex<usize>,
+    }
+
+    impl OpenRunListingClient {
+        fn new() -> Self {
+            Self {
+                requests: Mutex::new(Vec::new()),
+                summary_requests: Mutex::new(0),
+                tool_calls: Mutex::new(0),
+            }
+        }
+
+        fn requests(&self) -> Vec<Vec<Message>> {
+            self.requests.lock().unwrap().clone()
+        }
+
+        fn summary_requests(&self) -> usize {
+            *self.summary_requests.lock().unwrap()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentLlmClient for OpenRunListingClient {
+        async fn stream_response(
+            &self,
+            messages: &[Message],
+            _tools: &[Arc<ToolDef>],
+            _max_tokens: u32,
+            _temperature: Option<f32>,
+            _provider_params: Option<&crate::lifecycle::run_primitive::ProviderParamsOverride>,
+        ) -> Result<super::LlmStreamResult, AgentError> {
+            let last_user = messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    Message::User(user) => Some(user.text_content()),
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let text = |text: &str| {
+                super::LlmStreamResult::new(
+                    vec![AssistantBlock::Text {
+                        text: text.to_string(),
+                        meta: None,
+                    }],
+                    StopReason::EndTurn,
+                    normalized_test_usage(self, Usage::default()),
+                )
+            };
+            if last_user == "COMPACT NOW" {
+                *self.summary_requests.lock().unwrap() += 1;
+                return Ok(text("summary"));
+            }
+            self.requests.lock().unwrap().push(messages.to_vec());
+            if last_user == "first" {
+                return Ok(text("first answer"));
+            }
+            // Any tool result in view is the answer to a call it made: a
+            // model that sees none calls again (and terminates once it sees
+            // the repeated call's result).
+            let sees_its_result = messages
+                .iter()
+                .any(|message| matches!(message, Message::ToolResults { .. }));
+            if sees_its_result {
+                return Ok(text("done"));
+            }
+            let mut calls = self.tool_calls.lock().unwrap();
+            *calls += 1;
+            Ok(super::LlmStreamResult::new(
+                vec![AssistantBlock::ToolUse {
+                    id: format!("tc_{calls}"),
+                    name: "list_records".into(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string())
+                        .expect("static raw value should parse"),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+                normalized_test_usage(self, Usage::default()),
+            ))
+        }
+
+        fn provider(&self) -> crate::provider::Provider {
+            crate::provider::Provider::Other
+        }
+
+        fn model(&self) -> &'static str {
+            "mock-model"
+        }
+    }
+
+    /// A tool that returns a 600 KB listing and counts its dispatches.
+    struct LargeListingDispatcher {
+        tools: Arc<[Arc<ToolDef>]>,
+        dispatches: Mutex<usize>,
+    }
+
+    impl LargeListingDispatcher {
+        fn new() -> Self {
+            Self {
+                tools: Arc::from([Arc::new(ToolDef::new(
+                    "list_records",
+                    "list every record",
+                    serde_json::json!({ "type": "object" }),
+                ))]),
+                dispatches: Mutex::new(0),
+            }
+        }
+
+        fn dispatches(&self) -> usize {
+            *self.dispatches.lock().unwrap()
+        }
+    }
+
+    #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
+    impl AgentToolDispatcher for LargeListingDispatcher {
+        fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+            Arc::clone(&self.tools)
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, ToolError> {
+            *self.dispatches.lock().unwrap() += 1;
+            Ok(ToolResult::new(call.id.to_string(), "r".repeat(600_000), false).into())
+        }
+    }
+
+    /// The position of the first message in `request` equal to `expected`.
+    fn position_of(request: &[Message], expected: &Message) -> Option<usize> {
+        request.iter().position(|message| message == expected)
+    }
+
+    /// A compaction at a round boundary of an open run folds only the rows
+    /// before the run. The run's prompt, its tool call and its 600 KB result
+    /// reach the next request exactly as committed, in order, after the
+    /// summary; the earlier run is folded; and the tool runs once. Folding
+    /// the run's own round left the model only a summary of a call it had
+    /// made, and it made the call again.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_compaction_inside_an_open_run_keeps_the_runs_own_round() {
+        let client = Arc::new(OpenRunListingClient::new());
+        let dispatcher = Arc::new(LargeListingDispatcher::new());
+        // Boundary 0 is run "first"; 1 is run "second" before its first
+        // response; 2 is the round boundary after its tool call.
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(Arc::new(DiscardingCompactor::new(2)))
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("first".into()).await.unwrap();
+        agent.run("second".into()).await.unwrap();
+
+        assert_eq!(
+            client.summary_requests(),
+            1,
+            "one compaction ran inside the run"
+        );
+        assert_eq!(dispatcher.dispatches(), 1, "the tool ran once");
+        let transcript = agent.session().messages().to_vec();
+        let prompt = transcript
+            .iter()
+            .find(
+                |message| matches!(message, Message::User(user) if user.text_content() == "second"),
+            )
+            .cloned()
+            .expect("the run's prompt is in the transcript");
+        let call = transcript
+            .iter()
+            .find(|message| {
+                matches!(message, Message::BlockAssistant(assistant) if assistant.has_tool_calls())
+            })
+            .cloned()
+            .expect("the run's tool call is in the transcript");
+        let result = transcript
+            .iter()
+            .find(|message| matches!(message, Message::ToolResults { .. }))
+            .cloned()
+            .expect("the run's tool result is in the transcript");
+        let Message::ToolResults { results, .. } = &result else {
+            unreachable!()
+        };
+        assert_eq!(results[0].text_content().len(), 600_000);
+
+        let after_compaction = client
+            .requests()
+            .last()
+            .cloned()
+            .expect("the request after the compaction");
+        let summary = after_compaction
+            .iter()
+            .position(|message| {
+                matches!(message, Message::User(user) if user.transcript_role.is_compaction_summary())
+            })
+            .expect("the request carries the summary");
+        let prompt_at = position_of(&after_compaction, &prompt).expect("the run's prompt");
+        let call_at = position_of(&after_compaction, &call).expect("the run's tool call");
+        let result_at = position_of(&after_compaction, &result).expect("the run's tool result");
+        assert!(
+            summary < prompt_at && prompt_at < call_at && call_at < result_at,
+            "summary, prompt, call and result in order: {summary} {prompt_at} {call_at} {result_at}"
+        );
+        assert!(
+            !after_compaction.iter().any(|message| {
+                matches!(
+                    message,
+                    Message::BlockAssistant(assistant)
+                        if assistant.text_blocks().collect::<String>() == "first answer"
+                )
+            }),
+            "the earlier run is folded into the summary"
+        );
+    }
+
+    /// The same compaction on a fresh session: the open run is all there is,
+    /// so nothing before it can be folded. The attempt is skipped before any
+    /// summary call, every row stays, and the tool runs once.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn a_compaction_with_nothing_before_the_open_run_is_skipped() {
+        let client = Arc::new(OpenRunListingClient::new());
+        let dispatcher = Arc::new(LargeListingDispatcher::new());
+        // Boundary 0 is the run's first call; 1 follows its tool round.
+        let compactor = Arc::new(DiscardingCompactor::new(1));
+        let mut agent = with_test_turn_state_handle(AgentBuilder::new())
+            .compactor(compactor)
+            .build_standalone(client.clone(), dispatcher.clone(), Arc::new(NoopStore))
+            .await;
+
+        agent.run("second".into()).await.unwrap();
+
+        assert_eq!(client.summary_requests(), 0, "no summary request");
+        assert_eq!(dispatcher.dispatches(), 1, "the tool ran once");
+        assert!(
+            !agent.session().messages().iter().any(|message| {
+                matches!(message, Message::User(user) if user.transcript_role.is_compaction_summary())
+            }),
+            "no rewrite"
+        );
+        assert!(
+            agent
+                .session()
+                .messages()
+                .iter()
+                .any(|message| matches!(message, Message::ToolResults { .. })),
+            "the run's result stays"
+        );
+        assert!(
+            agent
+                .compaction_cadence
+                .last_compaction_attempt_boundary_index
+                .is_some(),
+            "the skipped attempt is recorded for cadence"
         );
     }
 

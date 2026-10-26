@@ -1939,6 +1939,10 @@ mod tests {
         }
     }
 
+    /// This is the compactor alone. The agent never hands it the rows of a
+    /// run in flight: it folds only the rows before the open run and keeps
+    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
+    /// the "in-flight turn" here is the newest turn before that run.
     #[test]
     fn test_rebuild_zero_budget_keeps_only_the_in_flight_request() {
         let c = DefaultCompactor::new(CompactionConfig {
@@ -1960,6 +1964,10 @@ mod tests {
         assert_eq!(result.discarded.len(), 2);
     }
 
+    /// This is the compactor alone. The agent never hands it the rows of a
+    /// run in flight: it folds only the rows before the open run and keeps
+    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
+    /// the "in-flight turn" here is the newest turn before that run.
     #[test]
     fn rebuild_does_not_retain_a_single_turn_larger_than_the_recovery_budget() {
         use meerkat_core::types::ToolResult;
@@ -3005,6 +3013,11 @@ mod tests {
     /// budget must not crowd out the in-flight turn. Its request stays
     /// verbatim whether the whole turn fits (kept whole) or not (the request
     /// row kept, the rest of the turn summarized).
+    ///
+    /// This is the compactor alone. The agent never hands it the rows of a
+    /// run in flight: it folds only the rows before the open run and keeps
+    /// the run's own rows verbatim (`agent::compact::open_run_floor`), so
+    /// the "in-flight turn" here is the newest turn before that run.
     #[test]
     fn a_system_heavy_session_keeps_the_in_flight_request() {
         use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};

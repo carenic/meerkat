@@ -59,6 +59,21 @@ them.
 
 ### Fixed
 
+- `meerkat-core`: a compaction at a round boundary of an open run no longer
+  folds the run's own rows. The agent derives the run's first row (the input
+  rows before its first response, found from the run id its assistant rows
+  carry) and compacts only the rows before it; the run's prompt, tool calls
+  and results stay verbatim after the summary, for any compactor. Before,
+  a run whose own rows exceeded the compactor's retention budget kept only
+  its request, and the model, seeing a summary of a tool call it had already
+  made, could make it again. When nothing before the open run can be folded
+  the attempt is skipped before its summary call and recorded for cadence.
+  When the open run's own tool results push a request past the provider cap,
+  that request (never the stored transcript) carries each oversized result's
+  identity and the head of its text with a marker naming the call; a request
+  that still does not fit fails as `RequestTooLarge`. A run's first boundary,
+  before its first response, compacts as before.
+
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
   start (`UnregisterQueuedInputs::Requeue`, which the graceful shutdowns of
   `rkat-rpc`, the REST server and a mob use by default for durable
