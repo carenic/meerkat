@@ -51635,7 +51635,7 @@ mod tests {
             meerkat_core::interaction::InteractionId(meerkat_core::time_compat::new_uuid_v7());
         let stored_only = [AgentEvent::InteractionFailed {
             interaction_id: stored_only_id,
-            reason: InteractionFailureReason::Cancelled,
+            reason: meerkat_core::event::InteractionFailureReason::Cancelled,
         }];
         let receipts = publisher
             .publish_interaction_terminals(&stored_only)
@@ -51757,7 +51757,7 @@ mod tests {
                 interaction_id: meerkat_core::interaction::InteractionId(
                     meerkat_core::time_compat::new_uuid_v7(),
                 ),
-                reason: InteractionFailureReason::Cancelled,
+                reason: meerkat_core::event::InteractionFailureReason::Cancelled,
             },
         ];
         publisher
