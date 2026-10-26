@@ -9033,13 +9033,9 @@ fn registered_runtime_authority_from_converged_record_id(
     })
 }
 
-/// Level-triggered cold convergence for the one runtime-lifecycle row.
-///
-/// The observed phase is never adopted. Every non-fixed decoded shape is
-/// replaced with a clean unbound Idle projection using the exact raw row
-/// version, conflicts restart from observation, and only then is a fresh
-/// Initialize/RegisterSession authority constructed. Supervisor and unregister
-/// custody are recovered independently from the converged row.
+/// [`reconcile_runtime_authority_for_cold_recovery_with_placement_witness`]
+/// with no placement witness, the form the tests drive.
+#[cfg(test)]
 pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
@@ -9056,14 +9052,21 @@ pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
     .await
 }
 
-/// [`reconcile_runtime_authority_for_cold_recovery`] for a predecessor
-/// settlement whose directed work still needs a terminal outbox: the
-/// converged row also carries `placement_witness`, the session's last
-/// runtime placement, as a placement witness (record version 7), so a crash
-/// before the settlement's sweep commit keeps the only durable copy of it.
-/// The classifier never reads the witness, so a row that carries it is
-/// converged as it is and written once; every later writer that builds its
-/// row from its own authority drops it.
+/// Level-triggered cold convergence for the one runtime-lifecycle row.
+///
+/// The observed phase is never adopted. Every non-fixed decoded shape is
+/// replaced with a clean unbound Idle projection using the exact raw row
+/// version, conflicts restart from observation, and only then is a fresh
+/// Initialize/RegisterSession authority constructed. Supervisor and unregister
+/// custody are recovered independently from the converged row.
+///
+/// With `placement_witness` (a predecessor settlement whose directed work
+/// still needs a terminal outbox), the converged row also carries the
+/// session's last runtime placement as a placement witness (record version
+/// 7), so a crash before the settlement's sweep commit keeps the only
+/// durable copy of it. The classifier never reads the witness, so a row that
+/// carries it is converged as it is and written once; every later writer
+/// that builds its row from its own authority drops it.
 pub(crate) async fn reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
