@@ -26,6 +26,7 @@ import {
   GUARD_LANE_INPUTS,
   MOB_CHAIN_CLIPPY_HEADS,
   MOB_CHAIN_INVALIDATED,
+  PARTITIONED_UNIT_PACKAGES,
   ROW_DURATIONS,
   UNIT_SOLO_PACKAGES,
   WAVE_FIRST_SECONDS,
@@ -90,7 +91,7 @@ function assertLanes(plan, label) {
   // one of the main unit lane's rows named in unit_rows_on_main) or named as
   // deferred to the push-to-main run, never dropped.
   const unitRows = unitRowsOf(plan, label);
-  const unitCovered = unitRows.shards.flatMap((shard) => shard.packages);
+  const unitCovered = unitLanesOf(unitRows.shards, label).flatMap((shard) => shard.packages);
   assert.deepEqual(
     [...unitCovered, ...plan.unit_deferred].sort(),
     [...plan.packages].sort(),
@@ -120,7 +121,7 @@ function assertLanes(plan, label) {
   const archivedPackages = plan.main_archive_builds
     .filter((build) => !build.package_flags.includes("--features"))
     .map((build) => build.package_flags.replace(/^-p /, ""));
-  const packed = plan.main_unit_shards.flatMap((shard) => shard.packages);
+  const packed = unitLanesOf(plan.main_unit_shards, label).flatMap((shard) => shard.packages);
   for (const name of archivedPackages) {
     assert.ok(!packed.includes(name), `${label}: archived package ${name} is not also packed`);
   }
@@ -131,6 +132,42 @@ function assertLanes(plan, label) {
   );
   assertArchivedLanes(plan, label);
   assertHookParity(plan, label);
+}
+
+// A plan's unit lanes from its unit rows: the rows of a partitioned lane
+// (PARTITIONED_UNIT_PACKAGES) are one lane, the others a lane each. The rows
+// of a partitioned lane are the same build, field for field, named
+// "<lane> k of n" and running `--partition hash:k/n` for every k of 1..n,
+// once each and in order, so together they run each of its tests once.
+function unitLanesOf(rows, label) {
+  const lanes = [];
+  const partitioned = new Map();
+  for (const row of rows) {
+    if (row.partition === undefined) {
+      lanes.push(row);
+      continue;
+    }
+    const match = row.partition.match(/^hash:([1-9][0-9]*)\/([1-9][0-9]*)$/);
+    assert.ok(match, `${label}: ${row.name} runs a hash partition, not ${row.partition}`);
+    const [, index, count] = match;
+    const suffix = ` ${index} of ${count}`;
+    assert.ok(row.name.endsWith(suffix), `${label}: ${row.name} is named after its partition ${row.partition}`);
+    const lane = { ...row, name: row.name.slice(0, -suffix.length) };
+    delete lane.partition;
+    const key = JSON.stringify(lane);
+    if (!partitioned.has(key)) {
+      partitioned.set(key, { lane, count: Number(count), indices: [] });
+      lanes.push(lane);
+    }
+    const group = partitioned.get(key);
+    assert.equal(Number(count), group.count, `${label}: ${row.name} counts the partitions of its lane`);
+    group.indices.push(Number(index));
+  }
+  for (const { lane, count, indices } of partitioned.values()) {
+    assert.ok(count >= 2, `${label}: ${lane.name} has at least two partitions`);
+    assert.deepEqual(indices, Array.from({ length: count }, (_, i) => i + 1), `${label}: ${lane.name} runs every partition once`);
+  }
+  return lanes;
 }
 
 // A plan's unit rows: the unit lane's in a pull request (or a release
@@ -495,11 +532,12 @@ function assertArchivedLanes(plan, label) {
 
 // Runtime's ordinary unit tests remain in the pull request even when its
 // authorization dependency has native facade fixtures in its own dev graph.
+// The lane runs as the rows of its hash partitions (below).
 {
   const plan = planFor(["crates/meerkat-runtime/src/lib.rs"]);
   assert.equal(plan.pr_unit_budget_minutes, 20, "runtime uses the 20-minute surrogate packing cap");
   assert.deepEqual(
-    unitOf(plan).shards.map((shard) => shard.packages).sort(),
+    unitLanesOf(unitOf(plan).shards, "runtime touch").map((shard) => shard.packages).sort(),
     [["meerkat-runtime"]],
     "runtime retains its pull-request unit lane",
   );
@@ -507,6 +545,57 @@ function assertArchivedLanes(plan, label) {
   assert.ok(!plan.unit_deferred_chain.includes("meerkat-runtime"), "runtime remains outside the mob build chain");
   const runtimeLane = unitOf(plan).shards.find((shard) => shard.packages.includes("meerkat-runtime"));
   assert.ok(runtimeLane.estimated_minutes <= plan.pr_unit_budget_minutes, "runtime's unit lane fits the budget");
+}
+
+// A partitioned unit lane (PARTITIONED_UNIT_PACKAGES): a pull request runs
+// the package's lane as one row per hash partition, each the build of the
+// package alone; a push runs the same rows verbatim in the main unit lane;
+// the matrices carry each of those rows' partition, and no other row's; and
+// the three unit jobs pass it to nextest. A row name holds no character an
+// artifact name refuses: the jobs name each row's sccache log after it.
+{
+  const ARTIFACT_NAME_REFUSES = /[":<>|*?\r\n\\/]/;
+  const githubLines = (args) =>
+    Object.fromEntries(run(["--format", "github", ...args]).stdout.trim().split("\n").map((line) => [line.slice(0, line.indexOf("=")), line.slice(line.indexOf("=") + 1)]));
+  const metadataPackages = workspacePackages(readMetadata());
+  assert.ok(PARTITIONED_UNIT_PACKAGES.length > 0, "a package runs a partitioned unit lane");
+  for (const { package: pkg, partitions } of PARTITIONED_UNIT_PACKAGES) {
+    const lib = metadataPackages.find((one) => one.name === pkg)?.targets.find((target) => target.kind.includes("lib"));
+    assert.ok(lib, `${pkg} is a workspace package with a library`);
+    const path = relative(root, lib.src_path);
+    const expected = Array.from({ length: partitions }, (_, index) => `hash:${index + 1}/${partitions}`);
+    const pr = planFor([path], ["--event", "pull_request"]);
+    assertLanes(pr, `${pkg} touch (pull request)`);
+    const rows = pr.unit_shards.filter((row) => row.packages.includes(pkg));
+    assert.deepEqual(rows.map((row) => row.partition), expected, `${pkg}: one pull-request unit row per partition`);
+    for (const row of rows) {
+      assert.deepEqual(row.packages, [pkg], `${row.name}: the partitioned lane builds ${pkg} alone`);
+      assert.doesNotMatch(row.name, ARTIFACT_NAME_REFUSES, `${row.name}: the row name is an artifact name`);
+    }
+    const push = assertUnitRowsOnMain([path], `${pkg} touch`);
+    assertLanes(push, `${pkg} touch (push)`);
+    const prMatrix = JSON.parse(githubLines(["--event", "pull_request", "--", path]).unit_shard_matrix).include;
+    const pushLines = githubLines(["--event", "push", "--", path]);
+    const pushMatrix = bothWaves(pushLines, "main_unit_shard_matrix", "main_unit_rest_shard_matrix");
+    for (const [label, matrix] of [["pull request", prMatrix], ["push", pushMatrix]]) {
+      assert.deepEqual(
+        matrix.filter((row) => row.partition !== undefined).map((row) => [row.name, row.packages, row.partition]),
+        rows.map((row) => [row.name, row.package_flags, row.partition]),
+        `${pkg} (${label}): the matrix carries the partitioned rows' partitions, and only theirs`,
+      );
+    }
+  }
+  const workflow = readFileSync(resolve(root, ".github/workflows/ci.yml"), "utf8");
+  for (const job of ["unit", "main-unit", "main-unit-rest"]) {
+    const text = jobLines(workflow, job).join("\n");
+    assert.match(text, /^ {10}PARTITION: \$\{\{ matrix\.partition \}\}$/m, `${job} reads the row's partition`);
+    assert.match(
+      text,
+      /^ {10}if \[\[ -n "\$\{PARTITION\}" \]\]; then\n {12}partition_args=\(--partition "\$\{PARTITION\}"\)\n {10}fi$/m,
+      `${job} passes a partition only for a row that sets one`,
+    );
+    assert.match(text, /nextest run \$\{PACKAGES\} \$\{TARGETS\} --profile ci-pr "\$\{partition_args\[@\]\}" \\$/m, `${job} runs the row's partition`);
+  }
 }
 
 // Budget by construction: every package outside the chain models under the
