@@ -412,6 +412,8 @@ export type InteractionFailureReason = {
   kind: "extraction_failed";
   last_output: string;
   reason: string;
+} | {
+  kind: "outcome_unknown";
 };
 
 export type InteractionId = string;
