@@ -3926,14 +3926,18 @@ pub struct MachineSessionArchiveProtocol<'a> {
     _authority: MachineSessionControlAuthority,
 }
 
-/// Owned archive-only publisher for a provably stored-only session.
+/// Owned publisher for a provably stored-only session: an archive's, or a
+/// cold predecessor settlement's.
 ///
-/// It is constructed only while `archive_with_machine_protocol` owns that
-/// session's recovery gate, has proved no live session task exists, and has
-/// drained any prior event projection. Those witnesses exclude a live stream
-/// sequencer/broadcaster, so exact terminals may append directly to the
-/// EventStore without racing or fabricating an in-memory publication.
-struct StoredOnlyArchiveTerminalPublisher<B: SessionAgentBuilder> {
+/// It is constructed only while its owner holds that session's recovery
+/// gate or turn boundary, has proved no live session task exists, and
+/// excludes every new actor of the session. The publisher itself re-checks
+/// actor absence under the recovery gate and drains any prior event
+/// projection before each publication. Those witnesses exclude a live stream
+/// sequencer/broadcaster, so exact terminals append directly to the
+/// EventStore, allocated from the session's event line, without racing or
+/// fabricating an in-memory publication.
+struct StoredOnlyTerminalPublisher<B: SessionAgentBuilder> {
     inner: Arc<EphemeralSessionService<B>>,
     session_id: SessionId,
     recovery_gate: Arc<Mutex<()>>,
@@ -3945,7 +3949,7 @@ struct StoredOnlyArchiveTerminalPublisher<B: SessionAgentBuilder> {
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 impl<B: SessionAgentBuilder + 'static> CoreExecutorPublicationHandle
-    for StoredOnlyArchiveTerminalPublisher<B>
+    for StoredOnlyTerminalPublisher<B>
 {
     async fn publish_interaction_terminals(
         &self,
@@ -17286,7 +17290,7 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
                     // is released, revalidates actor absence, and drains prior
                     // projections before touching the custom EventStore. No
                     // EventStore callback runs while archive preparation owns M.
-                    Some(Arc::new(StoredOnlyArchiveTerminalPublisher {
+                    Some(Arc::new(StoredOnlyTerminalPublisher {
                         inner: Arc::clone(&self.inner),
                         session_id: id.clone(),
                         recovery_gate: Arc::clone(&recovery_gate),
@@ -17727,6 +17731,246 @@ impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
         _authority: MachineSessionControlAuthority,
     ) -> Result<(), SessionError> {
         self.inner.cancel_after_boundary(id).await
+    }
+}
+
+impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
+    /// Settle, before the session's next registration, the runtime work an
+    /// earlier incarnation of `id` left, under `claim`, without a serving
+    /// registration, and leave the session unregistered and registrable.
+    ///
+    /// `claim` is this service's own hosting claim of `id`
+    /// ([`Self::grant_session_hosting`]): a cross-process OS lock taken by
+    /// this service's runtime owner. The settlement borrows it and never
+    /// drops, replaces or re-acquires it; the caller keeps it until its fresh
+    /// registration has published, so that registration joins the same
+    /// lineage. The steps:
+    /// - the application-lifecycle reservation, then the session's turn
+    ///   boundary;
+    /// - the runtime owner's settlement begins: claim checks, a HeadCanonical
+    ///   store, no registration, every durable input row accounted for, and
+    ///   the placement witness directed work needs;
+    /// - under the session's recovery gate, the durable tail is committed as
+    ///   a writer (its commit stages the terminal batch of the inputs it
+    ///   consumes when its gates allow), or found aligned, or held for the
+    ///   second drive;
+    /// - an internal, non-serving registration publishes (consent owner loss
+    ///   completes at its publication), and in one commit every non-terminal
+    ///   input ends `Abandoned { Stopped }` with its runless terminal and
+    ///   every input a recovered boundary consumed without a receipt gets its
+    ///   outcome-unknown answer;
+    /// - a tail held beside that work is driven once more;
+    /// - one process-owned task drains every owed terminal through this
+    ///   service's stored-only publisher (every receipt finalized, every
+    ///   directed terminal published), then runs the closing census of every
+    ///   durable input row and removes the internal registration exactly.
+    ///
+    /// `Ok` is the complete census: every input the settlement found
+    /// non-terminal, terminal but owing its receipt or publication, or left
+    /// without a receipt by a recovered boundary, is listed once with its
+    /// finalized receipt and, when directed, its published terminal; nothing
+    /// is owed; rows whose receipt a migration made permanently unavailable
+    /// are listed apart; and every durable input row of the session reads
+    /// closed. A refusal's progress reports final evidence only. A deadline,
+    /// a cancelled call, an error or a commit with an unknown outcome
+    /// certifies nothing: the host repeats the call before it registers, and
+    /// a repeat converges from the store.
+    pub async fn settle_cold_predecessor_before(
+        &self,
+        id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<meerkat_runtime::ColdPredecessorSettlement, crate::ColdPredecessorSettleError> {
+        use crate::{
+            ColdPredecessorSettleError as SettleError, ColdPredecessorSettleRefusal as Refusal,
+        };
+        use meerkat_runtime::PredecessorSettlementRefusal as Settlement;
+        let untouched = |refusal| SettleError::untouched(id.clone(), refusal);
+        let session = |error| untouched(Refusal::Session(error));
+        let owner = self
+            .acquire_canonical_runtime_adapter(None)
+            .map_err(|error| session(runtime_driver_error_to_session_error(error)))?;
+        if claim.session_id() != id {
+            return Err(untouched(Refusal::Settlement(Settlement::ClaimNotOwned)));
+        }
+        let _application_lifecycle = self
+            .inner
+            .reserve_tool_application_lifecycle(id)
+            .await
+            .map_err(session)?;
+        let busy = || session(SessionError::Busy { id: id.clone() });
+        let remaining = deadline
+            .checked_duration_since(meerkat_core::time_compat::Instant::now())
+            .ok_or_else(busy)?;
+        let _turn_boundary =
+            tokio::time::timeout(remaining, self.acquire_runtime_turn_finalization_guard(id))
+                .await
+                .map_err(|_| busy())?;
+
+        let mut progress = meerkat_runtime::ColdPredecessorSettlement::untouched(id.clone());
+        let (publication, held_refusal) = 'settle: loop {
+            progress.tail = None;
+            progress.owner_loss = None;
+            let mut lease = owner
+                .begin_predecessor_settlement_before(claim, deadline)
+                .await
+                .map_err(|refusal| untouched(Refusal::Settlement(refusal)))?;
+            // R is only ever try-locked while the lease holds T: a busy R
+            // drops the lease, waits for R holding nothing, and restarts.
+            let recovery_gate = self.recovery_gate_for_session(id).await;
+            let Ok(recovery_guard) = Arc::clone(&recovery_gate).try_lock_owned() else {
+                drop(lease);
+                drop(
+                    self.settlement_recovery_gate_before(id, recovery_gate, deadline)
+                        .await
+                        .map_err(session)?,
+                );
+                continue 'settle;
+            };
+            if !self
+                .session_known_to_archive_authority(id)
+                .await
+                .map_err(session)?
+                || self
+                    .session_archived_by_runtime_store_authority(id)
+                    .await
+                    .map_err(session)?
+            {
+                return Err(session(SessionError::NotFound { id: id.clone() }));
+            }
+            if self.inner.has_live_session(id).await.map_err(session)? {
+                return Err(busy());
+            }
+            progress.tail = owner
+                .settle_predecessor_tail_with_lease(&mut lease)
+                .await
+                .map_err(|refusal| untouched(Refusal::Settlement(refusal)))?;
+            drop(recovery_guard);
+
+            let work = match owner
+                .end_predecessor_work_with_lease_before(&mut lease, deadline)
+                .await
+            {
+                Ok(work) => work,
+                Err(refusal) => {
+                    // A published registration is removed exactly, with
+                    // nothing published.
+                    if lease.registered() {
+                        let _ = owner
+                            .finish_predecessor_settlement_before(lease, None, deadline)
+                            .await;
+                    }
+                    self.note_settled_tail(id, &progress);
+                    return Err(SettleError::with_progress(
+                        Refusal::Settlement(refusal),
+                        progress,
+                    ));
+                }
+            };
+            progress.owner_loss = Some(work.owner_loss);
+
+            let mut held_refusal = None;
+            if lease.tail_held() {
+                let recovery_gate = self.recovery_gate_for_session(id).await;
+                let Ok(recovery_guard) = Arc::clone(&recovery_gate).try_lock_owned() else {
+                    // The ended work is durable: remove the registration,
+                    // wait for R holding nothing, and settle again.
+                    let _ = owner
+                        .finish_predecessor_settlement_before(lease, None, deadline)
+                        .await;
+                    drop(
+                        self.settlement_recovery_gate_before(id, recovery_gate, deadline)
+                            .await
+                            .map_err(session)?,
+                    );
+                    continue 'settle;
+                };
+                match owner.settle_predecessor_tail_with_lease(&mut lease).await {
+                    Ok(Some(tail)) => progress.tail = Some(tail),
+                    Ok(None) => {}
+                    Err(refusal) => held_refusal = Some(refusal),
+                }
+                drop(recovery_guard);
+            }
+
+            // Only while no live actor of the session is hosted here.
+            if self.inner.has_live_session(id).await.map_err(session)? {
+                let _ = owner
+                    .finish_predecessor_settlement_before(lease, None, deadline)
+                    .await;
+                self.note_settled_tail(id, &progress);
+                return Err(SettleError::with_progress(
+                    Refusal::Session(SessionError::Busy { id: id.clone() }),
+                    progress,
+                ));
+            }
+            let publisher: Arc<dyn CoreExecutorPublicationHandle> =
+                Arc::new(StoredOnlyTerminalPublisher {
+                    inner: Arc::clone(&self.inner),
+                    session_id: id.clone(),
+                    recovery_gate: self.recovery_gate_for_session(id).await,
+                    event_store: self.event_store.clone(),
+                    event_projection_faults: Arc::clone(&self.event_projection_faults),
+                    event_projection_drains: Arc::clone(&self.event_projection_drains),
+                });
+            let publication = owner
+                .finish_predecessor_settlement_before(lease, Some(publisher), deadline)
+                .await;
+            break 'settle (publication, held_refusal);
+        };
+        self.note_settled_tail(id, &progress);
+        match publication {
+            Ok(publication) => {
+                progress.inputs = publication.converged;
+                progress.terminals_owed = publication.owed;
+                if let Some(refusal) = held_refusal {
+                    return Err(SettleError::with_progress(
+                        Refusal::Settlement(refusal),
+                        progress,
+                    ));
+                }
+                progress.durable_rows_closed = publication.durable_rows_closed;
+                progress.migrated_without_receipt = publication.migrated_without_receipt;
+                Ok(progress)
+            }
+            Err(refused) => {
+                progress.inputs = refused.progress.converged;
+                progress.terminals_owed = refused.progress.owed;
+                Err(SettleError::with_progress(
+                    Refusal::Settlement(held_refusal.unwrap_or(refused.refusal)),
+                    progress,
+                ))
+            }
+        }
+    }
+
+    /// A tail this settlement committed advanced the session's live
+    /// authority.
+    fn note_settled_tail(
+        &self,
+        id: &SessionId,
+        progress: &meerkat_runtime::ColdPredecessorSettlement,
+    ) {
+        if progress.tail.is_some() {
+            self.note_live_authority_advanced(id);
+        }
+    }
+
+    /// Wait for the session's recovery gate, holding nothing else, until
+    /// `deadline`.
+    async fn settlement_recovery_gate_before(
+        &self,
+        id: &SessionId,
+        recovery_gate: Arc<Mutex<()>>,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>, SessionError> {
+        let busy = || SessionError::Busy { id: id.clone() };
+        let remaining = deadline
+            .checked_duration_since(meerkat_core::time_compat::Instant::now())
+            .ok_or_else(busy)?;
+        tokio::time::timeout(remaining, recovery_gate.lock_owned())
+            .await
+            .map_err(|_| busy())
     }
 }
 
@@ -51204,7 +51448,7 @@ mod tests {
             .expect("create live successor actor");
         let session_id = created.session_id;
         let recovery_gate = service.recovery_gate_for_session(&session_id).await;
-        let publisher = StoredOnlyArchiveTerminalPublisher {
+        let publisher = StoredOnlyTerminalPublisher {
             inner: Arc::clone(&service.inner),
             session_id: session_id.clone(),
             recovery_gate,
@@ -51308,7 +51552,7 @@ mod tests {
             .await
             .expect("the earlier actor is removed");
 
-        let publisher = StoredOnlyArchiveTerminalPublisher {
+        let publisher = StoredOnlyTerminalPublisher {
             inner: Arc::clone(&service.inner),
             session_id: session_id.clone(),
             recovery_gate: service.recovery_gate_for_session(&session_id).await,
@@ -51422,7 +51666,7 @@ mod tests {
             .discard_live_session(&session_id)
             .await
             .expect("no actor is hosted");
-        let publisher = StoredOnlyArchiveTerminalPublisher {
+        let publisher = StoredOnlyTerminalPublisher {
             inner: Arc::clone(&first.inner),
             session_id: session_id.clone(),
             recovery_gate: first.recovery_gate_for_session(&session_id).await,
