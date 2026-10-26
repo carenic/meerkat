@@ -524,7 +524,7 @@ async fn a_local_day_range_selects_that_days_rows_through_the_tool() {
         let ordinal = u64::try_from(ordinal).expect("small ordinal");
         rows.push(commit_occurrence(&store, &schedule, ordinal, at(due)).await);
     }
-    let service = ScheduleService::new(store.clone());
+    let service = ScheduleService::new(store);
 
     let reply = occurrences_tool(
         &service,
