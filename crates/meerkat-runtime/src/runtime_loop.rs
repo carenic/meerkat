@@ -2756,7 +2756,7 @@ async fn recover_committed_runtime_projections_before_teardown(
                         ),
                     }
                 })?),
-                executor,
+                &mut TerminalPublisher::Executor(&mut *executor),
                 &pending.input_ids,
                 &[],
                 &batch_key,
