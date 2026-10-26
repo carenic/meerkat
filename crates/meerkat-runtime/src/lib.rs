@@ -646,6 +646,11 @@ pub use meerkat_machine::{
     classify_runtime_loop_queue_admission, standalone_session_runtime_authorities,
     standalone_tool_visibility_owner,
 };
+pub use meerkat_machine::{
+    ColdPredecessorSettlement, MachinePredecessorSettlementLease, PredecessorOwnerLoss,
+    PredecessorPublication, PredecessorPublicationRefused, PredecessorSettlementRefusal,
+    PredecessorTailCommit, PredecessorWork, SettledBy, SettledInput,
+};
 pub use meerkat_machine_types::{
     CommittedModelRoutingHandoff, HydratedSessionLlmState, ImageOperationRoutingRequest,
     ImageOperationRoutingResult, ModelRoutingApprovalDisposition, ModelRoutingHandoffHoldReason,

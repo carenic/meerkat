@@ -1315,8 +1315,16 @@ impl MeerkatMachine {
             Arc::clone(&entry.completions),
             entry.wake_sender(),
             entry.publication_handle(),
-            entry.archive_recovered_registration,
-            entry.archive_recovered_from_quiescent,
+            matches!(
+                entry.mechanical_registration,
+                Some(super::MechanicalRegistration::Archive { .. })
+            ),
+            matches!(
+                entry.mechanical_registration,
+                Some(super::MechanicalRegistration::Archive {
+                    from_quiescent: true
+                })
+            ),
         ))
     }
 
@@ -1861,7 +1869,10 @@ impl MeerkatMachine {
                     "archive-recovered runtime {runtime_id} was replaced before quiescent cleanup"
                 )));
             }
-            if !entry.archive_recovered_registration {
+            if !matches!(
+                entry.mechanical_registration,
+                Some(super::MechanicalRegistration::Archive { .. })
+            ) {
                 return Err(RuntimeControlPlaneError::Internal(format!(
                     "runtime {runtime_id} no longer carries its exact archive-recovered registration marker"
                 )));

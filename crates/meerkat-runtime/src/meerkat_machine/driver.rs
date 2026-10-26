@@ -1471,7 +1471,13 @@ impl DriverEntry {
         let checkpoint = self.begin_terminal_transition("runless_terminal_preparation")?;
         let mut batches = Vec::with_capacity(recipient_batches.len());
         for batch_input_ids in recipient_batches {
-            match self.stage_runless_runtime_termination_batch(&batch_input_ids, &reason) {
+            match self.stage_runless_terminal_batch(
+                &batch_input_ids,
+                crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
+                    reason: reason.clone(),
+                },
+                None,
+            ) {
                 Ok(candidate_owner_input_id) => batches.push(RunlessTerminalBatch {
                     input_ids: batch_input_ids,
                     candidate_owner_input_id,
@@ -1487,34 +1493,109 @@ impl DriverEntry {
         })
     }
 
-    /// Stage one runless terminal-completion batch and, for its directed
-    /// recipients, its outbox batch. Returns the directed outbox owner, or
-    /// the failed step with its error for the caller's checkpoint.
-    fn stage_runless_runtime_termination_batch(
+    /// Stage, under the caller's checkpoint, the runless batches of a
+    /// predecessor settlement's sweep, which its one durable commit persists:
+    /// the runtime termination of `ended` with `reason`, and, for each run
+    /// of `answered`, the outcome-unknown answer to the inputs that run
+    /// consumed at a recovered boundary that staged no receipt. Each set
+    /// splits into batches of at most
+    /// [`crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS`] in
+    /// canonical order, and every directed recipient gets its outbox, placed
+    /// by `unplaced_owner` while the driver's own authority is unplaced. An
+    /// input never sits in two batches.
+    pub(crate) fn prepare_predecessor_settlement_terminals(
+        &mut self,
+        ended: &[InputId],
+        reason: String,
+        answered: &[(RunId, Vec<InputId>)],
+        unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
+    ) -> Result<PreparedRunlessInteractionTerminalOutboxes, RuntimeDriverError> {
+        let mut groups = Vec::new();
+        for batch_input_ids in runless_termination_batches(ended)? {
+            groups.push((
+                batch_input_ids,
+                crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
+                    reason: reason.clone(),
+                },
+            ));
+        }
+        for (run_id, input_ids) in answered {
+            for batch_input_ids in runless_termination_batches(input_ids)? {
+                groups.push((
+                    batch_input_ids,
+                    crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                        run_id: run_id.clone(),
+                    },
+                ));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        if groups
+            .iter()
+            .flat_map(|(input_ids, _)| input_ids.iter())
+            .any(|input_id| !seen.insert(input_id.clone()))
+        {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: "a predecessor settlement's terminals name an input twice".to_string(),
+            });
+        }
+        if groups.is_empty() {
+            return Ok(PreparedRunlessInteractionTerminalOutboxes {
+                checkpoint: None,
+                batches: Vec::new(),
+            });
+        }
+        let checkpoint =
+            self.begin_terminal_transition("predecessor_settlement_terminal_preparation")?;
+        let mut batches = Vec::with_capacity(groups.len());
+        for (batch_input_ids, candidate) in groups {
+            match self.stage_runless_terminal_batch(&batch_input_ids, candidate, unplaced_owner) {
+                Ok(candidate_owner_input_id) => batches.push(RunlessTerminalBatch {
+                    input_ids: batch_input_ids,
+                    candidate_owner_input_id,
+                }),
+                Err((operation, error)) => {
+                    return Err(self.fail_terminal_transition(checkpoint, operation, error));
+                }
+            }
+        }
+        Ok(PreparedRunlessInteractionTerminalOutboxes {
+            checkpoint: Some(checkpoint),
+            batches,
+        })
+    }
+
+    /// Stage one runless terminal-completion batch with `candidate` (a
+    /// runtime termination or an outcome-unknown answer) and, for its
+    /// directed recipients, its outbox batch. Returns the directed outbox
+    /// owner, or the failed step with its error for the caller's checkpoint.
+    fn stage_runless_terminal_batch(
         &mut self,
         input_ids: &[InputId],
-        reason: &str,
+        candidate: crate::input_state::InteractionTerminalCandidate,
+        unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<Option<InputId>, (&'static str, RuntimeDriverError)> {
-        let candidate = crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
-            reason: reason.to_string(),
-        };
         let completion_batch = self
             .stage_input_terminal_completion_batch(
                 InteractionTerminalBatchScope::RuntimeTermination,
                 input_ids,
-                candidate,
+                candidate.clone(),
                 false,
             )
             .map_err(|error| ("runless_terminal_completion_batch_stage", error))?;
         if let Some(candidate_owner_input_id) = self
-            .existing_exact_runless_runtime_termination_batch(input_ids, reason)
+            .existing_exact_runless_terminal_batch(input_ids, &candidate)
             .map_err(|error| ("runless_terminal_batch_validation", error))?
         {
             return Ok(Some(candidate_owner_input_id));
         }
-        let outboxes =
-            authorized_staged_directed_terminal_outboxes(self, input_ids, &completion_batch)
-                .map_err(|error| ("runless_terminal_outbox_authorization", error))?;
+        let outboxes = authorized_staged_directed_terminal_outboxes_placed(
+            self,
+            input_ids,
+            &completion_batch,
+            unplaced_owner,
+        )
+        .map_err(|error| ("runless_terminal_outbox_authorization", error))?;
         let candidate_owner_input_id = outboxes
             .first()
             .map(|outbox| outbox.candidate_owner_input_id.clone());
@@ -1557,16 +1638,19 @@ impl DriverEntry {
         Ok(false)
     }
 
-    fn existing_exact_runless_runtime_termination_batch(
+    fn existing_exact_runless_terminal_batch(
         &self,
         input_ids: &[InputId],
-        reason: &str,
+        candidate: &crate::input_state::InteractionTerminalCandidate,
     ) -> Result<Option<InputId>, RuntimeDriverError> {
         use crate::input_state::{
-            InteractionTerminalBatchKey, InteractionTerminalCandidate,
-            InteractionTerminalOutboxPhase, validate_interaction_terminal_outbox_batch_shape,
+            InteractionTerminalBatchKey, InteractionTerminalOutboxPhase,
+            validate_interaction_terminal_outbox_batch_shape,
             validate_unpublished_interaction_terminal_outbox_batch,
         };
+
+        let candidate_digest = crate::input_state::interaction_terminal_payload_digest(candidate)
+            .map_err(RuntimeDriverError::Internal)?;
 
         let mut grouped = std::collections::HashMap::<
             InteractionTerminalBatchKey,
@@ -1620,18 +1704,16 @@ impl DriverEntry {
             let owner = &outboxes[0];
             let linked = self.linked_terminal_completion_for_outbox_batch(&outboxes)?;
             let persisted_completion_input_ids = linked.input_ids;
-            let exact_reason = matches!(
-                linked.candidate.as_ref(),
-                Some(InteractionTerminalCandidate::RuntimeTerminated {
-                    reason: existing_reason,
-                }) if existing_reason == reason
-            );
+            let exact_candidate = linked.candidate.as_ref().is_some_and(|existing| {
+                crate::input_state::interaction_terminal_payload_digest(existing)
+                    .is_ok_and(|existing_digest| existing_digest == candidate_digest)
+            });
             let exact_recipients = persisted_completion_input_ids == input_ids;
             let overlaps_requested = persisted_completion_input_ids
                 .iter()
                 .any(|input_id| requested.contains(input_id));
 
-            if exact_recipients && exact_reason {
+            if exact_recipients && exact_candidate {
                 if exact_owner
                     .replace(owner.candidate_owner_input_id.clone())
                     .is_some()
@@ -6030,6 +6112,24 @@ impl DriverEntry {
         }
     }
 
+    /// [`Self::abandon_pending_inputs`] whose one durable commit also writes
+    /// the rows of `terminal_rows`, the terminal inputs whose batches the
+    /// caller staged under the same checkpoint. An ephemeral driver has
+    /// nothing to write.
+    pub(crate) async fn abandon_pending_inputs_with_terminal_rows(
+        &mut self,
+        reason: crate::input_state::InputAbandonReason,
+        terminal_rows: &[InputId],
+    ) -> Result<usize, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.abandon_pending_inputs(reason),
+            DriverEntry::Persistent(d) => {
+                d.abandon_pending_inputs_with_terminal_rows(reason, terminal_rows)
+                    .await
+            }
+        }
+    }
+
     /// The inputs the ended resumable run `run_id` still holds; see
     /// [`crate::driver::EphemeralRuntimeDriver::ended_resumable_run_kept_inputs`].
     pub(crate) fn ended_resumable_run_kept_inputs(&self, run_id: &RunId) -> Vec<InputId> {
@@ -6411,6 +6511,18 @@ fn authorized_staged_directed_terminal_outboxes(
     input_ids: &[InputId],
     completion_batch: &StagedInputTerminalCompletionBatch,
 ) -> Result<Vec<crate::input_state::InteractionTerminalOutbox>, RuntimeDriverError> {
+    authorized_staged_directed_terminal_outboxes_placed(driver, input_ids, completion_batch, None)
+}
+
+/// [`authorized_staged_directed_terminal_outboxes`]; while the driver's
+/// authority holds no runtime placement, the outboxes name `unplaced_owner`
+/// when one is given.
+fn authorized_staged_directed_terminal_outboxes_placed(
+    driver: &DriverEntry,
+    input_ids: &[InputId],
+    completion_batch: &StagedInputTerminalCompletionBatch,
+    unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
+) -> Result<Vec<crate::input_state::InteractionTerminalOutbox>, RuntimeDriverError> {
     use crate::input_state::InteractionTerminalOutbox;
     let mut directed = Vec::new();
     for input_id in input_ids {
@@ -6497,6 +6609,26 @@ fn authorized_staged_directed_terminal_outboxes(
     let batch_key = completion_batch
         .directed_outbox_batch_key(&candidate_owner_input_id)
         .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+    let unplaced = binding.1.is_none() && binding.2.is_none() && binding.3.is_none();
+    let (
+        owner_agent_runtime_id,
+        owner_fence_token,
+        owner_runtime_generation,
+        owner_runtime_epoch_id,
+    ) = match (unplaced, unplaced_owner) {
+        (true, Some(placement)) => (
+            Some(placement.agent_runtime_id.clone()),
+            Some(placement.fence_token),
+            Some(placement.runtime_generation),
+            placement.runtime_epoch_id.clone(),
+        ),
+        _ => (
+            binding.1.as_ref().map(|value| value.0.clone()),
+            binding.2.map(|value| value.0),
+            binding.3.map(|value| value.0),
+            binding.4.as_ref().map(|value| value.0.clone()),
+        ),
+    };
     directed
         .into_iter()
         .enumerate()
@@ -6507,10 +6639,10 @@ fn authorized_staged_directed_terminal_outboxes(
                 batch_ordinal: ordinal as u16,
                 batch_key: batch_key.clone(),
                 owner_session_id: owner_session_id.clone(),
-                owner_agent_runtime_id: binding.1.as_ref().map(|value| value.0.clone()),
-                owner_fence_token: binding.2.map(|value| value.0),
-                owner_runtime_generation: binding.3.map(|value| value.0),
-                owner_runtime_epoch_id: binding.4.as_ref().map(|value| value.0.clone()),
+                owner_agent_runtime_id: owner_agent_runtime_id.clone(),
+                owner_fence_token,
+                owner_runtime_generation,
+                owner_runtime_epoch_id: owner_runtime_epoch_id.clone(),
                 candidate_owner_input_id: candidate_owner_input_id.clone(),
                 released_0831_candidate: None,
                 candidate_digest: completion_batch.candidate_digest.clone(),
@@ -9337,6 +9469,57 @@ pub(crate) async fn machine_recover_persistent_inputs_from_observed(
     }
 
     Ok(report)
+}
+
+/// Load `rows`, terminal input rows a registration's recovery does not load
+/// (the consumed rows a recovered boundary left without a receipt, which a
+/// predecessor settlement answers), into `driver`'s generated authority and
+/// ledger exactly as a registration loads a pending-terminal row: each row
+/// is normalized and enters through the existing `RecoverInputLifecycle`,
+/// and no lifecycle transition runs. A row the driver already holds is left
+/// as it is.
+pub(crate) async fn machine_recover_settlement_terminal_rows(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    driver: &mut DriverEntry,
+    rows: Vec<StoredInputState>,
+) -> Result<(), RuntimeDriverError> {
+    let driver = match driver {
+        DriverEntry::Ephemeral(driver) => driver,
+        DriverEntry::Persistent(driver) => driver.inner_mut(),
+    };
+    for bundle in rows {
+        let (mut bundle, _) =
+            machine_normalize_recovered_input_state(store, runtime_id, bundle, None).await?;
+        let input_id = bundle.state.input_id.clone();
+        if !crate::meerkat_machine::input_seed_behavioral_terminality_via_authority(
+            &input_id,
+            &bundle.seed,
+        )
+        .map_err(RuntimeDriverError::Internal)?
+        {
+            return Err(RuntimeDriverError::RecoveryCorruption {
+                reason: format!("settlement row {input_id} is not terminal"),
+            });
+        }
+        if driver.input_state(&input_id).is_some() {
+            continue;
+        }
+        driver.recover_terminal_input_lifecycle(
+            &input_id,
+            &bundle.seed,
+            bundle.state.idempotency_key.as_ref(),
+        )?;
+        bundle.state.authorization_audit = bundle
+            .state
+            .authorization_audit
+            .restore_observations_for_owner()
+            .map_err(|error| RuntimeDriverError::RecoveryCorruption {
+                reason: error.to_string(),
+            })?;
+        driver.ledger_mut().recover(bundle.state);
+    }
+    Ok(())
 }
 
 pub(crate) fn machine_build_replay_plan(
