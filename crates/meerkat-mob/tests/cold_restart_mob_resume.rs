@@ -11406,10 +11406,43 @@ async fn a_held_members_open_run_resumes_when_the_host_releases_its_hold_without
     let paths = Paths::new(temp.path());
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
         Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
-    let run = stop_gracefully_over_an_open_member_run(&paths, runtime_store.clone(), true).await;
+    held_members_open_run_resumes_on_release(&paths, runtime_store, true, "held-head-canonical")
+        .await;
+}
+
+/// The same host hold and release on WholeBlob.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_held_members_open_run_resumes_on_release_whole_blob() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+            .expect("open durable runtime store"),
+    );
+    held_members_open_run_resumes_on_release(&paths, runtime_store, false, "held-whole-blob").await;
+}
+
+/// Restart over a graceful stop's kept run with the member's run starts held
+/// by the host, then release the hold with no new input: the run resumes from
+/// its last round commit, once.
+#[cfg(feature = "test-support")]
+async fn held_members_open_run_resumes_on_release(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    head_canonical: bool,
+    context: &str,
+) {
+    let run =
+        stop_gracefully_over_an_open_member_run(paths, runtime_store.clone(), head_canonical).await;
 
     let client_2 = Arc::new(HoldingToolLoopClient::new(0));
-    let service_2 = requeue_service(&paths, runtime_store.clone(), true, client_2.clone());
+    let service_2 = requeue_service(
+        paths,
+        runtime_store.clone(),
+        head_canonical,
+        client_2.clone(),
+    );
     let worker = AgentIdentity::from("w-1");
     let handle = MobBuilder::for_resume(
         MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
@@ -11431,22 +11464,22 @@ async fn a_held_members_open_run_resumes_when_the_host_releases_its_hold_without
     while service_2.comms_runtime(&run.w1_sid).await.is_none() {
         assert!(
             Instant::now() < deadline,
-            "the held member's runtime registers before the release"
+            "[{context}] the held member's runtime registers before the release"
         );
         sleep(Duration::from_millis(50)).await;
     }
     sleep(Duration::from_millis(500)).await;
     assert_eq!(
-        provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true).await,
+        provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, head_canonical).await,
         Some(run.run_id.clone()),
-        "the held member's kept run waits for the host's release"
+        "[{context}] the held member's kept run waits for the host's release"
     );
     assert_eq!(
         client_2
             .loop_requests
             .load(std::sync::atomic::Ordering::SeqCst),
         0,
-        "no model request while the host holds the member"
+        "[{context}] no model request while the host holds the member"
     );
 
     // The host is ready: it releases its hold and sends nothing else.
@@ -11462,8 +11495,8 @@ async fn a_held_members_open_run_resumes_when_the_host_releases_its_hold_without
         runtime_store.as_ref(),
         client_2.as_ref(),
         &run,
-        true,
-        "held-head-canonical",
+        head_canonical,
+        context,
     )
     .await;
     let _ = handle.shutdown().await;
