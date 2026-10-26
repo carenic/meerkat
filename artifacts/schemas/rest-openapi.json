@@ -11568,6 +11568,19 @@
               "reason"
             ],
             "type": "object"
+          },
+          {
+            "description": "A run consumed the interaction's input at a boundary that a recovery\ncommitted without the input's receipt, and a later settlement of the\nsession answered it: what the run did for this interaction is not\nknown. It is not a completion, and the interaction must not be\nresubmitted because of it, since its run may have acted on it.",
+            "properties": {
+              "kind": {
+                "const": "outcome_unknown",
+                "type": "string"
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": "object"
           }
         ]
       },

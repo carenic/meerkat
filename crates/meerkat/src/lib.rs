@@ -568,14 +568,15 @@ pub use meerkat_session::DefaultCompactor;
 // PersistentSessionService: used by runtime-backed surfaces (REST, RPC, MCP).
 // EphemeralSessionService: in-memory substrate for testing/embedded use only.
 // Both implement SessionService. Production paths add MeerkatMachine on top.
+#[cfg(feature = "session-store")]
+pub use meerkat_session::{
+    ColdPredecessorSettleError, ColdPredecessorSettleRefusal, LiveDurableSourceObservation,
+    LiveSessionActorTurnBoundaryLease, LiveSessionActorWitnessSlot,
+    MachineServiceTurnCommitProtocol, MachineSessionArchiveProtocol, PersistentSessionService,
+};
 pub use meerkat_session::{
     EphemeralSessionService, LiveSessionActorWitness, RuntimeContextAdmissionGuard, SessionAgent,
     SessionAgentBuilder,
-};
-#[cfg(feature = "session-store")]
-pub use meerkat_session::{
-    LiveDurableSourceObservation, LiveSessionActorTurnBoundaryLease, LiveSessionActorWitnessSlot,
-    MachineServiceTurnCommitProtocol, MachineSessionArchiveProtocol, PersistentSessionService,
 };
 // Maintenance compositions (offline `rkat storage migrate`): a builder that
 // refuses agent construction, composed with the persistent service to drive

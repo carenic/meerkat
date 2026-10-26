@@ -1274,6 +1274,9 @@ pub enum RuntimeCompletionObservedOutcome {
     RuntimeApplyFailed,
     FinalizationFailed,
     RuntimeTerminated,
+    /// A recovered boundary consumed the input without staging its receipt;
+    /// what its run did for the input is not known. Never cleans up a runtime.
+    OutcomeUnknown,
 }
 
 /// Typed observation of the terminal payload shape produced by runtime-loop
@@ -1287,6 +1290,9 @@ pub enum RuntimeCompletionTerminalObservation {
     CallbackPending,
     MachineTerminal,
     RuntimeTerminated,
+    /// The runless answer to an input a recovered boundary consumed without
+    /// staging its receipt: it names the run, not what the run did.
+    OutcomeUnknown,
 }
 
 /// Typed observation of whether runtime finalization completed after the
@@ -1342,6 +1348,7 @@ pub enum RuntimeCompletionResultClass {
     AbandonedWithError,
     CompletedWithFinalizationFailure,
     RuntimeTerminated,
+    OutcomeUnknown,
 }
 
 /// Correlation owner for one validated durable completion batch.
@@ -16549,6 +16556,33 @@ macro_rules! meerkat_catalog_machine_dsl {
             }
         }
 
+        // The runless sibling of ResolveRuntimeCompletionResultRuntimeTerminated
+        // for an input a recovered boundary consumed without staging its
+        // receipt: a predecessor settlement answers it with a runless batch
+        // whose payload names the run. What the run did for the input is not
+        // known, so the class is never a completion, and its cleanup outcome
+        // never cleans up a runtime (ResolveRuntimeCompletionCleanupRetain).
+        transition ResolveRuntimeCompletionResultOutcomeUnknown {
+            per_phase [Initializing, Idle, Attached, Running, Retired, Stopped]
+            on input ResolveRuntimeCompletionResult { run_id, terminal, finalization }
+            guard "session_registered" { self.session_id != None }
+            guard "no_run_result" { run_id == None }
+            guard "finalization_succeeded" { finalization == RuntimeCompletionFinalizationObservation::Succeeded }
+            guard "terminal_outcome_unknown" { terminal == RuntimeCompletionTerminalObservation::OutcomeUnknown }
+            update {}
+            to Idle
+            emit RuntimeCompletionResultResolved {
+                session_id: self.session_id.get("value"),
+                agent_runtime_id: self.active_runtime_id,
+                fence_token: self.active_fence_token,
+                runtime_generation: self.active_runtime_generation,
+                runtime_epoch_id: self.active_runtime_epoch_id,
+                run_id: None,
+                result_class: RuntimeCompletionResultClass::OutcomeUnknown,
+                cleanup_outcome: RuntimeCompletionObservedOutcome::OutcomeUnknown
+            }
+        }
+
         // 16b. ResolveRuntimeCompletionCleanup: generated cleanup action for
         // completion waiter observations. The shell may observe a typed
         // completion outcome and read authoritative archive/live-session
@@ -16724,6 +16758,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 outcome == RuntimeCompletionObservedOutcome::Completed
                 || outcome == RuntimeCompletionObservedOutcome::CompletedWithoutResult
                 || outcome == RuntimeCompletionObservedOutcome::CallbackPending
+                || outcome == RuntimeCompletionObservedOutcome::OutcomeUnknown
                 || (outcome == RuntimeCompletionObservedOutcome::Abandoned
                     && live_session != RuntimeCompletionLiveSessionObservation::Absent)
                 || (outcome == RuntimeCompletionObservedOutcome::Cancelled

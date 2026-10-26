@@ -2618,8 +2618,27 @@ impl PersistentRuntimeDriver {
         &mut self,
         reason: InputAbandonReason,
     ) -> Result<usize, RuntimeDriverError> {
+        self.abandon_pending_inputs_with_terminal_rows(reason, &[])
+            .await
+    }
+
+    /// [`Self::abandon_pending_inputs`] whose one commit also writes the rows
+    /// of `terminal_rows`: terminal inputs this driver holds with a terminal
+    /// batch staged under the same checkpoint (a predecessor settlement's
+    /// outcome-unknown answers), so the abandoned rows and those batches land
+    /// together or not at all.
+    pub(crate) async fn abandon_pending_inputs_with_terminal_rows(
+        &mut self,
+        reason: InputAbandonReason,
+        terminal_rows: &[InputId],
+    ) -> Result<usize, RuntimeDriverError> {
         self.require_durability_ready()?;
-        let changed_input_ids = self.inner.active_input_ids();
+        let mut changed_input_ids = self.inner.active_input_ids();
+        for input_id in terminal_rows {
+            if !changed_input_ids.contains(input_id) {
+                changed_input_ids.push(input_id.clone());
+            }
+        }
         let checkpoint = self.persistence_rollback_checkpoint();
         let abandoned = match self.inner.abandon_pending_inputs(reason) {
             Ok(abandoned) => abandoned,

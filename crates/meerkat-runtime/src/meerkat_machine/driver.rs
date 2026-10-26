@@ -215,11 +215,20 @@ pub(crate) struct InputTerminalCompletionAuthorizationWitness {
     recipients: indexmap::IndexMap<InputId, InputTerminalOutcome>,
     cas_profile: crate::store::InputStateBatchCasImplementationProfile,
     write_fence: Option<InputTerminalCompletionWriteFence>,
+    /// The run an outcome-unknown batch's candidate names; `None` for every
+    /// other candidate. Generated completion authority carries no payload, so
+    /// the public answer takes the run from the exact batch it resolves.
+    outcome_unknown_run: Option<RunId>,
 }
 
 impl InputTerminalCompletionAuthorizationWitness {
     pub(crate) fn runtime_id(&self) -> &LogicalRuntimeId {
         &self.runtime_id
+    }
+
+    /// The run an outcome-unknown batch's candidate names.
+    pub(crate) fn outcome_unknown_run(&self) -> Option<&RunId> {
+        self.outcome_unknown_run.as_ref()
     }
 
     pub(crate) fn candidate_digest(&self) -> &str {
@@ -235,7 +244,9 @@ impl InputTerminalCompletionAuthorizationWitness {
     }
 }
 
-enum InteractionTerminalBatchScope<'a> {
+/// The scope of one terminal-completion batch: the run whose contributors it
+/// answers, or a runless runtime termination.
+pub(crate) enum InteractionTerminalBatchScope<'a> {
     Run(&'a RunId),
     RuntimeTermination,
 }
@@ -532,7 +543,14 @@ impl RuntimeCompletionResultAuthority {
             }
             _ => InputTerminalOutcome::Consumed,
         };
+        let outcome_unknown_run = match &candidate {
+            crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                run_id,
+            } => Some(run_id.clone()),
+            _ => None,
+        };
         InputTerminalCompletionAuthorizationWitness {
+            outcome_unknown_run,
             runtime_id: LogicalRuntimeId::new("test-runtime"),
             session_id: self.session_id.clone(),
             agent_runtime_id: self.agent_runtime_id.as_ref().map(|value| value.0.clone()),
@@ -1209,68 +1227,16 @@ impl DriverEntry {
         candidate: crate::input_state::InteractionTerminalCandidate,
         requires_session_checkpoint: bool,
     ) -> Result<StagedInputTerminalCompletionBatch, RuntimeDriverError> {
-        use crate::input_state::{
-            InputTerminalCompletion, InputTerminalCompletionBatchKey, InputTerminalCompletionPhase,
-            interaction_terminal_payload_digest,
-        };
-        if input_ids.is_empty()
-            || input_ids.len() > crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS
-        {
-            return Err(RuntimeDriverError::ValidationFailed {
-                reason: "terminal completion recipient batch has invalid size".to_string(),
-            });
-        }
-        let completion_input_ids = canonical_completion_input_ids(input_ids);
-        if completion_input_ids
+        let completions = build_input_terminal_completion_rows(
+            scope,
+            input_ids,
+            candidate,
+            requires_session_checkpoint,
+        )?;
+        let completion_input_ids = completions
             .iter()
-            .collect::<std::collections::HashSet<_>>()
-            .len()
-            != completion_input_ids.len()
-        {
-            return Err(RuntimeDriverError::ValidationFailed {
-                reason: "terminal completion recipient batch contains duplicate inputs".to_string(),
-            });
-        }
-        let owner_input_id = completion_input_ids[0].clone();
-        let batch_key = match scope {
-            InteractionTerminalBatchScope::Run(run_id) => InputTerminalCompletionBatchKey::Run {
-                run_id: run_id.clone(),
-            },
-            InteractionTerminalBatchScope::RuntimeTermination => {
-                InputTerminalCompletionBatchKey::RuntimeTermination {
-                    owner_input_id: owner_input_id.clone(),
-                }
-            }
-        };
-        let candidate_digest = interaction_terminal_payload_digest(&candidate)
-            .map_err(RuntimeDriverError::Internal)?;
-        let completion_input_ids_digest =
-            interaction_terminal_payload_digest(&completion_input_ids)
-                .map_err(RuntimeDriverError::Internal)?;
-        let completions = completion_input_ids
-            .iter()
-            .enumerate()
-            .map(|(ordinal, input_id)| {
-                let owns_payload = input_id == &owner_input_id;
-                let completion = InputTerminalCompletion {
-                    input_id: input_id.clone(),
-                    batch_ordinal: ordinal as u16,
-                    batch_key: batch_key.clone(),
-                    owner_input_id: owner_input_id.clone(),
-                    candidate_digest: candidate_digest.clone(),
-                    completion_input_ids_digest: completion_input_ids_digest.clone(),
-                    requires_session_checkpoint,
-                    candidate: owns_payload.then(|| candidate.clone()),
-                    completion_input_ids: owns_payload.then(|| completion_input_ids.clone()),
-                    outcome: None,
-                    phase: InputTerminalCompletionPhase::Pending,
-                };
-                completion
-                    .validate_row()
-                    .map_err(RuntimeDriverError::Internal)?;
-                Ok(completion)
-            })
-            .collect::<Result<Vec<_>, RuntimeDriverError>>()?;
+            .map(|completion| completion.input_id.clone())
+            .collect::<Vec<_>>();
         let ledger = self.shell_driver_mut().ledger_mut();
         let mut missing = Vec::new();
         // Validate the entire batch before writing its first row. In
@@ -1533,7 +1499,13 @@ impl DriverEntry {
         let checkpoint = self.begin_terminal_transition("runless_terminal_preparation")?;
         let mut batches = Vec::with_capacity(recipient_batches.len());
         for batch_input_ids in recipient_batches {
-            match self.stage_runless_runtime_termination_batch(&batch_input_ids, &reason) {
+            match self.stage_runless_terminal_batch(
+                &batch_input_ids,
+                crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
+                    reason: reason.clone(),
+                },
+                None,
+            ) {
                 Ok(candidate_owner_input_id) => batches.push(RunlessTerminalBatch {
                     input_ids: batch_input_ids,
                     candidate_owner_input_id,
@@ -1549,34 +1521,109 @@ impl DriverEntry {
         })
     }
 
-    /// Stage one runless terminal-completion batch and, for its directed
-    /// recipients, its outbox batch. Returns the directed outbox owner, or
-    /// the failed step with its error for the caller's checkpoint.
-    fn stage_runless_runtime_termination_batch(
+    /// Stage, under the caller's checkpoint, the runless batches of a
+    /// predecessor settlement's sweep, which its one durable commit persists:
+    /// the runtime termination of `ended` with `reason`, and, for each run
+    /// of `answered`, the outcome-unknown answer to the inputs that run
+    /// consumed at a recovered boundary that staged no receipt. Each set
+    /// splits into batches of at most
+    /// [`crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS`] in
+    /// canonical order, and every directed recipient gets its outbox, placed
+    /// by `unplaced_owner` while the driver's own authority is unplaced. An
+    /// input never sits in two batches.
+    pub(crate) fn prepare_predecessor_settlement_terminals(
+        &mut self,
+        ended: &[InputId],
+        reason: String,
+        answered: &[(RunId, Vec<InputId>)],
+        unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
+    ) -> Result<PreparedRunlessInteractionTerminalOutboxes, RuntimeDriverError> {
+        let mut groups = Vec::new();
+        for batch_input_ids in runless_termination_batches(ended)? {
+            groups.push((
+                batch_input_ids,
+                crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
+                    reason: reason.clone(),
+                },
+            ));
+        }
+        for (run_id, input_ids) in answered {
+            for batch_input_ids in runless_termination_batches(input_ids)? {
+                groups.push((
+                    batch_input_ids,
+                    crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                        run_id: run_id.clone(),
+                    },
+                ));
+            }
+        }
+        let mut seen = std::collections::HashSet::new();
+        if groups
+            .iter()
+            .flat_map(|(input_ids, _)| input_ids.iter())
+            .any(|input_id| !seen.insert(input_id.clone()))
+        {
+            return Err(RuntimeDriverError::ValidationFailed {
+                reason: "a predecessor settlement's terminals name an input twice".to_string(),
+            });
+        }
+        if groups.is_empty() {
+            return Ok(PreparedRunlessInteractionTerminalOutboxes {
+                checkpoint: None,
+                batches: Vec::new(),
+            });
+        }
+        let checkpoint =
+            self.begin_terminal_transition("predecessor_settlement_terminal_preparation")?;
+        let mut batches = Vec::with_capacity(groups.len());
+        for (batch_input_ids, candidate) in groups {
+            match self.stage_runless_terminal_batch(&batch_input_ids, candidate, unplaced_owner) {
+                Ok(candidate_owner_input_id) => batches.push(RunlessTerminalBatch {
+                    input_ids: batch_input_ids,
+                    candidate_owner_input_id,
+                }),
+                Err((operation, error)) => {
+                    return Err(self.fail_terminal_transition(checkpoint, operation, error));
+                }
+            }
+        }
+        Ok(PreparedRunlessInteractionTerminalOutboxes {
+            checkpoint: Some(checkpoint),
+            batches,
+        })
+    }
+
+    /// Stage one runless terminal-completion batch with `candidate` (a
+    /// runtime termination or an outcome-unknown answer) and, for its
+    /// directed recipients, its outbox batch. Returns the directed outbox
+    /// owner, or the failed step with its error for the caller's checkpoint.
+    fn stage_runless_terminal_batch(
         &mut self,
         input_ids: &[InputId],
-        reason: &str,
+        candidate: crate::input_state::InteractionTerminalCandidate,
+        unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
     ) -> Result<Option<InputId>, (&'static str, RuntimeDriverError)> {
-        let candidate = crate::input_state::InteractionTerminalCandidate::RuntimeTerminated {
-            reason: reason.to_string(),
-        };
         let completion_batch = self
             .stage_input_terminal_completion_batch(
                 InteractionTerminalBatchScope::RuntimeTermination,
                 input_ids,
-                candidate,
+                candidate.clone(),
                 false,
             )
             .map_err(|error| ("runless_terminal_completion_batch_stage", error))?;
         if let Some(candidate_owner_input_id) = self
-            .existing_exact_runless_runtime_termination_batch(input_ids, reason)
+            .existing_exact_runless_terminal_batch(input_ids, &candidate)
             .map_err(|error| ("runless_terminal_batch_validation", error))?
         {
             return Ok(Some(candidate_owner_input_id));
         }
-        let outboxes =
-            authorized_staged_directed_terminal_outboxes(self, input_ids, &completion_batch)
-                .map_err(|error| ("runless_terminal_outbox_authorization", error))?;
+        let outboxes = authorized_staged_directed_terminal_outboxes_placed(
+            self,
+            input_ids,
+            &completion_batch,
+            unplaced_owner,
+        )
+        .map_err(|error| ("runless_terminal_outbox_authorization", error))?;
         let candidate_owner_input_id = outboxes
             .first()
             .map(|outbox| outbox.candidate_owner_input_id.clone());
@@ -1619,16 +1666,19 @@ impl DriverEntry {
         Ok(false)
     }
 
-    fn existing_exact_runless_runtime_termination_batch(
+    fn existing_exact_runless_terminal_batch(
         &self,
         input_ids: &[InputId],
-        reason: &str,
+        candidate: &crate::input_state::InteractionTerminalCandidate,
     ) -> Result<Option<InputId>, RuntimeDriverError> {
         use crate::input_state::{
-            InteractionTerminalBatchKey, InteractionTerminalCandidate,
-            InteractionTerminalOutboxPhase, validate_interaction_terminal_outbox_batch_shape,
+            InteractionTerminalBatchKey, InteractionTerminalOutboxPhase,
+            validate_interaction_terminal_outbox_batch_shape,
             validate_unpublished_interaction_terminal_outbox_batch,
         };
+
+        let candidate_digest = crate::input_state::interaction_terminal_payload_digest(candidate)
+            .map_err(RuntimeDriverError::Internal)?;
 
         let mut grouped = std::collections::HashMap::<
             InteractionTerminalBatchKey,
@@ -1682,18 +1732,16 @@ impl DriverEntry {
             let owner = &outboxes[0];
             let linked = self.linked_terminal_completion_for_outbox_batch(&outboxes)?;
             let persisted_completion_input_ids = linked.input_ids;
-            let exact_reason = matches!(
-                linked.candidate.as_ref(),
-                Some(InteractionTerminalCandidate::RuntimeTerminated {
-                    reason: existing_reason,
-                }) if existing_reason == reason
-            );
+            let exact_candidate = linked.candidate.as_ref().is_some_and(|existing| {
+                crate::input_state::interaction_terminal_payload_digest(existing)
+                    .is_ok_and(|existing_digest| existing_digest == candidate_digest)
+            });
             let exact_recipients = persisted_completion_input_ids == input_ids;
             let overlaps_requested = persisted_completion_input_ids
                 .iter()
                 .any(|input_id| requested.contains(input_id));
 
-            if exact_recipients && exact_reason {
+            if exact_recipients && exact_candidate {
                 if exact_owner
                     .replace(owner.candidate_owner_input_id.clone())
                     .is_some()
@@ -3706,6 +3754,14 @@ impl DriverEntry {
             recipients,
             cas_profile,
             write_fence,
+            outcome_unknown_run: match owner.candidate.as_ref() {
+                Some(
+                    crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                        run_id,
+                    },
+                ) => Some(run_id.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -6167,6 +6223,24 @@ impl DriverEntry {
         }
     }
 
+    /// [`Self::abandon_pending_inputs`] whose one durable commit also writes
+    /// the rows of `terminal_rows`, the terminal inputs whose batches the
+    /// caller staged under the same checkpoint. An ephemeral driver has
+    /// nothing to write.
+    pub(crate) async fn abandon_pending_inputs_with_terminal_rows(
+        &mut self,
+        reason: crate::input_state::InputAbandonReason,
+        terminal_rows: &[InputId],
+    ) -> Result<usize, RuntimeDriverError> {
+        match self {
+            DriverEntry::Ephemeral(d) => d.abandon_pending_inputs(reason),
+            DriverEntry::Persistent(d) => {
+                d.abandon_pending_inputs_with_terminal_rows(reason, terminal_rows)
+                    .await
+            }
+        }
+    }
+
     /// The inputs the ended resumable run `run_id` still holds; see
     /// [`crate::driver::EphemeralRuntimeDriver::ended_resumable_run_kept_inputs`].
     pub(crate) fn ended_resumable_run_kept_inputs(&self, run_id: &RunId) -> Vec<InputId> {
@@ -6548,6 +6622,18 @@ fn authorized_staged_directed_terminal_outboxes(
     input_ids: &[InputId],
     completion_batch: &StagedInputTerminalCompletionBatch,
 ) -> Result<Vec<crate::input_state::InteractionTerminalOutbox>, RuntimeDriverError> {
+    authorized_staged_directed_terminal_outboxes_placed(driver, input_ids, completion_batch, None)
+}
+
+/// [`authorized_staged_directed_terminal_outboxes`]; while the driver's
+/// authority holds no runtime placement, the outboxes name `unplaced_owner`
+/// when one is given.
+fn authorized_staged_directed_terminal_outboxes_placed(
+    driver: &DriverEntry,
+    input_ids: &[InputId],
+    completion_batch: &StagedInputTerminalCompletionBatch,
+    unplaced_owner: Option<&crate::input_state::InteractionTerminalPlacement>,
+) -> Result<Vec<crate::input_state::InteractionTerminalOutbox>, RuntimeDriverError> {
     use crate::input_state::InteractionTerminalOutbox;
     let mut directed = Vec::new();
     for input_id in input_ids {
@@ -6634,6 +6720,26 @@ fn authorized_staged_directed_terminal_outboxes(
     let batch_key = completion_batch
         .directed_outbox_batch_key(&candidate_owner_input_id)
         .map_err(|reason| RuntimeDriverError::ValidationFailed { reason })?;
+    let unplaced = binding.1.is_none() && binding.2.is_none() && binding.3.is_none();
+    let (
+        owner_agent_runtime_id,
+        owner_fence_token,
+        owner_runtime_generation,
+        owner_runtime_epoch_id,
+    ) = match (unplaced, unplaced_owner) {
+        (true, Some(placement)) => (
+            Some(placement.agent_runtime_id.clone()),
+            Some(placement.fence_token),
+            Some(placement.runtime_generation),
+            placement.runtime_epoch_id.clone(),
+        ),
+        _ => (
+            binding.1.as_ref().map(|value| value.0.clone()),
+            binding.2.map(|value| value.0),
+            binding.3.map(|value| value.0),
+            binding.4.as_ref().map(|value| value.0.clone()),
+        ),
+    };
     directed
         .into_iter()
         .enumerate()
@@ -6644,10 +6750,10 @@ fn authorized_staged_directed_terminal_outboxes(
                 batch_ordinal: ordinal as u16,
                 batch_key: batch_key.clone(),
                 owner_session_id: owner_session_id.clone(),
-                owner_agent_runtime_id: binding.1.as_ref().map(|value| value.0.clone()),
-                owner_fence_token: binding.2.map(|value| value.0),
-                owner_runtime_generation: binding.3.map(|value| value.0),
-                owner_runtime_epoch_id: binding.4.as_ref().map(|value| value.0.clone()),
+                owner_agent_runtime_id: owner_agent_runtime_id.clone(),
+                owner_fence_token,
+                owner_runtime_generation,
+                owner_runtime_epoch_id: owner_runtime_epoch_id.clone(),
                 candidate_owner_input_id: candidate_owner_input_id.clone(),
                 released_0831_candidate: None,
                 candidate_digest: completion_batch.candidate_digest.clone(),
@@ -6668,6 +6774,90 @@ fn canonical_completion_input_ids(input_ids: &[InputId]) -> Vec<InputId> {
     let mut canonical = input_ids.to_vec();
     canonical.sort_by_key(|input_id| input_id.0);
     canonical
+}
+
+/// Build, without writing anything, the rows of one terminal-completion
+/// batch: one `Pending` row per recipient in canonical order, the canonical
+/// owner (the first recipient) holding the batch's single candidate and its
+/// recipient set, every row validated.
+///
+/// The live terminal paths stage these rows into the driver's ledger
+/// (`DriverEntry::stage_input_terminal_completion_batch`); a recovered
+/// boundary's commit writes them in its own fenced transaction
+/// (`crate::recovery`). Both build them here, so a recovered batch is
+/// byte-for-byte the batch a live run with the same recipients and candidate
+/// stages.
+pub(crate) fn build_input_terminal_completion_rows(
+    scope: InteractionTerminalBatchScope<'_>,
+    input_ids: &[InputId],
+    candidate: crate::input_state::InteractionTerminalCandidate,
+    requires_session_checkpoint: bool,
+) -> Result<Vec<crate::input_state::InputTerminalCompletion>, RuntimeDriverError> {
+    use crate::input_state::{
+        InputTerminalCompletion, InputTerminalCompletionBatchKey, InputTerminalCompletionPhase,
+        interaction_terminal_payload_digest,
+    };
+    if input_ids.is_empty()
+        || input_ids.len() > crate::input_state::TERMINAL_COMPLETION_BATCH_MAX_INPUTS
+    {
+        return Err(RuntimeDriverError::ValidationFailed {
+            reason: "terminal completion recipient batch has invalid size".to_string(),
+        });
+    }
+    let completion_input_ids = canonical_completion_input_ids(input_ids);
+    if completion_input_ids
+        .iter()
+        .collect::<std::collections::HashSet<_>>()
+        .len()
+        != completion_input_ids.len()
+    {
+        return Err(RuntimeDriverError::ValidationFailed {
+            reason: "terminal completion recipient batch contains duplicate inputs".to_string(),
+        });
+    }
+    let owner_input_id = completion_input_ids[0].clone();
+    let batch_key = match scope {
+        InteractionTerminalBatchScope::Run(run_id) => InputTerminalCompletionBatchKey::Run {
+            run_id: run_id.clone(),
+        },
+        InteractionTerminalBatchScope::RuntimeTermination => {
+            InputTerminalCompletionBatchKey::RuntimeTermination {
+                owner_input_id: owner_input_id.clone(),
+            }
+        }
+    };
+    let candidate_digest =
+        interaction_terminal_payload_digest(&candidate).map_err(RuntimeDriverError::Internal)?;
+    let completion_input_ids_digest = interaction_terminal_payload_digest(&completion_input_ids)
+        .map_err(RuntimeDriverError::Internal)?;
+    completion_input_ids
+        .iter()
+        .enumerate()
+        .map(|(ordinal, input_id)| {
+            let owns_payload = input_id == &owner_input_id;
+            let batch_ordinal =
+                u16::try_from(ordinal).map_err(|_| RuntimeDriverError::ValidationFailed {
+                    reason: "terminal completion recipient batch has invalid size".to_string(),
+                })?;
+            let completion = InputTerminalCompletion {
+                input_id: input_id.clone(),
+                batch_ordinal,
+                batch_key: batch_key.clone(),
+                owner_input_id: owner_input_id.clone(),
+                candidate_digest: candidate_digest.clone(),
+                completion_input_ids_digest: completion_input_ids_digest.clone(),
+                requires_session_checkpoint,
+                candidate: owns_payload.then(|| candidate.clone()),
+                completion_input_ids: owns_payload.then(|| completion_input_ids.clone()),
+                outcome: None,
+                phase: InputTerminalCompletionPhase::Pending,
+            };
+            completion
+                .validate_row()
+                .map_err(RuntimeDriverError::Internal)?;
+            Ok(completion)
+        })
+        .collect()
 }
 
 /// Whether [`machine_begin_run`] established the run or found run starts held.
@@ -8954,6 +9144,25 @@ fn registered_runtime_authority_from_converged_record_id(
     })
 }
 
+/// [`reconcile_runtime_authority_for_cold_recovery_with_placement_witness`]
+/// with no placement witness, the form the tests drive.
+#[cfg(test)]
+pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    session_id: &SessionId,
+    runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
+    reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+        store,
+        runtime_id,
+        session_id,
+        runtime_epoch_id,
+        None,
+    )
+    .await
+}
+
 /// Level-triggered cold convergence for the one runtime-lifecycle row.
 ///
 /// The observed phase is never adopted. Every non-fixed decoded shape is
@@ -8961,17 +9170,29 @@ fn registered_runtime_authority_from_converged_record_id(
 /// version, conflicts restart from observation, and only then is a fresh
 /// Initialize/RegisterSession authority constructed. Supervisor and unregister
 /// custody are recovered independently from the converged row.
-pub(crate) async fn reconcile_runtime_authority_for_cold_recovery(
+///
+/// With `placement_witness` (a predecessor settlement whose directed work
+/// still needs a terminal outbox), the converged row also carries the
+/// session's last runtime placement as a placement witness (record version
+/// 7), so a crash before the settlement's sweep commit keeps the only
+/// durable copy of it. The classifier never reads the witness, so a row that
+/// carries it is converged as it is and written once; every later writer
+/// that builds its row from its own authority drops it.
+pub(crate) async fn reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
     store: &dyn crate::store::RuntimeStore,
     runtime_id: &LogicalRuntimeId,
     session_id: &SessionId,
     runtime_epoch_id: &meerkat_core::RuntimeEpochId,
+    placement_witness: Option<&crate::input_state::InteractionTerminalPlacement>,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     reconcile_runtime_authority_for_cold_recovery_id(
         store,
         runtime_id,
         &crate::meerkat_machine::dsl::SessionId::from_domain(session_id),
         &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(runtime_epoch_id),
+        placement_witness
+            .map(crate::input_state::InteractionTerminalPlacement::lifecycle_binding)
+            .as_ref(),
     )
     .await
 }
@@ -8981,6 +9202,7 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     runtime_id: &LogicalRuntimeId,
     session_id: &crate::meerkat_machine::dsl::SessionId,
     runtime_epoch_id: &crate::meerkat_machine::dsl::RuntimeEpochId,
+    placement_witness: Option<&crate::store::MachineLifecycleBindingFacts>,
 ) -> Result<ReconciledRuntimeAuthority, RuntimeDriverError> {
     loop {
         let observed = match store.observe_machine_lifecycle(runtime_id).await {
@@ -9015,12 +9237,29 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
         };
         match runtime_authority_reconcile_decision_for_observation(&observed)? {
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::Converged => {
-                let crate::store::MachineLifecycleObservation::Decoded { record, .. } = observed
+                let crate::store::MachineLifecycleObservation::Decoded { record, version } =
+                    observed
                 else {
                     return Err(RuntimeDriverError::Internal(
                         "runtime-authority classifier converged a non-decoded row".to_string(),
                     ));
                 };
+                if let Some(witness) = placement_witness
+                    && record.placement_witness() != Some(witness)
+                {
+                    // The converged row keeps its shape and gains the
+                    // witness, written once, fenced on the row just read.
+                    let replacement =
+                        converged_lifecycle_commit_with_placement_witness(&record, witness)?;
+                    compare_and_swap_reconciled_lifecycle(
+                        store,
+                        runtime_id,
+                        crate::store::MachineLifecycleExpectedVersion::Version(version),
+                        replacement,
+                    )
+                    .await?;
+                    continue;
+                }
                 return registered_runtime_authority_from_converged_record_id(
                     session_id,
                     runtime_epoch_id,
@@ -9062,35 +9301,10 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
                         supervisor_authority,
                         unregister_progress,
                         live_bridge_recovery,
-                    );
-                match store
-                    .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
-                    .await
-                {
-                    Ok(crate::store::MachineLifecycleCasOutcome::Applied { .. }) => continue,
-                    Ok(crate::store::MachineLifecycleCasOutcome::Conflict { .. }) => {
-                        // A concurrent writer won the target-local CAS. The
-                        // caller owns scheduling: return a typed requeue rather
-                        // than spinning inside one recovery invocation.
-                        return Err(RuntimeDriverError::RecoveryBackoff {
-                            reason: "runtime lifecycle CAS conflicted; re-observe on the next reconciliation pass".to_string(),
-                        });
-                    }
-                    Err(crate::store::RuntimeStoreError::MachineLifecycleRepairBlocked {
-                        evidence_digest,
-                        detail,
-                    }) => {
-                        return Err(RuntimeDriverError::RecoveryRepairBlocked {
-                            evidence_digest,
-                            reason: detail,
-                        });
-                    }
-                    Err(error) => {
-                        return Err(RuntimeDriverError::RecoveryBackoff {
-                            reason: error.to_string(),
-                        });
-                    }
-                }
+                    )
+                    .with_placement_witness(placement_witness.cloned());
+                compare_and_swap_reconciled_lifecycle(store, runtime_id, expected, replacement)
+                    .await?;
             }
             crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::RepairBlocked
             | crate::meerkat_machine::dsl::RuntimeAuthorityReconcileDecision::Quarantine => {
@@ -9108,6 +9322,67 @@ async fn reconcile_runtime_authority_for_cold_recovery_id(
     }
 }
 
+/// Apply one reconcile replacement of the lifecycle row, fenced on the row
+/// the pass observed. `Ok` means the replacement landed and the caller
+/// observes again; a lost race answers a typed requeue rather than spinning
+/// inside one recovery invocation.
+async fn compare_and_swap_reconciled_lifecycle(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    expected: crate::store::MachineLifecycleExpectedVersion,
+    replacement: crate::store::MachineLifecycleCommit,
+) -> Result<(), RuntimeDriverError> {
+    match store
+        .compare_and_swap_machine_lifecycle(runtime_id, expected, replacement)
+        .await
+    {
+        Ok(crate::store::MachineLifecycleCasOutcome::Applied { .. }) => Ok(()),
+        Ok(crate::store::MachineLifecycleCasOutcome::Conflict { .. }) => {
+            // A concurrent writer won the target-local CAS. The caller owns
+            // scheduling: return a typed requeue rather than spinning inside
+            // one recovery invocation.
+            Err(RuntimeDriverError::RecoveryBackoff {
+                reason:
+                    "runtime lifecycle CAS conflicted; re-observe on the next reconciliation pass"
+                        .to_string(),
+            })
+        }
+        Err(crate::store::RuntimeStoreError::MachineLifecycleRepairBlocked {
+            evidence_digest,
+            detail,
+        }) => Err(RuntimeDriverError::RecoveryRepairBlocked {
+            evidence_digest,
+            reason: detail,
+        }),
+        Err(error) => Err(RuntimeDriverError::RecoveryBackoff {
+            reason: error.to_string(),
+        }),
+    }
+}
+
+/// The converged row `record` exactly as it is, carrying `witness`.
+fn converged_lifecycle_commit_with_placement_witness(
+    record: &crate::store::DecodedMachineLifecycleObservation,
+    witness: &crate::store::MachineLifecycleBindingFacts,
+) -> Result<crate::store::MachineLifecycleCommit, RuntimeDriverError> {
+    let runtime_state = record.runtime_state().ok_or_else(|| {
+        RuntimeDriverError::Internal(
+            "runtime-authority classifier converged a row without a lifecycle phase".to_string(),
+        )
+    })?;
+    Ok(
+        crate::store::MachineLifecycleCommit::new_with_binding_run_unregister_progress_and_live_bridge(
+            runtime_state,
+            record.binding().clone(),
+            record.run().clone(),
+            record.supervisor_authority().clone(),
+            record.unregister_progress().cloned(),
+            record.live_bridge_recovery().clone(),
+        )
+        .with_placement_witness(Some(witness.clone())),
+    )
+}
+
 #[cfg(test)]
 pub(crate) async fn machine_recover_persistent_driver(
     store: &dyn crate::store::RuntimeStore,
@@ -9122,6 +9397,7 @@ pub(crate) async fn machine_recover_persistent_driver(
         &crate::meerkat_machine::dsl::RuntimeEpochId::from_domain(
             &meerkat_core::RuntimeEpochId::new(),
         ),
+        None,
     )
     .await?;
     let recovered_unregister_progress = reconciled.unregister_progress;
@@ -9307,6 +9583,57 @@ pub(crate) async fn machine_recover_persistent_inputs_from_observed(
     }
 
     Ok(report)
+}
+
+/// Load `rows`, terminal input rows a registration's recovery does not load
+/// (the consumed rows a recovered boundary left without a receipt, which a
+/// predecessor settlement answers), into `driver`'s generated authority and
+/// ledger exactly as a registration loads a pending-terminal row: each row
+/// is normalized and enters through the existing `RecoverInputLifecycle`,
+/// and no lifecycle transition runs. A row the driver already holds is left
+/// as it is.
+pub(crate) async fn machine_recover_settlement_terminal_rows(
+    store: &dyn crate::store::RuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    driver: &mut DriverEntry,
+    rows: Vec<StoredInputState>,
+) -> Result<(), RuntimeDriverError> {
+    let driver = match driver {
+        DriverEntry::Ephemeral(driver) => driver,
+        DriverEntry::Persistent(driver) => driver.inner_mut(),
+    };
+    for bundle in rows {
+        let (mut bundle, _) =
+            machine_normalize_recovered_input_state(store, runtime_id, bundle, None).await?;
+        let input_id = bundle.state.input_id.clone();
+        if !crate::meerkat_machine::input_seed_behavioral_terminality_via_authority(
+            &input_id,
+            &bundle.seed,
+        )
+        .map_err(RuntimeDriverError::Internal)?
+        {
+            return Err(RuntimeDriverError::RecoveryCorruption {
+                reason: format!("settlement row {input_id} is not terminal"),
+            });
+        }
+        if driver.input_state(&input_id).is_some() {
+            continue;
+        }
+        driver.recover_terminal_input_lifecycle(
+            &input_id,
+            &bundle.seed,
+            bundle.state.idempotency_key.as_ref(),
+        )?;
+        bundle.state.authorization_audit = bundle
+            .state
+            .authorization_audit
+            .restore_observations_for_owner()
+            .map_err(|error| RuntimeDriverError::RecoveryCorruption {
+                reason: error.to_string(),
+            })?;
+        driver.ledger_mut().recover(bundle.state);
+    }
+    Ok(())
 }
 
 pub(crate) fn machine_build_replay_plan(
@@ -12702,6 +13029,9 @@ mod recovery_tests {
                     error: meerkat_core::TurnErrorMetadata::runtime_apply_failure(reason.clone()),
                 }
             }
+            InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown { run_id } => {
+                CompletionOutcome::recovered_boundary_outcome_unknown(run_id.clone())
+            }
         };
         (
             outcome,
@@ -14697,6 +15027,134 @@ mod recovery_tests {
         );
         assert_eq!(record.supervisor_authority(), &supervisor);
         assert_eq!(record.unregister_progress(), Some(&unregister_progress));
+    }
+
+    /// A predecessor settlement's reconcile keeps its placement witness in
+    /// the clean row it converges to (record version 7), whether it
+    /// normalizes a bound row or finds the row converged without it, and
+    /// writes it once: a converged row that already carries it is left as it
+    /// is, by the settlement's repeat and by a plain registration alike.
+    #[tokio::test]
+    async fn a_settlement_reconcile_keeps_its_placement_witness_in_the_converged_row() {
+        use crate::store::{MachineLifecycleObservation, RuntimeStore};
+
+        let placement = crate::input_state::InteractionTerminalPlacement {
+            agent_runtime_id: "predecessor-runtime".to_string(),
+            fence_token: 41,
+            runtime_generation: 9,
+            runtime_epoch_id: Some("predecessor-epoch".to_string()),
+        };
+        let observe = |store: &crate::store::memory::InMemoryRuntimeStore,
+                       runtime_id: &LogicalRuntimeId| {
+            let store = store.clone();
+            let runtime_id = runtime_id.clone();
+            async move {
+                let MachineLifecycleObservation::Decoded { record, version } = store
+                    .observe_machine_lifecycle(&runtime_id)
+                    .await
+                    .expect("observe the lifecycle row")
+                else {
+                    panic!("the lifecycle row decodes");
+                };
+                (record, version)
+            }
+        };
+
+        // A bound row: normalization writes the clean row with the witness.
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let store = crate::store::memory::InMemoryRuntimeStore::new();
+        store
+            .commit_machine_lifecycle(
+                &runtime_id,
+                crate::store::MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Idle,
+                    placement.lifecycle_binding(),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
+            .await
+            .expect("persist the predecessor's bound row");
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the settlement's reconcile converges");
+        let (record, version) = observe(&store, &runtime_id).await;
+        assert_eq!(record.runtime_state(), Some(RuntimeState::Idle));
+        assert_eq!(
+            record.binding(),
+            &crate::store::MachineLifecycleBindingFacts::default()
+        );
+        assert_eq!(
+            record.record_version(),
+            crate::store::PLACEMENT_WITNESS_MACHINE_LIFECYCLE_STORE_RECORD_VERSION
+        );
+        assert_eq!(
+            record.placement_witness(),
+            Some(&placement.lifecycle_binding())
+        );
+
+        // Converged with the witness: the repeat and a plain registration
+        // write nothing.
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the repeat converges");
+        reconcile_runtime_authority_for_cold_recovery(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+        )
+        .await
+        .expect("a plain registration converges");
+        assert_eq!(observe(&store, &runtime_id).await.1, version);
+
+        // A clean row without the witness: the settlement writes it once.
+        let session_id = SessionId::new();
+        let runtime_id = LogicalRuntimeId::for_session(&session_id);
+        let store = crate::store::memory::InMemoryRuntimeStore::new();
+        store
+            .commit_machine_lifecycle(
+                &runtime_id,
+                crate::store::MachineLifecycleCommit::new_with_binding(
+                    RuntimeState::Idle,
+                    crate::store::MachineLifecycleBindingFacts::default(),
+                    crate::store::SupervisorAuthoritySnapshot::UnboundNoReceipt,
+                ),
+                &[],
+            )
+            .await
+            .expect("persist a clean row");
+        let (clean, clean_version) = observe(&store, &runtime_id).await;
+        assert_eq!(clean.placement_witness(), None);
+        reconcile_runtime_authority_for_cold_recovery_with_placement_witness(
+            &store,
+            &runtime_id,
+            &session_id,
+            &meerkat_core::RuntimeEpochId::new(),
+            Some(&placement),
+        )
+        .await
+        .expect("the settlement's reconcile converges");
+        let (witnessed, witnessed_version) = observe(&store, &runtime_id).await;
+        assert_ne!(witnessed_version, clean_version);
+        assert_eq!(
+            witnessed.placement_witness(),
+            Some(&placement.lifecycle_binding())
+        );
+        assert_eq!(witnessed.binding(), clean.binding());
     }
 
     #[tokio::test]

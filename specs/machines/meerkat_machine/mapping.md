@@ -1601,6 +1601,24 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownInitializing`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownIdle`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownAttached`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownRetired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeCompletionResultOutcomeUnknownStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `ResolveRuntimeCompletionCleanupArchivedInitializing`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)

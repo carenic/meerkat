@@ -479,6 +479,12 @@ const MEERKAT_TRANSITION_ENUM_LATE_TAIL: &[&str] = &[
     "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentRunning",
     "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentStopped",
     "AuthorizeOperatorDurableTailRepairRefuseNonQuiescentDestroyed",
+    "ResolveRuntimeCompletionResultOutcomeUnknownInitializing",
+    "ResolveRuntimeCompletionResultOutcomeUnknownIdle",
+    "ResolveRuntimeCompletionResultOutcomeUnknownAttached",
+    "ResolveRuntimeCompletionResultOutcomeUnknownRunning",
+    "ResolveRuntimeCompletionResultOutcomeUnknownRetired",
+    "ResolveRuntimeCompletionResultOutcomeUnknownStopped",
 ];
 
 // Append-only emission tails for the other machines, whose public

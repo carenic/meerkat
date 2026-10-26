@@ -2378,10 +2378,10 @@ fn schedule_completion_from_runtime_completion(
                 Err(error) => completion_after_wait_failure(error, outcome_read).await?,
             },
             AcceptedScheduledInputCompletion::Terminal(terminal) => {
-                return Ok(delivery_terminal_from_completion_outcome(
+                return delivery_terminal_from_completion_outcome(
                     terminal,
                     materialized_session_id,
-                ));
+                );
             }
             AcceptedScheduledInputCompletion::AuthorityUnavailable { detail } => {
                 return Err(authority_unavailable_completion(detail));
@@ -2391,10 +2391,7 @@ fn schedule_completion_from_runtime_completion(
                 reread_admitted_input_outcome(reread).await?
             }
         };
-        Ok(delivery_terminal_from_completion_outcome(
-            outcome,
-            materialized_session_id,
-        ))
+        delivery_terminal_from_completion_outcome(outcome, materialized_session_id)
     })
 }
 
@@ -2482,8 +2479,8 @@ fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryComple
 fn delivery_terminal_from_completion_outcome(
     outcome: CompletionOutcome,
     _materialized_session_id: Option<SessionId>,
-) -> DeliveryTerminal {
-    match outcome {
+) -> Result<DeliveryTerminal, ScheduleDomainError> {
+    Ok(match outcome {
         CompletionOutcome::Completed(_) | CompletionOutcome::CompletedWithoutResult => {
             DeliveryTerminal::runtime_completion(
                 meerkat_schedule::RuntimeCompletionOutcome::Completed,
@@ -2563,7 +2560,16 @@ fn delivery_terminal_from_completion_outcome(
                 runtime_outcome,
             )
         }
-    }
+        // No runtime completion class is honest here: the run that consumed
+        // the input may have acted on it. The delivery records that it holds
+        // no authority over the outcome, which is neither a completion nor a
+        // runtime rejection, and nothing is redelivered.
+        CompletionOutcome::OutcomeUnknown { run_id } => {
+            return Err(authority_unavailable_completion(format!(
+                "outcome unknown: run {run_id} consumed the scheduled input without a receipt"
+            )));
+        }
+    })
 }
 
 fn terminal_from_runtime_completion_outcome(
@@ -4575,7 +4581,8 @@ mod tests {
                 dedupe_key: None,
             },
             None,
-        );
+        )
+        .expect("a callback pending outcome is a runtime completion");
 
         assert_eq!(terminal.phase, OccurrencePhase::AwaitingCompletion);
         assert_eq!(
@@ -4590,6 +4597,134 @@ mod tests {
                 .contains("external_approval")
         );
         assert!(terminal.runtime_outcome.is_some());
+    }
+
+    /// An occurrence whose input ends with an unknown outcome ends its
+    /// delivery terminally: the host answers that it holds no authority over
+    /// the outcome, the occurrence records `DeliveryFailed`, and later ticks
+    /// never fire, reclaim or redeliver it, since its run may have acted.
+    #[tokio::test]
+    async fn an_occurrence_whose_input_ends_outcome_unknown_is_never_fired_again() {
+        struct ReadyTarget;
+        #[async_trait]
+        impl ScheduleTargetProbe for ReadyTarget {
+            async fn probe_target(
+                &self,
+                _occurrence: &Occurrence,
+            ) -> Result<TargetProbeOutcome, ScheduleDomainError> {
+                Ok(TargetProbeOutcome::Ready)
+            }
+        }
+        struct OutcomeUnknownTarget {
+            deliveries: AtomicUsize,
+        }
+        #[async_trait]
+        impl ScheduleTargetDelivery for OutcomeUnknownTarget {
+            async fn deliver_occurrence(
+                &self,
+                occurrence: &Occurrence,
+                identity: &ScheduleDeliveryIdentity,
+            ) -> Result<DeliveryDispatch, ScheduleDomainError> {
+                self.deliveries.fetch_add(1, Ordering::SeqCst);
+                Ok(build_dispatch_from_accepted(
+                    occurrence,
+                    AcceptedScheduledInput::with_runtime_terminal(
+                        Some(identity.correlation_id.clone()),
+                        CompletionOutcome::OutcomeUnknown {
+                            run_id: meerkat_core::lifecycle::RunId::new(),
+                        },
+                    ),
+                    None,
+                ))
+            }
+        }
+
+        let store =
+            Arc::new(meerkat_schedule::MemoryScheduleStore::new()) as Arc<dyn ScheduleStore>;
+        let service = ScheduleService::new(Arc::clone(&store));
+        let schedule = service
+            .create(meerkat_schedule::CreateScheduleRequest {
+                name: Some("outcome-unknown-occurrence".to_string()),
+                description: None,
+                trigger: meerkat_schedule::TriggerSpec::Once {
+                    due_at_utc: chrono::Utc::now() - ChronoDuration::seconds(1),
+                },
+                target: materialize_on_demand_target(),
+                misfire_policy: meerkat_schedule::MisfirePolicy::Skip,
+                overlap_policy: meerkat_schedule::OverlapPolicy::SkipIfRunning,
+                missing_target_policy: meerkat_schedule::MissingTargetPolicy::Skip,
+                labels: BTreeMap::new(),
+                planning_horizon_days: Some(1),
+                planning_horizon_occurrences: Some(1),
+            })
+            .await
+            .expect("the schedule plans its occurrence");
+        let target = Arc::new(OutcomeUnknownTarget {
+            deliveries: AtomicUsize::new(0),
+        });
+        let driver = ScheduleDriver::new(
+            service.clone(),
+            Arc::clone(&store),
+            Arc::new(ReadyTarget),
+            Arc::clone(&target) as Arc<dyn ScheduleTargetDelivery>,
+            "outcome-unknown-driver",
+            ScheduleDriverConfig {
+                claim_limit: 8,
+                lease_duration: ChronoDuration::seconds(30),
+            },
+        );
+
+        driver
+            .tick_once()
+            .await
+            .expect("the first tick fires the occurrence");
+        let mut failed = None;
+        for _ in 0..200 {
+            let occurrences = service
+                .list_occurrences(&schedule.schedule_id)
+                .await
+                .expect("the occurrences list");
+            if let Some(occurrence) = occurrences
+                .into_iter()
+                .find(|occurrence| occurrence.phase == OccurrencePhase::DeliveryFailed)
+            {
+                failed = Some(occurrence);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let failed = failed.expect("the occurrence ends delivery_failed");
+        assert_eq!(
+            failed.failure_class,
+            Some(meerkat_schedule::OccurrenceFailureClass::InternalError)
+        );
+        assert!(
+            failed
+                .failure_detail
+                .as_deref()
+                .is_some_and(|detail| detail.contains("outcome unknown")),
+            "the recorded state says the outcome is unknown: {:?}",
+            failed.failure_detail
+        );
+
+        for _ in 0..3 {
+            driver.tick_once().await.expect("a later tick");
+        }
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        assert_eq!(
+            target.deliveries.load(Ordering::SeqCst),
+            1,
+            "the occurrence is never fired, reclaimed or redelivered again"
+        );
+        let after = service
+            .list_occurrences(&schedule.schedule_id)
+            .await
+            .expect("the occurrences list")
+            .into_iter()
+            .find(|occurrence| occurrence.occurrence_id == failed.occurrence_id)
+            .expect("the occurrence is listed");
+        assert_eq!(after.phase, OccurrencePhase::DeliveryFailed);
+        assert_eq!(after.attempt_count, failed.attempt_count);
     }
 
     #[tokio::test]

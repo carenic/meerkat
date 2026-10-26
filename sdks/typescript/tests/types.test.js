@@ -571,6 +571,17 @@ describe("Typed Events", () => {
     }
   });
 
+  it("parses the outcome-unknown interaction failure reason as its own kind", () => {
+    const event = parseEvent({
+      type: "interaction_failed",
+      interaction_id: "interaction-1",
+      reason: { kind: "outcome_unknown" },
+    });
+    assert.equal(event.type, "interaction_failed");
+    assert.equal(event.interactionId, "interaction-1");
+    assert.deepEqual(event.reason, { kind: "outcome_unknown" });
+  });
+
   it("preserves policy-stop kind, terminality, and provider details on run_failed", () => {
     const reason = {
       reason_type: "llm_provider_error",

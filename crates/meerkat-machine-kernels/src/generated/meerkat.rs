@@ -10504,6 +10504,8 @@ pub enum RuntimeCompletionObservedOutcome {
     FinalizationFailed,
     #[serde(rename = "RuntimeTerminated")]
     RuntimeTerminated,
+    #[serde(rename = "OutcomeUnknown")]
+    OutcomeUnknown,
 }
 impl RuntimeCompletionObservedOutcome {
     pub fn as_str(&self) -> &'static str {
@@ -10516,6 +10518,7 @@ impl RuntimeCompletionObservedOutcome {
             Self::RuntimeApplyFailed => "RuntimeApplyFailed",
             Self::FinalizationFailed => "FinalizationFailed",
             Self::RuntimeTerminated => "RuntimeTerminated",
+            Self::OutcomeUnknown => "OutcomeUnknown",
         }
     }
 }
@@ -10531,6 +10534,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionObservedOutcome {
             "RuntimeApplyFailed" => Ok(Self::RuntimeApplyFailed),
             "FinalizationFailed" => Ok(Self::FinalizationFailed),
             "RuntimeTerminated" => Ok(Self::RuntimeTerminated),
+            "OutcomeUnknown" => Ok(Self::OutcomeUnknown),
             other => Err(format!(
                 "invalid RuntimeCompletionObservedOutcome value `{other}`"
             )),
@@ -10630,6 +10634,8 @@ pub enum RuntimeCompletionResultClass {
     CompletedWithFinalizationFailure,
     #[serde(rename = "RuntimeTerminated")]
     RuntimeTerminated,
+    #[serde(rename = "OutcomeUnknown")]
+    OutcomeUnknown,
 }
 impl RuntimeCompletionResultClass {
     pub fn as_str(&self) -> &'static str {
@@ -10641,6 +10647,7 @@ impl RuntimeCompletionResultClass {
             Self::AbandonedWithError => "AbandonedWithError",
             Self::CompletedWithFinalizationFailure => "CompletedWithFinalizationFailure",
             Self::RuntimeTerminated => "RuntimeTerminated",
+            Self::OutcomeUnknown => "OutcomeUnknown",
         }
     }
 }
@@ -10655,6 +10662,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionResultClass {
             "AbandonedWithError" => Ok(Self::AbandonedWithError),
             "CompletedWithFinalizationFailure" => Ok(Self::CompletedWithFinalizationFailure),
             "RuntimeTerminated" => Ok(Self::RuntimeTerminated),
+            "OutcomeUnknown" => Ok(Self::OutcomeUnknown),
             other => Err(format!(
                 "invalid RuntimeCompletionResultClass value `{other}`"
             )),
@@ -10698,6 +10706,8 @@ pub enum RuntimeCompletionTerminalObservation {
     MachineTerminal,
     #[serde(rename = "RuntimeTerminated")]
     RuntimeTerminated,
+    #[serde(rename = "OutcomeUnknown")]
+    OutcomeUnknown,
 }
 impl RuntimeCompletionTerminalObservation {
     pub fn as_str(&self) -> &'static str {
@@ -10707,6 +10717,7 @@ impl RuntimeCompletionTerminalObservation {
             Self::CallbackPending => "CallbackPending",
             Self::MachineTerminal => "MachineTerminal",
             Self::RuntimeTerminated => "RuntimeTerminated",
+            Self::OutcomeUnknown => "OutcomeUnknown",
         }
     }
 }
@@ -10719,6 +10730,7 @@ impl std::convert::TryFrom<&str> for RuntimeCompletionTerminalObservation {
             "CallbackPending" => Ok(Self::CallbackPending),
             "MachineTerminal" => Ok(Self::MachineTerminal),
             "RuntimeTerminated" => Ok(Self::RuntimeTerminated),
+            "OutcomeUnknown" => Ok(Self::OutcomeUnknown),
             other => Err(format!(
                 "invalid RuntimeCompletionTerminalObservation value `{other}`"
             )),
@@ -25768,6 +25780,12 @@ pub enum TransitionId {
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentRunning,
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentStopped,
     AuthorizeOperatorDurableTailRepairRefuseNonQuiescentDestroyed,
+    ResolveRuntimeCompletionResultOutcomeUnknownInitializing,
+    ResolveRuntimeCompletionResultOutcomeUnknownIdle,
+    ResolveRuntimeCompletionResultOutcomeUnknownAttached,
+    ResolveRuntimeCompletionResultOutcomeUnknownRunning,
+    ResolveRuntimeCompletionResultOutcomeUnknownRetired,
+    ResolveRuntimeCompletionResultOutcomeUnknownStopped,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

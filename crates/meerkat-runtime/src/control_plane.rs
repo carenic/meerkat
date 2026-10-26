@@ -126,6 +126,18 @@ impl RunlessTerminalConvergenceError {
         }
     }
 
+    /// A carrier only a repeat of a cold predecessor settlement converges:
+    /// it fails closed as corruption does, typed as the blocked repair it is.
+    fn settlement_repeat_required(context: &'static str, reason: impl Into<String>) -> Self {
+        Self::Corrupt {
+            context,
+            error: RuntimeDriverError::RecoveryRepairBlocked {
+                evidence_digest: None,
+                reason: reason.into(),
+            },
+        }
+    }
+
     fn retryable(context: &'static str, reason: impl Into<String>) -> Self {
         Self::Retryable {
             context,
@@ -494,6 +506,18 @@ async fn drain_recovered_runless_runtime_terminations_classified(
             // owned by RuntimeLoop.
             continue;
         };
+        // The outcome-unknown answer of a cold predecessor settlement that
+        // stopped after its sweep commit: only a repeat of that settlement
+        // publishes it.
+        if terminal_observation
+            == crate::meerkat_machine::dsl::RuntimeCompletionTerminalObservation::OutcomeUnknown
+        {
+            return Err(RunlessTerminalConvergenceError::settlement_repeat_required(
+                "validating a committed recovery carrier",
+                "an outcome-unknown answer of a cold predecessor settlement is still owed; \
+                 repeat the settlement first",
+            ));
+        }
         if terminal.is_some()
             || completion_error_metadata.is_some()
             || terminal_observation

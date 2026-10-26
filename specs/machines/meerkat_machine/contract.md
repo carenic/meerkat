@@ -1357,7 +1357,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 ### `AuthorizedRuntimeCompletionResultClosure`
 - Authority: `RuntimeCompletionResultAuthority`
 - Source Inputs: `ResolveRuntimeCompletionResult`, `ResolveCheckpointCompletionResult`, `ResolveAbandonedCompletionResult`
-- Transitions: `ResolveRuntimeCompletionResultCompletedInitializing`, `ResolveRuntimeCompletionResultCompletedIdle`, `ResolveRuntimeCompletionResultCompletedAttached`, `ResolveRuntimeCompletionResultCompletedRunning`, `ResolveRuntimeCompletionResultCompletedRetired`, `ResolveRuntimeCompletionResultCompletedStopped`, `ResolveRuntimeCompletionResultWithoutResultInitializing`, `ResolveRuntimeCompletionResultWithoutResultIdle`, `ResolveRuntimeCompletionResultWithoutResultAttached`, `ResolveRuntimeCompletionResultWithoutResultRunning`, `ResolveRuntimeCompletionResultWithoutResultRetired`, `ResolveRuntimeCompletionResultWithoutResultStopped`, `ResolveRuntimeCompletionResultCallbackPendingInitializing`, `ResolveRuntimeCompletionResultCallbackPendingIdle`, `ResolveRuntimeCompletionResultCallbackPendingAttached`, `ResolveRuntimeCompletionResultCallbackPendingRunning`, `ResolveRuntimeCompletionResultCallbackPendingRetired`, `ResolveRuntimeCompletionResultCallbackPendingStopped`, `ResolveRuntimeCompletionResultCancelledInitializing`, `ResolveRuntimeCompletionResultCancelledIdle`, `ResolveRuntimeCompletionResultCancelledAttached`, `ResolveRuntimeCompletionResultCancelledRunning`, `ResolveRuntimeCompletionResultCancelledRetired`, `ResolveRuntimeCompletionResultCancelledStopped`, `ResolveRuntimeCompletionResultRuntimeApplyFailedInitializing`, `ResolveRuntimeCompletionResultRuntimeApplyFailedIdle`, `ResolveRuntimeCompletionResultRuntimeApplyFailedAttached`, `ResolveRuntimeCompletionResultRuntimeApplyFailedRunning`, `ResolveRuntimeCompletionResultRuntimeApplyFailedRetired`, `ResolveRuntimeCompletionResultRuntimeApplyFailedStopped`, `ResolveRuntimeCompletionResultMachineFailedInitializing`, `ResolveRuntimeCompletionResultMachineFailedIdle`, `ResolveRuntimeCompletionResultMachineFailedAttached`, `ResolveRuntimeCompletionResultMachineFailedRunning`, `ResolveRuntimeCompletionResultMachineFailedRetired`, `ResolveRuntimeCompletionResultMachineFailedStopped`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultInitializing`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultIdle`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultAttached`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultRunning`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultRetired`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultStopped`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultInitializing`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultIdle`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultAttached`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultRunning`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultRetired`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultStopped`, `ResolveRuntimeCompletionResultRuntimeTerminatedInitializing`, `ResolveRuntimeCompletionResultRuntimeTerminatedIdle`, `ResolveRuntimeCompletionResultRuntimeTerminatedAttached`, `ResolveRuntimeCompletionResultRuntimeTerminatedRunning`, `ResolveRuntimeCompletionResultRuntimeTerminatedRetired`, `ResolveRuntimeCompletionResultRuntimeTerminatedStopped`, `ResolveCheckpointCompletionResultSucceededInitializing`, `ResolveCheckpointCompletionResultSucceededIdle`, `ResolveCheckpointCompletionResultSucceededAttached`, `ResolveCheckpointCompletionResultSucceededRunning`, `ResolveCheckpointCompletionResultSucceededRetired`, `ResolveCheckpointCompletionResultSucceededStopped`, `ResolveCheckpointCompletionResultFailedInitializing`, `ResolveCheckpointCompletionResultFailedIdle`, `ResolveCheckpointCompletionResultFailedAttached`, `ResolveCheckpointCompletionResultFailedRunning`, `ResolveCheckpointCompletionResultFailedRetired`, `ResolveCheckpointCompletionResultFailedStopped`, `ResolveAbandonedCompletionResultRuntimeApplyFailedInitializing`, `ResolveAbandonedCompletionResultRuntimeApplyFailedIdle`, `ResolveAbandonedCompletionResultRuntimeApplyFailedAttached`, `ResolveAbandonedCompletionResultRuntimeApplyFailedRunning`, `ResolveAbandonedCompletionResultRuntimeApplyFailedRetired`, `ResolveAbandonedCompletionResultRuntimeApplyFailedStopped`, `ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed`
+- Transitions: `ResolveRuntimeCompletionResultCompletedInitializing`, `ResolveRuntimeCompletionResultCompletedIdle`, `ResolveRuntimeCompletionResultCompletedAttached`, `ResolveRuntimeCompletionResultCompletedRunning`, `ResolveRuntimeCompletionResultCompletedRetired`, `ResolveRuntimeCompletionResultCompletedStopped`, `ResolveRuntimeCompletionResultWithoutResultInitializing`, `ResolveRuntimeCompletionResultWithoutResultIdle`, `ResolveRuntimeCompletionResultWithoutResultAttached`, `ResolveRuntimeCompletionResultWithoutResultRunning`, `ResolveRuntimeCompletionResultWithoutResultRetired`, `ResolveRuntimeCompletionResultWithoutResultStopped`, `ResolveRuntimeCompletionResultCallbackPendingInitializing`, `ResolveRuntimeCompletionResultCallbackPendingIdle`, `ResolveRuntimeCompletionResultCallbackPendingAttached`, `ResolveRuntimeCompletionResultCallbackPendingRunning`, `ResolveRuntimeCompletionResultCallbackPendingRetired`, `ResolveRuntimeCompletionResultCallbackPendingStopped`, `ResolveRuntimeCompletionResultCancelledInitializing`, `ResolveRuntimeCompletionResultCancelledIdle`, `ResolveRuntimeCompletionResultCancelledAttached`, `ResolveRuntimeCompletionResultCancelledRunning`, `ResolveRuntimeCompletionResultCancelledRetired`, `ResolveRuntimeCompletionResultCancelledStopped`, `ResolveRuntimeCompletionResultRuntimeApplyFailedInitializing`, `ResolveRuntimeCompletionResultRuntimeApplyFailedIdle`, `ResolveRuntimeCompletionResultRuntimeApplyFailedAttached`, `ResolveRuntimeCompletionResultRuntimeApplyFailedRunning`, `ResolveRuntimeCompletionResultRuntimeApplyFailedRetired`, `ResolveRuntimeCompletionResultRuntimeApplyFailedStopped`, `ResolveRuntimeCompletionResultMachineFailedInitializing`, `ResolveRuntimeCompletionResultMachineFailedIdle`, `ResolveRuntimeCompletionResultMachineFailedAttached`, `ResolveRuntimeCompletionResultMachineFailedRunning`, `ResolveRuntimeCompletionResultMachineFailedRetired`, `ResolveRuntimeCompletionResultMachineFailedStopped`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultInitializing`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultIdle`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultAttached`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultRunning`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultRetired`, `ResolveRuntimeCompletionResultFinalizationFailureWithResultStopped`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultInitializing`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultIdle`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultAttached`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultRunning`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultRetired`, `ResolveRuntimeCompletionResultFinalizationFailureWithoutResultStopped`, `ResolveRuntimeCompletionResultRuntimeTerminatedInitializing`, `ResolveRuntimeCompletionResultRuntimeTerminatedIdle`, `ResolveRuntimeCompletionResultRuntimeTerminatedAttached`, `ResolveRuntimeCompletionResultRuntimeTerminatedRunning`, `ResolveRuntimeCompletionResultRuntimeTerminatedRetired`, `ResolveRuntimeCompletionResultRuntimeTerminatedStopped`, `ResolveRuntimeCompletionResultOutcomeUnknownInitializing`, `ResolveRuntimeCompletionResultOutcomeUnknownIdle`, `ResolveRuntimeCompletionResultOutcomeUnknownAttached`, `ResolveRuntimeCompletionResultOutcomeUnknownRunning`, `ResolveRuntimeCompletionResultOutcomeUnknownRetired`, `ResolveRuntimeCompletionResultOutcomeUnknownStopped`, `ResolveCheckpointCompletionResultSucceededInitializing`, `ResolveCheckpointCompletionResultSucceededIdle`, `ResolveCheckpointCompletionResultSucceededAttached`, `ResolveCheckpointCompletionResultSucceededRunning`, `ResolveCheckpointCompletionResultSucceededRetired`, `ResolveCheckpointCompletionResultSucceededStopped`, `ResolveCheckpointCompletionResultFailedInitializing`, `ResolveCheckpointCompletionResultFailedIdle`, `ResolveCheckpointCompletionResultFailedAttached`, `ResolveCheckpointCompletionResultFailedRunning`, `ResolveCheckpointCompletionResultFailedRetired`, `ResolveCheckpointCompletionResultFailedStopped`, `ResolveAbandonedCompletionResultRuntimeApplyFailedInitializing`, `ResolveAbandonedCompletionResultRuntimeApplyFailedIdle`, `ResolveAbandonedCompletionResultRuntimeApplyFailedAttached`, `ResolveAbandonedCompletionResultRuntimeApplyFailedRunning`, `ResolveAbandonedCompletionResultRuntimeApplyFailedRetired`, `ResolveAbandonedCompletionResultRuntimeApplyFailedStopped`, `ResolveRuntimeCompletionResultRuntimeTerminatedDestroyedDestroyed`
 - Guard Expansion:
   - `ResolveRuntimeCompletionResultCompletedInitializing`: `session_registered`, `run_correlated`, `finalization_succeeded`, `terminal_run_result`
   - `ResolveRuntimeCompletionResultCompletedIdle`: `session_registered`, `run_correlated`, `finalization_succeeded`, `terminal_run_result`
@@ -1413,6 +1413,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `ResolveRuntimeCompletionResultRuntimeTerminatedRunning`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_runtime_terminated`
   - `ResolveRuntimeCompletionResultRuntimeTerminatedRetired`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_runtime_terminated`
   - `ResolveRuntimeCompletionResultRuntimeTerminatedStopped`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_runtime_terminated`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownInitializing`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownIdle`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownAttached`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownRunning`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownRetired`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
+  - `ResolveRuntimeCompletionResultOutcomeUnknownStopped`: `session_registered`, `no_run_result`, `finalization_succeeded`, `terminal_outcome_unknown`
   - `ResolveCheckpointCompletionResultSucceededInitializing`: `session_registered`, `checkpoint_input`, `exact_consumed_checkpoint`, `all_recipients_consumed_by_run`, `finalization_succeeded`
   - `ResolveCheckpointCompletionResultSucceededIdle`: `session_registered`, `checkpoint_input`, `exact_consumed_checkpoint`, `all_recipients_consumed_by_run`, `finalization_succeeded`
   - `ResolveCheckpointCompletionResultSucceededAttached`: `session_registered`, `checkpoint_input`, `exact_consumed_checkpoint`, `all_recipients_consumed_by_run`, `finalization_succeeded`
@@ -6731,6 +6737,72 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `terminal_runtime_terminated`
 - Emits: `RuntimeCompletionResultResolved`
 - To: `Destroyed`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownInitializing`
+- From: `Initializing`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Initializing`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownIdle`
+- From: `Idle`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Idle`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownAttached`
+- From: `Attached`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Attached`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownRunning`
+- From: `Running`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Running`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownRetired`
+- From: `Retired`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Retired`
+
+### `ResolveRuntimeCompletionResultOutcomeUnknownStopped`
+- From: `Stopped`
+- On: `ResolveRuntimeCompletionResult`(run_id, terminal, finalization)
+- Guards:
+  - `session_registered`
+  - `no_run_result`
+  - `finalization_succeeded`
+  - `terminal_outcome_unknown`
+- Emits: `RuntimeCompletionResultResolved`
+- To: `Stopped`
 
 ### `ResolveRuntimeCompletionCleanupArchivedInitializing`
 - From: `Initializing`

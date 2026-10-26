@@ -1856,6 +1856,25 @@ impl meerkat_mob::MobSessionService for RpcMobSessionService {
             .await
     }
 
+    /// A mob host settles a cold member's predecessor through the wrapped
+    /// persistent service and its canonical machine; the trait default would
+    /// refuse it `Unsupported`.
+    async fn settle_cold_predecessor_with_mob_lifecycle_authority_before(
+        &self,
+        session_id: &SessionId,
+        claim: &meerkat_core::session_hosting::HostingClaim,
+        deadline: meerkat_core::time_compat::Instant,
+    ) -> Result<meerkat_runtime::ColdPredecessorSettlement, meerkat::ColdPredecessorSettleError>
+    {
+        <PersistentSessionService<FactoryAgentBuilder> as meerkat_mob::MobSessionService>::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+            &self.service,
+            session_id,
+            claim,
+            deadline,
+        )
+        .await
+    }
+
     async fn discard_live_session_under_runtime_turn_boundary(
         &self,
         session_id: &SessionId,
@@ -15679,6 +15698,20 @@ fn completion_outcome_to_rpc_result(
             message: format!("runtime terminated: {reason}"),
             data: Some(serde_json::json!({
                 "error": turn_error,
+            })),
+        }),
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        CompletionOutcome::OutcomeUnknown { run_id } => Err(RpcError {
+            code: error::INTERNAL_ERROR,
+            message: format!(
+                "outcome unknown: run {run_id} consumed the input without a receipt; do not resubmit it"
+            ),
+            data: Some(serde_json::json!({
+                "session_id": session_id.to_string(),
+                "kind": "outcome_unknown",
+                "run_id": run_id.to_string(),
+                "resumable": false,
             })),
         }),
     }
@@ -30425,6 +30458,42 @@ mod tests {
         assert!(
             matches!(appended, Err(SessionError::NotFound { ref id }) if id == &missing_session),
             "RPC-hosted mob members must reach the persistent owner instead of the Unsupported default: {appended:?}"
+        );
+    }
+
+    /// RPC-hosted mob members settle a cold predecessor through the
+    /// persistent owner: the settlement's own checks answer (a claim of
+    /// another session refused `ClaimNotOwned`, nothing touched), not the
+    /// trait default's `Unsupported`.
+    #[cfg(feature = "mob")]
+    #[tokio::test]
+    async fn mob_session_service_forwards_the_cold_predecessor_settlement_to_persistent_owner() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = make_runtime(temp_factory(&temp), 10);
+        let service = runtime.session_service();
+        let settled = SessionId::new();
+        let other_session_claim = runtime
+            .service
+            .grant_session_hosting(&SessionId::new())
+            .expect("a hosting claim of another session");
+
+        let refused =
+            meerkat_mob::MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before(
+                service.as_ref(),
+                &settled,
+                &other_session_claim,
+                meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10),
+            )
+            .await
+            .expect_err("a claim of another session settles nothing");
+        assert!(
+            matches!(
+                refused.refusal,
+                meerkat::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::ClaimNotOwned
+                )
+            ),
+            "RPC-hosted mob members must reach the persistent owner instead of the Unsupported default: {refused:?}"
         );
     }
 

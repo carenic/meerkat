@@ -2384,6 +2384,12 @@ pub enum InteractionFailureReason {
         /// Human-readable extraction failure reason.
         reason: String,
     },
+    /// A run consumed the interaction's input at a boundary that a recovery
+    /// committed without the input's receipt, and a later settlement of the
+    /// session answered it: what the run did for this interaction is not
+    /// known. It is not a completion, and the interaction must not be
+    /// resubmitted because of it, since its run may have acted on it.
+    OutcomeUnknown,
 }
 
 impl InteractionFailureReason {
@@ -2417,6 +2423,10 @@ impl std::fmt::Display for InteractionFailureReason {
             Self::Abandoned { detail } => write!(f, "{detail}"),
             Self::InteractionStreamAbandoned { reason } => reason.fmt(f),
             Self::FinalizationFailed { detail } => write!(f, "{detail}"),
+            Self::OutcomeUnknown => write!(
+                f,
+                "outcome unknown: the run that consumed the input committed no receipt for it"
+            ),
         }
     }
 }

@@ -133,6 +133,16 @@ impl MeerkatMachine {
             .get(session_id)
             .filter(|entry| &entry.runtime_id == runtime_id)
             .ok_or_else(|| RuntimeControlPlaneError::NotFound(runtime_id.clone()))?;
+        // A predecessor settlement's internal registration is the
+        // settlement's alone: no control command acts on it.
+        if entry.is_predecessor_settlement() {
+            return Err(RuntimeControlPlaneError::Internal(
+                RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                }
+                .to_string(),
+            ));
+        }
         Ok(MutationGuardedControlEntry {
             driver: Arc::clone(&entry.driver),
             completions: Arc::clone(&entry.completions),

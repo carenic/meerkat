@@ -236,6 +236,37 @@ async fn the_tail_presence_check_fails_closed_for_a_persistent_service_that_does
     );
 }
 
+/// The trait default of the cold-predecessor settlement refuses, typed, and
+/// touches nothing: only a runtime-backed persistent service settles, so a
+/// wrapper must forward the call.
+#[tokio::test]
+async fn the_cold_predecessor_settlement_default_refuses_unsupported() {
+    let session_id = SessionId::new();
+    let machine = meerkat_runtime::MeerkatMachine::ephemeral();
+    let claim = machine
+        .grant_session_hosting(&session_id)
+        .expect("a storeless machine grants its own claim");
+    let refused = (UnforwardedTailCheckService { persistent: true })
+        .settle_cold_predecessor_with_mob_lifecycle_authority_before(
+            &session_id,
+            &claim,
+            meerkat_core::time_compat::Instant::now() + Duration::from_secs(1),
+        )
+        .await
+        .expect_err("the default settles nothing");
+    assert_eq!(refused.session_id, session_id);
+    assert!(
+        matches!(
+            refused.refusal,
+            meerkat_session::ColdPredecessorSettleRefusal::Session(SessionError::Unsupported(_))
+        ),
+        "{refused:?}"
+    );
+    assert!(refused.progress.tail.is_none());
+    assert!(refused.progress.inputs.is_empty());
+    assert!(refused.progress.owner_loss.is_none());
+}
+
 /// A resume spawn through a persistent session service that does not forward
 /// the durable tail presence check is refused with that typed refusal before
 /// anything reads or settles the session: the check fails closed, it is not

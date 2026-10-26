@@ -81,6 +81,10 @@ pub(crate) enum SettledGateWait {
     /// committed: ending the wait would strand the pending finalization, which
     /// the reload-required discard refuses.
     StagedUnregister,
+    /// A predecessor settlement's own internal registration: it never
+    /// attaches an executor, so no runtime loop or boundary commit of the
+    /// session can keep the gate, and its marker refuses every other taker.
+    UnattachedSettlement,
     /// A test fixture that installs test state under the gate.
     #[cfg(any(test, feature = "test-support"))]
     TestFixture,

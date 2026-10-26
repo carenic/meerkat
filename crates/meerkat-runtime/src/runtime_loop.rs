@@ -991,6 +991,53 @@ enum InteractionTerminalPublicationError {
     StaleAuthority(String),
     #[error("terminal publication corruption: {0}")]
     Corrupt(String),
+    /// A stored-only publication met a batch whose finalization needs a
+    /// session checkpoint, which only an executor takes. Nothing of the
+    /// batch was finalized.
+    #[error("terminal publication needs an executor's session checkpoint: {0}")]
+    CheckpointRequired(String),
+}
+
+/// What publishes a terminal batch: the runtime loop's executor or, for a
+/// session no executor serves, a stored-only publication handle that writes
+/// the session's durable event log. Only an executor checkpoints a session:
+/// a stored-only publisher refuses a batch that needs a checkpoint, typed,
+/// before anything of it is finalized, and never defers it.
+pub(crate) enum TerminalPublisher<'a> {
+    Executor(&'a mut dyn meerkat_core::lifecycle::CoreExecutor),
+    StoredOnly(&'a dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle),
+}
+
+impl<'a> TerminalPublisher<'a> {
+    async fn publish_interaction_terminals(
+        &mut self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        match self {
+            Self::Executor(executor) => executor.publish_interaction_terminals(events).await,
+            Self::StoredOnly(handle) => handle.publish_interaction_terminals(events).await,
+        }
+    }
+
+    /// The executor that checkpoints the session for a batch that needs it,
+    /// or the typed refusal of a stored-only publisher.
+    fn checkpointing_executor<'s>(
+        &'s mut self,
+        context: &str,
+    ) -> Result<
+        &'s mut (dyn meerkat_core::lifecycle::CoreExecutor + 'a),
+        InteractionTerminalPublicationError,
+    > {
+        match self {
+            Self::Executor(executor) => Ok(&mut **executor),
+            Self::StoredOnly(_) => Err(InteractionTerminalPublicationError::CheckpointRequired(
+                context.to_string(),
+            )),
+        }
+    }
 }
 
 impl InteractionTerminalPublicationError {
@@ -1051,6 +1098,19 @@ impl InteractionTerminalPublicationError {
             other => Self::Corrupt(format!("{context}: {other}")),
         }
     }
+
+    /// The driver error a caller outside the runtime loop reports for a
+    /// failed recovered-terminal drain.
+    fn into_driver_error(self) -> crate::RuntimeDriverError {
+        match self {
+            Self::Retryable(detail) => crate::RuntimeDriverError::Internal(detail),
+            Self::StaleAuthority(reason) => crate::RuntimeDriverError::StaleAuthority { reason },
+            Self::Corrupt(reason) => crate::RuntimeDriverError::RecoveryCorruption { reason },
+            Self::CheckpointRequired(reason) => {
+                crate::RuntimeDriverError::ValidationFailed { reason }
+            }
+        }
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1100,7 +1160,7 @@ async fn finalize_publish_and_resolve_runtime_terminals(
         post_commit_hooks,
         completions,
         Some(authority_guard),
-        executor,
+        &mut TerminalPublisher::Executor(&mut *executor),
         &persisted_input_ids,
         &persisted_interaction_ids,
         &batch_key,
@@ -1618,7 +1678,7 @@ async fn publish_authorized_runtime_terminal_batch(
     post_commit_hooks: &std::sync::Arc<meerkat_core::PostCommitHookDispatcher>,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
     authority_guard: Option<crate::tokio::sync::OwnedMutexGuard<()>>,
-    executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+    publisher: &mut TerminalPublisher<'_>,
     input_ids: &[InputId],
     interaction_ids: &[InteractionId],
     batch_key: &crate::input_state::InteractionTerminalBatchKey,
@@ -1872,7 +1932,7 @@ async fn publish_authorized_runtime_terminal_batch(
                     )
                 })?;
         }
-        let receipts = executor
+        let receipts = publisher
             .publish_interaction_terminals(events)
             .await
             .map_err(|error| {
@@ -1991,7 +2051,62 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
     _authority_guard: &crate::tokio::sync::OwnedMutexGuard<()>,
 ) -> Result<(), InteractionTerminalPublicationError> {
-    drain_recovered_input_terminal_completions(driver, completions, executor).await?;
+    drain_recovered_terminals_with(
+        driver,
+        post_commit_hooks,
+        completions,
+        &mut TerminalPublisher::Executor(executor),
+    )
+    .await
+}
+
+/// The runtime loop's startup terminal drain, run for a session no executor
+/// serves: every pending terminal-completion batch is finalized, and every
+/// unpublished interaction terminal is published through `publication`, a
+/// stored-only publication handle, under the same generated completion
+/// authority as the loop's own startup drain. It holds no runtime gate, takes
+/// the driver lock only for each read, finalization and receipt write, and
+/// never across a publication. A batch that needs a session checkpoint is
+/// refused typed before anything of it is finalized.
+pub(crate) async fn drain_recovered_terminals_with_stored_only_publisher(
+    driver: &crate::meerkat_machine::SharedDriver,
+    post_commit_hooks: &std::sync::Arc<meerkat_core::PostCommitHookDispatcher>,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    publication: &dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle,
+) -> Result<(), crate::RuntimeDriverError> {
+    drain_recovered_terminals_with(
+        driver,
+        post_commit_hooks,
+        completions,
+        &mut TerminalPublisher::StoredOnly(publication),
+    )
+    .await
+    .map_err(InteractionTerminalPublicationError::into_driver_error)
+}
+
+async fn drain_recovered_terminals_with(
+    driver: &crate::meerkat_machine::SharedDriver,
+    post_commit_hooks: &std::sync::Arc<meerkat_core::PostCommitHookDispatcher>,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    publisher: &mut TerminalPublisher<'_>,
+) -> Result<(), InteractionTerminalPublicationError> {
+    // A store-owned durable-tail recovery can end inputs this driver still
+    // holds, with their terminal batch, after the registration recovered
+    // them (a materialization's own recovery runs between the registration
+    // and the attach). Their terminals and carriers are adopted first, so
+    // the drain finds every pending owner the store names in the live shell.
+    driver
+        .lock()
+        .await
+        .adopt_durable_consumed_inputs(completions)
+        .await
+        .map_err(|error| {
+            InteractionTerminalPublicationError::from_driver(
+                "recovered input terminal adoption failed",
+                error,
+            )
+        })?;
+    drain_recovered_input_terminal_completions_with(driver, completions, publisher).await?;
     let batches = driver
         .lock()
         .await
@@ -2066,6 +2181,10 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
                 let committed_snapshot = if finalized_receipt.is_none()
                     && requires_external_session_checkpoint
                 {
+                    // Refused before anything of the batch is finalized.
+                    publisher.checkpointing_executor(
+                        "a recovered interaction terminal batch needs a session checkpoint",
+                    )?;
                     Some(
                         driver
                             .lock()
@@ -2111,7 +2230,10 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
                     };
                     (finalization, finalization_error)
                 } else if let Some(snapshot) = committed_snapshot {
-                    match executor
+                    match publisher
+                        .checkpointing_executor(
+                            "a recovered interaction terminal batch needs a session checkpoint",
+                        )?
                         .checkpoint_committed_session_snapshot(snapshot)
                         .await
                     {
@@ -2141,7 +2263,7 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
                     post_commit_hooks,
                     completions,
                     None,
-                    executor,
+                    publisher,
                     &input_ids,
                     &interaction_ids,
                     &batch_key,
@@ -2164,7 +2286,7 @@ async fn drain_recovered_interaction_terminal_outboxes_under_authority(
                     post_commit_hooks,
                     completions,
                     None,
-                    executor,
+                    publisher,
                     &input_ids,
                     &interaction_ids,
                     &batch_key,
@@ -2192,14 +2314,31 @@ pub(crate) async fn test_drain_recovered_input_terminal_completions(
         .map_err(|error| error.to_string())
 }
 
-/// Finalize every durable non-directed terminal candidate before startup can
-/// accept work. Directed batches continue through the interaction outbox
-/// below, whose shared authorized bundle finalizes this same receipt before
-/// event publication and waiter delivery.
+/// Finalize every durable non-directed terminal candidate, with `executor`
+/// as the publisher. The startup drain runs this through
+/// [`drain_recovered_terminals_with`]; tests drive it alone.
+#[cfg(test)]
 async fn drain_recovered_input_terminal_completions(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
     executor: &mut dyn meerkat_core::lifecycle::CoreExecutor,
+) -> Result<(), InteractionTerminalPublicationError> {
+    drain_recovered_input_terminal_completions_with(
+        driver,
+        completions,
+        &mut TerminalPublisher::Executor(executor),
+    )
+    .await
+}
+
+/// Finalize every durable non-directed terminal candidate before startup can
+/// accept work. Directed batches continue through the interaction outbox
+/// below, whose shared authorized bundle finalizes this same receipt before
+/// event publication and waiter delivery.
+async fn drain_recovered_input_terminal_completions_with(
+    driver: &crate::meerkat_machine::SharedDriver,
+    completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
+    publisher: &mut TerminalPublisher<'_>,
 ) -> Result<(), InteractionTerminalPublicationError> {
     let batches = driver
         .lock()
@@ -2241,6 +2380,10 @@ async fn drain_recovered_input_terminal_completions(
             false
         };
         let (finalization, finalization_error) = if requires_external_session_checkpoint {
+            // Refused before anything of the batch is finalized.
+            publisher.checkpointing_executor(
+                "a recovered terminal completion batch needs a session checkpoint",
+            )?;
             let snapshot = driver
                 .lock()
                 .await
@@ -2258,7 +2401,10 @@ async fn drain_recovered_input_terminal_completions(
                             .to_string(),
                     )
                 })?;
-            match executor
+            match publisher
+                .checkpointing_executor(
+                    "a recovered terminal completion batch needs a session checkpoint",
+                )?
                 .checkpoint_committed_session_snapshot(snapshot)
                 .await
             {
@@ -2408,6 +2554,14 @@ async fn drain_recovered_interaction_terminal_outboxes_until_clear(
                 tracing::error!(
                     error = %error,
                     "interaction terminal recovery failed closed on durable corruption"
+                );
+                return true;
+            }
+            Err(InteractionTerminalPublicationError::CheckpointRequired(error)) => {
+                tracing::error!(
+                    error = %error,
+                    "interaction terminal recovery failed closed: an executor publisher always \
+                     checkpoints, so this refusal is unreachable here"
                 );
                 return true;
             }
@@ -2622,7 +2776,7 @@ async fn recover_committed_runtime_projections_before_teardown(
                         ),
                     }
                 })?),
-                executor,
+                &mut TerminalPublisher::Executor(&mut *executor),
                 &pending.input_ids,
                 &[],
                 &batch_key,

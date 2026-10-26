@@ -839,6 +839,16 @@ class InteractionFailureReasonExtractionFailed(TypedDict, total=False):
     reason: Required[str]
 
 
+class InteractionFailureReasonOutcomeUnknown(TypedDict, total=False):
+    """A run consumed the interaction's input at a boundary that a recovery
+    committed without the input's receipt, and a later settlement of the
+    session answered it: what the run did for this interaction is not
+    known. It is not a completion, and the interaction must not be
+    resubmitted because of it, since its run may have acted on it.
+    """
+    kind: Required[Literal['outcome_unknown']]
+
+
 # Typed reason an interaction-scoped run failed (terminal event for tap
 # subscribers).
 #
@@ -847,7 +857,7 @@ class InteractionFailureReasonExtractionFailed(TypedDict, total=False):
 # never a separately-carried field.
 #
 # [`Display`]: std::fmt::Display
-InteractionFailureReason = InteractionFailureReasonCancelled | InteractionFailureReasonAbandoned | InteractionFailureReasonInteractionStreamAbandoned | InteractionFailureReasonFinalizationFailed | InteractionFailureReasonExtractionFailed
+InteractionFailureReason = InteractionFailureReasonCancelled | InteractionFailureReasonAbandoned | InteractionFailureReasonInteractionStreamAbandoned | InteractionFailureReasonFinalizationFailed | InteractionFailureReasonExtractionFailed | InteractionFailureReasonOutcomeUnknown
 
 
 # Typed cause of a committed live channel close.

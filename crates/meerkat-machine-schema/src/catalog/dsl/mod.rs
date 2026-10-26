@@ -396,6 +396,7 @@ fn meerkat_queue_to_run_command_plans() -> Vec<CommandPlanSchema> {
         "ResolveRuntimeCompletionResultFinalizationFailureWithResult",
         "ResolveRuntimeCompletionResultFinalizationFailureWithoutResult",
         "ResolveRuntimeCompletionResultRuntimeTerminated",
+        "ResolveRuntimeCompletionResultOutcomeUnknown",
         "ResolveCheckpointCompletionResultSucceeded",
         "ResolveCheckpointCompletionResultFailed",
         "ResolveAbandonedCompletionResultRuntimeApplyFailed",
@@ -2619,6 +2620,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "RuntimeApplyFailed",
                     "FinalizationFailed",
                     "RuntimeTerminated",
+                    "OutcomeUnknown",
                 ],
             ),
             NamedTypeBinding::string_enum(
@@ -2629,6 +2631,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "CallbackPending",
                     "MachineTerminal",
                     "RuntimeTerminated",
+                    "OutcomeUnknown",
                 ],
             ),
             NamedTypeBinding::string_enum(
@@ -2670,6 +2673,7 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
                     "AbandonedWithError",
                     "CompletedWithFinalizationFailure",
                     "RuntimeTerminated",
+                    "OutcomeUnknown",
                 ],
             ),
             NamedTypeBinding::string_enum(

@@ -1247,6 +1247,7 @@ pub use agent_mandate::{
 pub(crate) mod scoped_context;
 mod service_call;
 pub use service_call::{ServiceCall, ServiceCallAuditError, ServiceCallOutcome};
+mod predecessor_settlement;
 mod session_management;
 mod session_mutation_gate;
 mod terminal_receipt;
@@ -1268,6 +1269,11 @@ pub(crate) use session_management::{
 };
 
 pub use composition::{MeerkatCompositionSignalDispatcher, MeerkatConsumerSurface};
+pub use predecessor_settlement::{
+    ColdPredecessorSettlement, MachinePredecessorSettlementLease, PredecessorOwnerLoss,
+    PredecessorPublication, PredecessorPublicationRefused, PredecessorSettlementRefusal,
+    PredecessorTailCommit, PredecessorWork, SettledBy, SettledInput,
+};
 pub use runtime_control::RuntimeCompletionWaitFailureAuthority;
 
 pub use comms_drain::{
@@ -1772,6 +1778,26 @@ impl UnregisterTeardownMechanicalObservations {
     }
 }
 
+/// Why a registration was inserted mechanically, without a serving owner.
+/// An ordinary registration has none.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MechanicalRegistration {
+    /// Reconstructed solely for archive convergence. `from_quiescent`: the
+    /// archive recovery began from durable Retired/Destroyed truth, a
+    /// public-result fact only that never substitutes for cleanup ownership.
+    Archive { from_quiescent: bool },
+    /// The internal, non-serving registration of a predecessor settlement
+    /// (`predecessor_settlement`). Its marker refuses, with
+    /// `UnregisterInProgress` and at each path's first decision, every path
+    /// that could make it live or end it: registration and adoption,
+    /// executor and exact-materialization claims, admission, control and
+    /// lifecycle commands, explicit and quiescent unregister, stop, and the
+    /// reload of a degraded registration. Only the settlement takes its
+    /// mutation gate, and only the settlement removes it, exactly and without
+    /// retiring anything.
+    PredecessorSettlement,
+}
+
 /// Per-session state: driver + generated authority binding + shell handles.
 struct RuntimeSessionEntry {
     /// Canonical runtime control-plane identity for this registered session.
@@ -1805,14 +1831,11 @@ struct RuntimeSessionEntry {
     /// owner settled it, and no earlier registration of the lineage
     /// completed it. Historical record only.
     owner_loss_proof: Option<meerkat_core::session_hosting::HostingOwnerLossProof>,
-    /// Reconstructed solely for archive convergence. This cleanup ownership
-    /// survives caller timeout; ordinary/concurrent registrations never carry
-    /// it.
-    archive_recovered_registration: bool,
-    /// The archive recovery above began from durable Retired/Destroyed truth.
-    /// This is a public-result fact only and never substitutes for cleanup
-    /// ownership.
-    archive_recovered_from_quiescent: bool,
+    /// Why this registration was inserted mechanically, without a serving
+    /// owner: archive convergence or a predecessor settlement. Its cleanup
+    /// ownership survives caller timeout; ordinary and concurrent
+    /// registrations never carry one.
+    mechanical_registration: Option<MechanicalRegistration>,
     /// Per-session mutation gate (M). It carries this entry's
     /// `durability_health`, so every copy of it can end a live wait on the
     /// session's degradation (see [`SessionMutationGate`]).
@@ -6585,10 +6608,28 @@ impl RuntimeSessionEntry {
         }
     }
 
+    /// Whether this is a predecessor settlement's internal registration.
+    fn is_predecessor_settlement(&self) -> bool {
+        matches!(
+            self.mechanical_registration,
+            Some(MechanicalRegistration::PredecessorSettlement)
+        )
+    }
+
     fn dsl_mutation_blocked_by_unregister(
         &self,
         session_id: &SessionId,
     ) -> Option<RuntimeDriverError> {
+        if self.is_predecessor_settlement() {
+            // The settlement's internal registration never serves: every
+            // path that could make it live is refused while the settlement
+            // owns it, and it leaves only through the settlement's exact
+            // removal. Its own steps take M through the settlement and apply
+            // transitions on the driver directly.
+            return Some(RuntimeDriverError::UnregisterInProgress {
+                runtime_id: self.runtime_id.clone(),
+            });
+        }
         if self.pending_unregister_finalization.is_some() {
             return Some(RuntimeDriverError::UnregisterFinalizationOutcomeUnknown {
                 reason: format!(
@@ -8606,6 +8647,14 @@ impl MeerkatMachine {
             if !Arc::ptr_eq(&entry.driver, driver) {
                 return Err(RuntimeDriverError::NotReady {
                     state: RuntimeState::Destroyed,
+                });
+            }
+            // A settlement's internal registration is the settlement's alone:
+            // a path that takes M without staging a DSL input (a cancel point,
+            // an archive lease) is refused here, after the gate.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
                 });
             }
         }
@@ -11059,6 +11108,12 @@ pub struct MeerkatMachineShared {
     /// behind a wedged registration transaction or injected RuntimeStore read.
     pending_session_archive_lease_preparations:
         StdMutex<HashMap<SessionId, PendingSessionArchiveLeasePreparation>>,
+    /// Per-session single flight for the process-owned task of a predecessor
+    /// settlement: its terminal drain, closing census and exact removal. A
+    /// later settlement of the session waits for it, holding no gate, before
+    /// it begins.
+    pending_predecessor_settlements:
+        StdMutex<HashMap<SessionId, predecessor_settlement::PendingPredecessorSettlement>>,
     /// Per-session process-owned serialization for durable V5 direct-member
     /// semantic admission. The task never holds residency or registration
     /// authority while awaiting a custom store.
@@ -13194,6 +13249,7 @@ impl MeerkatMachine {
                 registration_transaction_slots: StdRwLock::new(HashMap::new()),
                 pending_runless_terminal_publications: StdMutex::new(HashMap::new()),
                 pending_session_archive_lease_preparations: StdMutex::new(HashMap::new()),
+                pending_predecessor_settlements: StdMutex::new(HashMap::new()),
                 pending_direct_member_bind_admissions: StdMutex::new(HashMap::new()),
                 store: None,
                 execution_custody: None,
@@ -13449,6 +13505,7 @@ impl MeerkatMachine {
                 registration_transaction_slots: StdRwLock::new(HashMap::new()),
                 pending_runless_terminal_publications: StdMutex::new(HashMap::new()),
                 pending_session_archive_lease_preparations: StdMutex::new(HashMap::new()),
+                pending_predecessor_settlements: StdMutex::new(HashMap::new()),
                 pending_direct_member_bind_admissions: StdMutex::new(HashMap::new()),
                 store: Some(store),
                 execution_custody,
