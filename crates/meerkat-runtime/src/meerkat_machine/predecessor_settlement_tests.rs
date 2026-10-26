@@ -2762,3 +2762,209 @@ async fn a_mixed_predecessor_is_settled_by_one_sweep_commit() {
     assert_eq!(host.placement_witness(&session_id).await, None);
     assert!(!host.machine.contains_session(&session_id).await);
 }
+
+/// An executor no settlement registration ever runs.
+struct IdleExecutor;
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutor for IdleExecutor {
+    async fn apply(
+        &mut self,
+        _run_id: RunId,
+        _primitive: meerkat_core::lifecycle::RunPrimitive,
+    ) -> Result<meerkat_core::lifecycle::core_executor::CoreApplyOutput, CoreExecutorError> {
+        Err(CoreExecutorError::Internal(
+            "a settlement registration never runs".to_string(),
+        ))
+    }
+
+    async fn cancel_after_boundary(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+
+    async fn stop_runtime_executor(&mut self, _reason: String) -> Result<(), CoreExecutorError> {
+        Ok(())
+    }
+}
+
+/// While the settlement's process-owned task holds the internal
+/// registration (its publication waits in a publisher the test holds),
+/// every caller that could make it live or end it is refused at its first
+/// decision, and none changes it:
+/// - a registration, an explicit unregister, a quiescent close of its exact
+///   witness, an explicit stop and an executor claim: typed
+///   `UnregisterInProgress`;
+/// - an exact-registration materialization of its witness:
+///   `RegistrationOwned`;
+/// - a retire, a reset, a destroy and an admission: the same refusal, and
+///   the admission writes no row.
+/// The entry keeps no unregister or stop coordinator, its registration use
+/// and its vacant materialization claim. Released, finish answers `Ok`, the
+/// registration is gone, and a fresh registration inserts.
+#[tokio::test]
+async fn every_live_caller_is_refused_while_the_settlement_task_holds_the_registration() {
+    let host = Host::head_canonical();
+    let (session_id, _q1, _d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(ScriptedPublisher::new(Script::HoldThenAppend));
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the drive answers");
+    host.machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep commits");
+    let use_before = {
+        let sessions = host.machine.sessions.read().await;
+        sessions
+            .get(&session_id)
+            .expect("the settlement's registration stands")
+            .registration_use()
+    };
+    let finishing = {
+        let machine = host.machine.clone();
+        let publisher = Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>;
+        crate::tokio::spawn(async move {
+            machine
+                .finish_predecessor_settlement_before(lease, Some(publisher), deadline())
+                .await
+        })
+    };
+    crate::tokio::time::timeout(BOUND, publisher.entered.notified())
+        .await
+        .expect("the task reached its publication");
+    let in_progress = |error: &dyn std::fmt::Display| {
+        error
+            .to_string()
+            .contains("Unregister teardown is still in progress")
+    };
+
+    registration_refused_unregister_in_progress(&host, &session_id).await;
+    let unregistering = host
+        .machine
+        .unregister_session(&session_id)
+        .await
+        .expect_err("an explicit unregister is refused");
+    assert!(
+        matches!(
+            unregistering,
+            RuntimeDriverError::UnregisterInProgress { .. }
+        ),
+        "{unregistering:?}"
+    );
+    let witness = host
+        .machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the settlement's registration has a witness");
+    let closing = host
+        .machine
+        .unregister_session_registration_until_terminal_if_quiescent(&witness)
+        .await
+        .expect_err("a quiescent close is refused");
+    assert!(
+        matches!(closing, RuntimeDriverError::UnregisterInProgress { .. }),
+        "{closing:?}"
+    );
+    let stopping = host
+        .machine
+        .stop_runtime_executor(&session_id, "an explicit stop")
+        .await
+        .expect_err("an explicit stop is refused");
+    assert!(
+        matches!(stopping, RuntimeDriverError::UnregisterInProgress { .. }),
+        "{stopping:?}"
+    );
+    let claiming = Arc::new(host.machine.clone())
+        .ensure_session_with_executor(session_id.clone(), Box::new(IdleExecutor))
+        .await
+        .expect_err("an executor claim is refused");
+    assert!(
+        matches!(claiming, RuntimeDriverError::UnregisterInProgress { .. }),
+        "{claiming:?}"
+    );
+    let materializing = Arc::new(host.machine.clone())
+        .prepare_local_session_materialization_for_registration(witness.clone())
+        .await
+        .expect_err("an exact-registration materialization is refused");
+    assert!(
+        matches!(materializing, RuntimeBindingsError::RegistrationOwned(_)),
+        "{materializing:?}"
+    );
+    let destroying = host
+        .machine
+        .execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::Destroy {
+                runtime_id: LogicalRuntimeId::for_session(&session_id),
+            },
+        )
+        .await
+        .expect_err("a destroy is refused");
+    assert!(in_progress(&destroying), "{destroying:?}");
+    let retiring = SessionServiceRuntimeExt::retire_runtime(&host.machine, &session_id)
+        .await
+        .expect_err("a retire is refused");
+    assert!(in_progress(&retiring), "{retiring:?}");
+    let resetting = SessionServiceRuntimeExt::reset_runtime(&host.machine, &session_id)
+        .await
+        .expect_err("a reset is refused");
+    assert!(in_progress(&resetting), "{resetting:?}");
+    let admitting = SessionServiceRuntimeExt::accept_input(
+        &host.machine,
+        &session_id,
+        prompt("admitted while the settlement owns the registration"),
+    )
+    .await
+    .expect_err("an admission is refused");
+    assert!(in_progress(&admitting), "{admitting:?}");
+    assert_eq!(
+        host.rows(&session_id).await.len(),
+        2,
+        "the refused admission wrote no row"
+    );
+    {
+        let sessions = host.machine.sessions.read().await;
+        let entry = sessions
+            .get(&session_id)
+            .expect("the settlement's registration stands");
+        assert!(entry.is_predecessor_settlement());
+        assert!(
+            entry.unregister_coordinator.is_none(),
+            "no unregister started"
+        );
+        assert!(
+            entry.runtime_stop_cleanup_coordinator.is_none(),
+            "no stop cleanup started"
+        );
+        assert!(entry.reload_required_discard_coordinator.is_none());
+        assert_eq!(entry.registration_use(), use_before, "nobody adopted it");
+        let claim_state = entry
+            .materialization_claim_state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(claim_state.current.is_none());
+        assert!(matches!(
+            claim_state.phase,
+            crate::RuntimeActorMaterializationClaimPhase::Vacant
+        ));
+    }
+    publisher.release.notify_one();
+
+    let publication = finishing
+        .await
+        .expect("the finish task joins")
+        .expect("the task removes its registration exactly and the census is complete");
+    assert_eq!(publication.durable_rows_closed, 2);
+    assert!(!host.machine.contains_session(&session_id).await);
+    host.machine
+        .register_session(session_id.clone())
+        .await
+        .expect("a fresh registration inserts");
+}
