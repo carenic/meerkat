@@ -97,6 +97,53 @@ them.
 
 ### Fixed
 
+- `meerkat-core`, `meerkat-session`: a compaction inside an open run no longer
+  folds the run's request or its newest round. Before, a run whose own rows
+  exceeded the compactor's retention budget kept only its request, and the
+  model, seeing a summary of a tool call it had already made, could make it
+  again. Now, at a round boundary after the run's first response, the agent
+  finds the run's first row (the input rows before its first response: the
+  prompt, injected context and the notices a peer, flow, external or job
+  input arrives as, found from the run id its assistant rows carry) and
+  compacts in two stages:
+  1. While the rows before the run hold a turn, only they are handed to the
+     compactor (and to a curator), and the run's own rows follow the summary
+     verbatim, for any compactor.
+  2. When nothing before the run is left, the run's own completed rounds are
+     folded, with any earlier summary, by the runtime itself; the run's
+     request and its newest round (its tool calls, their results and any
+     rows a tool appended after them) stay verbatim, and the summary ends by
+     naming every call the run's earlier rounds made, those an earlier fold
+     took out included, as already run (a call whose result was an error as
+     ran and failed, so it may still be made again). That list is kept in
+     the session metadata key `open_run_folded_calls` for the open run,
+     committed with each fold, and never read back from a summary's text;
+     each call's outcome comes from its own round, since some providers reuse
+     call ids in every round. The line names the newest 200 calls and counts
+     older ones by tool name. A long single run therefore keeps compacting,
+     one boundary later than before, and always sees the calls it made last.
+     A fold that would take out only one row is skipped.
+
+  A run whose newest round is its only one has nothing to fold: the attempt
+  is skipped before its summary call and recorded for cadence. A run's first
+  boundary, before its first response, compacts as before. Custom compactors:
+  inside a run the rows a compactor gets end with a complete turn, so a
+  rebuild that keeps the last user row and puts the summary first is now
+  refused there (the summary must stand at the first discarded row);
+  `CompactionWindow` and `CompactionCurator` document what they get.
+  `DefaultCompactor` keeps a newest turn's request verbatim only while that
+  turn has no final answer, so an answered turn is kept or folded whole and
+  never left reading as pending. `compaction_started` and
+  `compaction_completed` keep reporting over the whole transcript. When the
+  open run's own tool results push a request past the provider cap (also
+  after a model fallback, against the fallback's cap), that request (never
+  the stored transcript) carries each oversized result of the run, found
+  after the run's first row so a reused call id of an earlier run is never
+  cut, with its identity and the head of its text and a marker naming the
+  call; the compaction trigger and its post-compaction check still see the
+  unbounded size, and a request that still does not fit fails as
+  `RequestTooLarge`.
+
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
   start (`UnregisterQueuedInputs::Requeue`, which the graceful shutdowns of
   `rkat-rpc`, the REST server and a mob use by default for durable

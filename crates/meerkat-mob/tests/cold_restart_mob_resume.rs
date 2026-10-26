@@ -3950,8 +3950,11 @@ async fn mob_cold_restart_after_a_kill_following_a_mid_run_checkpoint_does_not_r
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
 
     // Compact at every model boundary after the session's first, keep one
-    // rewrite: the run's third tool round leaves two rewrites its durable
-    // head does not cover, so the fourth model boundary checkpoints first.
+    // rewrite. Nothing comes before the run, so each compaction folds the
+    // run's own completed rounds and keeps its newest; the boundary after
+    // its first round has nothing to fold. The run's fourth tool round
+    // therefore leaves two rewrites its durable head does not cover, so the
+    // fifth model boundary checkpoints first.
     let mut config = Config::default();
     config.compaction.history_retained_rewrites = 1;
     config.compaction.min_turns_between_compactions = 1;
@@ -3964,7 +3967,7 @@ async fn mob_cold_restart_after_a_kill_following_a_mid_run_checkpoint_does_not_r
     }
 
     // ---------------- Lifetime 1 ----------------
-    let client_1 = Arc::new(HoldingToolLoopClient::new(4));
+    let client_1 = Arc::new(HoldingToolLoopClient::new(5));
     let (service_1, store_1) = persistent_head_canonical_service_with(
         &paths,
         runtime_store.clone(),

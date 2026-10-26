@@ -62,7 +62,9 @@ A compaction during the run keeps the commits going. On a `sqlite` realm the
 next round commits on top of the compacted transcript. On a WholeBlob realm
 the run's next round commit after a compaction makes the compacted session
 document the session's new committed base, and later round commits continue
-on top of it, after any number of compactions. If the process stops between
+on top of it, after any number of compactions. A compaction inside a run
+keeps the run's request and newest round verbatim, and folds the rows before
+the run first, then the run's completed rounds. If the process stops between
 the compaction and that commit, the run continues from its previous commit
 and compacts again.
 
