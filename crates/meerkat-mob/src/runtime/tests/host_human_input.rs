@@ -5494,9 +5494,14 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
     .await
     .expect("the requeue stop finishes")
     .expect("requeue stop");
+    let events = stop_events(&root_path, &session_id).await;
+    let kickoff_run = events.iter().find_map(|event| match event {
+        AgentEvent::RunStarted { identity, .. } => identity.run_id.clone(),
+        _ => None,
+    });
     assert_eq!(
-        report.runs.get(&identity),
-        None,
+        (report.runs.get(&identity), kickoff_run.is_some()),
+        (None, true),
         "the first process keeps the kickoff and its run"
     );
     let rows_before = member_input_rows(&host.runtime_store, &session_id).await;
@@ -5518,9 +5523,24 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
         .await
         .expect("the member's runtime loop parks on the hold")
         .expect("park signal");
-    assert!(
-        held.adapter.resumable_run_id(&session_id).await.is_some(),
-        "the held registration keeps the kickoff's run marked"
+    let held_kickoff = held
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is restored")
+        .kickoff
+        .expect("the member has a kickoff");
+    assert_eq!(
+        (
+            held.adapter.resumable_run_id(&session_id).await,
+            held_kickoff.phase,
+        ),
+        (
+            kickoff_run.clone(),
+            crate::roster::MobMemberKickoffPhase::Starting,
+        ),
+        "the held registration keeps the kickoff's run marked, and the kickoff is still starting"
     );
     tokio::time::timeout(
         WAIT,
@@ -5557,6 +5577,16 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
         .expect("the member's runtime loop parks on the hold")
         .expect("park signal");
     let requests_while_held = restarted_client.requests().len();
+    let run_while_held = restarted.adapter.resumable_run_id(&session_id).await;
+    let phase_while_held = restarted
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("roster read")
+        .expect("the member is restored")
+        .kickoff
+        .expect("the member has a kickoff")
+        .phase;
     restarted
         .handle
         .release_member_run_starts(&identity, crate::HostRunStartHoldReason::ToolsNotPublished)
@@ -5577,13 +5607,22 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
     assert_eq!(
         (
             requests_while_held,
+            run_while_held,
+            phase_while_held,
             after.phase,
             after.objective_id == before.objective_id,
             requests_carrying(&restarted_client.requests(), KEPT_KICKOFF),
         ),
-        (0, crate::roster::MobMemberKickoffPhase::Started, true, 1),
-        "the host's release re-attaches the kept kickoff: its run resumes once and resolves it \
-         under the same objective"
+        (
+            0,
+            kickoff_run,
+            crate::roster::MobMemberKickoffPhase::Starting,
+            crate::roster::MobMemberKickoffPhase::Started,
+            true,
+            1,
+        ),
+        "the Keep left the kickoff starting with its run marked; the host's release re-attaches \
+         it, and its run resumes once and resolves it under the same objective"
     );
     tokio::time::timeout(WAIT, restarted.handle.shutdown())
         .await
