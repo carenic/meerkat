@@ -1206,10 +1206,11 @@ async fn a_claim_drive_proves_nothing_against_its_own_runtimes_registration_whol
 // The run of a prompt a graceful stop kept, cut by a power cut.
 // ---------------------------------------------------------------------------
 
-/// The max age, in milliseconds, of the graceful stop that keeps the prompt:
-/// the next start comes well inside it, and the start after the power cut
-/// waits it out.
-const KEPT_PROMPT_MAX_AGE_MS: u64 = 3_000;
+/// The max age of the graceful stop that keeps the prompt. It spans the
+/// prompt's admission, the stop, host 1's shutdown, the file copy and host 2's
+/// open up to its pre-serve age check, so a slow runner still runs the prompt
+/// inside it; the start after the power cut waits it out, idle.
+const KEPT_PROMPT_MAX_AGE: Duration = Duration::from_secs(30);
 
 /// The kept prompt's row, as `start`'s runtime store holds it.
 async fn kept_prompt_row(
@@ -1226,16 +1227,16 @@ async fn kept_prompt_row(
 }
 
 /// A graceful stop keeps a queued prompt for the next start (the requeue
-/// disposition, with a short max age), and the next start, inside that max
-/// age, runs it as an ordinary run, run B. The power goes out while run B
-/// waits on the model after its tool round's commit, and the next host opens
-/// the session once the stop's max age, counted from the prompt's admission,
-/// has passed. Run B resumes from its tail: it is the prompt's own run, which
-/// started, not a run the stop kept, so its crash is an ordinary one, not an
-/// expired stop. Run B's start cleared the stop's mark from the prompt, so
-/// the power cut left none. RED before: the mark stayed on the prompt while
-/// run B was open, and the host settled run B as `RequeueExpired` and closed
-/// it as interrupted instead of resuming it.
+/// disposition), and the next start, inside the stop's max age, runs it as an
+/// ordinary run, run B. The power goes out while run B waits on the model
+/// after its tool round's commit, and the next host opens the session once
+/// the stop's max age, counted from the prompt's admission, has passed. Run B
+/// resumes from its tail: it is the prompt's own run, which started, not a run
+/// the stop kept, so its crash is an ordinary one, not an expired stop. Run
+/// B's start cleared the stop's mark from the prompt, so the power cut left
+/// none. RED before: the mark stayed on the prompt while run B was open, and
+/// the host ended run B's input as `RequeueExpired` and closed run B as
+/// interrupted instead of resuming it.
 async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_age(
     head_canonical: bool,
 ) {
@@ -1282,7 +1283,7 @@ async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_a
         .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
             &registration,
             meerkat_runtime::UnregisterQueuedInputs::Requeue {
-                max_age: Duration::from_millis(KEPT_PROMPT_MAX_AGE_MS),
+                max_age: KEPT_PROMPT_MAX_AGE,
             },
         )
         .await
@@ -1297,17 +1298,15 @@ async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_a
         .expect("the kept prompt keeps its payload")
         .header()
         .timestamp;
+    let max_age_ms =
+        u64::try_from(KEPT_PROMPT_MAX_AGE.as_millis()).expect("the max age fits in milliseconds");
     assert_eq!(
         (
             stopped.seed.phase,
             stopped.seed.terminal_outcome,
             stopped.state.stop_requeue.map(|mark| mark.max_age_ms),
         ),
-        (
-            InputLifecycleState::Queued,
-            None,
-            Some(KEPT_PROMPT_MAX_AGE_MS)
-        ),
+        (InputLifecycleState::Queued, None, Some(max_age_ms)),
         "the stop keeps the prompt queued and marked for the next start"
     );
 
@@ -1320,6 +1319,15 @@ async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_a
     run_b_client.push(Step::Held);
     let second = restarted.open(&after_the_stop, &run_b_client);
     materialize_session(&second, restarted.stored_session(&second, &id).await).await;
+    let second_open_row = kept_prompt_row(&second, &id, &kept).await;
+    assert_ne!(
+        second_open_row.seed.terminal_outcome,
+        Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+            reason: meerkat_runtime::InputAbandonReason::RequeueExpired,
+        }),
+        "timing precondition: host 2 must open the session inside the stop's max age, counted \
+         from the prompt's admission; it opened later and expired the prompt instead of running it"
+    );
     tokio::time::timeout(DEADLINE, run_b_client.entered.acquire())
         .await
         .expect("the start inside the max age runs the kept prompt to its second model call")
@@ -1347,9 +1355,8 @@ async fn the_run_of_a_kept_prompt_resumes_after_a_power_cut_past_the_stops_max_a
 
     // The next host opens the session once the stop's max age has passed.
     let past_the_max_age = admitted_at
-        + chrono::Duration::milliseconds(
-            i64::try_from(KEPT_PROMPT_MAX_AGE_MS).expect("the max age fits") + 500,
-        );
+        + chrono::Duration::from_std(KEPT_PROMPT_MAX_AGE + Duration::from_millis(500))
+            .expect("the max age is a chrono duration");
     if let Ok(wait) = (past_the_max_age - chrono::Utc::now()).to_std() {
         tokio::time::sleep(wait).await;
     }

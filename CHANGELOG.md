@@ -44,12 +44,14 @@ them.
   mark stayed on the prompt while its run was open, so when the process
   then ended without a graceful stop (a crash or a power cut) after the run
   had committed a round, the next start after the stop's max age, counted
-  from the prompt's admission, ended the whole run as `RequeueExpired` and
-  closed it as interrupted instead of resuming it. The mark is now cleared,
-  durably, when the prompt is staged for its run, as it already was when a
-  run the stop kept resumes; a kept prompt still queued keeps its mark.
-  Once its run has started, such a prompt's row is written as stored input
-  state version 7 again, which 0.9.4 reads.
+  from the prompt's admission, ended the run's inputs as `RequeueExpired`
+  and closed the run as interrupted instead of resuming it. The mark is now
+  cleared, durably, when the prompt is staged for its run, as it already was
+  when a run the stop kept resumes; a kept prompt still queued keeps its
+  mark. Once its run has started, such a prompt's row is written as stored
+  input state version 7 again, which 0.9.4 reads. Rows 0.9.5 already wrote
+  keep the mark: a run of such a prompt that 0.9.5 started and a crash cut
+  is still ended as `RequeueExpired` by a start past the max age.
 
 ## [0.9.5] - 2026-10-23
 
