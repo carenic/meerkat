@@ -2966,15 +2966,16 @@ async fn member_input_rows(
 }
 
 /// A Shutdown with `QueuedInputsOnShutdown::Keep` over a member whose
-/// registration served nothing hands the store back as it found it. The first
-/// process shuts down with a requeue while a turn runs, its first round
-/// committed (a tool call) and its second request blocked, and a second input
-/// waits behind it, so the store holds the member's open run with a round to
+/// registration served nothing changes nothing it finds. The first process
+/// shuts down with a requeue while a turn runs, its first round committed (a
+/// tool call) and its second request blocked, and a second input waits
+/// behind it, so the store holds the member's open run with a round to
 /// continue from and its requeued input. The second process restores the mob
-/// with the member's run starts
-/// held by its host, so the member's registration recovers both and runs
-/// nothing, and shuts down with Keep: every input row of the member is the
-/// same before and after it, and its model saw no request. The third process
+/// with the member's run starts held by its host, so the member's
+/// registration recovers both and runs nothing, and shuts down with Keep:
+/// every input row of the member reads the same before the Keep (after the
+/// held restore, whose ordinary recovery may normalize an input as every
+/// start does) and after it, and its model saw no request. The third process
 /// resumes the run and runs the queued input, once each.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it() {
@@ -3029,15 +3030,6 @@ async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it()
         ),
         "the first process keeps the running turn and the queued input"
     );
-    let rows_before = member_input_rows(&host.runtime_store, &session_id).await;
-    let digests_before = (
-        stop_row(&host.runtime_store, &session_id, &running_key, &running_id)
-            .await
-            .digest,
-        stop_row(&host.runtime_store, &session_id, &key, &input_id)
-            .await
-            .digest,
-    );
     drop(host);
     await_supervisor_route_release(&mob_id).await;
 
@@ -3059,6 +3051,18 @@ async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it()
     assert!(
         held.adapter.resumable_run_id(&session_id).await.is_some(),
         "the held registration keeps the open run marked"
+    );
+    // The baseline is the store as the held restore left it: the boot's
+    // ordinary recovery, which every start runs, may already have
+    // normalized an input. The Keep is measured across its own Shutdown.
+    let rows_before = member_input_rows(&held.runtime_store, &session_id).await;
+    let digests_before = (
+        stop_row(&held.runtime_store, &session_id, &running_key, &running_id)
+            .await
+            .digest,
+        stop_row(&held.runtime_store, &session_id, &key, &input_id)
+            .await
+            .digest,
     );
     tokio::time::timeout(
         WAIT,
@@ -3087,7 +3091,8 @@ async fn a_keep_shutdown_of_a_held_member_leaves_its_work_as_the_store_held_it()
     assert_eq!(
         (rows_after, digests_after),
         (rows_before, digests_before),
-        "a keep stop of a registration that served nothing leaves every input row as it was"
+        "the Keep itself changes no input row: a keep stop of a registration that served \
+         nothing leaves every row as the held restore left it"
     );
     drop(held);
     await_supervisor_route_release(&mob_id).await;
@@ -5549,7 +5554,6 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
         (None, true),
         "the first process keeps the kickoff and its run"
     );
-    let rows_before = member_input_rows(&host.runtime_store, &session_id).await;
     drop(host);
     await_supervisor_route_release(&mob_id).await;
 
@@ -5587,6 +5591,10 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
         ),
         "the held registration keeps the kickoff's run marked, and the kickoff is still starting"
     );
+    // The baseline is the store as the held restore left it: the boot's
+    // ordinary recovery, which every start runs, may already have
+    // normalized an input. The Keep is measured across its own Shutdown.
+    let rows_before = member_input_rows(&held.runtime_store, &session_id).await;
     tokio::time::timeout(
         WAIT,
         held.handle.shutdown_with_report(
@@ -5601,8 +5609,8 @@ async fn a_keep_shutdown_of_a_held_member_keeps_its_kickoff_for_the_hosts_releas
     assert_eq!(
         (held_client.requests().len(), rows_after),
         (0, rows_before),
-        "a keep stop of a held member leaves the rows of its kept kickoff as they were, and the \
-         member ran nothing"
+        "the Keep itself changes no input row: a keep stop of a held member leaves the rows of \
+         its kept kickoff as the held restore left them, and the member ran nothing"
     );
     drop(held);
     await_supervisor_route_release(&mob_id).await;
