@@ -81,6 +81,10 @@ them.
   and nothing is written. `InMemoryRuntimeStore` and the host store adapter
   `SpiRuntimeStore` implement it; the provided default answers
   `Unsupported`, so a store decorator forwards it to the store it wraps.
+  The host store reference and `ScopeFamily` now state that Core never uses
+  a scope family tag starting with `x` or `mx`, so a layer above Core can
+  keep scopes of its own in a realm without colliding with a later Core
+  family.
 
 ### Fixed
 

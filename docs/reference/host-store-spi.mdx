@@ -288,6 +288,12 @@ depend on it.
 A realm therefore holds a few scopes per session and per mob, and listing
 and the bulk load at open read every head once.
 
+Each scope's name starts with the tag of its family and a `:`. Core never
+uses a family tag that starts with `x` or `mx`. A layer above Core that keeps
+scopes of its own in the realm, through the same realm handle, names its
+families with those prefixes, so no family a later Core release adds can take
+one of its tags.
+
 ## Mapping Onto A Database
 
 Any database that meets the obligations works. Two common shapes:
