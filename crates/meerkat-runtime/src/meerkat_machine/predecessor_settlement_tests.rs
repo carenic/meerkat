@@ -1691,8 +1691,10 @@ impl meerkat_core::approval::ConsentOwnerLossSettlement for RecordingConsentOwne
 /// boundary (its directed and nondirected contributors), a queued prompt
 /// and a queued directed input beside it, a directed input a cancel point
 /// ended whose runless terminal is still unpublished, and an approved,
-/// unspent consent the lost owner parked in the session's scope, with the
-/// issuing consent owner installed.
+/// unspent consent the lost owner parked in the session's scope. The lost
+/// owner is the predecessor's own approval owner; this process installs a
+/// new issuing consent owner over the same approval store, which knows the
+/// consent only from its stored row, as after a restart.
 ///
 /// The settlement commits the tail with its contributors' batch, ends the
 /// queued inputs `Stopped`, converges the cancelled input's pending terminal
@@ -1711,7 +1713,13 @@ async fn a_settlement_answers_everything_the_predecessor_left_and_settles_its_lo
     };
 
     let host = Host::head_canonical();
-    let approvals = ApprovalService::new();
+    // The approval store outlives the predecessor process: its approval
+    // owner parked the consent, and this process's owner is a new instance
+    // over the same store.
+    let approval_store: Arc<dyn meerkat_core::approval::ApprovalStore> =
+        Arc::new(meerkat_core::approval::InMemoryApprovalStore::new());
+    let approvals =
+        ApprovalService::with_store(Arc::clone(&approval_store)).expect("this process's owner");
     host.machine
         .install_consent_owner_loss_settlement(Arc::new(approvals.clone()))
         .expect("the issuing consent owner is installed before any registration");
@@ -1732,7 +1740,9 @@ async fn a_settlement_answers_everything_the_predecessor_left_and_settles_its_lo
         cancelled_while_queued(&session_id, &x0, "cancelled by its caller").await,
     )
     .await;
-    let consent = lost_owners_parked_consent(&host, &session_id, &approvals).await;
+    let lost_owner =
+        ApprovalService::with_store(approval_store).expect("the predecessor's approval owner");
+    let consent = lost_owners_parked_consent(&host, &session_id, &lost_owner).await;
     let claim = host.claim(&session_id);
     let publisher = Arc::new(RecordingPublisher::default());
 
