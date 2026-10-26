@@ -3930,7 +3930,8 @@ fn recovered_boundary_terminal_candidate(
 /// it as it adopts any outbox an earlier incarnation left.
 ///
 /// `None` stages nothing, which leaves the contributors as every earlier
-/// release left them (consumed, with no receipt and no requester terminal):
+/// release left them (consumed, with no receipt and no requester terminal,
+/// for a predecessor settlement to answer):
 /// - nothing is consumed, or the disposition commits nothing;
 /// - the contributors exceed one batch, or a row already carries terminal
 ///   work or is a migrated row without completion evidence;
@@ -3941,9 +3942,13 @@ fn recovered_boundary_terminal_candidate(
 ///   a second one would block that batch's recovery;
 /// - the store cannot say whether such a batch is pending.
 ///
-/// Without a complete placement, the batch still gives every contributor its
-/// receipt, but stages no outbox: a directed contributor's requester stays
-/// unanswered, as before.
+/// Without a complete placement no directed outbox can be staged, so the
+/// batch holds the nondirected contributors only, and each directed
+/// contributor is left as before, keeping the payload that owns its
+/// interaction. Its receipt is never finalized without its outbox: the drain
+/// would compact the candidate a later outbox binds to, and its requester
+/// could never be answered. With no nondirected contributor nothing is
+/// staged.
 async fn recovered_boundary_terminal_batch(
     store: &dyn RuntimeStore,
     runtime_id: &LogicalRuntimeId,
@@ -3970,6 +3975,7 @@ async fn recovered_boundary_terminal_batch(
         return Ok(None);
     }
     let mut directed = Vec::new();
+    let mut nondirected = Vec::new();
     for (bundle, _) in attributed {
         let input_id = &bundle.state.input_id;
         if bundle.state.terminal_completion.is_some()
@@ -3986,10 +3992,11 @@ async fn recovered_boundary_terminal_batch(
             return Ok(None);
         }
         let Some(input) = bundle.state.persisted_input.as_ref() else {
+            nondirected.push(input_id.clone());
             continue;
         };
         match crate::input::validated_directed_interaction_id(input) {
-            Ok(None) => {}
+            Ok(None) => nondirected.push(input_id.clone()),
             Ok(Some(interaction_id)) if interaction_id.0 == input_id.0 => {
                 directed.push((input_id.clone(), interaction_id));
             }
@@ -4037,10 +4044,31 @@ async fn recovered_boundary_terminal_batch(
             return Ok(None);
         }
     }
-    let input_ids = attributed
-        .iter()
-        .map(|(bundle, _)| bundle.state.input_id.clone())
-        .collect::<Vec<_>>();
+    let observed_placement =
+        crate::input_state::InteractionTerminalPlacement::from_lifecycle_binding(placement);
+    let input_ids = match observed_placement {
+        Some(_) => attributed
+            .iter()
+            .map(|(bundle, _)| bundle.state.input_id.clone())
+            .collect::<Vec<_>>(),
+        None => {
+            if !directed.is_empty() {
+                tracing::info!(
+                    %session_id,
+                    %run_id,
+                    directed = directed.len(),
+                    "the session's lifecycle row records no runtime placement; the recovered \
+                     boundary stages its nondirected contributors' receipts only and leaves its \
+                     directed contributors without one"
+                );
+                directed.clear();
+            }
+            nondirected
+        }
+    };
+    if input_ids.is_empty() {
+        return Ok(None);
+    }
     let rows = crate::meerkat_machine::driver::build_input_terminal_completion_rows(
         crate::meerkat_machine::driver::InteractionTerminalBatchScope::Run(run_id),
         &input_ids,
@@ -4060,32 +4088,19 @@ async fn recovered_boundary_terminal_batch(
     let candidate_digest = owner.candidate_digest.clone();
     let completion_input_ids_digest = owner.completion_input_ids_digest.clone();
     let mut outboxes = HashMap::new();
-    if !directed.is_empty() {
-        match crate::input_state::InteractionTerminalPlacement::from_lifecycle_binding(placement) {
-            Some(placement) => {
-                directed.sort_by_key(|(input_id, _)| input_id.0);
-                let directed_rows = recovered_boundary_directed_outboxes(
-                    session_id,
-                    run_id,
-                    &directed,
-                    &placement,
-                    &candidate_digest,
-                    &completion_input_ids_digest,
-                    &terminal_candidate,
-                )?;
-                for outbox in directed_rows {
-                    outboxes.insert(outbox.input_id.clone(), outbox);
-                }
-            }
-            None => {
-                tracing::warn!(
-                    %session_id,
-                    %run_id,
-                    directed = directed.len(),
-                    "the session's lifecycle row records no runtime placement; the recovered \
-                     boundary's directed contributors get their receipt but no requester terminal"
-                );
-            }
+    if let (Some(placement), false) = (observed_placement.as_ref(), directed.is_empty()) {
+        directed.sort_by_key(|(input_id, _)| input_id.0);
+        let directed_rows = recovered_boundary_directed_outboxes(
+            session_id,
+            run_id,
+            &directed,
+            placement,
+            &candidate_digest,
+            &completion_input_ids_digest,
+            &terminal_candidate,
+        )?;
+        for outbox in directed_rows {
+            outboxes.insert(outbox.input_id.clone(), outbox);
         }
     }
     Ok(Some(RecoveredBoundaryTerminalBatch {

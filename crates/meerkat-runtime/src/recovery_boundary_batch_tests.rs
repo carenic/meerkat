@@ -1,7 +1,8 @@
 //! Rows for the terminal a recovered boundary stages for the contributors it
 //! consumes: one run-scoped terminal-completion batch in the boundary's own
 //! fenced commit, and a directed outbox for each directed contributor when
-//! the session's lifecycle row records a runtime placement.
+//! the session's lifecycle row records a runtime placement (without one, the
+//! batch holds the nondirected contributors only).
 //!
 //! Before it, a recovered boundary left each contributor consumed with no
 //! receipt, so its exact receipt read answered corruption and a directed
@@ -378,12 +379,85 @@ async fn an_interrupted_boundary_answers_its_contributors_cancelled() {
     );
 }
 
-/// Without a placement in the session's lifecycle row (here: no row), the
-/// boundary still stages every contributor's receipt, but no outbox: a
-/// directed contributor's requester stays unanswered, as before.
+/// Without a placement in the session's lifecycle row (here: no row), no
+/// directed outbox can be staged: the batch holds the nondirected
+/// contributor only, and the directed contributor is left as before
+/// (consumed with no receipt, keeping the payload that owns its interaction)
+/// for a predecessor settlement to answer. Its receipt is never finalized
+/// without its outbox.
 #[tokio::test]
-async fn a_boundary_without_a_recorded_placement_stages_receipts_but_no_outbox() {
+async fn a_boundary_without_a_recorded_placement_stages_its_nondirected_contributors_only() {
+    let nondirected = prompt("the run's prompt");
     let directed = directed_step("unplaced");
+    let seeded = seeded(
+        &[nondirected.clone(), directed.clone()],
+        completed_tail,
+        false,
+    )
+    .await;
+
+    assert_eq!(
+        seeded.recover().await,
+        DurableTailRecoveryDisposition::CommitCompleted
+    );
+
+    let rows = seeded.rows().await;
+    let staged = row(&rows, &nondirected);
+    let completion = staged
+        .state
+        .terminal_completion
+        .as_ref()
+        .expect("the nondirected contributor's receipt is staged with the boundary");
+    assert_eq!(
+        completion.batch_key,
+        InputTerminalCompletionBatchKey::Run {
+            run_id: seeded.run_id.clone()
+        }
+    );
+    assert_eq!(&completion.owner_input_id, nondirected.id());
+    assert_eq!(
+        completion.completion_input_ids.as_ref(),
+        Some(&vec![nondirected.id().clone()]),
+        "the batch names the nondirected contributor alone"
+    );
+    assert!(staged.state.interaction_terminal_outbox.is_none());
+
+    let left = row(&rows, &directed);
+    assert_eq!(left.seed.phase, InputLifecycleState::Consumed);
+    assert_eq!(left.seed.last_run_id.as_ref(), Some(&seeded.run_id));
+    let boundary_sequence = left
+        .seed
+        .last_boundary_sequence
+        .expect("the contributor names the recovered boundary");
+    assert!(
+        seeded
+            .store
+            .load_boundary_receipt(&seeded.runtime_id, &seeded.run_id, boundary_sequence)
+            .await
+            .expect("the boundary receipt reads")
+            .is_some(),
+        "the boundary that consumed the directed contributor is durable beside it"
+    );
+    assert!(
+        left.state.terminal_completion.is_none(),
+        "a directed contributor's receipt is never staged without its outbox"
+    );
+    assert!(left.state.interaction_terminal_outbox.is_none());
+    assert!(
+        left.state.persisted_input.is_some(),
+        "a directed row without its outbox keeps the payload that owns its interaction"
+    );
+    assert!(
+        crate::terminal_status::input_terminal_receipt_read(&rows, directed.id()).is_err(),
+        "the directed contributor's receipt read answers as before"
+    );
+}
+
+/// Without a placement and with directed contributors alone, nothing is
+/// staged: every contributor is left as before.
+#[tokio::test]
+async fn a_boundary_without_a_recorded_placement_stages_nothing_for_directed_contributors_alone() {
+    let directed = directed_step("unplaced alone");
     let seeded = seeded(&[directed.clone()], completed_tail, false).await;
 
     assert_eq!(
@@ -392,12 +466,19 @@ async fn a_boundary_without_a_recorded_placement_stages_receipts_but_no_outbox()
     );
 
     let rows = seeded.rows().await;
-    let stored = row(&rows, &directed);
-    assert!(stored.state.terminal_completion.is_some());
-    assert!(stored.state.interaction_terminal_outbox.is_none());
+    let left = row(&rows, &directed);
+    assert_eq!(left.seed.phase, InputLifecycleState::Consumed);
+    assert!(left.state.terminal_completion.is_none());
+    assert!(left.state.interaction_terminal_outbox.is_none());
+    assert!(left.state.persisted_input.is_some());
     assert!(
-        stored.state.persisted_input.is_some(),
-        "a directed row without its outbox keeps the payload that owns its interaction"
+        seeded
+            .store
+            .load_pending_terminal_owner_ids_page(&seeded.runtime_id, None, 16)
+            .await
+            .expect("the pending-owner index reads")
+            .is_empty(),
+        "nothing is pending for the session"
     );
 }
 
