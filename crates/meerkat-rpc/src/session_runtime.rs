@@ -15668,6 +15668,20 @@ fn completion_outcome_to_rpc_result(
                 "error": turn_error,
             })),
         }),
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        CompletionOutcome::OutcomeUnknown { run_id } => Err(RpcError {
+            code: error::INTERNAL_ERROR,
+            message: format!(
+                "outcome unknown: run {run_id} consumed the input without a receipt; do not resubmit it"
+            ),
+            data: Some(serde_json::json!({
+                "session_id": session_id.to_string(),
+                "kind": "outcome_unknown",
+                "run_id": run_id.to_string(),
+                "resumable": false,
+            })),
+        }),
     }
 }
 

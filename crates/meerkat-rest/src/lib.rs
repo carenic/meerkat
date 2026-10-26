@@ -5114,6 +5114,21 @@ fn completion_outcome_to_api_result(
         meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, .. } => {
             Err(ApiError::Internal(format!("runtime terminated: {reason}")))
         }
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { run_id } => {
+            Err(ApiError::InternalWithData {
+                message: format!(
+                    "outcome unknown: run {run_id} consumed the input without a receipt; do not \
+                     resubmit it"
+                ),
+                code: "TURN_OUTCOME_UNKNOWN".to_string(),
+                details: json!({
+                    "run_id": run_id.to_string(),
+                    "resumable": false,
+                }),
+            })
+        }
     }
 }
 

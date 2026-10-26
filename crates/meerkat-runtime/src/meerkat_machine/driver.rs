@@ -215,11 +215,20 @@ pub(crate) struct InputTerminalCompletionAuthorizationWitness {
     recipients: indexmap::IndexMap<InputId, InputTerminalOutcome>,
     cas_profile: crate::store::InputStateBatchCasImplementationProfile,
     write_fence: Option<InputTerminalCompletionWriteFence>,
+    /// The run an outcome-unknown batch's candidate names; `None` for every
+    /// other candidate. Generated completion authority carries no payload, so
+    /// the public answer takes the run from the exact batch it resolves.
+    outcome_unknown_run: Option<RunId>,
 }
 
 impl InputTerminalCompletionAuthorizationWitness {
     pub(crate) fn runtime_id(&self) -> &LogicalRuntimeId {
         &self.runtime_id
+    }
+
+    /// The run an outcome-unknown batch's candidate names.
+    pub(crate) fn outcome_unknown_run(&self) -> Option<&RunId> {
+        self.outcome_unknown_run.as_ref()
     }
 
     pub(crate) fn candidate_digest(&self) -> &str {
@@ -534,7 +543,14 @@ impl RuntimeCompletionResultAuthority {
             }
             _ => InputTerminalOutcome::Consumed,
         };
+        let outcome_unknown_run = match &candidate {
+            crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                run_id,
+            } => Some(run_id.clone()),
+            _ => None,
+        };
         InputTerminalCompletionAuthorizationWitness {
+            outcome_unknown_run,
             runtime_id: LogicalRuntimeId::new("test-runtime"),
             session_id: self.session_id.clone(),
             agent_runtime_id: self.agent_runtime_id.as_ref().map(|value| value.0.clone()),
@@ -3628,6 +3644,14 @@ impl DriverEntry {
             recipients,
             cas_profile,
             write_fence,
+            outcome_unknown_run: match owner.candidate.as_ref() {
+                Some(
+                    crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                        run_id,
+                    },
+                ) => Some(run_id.clone()),
+                _ => None,
+            },
         })
     }
 
@@ -12624,6 +12648,9 @@ mod recovery_tests {
                     reason: reason.clone(),
                     error: meerkat_core::TurnErrorMetadata::runtime_apply_failure(reason.clone()),
                 }
+            }
+            InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown { run_id } => {
+                CompletionOutcome::recovered_boundary_outcome_unknown(run_id.clone())
             }
         };
         (

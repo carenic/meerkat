@@ -7593,6 +7593,8 @@ fn deferred_turn_outcome_from_completion(
             meerkat_runtime::completion::CompletionOutcome::CallbackPending { .. }
             | meerkat_runtime::completion::CompletionOutcome::CallbackBatchPending { .. },
         ) => DeferredTurnEventOutcome::CallbackPending,
+        // An outcome-unknown answer is no success: its terminal event is an
+        // interaction failure, which releases the deferred events as failed.
         Ok(
             meerkat_runtime::completion::CompletionOutcome::Cancelled
             | meerkat_runtime::completion::CompletionOutcome::Abandoned { .. }
@@ -7600,7 +7602,8 @@ fn deferred_turn_outcome_from_completion(
             | meerkat_runtime::completion::CompletionOutcome::CompletedWithFinalizationFailure {
                 ..
             }
-            | meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { .. },
+            | meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { .. }
+            | meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { .. },
         )
         | Err(_) => DeferredTurnEventOutcome::Failed,
     }

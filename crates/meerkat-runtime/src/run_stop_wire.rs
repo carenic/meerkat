@@ -61,13 +61,13 @@ fn wire_run_stop_contributor(
     };
     Ok(WireRunStopContributor {
         input_id: contributor.input_id.to_string(),
-        completion: wire_run_stop_completion(&contributor.outcome),
+        completion: wire_run_stop_completion(&contributor.outcome)?,
         terminal,
     })
 }
 
-fn wire_run_stop_completion(outcome: &CompletionOutcome) -> WireRunStopCompletion {
-    match outcome {
+fn wire_run_stop_completion(outcome: &CompletionOutcome) -> Result<WireRunStopCompletion, String> {
+    Ok(match outcome {
         CompletionOutcome::Completed(_) => WireRunStopCompletion::Completed,
         CompletionOutcome::CompletedWithoutResult => WireRunStopCompletion::CompletedWithoutResult,
         CompletionOutcome::CallbackPending { .. }
@@ -79,7 +79,15 @@ fn wire_run_stop_completion(outcome: &CompletionOutcome) -> WireRunStopCompletio
             WireRunStopCompletion::CompletedWithFinalizationFailure
         }
         CompletionOutcome::RuntimeTerminated { .. } => WireRunStopCompletion::RuntimeTerminated,
-    }
+        // A run stop reports the stopped run's own staged contributors, never
+        // a terminal row of an earlier run, so it cannot carry this answer.
+        CompletionOutcome::OutcomeUnknown { run_id } => {
+            return Err(format!(
+                "a run stop reported an outcome-unknown answer of run {run_id}, which no stop \
+                 contributor can carry"
+            ));
+        }
+    })
 }
 
 fn wire_input_terminal_outcome(outcome: InputPublicTerminalOutcome) -> WireInputTerminalOutcome {

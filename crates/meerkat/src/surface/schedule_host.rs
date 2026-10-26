@@ -2378,10 +2378,10 @@ fn schedule_completion_from_runtime_completion(
                 Err(error) => completion_after_wait_failure(error, outcome_read).await?,
             },
             AcceptedScheduledInputCompletion::Terminal(terminal) => {
-                return Ok(delivery_terminal_from_completion_outcome(
+                return delivery_terminal_from_completion_outcome(
                     terminal,
                     materialized_session_id,
-                ));
+                );
             }
             AcceptedScheduledInputCompletion::AuthorityUnavailable { detail } => {
                 return Err(authority_unavailable_completion(detail));
@@ -2391,10 +2391,7 @@ fn schedule_completion_from_runtime_completion(
                 reread_admitted_input_outcome(reread).await?
             }
         };
-        Ok(delivery_terminal_from_completion_outcome(
-            outcome,
-            materialized_session_id,
-        ))
+        delivery_terminal_from_completion_outcome(outcome, materialized_session_id)
     })
 }
 
@@ -2482,8 +2479,8 @@ fn completion_wait_failure_reason(error: &CompletionWaitError) -> DeliveryComple
 fn delivery_terminal_from_completion_outcome(
     outcome: CompletionOutcome,
     _materialized_session_id: Option<SessionId>,
-) -> DeliveryTerminal {
-    match outcome {
+) -> Result<DeliveryTerminal, ScheduleDomainError> {
+    Ok(match outcome {
         CompletionOutcome::Completed(_) | CompletionOutcome::CompletedWithoutResult => {
             DeliveryTerminal::runtime_completion(
                 meerkat_schedule::RuntimeCompletionOutcome::Completed,
@@ -2563,7 +2560,16 @@ fn delivery_terminal_from_completion_outcome(
                 runtime_outcome,
             )
         }
-    }
+        // No runtime completion class is honest here: the run that consumed
+        // the input may have acted on it. The delivery records that it holds
+        // no authority over the outcome, which is neither a completion nor a
+        // runtime rejection, and nothing is redelivered.
+        CompletionOutcome::OutcomeUnknown { run_id } => {
+            return Err(authority_unavailable_completion(format!(
+                "outcome unknown: run {run_id} consumed the scheduled input without a receipt"
+            )));
+        }
+    })
 }
 
 fn terminal_from_runtime_completion_outcome(
@@ -4575,7 +4581,8 @@ mod tests {
                 dedupe_key: None,
             },
             None,
-        );
+        )
+        .expect("a callback pending outcome is a runtime completion");
 
         assert_eq!(terminal.phase, OccurrencePhase::AwaitingCompletion);
         assert_eq!(

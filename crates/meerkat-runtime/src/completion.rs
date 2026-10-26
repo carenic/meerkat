@@ -216,6 +216,10 @@ pub enum CompletionClass {
     /// The runtime was stopped or destroyed while the input was pending
     /// ([`CompletionOutcome::RuntimeTerminated`]).
     RuntimeTerminated,
+    /// The input was consumed by a run at a boundary a recovery committed
+    /// without the input's receipt, and what the run did for it is not known
+    /// ([`CompletionOutcome::OutcomeUnknown`]). Never a completion.
+    OutcomeUnknown,
 }
 
 /// Outcome delivered to a completion waiter.
@@ -271,6 +275,15 @@ pub enum CompletionOutcome {
         reason: String,
         error: TurnErrorMetadata,
     },
+    /// The input was consumed by run `run_id` at a boundary that a recovery
+    /// committed without the input's receipt, and a predecessor settlement
+    /// answered it later. What the run did for this input is not known.
+    ///
+    /// It is not a completion, a cancellation, a failure or a runtime
+    /// termination: read it as not completed, and never redeliver or resubmit
+    /// the input because of it, since its run may have acted on it. Only a
+    /// receipt read meets it; a live completion waiter never does.
+    OutcomeUnknown { run_id: RunId },
 }
 
 /// Public completion plus the exact committed input terminal observed by the
@@ -391,7 +404,25 @@ pub fn interaction_terminal_event(
                 reason: InteractionFailureReason::finalization_failed(detail),
             }
         }
+        CompletionOutcome::OutcomeUnknown { .. } => AgentEvent::InteractionFailed {
+            interaction_id,
+            reason: InteractionFailureReason::OutcomeUnknown,
+        },
     }
+}
+
+/// Whether `event` is the requester terminal [`interaction_terminal_event`]
+/// projects an outcome-unknown answer to.
+pub(crate) fn is_outcome_unknown_interaction_terminal(
+    event: &meerkat_core::event::AgentEvent,
+) -> bool {
+    matches!(
+        event,
+        meerkat_core::event::AgentEvent::InteractionFailed {
+            reason: meerkat_core::event::InteractionFailureReason::OutcomeUnknown,
+            ..
+        }
+    )
 }
 
 /// Runtime-minted observation for post-completion cleanup.
@@ -970,6 +1001,25 @@ impl CompletionOutcome {
                 CompletionClass::CompletedWithFinalizationFailure
             }
             Self::RuntimeTerminated { .. } => CompletionClass::RuntimeTerminated,
+            Self::OutcomeUnknown { .. } => CompletionClass::OutcomeUnknown,
+        }
+    }
+
+    /// The outcome-unknown answer for an input that `run_id` consumed at a
+    /// boundary a recovery committed without the input's receipt
+    /// ([`Self::OutcomeUnknown`]).
+    pub(crate) fn recovered_boundary_outcome_unknown(run_id: RunId) -> Self {
+        Self::OutcomeUnknown { run_id }
+    }
+
+    /// The run an outcome-unknown answer names: the run that consumed the
+    /// input at a boundary a recovery committed without the input's receipt.
+    /// `None` for every other outcome.
+    #[must_use]
+    pub fn outcome_unknown_run(&self) -> Option<&RunId> {
+        match self {
+            Self::OutcomeUnknown { run_id } => Some(run_id),
+            _ => None,
         }
     }
 
@@ -1012,6 +1062,7 @@ fn authorized_completion_outcome(
     authority: RuntimeCompletionResultAuthority,
     finalization_error: Option<TurnErrorMetadata>,
     runtime_termination_reason: Option<&str>,
+    outcome_unknown_run: Option<&RunId>,
 ) -> Result<(CompletionOutcome, CompletionCleanupObservation), CompletionWaitError> {
     let attempt = authority.begin_surface_resolution();
     if runtime_termination_reason.is_some()
@@ -1134,15 +1185,21 @@ fn authorized_completion_outcome(
             };
             CompletionOutcome::runtime_terminated(reason)
         }
-        // Only a batch whose candidate answers outcome unknown resolves this
-        // class, and nothing stages such a batch here.
         RuntimeCompletionResultClass::OutcomeUnknown => {
-            attempt.fail();
-            return Err(CompletionWaitError::AuthorityUnavailable(
-                "runtime completion authority resolved OutcomeUnknown for a batch that stages no \
-                 outcome-unknown answer"
-                    .to_string(),
-            ));
+            if terminal.is_some() || finalization_error.is_some() {
+                attempt.fail();
+                return Err(CompletionWaitError::AuthorityUnavailable(
+                    "runtime completion authority resolved OutcomeUnknown with payload".to_string(),
+                ));
+            }
+            let Some(run_id) = outcome_unknown_run else {
+                attempt.fail();
+                return Err(CompletionWaitError::AuthorityUnavailable(
+                    "runtime completion authority resolved OutcomeUnknown without the run it names"
+                        .to_string(),
+                ));
+            };
+            CompletionOutcome::recovered_boundary_outcome_unknown(run_id.clone())
         }
     };
     Ok((
@@ -1278,6 +1335,17 @@ pub(crate) fn authorize_runtime_terminal_bundle(
         RuntimeCompletionResultClass::Cancelled => {
             crate::input_state::InteractionTerminalCandidate::Cancelled
         }
+        RuntimeCompletionResultClass::OutcomeUnknown => {
+            let Some(run_id) = terminal_completion_witness.outcome_unknown_run() else {
+                return Err(CompletionWaitError::AuthorityUnavailable(
+                    "runtime completion authority resolved OutcomeUnknown for a batch that names no run"
+                        .to_string(),
+                ));
+            };
+            crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                run_id: run_id.clone(),
+            }
+        }
         _ => crate::input_state::InteractionTerminalCandidate::from_core_apply_terminal(terminal),
     };
     let candidate_digest = crate::input_state::interaction_terminal_payload_digest(&candidate)
@@ -1288,11 +1356,13 @@ pub(crate) fn authorize_runtime_terminal_bundle(
                 .to_string(),
         ));
     }
+    let outcome_unknown_run = terminal_completion_witness.outcome_unknown_run().cloned();
     let (outcome, cleanup_observation) = authorized_completion_outcome(
         terminal,
         authority,
         finalization_error,
         runtime_termination_reason,
+        outcome_unknown_run.as_ref(),
     )?;
     let interaction_events = interaction_ids
         .iter()
@@ -1318,7 +1388,7 @@ pub(crate) fn authorized_interaction_terminal_events(
     finalization_error: Option<TurnErrorMetadata>,
 ) -> Result<Vec<meerkat_core::event::AgentEvent>, CompletionWaitError> {
     let (outcome, _) =
-        authorized_completion_outcome(terminal, authority, finalization_error, None)?;
+        authorized_completion_outcome(terminal, authority, finalization_error, None, None)?;
     Ok(interaction_ids
         .iter()
         .map(|interaction_id| interaction_terminal_event(*interaction_id, outcome.clone()))
@@ -1719,14 +1789,19 @@ impl CompletionRegistry {
             attempt.abandon();
             return;
         }
-        let (outcome, cleanup_observation) =
-            match authorized_completion_outcome(terminal, authority, finalization_error, None) {
-                Ok(projected) => projected,
-                Err(error) => {
-                    self.fail_inputs(input_ids, error);
-                    return;
-                }
-            };
+        let (outcome, cleanup_observation) = match authorized_completion_outcome(
+            terminal,
+            authority,
+            finalization_error,
+            None,
+            None,
+        ) {
+            Ok(projected) => projected,
+            Err(error) => {
+                self.fail_inputs(input_ids, error);
+                return;
+            }
+        };
         for input_id in input_ids {
             if let Some((senders, captured)) = self.take_input_waiters(&input_id) {
                 self.send_input_outcome(
@@ -2499,6 +2574,135 @@ mod tests {
             CompletionWaitError::AuthorityUnavailable(reason)
                 if reason.contains("exact pending batch candidate")
         ));
+    }
+
+    /// The generated completion authority resolves a runless outcome-unknown
+    /// observation to its own class, from a succeeded finalization only, and
+    /// the cleanup that follows it retains the runtime.
+    #[test]
+    fn generated_authority_resolves_a_runless_outcome_unknown_observation() {
+        use crate::meerkat_machine::dsl::{
+            MeerkatMachineEffect, MeerkatMachineInput, RuntimeCompletionCleanupAction,
+            RuntimeCompletionFinalizationObservation as Finalization,
+            RuntimeCompletionLiveSessionObservation,
+            RuntimeCompletionTerminalObservation as Terminal,
+        };
+        let resolve =
+            crate::meerkat_machine::driver::machine_resolve_pre_resolved_runtime_completion_result;
+        let authority = resolve(None, Terminal::OutcomeUnknown, Finalization::Succeeded)
+            .expect("a runless outcome-unknown observation resolves");
+        assert_eq!(
+            authority.result_class(),
+            RuntimeCompletionResultClass::OutcomeUnknown
+        );
+        assert!(
+            resolve(None, Terminal::OutcomeUnknown, Finalization::Failed).is_err(),
+            "no transition resolves a failed finalization of it"
+        );
+        assert!(
+            resolve(
+                Some(&RunId::new()),
+                Terminal::OutcomeUnknown,
+                Finalization::Succeeded
+            )
+            .is_err(),
+            "a run-correlated observation of it resolves nothing"
+        );
+
+        let session_id = SessionId::new();
+        let dsl_session_id = crate::meerkat_machine::dsl::SessionId::from_domain(&session_id);
+        let mut machine =
+            crate::meerkat_machine::dsl_authority::new_registered_authority_without_runtime_entry(
+                &session_id,
+            )
+            .expect("a registered authority");
+        let transition = crate::meerkat_machine::dsl::MeerkatMachineMutator::apply(
+            &mut machine,
+            MeerkatMachineInput::ResolveRuntimeCompletionCleanup {
+                session_id: dsl_session_id.clone(),
+                observation_session_id: dsl_session_id,
+                observation_agent_runtime_id: None,
+                observation_fence_token: None,
+                observation_runtime_generation: None,
+                observation_runtime_epoch_id: None,
+                outcome: RuntimeCompletionObservedOutcome::OutcomeUnknown,
+                archived_by_authority: false,
+                live_session: RuntimeCompletionLiveSessionObservation::Absent,
+            },
+        )
+        .expect("the retain arm admits an outcome-unknown observation");
+        assert!(transition.into_effects().iter().any(|effect| matches!(
+            effect,
+            MeerkatMachineEffect::RuntimeCompletionCleanupResolved {
+                action: RuntimeCompletionCleanupAction::RetainRuntime,
+                ..
+            }
+        )));
+    }
+
+    /// An outcome-unknown batch answers its requester with an interaction
+    /// failure whose reason says the outcome is unknown, and finalizes the
+    /// receipt with the run the batch names: never a completion.
+    #[test]
+    fn an_outcome_unknown_bundle_names_its_run_and_fails_the_interaction() {
+        let input_id = InputId::new();
+        let interaction_id = meerkat_core::interaction::InteractionId(input_id.0);
+        let run_id = RunId::new();
+        let authority = authority(
+            RuntimeCompletionResultClass::OutcomeUnknown,
+            RuntimeCompletionObservedOutcome::OutcomeUnknown,
+        );
+        let witness = authority.test_completion_batch_witness(
+            vec![input_id],
+            crate::input_state::InteractionTerminalCandidate::RecoveredBoundaryOutcomeUnknown {
+                run_id: run_id.clone(),
+            },
+        );
+        let bundle = authorize_runtime_terminal_bundle(
+            &[interaction_id],
+            None,
+            authority,
+            witness,
+            None,
+            None,
+        )
+        .expect("generated authority authorizes the outcome-unknown batch");
+        let [event] = bundle.interaction_events() else {
+            panic!("one requester terminal per interaction");
+        };
+        assert!(is_outcome_unknown_interaction_terminal(event));
+        assert!(matches!(
+            event,
+            meerkat_core::event::AgentEvent::InteractionFailed {
+                interaction_id: emitted_id,
+                reason: meerkat_core::event::InteractionFailureReason::OutcomeUnknown,
+            } if *emitted_id == interaction_id
+        ));
+        let completion = bundle.terminal_completion();
+        assert_eq!(completion.outcome().outcome_unknown_run(), Some(&run_id));
+        assert_eq!(
+            completion.outcome().class(),
+            CompletionClass::OutcomeUnknown
+        );
+        assert!(!completion.outcome().carries_result_payload());
+    }
+
+    /// The outcome-unknown answer's durable form names its run under its own
+    /// completion type.
+    #[test]
+    fn outcome_unknown_completion_json_names_its_run() {
+        let run_id = RunId::new();
+        let outcome = CompletionOutcome::recovered_boundary_outcome_unknown(run_id.clone());
+        let encoded = serde_json::to_value(&outcome).unwrap();
+        assert_eq!(
+            encoded,
+            serde_json::json!({
+                "completion_type": "outcome_unknown",
+                "run_id": run_id.to_string(),
+            })
+        );
+        let decoded: CompletionOutcome = serde_json::from_value(encoded).unwrap();
+        assert_eq!(decoded.outcome_unknown_run(), Some(&run_id));
     }
 
     #[test]

@@ -4602,6 +4602,17 @@ fn kickoff_resolution_input(
                 .detail
                 .unwrap_or_else(|| "turn finalization failed".to_string()),
         },
+        // Never a started kickoff: what the run did for the kickoff input is
+        // not known. A failed kickoff is recorded and never started again,
+        // as for a waiter that failed, so nothing is resubmitted.
+        meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { run_id } => {
+            mob_dsl::MobMachineInput::KickoffResolveFailed {
+                member_id,
+                error: format!(
+                    "outcome unknown: run {run_id} consumed the kickoff input without a receipt"
+                ),
+            }
+        }
     }
 }
 

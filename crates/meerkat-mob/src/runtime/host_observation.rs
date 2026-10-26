@@ -2848,6 +2848,12 @@ impl CompletionTerminalExpectation {
                     .detail
                     .unwrap_or_else(|| "turn finalization failed".to_string()),
             },
+            // Never a completion: its terminal is the interaction failure
+            // whose reason says the outcome is unknown.
+            CompletionOutcome::OutcomeUnknown { .. } => Self::Failed {
+                kind: Some(TurnTerminalKind::InteractionFailed),
+                reason: meerkat_core::event::InteractionFailureReason::OutcomeUnknown.to_string(),
+            },
         }
     }
 

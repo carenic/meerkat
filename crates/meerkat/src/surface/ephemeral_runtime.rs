@@ -382,6 +382,16 @@ pub fn ephemeral_runtime_completion_result(
             reason,
             serde_json::json!({ "error": error }),
         ),
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        CompletionOutcome::OutcomeUnknown { run_id } => (
+            "TURN_OUTCOME_UNKNOWN",
+            format!(
+                "outcome unknown: run {run_id} consumed the input without a receipt; do not \
+                 resubmit it"
+            ),
+            serde_json::json!({ "run_id": run_id.to_string(), "resumable": false }),
+        ),
     };
     Err(SessionError::FailedWithData {
         message: message.clone(),

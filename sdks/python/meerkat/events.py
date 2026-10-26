@@ -1387,7 +1387,7 @@ def _parse_interaction_failure_reason(raw: Any) -> InteractionFailureReason:
     if not isinstance(raw, dict):
         raise ValueError("interaction_failed.reason must be object")
     kind = _require_str(raw, "kind")
-    if kind == "cancelled":
+    if kind in {"cancelled", "outcome_unknown"}:
         return InteractionFailureReason(kind=kind)
     if kind == "extraction_failed":
         return InteractionFailureReason(

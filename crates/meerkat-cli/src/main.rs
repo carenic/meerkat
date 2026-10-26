@@ -409,6 +409,14 @@ fn completion_outcome_to_cli_runtime_turn_result(
         meerkat_runtime::completion::CompletionOutcome::RuntimeTerminated { reason, .. } => {
             Err(anyhow::anyhow!("runtime terminated: {reason}"))
         }
+        // Not a result and not a failure to retry: the run that consumed the
+        // input may have acted on it, so the input must not be resubmitted.
+        meerkat_runtime::completion::CompletionOutcome::OutcomeUnknown { run_id } => {
+            Err(anyhow::anyhow!(
+                "outcome unknown: run {run_id} consumed the input without a receipt; do not \
+                 resubmit it"
+            ))
+        }
     }
 }
 
