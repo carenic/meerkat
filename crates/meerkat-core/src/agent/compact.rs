@@ -3264,7 +3264,7 @@ mod tests {
         assert_eq!(
             compaction_scope(
                 &[
-                    sys.clone(),
+                    sys,
                     summary_row("earlier"),
                     user("p"),
                     call_row(r, "tc_1"),
