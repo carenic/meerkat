@@ -96,15 +96,25 @@ them.
 - `meerkat-core`: a decided consent moved into a resumed run is now spent
   once even when the session's agent was rebuilt in the same process (for
   example a session unregistered with its queued inputs kept, then resumed).
-  The retained call is resolved afresh against the rebuilt dispatcher, and
+  The retained call is resolved afresh against the rebuilt dispatcher, the
+  fresh plan passes the checks every call passes after its resolution, and
   the approval owner rebinds the consent to that plan only as the same
   durable execution: the same call, tool declaration digest, execution mode
   and durable operation targets, decided R3 again by the run's owners. A
   plan that is not the same durable execution (a hybrid tool that selects
-  another mode included) refuses before entry and withdraws the consent. A
-  tool the rebuilt agent has not published yet does not use up the run's one
-  attempt: the run's next boundary attempts it again. A process restart
-  still ends the consent, and the next call asks for fresh consent.
+  another mode included), and a re-decision the run's owners refuse or no
+  longer review as R3, refuse before entry and withdraw the consent.
+  `dispatch_retained_consent_attempt`, which hosts call directly, now
+  resolves afresh this way for any retained consent whose plan names another
+  dispatcher allocation, where it refused before. A tool the rebuilt agent
+  has not published yet does not use up the run's one attempt: the run's
+  next boundary attempts it again, and a failure that is in fact permanent
+  but reads as not ready is attempted once per boundary until the run's
+  close withdraws the consent. Accepted limits: an MCP server is compared by
+  its configured name, so a name re-pointed to another endpoint compares
+  equal when the account does not name the endpoint, and an account the
+  owner cannot state compares equal to another such account. A process
+  restart still ends the consent, and the next call asks for fresh consent.
 
 ## [0.9.5] - 2026-10-23
 

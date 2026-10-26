@@ -3239,10 +3239,11 @@ async fn fenced_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
 /// one boundary, and the dispatcher's own result is forwarded unchanged.
 ///
 /// When this process rebuilt the agent after the plan was resolved, the
-/// retained call is resolved afresh against the current dispatcher, and the
-/// approval owner rebinds the custody to that plan only as the same durable
-/// execution (call identity, declaration digest, durable operation targets,
-/// tier); anything else refuses with zero entry. The old plan is never
+/// retained call is resolved afresh against the current dispatcher (and
+/// checked as every call is after its resolution), and the approval owner
+/// rebinds the custody to that plan only as the same durable execution (call
+/// identity, declaration digest, durable operation targets, tier); anything
+/// else refuses with zero entry. The old plan is never
 /// dispatched through another allocation. The execution mode is part of
 /// that identity: a hybrid tool that selects another mode after the rebuild
 /// is a mismatch. A resolution that is not ready yet (the tool not published
@@ -3429,10 +3430,13 @@ enum RetainedRebind {
 
 /// Resolve `retained`'s call afresh against `dispatcher`, with the retained
 /// plan's own resolution context, and have the approval owner rebind the
-/// custody to that plan, only as the same durable execution. A tool the
-/// rebuilt agent has not published yet, or one unavailable now, is not
-/// ready, as is an approval owner that is held now; any other resolution
-/// failure refuses.
+/// custody to that plan, only as the same durable execution. The fresh plan
+/// passes the root seam every call passes after its resolution
+/// ([`AgentToolDispatcher::validate_resolved_execution_plan`]: the caller's
+/// deadline chain, the tool published and callable, its mode within the live
+/// catalog contract). A tool the rebuilt agent has not published yet, or one
+/// unavailable now, is not ready, as is an approval owner that is held now;
+/// any other resolution or validation failure refuses.
 fn rebind_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
@@ -3459,7 +3463,12 @@ fn rebind_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
         return owner_changed(call.name);
     };
     let fresh =
-        match resolve_tool_execution_plan_fenced(dispatcher, call, context, resolution_context) {
+        match resolve_tool_execution_plan_fenced(dispatcher, call, context, resolution_context)
+            .and_then(|fresh| {
+                dispatcher
+                    .validate_resolved_execution_plan(call, resolution_context, &fresh)
+                    .map(|()| fresh)
+            }) {
             Ok(fresh) => fresh,
             Err(
                 error @ (crate::ToolExecutionResolutionError::NotFound { .. }

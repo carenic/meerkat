@@ -469,14 +469,16 @@ the retained action, replay it, or change its requester.
 On a later explicit attempt, resolve the retained candidate and complete host
 validation, preparation, and cancellation checks before consumption. Recheck
 current authorization and conditionally consume consent at the physical-entry
-boundary. Changed or lost bindings need fresh consent. A failure known to precede
-the consumption commit leaves otherwise-valid consent spendable; an ambiguous
-commit result must be resolved through the same owner before reuse. After a
-committed use, cancellation or failure does not refund it. Reconciliation or
-applicable operation idempotency is required before repeating an uncertain
-effect; fresh consent alone does not establish non-delivery. An audit record
-cannot recreate executable consent. Test presentation, delivery, and sink
-integration before advertising this workflow.
+boundary. Changed or lost bindings need fresh consent. A retained call that a
+dispatcher this process rebuilt resolves again keeps its consent only as the same
+durable execution: the same call, tool declaration, execution mode, operation
+targets and R3 decision. A failure known to precede the consumption commit leaves
+otherwise-valid consent spendable; an ambiguous commit result must be resolved
+through the same owner before reuse. After a committed use, cancellation or
+failure does not refund it. Reconciliation or applicable operation idempotency is
+required before repeating an uncertain effect; fresh consent alone does not
+establish non-delivery. An audit record cannot recreate executable consent. Test
+presentation, delivery, and sink integration before advertising this workflow.
 
 Spendable consent lives in memory: a restored consent record is history only.
 An old Pending or Approved row does not restore the original retained action,

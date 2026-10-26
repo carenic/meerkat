@@ -6987,41 +6987,47 @@ where
     }
 
     /// Boundary step 3c: in-run human consent (ADR-001). An authenticated
-    /// decision that reached this still-open run is spent here by the run's
-    /// own owner, before tool capture and request preparation. Only consent
-    /// this run requested itself, and consent the approval owner moved into
-    /// this run by the committed receipt of one of its staged notice inputs
-    /// (before the run opened or at any later boundary), is examined: a run
-    /// that requested none, and resumes no retained work under a consent
-    /// scope, pays one empty-set check and never touches the approval
-    /// owner. A receipt that commits after the run's first boundary read the
-    /// consent moved into it can let the model call the operation again
-    /// first, which asks for fresh consent once more (approving it runs the
-    /// operation again); the moved consent still runs once, at the run's
-    /// next boundary, and the run's close withdraws it unspent when there
-    /// is none. Each approved candidate gets one fresh retained attempt in
-    /// this run: the exact original call and plan, with this run's work and
-    /// run, through the common fenced entry whose leaf spends the decision
-    /// once. When this process rebuilt the session's agent after the plan
-    /// was resolved, the attempt resolves the call afresh and spends only
-    /// the same durable execution
+    /// decision that reached this still-open run is spent here by the run's own
+    /// owner, before tool capture and request preparation. Only consent this
+    /// run requested itself, and consent the approval owner moved into this run
+    /// by the committed receipt of one of its staged notice inputs (before the
+    /// run opened or at any later boundary), is examined: a run that requested
+    /// none, and resumes no retained work under a consent scope, pays one
+    /// empty-set check and never touches the approval owner. A receipt that
+    /// commits after the run's first boundary read the consent moved into it
+    /// can let the model call the operation again first, which asks for fresh
+    /// consent once more (approving it runs the operation again); the moved
+    /// consent still runs once, at the run's next boundary, and the run's close
+    /// withdraws it unspent when there is none. Each approved candidate gets
+    /// one fresh retained attempt in this run: the exact original call and
+    /// plan, with this run's work and run, through the common fenced entry
+    /// whose leaf spends the decision once. When this process rebuilt the
+    /// session's agent after the plan was resolved, the attempt resolves the
+    /// call afresh and spends only the same durable execution
     /// ([`crate::dispatch_retained_consent_attempt`]); an attempt whose call
-    /// the rebuilt agent cannot resolve yet (its tool not published again,
-    /// or its owner unavailable now) does not count, and the run's next
-    /// boundary attempts it again. Nothing waits for the owner: when it is
-    /// held, the run's own decided consent waits for the next boundary, and
-    /// the read of the consent moved into the run (the boundary's first
-    /// step, [`Self::enrol_moved_run_consent`]) yields and the boundary
-    /// looks again, so a hold at that read never costs the run that consent;
-    /// a hold met later in the boundary (the decided read, or the attempt's
-    /// resolve or spend) acts as for consent the run requested itself, and
-    /// moved consent the run then never spends is withdrawn at its close.
-    /// The run can still close, or be dropped, before or during an attempt;
-    /// its run scope then parks or withdraws what it admitted, and an
-    /// attempt that entered keeps its own outcome. Asynchronous work the
-    /// attempts started is registered with this turn through the turn
-    /// owner, with its exact refs and wait policies, as a tool batch's is;
-    /// `true` means the turn now waits for it and the boundary must repoll.
+    /// the rebuilt agent cannot resolve yet (its tool not published again, or
+    /// its owner unavailable now) does not count, and the run's next boundary
+    /// attempts it again. A failure that is in fact permanent but reads as not
+    /// ready is attempted once per boundary until the run's close withdraws the
+    /// consent. Two limits of that sameness are accepted: an MCP server is
+    /// compared by its configured name, so a name re-pointed to another
+    /// endpoint between the park and the resume compares equal when the account
+    /// does not name the endpoint; and an account the owner cannot state
+    /// compares equal to another such account (only a host with its own policy
+    /// can issue R3 consent on one). Nothing waits for the owner: when it is
+    /// held, the run's own decided consent waits for the next boundary, and the
+    /// read of the consent moved into the run (the boundary's first step,
+    /// [`Self::enrol_moved_run_consent`]) yields and the boundary looks again,
+    /// so a hold at that read never costs the run that consent; a hold met
+    /// later in the boundary (the decided read, or the attempt's resolve or
+    /// spend) acts as for consent the run requested itself, and moved consent
+    /// the run then never spends is withdrawn at its close. The run can still
+    /// close, or be dropped, before or during an attempt; its run scope then
+    /// parks or withdraws what it admitted, and an attempt that entered keeps
+    /// its own outcome. Asynchronous work the attempts started is registered
+    /// with this turn through the turn owner, with its exact refs and wait
+    /// policies, as a tool batch's is; `true` means the turn now waits for it
+    /// and the boundary must repoll.
     async fn spend_decided_run_consent(
         &mut self,
         ctx: &mut CallingLlmTurnCtx<'_>,
@@ -37577,6 +37583,9 @@ mod tests {
                 account: Option<&'static str>,
                 /// While set, the first restricted action is not published.
                 restricted_unpublished: std::sync::atomic::AtomicBool,
+                /// When set, the resolver drops the caller's deadline chain
+                /// for one of its own.
+                own_deadline: bool,
             }
 
             impl Actions {
@@ -37621,9 +37630,17 @@ mod tests {
                         .ok_or_else(|| crate::ToolExecutionResolutionError::NotFound {
                             tool_name: call.name.to_string(),
                         })?;
-                    let plan = entry
-                        .execution
-                        .resolve_default(resolution_context.deadlines().clone())?;
+                    let deadlines = if self.own_deadline {
+                        crate::ToolDeadlineChain::new(vec![
+                            crate::ToolDeadlineContributor::finite(
+                                crate::ToolDeadlineOwner::Dispatcher,
+                                std::time::Duration::from_secs(60),
+                            ),
+                        ])?
+                    } else {
+                        resolution_context.deadlines().clone()
+                    };
+                    let plan = entry.execution.resolve_default(deadlines)?;
                     let Some(subject) = self.account else {
                         return Ok(plan);
                     };
@@ -38705,9 +38722,13 @@ mod tests {
 
             /// The resumed run of a rebuilt agent whose dispatcher reaches the
             /// tool other than the run that requested the consent: the attempt
-            /// is refused before entry and the consent withdrawn (its context
-            /// changed), and neither allocation runs the body.
-            async fn rebuilt_mismatch(original: Actions, rebuilt: Actions) {
+            /// is refused before entry, nothing is spent, neither allocation
+            /// runs the body, and the consent ends `withdrawn`.
+            async fn rebuilt_agent_refuses(
+                original: Actions,
+                rebuilt: Actions,
+                withdrawn: ApprovalConsentWithdrawalReason,
+            ) {
                 let model = Arc::new(ScriptedModel::default());
                 let original = Arc::new(original);
                 let owner = Arc::new(Owner::default());
@@ -38741,8 +38762,7 @@ mod tests {
                 assert!(refused.consumed_at.is_none(), "nothing spent");
                 assert_eq!(
                     refused.withdrawal.map(|withdrawal| withdrawal.reason),
-                    Some(ApprovalConsentWithdrawalReason::ContextChanged),
-                    "not the same durable execution"
+                    Some(withdrawn)
                 );
                 let requests = model.requests();
                 let attempts = consent_attempts(&requests[2]);
@@ -38754,12 +38774,13 @@ mod tests {
             /// declaration never spends the moved consent.
             #[tokio::test]
             async fn a_rebuilt_agent_serving_another_declaration_never_spends_the_moved_consent() {
-                rebuilt_mismatch(
+                rebuilt_agent_refuses(
                     Actions::default(),
                     Actions {
                         restricted_description: Some("rebuilt with another declaration"),
                         ..Actions::default()
                     },
+                    ApprovalConsentWithdrawalReason::ContextChanged,
                 )
                 .await;
             }
@@ -38768,7 +38789,7 @@ mod tests {
             /// acting with another account never spends the moved consent.
             #[tokio::test]
             async fn a_rebuilt_agent_reaching_another_account_never_spends_the_moved_consent() {
-                rebuilt_mismatch(
+                rebuilt_agent_refuses(
                     Actions {
                         account: Some("alice"),
                         ..Actions::default()
@@ -38777,6 +38798,24 @@ mod tests {
                         account: Some("bob"),
                         ..Actions::default()
                     },
+                    ApprovalConsentWithdrawalReason::ContextChanged,
+                )
+                .await;
+            }
+
+            /// A rebuilt agent whose resolver drops the caller's deadline
+            /// chain for one of its own fails the root seam every call passes
+            /// after its resolution: the attempt is refused before entry,
+            /// nothing is spent, and the run's close withdraws the consent.
+            #[tokio::test]
+            async fn a_rebuilt_agent_failing_the_root_seam_never_spends_the_moved_consent() {
+                rebuilt_agent_refuses(
+                    Actions::default(),
+                    Actions {
+                        own_deadline: true,
+                        ..Actions::default()
+                    },
+                    ApprovalConsentWithdrawalReason::RunEnded,
                 )
                 .await;
             }

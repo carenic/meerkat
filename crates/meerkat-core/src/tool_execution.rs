@@ -949,7 +949,12 @@ impl ToolOperationTarget {
     /// reconnection: equal in everything but an MCP server's live connection
     /// generation. The registration (server or route), the raw operation,
     /// the connector approval and the account still have to be equal, and
-    /// every other target is compared whole.
+    /// every other target is compared whole. A registration is its
+    /// configured name: the endpoint it points to is not compared, so a name
+    /// re-pointed to another endpoint compares equal unless the account
+    /// names it. An account the owner cannot state
+    /// ([`crate::OperationAccount::Unavailable`]) compares equal to another
+    /// such account.
     pub(crate) fn same_durable_target(&self, other: &Self) -> bool {
         match (self, other) {
             (
