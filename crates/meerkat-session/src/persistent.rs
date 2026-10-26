@@ -53624,9 +53624,13 @@ mod tests {
             "{refused:?}"
         );
         let progress = &refused.progress;
+        // A completed tail commits beside the queued directed input it does
+        // not consume, which it retains for the sweep to end.
         assert_eq!(
             progress.tail.as_ref().map(|tail| tail.disposition),
-            Some(meerkat_runtime::recovery::DurableTailRecoveryDisposition::CommitCompleted),
+            Some(
+                meerkat_runtime::recovery::DurableTailRecoveryDisposition::CommitCompletedRetainInputs
+            ),
             "the committed tail is final evidence"
         );
         assert_eq!(
