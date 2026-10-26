@@ -862,6 +862,10 @@ impl SettlementEvidence {
     /// The closing census: `Ok` with the complete publication when every
     /// durable row reads closed and every settled input is explained;
     /// otherwise the refusal, with the final evidence as its progress.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the refusal carries its final evidence inline, as the public result does"
+    )]
     fn into_closing_census(self) -> Result<PredecessorPublication, PredecessorPublicationRefused> {
         let progress = PredecessorPublication {
             converged: self.converged,
@@ -1283,6 +1287,10 @@ impl MeerkatMachine {
             .map(|entry| entry._hosting_claim.same_lineage(claim))
     }
 
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public refusal carries a runtime or recovery error inline"
+    )]
     fn require_settlement_store(
         &self,
         lease: &MachinePredecessorSettlementLease,
@@ -1306,6 +1314,10 @@ impl MeerkatMachine {
 
     /// The claim checks of a settlement: this machine's own hosting owner,
     /// a cross-process OS lock, and this machine's hosting domain.
+    #[allow(
+        clippy::result_large_err,
+        reason = "the public refusal carries a runtime or recovery error inline"
+    )]
     fn check_predecessor_settlement_claim(
         &self,
         claim: &HostingClaim,
@@ -1792,6 +1804,10 @@ fn refused_with_final_evidence(
 
 /// The consent owner-loss outcome of the internal registration's
 /// publication.
+#[allow(
+    clippy::result_large_err,
+    reason = "the public refusal carries a runtime or recovery error inline"
+)]
 fn predecessor_owner_loss(
     published: &PublishedSettlementRegistration,
     claim: &HostingClaim,
