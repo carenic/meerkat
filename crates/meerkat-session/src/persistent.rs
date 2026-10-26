@@ -53670,10 +53670,10 @@ mod tests {
 
     /// A directed input the predecessor queued, settled through the service's
     /// own stored-only publisher into its durable event store: the input
-    /// ends `Stopped`, its requester's terminal is published at the sequence
-    /// the event store recorded, nothing stays owed, the session's event line
-    /// allocates strictly above the published row, and a repeat publishes
-    /// nothing again.
+    /// ends `Stopped`, its requester's terminal is published and the settled
+    /// input names the event store's row of it, nothing stays owed, the
+    /// session's event line allocates strictly above that row's stream
+    /// sequence, and a repeat publishes nothing again.
     #[tokio::test]
     async fn a_directed_input_is_settled_through_the_services_stored_only_publisher() {
         let tail = HostedDurableTail::new().await;
@@ -53718,8 +53718,8 @@ mod tests {
             })
             .expect("the published terminal is a durable row");
         assert_eq!(
-            published.stream_seq, published_seq,
-            "the settled input names the sequence the event store recorded"
+            published.seq, published_seq,
+            "the settled input names the event store's row of its terminal"
         );
         assert!(
             matches!(
@@ -53737,7 +53737,7 @@ mod tests {
             .stored_only_event_line(&tail.session_id, None)
             .await;
         assert!(
-            line.reserve(1) + 1 > published_seq,
+            line.reserve(1) + 1 > published.stream_seq,
             "the session's next allocation lands above the published row"
         );
         let machine = service
