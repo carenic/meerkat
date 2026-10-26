@@ -134,3 +134,67 @@ impl From<ColdPredecessorSettleError> for SessionError {
 fn internal(error: RuntimeDriverError) -> SessionError {
     SessionError::Agent(AgentError::InternalError(error.to_string()))
 }
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod tests {
+    use super::*;
+
+    fn mapped(id: &SessionId, refusal: PredecessorSettlementRefusal) -> SessionError {
+        SessionError::from(ColdPredecessorSettleError::untouched(
+            id.clone(),
+            ColdPredecessorSettleRefusal::Settlement(refusal),
+        ))
+    }
+
+    /// Each refusal reaches a host that reads only `SessionError` as the
+    /// session error it already handles: a registration is busy, a claim or
+    /// profile the call cannot use is unsupported, a held or refused tail is
+    /// the durable-tail hold, and the refusals no session variant names stay
+    /// internal. A session refusal passes through unchanged.
+    #[test]
+    fn a_settlement_refusal_maps_to_the_session_error_hosts_read() {
+        let id = SessionId::new();
+        assert!(matches!(
+            mapped(&id, PredecessorSettlementRefusal::Registered),
+            SessionError::Busy { .. }
+        ));
+        for refusal in [
+            PredecessorSettlementRefusal::ClaimNotOwned,
+            PredecessorSettlementRefusal::ExclusivityUnproven,
+        ] {
+            assert!(matches!(mapped(&id, refusal), SessionError::Unsupported(_)));
+        }
+        assert!(matches!(
+            mapped(&id, PredecessorSettlementRefusal::TailHeld),
+            SessionError::DurableTailHeldForRecovery { .. }
+        ));
+        assert!(matches!(
+            mapped(&id, PredecessorSettlementRefusal::TailRefused),
+            SessionError::DurableTailRecoveryRefused { .. }
+        ));
+        for refusal in [
+            PredecessorSettlementRefusal::UnsettleableRows {
+                undecodable: vec!["an undecodable row".to_string()],
+                unproven: Vec::new(),
+            },
+            PredecessorSettlementRefusal::PlacementWitnessMissing {
+                directed: vec![meerkat_core::lifecycle::InputId::new()],
+            },
+            PredecessorSettlementRefusal::CensusIncomplete {
+                open: vec![meerkat_core::lifecycle::InputId::new()],
+                unreceipted: Vec::new(),
+            },
+        ] {
+            assert!(matches!(
+                mapped(&id, refusal),
+                SessionError::Agent(AgentError::InternalError(_))
+            ));
+        }
+        let passed = SessionError::from(ColdPredecessorSettleError::untouched(
+            id.clone(),
+            ColdPredecessorSettleRefusal::Session(SessionError::NotFound { id: id.clone() }),
+        ));
+        assert!(matches!(passed, SessionError::NotFound { id: found } if found == id));
+    }
+}

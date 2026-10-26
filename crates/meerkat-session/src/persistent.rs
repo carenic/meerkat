@@ -53185,6 +53185,227 @@ mod tests {
         drop(held);
     }
 
+    fn settlement_deadline() -> meerkat_core::time_compat::Instant {
+        meerkat_core::time_compat::Instant::now() + std::time::Duration::from_secs(10)
+    }
+
+    /// A cold predecessor's durable tail, settled under the service's own
+    /// claim: the tail is committed as a writer, nothing else was owed, the
+    /// census is complete, nothing is registered afterwards, and a repeat
+    /// settles nothing more. The host's fresh registration, with the claim
+    /// still held, joins the claim's lineage.
+    #[tokio::test]
+    async fn settle_cold_predecessor_commits_the_tail_and_leaves_the_session_registrable() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let claim = service
+            .grant_session_hosting(&tail.session_id)
+            .expect("this runtime owner takes the session's claim");
+
+        let settled = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect("the settlement certifies the session");
+        let committed_tail = settled.tail.as_ref().expect("the tail is committed");
+        assert_eq!(
+            committed_tail.disposition,
+            meerkat_runtime::recovery::DurableTailRecoveryDisposition::CommitCompleted
+        );
+        assert!(settled.inputs.is_empty());
+        assert!(settled.terminals_owed.is_empty());
+        assert!(settled.migrated_without_receipt.is_empty());
+        assert_eq!(settled.durable_rows_closed, 0);
+        assert_eq!(
+            settled.owner_loss,
+            Some(meerkat_runtime::PredecessorOwnerLoss::NoConsentOwner),
+            "no issuing consent owner is installed"
+        );
+        let (committed, physical, provisional) = tail.durable_state().await;
+        assert_eq!(
+            committed, physical,
+            "the settled boundary is the physical head"
+        );
+        assert!(!provisional, "the settlement consumed the provisional tail");
+        let machine = service
+            .acquire_canonical_runtime_adapter(None)
+            .expect("the service's runtime owner");
+        assert!(
+            !machine.contains_session(&tail.session_id).await,
+            "the settlement leaves nothing registered"
+        );
+
+        let repeat = service
+            .settle_cold_predecessor_before(&tail.session_id, &claim, settlement_deadline())
+            .await
+            .expect("a repeat certifies the session again");
+        assert!(repeat.tail.is_none(), "no tail stands any more");
+        assert!(repeat.inputs.is_empty());
+
+        machine
+            .register_session(tail.session_id.clone())
+            .await
+            .expect("the session registers afterwards");
+        assert_eq!(
+            machine
+                .registration_claim_same_lineage(&tail.session_id, &claim)
+                .await,
+            Some(true),
+            "the fresh registration joined the settlement's claim lineage"
+        );
+        drop(claim);
+    }
+
+    /// Only this service's own claim of the session settles it: another
+    /// runtime owner's claim, and this owner's claim of another session, are
+    /// refused `ClaimNotOwned` with nothing touched.
+    #[tokio::test]
+    async fn settle_cold_predecessor_refuses_a_claim_it_does_not_own() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let before = tail.durable_state().await;
+
+        let foreign = tail.another_owner_hosts_the_session();
+        let refused = service
+            .settle_cold_predecessor_before(&tail.session_id, &foreign, settlement_deadline())
+            .await
+            .expect_err("another runtime owner's claim settles nothing");
+        assert!(
+            matches!(
+                refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::ClaimNotOwned
+                )
+            ),
+            "{refused:?}"
+        );
+        assert!(refused.progress.tail.is_none());
+        assert!(refused.progress.inputs.is_empty());
+        assert_eq!(tail.durable_state().await, before);
+        drop(foreign);
+
+        let other = SessionId::new();
+        let other_claim = service
+            .grant_session_hosting(&other)
+            .expect("this runtime owner takes another session's claim");
+        let refused = service
+            .settle_cold_predecessor_before(&tail.session_id, &other_claim, settlement_deadline())
+            .await
+            .expect_err("another session's claim settles nothing");
+        assert!(
+            matches!(
+                refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::ClaimNotOwned
+                )
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(tail.durable_state().await, before);
+    }
+
+    /// A session the store never committed is refused `NotFound`, and the
+    /// settlement leaves nothing registered.
+    #[tokio::test]
+    async fn settle_cold_predecessor_answers_not_found_for_an_unknown_session() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let unknown = SessionId::new();
+        let claim = service
+            .grant_session_hosting(&unknown)
+            .expect("this runtime owner takes the unknown session's claim");
+
+        let refused = service
+            .settle_cold_predecessor_before(&unknown, &claim, settlement_deadline())
+            .await
+            .expect_err("an unknown session is not settled");
+        assert!(
+            matches!(
+                &refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Session(SessionError::NotFound { id })
+                    if *id == unknown
+            ),
+            "{refused:?}"
+        );
+        let machine = service
+            .acquire_canonical_runtime_adapter(None)
+            .expect("the service's runtime owner");
+        assert!(!machine.contains_session(&unknown).await);
+    }
+
+    /// A session with a registration here is refused `Registered`, and the
+    /// registration is untouched.
+    #[tokio::test]
+    async fn settle_cold_predecessor_refuses_a_registered_session() {
+        let tail = HostedDurableTail::new().await;
+        let service = tail.service();
+        let registered = SessionId::new();
+        let claim = service
+            .grant_session_hosting(&registered)
+            .expect("this runtime owner takes the session's claim");
+        let machine = service
+            .acquire_canonical_runtime_adapter(None)
+            .expect("the service's runtime owner");
+        machine
+            .register_session(registered.clone())
+            .await
+            .expect("the session registers");
+
+        let refused = service
+            .settle_cold_predecessor_before(&registered, &claim, settlement_deadline())
+            .await
+            .expect_err("a registered session is not settled");
+        assert!(
+            matches!(
+                refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::Registered
+                )
+            ),
+            "{refused:?}"
+        );
+        assert!(machine.contains_session(&registered).await);
+    }
+
+    /// A WholeBlob runtime store is refused before anything is touched.
+    #[tokio::test]
+    async fn settle_cold_predecessor_refuses_a_whole_blob_store() {
+        let dir = tempfile::tempdir().expect("whole-blob settlement directory");
+        let runtime_store = Arc::new(
+            meerkat_runtime::SqliteRuntimeStore::new(dir.path().join("runtime.sqlite3"))
+                .expect("whole-blob runtime store")
+                .with_hosting_paths(meerkat_runtime::HostingPaths {
+                    hosting_lock_dir: dir.path().join("hosting"),
+                    cold_delivery_lock: dir.path().join("cold-delivery.lock"),
+                    database: None,
+                }),
+        );
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()) as Arc<dyn SessionStore>,
+            runtime_store as Arc<dyn RuntimeStore>,
+            memory_blob_store(),
+        );
+        let id = SessionId::new();
+        let claim = service
+            .grant_session_hosting(&id)
+            .expect("this runtime owner takes the session's claim");
+
+        let refused = service
+            .settle_cold_predecessor_before(&id, &claim, settlement_deadline())
+            .await
+            .expect_err("a WholeBlob store is not settled");
+        assert!(
+            matches!(
+                refused.refusal,
+                crate::ColdPredecessorSettleRefusal::Settlement(
+                    meerkat_runtime::PredecessorSettlementRefusal::ProfileUnsupported { .. }
+                )
+            ),
+            "{refused:?}"
+        );
+    }
+
     /// A committed WholeBlob document the current decoder refuses (its live
     /// transcript no longer preserves the graph-proved audited endpoint) is
     /// read by recovery before anything else on the resume path. The refusal
