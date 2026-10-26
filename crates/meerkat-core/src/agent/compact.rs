@@ -951,7 +951,7 @@ pub(crate) fn bound_open_run_tool_results_for_request(
     }
     let run_bytes = run_results
         .iter()
-        .map(|result| content_bytes(*result))
+        .map(|result| content_bytes(result))
         .fold(0usize, usize::saturating_add);
     let encoded = usize::try_from(encoded_bytes).unwrap_or(usize::MAX);
     let cap = usize::try_from(max_bytes).unwrap_or(usize::MAX);
