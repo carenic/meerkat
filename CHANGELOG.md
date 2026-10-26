@@ -46,8 +46,8 @@ them.
   the race stalled the failed attachment's teardown instead. The loop's
   teardown now leaves an attachment that never served to that owner, whose
   unregister keeps every input the registration recovered for the next
-  start. A retire or an archive that meets an unserved attachment still
-  stops every input.
+  start, unless the registration served live work. A retire or an archive
+  that meets an unserved attachment still stops every input.
 
 ## [0.9.5] - 2026-10-23
 

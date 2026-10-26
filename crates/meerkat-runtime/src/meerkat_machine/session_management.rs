@@ -8728,9 +8728,10 @@ impl MeerkatMachine {
         {
             // An attachment that never served is retired by its exact startup
             // or pending owner, whose unregister keeps every input the
-            // registration recovered from the store. A cleanup claimed here
-            // first would run the stop before that unregister began, and so
-            // end those inputs as stopped.
+            // registration recovered from the store, unless the registration
+            // served live work. A cleanup claimed here first would run the
+            // stop before that unregister began, and so end those inputs as
+            // stopped.
             return Ok(RuntimeLoopTeardownWait::Settled);
         } else {
             // A spontaneous loop exit can hand off a machine-managed executor
