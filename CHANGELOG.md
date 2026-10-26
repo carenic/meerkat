@@ -50,8 +50,10 @@ them.
   when a run the stop kept resumes; a kept prompt still queued keeps its
   mark. Once its run has started, such a prompt's row is written as stored
   input state version 7 again, which 0.9.4 reads. Rows 0.9.5 already wrote
-  keep the mark: a run of such a prompt that 0.9.5 started and a crash cut
-  is still ended as `RequeueExpired` by a start past the max age.
+  keep the mark: a run that 0.9.5 started from a kept queued prompt and a
+  crash cut before the upgrade still has its inputs ended as
+  `RequeueExpired`, and is closed as interrupted, by a start past the max
+  age.
 
 ## [0.9.5] - 2026-10-23
 
