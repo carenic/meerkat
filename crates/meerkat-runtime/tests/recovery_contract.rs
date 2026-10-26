@@ -2305,7 +2305,12 @@ fn kept_row(
     stop_requeue: Option<meerkat_runtime::input_state::StopRequeueMark>,
 ) -> InputStatePersistenceRecord {
     let mut row = applied_pending_state(input, run_id, 1);
+    // What admission stamps on a directed input: its idempotency key and its
+    // directed attribution, which binds its interaction terminal.
     row.state.idempotency_key = input.header().idempotency_key.clone();
+    row.state.directed_run_started_attribution =
+        meerkat_runtime::input_state::DirectedRunStartedAttribution::from_input(input)
+            .expect("the input's directed shape validates");
     row.state.stop_requeue = stop_requeue;
     match phase {
         InputLifecycleState::AppliedPendingConsumption => persistable(row),
@@ -5868,13 +5873,18 @@ impl RecordingPublications {
     /// Wait, bounded, until at least `count` events were published.
     async fn wait_for(&self, count: usize) {
         let mut published = self.published.subscribe();
-        tokio::time::timeout(
+        if tokio::time::timeout(
             std::time::Duration::from_secs(10),
             published.wait_for(|published| *published >= count),
         )
         .await
-        .expect("the terminals are published")
-        .expect("the publication counter stays open");
+        .is_err()
+        {
+            panic!(
+                "{count} terminals are published, but only these were: {:?}",
+                self.events()
+            );
+        }
     }
 
     fn interaction_failures(&self, interaction: meerkat_core::interaction::InteractionId) -> usize {
