@@ -848,10 +848,10 @@ struct WholeSettlement {
 /// One whole settlement as the session service drives it: begin, the tail
 /// drive, the internal registration and its sweep, the second drive when
 /// the first held, and finish with `publisher`.
-async fn settle_whole(
+async fn settle_whole<P: CoreExecutorPublicationHandle + 'static>(
     host: &Host,
     claim: &HostingClaim,
-    publisher: &Arc<RecordingPublisher>,
+    publisher: &Arc<P>,
 ) -> WholeSettlement {
     let mut lease = host
         .machine
@@ -2210,4 +2210,444 @@ async fn an_outcome_unknown_batch_a_stopped_settlement_left_is_converged_by_the_
             ..
         }
     ));
+}
+
+// ---------------------------------------------------------------------------
+// Deadlines and publication inside the process-owned task
+// ---------------------------------------------------------------------------
+
+fn deadline_in(millis: u64) -> meerkat_core::time_compat::Instant {
+    meerkat_core::time_compat::Instant::now() + std::time::Duration::from_millis(millis)
+}
+
+/// What a [`ScriptedPublisher`] does at its next publication; every later
+/// one appends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Script {
+    Append,
+    /// Waits at the publication until released, then appends.
+    HoldThenAppend,
+    /// Fails before it appends anything.
+    FailBeforeAppend,
+    /// Appends, then fails before the caller learns of it (a crash between
+    /// the event append and its receipt).
+    FailAfterAppend,
+}
+
+/// A stored-only publisher scripted for its next publication. An event it
+/// already appended (the same interaction, the same bytes) is answered with
+/// the sequence it got, appending nothing, as an event store answers a
+/// replay.
+struct ScriptedPublisher {
+    appended: std::sync::Mutex<Vec<(AgentEvent, u64)>>,
+    next: std::sync::Mutex<Script>,
+    entered: crate::tokio::sync::Notify,
+    release: crate::tokio::sync::Notify,
+}
+
+impl ScriptedPublisher {
+    fn new(script: Script) -> Self {
+        Self {
+            appended: std::sync::Mutex::new(Vec::new()),
+            next: std::sync::Mutex::new(script),
+            entered: crate::tokio::sync::Notify::new(),
+            release: crate::tokio::sync::Notify::new(),
+        }
+    }
+
+    fn events(&self) -> Vec<AgentEvent> {
+        self.appended
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(event, _)| event.clone())
+            .collect()
+    }
+
+    fn append(
+        &self,
+        events: &[AgentEvent],
+    ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+        let mut appended = self.appended.lock().unwrap();
+        events
+            .iter()
+            .map(|event| {
+                let digest = crate::input_state::interaction_terminal_payload_digest(event)
+                    .map_err(CoreExecutorError::Internal)?;
+                let replayed = appended.iter().find_map(|(existing, seq)| {
+                    crate::input_state::interaction_terminal_payload_digest(existing)
+                        .is_ok_and(|existing_digest| existing_digest == digest)
+                        .then_some(*seq)
+                });
+                let seq = match replayed {
+                    Some(seq) => seq,
+                    None => {
+                        let seq = appended.len() as u64 + 1;
+                        appended.push((event.clone(), seq));
+                        seq
+                    }
+                };
+                CoreInteractionTerminalPublicationReceipt::try_new(event, seq)
+            })
+            .collect()
+    }
+}
+
+#[async_trait::async_trait]
+impl CoreExecutorPublicationHandle for ScriptedPublisher {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[AgentEvent],
+    ) -> Result<Vec<CoreInteractionTerminalPublicationReceipt>, CoreExecutorError> {
+        let script = std::mem::replace(&mut *self.next.lock().unwrap(), Script::Append);
+        match script {
+            Script::Append => self.append(events),
+            Script::HoldThenAppend => {
+                self.entered.notify_one();
+                self.release.notified().await;
+                self.append(events)
+            }
+            Script::FailBeforeAppend => Err(CoreExecutorError::Internal(
+                "the event store refused the append".to_string(),
+            )),
+            Script::FailAfterAppend => {
+                self.append(events)?;
+                Err(CoreExecutorError::Internal(
+                    "the process stopped before the append's receipt".to_string(),
+                ))
+            }
+        }
+    }
+}
+
+/// A queued prompt and a queued directed input of a placed predecessor,
+/// with a committed session and no tail.
+async fn queued_pair(host: &Host) -> (SessionId, Input, Input) {
+    let (session_id, _) = durable_session(host, None).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let q1 = prompt("queued by the predecessor");
+    let d2 = directed_step("queued directed by the predecessor");
+    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued(&d2, 2)).await;
+    (session_id, q1, d2)
+}
+
+/// A refusal of a registration of the session that never adopts it: what
+/// every caller meets while the settlement's task owns the registration.
+async fn registration_refused_unregister_in_progress(host: &Host, session_id: &SessionId) {
+    let refused = host
+        .machine
+        .execute_meerkat_machine_command(
+            None,
+            MeerkatMachineCommand::RegisterSession {
+                session_id: session_id.clone(),
+            },
+        )
+        .await
+        .expect_err("the settlement's registration refuses a registration");
+    assert!(
+        matches!(
+            refused,
+            MeerkatMachineCommandError::Driver(RuntimeDriverError::UnregisterInProgress { .. })
+        ),
+        "{refused:?}"
+    );
+}
+
+/// The caller's deadline passes before the task's drain finalized anything
+/// (the drain waits on the internal registration's driver lock, which the
+/// test holds). The call answers RuntimeTerminalPublicationInProgress with
+/// final evidence only: nothing converged, both inputs it ended owed, by id
+/// only, although their rows are durably ended with their carriers. Until
+/// the task finishes, a registration of the session is refused, never
+/// adopted, and a concurrent settlement waits for the task, holding no
+/// gate, and refuses at its own deadline. The task then drains and removes
+/// on its own, and a repeat finds nothing left to settle.
+#[tokio::test]
+async fn a_deadline_before_the_drain_reports_final_evidence_only_and_the_task_finishes_alone() {
+    let host = Host::head_canonical();
+    let (session_id, q1, d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(RecordingPublisher::default());
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the drive answers");
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep commits");
+    assert_eq!(sorted(work.ended), sorted_ids(&[&q1, &d2]));
+    let driver = Arc::clone(
+        &lease
+            .internal
+            .as_ref()
+            .expect("the internal registration published")
+            .driver,
+    );
+    let held = driver.lock().await;
+
+    let refused = host
+        .machine
+        .finish_predecessor_settlement_before(
+            lease,
+            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            deadline_in(200),
+        )
+        .await
+        .expect_err("the deadline passes inside the drain");
+    assert!(
+        matches!(
+            refused.refusal,
+            PredecessorSettlementRefusal::Runtime(
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            )
+        ),
+        "{:?}",
+        refused.refusal
+    );
+    assert!(
+        refused.progress.converged.is_empty(),
+        "no receipt is final yet"
+    );
+    assert_eq!(sorted(refused.progress.owed), sorted_ids(&[&q1, &d2]));
+    assert_eq!(refused.progress.durable_rows_closed, 0);
+    assert!(refused.progress.migrated_without_receipt.is_empty());
+    let rows = host.rows(&session_id).await;
+    for input in [&q1, &d2] {
+        assert_eq!(
+            stored_row(&rows, input).seed.phase,
+            InputLifecycleState::Abandoned,
+            "{} is durably ended",
+            input.id()
+        );
+    }
+
+    registration_refused_unregister_in_progress(&host, &session_id).await;
+    let waiting = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline_in(100))
+        .await
+        .expect_err("a concurrent settlement waits for the task until its deadline");
+    assert!(
+        matches!(
+            waiting,
+            PredecessorSettlementRefusal::Runtime(
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            )
+        ),
+        "{waiting:?}"
+    );
+    drop(held);
+
+    let repeat = settle_whole(&host, &claim, &Arc::new(RecordingPublisher::default())).await;
+    let repeated = repeat
+        .publication
+        .expect("the repeat finds every row closed");
+    assert!(
+        repeated.converged.is_empty(),
+        "the task converged everything on its own"
+    );
+    assert_eq!(repeated.durable_rows_closed, 2);
+    let events = publisher.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    published_for(&events, &d2);
+    let rows = host.rows(&session_id).await;
+    for input in [&q1, &d2] {
+        assert!(
+            matches!(
+                crate::terminal_status::input_terminal_receipt_read(&rows, input.id()),
+                Ok(Some(InputTerminalReceiptRead::Finalized(_)))
+            ),
+            "{} has its final receipt",
+            input.id()
+        );
+    }
+}
+
+/// The task's publication waits in the publisher (an event store held by
+/// someone else) past the caller's deadline. The receipts were finalized
+/// before the publication, so the call's progress lists the nondirected
+/// input converged and the directed one owed, by id only, with no sequence.
+/// While the publication waits, the task holds no gate: the internal
+/// registration's driver lock and mutation gate are free, a registration
+/// takes the registration transaction and is refused at the entry, and a
+/// concurrent settlement waits for the task holding nothing. Released, the
+/// publication appends once and the task finishes; a repeat finds nothing
+/// left.
+#[tokio::test]
+async fn a_held_publication_holds_no_gate_and_finishes_once_released() {
+    let host = Host::head_canonical();
+    let (session_id, q1, d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(ScriptedPublisher::new(Script::HoldThenAppend));
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the drive answers");
+    host.machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep commits");
+    let internal = lease
+        .internal
+        .as_ref()
+        .expect("the internal registration published");
+    let driver = Arc::clone(&internal.driver);
+    let mutation_gate = internal.mutation_gate.clone();
+
+    let refused = host
+        .machine
+        .finish_predecessor_settlement_before(
+            lease,
+            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            deadline_in(1_000),
+        )
+        .await
+        .expect_err("the deadline passes while the publication waits");
+    crate::tokio::time::timeout(BOUND, publisher.entered.notified())
+        .await
+        .expect("the task reached its publication");
+    assert!(
+        matches!(
+            refused.refusal,
+            PredecessorSettlementRefusal::Runtime(
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            )
+        ),
+        "{:?}",
+        refused.refusal
+    );
+    let [converged] = refused.progress.converged.as_slice() else {
+        panic!(
+            "only the nondirected input converged: {:?}",
+            refused.progress.converged
+        );
+    };
+    assert_eq!(&converged.input_id, q1.id());
+    assert_eq!(converged.settled_by, SettledBy::Ended);
+    assert_eq!(refused.progress.owed, vec![d2.id().clone()]);
+
+    drop(
+        driver
+            .try_lock()
+            .expect("no driver lock is held across the publication"),
+    );
+    drop(
+        crate::tokio::time::timeout(
+            BOUND,
+            mutation_gate.lock_settled(SettledGateWait::UnattachedSettlement),
+        )
+        .await
+        .expect("no mutation gate is held across the publication"),
+    );
+    registration_refused_unregister_in_progress(&host, &session_id).await;
+    let waiting = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline_in(100))
+        .await
+        .expect_err("a concurrent settlement waits for the task until its deadline");
+    assert!(
+        matches!(
+            waiting,
+            PredecessorSettlementRefusal::Runtime(
+                RuntimeDriverError::RuntimeTerminalPublicationInProgress { .. }
+            )
+        ),
+        "{waiting:?}"
+    );
+    publisher.release.notify_one();
+
+    let repeat = settle_whole(&host, &claim, &Arc::new(RecordingPublisher::default())).await;
+    let repeated = repeat
+        .publication
+        .expect("the repeat finds every row closed");
+    assert!(repeated.converged.is_empty());
+    assert_eq!(repeated.durable_rows_closed, 2);
+    assert_eq!(publisher.events().len(), 1, "the terminal is appended once");
+    assert!(!host.machine.contains_session(&session_id).await);
+}
+
+/// The publication fails before it appends: the receipts are final, the
+/// directed input's terminal is not appended, so it stays owed (an id with
+/// no sequence) and the nondirected one converged. The task still removes
+/// its registration. The repeat appends the terminal and only then lists
+/// the directed input, with that sequence.
+#[tokio::test]
+async fn a_terminal_whose_append_failed_stays_owed_until_the_repeat_appends_it() {
+    let host = Host::head_canonical();
+    let (session_id, q1, d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(ScriptedPublisher::new(Script::FailBeforeAppend));
+
+    let settled = settle_whole(&host, &claim, &publisher).await;
+
+    let refused = settled
+        .publication
+        .expect_err("the drain stops at the failed append");
+    assert!(
+        matches!(refused.refusal, PredecessorSettlementRefusal::Runtime(_)),
+        "{:?}",
+        refused.refusal
+    );
+    let [converged] = refused.progress.converged.as_slice() else {
+        panic!(
+            "only the nondirected input converged: {:?}",
+            refused.progress.converged
+        );
+    };
+    assert_eq!(&converged.input_id, q1.id());
+    assert_eq!(refused.progress.owed, vec![d2.id().clone()]);
+    assert!(publisher.events().is_empty());
+    assert!(!host.machine.contains_session(&session_id).await);
+
+    let repeat = settle_whole(&host, &claim, &publisher).await;
+    let repeated = repeat
+        .publication
+        .expect("the repeat appends the terminal and finds every row closed");
+    let appended = settled_input(&repeated, &d2);
+    assert_eq!(appended.settled_by, SettledBy::PendingTerminalConverged);
+    assert_eq!(appended.published_terminal_seq, Some(1));
+    assert_eq!(publisher.events().len(), 1);
+}
+
+/// The publication appends the terminal and the process stops before the
+/// append's receipt: the input stays owed. The repeat's append answers the
+/// same terminal as a replay, appending nothing, and the outbox receipt
+/// lands once, with the sequence of the first append.
+#[tokio::test]
+async fn a_terminal_appended_before_its_receipt_is_replayed_once_by_the_repeat() {
+    let host = Host::head_canonical();
+    let (session_id, _q1, d2) = queued_pair(&host).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(ScriptedPublisher::new(Script::FailAfterAppend));
+
+    let settled = settle_whole(&host, &claim, &publisher).await;
+
+    let refused = settled
+        .publication
+        .expect_err("the drain stops before the append's receipt");
+    assert_eq!(refused.progress.owed, vec![d2.id().clone()]);
+    assert_eq!(publisher.events().len(), 1, "the terminal was appended");
+
+    let repeat = settle_whole(&host, &claim, &publisher).await;
+    let repeated = repeat
+        .publication
+        .expect("the repeat converges the replayed terminal");
+    let replayed = settled_input(&repeated, &d2);
+    assert_eq!(replayed.settled_by, SettledBy::PendingTerminalConverged);
+    assert_eq!(replayed.published_terminal_seq, Some(1));
+    assert_eq!(publisher.events().len(), 1, "the replay appended nothing");
 }
