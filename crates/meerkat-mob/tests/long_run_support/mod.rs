@@ -1806,6 +1806,40 @@ impl Incarnation {
             .count())
     }
 
+    /// The error class of every `RunFailed` `session`'s event stream holds
+    /// for `run`, in order. The stream is read until it stays idle for half
+    /// a second, so a terminal published just after the read began is seen.
+    pub async fn run_failures(
+        &self,
+        session: &SessionId,
+        run: &RunId,
+    ) -> Result<Vec<meerkat_core::event::AgentErrorClass>, String> {
+        let mut stream = match self
+            .service
+            .subscribe_session_events_from(session, meerkat_core::SessionEventCursor::Earliest)
+            .await
+        {
+            Ok(subscription) => subscription.stream,
+            Err(meerkat_core::comms::StreamError::NotFound(_)) => return Ok(Vec::new()),
+            Err(error) => return Err(format!("replay the session's events: {error}")),
+        };
+        let mut failures = Vec::new();
+        while let Ok(Some(envelope)) =
+            tokio::time::timeout(Duration::from_millis(500), stream.next()).await
+        {
+            if let AgentEvent::RunFailed {
+                identity,
+                error_report,
+                ..
+            } = envelope.payload
+                && identity.run_id.as_ref() == Some(run)
+            {
+                failures.push(error_report.class);
+            }
+        }
+        Ok(failures)
+    }
+
     /// How many compaction summaries `session`'s committed transcript holds.
     pub async fn compaction_summaries(&self, session: &SessionId) -> Result<usize, String> {
         Ok(self
@@ -2756,6 +2790,9 @@ pub struct DeployRestart {
     /// Whether an input accepted on its session after the restart ran to
     /// its end: no stop mark or resume mark outlives the restart.
     pub follow_up_consumed: bool,
+    /// The error class of every `RunFailed` the restarted session's event
+    /// stream holds for the killed run.
+    pub killed_run_failures: Vec<meerkat_core::event::AgentErrorClass>,
 }
 
 /// The input a restart runs on each worker's session after reading it.
@@ -2829,6 +2866,9 @@ pub async fn restart_workers(
             notices: incarnation.interrupted_notices(&killed.session).await?,
             summaries: incarnation.compaction_summaries(&killed.session).await?,
             follow_up_consumed: false,
+            killed_run_failures: incarnation
+                .run_failures(&killed.session, &killed.run.run_id)
+                .await?,
         });
     }
     let follow_up_tag = match follow_up {
