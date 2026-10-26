@@ -1807,12 +1807,15 @@ impl Incarnation {
     }
 
     /// The error report of every `RunFailed` `session`'s event stream holds
-    /// for `run`, in order. The stream is read until it stays idle for half
-    /// a second, so a terminal published just after the read began is seen.
+    /// for `run`, in order. With `expect_one`, the read first waits, bounded,
+    /// until one arrives (a settled run's terminal is published after its
+    /// settlement commits, possibly after retries), then drains briefly for
+    /// duplicates; without it, the stream is read until it stays idle.
     pub async fn run_failures(
         &self,
         session: &SessionId,
         run: &RunId,
+        expect_one: bool,
     ) -> Result<Vec<meerkat_core::event::AgentErrorReport>, String> {
         let mut stream = match self
             .service
@@ -1824,9 +1827,16 @@ impl Incarnation {
             Err(error) => return Err(format!("replay the session's events: {error}")),
         };
         let mut failures = Vec::new();
-        while let Ok(Some(envelope)) =
-            tokio::time::timeout(Duration::from_millis(500), stream.next()).await
-        {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let idle = if expect_one && failures.is_empty() {
+                deadline.saturating_duration_since(Instant::now())
+            } else {
+                Duration::from_millis(500)
+            };
+            let Ok(Some(envelope)) = tokio::time::timeout(idle, stream.next()).await else {
+                break;
+            };
             if let AgentEvent::RunFailed {
                 identity,
                 error_report,
@@ -2885,9 +2895,21 @@ pub async fn restart_workers(
             notices: incarnation.interrupted_notices(&killed.session).await?,
             summaries: incarnation.compaction_summaries(&killed.session).await?,
             follow_up_consumed: false,
-            killed_run_failures: incarnation
-                .run_failures(&killed.session, &killed.run.run_id)
-                .await?,
+            killed_run_failures: {
+                // A run settled instead of resumed owes its RunFailed.
+                let settled = matches!(
+                    incarnation
+                        .input_terminal(&killed.session, &killed.input)
+                        .await,
+                    Some(meerkat_runtime::InputTerminalOutcome::Abandoned {
+                        reason: meerkat_runtime::InputAbandonReason::RequeueExpired
+                            | meerkat_runtime::InputAbandonReason::ResumeRefused,
+                    })
+                );
+                incarnation
+                    .run_failures(&killed.session, &killed.run.run_id, settled)
+                    .await?
+            },
         });
     }
     let follow_up_tag = match follow_up {

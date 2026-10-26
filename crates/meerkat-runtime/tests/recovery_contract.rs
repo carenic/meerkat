@@ -5877,6 +5877,22 @@ impl RecordingPublications {
         .expect("the publication counter stays open");
     }
 
+    /// The settled runs' terminals published through it, as their
+    /// `RunFailed` events.
+    fn run_failures(&self, run: &RunId) -> Vec<meerkat_core::event::AgentErrorReport> {
+        self.events()
+            .into_iter()
+            .filter_map(|event| match event {
+                meerkat_core::event::AgentEvent::RunFailed {
+                    identity,
+                    error_report,
+                    ..
+                } if identity.run_id.as_ref() == Some(run) => Some(error_report),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn interaction_failures(&self, interaction: meerkat_core::interaction::InteractionId) -> usize {
         self.events()
             .iter()
@@ -5917,6 +5933,37 @@ impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for RecordingPublica
             })
             .collect()
     }
+
+    async fn publish_settled_run_terminal(
+        &self,
+        settled: &meerkat_core::lifecycle::SettledRunTerminal,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        let count = {
+            let mut recorded = self.events.lock().unwrap();
+            recorded.push(settled.run_failed_event());
+            recorded.len()
+        };
+        self.published.send_replace(count);
+        Ok(())
+    }
+}
+
+/// The report of the `RunFailed` a run settled for `cause` ends with.
+fn settled_run_report(
+    cause: meerkat_core::lifecycle::SettledRunCause,
+) -> meerkat_core::event::AgentErrorReport {
+    let meerkat_core::event::AgentEvent::RunFailed { error_report, .. } =
+        meerkat_core::lifecycle::SettledRunTerminal::new(
+            SessionId::new(),
+            RunId::new(),
+            Default::default(),
+            cause,
+        )
+        .run_failed_event()
+    else {
+        panic!("a settled run's terminal is a RunFailed");
+    };
+    error_report
 }
 
 /// [`RecordedRuns`] with a terminal publication capability that records
@@ -6059,7 +6106,8 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
         .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
         .await
         .expect("attach the executor");
-    executor.publications.wait_for(1).await;
+    // The interaction terminal, then the run's own.
+    executor.publications.wait_for(2).await;
 
     assert_eq!(
         stored_terminal(&store, &runtime_id, input.id()).await,
@@ -6070,6 +6118,13 @@ async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once()
             }),
         )),
         "the start settles the kept run as expired"
+    );
+    assert_eq!(
+        executor.publications.run_failures(&run_id),
+        vec![settled_run_report(
+            meerkat_core::lifecycle::SettledRunCause::RequeueExpired
+        )],
+        "the run ends once on the session's stream, as expired"
     );
     assert_eq!(
         executor.publications.interaction_failures(interaction),
@@ -6188,7 +6243,8 @@ async fn a_refused_resume_of_a_kept_directed_run_fails_its_interaction_once() {
         .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
         .await
         .expect("attach the executor");
-    executor.publications.wait_for(1).await;
+    // The run's own terminal and the interaction terminal.
+    executor.publications.wait_for(2).await;
 
     assert_eq!(
         stored_terminal(&store, &runtime_id, input.id()).await,
@@ -6199,6 +6255,13 @@ async fn a_refused_resume_of_a_kept_directed_run_fails_its_interaction_once() {
             }),
         )),
         "the refused run's input ends refused"
+    );
+    assert_eq!(
+        executor.publications.run_failures(&run_id),
+        vec![settled_run_report(
+            meerkat_core::lifecycle::SettledRunCause::ResumeRefused
+        )],
+        "the run ends once on the session's stream, as refused"
     );
     assert_eq!(
         executor.publications.interaction_failures(interaction),

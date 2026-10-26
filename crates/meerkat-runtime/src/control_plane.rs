@@ -868,7 +868,11 @@ pub(crate) async fn publish_settled_run_terminal(
 /// when one is given. A start that settles a kept run before it serves
 /// publishes through an actor whose surface may publish its exact witness
 /// only as the attachment commits; until then a publication is refused, so
-/// it is retried instead of lost.
+/// it is retried instead of lost. Each attempt is bounded by the deadline
+/// too. Only that refusal is retried (a control failure while the
+/// capability's actor is not bound yet or still live): an actor that is gone
+/// (the session stopped), a capability that does not support the
+/// publication, and any other answer end the retries.
 pub(crate) async fn publish_settled_run_terminal_before(
     publication_handle: Option<&dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>,
     terminal: &meerkat_core::lifecycle::SettledRunTerminal,
@@ -884,11 +888,30 @@ pub(crate) async fn publish_settled_run_terminal_before(
     };
     let mut delay_ms = 25_u64;
     loop {
-        let Err(error) = handle.publish_settled_run_terminal(terminal).await else {
-            return;
+        let answered =
+            await_before_deadline(deadline, handle.publish_settled_run_terminal(terminal)).await;
+        let error = match answered {
+            Some(Ok(())) => return,
+            Some(Err(error)) => error,
+            None => {
+                tracing::warn!(
+                    session_id = %terminal.session_id(),
+                    run_id = %terminal.run_id(),
+                    "the settled run's terminal was not published before its deadline"
+                );
+                return;
+            }
         };
-        let retry =
-            deadline.and_then(|deadline| retry_delay_before_deadline(delay_ms, Some(deadline)));
+        let actor_may_still_answer = handle.actor_identity().is_none_or(|actor| actor.is_live());
+        let retryable = matches!(
+            error,
+            meerkat_core::lifecycle::CoreExecutorError::ControlFailed { .. }
+        ) && actor_may_still_answer;
+        let retry = retryable
+            .then(|| {
+                deadline.and_then(|deadline| retry_delay_before_deadline(delay_ms, Some(deadline)))
+            })
+            .flatten();
         let Some(sleep_for) = retry else {
             tracing::warn!(
                 session_id = %terminal.session_id(),

@@ -125,9 +125,12 @@ them.
   part of it. A start that settles an expired run retries it for up to a
   minute while its attachment comes to serve. A crash in between, or a
   start whose tail repair leaves a tail standing (so the session reloads
-  instead of serving), loses it, and no later start publishes it. An
-  archive that settles a kept run publishes no run terminal, since it
-  serves no live actor, and neither does a suspension the runtime refuses.
+  instead of serving), loses it, and no later start publishes it. The event
+  needs the attachment's publication capability: a surface without one, or
+  one that does not support the publication, publishes none. An archive
+  that settles a kept run publishes no run terminal, since it serves no live
+  actor; nor do a retire, a destroy or a reset, which end a kept run without
+  settling it; nor does a suspension the runtime refuses.
 
 - `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
   schedules are included; the tool lists active and paused schedules only, and
