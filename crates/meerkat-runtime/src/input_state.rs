@@ -1645,8 +1645,11 @@ pub(crate) fn input_terminal_completion_outcome(
 ///   input a graceful stop kept queued once it is older than the stop's max
 ///   age (`PendingRuntimeExecutorAttachment::settle_expired_stop_requeued_inputs`).
 /// - `Abandoned { ResumeRefused }` (and the receipt-less `Cancelled` and
-///   `RequeueExpired` of the same path): a run left open by a restart that is
-///   settled instead of resumed (`DriverEntry::settle_resumable_run`).
+///   `RequeueExpired` of the same path), on rows 0.9.5 wrote: a run left open
+///   by a restart that is settled instead of resumed. Since then the
+///   settlement (`DriverEntry::settle_resumable_run_with_terminals`) stages
+///   a runtime-termination batch for those inputs in the same commit, so a
+///   newer row has its receipt.
 ///
 /// `Cancelled` and `MaxAttemptsExhausted` are also reached with a receipt
 /// (tracked cancel, attachment replacement, a failed run's batch); a row of

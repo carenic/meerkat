@@ -101,9 +101,15 @@ them.
   interaction end. The settlement now stages the runtime-termination carrier
   for the run's inputs in the same durable commit that ends them, as a stop
   already does for the queued inputs it ends: a directed input's interaction
-  fails exactly once with an `InteractionFailed`. A start that settles an
-  expired kept run publishes after it releases the session, so a crash in
-  between leaves the committed carrier for the next start to publish.
+  fails exactly once with an `InteractionFailed`. A nondirected kept input
+  now carries a runtime-termination receipt too: its receipt reads move from
+  pending to finalized with the runtime-terminated outcome and the
+  settlement's reason, where they used to read as a terminal without a
+  receipt (rows 0.9.5 settled still read that way). A start that settles an
+  expired kept run publishes after it releases the session, through the
+  attachment's publication capability, so a crash in between, or a surface
+  without that capability, leaves the committed carrier for the next stop or
+  start to publish.
 
 - `meerkat-runtime`: a run left open across a restart (kept by a graceful
   stop, or cut by a crash after a round commit) that the runtime settles

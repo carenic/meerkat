@@ -2204,6 +2204,17 @@ async fn a_kept_run(
     store: &InMemoryRuntimeStore,
     kept_phase: InputLifecycleState,
 ) -> (SessionId, RunId, Input) {
+    a_kept_run_of(store, kept_phase, make_prompt("the run's prompt"), None).await
+}
+
+/// [`a_kept_run`] whose kept input is `input`, its row carrying the stop's
+/// requeue mark `stop_requeue` when given.
+async fn a_kept_run_of(
+    store: &InMemoryRuntimeStore,
+    kept_phase: InputLifecycleState,
+    input: Input,
+    stop_requeue: Option<meerkat_runtime::input_state::StopRequeueMark>,
+) -> (SessionId, RunId, Input) {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
     use meerkat_core::types::{
         AssistantBlock, BlockAssistantMessage, Message, StopReason, TranscriptMessageIdentity,
@@ -2212,7 +2223,6 @@ async fn a_kept_run(
     use meerkat_runtime::store::{PreparedRuntimeSessionCommit, PreparedWholeBlobProvisionalTail};
 
     let run_id = RunId::new();
-    let input = make_prompt("the run's prompt");
     let mut committed = meerkat_core::Session::new();
     committed.push(Message::User(UserMessage::text("the run's prompt")));
     let session_id = committed.id().clone();
@@ -2275,7 +2285,10 @@ async fn a_kept_run(
         .await
         .unwrap();
     store
-        .persist_input_state(&runtime_id, &kept_row(&input, &run_id, kept_phase))
+        .persist_input_state(
+            &runtime_id,
+            &kept_row(&input, &run_id, kept_phase, stop_requeue),
+        )
         .await
         .unwrap();
     (session_id, run_id, input)
@@ -2289,8 +2302,11 @@ fn kept_row(
     input: &Input,
     run_id: &RunId,
     phase: InputLifecycleState,
+    stop_requeue: Option<meerkat_runtime::input_state::StopRequeueMark>,
 ) -> InputStatePersistenceRecord {
     let mut row = applied_pending_state(input, run_id, 1);
+    row.state.idempotency_key = input.header().idempotency_key.clone();
+    row.state.stop_requeue = stop_requeue;
     match phase {
         InputLifecycleState::AppliedPendingConsumption => persistable(row),
         InputLifecycleState::Applied => {
@@ -5779,4 +5795,428 @@ async fn head_canonical_recovery_beside_an_interrupted_cursor_tail_with_a_cursor
         BesideTheTail::CursorListed,
     )
     .await;
+}
+
+// ---------------------------------------------------------------------------
+// A settled kept run publishes its inputs' terminals.
+// ---------------------------------------------------------------------------
+
+/// A directed peer message admitted at `admitted_at`, as a
+/// host-residency-fenced bridge delivers it: its interaction, input,
+/// correlation and idempotency ids agree and it names the sending runtime.
+fn make_directed_peer(
+    text: &str,
+    admitted_at: chrono::DateTime<Utc>,
+) -> (Input, meerkat_core::interaction::InteractionId) {
+    let id = InputId::new();
+    let interaction = meerkat_core::interaction::InteractionId(id.0);
+    let input = Input::Peer(meerkat_runtime::input::PeerInput {
+        header: InputHeader {
+            ingress_context: None,
+            retained_resume: None,
+            authority_association: None,
+            id,
+            timestamp: admitted_at,
+            source: InputOrigin::Peer {
+                peer_id: "kept-run-peer".into(),
+                display_identity: None,
+                runtime_id: Some(LogicalRuntimeId("kept-run-peer-runtime".into())),
+            },
+            durability: InputDurability::Durable,
+            visibility: InputVisibility::default(),
+            idempotency_key: Some(meerkat_runtime::identifiers::IdempotencyKey::new(
+                interaction.to_string(),
+            )),
+            supersession_key: None,
+            correlation_id: Some(meerkat_runtime::identifiers::CorrelationId::from_uuid(
+                interaction.0,
+            )),
+        },
+        directed_interaction_id: Some(interaction),
+        convention: Some(meerkat_runtime::input::PeerConvention::Message),
+        content: text.into(),
+        payload: None,
+        handling_mode: Some(meerkat_core::types::HandlingMode::Queue),
+        sender_taint: None,
+        objective_id: None,
+        system_prompts: Vec::new(),
+        injected_context: Vec::new(),
+        in_reply_to: None,
+    });
+    (input, interaction)
+}
+
+/// Records every interaction terminal published through it, and counts
+/// them on a watch channel a test waits on.
+struct RecordingPublications {
+    events: std::sync::Mutex<Vec<meerkat_core::event::AgentEvent>>,
+    published: tokio::sync::watch::Sender<usize>,
+}
+
+impl RecordingPublications {
+    fn new() -> Arc<Self> {
+        Arc::new(Self {
+            events: std::sync::Mutex::new(Vec::new()),
+            published: tokio::sync::watch::channel(0).0,
+        })
+    }
+
+    fn events(&self) -> Vec<meerkat_core::event::AgentEvent> {
+        self.events.lock().unwrap().clone()
+    }
+
+    /// Wait, bounded, until at least `count` events were published.
+    async fn wait_for(&self, count: usize) {
+        let mut published = self.published.subscribe();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            published.wait_for(|published| *published >= count),
+        )
+        .await
+        .expect("the terminals are published")
+        .expect("the publication counter stays open");
+    }
+
+    fn interaction_failures(&self, interaction: meerkat_core::interaction::InteractionId) -> usize {
+        self.events()
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    meerkat_core::event::AgentEvent::InteractionFailed { interaction_id, .. }
+                        if *interaction_id == interaction
+                )
+            })
+            .count()
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::CoreExecutorPublicationHandle for RecordingPublications {
+    async fn publish_interaction_terminals(
+        &self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        let count = {
+            let mut recorded = self.events.lock().unwrap();
+            recorded.extend_from_slice(events);
+            recorded.len()
+        };
+        self.published.send_replace(count);
+        events
+            .iter()
+            .enumerate()
+            .map(|(index, event)| {
+                meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt::try_new(
+                    event,
+                    index as u64 + 1,
+                )
+            })
+            .collect()
+    }
+}
+
+/// [`RecordedRuns`] with a terminal publication capability that records
+/// what is published, through its handle and through the executor.
+#[derive(Clone)]
+struct PublishingRuns {
+    runs: RecordedRuns,
+    publications: Arc<RecordingPublications>,
+}
+
+impl PublishingRuns {
+    fn new() -> Self {
+        Self {
+            runs: RecordedRuns::default(),
+            publications: RecordingPublications::new(),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl meerkat_core::lifecycle::core_executor::CoreExecutor for PublishingRuns {
+    fn publication_handle(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::lifecycle::CoreExecutorPublicationHandle>> {
+        Some(Arc::clone(&self.publications) as Arc<_>)
+    }
+
+    async fn publish_interaction_terminals(
+        &mut self,
+        events: &[meerkat_core::event::AgentEvent],
+    ) -> Result<
+        Vec<meerkat_core::lifecycle::core_executor::CoreInteractionTerminalPublicationReceipt>,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        meerkat_core::lifecycle::CoreExecutorPublicationHandle::publish_interaction_terminals(
+            self.publications.as_ref(),
+            events,
+        )
+        .await
+    }
+
+    async fn apply(
+        &mut self,
+        run_id: RunId,
+        primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+    ) -> Result<
+        meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+        meerkat_core::lifecycle::core_executor::CoreExecutorError,
+    > {
+        meerkat_core::lifecycle::core_executor::CoreExecutor::apply(
+            &mut self.runs,
+            run_id,
+            primitive,
+        )
+        .await
+    }
+
+    async fn cancel_after_boundary(
+        &mut self,
+        reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        meerkat_core::lifecycle::core_executor::CoreExecutor::cancel_after_boundary(
+            &mut self.runs,
+            reason,
+        )
+        .await
+    }
+
+    async fn stop_runtime_executor(
+        &mut self,
+        reason: String,
+    ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+        meerkat_core::lifecycle::core_executor::CoreExecutor::stop_runtime_executor(
+            &mut self.runs,
+            reason,
+        )
+        .await
+    }
+}
+
+/// The phase of the interaction-terminal outbox the stored row of
+/// `input_id` carries, from its wire image (the field is runtime-owned).
+async fn stored_outbox_phase(
+    store: &InMemoryRuntimeStore,
+    runtime_id: &LogicalRuntimeId,
+    input_id: &InputId,
+) -> Option<String> {
+    let row = store
+        .load_input_states_strict(runtime_id)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|row| &row.state.input_id == input_id)?;
+    let image = serde_json::to_value(&row).unwrap();
+    image
+        .pointer("/state/interaction_terminal_outbox/phase/phase")
+        .or_else(|| image.pointer("/state/interaction_terminal_outbox/phase"))
+        .and_then(|phase| phase.as_str())
+        .map(str::to_string)
+}
+
+/// A start over a kept directed run whose stop's max age has passed settles
+/// the run as expired: its input ends `RequeueExpired`, the caller hears it
+/// as exactly one `InteractionFailed` for its interaction, through the
+/// attachment's publication capability, and the outbox reads published.
+/// Nothing runs. A later start over the same store publishes nothing more.
+/// RED before: the settlement staged no interaction terminal, so nothing was
+/// published.
+#[tokio::test]
+async fn a_kept_directed_run_past_its_stops_max_age_fails_its_interaction_once() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let an_hour_ago = Utc::now() - chrono::Duration::hours(1);
+    let (directed, interaction) = make_directed_peer("the run's request", an_hour_ago);
+    let (session_id, run_id, input) = a_kept_run_of(
+        &store,
+        InputLifecycleState::AppliedPendingConsumption,
+        directed,
+        Some(meerkat_runtime::input_state::StopRequeueMark {
+            stopped_at: an_hour_ago,
+            max_age_ms: 1_000,
+        }),
+    )
+    .await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let machine = Arc::new(
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine"),
+    );
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session's runtime registers");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        Some(run_id.clone()),
+        "the registration keeps the run resumable"
+    );
+    let executor = PublishingRuns::new();
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
+        .await
+        .expect("attach the executor");
+    executor.publications.wait_for(1).await;
+
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        Some((
+            InputLifecycleState::Abandoned,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::input_state::InputAbandonReason::RequeueExpired,
+            }),
+        )),
+        "the start settles the kept run as expired"
+    );
+    assert_eq!(
+        executor.publications.interaction_failures(interaction),
+        1,
+        "the caller hears the run's end once: {:?}",
+        executor.publications.events()
+    );
+    assert_eq!(
+        stored_outbox_phase(&store, &runtime_id, input.id())
+            .await
+            .as_deref(),
+        Some("published"),
+        "the outbox reads published"
+    );
+    assert!(
+        executor.runs.applied().is_empty(),
+        "nothing of the expired run runs: {:?}",
+        executor.runs.applied()
+    );
+
+    // A later start over the same store, once its loop has served a new
+    // input, published nothing.
+    machine
+        .unregister_session(&session_id)
+        .await
+        .expect("the first start ends");
+    drop(machine);
+    let restarted = Arc::new(
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine"),
+    );
+    restarted
+        .register_session(session_id.clone())
+        .await
+        .expect("the session's runtime registers again");
+    let later = PublishingRuns::new();
+    restarted
+        .ensure_session_with_executor(session_id.clone(), Box::new(later.clone()))
+        .await
+        .expect("attach the executor again");
+    let next = make_prompt("the next input");
+    let (_, waiter) = restarted
+        .accept_input_with_completion(&session_id, next.clone())
+        .await
+        .expect("the next input is admitted");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        waiter.expect("the next input's waiter").wait(),
+    )
+    .await
+    .expect("the next input completes")
+    .expect("the next input's waiter resolves");
+    assert_eq!(later.runs.applied(), vec![next.id().clone()]);
+    assert!(
+        later.publications.events().is_empty(),
+        "a later start publishes nothing more: {:?}",
+        later.publications.events()
+    );
+}
+
+/// Answers every resume with `Superseded`.
+struct SupersededResume;
+
+#[async_trait::async_trait]
+impl meerkat_runtime::resumed_run_admission::ResumedRunAdmission for SupersededResume {
+    async fn admit_resumed_run(
+        &self,
+        _request: &meerkat_runtime::resumed_run_admission::ResumedRunAdmissionRequest,
+    ) -> meerkat_runtime::resumed_run_admission::ResumedRunAdmissionDecision {
+        meerkat_runtime::resumed_run_admission::ResumedRunAdmissionDecision::Superseded {
+            detail: "the run's work moved on".to_string(),
+        }
+    }
+}
+
+/// The admission refuses the resume of a kept directed run (superseded):
+/// the run is settled, its input ends `ResumeRefused`, and the runtime
+/// loop's own outbox drain gives the caller exactly one `InteractionFailed`
+/// for its interaction; the outbox reads published and nothing runs. RED
+/// before: the refused settlement staged no interaction terminal.
+#[tokio::test]
+async fn a_refused_resume_of_a_kept_directed_run_fails_its_interaction_once() {
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let (directed, interaction) = make_directed_peer("the run's request", Utc::now());
+    let (session_id, run_id, input) = a_kept_run_of(
+        &store,
+        InputLifecycleState::AppliedPendingConsumption,
+        directed,
+        None,
+    )
+    .await;
+    let runtime_id = LogicalRuntimeId::for_session(&session_id);
+    let machine = Arc::new(
+        MeerkatMachine::persistent(store.clone() as Arc<dyn RuntimeStore>, memory_blob_store())
+            .expect("persistent machine"),
+    );
+    machine
+        .register_session(session_id.clone())
+        .await
+        .expect("the session's runtime registers");
+    assert_eq!(
+        machine.resumable_run_id(&session_id).await,
+        Some(run_id.clone()),
+        "the registration keeps the run resumable"
+    );
+    let registration = machine
+        .current_session_registration_witness(&session_id)
+        .await
+        .expect("the registration");
+    machine
+        .bind_resumed_run_admission(&registration, Arc::new(SupersededResume) as _)
+        .await
+        .expect("bind the admission");
+    let executor = PublishingRuns::new();
+    machine
+        .ensure_session_with_executor(session_id.clone(), Box::new(executor.clone()))
+        .await
+        .expect("attach the executor");
+    executor.publications.wait_for(1).await;
+
+    assert_eq!(
+        stored_terminal(&store, &runtime_id, input.id()).await,
+        Some((
+            InputLifecycleState::Abandoned,
+            Some(InputTerminalOutcome::Abandoned {
+                reason: meerkat_runtime::input_state::InputAbandonReason::ResumeRefused,
+            }),
+        )),
+        "the refused run's input ends refused"
+    );
+    assert_eq!(
+        executor.publications.interaction_failures(interaction),
+        1,
+        "the caller hears the run's end once: {:?}",
+        executor.publications.events()
+    );
+    assert_eq!(
+        stored_outbox_phase(&store, &runtime_id, input.id())
+            .await
+            .as_deref(),
+        Some("published"),
+        "the outbox reads published"
+    );
+    assert!(
+        executor.runs.applied().is_empty(),
+        "nothing of the refused run runs: {:?}",
+        executor.runs.applied()
+    );
+    assert_eq!(machine.resumable_run_id(&session_id).await, None);
 }

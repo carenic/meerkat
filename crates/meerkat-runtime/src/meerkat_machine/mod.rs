@@ -4108,6 +4108,9 @@ impl PendingRuntimeExecutorAttachment {
             .await?;
         // The expired run whose tail repair requires the session to reload.
         let mut reload_for_run = None;
+        // The expired run whose tail is repaired once the queued inputs are
+        // swept.
+        let mut settled_run = None;
         // The runtime-termination carriers the expired run's settlement
         // committed, and the run's own terminal, published once the driver
         // is released.
@@ -4144,18 +4147,7 @@ impl PendingRuntimeExecutorAttachment {
                     self.runless_terminal.owe();
                 }
                 expired.extend(settled);
-                // The settled run never resumes, so its provisional tail is
-                // repaired as an interrupted run, after the abandonment
-                // committed: its rows stay in the transcript, and the
-                // session's next run commits its first round over the
-                // repaired body (the session layer resynchronizes the seeded
-                // actor from it at its next step).
-                if driver
-                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
-                    .await
-                {
-                    reload_for_run = Some(run_id);
-                }
+                settled_run = Some(run_id);
             }
             let candidates =
                 crate::input_state::expired_stop_requeued_inputs(driver.as_driver(), now);
@@ -4180,6 +4172,21 @@ impl PendingRuntimeExecutorAttachment {
                     );
                 }
             }
+            // The settled run never resumes, so its provisional tail is
+            // repaired as an interrupted run, after the abandonment
+            // committed: its rows stay in the transcript, and the session's
+            // next run commits its first round over the repaired body (the
+            // session layer resynchronizes the seeded actor from it at its
+            // next step). After the queued sweep, so an expired queued input
+            // naming an earlier run is terminal by then and cannot hold the
+            // repair.
+            if let Some(run_id) = settled_run
+                && driver
+                    .repair_settled_run_tail(self.witness.session_id(), &run_id)
+                    .await
+            {
+                reload_for_run = Some(run_id);
+            }
             expired
         };
         if !expired.is_empty() {
@@ -4190,17 +4197,34 @@ impl PendingRuntimeExecutorAttachment {
                 crate::completion::CompletionWaitError::AttachmentReplaced,
             );
         }
-        // This runs after the runtime loop's startup drain, so the carriers
-        // the settlement committed, and then the run's own terminal, are
-        // published here, through the publisher the attachment already
-        // carries. Detached: the session actor answers a publication only
-        // once this attachment is served, and this attachment is not served
-        // until this returns. A failed or missing publication leaves each
-        // directed outbox as its durable retry anchor for the next drain.
-        // The run's terminal is not durable, so it is retried for a bounded
-        // time while the attachment comes to serve (a surface may publish
-        // its exact actor witness only as the attachment commits), and is
-        // lost after that.
+        // A tail the repair left standing would refuse the session's next
+        // run's first round commit, so the session reloads at once, and this
+        // attachment does not serve. A crash right after the settlement
+        // leaves the same state for the next registration's recovery.
+        if let Some(run_id) = reload_for_run {
+            let reason = format!("expired run {run_id}'s provisional tail still stands");
+            self.machine
+                .require_session_durability_reload(
+                    self.witness.session_id(),
+                    "expired_resumable_run_tail_repair",
+                    reason.clone(),
+                )
+                .await;
+            return Err(RuntimeDriverError::Internal(format!(
+                "{reason}; the session reloads before it serves"
+            )));
+        }
+        // The attachment serves. This runs after the runtime loop's startup
+        // drain, so the carriers the settlement committed, and then the
+        // run's own terminal, are published here, through the publisher the
+        // attachment already carries. Detached: the session actor answers a
+        // publication only once this attachment is served, and this
+        // attachment is not served until this returns. A failed or missing
+        // publication leaves each directed outbox as its durable retry
+        // anchor for the next drain. The run's terminal is not durable, so it
+        // is retried for a bounded time while the attachment comes to serve
+        // (a surface may publish its exact actor witness only as the
+        // attachment commits), and is lost after that.
         if !settled_batches.is_empty() || settled_terminal.is_some() {
             let publication_handle = self
                 .machine
@@ -4241,23 +4265,6 @@ impl PendingRuntimeExecutorAttachment {
                     .await;
                 }
             }));
-        }
-        // A tail the repair left standing would refuse the session's next
-        // run's first round commit, so the session reloads at once, and this
-        // attachment does not serve. A crash right after the settlement
-        // leaves the same state for the next registration's recovery.
-        if let Some(run_id) = reload_for_run {
-            let reason = format!("expired run {run_id}'s provisional tail still stands");
-            self.machine
-                .require_session_durability_reload(
-                    self.witness.session_id(),
-                    "expired_resumable_run_tail_repair",
-                    reason.clone(),
-                )
-                .await;
-            return Err(RuntimeDriverError::Internal(format!(
-                "{reason}; the session reloads before it serves"
-            )));
         }
         Ok(expired)
     }
