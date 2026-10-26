@@ -163,6 +163,13 @@ impl Default for SpiRealmConfig {
 /// A family of journaled scopes: its tag (the scope name prefix), its kind,
 /// and the entry groups it keeps in the head (pinned: readable at boot
 /// without loading the body).
+///
+/// A tag names one family in a realm. A scope's name starts with its
+/// family's tag and a `:`, so a tag never contains `:`. Core never uses a
+/// tag that starts with `x` or `mx`: a layer above Core that keeps scopes of
+/// its own in the realm ([`SpiRealm::claim`], [`SpiRealm::commit`]) names its
+/// families with those prefixes, and no family a later Core release adds can
+/// take one of its tags.
 #[derive(Debug, Clone, Copy)]
 pub struct ScopeFamily {
     pub tag: &'static str,

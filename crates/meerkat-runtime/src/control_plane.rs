@@ -735,14 +735,21 @@ pub(crate) async fn terminalize_async_stop_once(
         // cancelled and its mark ends, before the stop classifies the rest. A
         // graceful unregister that keeps queued work keeps that run too: the
         // next registration finds it open again.
+        let termination_reason = generated_runtime_termination_reason(&driver).to_string();
+        let mut settled_resumable_batches = Vec::new();
         let settled_resumable_input_ids = match driver.resumable_run_id() {
             Some(run_id) if !driver.stop_keeps_queued_work() => {
-                let settled = driver
-                    .settle_resumable_run(
+                // The kept run's inputs get the runtime-termination carrier
+                // in the same commit, so a directed caller hears that the
+                // run ended with the stop.
+                let (settled, batches) = driver
+                    .settle_resumable_run_with_terminals(
                         &run_id,
                         crate::input_state::InputAbandonReason::Cancelled,
+                        &termination_reason,
                     )
                     .await?;
+                settled_resumable_batches = batches;
                 // Its provisional tail is repaired as an interrupted run,
                 // after the abandonment committed: every committed round
                 // stays. A tail the repair leaves standing is the next
@@ -759,7 +766,6 @@ pub(crate) async fn terminalize_async_stop_once(
             runless_terminal.owe();
         }
         let active_input_ids = driver.as_driver().active_input_ids();
-        let termination_reason = generated_runtime_termination_reason(&driver).to_string();
         // `Stopped` must still replay RuntimeExecutorExited so an interrupted
         // terminalization can idempotently repair cleanup facts. `Destroyed`
         // is different: Destroy already committed the absorbing DSL terminal
@@ -799,8 +805,9 @@ pub(crate) async fn terminalize_async_stop_once(
                 runless_terminal.owe();
             }
         }
-        let terminal_batches =
+        let mut terminal_batches =
             crate::meerkat_machine::driver::DriverEntry::commit_prepared_runless_interaction_terminal_outboxes(prepared);
+        terminal_batches.extend(settled_resumable_batches);
         (
             settled_resumable_input_ids,
             terminal_batches,
