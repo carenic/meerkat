@@ -2298,10 +2298,10 @@ pub(crate) async fn test_drain_recovered_input_terminal_completions(
         .map_err(|error| error.to_string())
 }
 
-/// Finalize every durable non-directed terminal candidate before startup can
-/// accept work. Directed batches continue through the interaction outbox
-/// below, whose shared authorized bundle finalizes this same receipt before
-/// event publication and waiter delivery.
+/// Finalize every durable non-directed terminal candidate, with `executor`
+/// as the publisher. The startup drain runs this through
+/// [`drain_recovered_terminals_with`]; tests drive it alone.
+#[cfg(test)]
 async fn drain_recovered_input_terminal_completions(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
@@ -2315,6 +2315,10 @@ async fn drain_recovered_input_terminal_completions(
     .await
 }
 
+/// Finalize every durable non-directed terminal candidate before startup can
+/// accept work. Directed batches continue through the interaction outbox
+/// below, whose shared authorized bundle finalizes this same receipt before
+/// event publication and waiter delivery.
 async fn drain_recovered_input_terminal_completions_with(
     driver: &crate::meerkat_machine::SharedDriver,
     completions: Option<&crate::meerkat_machine::SharedCompletionRegistry>,
