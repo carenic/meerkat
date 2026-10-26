@@ -35,6 +35,15 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-core`: `BoundOperationReview::consent_notice_issuer` returns the
+  approval owner that issues the review's human consent, present exactly
+  when R3 routes to human consent, as `consent_owner_loss_settlement` is. A
+  host composes it into its delivery owner's consent notice projection
+  (`ConsentNoticeProjector`), so the notices that owner owes are projected
+  for exactly the owner that issued the consent.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
