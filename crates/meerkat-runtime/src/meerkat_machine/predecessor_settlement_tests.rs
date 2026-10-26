@@ -615,6 +615,9 @@ fn interrupted_tail(mut session: meerkat_core::Session, run_id: &RunId) -> meerk
     session
 }
 
+/// How a row builds a run's tail from the committed session.
+type TailFn = Box<dyn FnOnce(meerkat_core::Session, &RunId) -> meerkat_core::Session>;
+
 /// A session with one committed boundary (its first turn's prompt) on the
 /// host's store and the co-located session store. With `tail`, run `run_id`
 /// then left `tail` as the store's provisional tail and the physical head,
@@ -622,6 +625,17 @@ fn interrupted_tail(mut session: meerkat_core::Session, run_id: &RunId) -> meerk
 async fn durable_session(
     host: &Host,
     tail: Option<fn(meerkat_core::Session, &RunId) -> meerkat_core::Session>,
+) -> (SessionId, RunId) {
+    durable_session_built(host, None, tail.map(|tail| Box::new(tail) as TailFn)).await
+}
+
+/// [`durable_session`], with a boundary of `left.0` that consumed `left.1`
+/// without a receipt committed before the tail (see [`commit_left_boundary`]),
+/// and any tail a row builds.
+async fn durable_session_built(
+    host: &Host,
+    left: Option<(&RunId, &[&Input])>,
+    tail: Option<TailFn>,
 ) -> (SessionId, RunId) {
     use meerkat_core::lifecycle::core_executor::BoundSessionCommit;
     use meerkat_core::session_store::PreparedHeadCanonicalMutation;
@@ -639,7 +653,7 @@ async fn durable_session(
         .expect("the committed document seals")
         .with_head_canonical_mutation(root)
         .expect("the committed head binds");
-    let committed_authority = host
+    let mut committed_authority = host
         .store
         .commit_prepared_session_boundary(
             &runtime_id,
@@ -651,6 +665,18 @@ async fn durable_session(
         .and_then(|authority| authority.head_canonical())
         .cloned()
         .expect("the boundary returns HeadCanonical authority");
+    if let Some((left_run, inputs)) = left {
+        commit_left_boundary(host, &session_id, left_run, inputs).await;
+        committed_authority = host
+            .store
+            .load_session_boundary_authority(&runtime_id)
+            .await
+            .expect("the session's authority reads")
+            .expect("the session has a committed authority")
+            .head_canonical()
+            .cloned()
+            .expect("HeadCanonical authority");
+    }
     let run_id = RunId::new();
     if let Some(tail) = tail {
         let base = session_store
@@ -686,6 +712,68 @@ async fn durable_session(
             .expect("the physical head moves past the boundary");
     }
     (session_id, run_id)
+}
+
+/// A boundary of `left_run` that consumed `inputs` and staged no receipt for
+/// them, as a recovery commit before this release left it: its receipt
+/// (sequence 1) and each input's row, consumed by that run at that
+/// sequence with no completion and no outbox, a directed one keeping its
+/// payload.
+async fn commit_left_boundary(
+    host: &Host,
+    session_id: &SessionId,
+    left_run: &RunId,
+    inputs: &[&Input],
+) {
+    host.store
+        .commit_prepared_session_boundary(
+            &LogicalRuntimeId::for_session(session_id),
+            crate::store::PreparedRuntimeSessionCommit::success(
+                None,
+                meerkat_core::lifecycle::RunBoundaryReceipt {
+                    run_id: left_run.clone(),
+                    boundary:
+                        meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint,
+                    contributing_input_ids: inputs.iter().map(|input| input.id().clone()).collect(),
+                    conversation_digest: None,
+                    message_count: 1,
+                    sequence: 1,
+                    owner_contributions: Vec::new(),
+                },
+                inputs
+                    .iter()
+                    .map(|input| {
+                        record(row(
+                            input,
+                            InputLifecycleState::Consumed,
+                            Some(left_run.clone()),
+                            Some(1),
+                        ))
+                    })
+                    .collect(),
+                Some(session_id.clone()),
+            ),
+        )
+        .await
+        .expect("the run's boundary commits its receipt and its consumed rows");
+}
+
+/// The tail of an open run cut after a tool round whose result it
+/// committed, with the run cursor its round commit wrote: the run binds
+/// `bound` and resumes with its next model call.
+fn continuable_tail(bound: Vec<InputId>) -> TailFn {
+    Box::new(move |session: meerkat_core::Session, run_id: &RunId| {
+        let mut session = interrupted_tail(session, run_id);
+        session
+            .set_run_cursor(&meerkat_core::SessionRunCursor::new(
+                run_id.clone(),
+                bound,
+                0,
+                meerkat_core::RunResumePoint::AwaitingModel,
+            ))
+            .expect("the run cursor serializes");
+        session
+    })
 }
 
 /// `input` applied by `run_id` and waiting for the run's boundary.
@@ -1104,40 +1192,7 @@ async fn inputs_a_recovered_boundary_left_without_a_receipt_are_answered_outcome
     let left_run = RunId::new();
     let l1 = directed_step("consumed without a receipt");
     let l2 = prompt("consumed without a receipt too");
-    host.store
-        .commit_prepared_session_boundary(
-            &LogicalRuntimeId::for_session(&session_id),
-            crate::store::PreparedRuntimeSessionCommit::success(
-                None,
-                meerkat_core::lifecycle::RunBoundaryReceipt {
-                    run_id: left_run.clone(),
-                    boundary:
-                        meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunCheckpoint,
-                    contributing_input_ids: vec![l1.id().clone(), l2.id().clone()],
-                    conversation_digest: None,
-                    message_count: 1,
-                    sequence: 1,
-                    owner_contributions: Vec::new(),
-                },
-                vec![
-                    record(row(
-                        &l1,
-                        InputLifecycleState::Consumed,
-                        Some(left_run.clone()),
-                        Some(1),
-                    )),
-                    record(row(
-                        &l2,
-                        InputLifecycleState::Consumed,
-                        Some(left_run.clone()),
-                        Some(1),
-                    )),
-                ],
-                Some(session_id.clone()),
-            ),
-        )
-        .await
-        .expect("the run's boundary commits its receipt and its consumed rows");
+    commit_left_boundary(&host, &session_id, &left_run, &[&l1, &l2]).await;
     let claim = host.claim(&session_id);
     let publisher = Arc::new(RecordingPublisher::default());
 
@@ -1805,4 +1860,354 @@ async fn a_dropped_claim_ends_the_lineage_the_settlement_completed() {
         settled_proofs[1], first,
         "the new lineage's registration settled its own owner loss"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Crash and cancellation between the steps
+// ---------------------------------------------------------------------------
+
+/// The lifecycle row's record version and placement witness.
+async fn lifecycle_record(
+    host: &Host,
+    session_id: &SessionId,
+) -> (u16, Option<MachineLifecycleBindingFacts>) {
+    match host
+        .store
+        .observe_machine_lifecycle(&LogicalRuntimeId::for_session(session_id))
+        .await
+        .expect("the lifecycle row reads")
+    {
+        MachineLifecycleObservation::Decoded { record, .. } => {
+            (record.record_version(), record.placement_witness().cloned())
+        }
+        other => panic!("the lifecycle row decodes: {other:?}"),
+    }
+}
+
+/// The contract's held-tail shape: an open run at a committed round (its
+/// round commit's cursor binds a directed and a nondirected input), with a
+/// queued input beside it that no run bound. The writer drive holds the
+/// tail (a store-only writer never continues a run, and the unbound input
+/// keeps it from closing the run as interrupted). The internal registration
+/// marks the run resumable; the sweep ends the mark and every input
+/// `Stopped` in one commit; the second drive then finds the cursor's inputs
+/// settled and commits the tail as interrupted, with no contributor left to
+/// consume.
+#[tokio::test]
+async fn an_open_run_held_beside_unbound_work_is_ended_and_then_committed_interrupted() {
+    let host = Host::head_canonical();
+    let b1 = directed_step("bound to the open run");
+    let b2 = prompt("also bound to the open run");
+    let q1 = prompt("queued beside the open run");
+    let (session_id, run_id) = durable_session_built(
+        &host,
+        None,
+        Some(continuable_tail(vec![b1.id().clone(), b2.id().clone()])),
+    )
+    .await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    host.persist(&session_id, applied_to(&b1, &run_id)).await;
+    host.persist(&session_id, applied_to(&b2, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let mut lease = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the settlement begins");
+    assert_eq!(
+        host.machine
+            .settle_predecessor_tail_with_lease(&mut lease)
+            .await
+            .expect("the first drive answers"),
+        None,
+        "the writer drive holds the open run"
+    );
+    assert!(lease.tail_held());
+    assert!(host.provisional_tail_stands(&session_id).await);
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut lease, deadline())
+        .await
+        .expect("the sweep ends every input");
+    assert_eq!(sorted(work.ended), sorted_ids(&[&b1, &b2, &q1]));
+    let tail = host
+        .machine
+        .settle_predecessor_tail_with_lease(&mut lease)
+        .await
+        .expect("the second drive answers")
+        .expect("the second drive commits the tail");
+    assert_eq!(tail.run_id, run_id);
+    assert_eq!(
+        tail.disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    let publication = host
+        .machine
+        .finish_predecessor_settlement_before(
+            lease,
+            Some(Arc::clone(&publisher) as Arc<dyn CoreExecutorPublicationHandle>),
+            deadline(),
+        )
+        .await
+        .expect("the census finds every row closed");
+
+    for input in [&b1, &b2, &q1] {
+        let settled = settled_input(&publication, input);
+        assert_eq!(settled.settled_by, SettledBy::Ended);
+        assert_eq!(
+            settled.receipt.terminal(),
+            &InputTerminalOutcome::Abandoned {
+                reason: InputAbandonReason::Stopped,
+            }
+        );
+    }
+    let events = publisher.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(
+        published_for(&events, &b1),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::Abandoned { detail },
+            ..
+        } if detail == "runtime stopped"
+    ));
+    assert!(!host.provisional_tail_stands(&session_id).await);
+    assert!(!host.machine.contains_session(&session_id).await);
+}
+
+/// The held-tail shape again, with a crash after the internal registration
+/// wrote the clean lifecycle row with the placement witness and before the
+/// sweep commit (the first attempt's drive held; its registration's row is
+/// written here as that registration wrote it, version 7, unbound, the
+/// predecessor's placement as witness, and nothing terminalized). The
+/// retry's begin takes the placement from the witness, its drive holds
+/// again, the sweep places the directed input's outbox by the witness and
+/// writes the row back without it, and the second drive commits the tail
+/// interrupted: the retry ends as the uninterrupted settlement does.
+#[tokio::test]
+async fn a_retry_after_a_crash_between_registration_and_sweep_finishes_by_the_witness() {
+    let host = Host::head_canonical();
+    let b1 = directed_step("bound to the open run");
+    let b2 = prompt("also bound to the open run");
+    let q1 = prompt("queued beside the open run");
+    let (session_id, run_id) = durable_session_built(
+        &host,
+        None,
+        Some(continuable_tail(vec![b1.id().clone(), b2.id().clone()])),
+    )
+    .await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    host.persist(&session_id, applied_to(&b1, &run_id)).await;
+    host.persist(&session_id, applied_to(&b2, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    let claim = host.claim(&session_id);
+
+    let mut first = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the first attempt begins");
+    assert_eq!(
+        host.machine
+            .settle_predecessor_tail_with_lease(&mut first)
+            .await
+            .expect("the first drive answers"),
+        None
+    );
+    drop(first);
+    host.lifecycle_row(
+        &session_id,
+        MachineLifecycleBindingFacts::default(),
+        Some(predecessor_placement()),
+    )
+    .await;
+    assert_eq!(
+        lifecycle_record(&host, &session_id).await,
+        (7, Some(predecessor_placement())),
+        "instrument: the crash left the version 7 row with its witness"
+    );
+
+    let publisher = Arc::new(RecordingPublisher::default());
+    let settled = settle_whole(&host, &claim, &publisher).await;
+
+    let tail = settled.tail.expect("the second drive commits the tail");
+    assert_eq!(tail.run_id, run_id);
+    assert_eq!(
+        tail.disposition,
+        DurableTailRecoveryDisposition::RepairAndCommitInterrupted
+    );
+    assert_eq!(sorted(settled.work.ended), sorted_ids(&[&b1, &b2, &q1]));
+    let publication = settled
+        .publication
+        .expect("the census finds every row closed");
+    for input in [&b1, &b2, &q1] {
+        assert_eq!(
+            settled_input(&publication, input).settled_by,
+            SettledBy::Ended
+        );
+    }
+    let rows = host.rows(&session_id).await;
+    let outbox = stored_row(&rows, &b1)
+        .state
+        .interaction_terminal_outbox
+        .as_ref()
+        .expect("the directed input's outbox");
+    assert_eq!(
+        outbox.owner_agent_runtime_id.as_deref(),
+        Some(PLACED_RUNTIME)
+    );
+    assert_eq!(outbox.owner_fence_token, Some(PLACED_FENCE));
+    assert_eq!(outbox.owner_runtime_generation, Some(PLACED_GENERATION));
+    assert_eq!(publisher.events().len(), 1);
+    let (version, witness) = lifecycle_record(&host, &session_id).await;
+    assert_ne!(version, 7, "the sweep commit wrote the row back");
+    assert_eq!(witness, None);
+}
+
+/// A settlement stopped after its sweep commit, before the drain (its
+/// caller went away, so its registration was removed without publishing):
+/// every carrier is durable and every receipt pending. The repeat ends
+/// nothing, rehydrates the pending batches, drains them, and lists every
+/// input as a pending terminal it converged.
+#[tokio::test]
+async fn a_settlement_stopped_before_its_drain_is_converged_by_the_repeat() {
+    let host = Host::head_canonical();
+    let (session_id, run_id) = durable_session(&host, Some(completed_tail)).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let d1 = directed_step("the run's directed contributor");
+    let p1 = prompt("the run's prompt contributor");
+    let q1 = prompt("queued beside the run");
+    let d2 = directed_step("queued directed beside the run");
+    host.persist(&session_id, applied_to(&d1, &run_id)).await;
+    host.persist(&session_id, applied_to(&p1, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued(&d2, 2)).await;
+    let claim = host.claim(&session_id);
+
+    let mut first = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the first attempt begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut first)
+        .await
+        .expect("the first drive answers")
+        .expect("the tail is committed");
+    host.machine
+        .end_predecessor_work_with_lease_before(&mut first, deadline())
+        .await
+        .expect("the sweep commits");
+    drop(first);
+    let rows = host.rows(&session_id).await;
+    for input in [&d1, &p1, &q1, &d2] {
+        assert!(
+            matches!(
+                stored_row(&rows, input)
+                    .state
+                    .terminal_completion
+                    .as_ref()
+                    .map(|completion| &completion.phase),
+                Some(crate::input_state::InputTerminalCompletionPhase::Pending)
+            ),
+            "instrument: {} owes its receipt",
+            input.id()
+        );
+    }
+
+    let publisher = Arc::new(RecordingPublisher::default());
+    let repeat = settle_whole(&host, &claim, &publisher).await;
+
+    assert!(repeat.tail.is_none(), "the tail was committed already");
+    assert!(repeat.work.ended.is_empty(), "the repeat ends nothing");
+    assert!(repeat.work.answered.is_empty());
+    let publication = repeat
+        .publication
+        .expect("the census finds every row closed");
+    assert_eq!(publication.durable_rows_closed, 4);
+    for input in [&d1, &p1, &q1, &d2] {
+        assert_eq!(
+            settled_input(&publication, input).settled_by,
+            SettledBy::PendingTerminalConverged
+        );
+    }
+    assert_eq!(
+        settled_input(&publication, &q1).receipt.terminal(),
+        &InputTerminalOutcome::Abandoned {
+            reason: InputAbandonReason::Stopped,
+        }
+    );
+    assert_eq!(
+        publisher.events().len(),
+        2,
+        "d1 and d2 are answered once each"
+    );
+}
+
+/// A settlement stopped after its sweep commit staged the outcome-unknown
+/// batch, before the drain: the repeat finds those rows owing their receipt
+/// (no longer rows a recovered boundary left without one), rehydrates the
+/// batch, drains it, and lists both inputs answered outcome unknown, naming
+/// their run.
+#[tokio::test]
+async fn an_outcome_unknown_batch_a_stopped_settlement_left_is_converged_by_the_repeat() {
+    let host = Host::head_canonical();
+    let (session_id, _) = durable_session(&host, None).await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let left_run = RunId::new();
+    let l1 = directed_step("consumed without a receipt");
+    let l2 = prompt("consumed without a receipt too");
+    commit_left_boundary(&host, &session_id, &left_run, &[&l1, &l2]).await;
+    let claim = host.claim(&session_id);
+
+    let mut first = host
+        .machine
+        .begin_predecessor_settlement_before(&claim, deadline())
+        .await
+        .expect("the first attempt begins");
+    host.machine
+        .settle_predecessor_tail_with_lease(&mut first)
+        .await
+        .expect("the first drive answers");
+    let work = host
+        .machine
+        .end_predecessor_work_with_lease_before(&mut first, deadline())
+        .await
+        .expect("the sweep commits the outcome-unknown batch");
+    assert_eq!(sorted(work.answered), sorted_ids(&[&l1, &l2]));
+    drop(first);
+
+    let publisher = Arc::new(RecordingPublisher::default());
+    let repeat = settle_whole(&host, &claim, &publisher).await;
+
+    assert!(
+        repeat.work.answered.is_empty(),
+        "the rows owe their receipt now; nothing is answered again"
+    );
+    let publication = repeat
+        .publication
+        .expect("the census finds every row closed");
+    for input in [&l1, &l2] {
+        let settled = settled_input(&publication, input);
+        assert_eq!(settled.settled_by, SettledBy::OutcomeUnknown);
+        assert!(matches!(
+            settled.receipt.outcome(),
+            CompletionOutcome::OutcomeUnknown { run_id } if run_id == &left_run
+        ));
+    }
+    let events = publisher.events();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(matches!(
+        published_for(&events, &l1),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::OutcomeUnknown,
+            ..
+        }
+    ));
 }
