@@ -2651,3 +2651,114 @@ async fn a_terminal_appended_before_its_receipt_is_replayed_once_by_the_repeat()
     assert_eq!(replayed.published_terminal_seq, Some(1));
     assert_eq!(publisher.events().len(), 1, "the replay appended nothing");
 }
+
+// ---------------------------------------------------------------------------
+// The mixed predecessor
+// ---------------------------------------------------------------------------
+
+/// Everything at once (R1's predecessor plus the inputs an earlier boundary
+/// of another run consumed without a receipt): the writer drive commits the
+/// tail with its contributors' batch (the earlier run left no batch, so the
+/// tail's is the only run-scoped one); one sweep commit ends the queued
+/// inputs `Stopped`, answers the earlier run's inputs outcome unknown and
+/// drops the witness; the task publishes the four directed terminals.
+#[tokio::test]
+async fn a_mixed_predecessor_is_settled_by_one_sweep_commit() {
+    let host = Host::head_canonical();
+    let left_run = RunId::new();
+    let l1 = directed_step("consumed without a receipt");
+    let l2 = prompt("consumed without a receipt too");
+    let left_inputs: [&Input; 2] = [&l1, &l2];
+    let (session_id, run_id) = durable_session_built(
+        &host,
+        Some((&left_run, &left_inputs[..])),
+        Some(Box::new(completed_tail) as TailFn),
+    )
+    .await;
+    host.lifecycle_row(&session_id, predecessor_placement(), None)
+        .await;
+    let d1 = directed_step("the run's directed contributor");
+    let p1 = prompt("the run's prompt contributor");
+    let q1 = prompt("queued beside the run");
+    let d2 = directed_step("queued directed beside the run");
+    let x0 = directed_step("cancelled while queued");
+    host.persist(&session_id, applied_to(&d1, &run_id)).await;
+    host.persist(&session_id, applied_to(&p1, &run_id)).await;
+    host.persist(&session_id, queued(&q1, 1)).await;
+    host.persist(&session_id, queued(&d2, 2)).await;
+    host.persist(
+        &session_id,
+        cancelled_while_queued(&session_id, &x0, "cancelled by its caller").await,
+    )
+    .await;
+    let claim = host.claim(&session_id);
+    let publisher = Arc::new(RecordingPublisher::default());
+
+    let settled = settle_whole(&host, &claim, &publisher).await;
+
+    let tail = settled.tail.expect("the tail is committed");
+    assert_eq!(tail.run_id, run_id);
+    assert_eq!(
+        tail.disposition,
+        DurableTailRecoveryDisposition::CommitCompletedRetainInputs
+    );
+    assert_eq!(sorted(settled.work.ended), sorted_ids(&[&q1, &d2]));
+    assert_eq!(sorted(settled.work.answered), sorted_ids(&[&l1, &l2]));
+    let publication = settled
+        .publication
+        .expect("the census finds every row closed");
+    assert!(publication.owed.is_empty());
+    assert_eq!(publication.durable_rows_closed, 7);
+    for input in [&d1, &p1] {
+        let settled = settled_input(&publication, input);
+        assert_eq!(settled.settled_by, SettledBy::TailConsumed);
+        assert_eq!(settled.receipt.run_id(), Some(&run_id));
+    }
+    for input in [&q1, &d2] {
+        assert_eq!(
+            settled_input(&publication, input).settled_by,
+            SettledBy::Ended
+        );
+    }
+    assert_eq!(
+        settled_input(&publication, &x0).settled_by,
+        SettledBy::PendingTerminalConverged
+    );
+    for input in [&l1, &l2] {
+        let settled = settled_input(&publication, input);
+        assert_eq!(settled.settled_by, SettledBy::OutcomeUnknown);
+        assert!(matches!(
+            settled.receipt.outcome(),
+            CompletionOutcome::OutcomeUnknown { run_id } if run_id == &left_run
+        ));
+    }
+    let events = publisher.events();
+    assert_eq!(events.len(), 4, "{events:?}");
+    assert!(matches!(
+        published_for(&events, &d1),
+        AgentEvent::InteractionComplete { .. }
+    ));
+    assert!(matches!(
+        published_for(&events, &d2),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::Abandoned { detail },
+            ..
+        } if detail == "runtime stopped"
+    ));
+    assert!(matches!(
+        published_for(&events, &x0),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::Abandoned { detail },
+            ..
+        } if detail == "cancelled by its caller"
+    ));
+    assert!(matches!(
+        published_for(&events, &l1),
+        AgentEvent::InteractionFailed {
+            reason: InteractionFailureReason::OutcomeUnknown,
+            ..
+        }
+    ));
+    assert_eq!(host.placement_witness(&session_id).await, None);
+    assert!(!host.machine.contains_session(&session_id).await);
+}
