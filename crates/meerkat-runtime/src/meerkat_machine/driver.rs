@@ -992,6 +992,34 @@ impl PreparedSoleRunlessTermination {
     }
 }
 
+/// What settling a resumable run committed
+/// ([`DriverEntry::settle_resumable_run_with_terminals`]), for the caller to
+/// realize once it releases the driver.
+#[derive(Debug)]
+pub(crate) struct SettledResumableRun {
+    /// The run's inputs the settlement abandoned.
+    pub(crate) abandoned: Vec<InputId>,
+    /// The runtime-termination carriers committed for them.
+    pub(crate) batches: Vec<RunlessTerminalBatch>,
+    /// The run's own terminal, owed on the session's event stream; none
+    /// when the driver names no session.
+    pub(crate) terminal: Option<meerkat_core::lifecycle::SettledRunTerminal>,
+}
+
+/// The settlement cause a run's terminal names for the reason its inputs
+/// were abandoned with.
+fn settled_run_cause(
+    reason: &crate::input_state::InputAbandonReason,
+) -> meerkat_core::lifecycle::SettledRunCause {
+    use crate::input_state::InputAbandonReason;
+    use meerkat_core::lifecycle::SettledRunCause;
+    match reason {
+        InputAbandonReason::RequeueExpired => SettledRunCause::RequeueExpired,
+        InputAbandonReason::ResumeRefused => SettledRunCause::ResumeRefused,
+        _ => SettledRunCause::Cancelled,
+    }
+}
+
 /// One terminal-completion batch of a runless runtime termination: its
 /// recipients, in canonical order, and the owner of its directed interaction
 /// terminal outbox batch when any recipient is directed. A termination of
@@ -5212,27 +5240,76 @@ impl DriverEntry {
     /// once, whoever drains it; a nondirected one gets its terminal
     /// completion batch. Every settle site goes through here: settling a
     /// kept run used to stage nothing, so a directed caller of the run never
-    /// learned that it ended. Returns the abandoned inputs and the committed
-    /// batches for the caller to publish after it releases the driver.
+    /// learned that it ended.
+    ///
+    /// The run's own terminal is read here too, before the settlement
+    /// retires the inputs' payloads: the transcript identity its rounds
+    /// carry, merged from its bound inputs as its resume would have
+    /// dispatched them. Its execution ended in an earlier process, which
+    /// published no terminal, so the caller publishes this one on the
+    /// session's event stream once it releases the driver. It is not part of
+    /// the durable commit: a crash after the commit and before the
+    /// publication loses it, and no later start publishes it.
     pub(crate) async fn settle_resumable_run_with_terminals(
         &mut self,
         run_id: &RunId,
         reason: crate::input_state::InputAbandonReason,
         termination_reason: &str,
-    ) -> Result<(Vec<InputId>, Vec<RunlessTerminalBatch>), RuntimeDriverError> {
+    ) -> Result<SettledResumableRun, RuntimeDriverError> {
         let kept = self.ended_resumable_run_kept_inputs(run_id);
+        let terminal = self.session_id().map(|session_id| {
+            meerkat_core::lifecycle::SettledRunTerminal::new(
+                session_id,
+                run_id.clone(),
+                self.settled_run_transcript_identity(run_id, &kept),
+                settled_run_cause(&reason),
+            )
+        });
         let prepared = self.prepare_runless_runtime_terminated_interaction_outboxes(
             &kept,
             termination_reason.to_string(),
         )?;
         match self.settle_resumable_run(run_id, reason).await {
-            Ok(abandoned) => Ok((
+            Ok(abandoned) => Ok(SettledResumableRun {
                 abandoned,
-                Self::commit_prepared_runless_interaction_terminal_outboxes(prepared),
-            )),
+                batches: Self::commit_prepared_runless_interaction_terminal_outboxes(prepared),
+                terminal,
+            }),
             Err(error) => {
                 self.rollback_prepared_runless_interaction_terminal_outboxes(prepared);
                 Err(error)
+            }
+        }
+    }
+
+    /// The transcript identity the rounds of the open run `run_id` carry:
+    /// its bound inputs, hydrated and merged as its resume would merge them,
+    /// under the run's id. Only the run id when the inputs cannot be
+    /// hydrated or merged.
+    fn settled_run_transcript_identity(
+        &self,
+        run_id: &RunId,
+        input_ids: &[InputId],
+    ) -> meerkat_core::types::TranscriptMessageIdentity {
+        let merged = self
+            .hydrate_resumed_run_inputs(run_id, input_ids)
+            .ok()
+            .and_then(|staged| {
+                let staged_ids: Vec<InputId> = staged.iter().map(|(id, _)| id.clone()).collect();
+                let semantics = machine_batch_runtime_semantics(self, &staged_ids)?;
+                crate::runtime_loop::merge_batch_turn_metadata(&staged, &semantics)
+                    .ok()
+                    .flatten()
+            });
+        match merged {
+            Some(metadata) => metadata.transcript_identity.with_run_id(run_id.clone()),
+            None => {
+                tracing::warn!(
+                    %run_id,
+                    "the settled run's inputs did not merge; its terminal names the run only"
+                );
+                meerkat_core::types::TranscriptMessageIdentity::default()
+                    .with_run_id(run_id.clone())
             }
         }
     }

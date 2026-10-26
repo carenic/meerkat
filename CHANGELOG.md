@@ -95,6 +95,20 @@ them.
   identity scope's commit, chunk batches included, and not for a session
   document's chunk batches), and that Core sets no deadline on a commit.
 
+- `meerkat-core`, `meerkat-session`, `meerkat-mob`: a run the runtime
+  settles without resuming it has a typed terminal payload,
+  `meerkat_core::lifecycle::SettledRunTerminal` (the session id, the run's
+  transcript identity under its run id, and a `SettledRunCause`:
+  `RequeueExpired`, `ResumeRefused` or `Cancelled`), and its
+  `run_failed_event` is the existing `AgentEvent::RunFailed` of class
+  `Cancelled`, with no reason or cause kind. `CoreExecutorPublicationHandle`
+  gains `publish_settled_run_terminal`, which publishes that event through
+  the handle's exact live actor and answers unsupported by default.
+  `EphemeralSessionService` and `PersistentSessionService` gain
+  `publish_settled_run_terminal_for_actor`, and `MobSessionService` gains the
+  same method, unsupported by default. The publication handles of the
+  `meerkat` surfaces, `meerkat-rpc` and `meerkat-mob` implement it.
+
 ### Fixed
 
 - `meerkat-core`, `meerkat-session`: a compaction inside an open run no longer
@@ -181,6 +195,27 @@ them.
   attachment's publication capability, so a crash in between, or a surface
   without that capability, leaves the committed carrier for the next stop or
   start to publish.
+
+- `meerkat-runtime`: a run left open across a restart (kept by a graceful
+  stop, or cut by a crash after a round commit) that the runtime settles
+  instead of resuming now ends on the session's event stream: its live
+  actor publishes one `RunFailed` of class `Cancelled` under the run's id
+  and the transcript identity its rounds carry (its interaction, merged
+  from its inputs as its resume would have merged them). The run's
+  execution ended in an earlier process, which published no terminal, so a
+  client that followed the run by its events never saw it end, whether its
+  input was directed or a plain prompt. This covers a start that finds the
+  run past its stop's max age, a refused resume, and a stop that keeps no
+  work. The event is published after the settlement commits and is not
+  part of it. A start that settles an expired run retries it for up to a
+  minute while its attachment comes to serve. A crash in between, or a
+  start whose tail repair leaves a tail standing (so the session reloads
+  instead of serving), loses it, and no later start publishes it. The event
+  needs the attachment's publication capability: a surface without one, or
+  one that does not support the publication, publishes none. An archive
+  that settles a kept run publishes no run terminal, since it serves no live
+  actor; nor do a retire, a destroy or a reset, which end a kept run without
+  settling it; nor does a suspension the runtime refuses.
 
 - `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
   schedules are included; the tool lists active and paused schedules only, and
