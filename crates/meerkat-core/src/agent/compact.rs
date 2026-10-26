@@ -762,18 +762,25 @@ pub(crate) fn open_run_floor(
     first_run_response(messages, run_id).map(|first| back_over_inputs(messages, first))
 }
 
-/// The first row of the run's newest round: its newest assistant row, after
-/// the input rows that led to it (a steer, a notice).
+/// The first row of the run's newest round: its newest assistant row with
+/// tool calls, after the input rows that led to it (a steer, a notice). A
+/// tool can append run-stamped assistant rows after its results (generated
+/// images, callback blocks); those belong to the round they follow, so the
+/// round starts at its call. A run with no call yet starts it at its newest
+/// row.
 fn newest_run_round(messages: &[Message], run_id: &crate::lifecycle::RunId) -> Option<usize> {
+    let run_row = |message: &Message, with_calls: bool| {
+        matches!(
+            message,
+            Message::BlockAssistant(assistant)
+                if assistant.identity.run_id.as_ref() == Some(run_id)
+                    && (!with_calls || assistant.has_tool_calls())
+        )
+    };
     messages
         .iter()
-        .rposition(|message| {
-            matches!(
-                message,
-                Message::BlockAssistant(assistant)
-                    if assistant.identity.run_id.as_ref() == Some(run_id)
-            )
-        })
+        .rposition(|message| run_row(message, true))
+        .or_else(|| messages.iter().rposition(|message| run_row(message, false)))
         .map(|newest| back_over_inputs(messages, newest))
 }
 
@@ -796,12 +803,37 @@ pub(crate) fn compaction_scope(
     }
     let first_response = first_run_response(messages, run_id)?;
     let newest_round = newest_run_round(messages, run_id)?;
+    // A fold must take at least two rows out to shrink the transcript (the
+    // summary takes one back).
+    let fold = open_run_rounds_fold(messages, first_response, newest_round);
+    let folded_rows = messages
+        .iter()
+        .enumerate()
+        .filter(|(offset, message)| fold(*offset, message))
+        .count();
     (newest_round > first_response
-        && prefix_has_foldable_turn(&messages[first_response..newest_round]))
-    .then_some(CompactionScope::OpenRunRounds {
-        first_response,
-        newest_round,
-    })
+        && prefix_has_foldable_turn(&messages[first_response..newest_round])
+        && folded_rows >= 2)
+        .then_some(CompactionScope::OpenRunRounds {
+            first_response,
+            newest_round,
+        })
+}
+
+/// Which rows a fold of the open run's completed rounds takes out: the
+/// rounds (`messages[first_response..newest_round]`, System rows aside),
+/// every earlier compaction summary, and superseded System versions.
+fn open_run_rounds_fold(
+    messages: &[Message],
+    first_response: usize,
+    newest_round: usize,
+) -> impl Fn(usize, &Message) -> bool {
+    let superseded = crate::types::superseded_system_prompt_offsets(messages);
+    move |offset: usize, message: &Message| match message {
+        Message::System(_) => superseded.contains(&offset),
+        Message::User(user) if user.transcript_role.is_compaction_summary() => true,
+        _ => (first_response..newest_round).contains(&offset),
+    }
 }
 
 /// The rows of the transcript the summary of `scope` is written from, when
@@ -816,28 +848,134 @@ pub(crate) fn compaction_source_floor(scope: CompactionScope) -> Option<usize> {
     }
 }
 
-/// The line a summary of the open run's own rounds ends with: the calls
-/// those rounds made, and that they ran.
-fn folded_run_calls_note(folded: &[Message]) -> Option<String> {
-    let calls = folded
+/// The fixed line a summary of the open run's own rounds ends with, after a
+/// blank line: the calls those rounds made, and that they ran.
+const FOLDED_CALLS_LEAD: &str = "The current run already made these tool calls in its earlier rounds; their results are \
+     summarized above.";
+/// Calls that ran: listed after this, as `name (id)` separated by `, `.
+const FOLDED_CALLS_RAN: &str = " They ran, so do not make them again: ";
+/// Calls that ran and failed: the model may still decide to retry one.
+const FOLDED_CALLS_FAILED: &str =
+    " They ran and failed, so make one again only if it is still needed: ";
+
+/// One tool call a fold of the open run's rounds names.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct FoldedCall {
+    name: String,
+    id: String,
+    failed: bool,
+}
+
+/// The calls the fixed line of an earlier fold of the same run names, read
+/// back from that summary's text. Core writes the line in one fixed form
+/// ([`folded_run_calls_note`]), so it parses exactly.
+fn calls_named_by_summary(summary: &str) -> Vec<FoldedCall> {
+    let Some((_, line)) = summary.rsplit_once(FOLDED_CALLS_LEAD) else {
+        return Vec::new();
+    };
+    let parse = |list: &str, failed: bool| {
+        list.trim_end_matches('.')
+            .split("), ")
+            .filter_map(|entry| {
+                let entry = entry.trim_end_matches(')');
+                let (name, id) = entry.rsplit_once(" (")?;
+                Some(FoldedCall {
+                    name: name.to_string(),
+                    id: id.to_string(),
+                    failed,
+                })
+            })
+            .collect::<Vec<_>>()
+    };
+    let (ran, failed) = match line.split_once(FOLDED_CALLS_FAILED) {
+        Some((ran, failed)) => (ran, Some(failed)),
+        None => (line, None),
+    };
+    let mut calls = ran
+        .split_once(FOLDED_CALLS_RAN)
+        .map(|(_, list)| parse(list, false))
+        .unwrap_or_default();
+    calls.extend(failed.map(|list| parse(list, true)).unwrap_or_default());
+    calls
+}
+
+/// The fixed line a fold of the open run's rounds ends its summary with: the
+/// calls the earlier folds of the run named (read from the summaries this
+/// fold replaces) and the calls of the rounds it folds now, each once, those
+/// whose result was an error listed apart as ran and failed. `None` when
+/// there is no call to name.
+fn folded_run_calls_note(
+    messages: &[Message],
+    first_response: usize,
+    newest_round: usize,
+) -> Option<String> {
+    let mut calls: Vec<FoldedCall> = messages
         .iter()
         .filter_map(|message| match message {
-            Message::BlockAssistant(assistant) => Some(assistant.blocks.iter()),
+            Message::User(user) if user.transcript_role.is_compaction_summary() => {
+                Some(calls_named_by_summary(&user.text_content()))
+            }
             _ => None,
         })
         .flatten()
-        .filter_map(|block| match block {
-            AssistantBlock::ToolUse { id, name, .. } => Some(format!("{name} ({id})")),
+        .collect();
+    let folded = messages
+        .get(first_response..newest_round)
+        .unwrap_or_default();
+    let failed_results: std::collections::BTreeSet<&str> = folded
+        .iter()
+        .filter_map(|message| match message {
+            Message::ToolResults { results, .. } => Some(results.iter()),
             _ => None,
         })
-        .collect::<Vec<_>>();
-    (!calls.is_empty()).then(|| {
-        format!(
-            "\n\nThese tool calls of the current run were made in its earlier rounds and \
-             already ran; their results are summarized above, so do not make them again: {}.",
-            calls.join(", ")
-        )
-    })
+        .flatten()
+        .filter(|result| result.is_error)
+        .map(|result| result.tool_use_id.as_str())
+        .collect();
+    calls.extend(
+        folded
+            .iter()
+            .filter_map(|message| match message {
+                Message::BlockAssistant(assistant) => Some(assistant.blocks.iter()),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|block| match block {
+                AssistantBlock::ToolUse { id, name, .. } => Some(FoldedCall {
+                    name: name.clone(),
+                    id: id.clone(),
+                    failed: failed_results.contains(id.as_str()),
+                }),
+                _ => None,
+            }),
+    );
+    let mut seen = std::collections::BTreeSet::new();
+    calls.retain(|call| seen.insert(call.id.clone()));
+    if calls.is_empty() {
+        return None;
+    }
+    let list = |failed: bool| {
+        calls
+            .iter()
+            .filter(|call| call.failed == failed)
+            .map(|call| format!("{} ({})", call.name, call.id))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut note = format!("\n\n{FOLDED_CALLS_LEAD}");
+    let ran = list(false);
+    if !ran.is_empty() {
+        note.push_str(FOLDED_CALLS_RAN);
+        note.push_str(&ran);
+        note.push('.');
+    }
+    let failed = list(true);
+    if !failed.is_empty() {
+        note.push_str(FOLDED_CALLS_FAILED);
+        note.push_str(&failed);
+        note.push('.');
+    }
+    Some(note)
 }
 
 /// Fold the open run's completed rounds (`messages[first_response..
@@ -850,12 +988,7 @@ fn rebuild_open_run_rounds(
     newest_round: usize,
     summary_text: &str,
 ) -> CompactionResult {
-    let superseded = crate::types::superseded_system_prompt_offsets(messages);
-    let fold = |offset: usize, message: &Message| match message {
-        Message::System(_) => superseded.contains(&offset),
-        Message::User(user) if user.transcript_role.is_compaction_summary() => true,
-        _ => (first_response..newest_round).contains(&offset),
-    };
+    let fold = open_run_rounds_fold(messages, first_response, newest_round);
     let summary_message = Message::User(crate::types::UserMessage::compaction_summary(format!(
         "{COMPACTION_SUMMARY_PREFIX}{summary_text}"
     )));
@@ -1419,15 +1552,14 @@ where
     // run's own rows follow verbatim, each retained at its exact offsets;
     // when nothing before the run is left, the run's completed rounds are
     // folded mechanically and its request and newest round kept, whatever
-    // the compactor. That summary ends naming the calls it folded.
+    // the compactor. That summary ends naming the calls the run's earlier
+    // rounds made: those this fold takes out and those an earlier fold of the
+    // run named.
     let summary_text = match scope {
         CompactionScope::OpenRunRounds {
             first_response,
             newest_round,
-        } => match messages
-            .get(first_response..newest_round)
-            .and_then(folded_run_calls_note)
-        {
+        } => match folded_run_calls_note(messages, first_response, newest_round) {
             Some(note) => format!("{summary_text}{note}"),
             None => summary_text,
         },
@@ -3118,6 +3250,14 @@ mod tests {
         )])
     }
 
+    fn failed_result_row(call_id: &str) -> Message {
+        Message::tool_results(vec![ToolResult::new(
+            call_id.into(),
+            "the call failed".into(),
+            true,
+        )])
+    }
+
     fn user(text: &str) -> Message {
         Message::User(UserMessage::text(text))
     }
@@ -3281,6 +3421,114 @@ mod tests {
             }),
             "the completed round folds; the steer stays with the newest round"
         );
+        assert_eq!(
+            compaction_scope(
+                &[
+                    sys.clone(),
+                    user("p"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                    answer_row(r, "an image the tool appended"),
+                ],
+                Some(&run)
+            ),
+            None,
+            "a row a tool appended after its result belongs to its round: still the only one"
+        );
+        assert_eq!(
+            compaction_scope(
+                &[
+                    sys.clone(),
+                    user("p"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                    call_row(r, "tc_2"),
+                    result_row("tc_2", 10),
+                    answer_row(r, "an image the tool appended"),
+                ],
+                Some(&run)
+            ),
+            Some(CompactionScope::OpenRunRounds {
+                first_response: 2,
+                newest_round: 4,
+            }),
+            "the newest round starts at its call, the appended row after it"
+        );
+        assert_eq!(
+            compaction_scope(
+                &[
+                    sys.clone(),
+                    user("p"),
+                    answer_row(r, "a first thought"),
+                    user("a steer"),
+                    call_row(r, "tc_1"),
+                    result_row("tc_1", 10),
+                ],
+                Some(&run)
+            ),
+            None,
+            "one row to fold would not shrink the transcript"
+        );
+    }
+
+    /// A second fold of the run's rounds keeps naming the calls the first
+    /// fold named: it reads them back from the summary it replaces. A call
+    /// whose result was an error is named as ran and failed, so the model
+    /// may still decide to make it again.
+    #[test]
+    fn a_later_fold_keeps_naming_the_calls_an_earlier_fold_named() {
+        let run = crate::lifecycle::RunId::new();
+        let r = Some(&run);
+        let sys = Message::System(crate::types::SystemMessage::new("sys"));
+        let first = vec![
+            sys.clone(),
+            user("p"),
+            call_row(r, "tc_1"),
+            result_row("tc_1", 10),
+            call_row(r, "tc_2"),
+            result_row("tc_2", 10),
+        ];
+        let first_note = folded_run_calls_note(&first, 2, 4).expect("the first fold names tc_1");
+        assert_eq!(
+            calls_named_by_summary(&format!("{COMPACTION_SUMMARY_PREFIX}summary{first_note}")),
+            vec![FoldedCall {
+                name: "list_records".into(),
+                id: "tc_1".into(),
+                failed: false,
+            }],
+            "the line parses back"
+        );
+        let second = vec![
+            sys,
+            summary_row(&format!("summary{first_note}")),
+            user("p"),
+            call_row(r, "tc_2"),
+            failed_result_row("tc_2"),
+            call_row(r, "tc_3"),
+            result_row("tc_3", 10),
+        ];
+        let second_note =
+            folded_run_calls_note(&second, 3, 5).expect("the second fold names its calls");
+        assert!(
+            second_note.contains("do not make them again: list_records (tc_1).")
+                && second_note.contains("only if it is still needed: list_records (tc_2)."),
+            "{second_note}"
+        );
+        assert_eq!(
+            calls_named_by_summary(&second_note),
+            vec![
+                FoldedCall {
+                    name: "list_records".into(),
+                    id: "tc_1".into(),
+                    failed: false,
+                },
+                FoldedCall {
+                    name: "list_records".into(),
+                    id: "tc_2".into(),
+                    failed: true,
+                },
+            ]
+        );
     }
 
     /// Folding the run's completed rounds keeps the System rows, the run's
@@ -3301,8 +3549,11 @@ mod tests {
             call_row(r, "tc_2"),
             result_row("tc_2", 10),
         ];
-        let note = folded_run_calls_note(&messages[3..5]).expect("the folded call is named");
-        assert!(note.contains("list_records (tc_1)") && note.contains("already ran"));
+        let note = folded_run_calls_note(&messages, 3, 5).expect("the folded call is named");
+        assert!(
+            note.contains("do not make them again: list_records (tc_1)."),
+            "{note}"
+        );
         let summary_text = format!("summary{note}");
         let result = rebuild_open_run_rounds(&messages, 3, 5, &summary_text);
         assert_eq!(

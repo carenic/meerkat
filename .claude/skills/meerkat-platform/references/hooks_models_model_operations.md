@@ -171,8 +171,9 @@ history_retained_rewrites = 4      # older pre-compaction bodies are retired
   prompts and up to `recent_turn_budget` recent complete turns stay. Inside a
   run, after its first response, a compaction never folds the run's request
   or newest round: it folds the rows before the run first, then, when
-  nothing is left there, the run's completed rounds (the summary names those
-  calls as already run); a run with only its newest round skips. With a
+  nothing is left there, the run's completed rounds (the summary names every
+  earlier call of the run as already run, a failed one as ran and failed); a
+  run with only its newest round skips. With a
   memory store attached, discarded messages are indexed for `memory_search`
   (summaries, injected context, tool results, notices and empty or
   whitespace-only text, such as tool-call-only turns, are not). Forking or

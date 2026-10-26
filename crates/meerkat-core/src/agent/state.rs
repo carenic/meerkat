@@ -3301,8 +3301,9 @@ where
         let mut retry_request_pressure_recheck = false;
         // Once per call: after a model fallback, the open run's oversized
         // tool results give way against the fallback's cap as they do
-        // against the primary's at the boundary.
-        let mut fallback_open_run_results_bounded = false;
+        // against the primary's at the boundary. The unbounded measurement
+        // is kept for the compaction check, as at the boundary.
+        let mut fallback_unbounded_request_pressure = None;
         let mut next_request_attempt = Some(prepared_attempt);
         let mut authorization_reprepared = false;
         // One bounded wait state per model call: its wall-clock deadline and
@@ -3449,7 +3450,7 @@ where
                         return Err(error);
                     }
                 };
-                if !fallback_open_run_results_bounded
+                if fallback_unbounded_request_pressure.is_none()
                     && let Some(pressure) = request_pressure
                     && let Some(max_bytes) = self
                         .compactor
@@ -3465,7 +3466,7 @@ where
                             max_bytes,
                         )
                 {
-                    fallback_open_run_results_bounded = true;
+                    fallback_unbounded_request_pressure = Some(pressure);
                     current_messages = Arc::new(bounded);
                     retry_request_pressure_recheck = true;
                     continue;
@@ -3509,7 +3510,8 @@ where
                     {
                         let prior_completed_boundary =
                             self.compaction_cadence.last_compaction_boundary_index;
-                        self.pending_compaction_request_pressure = request_pressure;
+                        self.pending_compaction_request_pressure =
+                            fallback_unbounded_request_pressure.or(request_pressure);
                         self.pending_compaction_request_budget = request_context_budget.clone();
                         let transition = TurnExecutionTransition {
                             prev_phase: TurnPhase::CallingLlm,
@@ -15790,8 +15792,9 @@ mod tests {
     /// boundary. Nothing comes before the run, so after its first round
     /// (its newest, nothing to fold) each compaction folds the run's
     /// completed rounds, the earlier summary with them, and keeps the run's
-    /// prompt and newest round verbatim; the summary names the calls it
-    /// folded as already run. The run keeps going, every call runs once,
+    /// prompt and newest round verbatim; the summary names every call the
+    /// run's earlier rounds made as already run, those an earlier fold named
+    /// included. The run keeps going, every call runs once,
     /// and its last request still shows its prompt and its newest call and
     /// result.
     #[cfg(feature = "workspace-tests")]
@@ -15839,9 +15842,10 @@ mod tests {
             panic!("the summary row");
         };
         assert!(
-            summary_row.text_content().contains("list_records (tc_2)")
-                && summary_row.text_content().contains("already ran"),
-            "the summary names the folded call as run: {}",
+            summary_row
+                .text_content()
+                .contains("do not make them again: list_records (tc_1), list_records (tc_2)."),
+            "the summary names every folded call as run, the first fold's included: {}",
             summary_row.text_content()
         );
         assert_in_order(

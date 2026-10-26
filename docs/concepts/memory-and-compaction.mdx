@@ -46,8 +46,10 @@ a run, after its first response, it folds in two stages:
    stay verbatim after the summary.
 2. When nothing before the run is left to fold, the run's own completed
    rounds fold, together with any earlier summary. The run's request and its
-   newest round (its tool calls and their results) stay verbatim, and the
-   summary ends by naming the folded calls and saying that they already ran.
+   newest round (its tool calls, their results and any rows a tool appended
+   after them) stay verbatim, and the summary ends by naming every call the
+   run's earlier rounds made, across folds, as already run; a call whose
+   result was an error is named as ran and failed, so it may be made again.
 
 A run whose newest round is its only one has nothing to fold, so such an
 attempt is skipped before any summary call. A custom compactor and a curator

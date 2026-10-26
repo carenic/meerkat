@@ -73,10 +73,13 @@ them.
      verbatim, for any compactor.
   2. When nothing before the run is left, the run's own completed rounds are
      folded, with any earlier summary, by the runtime itself; the run's
-     request and its newest round (its tool calls and results) stay verbatim,
-     and the summary ends by naming the folded calls and saying they already
-     ran. A long single run therefore keeps compacting, one boundary later
-     than before, and always sees the calls it made last.
+     request and its newest round (its tool calls, their results and any
+     rows a tool appended after them) stay verbatim, and the summary ends by
+     naming every call the run's earlier rounds made, those an earlier fold
+     named included, as already run (a call whose result was an error as ran
+     and failed, so it may still be made again). A long single run therefore
+     keeps compacting, one boundary later than before, and always sees the
+     calls it made last. A fold that would take out only one row is skipped.
 
   A run whose newest round is its only one has nothing to fold: the attempt
   is skipped before its summary call and recorded for cadence. A run's first
