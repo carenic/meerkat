@@ -1953,6 +1953,13 @@ impl MeerkatMachine {
                             ),
                         });
                     }
+                    // A predecessor settlement's internal registration admits
+                    // nothing: refused before the admission writes its row.
+                    if entry.is_predecessor_settlement() {
+                        return Err(RuntimeDriverError::UnregisterInProgress {
+                            runtime_id: entry.runtime_id.clone(),
+                        });
+                    }
                     entry.require_durability_ready().map_err(|required| {
                         RuntimeDriverError::RecoveryRepairBlocked {
                             evidence_digest: None,

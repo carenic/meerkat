@@ -1744,6 +1744,7 @@ impl MeerkatMachine {
                 || entry.publication_handle().is_some()
                 || entry.unregister_coordinator.is_some()
                 || entry.runtime_stop_cleanup_coordinator.is_some()
+                || entry.reload_required_discard_coordinator.is_some()
                 || entry.pending_unregister_finalization.is_some()
                 || !claim_vacant
             {

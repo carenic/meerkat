@@ -4981,6 +4981,16 @@ impl MeerkatMachine {
                     if !entry.mutation_gate.same_gate(&gate) {
                         continue;
                     }
+                    // A predecessor settlement's internal registration is
+                    // never claimed for an executor, degraded or not: decided
+                    // before any unregister join or degraded reload.
+                    if entry.is_predecessor_settlement() {
+                        break ExistingExecutorClaim::Blocked(
+                            RuntimeDriverError::UnregisterInProgress {
+                                runtime_id: entry.runtime_id.clone(),
+                            },
+                        );
+                    }
                     let unregister_settlement_required = entry
                         .dsl_authority
                         .lock()
@@ -6501,6 +6511,10 @@ impl MeerkatMachine {
             && entry.post_stop_cleanup_handle.is_none()
             && entry.post_stop_cleanup_attachment_id.is_none()
             && materialization_is_vacant
+            // A predecessor settlement's internal registration is owned by
+            // its settlement: exact preparation and ownerless actor cleanup
+            // never claim, adopt or tear it down.
+            && !entry.is_predecessor_settlement()
     }
 
     /// Fence exact service-actor cleanup after a reload has published an
@@ -6681,6 +6695,14 @@ impl MeerkatMachine {
             };
             if entry.epoch_id != *witness.epoch_id() || !witness.matches_entry(entry) {
                 return Ok(ReloadRequiredRegistrationUseSettlement::NotCurrent);
+            }
+            // A predecessor settlement's internal registration is removed by
+            // the settlement alone, exactly, a degraded one included: no
+            // reload discards or replaces it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
             }
             if let Some(attachment) = attachment
                 && (!attachment.belongs_to(self)
@@ -8333,6 +8355,13 @@ impl MeerkatMachine {
             if entry.unregister_coordinator.is_some() {
                 return Ok(RuntimeSessionQuiescentClose::AlreadyClosing);
             }
+            // A predecessor settlement's internal registration leaves only
+            // through the settlement's exact removal: no close starts on it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
+            }
             (
                 Arc::clone(&entry.driver),
                 entry.pending_unregister_finalization.is_some(),
@@ -9222,6 +9251,14 @@ impl MeerkatMachine {
                     })
                 };
             };
+            // A predecessor settlement's internal registration has no
+            // executor to stop and leaves only through the settlement's
+            // exact removal: no stop cleanup starts on it or joins it.
+            if entry.is_predecessor_settlement() {
+                return Err(RuntimeDriverError::UnregisterInProgress {
+                    runtime_id: entry.runtime_id.clone(),
+                });
+            }
             if entry.reload_required_discard_coordinator.is_some() {
                 return Err(RuntimeDriverError::RecoveryRepairBlocked {
                     evidence_digest: None,
@@ -9982,6 +10019,14 @@ impl MeerkatMachine {
                                 || !Self::is_stopped_attachment_residue(session_id, entry)) =>
                     {
                         CoordinatorDecision::NotStoppedResidue
+                    }
+                    // A predecessor settlement's internal registration leaves
+                    // only through the settlement's exact removal: no
+                    // unregister starts on it or joins it.
+                    Some(entry) if entry.is_predecessor_settlement() => {
+                        return Err(RuntimeDriverError::UnregisterInProgress {
+                            runtime_id: entry.runtime_id.clone(),
+                        });
                     }
                     Some(entry) => {
                         if entry.reload_required_discard_coordinator.is_some() {

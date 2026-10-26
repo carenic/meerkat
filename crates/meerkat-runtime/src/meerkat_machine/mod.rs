@@ -1787,9 +1787,12 @@ enum MechanicalRegistration {
     /// public-result fact only that never substitutes for cleanup ownership.
     Archive { from_quiescent: bool },
     /// The internal, non-serving registration of a predecessor settlement
-    /// (`predecessor_settlement`). Its marker refuses every path that could
-    /// make it live (adoption, attachment, admission, lifecycle mutation,
-    /// unregister) with `UnregisterInProgress`; only the settlement takes its
+    /// (`predecessor_settlement`). Its marker refuses, with
+    /// `UnregisterInProgress` and at each path's first decision, every path
+    /// that could make it live or end it: registration and adoption,
+    /// executor and exact-materialization claims, admission, control and
+    /// lifecycle commands, explicit and quiescent unregister, stop, and the
+    /// reload of a degraded registration. Only the settlement takes its
     /// mutation gate, and only the settlement removes it, exactly and without
     /// retiring anything.
     PredecessorSettlement,
