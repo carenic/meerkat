@@ -36,7 +36,10 @@ name: CI
 #                     outside the chain (FEATURE_UNIT_SUITES in
 #                     scripts/ci-cargo-lanes.mjs; PR: those not marked
 #                     pullRequest: false). A push runs these rows in
-#                     main-unit instead, verbatim (unit_rows_on_main)
+#                     main-unit instead, verbatim (unit_rows_on_main). A
+#                     package in PARTITIONED_UNIT_PACKAGES (meerkat-runtime)
+#                     runs as rows that each build it and run one
+#                     --partition hash:k/n of its tests
 #   integration     - (xN) the tests/*.rs binaries of each integration
 #                     suite whose trigger packages or paths changed
 #                     (INTEGRATION_SUITES in scripts/ci-cargo-lanes.mjs):
@@ -1112,6 +1115,9 @@ jobs:
           # Set only on feature-suite rows whose tests need a deeper test-thread
           # stack than the 8 MiB .cargo/config.toml default (see FEATURE_UNIT_SUITES).
           MIN_STACK: ${{ matrix.rust_min_stack }}
+          # Set only on the rows of a partitioned lane (PARTITIONED_UNIT_PACKAGES):
+          # the row builds the lane and runs one hash partition of its tests.
+          PARTITION: ${{ matrix.partition }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a unit lane"; exit 1; }
@@ -1122,6 +1128,10 @@ jobs:
           # An empty RUST_MIN_STACK would drop tests to Rust's 2 MiB default, so it
           # is exported only when the row sets one.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          partition_args=()
+          if [[ -n "${PARTITION}" ]]; then
+            partition_args=(--partition "${PARTITION}")
+          fi
           # Tests of crates that dev-depend on mcp-test-server spawn this exact
           # fixture and fail without it (mcp_test_server::fixture_binary).
           # shellcheck disable=SC2086
@@ -1131,7 +1141,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr "${partition_args[@]}" \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log
@@ -1784,6 +1794,9 @@ jobs:
           # Set only on feature-suite rows whose tests need a deeper test-thread
           # stack than the 8 MiB .cargo/config.toml default (see FEATURE_UNIT_SUITES).
           MIN_STACK: ${{ matrix.rust_min_stack }}
+          # Set only on the rows of a partitioned lane (PARTITIONED_UNIT_PACKAGES):
+          # the row builds the lane and runs one hash partition of its tests.
+          PARTITION: ${{ matrix.partition }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
@@ -1794,6 +1807,10 @@ jobs:
           # An empty RUST_MIN_STACK would drop tests to Rust's 2 MiB default, so it
           # is exported only when the row sets one.
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          partition_args=()
+          if [[ -n "${PARTITION}" ]]; then
+            partition_args=(--partition "${PARTITION}")
+          fi
           # Tests of crates that dev-depend on mcp-test-server spawn this exact
           # fixture and fail without it (mcp_test_server::fixture_binary).
           # shellcheck disable=SC2086
@@ -1803,7 +1820,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr "${partition_args[@]}" \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log
@@ -1868,6 +1885,8 @@ jobs:
           PACKAGES: ${{ matrix.packages }}
           TARGETS: ${{ matrix.targets }}
           MIN_STACK: ${{ matrix.rust_min_stack }}
+          # A partitioned lane's rows only (see main-unit).
+          PARTITION: ${{ matrix.partition }}
         run: |
           set -euo pipefail
           [[ -n "${PACKAGES}" ]] || { echo "::error::empty package list in a main unit lane"; exit 1; }
@@ -1876,6 +1895,10 @@ jobs:
             *) echo "::error::unexpected unit targets '${TARGETS}'"; exit 1 ;;
           esac
           if [[ -n "${MIN_STACK}" ]]; then export RUST_MIN_STACK="${MIN_STACK}"; fi
+          partition_args=()
+          if [[ -n "${PARTITION}" ]]; then
+            partition_args=(--partition "${PARTITION}")
+          fi
           # shellcheck disable=SC2086
           fixture="$(scripts/mcp-test-server-fixture --if-needed ${PACKAGES})"
           if [[ -n "${fixture}" ]]; then
@@ -1883,7 +1906,7 @@ jobs:
             echo "mcp-test-server fixture: ${MEERKAT_MCP_TEST_SERVER}"
           fi
           # shellcheck disable=SC2086
-          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr \
+          ./scripts/repo-cargo nextest run ${PACKAGES} ${TARGETS} --profile ci-pr "${partition_args[@]}" \
             --no-tests=pass --no-fail-fast --status-level fail --final-status-level fail
 
       - name: Upload sccache server log

@@ -467,6 +467,9 @@ and its CI must be green before a release tag (`require_ci_green`):
   machine-dsl-tests do not build mob and run in the pull request; xtask, whose
   tests run 5-7 minutes on 4 vCPU, gets a unit lane of its own
   (`UNIT_SOLO_PACKAGES`) so they do not stack on other crates' builds.
+  meerkat-runtime's lane of its own runs as two rows
+  (`PARTITIONED_UNIT_PACKAGES`): each builds the crate (10-11 minutes) and
+  runs one `--partition hash:k/2` of its tests (7-8 minutes in one job).
 - Feature-gated unit suites (`FEATURE_UNIT_SUITES` in
   `scripts/ci-cargo-lanes.mjs`): the unit lanes build default features only,
   so each suite adds a `nextest -p <package> --features <list>` row to
