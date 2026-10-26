@@ -35,6 +35,28 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-schedule`: `meerkat_schedule_occurrences` takes optional bounded
+  read arguments. `occurrence_id` returns one occurrence with all of its
+  delivery receipts and answers not found when it belongs to another
+  schedule. `due_after_utc` / `due_before_utc` (inclusive, RFC 3339 with any
+  offset) and `phase` filter in the store query. `limit` (default 100 once any
+  of these options or `view: "summary"` is given, maximum 500) pages the rows
+  in due order with a `page` object (`returned`, `has_more`, `next_cursor`),
+  and `cursor` (opaque) continues after the last row, stable while new
+  occurrences are planned or a revision supersedes old ones; a cursor page
+  reads a bounded number of rows, never the rest of the history.
+  `view: "summary"` drops the trigger, the target action and prompt and the
+  machine state, in both the list and the exact read (whose receipts are
+  summarized too), and adds the due time in a calendar trigger's own
+  timezone. A call with only `schedule_id`, or with only `view: "full"`,
+  returns exactly what it returned before. `ScheduleService` gains
+  `list_occurrences_matching`, `get_schedule_occurrence` and
+  `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
+  documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
+  limit it already followed.
+
 ### Fixed
 
 - `meerkat-runtime`: a queued prompt that a graceful stop kept for the next
@@ -54,6 +76,10 @@ them.
   crash cut before the upgrade still has its inputs ended as
   `RequeueExpired`, and is closed as interrupted, by a start past the max
   age.
+
+- `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
+  schedules are included; the tool lists active and paused schedules only, and
+  the description now says so.
 
 - `meerkat-runtime`: a run left open across a restart (kept by a graceful
   stop, or cut by a crash after a round commit) now resumes when a run-start
