@@ -28,6 +28,13 @@ pub(super) enum RetirementReply {
     SpawnRollback,
     /// A re-drive the actor owns itself (on resume): no caller awaits it.
     Owned,
+    /// A rotation (`rotate_member`): the retirement records the rotation at
+    /// its admission and seats the next incarnation in its terminal step;
+    /// the caller is answered with the next incarnation's session.
+    Rotate {
+        rotation: Box<super::dormant_seat::MemberRotation>,
+        reply: oneshot::Sender<Result<SessionId, MobError>>,
+    },
 }
 
 impl RetirementReply {
@@ -40,7 +47,11 @@ impl RetirementReply {
     fn owns_started_retirement(&self) -> bool {
         matches!(
             self,
-            Self::Retire(_) | Self::BatchRetire(_) | Self::Owned | Self::IdentityReconcile(_)
+            Self::Retire(_)
+                | Self::BatchRetire(_)
+                | Self::Owned
+                | Self::IdentityReconcile(_)
+                | Self::Rotate { .. }
         )
     }
 }
@@ -3637,6 +3648,18 @@ impl MobActor {
                     "member retirement durably started; owned until it settles"
                 );
                 self.retirement_take_ownership(&mut continuation);
+                // A rotation records itself on the retirement it admitted, in
+                // this same step (F6).
+                let begun = match &continuation.reply {
+                    RetirementReply::Rotate { rotation, .. } => {
+                        self.begin_member_rotation(&continuation.entry, rotation)
+                    }
+                    _ => Ok(()),
+                };
+                if let Err(error) = begun {
+                    self.finish_retirement(continuation, Err(error)).await;
+                    return;
+                }
                 if let Err(error) = self
                     .retirement_record_kickoff_cancel(&mut continuation)
                     .await
@@ -4021,6 +4044,9 @@ impl MobActor {
                 RetirementReply::Respawn { reply, .. } => {
                     let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
                 }
+                RetirementReply::Rotate { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
                 RetirementReply::IdentityReconcile(_) => {}
                 RetirementReply::SpawnRollback | RetirementReply::Owned => {}
             }
@@ -4042,6 +4068,9 @@ impl MobActor {
                 RetirementReply::Respawn { reply, .. } => {
                     let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
                 }
+                RetirementReply::Rotate { reply, .. } => {
+                    let _ = reply.send(Err(error));
+                }
                 RetirementReply::IdentityReconcile(_)
                 | RetirementReply::SpawnRollback
                 | RetirementReply::Owned => {}
@@ -4059,6 +4088,9 @@ impl MobActor {
                 }
                 RetirementReply::Respawn { reply, .. } => {
                     let _ = reply.send(Err(super::super::handle::MobRespawnError::from(error)));
+                }
+                RetirementReply::Rotate { reply, .. } => {
+                    let _ = reply.send(Err(error));
                 }
                 RetirementReply::IdentityReconcile(authority) => {
                     self.record_identity_reconcile_disposition(
@@ -4109,6 +4141,9 @@ impl MobActor {
                     let _ = reply.send(Err(super::super::handle::MobRespawnError::from(
                         MobError::MemberNotFound(identity),
                     )));
+                }
+                RetirementReply::Rotate { reply, .. } => {
+                    let _ = reply.send(Err(MobError::MemberNotFound(identity)));
                 }
                 RetirementReply::IdentityReconcile(authority) => {
                     if let Err(error) = result {
@@ -4206,7 +4241,10 @@ impl MobActor {
         // A retirement whose start is already durable (a re-drive) is owned
         // from here on.
         self.retirement_take_ownership(&mut continuation);
-        if matches!(&continuation.reply, RetirementReply::Retire(_)) {
+        if matches!(
+            &continuation.reply,
+            RetirementReply::Retire(_) | RetirementReply::Rotate { .. }
+        ) {
             self.retirement_retry_pending_anchors(continuation).await;
         } else {
             self.retirement_begin_member_effects(continuation).await;
@@ -4530,15 +4568,24 @@ impl MobActor {
                             continuation.disposal.as_ref(),
                             continuation.archive_disposal,
                         ) {
-                            (Some(ctx), Some(disposal)) => {
-                                self.observe_member_retirement_archived(ctx, disposal).await
-                            }
+                            // A rotation's terminal retires this incarnation
+                            // and seats the next one in one step (F6).
+                            (Some(ctx), Some(disposal)) => match &continuation.reply {
+                                RetirementReply::Rotate { rotation, .. } => {
+                                    self.commit_member_rotation(ctx, disposal, rotation).await
+                                }
+                                _ => self.observe_member_retirement_archived(ctx, disposal).await,
+                            },
                             _ => Err(MobError::Internal(
                                 "retirement lost its typed archive disposition".into(),
                             )),
                         },
                     };
                     match result {
+                        Ok(()) if matches!(continuation.reply, RetirementReply::Rotate { .. }) => {
+                            continuation.terminal_published = true;
+                            self.finish_member_rotation(continuation).await;
+                        }
                         Ok(()) => {
                             continuation.terminal_published = true;
                             self.retirement_terminal_carrier_cleanup(continuation).await;
@@ -5176,8 +5223,44 @@ impl MobActor {
                             continuation.entry.agent_identity
                         )));
                 }
+                RetirementReply::Rotate { rotation, reply } => {
+                    let _ = reply.send(result.map(|()| rotation.candidate.session_id.clone()));
+                }
             }
         })
+    }
+
+    /// After a rotation's terminal step: the retired incarnation's projection
+    /// is cleaned here, on the actor (the plain retirement's later stages
+    /// fence on the retired incarnation, which the roster no longer holds),
+    /// and the rotation settles. The roster keeps the next incarnation.
+    pub(super) async fn finish_member_rotation(&mut self, continuation: RetirementContinuation) {
+        let identity = continuation.entry.agent_identity.clone();
+        if let Err(error) = self
+            .runtime_metadata
+            .delete_external_binding_overlay(
+                &self.definition.id,
+                &identity,
+                continuation.entry.generation,
+            )
+            .await
+        {
+            self.finish_retirement(continuation, Err(error.into()))
+                .await;
+            return;
+        }
+        self.edge_locks.prune(identity.as_str()).await;
+        self.restore_diagnostics.write().await.remove(&identity);
+        self.member_event_pumps.stop_pump(&identity).await;
+        self.per_spawn_external_tools
+            .write()
+            .await
+            .remove(&identity);
+        self.reachability_observations.clear_member(&identity);
+        // The rotation's terminal changed the roster: wake the machine-state
+        // watch, whose contract covers every roster mutation.
+        self.publish_machine_state_projection();
+        self.finish_retirement(continuation, Ok(())).await;
     }
 }
 

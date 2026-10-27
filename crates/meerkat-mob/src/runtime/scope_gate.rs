@@ -143,6 +143,9 @@ impl MobCommand {
             | Self::Complete { .. }
             | Self::Destroy { .. }
             | Self::Reset { .. }
+            // A rotation retires the member's current life to seat its next.
+            | Self::PlanMemberRotation { .. }
+            | Self::StartMemberRotation { .. }
             | Self::AdoptMemberIdentityDeclaration { .. }
             | Self::ApplyMemberToolDeclaration { .. }
             | Self::ResolveIdentityConvergenceBlock { .. } => Some(ControlScope::Retire),
@@ -349,6 +352,8 @@ impl MobCommand {
                     | Self::ResumeLifecycle { .. }
                     | Self::Reset { .. }
                     | Self::ReloadMemberRegistration { .. }
+                    | Self::PlanMemberRotation { .. }
+                    | Self::StartMemberRotation { .. }
             ),
             Some(
                 ControlScope::List
@@ -441,6 +446,12 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::PlanDormantSeats { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::PlanMemberRotation { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::StartMemberRotation { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             Self::CommitDormantSeats { reply_tx, .. } => {

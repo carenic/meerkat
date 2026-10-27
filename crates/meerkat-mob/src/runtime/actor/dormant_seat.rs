@@ -10,9 +10,27 @@
 
 use super::super::dormant_seat::{
     DormantSeatCandidate, DormantSeatCommitEntry, DormantSeatLaunch, DormantSeatOutcome,
-    DormantSeatPlan, DormantSeatPlanEntry, fresh_seat_session_id,
+    DormantSeatPlan, DormantSeatPlanEntry, MemberRotationPlan, fresh_seat_session_id,
 };
 use super::*;
+
+/// What a plan is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatPlanMode {
+    /// A dormant seat (`seat_dormant_members`).
+    Seat,
+    /// A rotation's next incarnation (`rotate_member`): a fresh life seated
+    /// Dormant with no kickoff, the identity seated now or not.
+    Rotation,
+}
+
+/// A rotation's next incarnation (`rotate_member`): its seat material,
+/// carried by the retirement of the current incarnation to the terminal
+/// step that seats it.
+pub(super) struct MemberRotation {
+    pub(super) candidate: Box<DormantSeatCandidate>,
+    pub(super) endpoint: Option<TrustedPeerDescriptor>,
+}
 
 /// One seated identity of a chunk, waiting for its plan and its outcome.
 struct SeatedInChunk {
@@ -34,7 +52,7 @@ impl MobActor {
         for spec in specs {
             let agent_identity = spec.identity.clone();
             let entry = if named.insert(agent_identity.clone()) {
-                match self.plan_dormant_seat(spec).await {
+                match self.plan_dormant_seat(spec, SeatPlanMode::Seat).await {
                     Ok(entry) => entry,
                     Err(error) => DormantSeatPlanEntry::Done(DormantSeatOutcome::Refused {
                         agent_identity,
@@ -58,15 +76,54 @@ impl MobActor {
         }
     }
 
+    /// Plan a rotation (`rotate_member`): the next incarnation's seat, and
+    /// whether the identity is seated now (its current incarnation is then
+    /// retired and the next one seated in the retirement's terminal step).
+    pub(super) async fn plan_member_rotation(
+        &mut self,
+        spec: super::super::handle::SpawnMemberSpec,
+    ) -> Result<MemberRotationPlan, MobError> {
+        let agent_identity = spec.identity.clone();
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
+        if self.retirements.contains_key(&agent_identity) {
+            return Err(MobError::LifecycleOperationPending {
+                intent: format!("retirement member {agent_identity}"),
+            });
+        }
+        let seated = self
+            .dsl_authority
+            .state()
+            .identity_to_runtime
+            .contains_key(&dsl_identity);
+        match self.plan_dormant_seat(spec, SeatPlanMode::Rotation).await? {
+            DormantSeatPlanEntry::Seat(candidate) => Ok(MemberRotationPlan {
+                candidate,
+                seated,
+                endpoint_source: self.member_residency.seat_endpoints.clone(),
+                provisioner: Arc::clone(&self.provisioner),
+            }),
+            _ => Err(MobError::Internal(format!(
+                "the rotation of '{agent_identity}' planned no seat"
+            ))),
+        }
+    }
+
     /// Plan one spec. Every check a spawn makes before anything exists is
     /// made here; the machine makes the rest at the commit.
     async fn plan_dormant_seat(
         &mut self,
         mut spec: super::super::handle::SpawnMemberSpec,
+        mode: SeatPlanMode,
     ) -> Result<DormantSeatPlanEntry, MobError> {
         let agent_identity = spec.identity.clone();
-        // CommitDormantSeat is Running-only: a stopped mob seats nothing.
-        if self.state() != MobState::Running {
+        // CommitDormantSeat is Running-only: a stopped mob seats nothing. A
+        // rotation of a seated member also runs while the mob is Stopped.
+        let phase = self.state();
+        let phase_admits = match mode {
+            SeatPlanMode::Seat => phase == MobState::Running,
+            SeatPlanMode::Rotation => matches!(phase, MobState::Running | MobState::Stopped),
+        };
+        if !phase_admits {
             return Err(self.invalid_transition_to(MobState::Running));
         }
         if agent_identity.is_system_reserved() {
@@ -76,7 +133,14 @@ impl MobActor {
         }
         let launch = match &spec.launch_mode {
             crate::launch::MemberLaunchMode::Fresh => DormantSeatLaunch::Fresh,
-            crate::launch::MemberLaunchMode::Resume { .. } => DormantSeatLaunch::Resume,
+            crate::launch::MemberLaunchMode::Resume { .. } if mode == SeatPlanMode::Seat => {
+                DormantSeatLaunch::Resume
+            }
+            crate::launch::MemberLaunchMode::Resume { .. } => {
+                return Err(MobError::Internal(format!(
+                    "the rotation of '{agent_identity}' seats a fresh life: its spec must launch Fresh"
+                )));
+            }
             crate::launch::MemberLaunchMode::Fork { .. } => {
                 return Err(MobError::Internal(format!(
                     "'{agent_identity}' cannot be seated dormant from a fork: a fork is spawned"
@@ -104,10 +168,11 @@ impl MobActor {
         }
 
         // An identity already seated: an earlier seat of this very spec is
-        // AlreadySeated; any other seat is the caller's rotation.
+        // AlreadySeated; any other seat is the caller's rotation (a
+        // rotation plans its next incarnation over the seated one).
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
         let state = self.dsl_authority.state();
-        if state.identity_to_runtime.contains_key(&dsl_identity) {
+        if mode == SeatPlanMode::Seat && state.identity_to_runtime.contains_key(&dsl_identity) {
             let current_generation = state
                 .identity_runtime_generations
                 .get(&dsl_identity)
@@ -203,7 +268,11 @@ impl MobActor {
         // runs as its first turn) is embodied through the ordinary spawn
         // path, as a 0.9.6 spawn is: it would be woken at once for the
         // kickoff anyway. Its session is the seat's name-based one.
-        if launch == DormantSeatLaunch::Fresh
+        // A rotation re-seats Dormant WITHOUT a kickoff: 0.9.6 started and then
+        // interrupted that kickoff, and the reset member starts on its next
+        // delivery.
+        if mode == SeatPlanMode::Seat
+            && launch == DormantSeatLaunch::Fresh
             && (runtime_mode == crate::MobRuntimeMode::AutonomousHost
                 || spec.initial_message.is_some())
         {
@@ -775,6 +844,274 @@ impl MobActor {
             creation_id: Some(creation_id),
             provenance,
         }
+    }
+}
+
+impl MobActor {
+    /// Start a rotation of a seated identity (`rotate_member`): its current
+    /// incarnation's retirement, which records the rotation at its admission
+    /// (`BeginMemberRotation`) and seats the next incarnation in its terminal
+    /// step (`CommitMemberRotation`). The caller is answered with the new
+    /// session once the retirement settles. A retirement of the identity that
+    /// is stuck is re-driven by it.
+    pub(super) async fn start_member_rotation(
+        &mut self,
+        candidate: Box<DormantSeatCandidate>,
+        endpoint: Option<TrustedPeerDescriptor>,
+        reply: oneshot::Sender<Result<SessionId, MobError>>,
+    ) {
+        let identity = candidate.agent_identity.clone();
+        let redrive = self.stuck_retirements.contains_key(&identity);
+        Box::pin(self.start_retirement(
+            identity,
+            Instant::now() + super::super::provisioner::MEMBER_RETIRE_TOTAL_TIMEOUT,
+            None,
+            super::retirement_io::RetirementReply::Rotate {
+                rotation: Box::new(MemberRotation {
+                    candidate,
+                    endpoint,
+                }),
+                reply,
+            },
+            redrive,
+        ))
+        .await;
+    }
+
+    /// Record the rotation on the retirement it admitted (F6): the next
+    /// session and endpoint (`BeginMemberRotation`) and the next
+    /// incarnation's profile authority (`AuthorizeSpawnProfile`, consumed by
+    /// the terminal step), in one step right after the retirement's durable
+    /// start. A re-drive of the same rotation keeps the intent it recorded.
+    pub(super) fn begin_member_rotation(
+        &mut self,
+        entry: &RosterEntry,
+        rotation: &MemberRotation,
+    ) -> Result<(), MobError> {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+        let next_session = mob_dsl::SessionId::from_domain(&rotation.candidate.session_id);
+        let state = self.dsl_authority.state();
+        let mut inputs = Vec::with_capacity(2);
+        match state.member_rotation_session_ids.get(&dsl_identity) {
+            Some(recorded) if recorded == &next_session => {}
+            Some(_) => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("rotation of member {}", entry.agent_identity),
+                });
+            }
+            None => inputs.push(mob_dsl::MobMachineInput::BeginMemberRotation {
+                agent_identity: dsl_identity.clone(),
+                agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
+                fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
+                generation: mob_dsl::Generation::from_domain(entry.generation),
+                session_id: next_session,
+                peer_endpoint: rotation
+                    .endpoint
+                    .as_ref()
+                    .map(mob_dsl::MemberPeerEndpoint::from),
+                // An archived session was answered at preparation, typed.
+                session_archived: false,
+            }),
+        }
+        let authorize = !state
+            .spawn_profile_authority_profile_names
+            .contains_key(&dsl_identity);
+        if authorize {
+            inputs.push(rotation.candidate.authorize_input.clone());
+        }
+        if inputs.is_empty() {
+            return Ok(());
+        }
+        let mut authority = self.dsl_authority.prepare_authority();
+        let transitions =
+            authority
+                .apply_batch(inputs)
+                .map_err(|error| MobError::MobMachineRejected {
+                    context: "begin_member_rotation",
+                    reason: error.to_string(),
+                })?;
+        if authorize {
+            let authorized = transitions.last().ok_or_else(|| {
+                MobError::Internal("the rotation's profile authority applied nothing".into())
+            })?;
+            require_authorized_effect(
+                authorized,
+                &rotation.candidate.authorized,
+                "begin_member_rotation",
+            )?;
+        }
+        let effects = transitions
+            .into_iter()
+            .flat_map(mob_dsl::MobMachineTransition::into_effects)
+            .collect();
+        self.commit_prepared_dsl_input(PreparedDslInput {
+            authority,
+            effects,
+            phase_changed: false,
+        })
+    }
+
+    /// The rotation's archive terminal (F6): the current incarnation retired
+    /// and the next one seated Dormant on the recorded session and endpoint,
+    /// in one transition. Its `MemberRetired` and `MemberSpawned` rows go to
+    /// the journal in one `append_batch` before the commit, so the identity is
+    /// never a non-member. The roster takes the next incarnation at once.
+    pub(super) async fn commit_member_rotation(
+        &mut self,
+        ctx: &DisposalContext,
+        disposal: mob_dsl::MemberSessionDisposal,
+        rotation: &MemberRotation,
+    ) -> Result<(), MobError> {
+        let entry = &ctx.entry;
+        let identity = &ctx.agent_identity;
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        if self.retire_event_exists(identity, entry.generation).await? {
+            return Err(MobError::Internal(format!(
+                "the rotation of '{identity}' found its retirement already journaled without its next incarnation"
+            )));
+        }
+        let session_id = self
+            .dsl_authority
+            .state()
+            .member_session_bindings
+            .get(&dsl_identity)
+            .cloned()
+            .or_else(|| {
+                entry
+                    .member_ref
+                    .bridge_session_id()
+                    .map(mob_dsl::SessionId::from_domain)
+            });
+        let candidate = &rotation.candidate;
+        let next_generation = candidate.generation;
+        let next_fence = self.issue_fence_token()?;
+        let next_runtime_id = crate::ids::AgentRuntimeId::new(identity.clone(), next_generation);
+        let next_session = mob_dsl::SessionId::from_domain(&candidate.session_id);
+        let rotation_input = mob_dsl::MobMachineInput::CommitMemberRotation {
+            agent_identity: dsl_identity.clone(),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
+            fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
+            generation: mob_dsl::Generation::from_domain(entry.generation),
+            session_id: session_id.clone(),
+            disposal,
+            next_agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&next_runtime_id),
+            next_fence_token: mob_dsl::FenceToken::from_domain(next_fence),
+            next_generation: mob_dsl::Generation::from_domain(next_generation),
+            runtime_mode: mob_dsl::SpawnPolicyRuntimeMode::from(candidate.runtime_mode),
+            external_addressable: candidate.authorized.external_addressable,
+        };
+        let mut authority = self.dsl_authority.prepare_authority();
+        let mut transitions = authority.apply_batch([rotation_input]).map_err(|error| {
+            MobError::MobMachineRejected {
+                context: "commit_member_rotation",
+                reason: error.to_string(),
+            }
+        })?;
+        let committed = transitions.first().ok_or_else(|| {
+            MobError::Internal("the rotation's terminal applied no transition".into())
+        })?;
+        Self::require_member_lifecycle_journal_effect(
+            committed,
+            mob_dsl::MobLifecycleJournalKind::MemberRetired,
+            identity,
+            &entry.agent_runtime_id,
+            None,
+            entry.generation,
+            session_id,
+            "commit_member_rotation",
+        )?;
+        Self::require_member_lifecycle_journal_effect(
+            committed,
+            mob_dsl::MobLifecycleJournalKind::MemberSpawned,
+            identity,
+            &next_runtime_id,
+            Some(next_fence),
+            next_generation,
+            Some(next_session),
+            "commit_member_rotation",
+        )?;
+        // F9: the next incarnation's boot verdict, in the same step. Its
+        // session is new and empty, so it holds no runtime work. A stopped
+        // mob plans it at its lift.
+        if authority.state().lifecycle_phase == mob_dsl::MobPhase::Running {
+            let plan = super::super::boot_plan::boot_materialization_input(
+                &dsl_identity,
+                &super::super::boot_plan::BootObligations::none(),
+                &self.member_residency.host_required,
+                &BTreeSet::new(),
+            );
+            match authority.apply_batch([plan]) {
+                Ok(planned) => transitions.extend(planned),
+                // The member stays seated and Dormant: its first delivery
+                // wakes it.
+                Err(error) => tracing::warn!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %identity,
+                    %error,
+                    "MobMachine refused a rotated member's boot plan"
+                ),
+            }
+        }
+        let phase_changed = transitions
+            .iter()
+            .any(|transition| transition.from_phase != transition.to_phase);
+        let prepared = PreparedDslInput {
+            authority,
+            effects: transitions
+                .into_iter()
+                .flat_map(mob_dsl::MobMachineTransition::into_effects)
+                .collect(),
+            phase_changed,
+        };
+        let creation = self.seat_creation_record(candidate).await;
+        let mut spawned = crate::event::MemberSpawnedEvent::new(
+            identity.clone(),
+            next_generation,
+            next_fence,
+            next_runtime_id,
+            candidate.profile_name.clone(),
+        )
+        .with_bridge_member_ref(Some(MemberRef::Session {
+            session_id: candidate.session_id.clone(),
+        }))
+        .with_member_peer_endpoint(rotation.endpoint.clone());
+        spawned.creation = creation;
+        spawned.runtime_mode = candidate.runtime_mode;
+        spawned.labels = candidate.labels.clone();
+        spawned.continuity_intent = candidate.continuity_intent.clone();
+        spawned.effective_profile_override = candidate.effective_profile_override.clone();
+        spawned.effective_model_override = candidate.effective_model_override.clone();
+        let batch = vec![
+            NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MemberRetired {
+                    agent_identity: identity.clone(),
+                    generation: entry.generation,
+                    role: entry.role.clone(),
+                },
+            },
+            NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MemberSpawned(spawned),
+            },
+        ];
+        let events = Arc::clone(&self.events);
+        let stored = self
+            .commit_prepared_dsl_input_after(prepared, move || async move {
+                events.append_batch(batch).await.map_err(MobError::from)
+            })
+            .await?;
+        self.retired_event_index
+            .write()
+            .await
+            .insert(Self::retire_event_key(identity, entry.generation));
+        let mut roster = self.roster.write().await;
+        for event in &stored {
+            roster.apply_event(event);
+        }
+        Ok(())
     }
 }
 

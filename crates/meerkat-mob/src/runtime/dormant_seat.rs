@@ -76,6 +76,25 @@ pub enum DormantSeatOutcome {
 }
 
 impl DormantSeatOutcome {
+    /// The error a single seat's outcome answers its caller with, when the
+    /// seat did not happen.
+    pub(crate) fn into_unseated_error(self) -> MobError {
+        match self {
+            Self::Refused { error, .. } => error,
+            Self::SessionArchived { session_id, .. } => MobError::SessionUnavailableForResume {
+                session_id,
+                reason: SessionResumeUnavailableReason::ArchivedNotRevivable,
+                runtime_state: None,
+                verdict: None,
+            },
+            Self::Seated { agent_identity, .. }
+            | Self::AlreadySeated { agent_identity, .. }
+            | Self::Embodied { agent_identity, .. } => MobError::Internal(format!(
+                "'{agent_identity}' was seated, but its seat was answered as not seated"
+            )),
+        }
+    }
+
     /// The identity this outcome answers for.
     pub fn agent_identity(&self) -> &AgentIdentity {
         match self {
@@ -185,6 +204,18 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     pub(in crate::runtime) authorized:
         super::spawn_profile_authority::AuthorizedSpawnProfileMaterial,
     pub(in crate::runtime) observations: super::actor::SpawnExecObservations,
+}
+
+/// The plan of a rotation (`rotate_member`): the next incarnation's seat.
+pub(in crate::runtime) struct MemberRotationPlan {
+    pub(in crate::runtime) candidate: Box<DormantSeatCandidate>,
+    /// Whether the identity is seated now: its current incarnation is then
+    /// retired and the next one seated in the retirement's terminal step.
+    /// Otherwise (its last retirement already completed) the rotation is one
+    /// fresh seat.
+    pub(in crate::runtime) seated: bool,
+    pub(in crate::runtime) endpoint_source: Option<MemberSeatEndpointSource>,
+    pub(in crate::runtime) provisioner: Arc<dyn super::provisioner::MobProvisioner>,
 }
 
 /// One entry of a seat chunk's commit, in the chunk's order.

@@ -1343,6 +1343,18 @@ pub(super) enum MobCommand {
         specs: Vec<super::handle::SpawnMemberSpec>,
         reply_tx: oneshot::Sender<Result<super::dormant_seat::DormantSeatPlan, crate::MobError>>,
     },
+    /// Plan a rotation (`rotate_member`): the next incarnation's seat.
+    PlanMemberRotation {
+        spec: Box<super::handle::SpawnMemberSpec>,
+        reply_tx: oneshot::Sender<Result<super::dormant_seat::MemberRotationPlan, crate::MobError>>,
+    },
+    /// Start a prepared rotation of a seated member: its retirement, which
+    /// seats the next incarnation in its terminal step.
+    StartMemberRotation {
+        candidate: Box<super::dormant_seat::DormantSeatCandidate>,
+        endpoint: Option<meerkat_core::comms::TrustedPeerDescriptor>,
+        reply_tx: oneshot::Sender<Result<SessionId, crate::MobError>>,
+    },
     /// Commit one prepared chunk of a dormant seat in one actor step.
     CommitDormantSeats {
         entries: Vec<super::dormant_seat::DormantSeatCommitEntry>,
@@ -2086,6 +2098,8 @@ impl MobCommand {
             Self::ProjectMemberStatus { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ReleaseMemberRunStarts { .. } => ShutdownAnswerClass::CallerRequest,
             Self::PlanDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::PlanMemberRotation { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::StartMemberRotation { .. } => ShutdownAnswerClass::CallerRequest,
             Self::CommitDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityIntent { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityConvergenceStatus { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2304,6 +2318,8 @@ impl MobCommand {
             Self::ProjectMemberStatus { .. } => "ProjectMemberStatus",
             Self::ReleaseMemberRunStarts { .. } => "ReleaseMemberRunStarts",
             Self::PlanDormantSeats { .. } => "PlanDormantSeats",
+            Self::PlanMemberRotation { .. } => "PlanMemberRotation",
+            Self::StartMemberRotation { .. } => "StartMemberRotation",
             Self::CommitDormantSeats { .. } => "CommitDormantSeats",
             Self::ProjectMemberStatusObserved { .. } => "ProjectMemberStatusObserved",
             Self::GetIdentityIntent { .. } => "GetIdentityIntent",

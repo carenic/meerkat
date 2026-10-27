@@ -30122,6 +30122,17 @@ impl MobActor {
                     let plan = Box::pin(self.plan_dormant_seats(specs)).await;
                     let _ = reply_tx.send(Ok(plan));
                 }
+                MobCommand::PlanMemberRotation { spec, reply_tx } => {
+                    let plan = Box::pin(self.plan_member_rotation(*spec)).await;
+                    let _ = reply_tx.send(plan);
+                }
+                MobCommand::StartMemberRotation {
+                    candidate,
+                    endpoint,
+                    reply_tx,
+                } => {
+                    Box::pin(self.start_member_rotation(candidate, endpoint, reply_tx)).await;
+                }
                 MobCommand::CommitDormantSeats { entries, reply_tx } => {
                     let result = Box::pin(self.commit_dormant_seats(entries)).await;
                     let _ = reply_tx.send(result);

@@ -9374,6 +9374,85 @@ impl MobHandle {
         Ok(outcomes)
     }
 
+    /// Rotate a member onto a fresh life (a reset, or a deleted identity
+    /// created anew): its current incarnation is retired and the next one is
+    /// seated Dormant, at the next generation, on a new empty session under a
+    /// name-based id, in the retirement's terminal step. Both journal rows are
+    /// written in one batch, so the identity is never a non-member: during
+    /// the retirement its current incarnation is Retiring, and deliveries to
+    /// it are refused typed. Returns the new session.
+    ///
+    /// The spec launches `Fresh`. The new incarnation owes no kickoff: an
+    /// `AutonomousHost` member rotated this way starts on its next delivery.
+    /// Its wiring is not carried over. An identity that is not seated (its
+    /// last retirement already completed) is seated as one fresh seat.
+    /// Re-calling it after a crash is safe: the rotation of a retirement
+    /// still in flight is recorded on that retirement, and the same
+    /// generation always names the same session. Needs the members' comms
+    /// transport, as [`Self::seat_dormant_members`] does.
+    pub async fn rotate_member(&self, mut spec: SpawnMemberSpec) -> Result<SessionId, MobError> {
+        use super::dormant_seat::DormantSeatCommitEntry;
+
+        if matches!(
+            self.command_authority_kind(),
+            crate::control_policy::CommandAuthorityKind::AgentLane
+        ) {
+            spec.mark_agent_creation();
+        }
+        let super::dormant_seat::MemberRotationPlan {
+            candidate,
+            seated,
+            endpoint_source,
+            provisioner,
+        } = self
+            .send_actor_command(|reply_tx| MobCommand::PlanMemberRotation {
+                spec: Box::new(spec),
+                reply_tx,
+            })
+            .await??;
+        let entry = super::dormant_seat::prepare_dormant_seat(
+            self.session_service.as_ref(),
+            provisioner.as_ref(),
+            endpoint_source.as_ref(),
+            &self.definition.id,
+            candidate,
+        )
+        .await
+        .map_err(|outcome| (*outcome).into_unseated_error())?;
+        if seated {
+            let DormantSeatCommitEntry::Seat {
+                candidate,
+                endpoint,
+            } = entry
+            else {
+                return Err(MobError::Internal(
+                    "a rotation's preparation produced no seat".into(),
+                ));
+            };
+            return self
+                .send_actor_command(|reply_tx| MobCommand::StartMemberRotation {
+                    candidate,
+                    endpoint,
+                    reply_tx,
+                })
+                .await?;
+        }
+        let outcome = self
+            .send_actor_command(|reply_tx| MobCommand::CommitDormantSeats {
+                entries: vec![entry],
+                reply_tx,
+            })
+            .await??
+            .into_iter()
+            .next()
+            .ok_or_else(|| MobError::Internal("a rotation's seat was not answered".into()))?;
+        match outcome {
+            super::DormantSeatOutcome::Seated { session_id, .. }
+            | super::DormantSeatOutcome::AlreadySeated { session_id, .. } => Ok(session_id),
+            other => Err(other.into_unseated_error()),
+        }
+    }
+
     /// One chunk of [`Self::seat_dormant_members`]: plan on the actor,
     /// prepare here (sessions and endpoints, off the actor), commit on the
     /// actor in one step.
