@@ -11431,6 +11431,198 @@ async fn a_mob_start_after_a_graceful_stop_resumes_a_members_open_run_head_canon
     let _ = handle.shutdown().await;
 }
 
+/// [`HoldingToolLoopClient`] whose orchestrator answers a resume notification
+/// turn only after it spawned a worker through the mob's handle, as a lead's
+/// spawn tool call waits on its spawn's receipt. Each armed notification
+/// turn spawns its own worker, bounded so that a spawn the mob withholds
+/// fails the row instead of hanging it.
+#[cfg(feature = "test-support")]
+struct SpawningResumeNotificationClient {
+    inner: HoldingToolLoopClient,
+    handle: std::sync::Mutex<Option<MobHandle>>,
+    spawned: std::sync::atomic::AtomicUsize,
+    spawns: std::sync::Mutex<Vec<Result<AgentIdentity, String>>>,
+}
+
+#[cfg(feature = "test-support")]
+impl SpawningResumeNotificationClient {
+    /// The tail of the orchestrator's resume notification prompt.
+    const RESUME_NOTIFICATION: &'static str = "continue orchestration";
+    /// How long one notification turn waits for its spawn's receipt.
+    const SPAWN_BOUND: Duration = Duration::from_secs(20);
+
+    fn new() -> Self {
+        Self {
+            inner: HoldingToolLoopClient::new(0),
+            handle: std::sync::Mutex::new(None),
+            spawned: std::sync::atomic::AtomicUsize::new(0),
+            spawns: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    fn arm(&self, handle: MobHandle) {
+        *self.handle.lock().expect("armed handle") = Some(handle);
+    }
+
+    /// Drop the armed handle: the client is owned by the mob's session
+    /// service, so holding the handle would keep the mob alive.
+    fn disarm(&self) {
+        self.handle.lock().expect("armed handle").take();
+    }
+
+    fn spawns(&self) -> Vec<Result<AgentIdentity, String>> {
+        self.spawns.lock().expect("recorded spawns").clone()
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for SpawningResumeNotificationClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> meerkat_client::types::LlmStream<'a> {
+        let last_user = request
+            .messages
+            .iter()
+            .rev()
+            .find_map(|message| match message {
+                meerkat_core::Message::User(user) => Some(user.text_content()),
+                _ => None,
+            })
+            .unwrap_or_default();
+        if !last_user.contains(Self::RESUME_NOTIFICATION) {
+            return self.inner.stream(request);
+        }
+        let handle = self.handle.lock().expect("armed handle").clone();
+        Box::pin(async_stream::stream! {
+            if let Some(handle) = handle {
+                let index = self
+                    .spawned
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                    + 1;
+                let identity = AgentIdentity::from(format!("w-spawned-{index}"));
+                let spawned = tokio::time::timeout(
+                    Self::SPAWN_BOUND,
+                    handle.spawn_spec(SpawnMemberSpec::new("worker", identity.clone())),
+                )
+                .await;
+                let outcome = match spawned {
+                    Ok(Ok(_)) => Ok(identity),
+                    Ok(Err(error)) => Err(format!("{identity}: {error}")),
+                    Err(_) => Err(format!(
+                        "{identity}: no spawn receipt within {:?}",
+                        Self::SPAWN_BOUND
+                    )),
+                };
+                self.spawns.lock().expect("recorded spawns").push(outcome);
+            }
+            for event in
+                HoldingToolLoopClient::reply(request, "ok", meerkat_core::StopReason::EndTurn)
+            {
+                yield Ok::<_, meerkat_client::LlmError>(event);
+            }
+        })
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::OpenAI
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// A host's graceful shutdown suspends a member's short open run; the next
+/// start finds the mob stopped. Its lift resumes that run, which finishes
+/// during the lift, and runs the orchestrator's resume notification turn,
+/// which spawns a worker through the mob and waits for the receipt, as a
+/// lead's spawn tool call does. The lift's post-commit work (operation
+/// bindings, then that notification turn) waits on member runs, so a spawn
+/// such a run makes is admitted while the work is in flight: the lift
+/// reaches ready, the worker is a member, and the open run resumed once.
+/// RED before: the lift's topology fence stayed up until its post-commit
+/// work finished and deferred every spawn until then, so the notification
+/// turn waited on a spawn the lift withheld while the lift waited on the
+/// turn; the spawn got no receipt.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lift_whose_resume_notification_turn_spawns_a_member_reaches_ready() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_gracefully_over_an_open_member_run(&paths, runtime_store.clone(), true).await;
+
+    let client_2 = Arc::new(SpawningResumeNotificationClient::new());
+    let (service_2, _store_2) = persistent_head_canonical_service_with(
+        &paths,
+        runtime_store.clone(),
+        Config::default(),
+        client_2.clone(),
+    );
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(client_2.clone())
+    .notify_orchestrator_on_resume(true)
+    .resume()
+    .await
+    .unwrap_or_else(|error| panic!("the start restores the member over its open run: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Stopped)),
+        "the mob starts as it was left, stopped: {status:?}"
+    );
+    client_2.arm(handle.clone());
+
+    let lifted = tokio::time::timeout(Duration::from_secs(120), handle.resume()).await;
+    client_2.disarm();
+    lifted
+        .expect("the lift answers")
+        .expect("the lift succeeds");
+    let spawns = client_2.spawns();
+    assert!(
+        !spawns.is_empty(),
+        "the lift ran the orchestrator's resume notification turn"
+    );
+    assert!(
+        spawns.iter().all(Result::is_ok),
+        "the spawn the notification turn made during the lift's post-commit work was admitted \
+         without waiting for that work: {spawns:?}"
+    );
+    for spawned in spawns.into_iter().filter_map(Result::ok) {
+        handle
+            .resolve_bridge_session_id(&spawned)
+            .await
+            .unwrap_or_else(|error| panic!("{spawned} is a session-backed member: {error}"));
+    }
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the lift reached ready: {status:?}"
+    );
+    assert_the_open_run_resumes_once_and_completes(
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &client_2.inner,
+        &run,
+        true,
+        "spawn-during-lift",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
 /// A host that holds a restored member's run starts until it is ready (for
 /// example until it has published the member's tools) releases the hold after
 /// the member's runtime registered. The registration's own wake for the kept

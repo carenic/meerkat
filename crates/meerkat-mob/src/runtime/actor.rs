@@ -18515,11 +18515,42 @@ impl MobActor {
         let ready: Vec<_> = self
             .member_admission_lanes
             .iter()
-            .filter(|(_, lane)| lane.inflight.is_none() && !lane.parked.is_empty())
+            .filter(|(_, lane)| {
+                lane.inflight.is_none()
+                    && lane
+                        .parked
+                        .front()
+                        .is_some_and(|head| !self.explicit_resume_parks_member_admission(head))
+            })
             .map(|(identity, _)| identity.clone())
             .collect();
         for identity in ready {
             self.start_next_member_admission(&identity);
+        }
+    }
+
+    /// Whether the explicit resume keeps `pending` parked. Work a member's run
+    /// can wait on (its submitted work) waits only for the resume's topology
+    /// reconciliation, never for its post-commit work, which can itself wait
+    /// on member runs. A registration reload waits for the resume's whole
+    /// member work.
+    fn explicit_resume_parks_member_admission(&self, pending: &ParkedMemberTurnAdmission) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            match pending {
+                ParkedMemberTurnAdmission::SubmitWorkPump(_) => {
+                    self.resume_topology_mutation_pending()
+                }
+                ParkedMemberTurnAdmission::Reload { .. } => {
+                    self.explicit_resume_member_work_fenced()
+                }
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = pending;
+            false
         }
     }
 
@@ -18601,11 +18632,7 @@ impl MobActor {
     fn spawn_member_turn_admission(&mut self, pending: ParkedMemberTurnAdmission) {
         let agent_identity = pending.agent_identity().clone();
         #[cfg(feature = "runtime-adapter")]
-        if matches!(
-            &pending,
-            ParkedMemberTurnAdmission::Reload { .. } | ParkedMemberTurnAdmission::SubmitWorkPump(_)
-        ) && self.resume_topology_mutation_pending()
-        {
+        if self.explicit_resume_parks_member_admission(&pending) {
             #[cfg(test)]
             let is_reload = matches!(&pending, ParkedMemberTurnAdmission::Reload { .. });
             let lane = self
@@ -31684,9 +31711,11 @@ impl MobActor {
         let wiring_io_pending = !self.wiring_io_tasks.is_empty();
         let member_effect_pending = !self.member_effect_tasks.is_empty();
         let identity_reconcile_pending = !self.identity_reconcile_queue.is_empty();
+        // The identity reconcile waits for an explicit resume's whole member
+        // work: its topology reconciliation and its post-commit work.
         #[cfg(feature = "runtime-adapter")]
         let identity_reconcile_pending =
-            identity_reconcile_pending && !self.resume_topology_mutation_pending();
+            identity_reconcile_pending && !self.explicit_resume_member_work_fenced();
         // A Shutdown parked on its runtime teardown releases members' identity
         // leases from there: no reconcile pass claims one again meanwhile.
         let identity_reconcile_pending =
@@ -33591,14 +33620,15 @@ impl MobActor {
 
     /// The deferred custody re-attempts share the identity reconcile's backoff
     /// deadline wake: the time until the earliest due entry, or `None` with no
-    /// entry, or while a Shutdown's runtime teardown or a resume's topology
-    /// mutation is in progress.
+    /// entry, or while a Shutdown's runtime teardown or an explicit resume's
+    /// member work (its topology reconciliation and its post-commit work) is
+    /// in progress.
     fn deferred_member_custody_next_wait(&self) -> Option<Duration> {
         if self.pending_shutdown_teardown.is_some() {
             return None;
         }
         #[cfg(feature = "runtime-adapter")]
-        if self.resume_topology_mutation_pending() {
+        if self.explicit_resume_member_work_fenced() {
             return None;
         }
         self.deferred_member_custody.next_wait(Instant::now())

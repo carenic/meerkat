@@ -14,6 +14,20 @@ impl MobActor {
             tracing::error!("post-topology work lost its matching continuation");
             return;
         };
+        // The topology reconciliation settled: MobMachine's topology fence
+        // comes down here, before the post-commit work, not after it. That
+        // work mutates no graph, and it can wait on member runs (an operation
+        // binding, the orchestrator's resume notification turn). A run can in
+        // turn wait on graph work the fence defers (a spawn, wire or retire
+        // tool call), so a fence held across the post-commit work let the
+        // resume and such a run wait on each other forever.
+        if let Err(error) = self.apply_explicit_resume_input(
+            |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeTopology { attempt },
+            "settle_explicit_resume_topology",
+        ) {
+            let _ = pending.reply_tx.send(Err(error));
+            return;
+        }
         pending.phase = ResumeLifecyclePhase::PostCommitMembers {
             step: ResumePostCommitStep::OperationBindings,
             post_commit_error: post_commit_error.or(topology_result.err()),
@@ -86,8 +100,26 @@ impl MobActor {
                 }
             }
         }
+        self.observe_owed_resume_post_commit_member(
+            crate::runtime::state::LifecycleProgressStage::ResumeOperationBindings,
+        );
         if self.resume_post_commit_member_tasks.is_empty() {
             self.begin_resume_orchestrator_notifications().await;
+        }
+    }
+
+    /// Name, in the resume's progress observation, a member whose post-commit
+    /// work at `stage` is still owed. A stall then names a member the resume
+    /// waits on, not the last member whose work finished.
+    fn observe_owed_resume_post_commit_member(
+        &self,
+        stage: crate::runtime::state::LifecycleProgressStage,
+    ) {
+        if let (Some(pending), Some(owed)) = (
+            self.pending_resume_lifecycle.as_ref(),
+            self.resume_post_commit_member_tasks.first(),
+        ) {
+            pending.progress.awaiting_member(owed, stage);
         }
     }
 
@@ -197,19 +229,18 @@ impl MobActor {
         if let Err(error) = result {
             self.retain_resume_post_commit_error(error);
         }
+        let stage = match step {
+            ResumePostCommitStep::OperationBindings => {
+                crate::runtime::state::LifecycleProgressStage::ResumeOperationBindings
+            }
+            ResumePostCommitStep::OrchestratorNotification => {
+                crate::runtime::state::LifecycleProgressStage::OrchestratorResumeNotification
+            }
+        };
         if let Some(pending) = self.pending_resume_lifecycle.as_ref() {
-            pending.progress.member_progress(
-                &identity,
-                match step {
-                    ResumePostCommitStep::OperationBindings => {
-                        crate::runtime::state::LifecycleProgressStage::ResumeOperationBindings
-                    }
-                    ResumePostCommitStep::OrchestratorNotification => {
-                        crate::runtime::state::LifecycleProgressStage::OrchestratorResumeNotification
-                    }
-                },
-            );
+            pending.progress.member_progress(&identity, stage);
         }
+        self.observe_owed_resume_post_commit_member(stage);
         if self.resume_post_commit_member_tasks.is_empty() {
             match step {
                 ResumePostCommitStep::OperationBindings => {
@@ -296,6 +327,9 @@ impl MobActor {
                 }
             }
         }
+        self.observe_owed_resume_post_commit_member(
+            crate::runtime::state::LifecycleProgressStage::OrchestratorResumeNotification,
+        );
         if self.resume_post_commit_member_tasks.is_empty() {
             self.finish_resume_post_commit_members();
         }
@@ -336,11 +370,9 @@ impl MobActor {
         } else {
             post_commit_error.map_or(Ok(()), Err)
         };
-        let settled = self.apply_explicit_resume_input(
-            |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeTopology { attempt },
-            "settle_explicit_resume_post_commit",
-        );
-        let result = settled.and_then(|()| self.finish_explicit_resume_attempt(result));
+        // The topology settled when its reconciliation did
+        // (`begin_resume_post_topology_members`).
+        let result = self.finish_explicit_resume_attempt(result);
         if result.is_ok() {
             // A resume re-drives every retirement this actor owns as stuck.
             self.enqueue_stuck_retirement_redrives();
