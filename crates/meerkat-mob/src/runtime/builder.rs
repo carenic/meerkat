@@ -11369,7 +11369,9 @@ async fn release_unapplied_member_restore(
     let receipt = match &provision.outcome {
         MemberRestoreProvisionOutcome::Durable { receipt, .. }
         | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
-        MemberRestoreProvisionOutcome::Failed(_) => return,
+        // Nothing was provisioned.
+        MemberRestoreProvisionOutcome::Failed(_)
+        | MemberRestoreProvisionOutcome::Retryable { .. } => return,
     };
     let released = match receipt.session_origin {
         super::provisioner::ProvisionSessionOrigin::Fresh => {
