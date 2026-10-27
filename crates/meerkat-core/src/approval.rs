@@ -1087,10 +1087,9 @@ pub struct ApprovalService {
     state: Arc<RwLock<ApprovalServiceState>>,
     store: Arc<dyn ApprovalStore>,
     unavailable_reason: Option<Arc<str>>,
-    /// Test-only signal: a reserved review commit passed every pre-check and
-    /// is about to take the commit reservation.
-    /// Review attempt disposals handed over without waiting; settled under
-    /// the owner's next review commit. Never held while waiting for `state`.
+    /// Review inputs handed over without waiting (attempt disposals and the
+    /// finish of an entered effect's step), settled in order by the owner's
+    /// next holder. Never held while waiting for `state`.
     queued_disposals: Arc<parking_lot::Mutex<Vec<QueuedReviewDisposal>>>,
     /// Work associations whose run closed while the owner was held; their
     /// unspent consent is parked or withdrawn by the next lock holder's
@@ -1608,6 +1607,81 @@ impl ApprovalService {
         Option<Result<ReviewAttemptStatus, ReviewOwnerError>>,
         SettledReports,
     ) {
+        self.settle_review_input(id, QueuedReviewInput::Dispose(retire), on_queued)
+    }
+
+    /// Admit one later step of an entered effect (`AdmitEnteredStep`) under
+    /// the owner's non-waiting reservation: a held owner is `Unavailable` at
+    /// once. Under that same reservation every review input queued behind
+    /// an earlier holder (a dispatch end's hand-back, a step's finish) is
+    /// settled into the owner first, so the generated owner alone decides
+    /// the admission: a step is admitted only while the attempt, spent once
+    /// at the effect's entry, is registered as `Used` and its effect is
+    /// open. Admitting spends nothing. `handle` must be bound to exactly
+    /// `binding` and `work`. The returned reports run once the caller is
+    /// outside every lock and outside the step.
+    pub(crate) fn admit_entered_step(
+        &self,
+        handle: &ReviewAttemptHandle,
+        binding: &crate::authorization::PreparedAuthorizationBinding,
+        work: &crate::authorization::WorkAuthorizationContext,
+    ) -> (Result<(), ReviewOwnerError>, SettledReports) {
+        if self.ensure_available().is_err() {
+            return (
+                Err(ReviewOwnerError::Unavailable),
+                SettledReports::default(),
+            );
+        }
+        let Some(mut state) = self.state.try_write() else {
+            return (
+                Err(ReviewOwnerError::Unavailable),
+                SettledReports::default(),
+            );
+        };
+        self.count_review_lock();
+        let mut reports = self.settle_queued_locked(&mut state);
+        let result = if handle.bound_to(binding, work) {
+            match review_status_from_outcome(
+                state.authority.admit_entered_step(handle.id().to_owned()),
+            ) {
+                Ok(ReviewAttemptStatus::Used) => Ok(()),
+                Ok(_) => Err(ReviewOwnerError::Unavailable),
+                Err(error) => Err(error),
+            }
+        } else {
+            Err(ReviewOwnerError::Mismatch)
+        };
+        reports.absorb(self.release_review_state(state));
+        (result, reports)
+    }
+
+    /// One admitted step of an entered effect finished (`FinishEnteredStep`),
+    /// WITHOUT waiting for the owner: applied now when the owner is free,
+    /// otherwise queued for its next holder through the same protocol as a
+    /// disposal, so a finish is never lost. The last finish of a closing
+    /// effect releases its attempt. The returned reports run once the caller
+    /// is outside every lock and outside the step.
+    pub(crate) fn finish_entered_step(&self, id: &str) -> SettledReports {
+        let (_, reports) =
+            self.settle_review_input(id, QueuedReviewInput::FinishEnteredStep, || {
+                Box::new(|_: Result<ReviewAttemptStatus, ReviewOwnerError>| {})
+            });
+        reports
+    }
+
+    /// Apply one review input WITHOUT waiting for the owner: now when the
+    /// state lock is free (the result is returned), otherwise queued for the
+    /// owner's next holder and reported through `on_queued` once settled
+    /// (`None` is returned).
+    fn settle_review_input(
+        &self,
+        id: &str,
+        input: QueuedReviewInput,
+        on_queued: impl FnOnce() -> QueuedDisposalReport,
+    ) -> (
+        Option<Result<ReviewAttemptStatus, ReviewOwnerError>>,
+        SettledReports,
+    ) {
         if self.ensure_available().is_err() {
             return (
                 Some(Err(ReviewOwnerError::Unavailable)),
@@ -1616,12 +1690,12 @@ impl ApprovalService {
         }
         if let Some(mut state) = self.state.try_write() {
             self.count_review_lock();
-            let result = dispose_locked(&mut state.authority, id, retire);
+            let result = apply_queued_locked(&mut state.authority, id, input);
             return (Some(result), self.release_review_state(state));
         }
         self.queued_disposals.lock().push(QueuedReviewDisposal {
             id: id.to_owned(),
-            retire,
+            input,
             report: on_queued(),
         });
         // Every lock holder settles the queue as it releases (writers under
@@ -1680,10 +1754,10 @@ impl ApprovalService {
                 let mut queue = self.queued_disposals.lock();
                 let settled = std::mem::take(&mut *queue)
                     .into_iter()
-                    .map(|disposal| {
+                    .map(|queued| {
                         let result =
-                            dispose_locked(&mut state.authority, &disposal.id, disposal.retire);
-                        (disposal.report, result)
+                            apply_queued_locked(&mut state.authority, &queued.id, queued.input);
+                        (queued.report, result)
                     })
                     .collect();
                 // A store-free release never drops a pending durable record:
@@ -1706,6 +1780,23 @@ impl ApprovalService {
                 self.retire_work_custody_locked(&mut state, &work);
             }
         }
+    }
+
+    /// Settle every queued review input into the owner now, in queue order,
+    /// under the reservation the caller holds (the state lock stays held).
+    /// Their reports run later, outside every lock.
+    fn settle_queued_locked(&self, state: &mut ApprovalServiceState) -> SettledReports {
+        let queued = std::mem::take(&mut *self.queued_disposals.lock());
+        SettledReports(
+            queued
+                .into_iter()
+                .map(|queued| {
+                    let result =
+                        apply_queued_locked(&mut state.authority, &queued.id, queued.input);
+                    (queued.report, result)
+                })
+                .collect(),
+        )
     }
 
     #[inline]
@@ -2086,11 +2177,23 @@ type SettledReviewDisposal = (
     Result<ReviewAttemptStatus, ReviewOwnerError>,
 );
 
-/// A review attempt disposal handed to the owner without waiting for it.
+/// A review input handed to the owner without waiting for it.
 struct QueuedReviewDisposal {
     id: String,
-    retire: Option<ReviewRetirementReason>,
+    input: QueuedReviewInput,
     report: QueuedDisposalReport,
+}
+
+/// What a queued review input applies once the owner settles it.
+#[derive(Debug, Clone, Copy)]
+enum QueuedReviewInput {
+    /// Retire the attempt (when a reason is set), then hand it back
+    /// (`ReleaseReview`): released, or its entered effect closed while a
+    /// step admitted under it is in flight.
+    Dispose(Option<ReviewRetirementReason>),
+    /// One admitted step of the attempt's entered effect finished
+    /// (`FinishEnteredStep`).
+    FinishEnteredStep,
 }
 
 /// A refused reserved review commit: the typed refusal and the attempt's
@@ -2104,6 +2207,20 @@ pub(crate) struct RefusedReviewCommit<E> {
     /// The commit already happened (a spend refused by its final check after
     /// the owner exit): its status stays committed and nothing refunds.
     pub(crate) committed: Option<ReviewAttemptStatus>,
+}
+
+/// Apply one queued review input under a reservation already held.
+fn apply_queued_locked(
+    authority: &mut ApprovalLifecycleMachineAuthority,
+    id: &str,
+    input: QueuedReviewInput,
+) -> Result<ReviewAttemptStatus, ReviewOwnerError> {
+    match input {
+        QueuedReviewInput::Dispose(retire) => dispose_locked(authority, id, retire),
+        QueuedReviewInput::FinishEnteredStep => {
+            review_status_from_outcome(authority.finish_entered_step(id.to_owned()))
+        }
+    }
 }
 
 /// Retire (when set) and release one attempt under a reservation already

@@ -66,8 +66,9 @@ use super::{
     ApprovalError, ApprovalId, ApprovalOwnerRef, ApprovalPrincipalId, ApprovalProposedAction,
     ApprovalRecord, ApprovalRequest, ApprovalResourceId, ApprovalResourceKind, ApprovalResourceRef,
     ApprovalRisk, ApprovalService, ApprovalServiceState, ApprovalStatus, QueuedDisposalReport,
-    QueuedReviewDisposal, SettledReports, allowed_decision_flags, approval_lifecycle_decision,
-    lifecycle_error, lifecycle_status_from_outcome, review_status_from_outcome,
+    QueuedReviewDisposal, QueuedReviewInput, SettledReports, allowed_decision_flags,
+    approval_lifecycle_decision, lifecycle_error, lifecycle_status_from_outcome,
+    review_status_from_outcome,
 };
 
 /// A human approver the host's ingress owner authenticated on the actual
@@ -2154,7 +2155,7 @@ impl ApprovalService {
     ) {
         self.queued_disposals.lock().push(QueuedReviewDisposal {
             id: candidate.attempt.id().to_owned(),
-            retire: None,
+            input: QueuedReviewInput::Dispose(None),
             report: candidate.retirement_report(reason, withdrawn),
         });
     }

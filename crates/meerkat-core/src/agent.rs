@@ -15,6 +15,7 @@ pub mod compact;
 mod compaction_retention_tests;
 #[cfg(test)]
 mod durable_boundary_tests;
+mod entered_operation;
 mod extraction;
 mod hook_impl;
 #[cfg(all(test, feature = "workspace-tests"))]
@@ -80,6 +81,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 pub use builder::{AgentBuildPolicyError, AgentBuilder, DefaultSystemPromptPolicy};
+pub use entered_operation::EnteredDispatchOperation;
 pub use runner::{
     AgentControlStateError, AgentRunner, LiveBridgePreparedOperation, SnapshotProjectionError,
 };
@@ -999,7 +1001,10 @@ impl ReviewedEntryTicket {
 /// It keeps this dispatch's work context, prepared check and binding-owned
 /// call and plan inside core; it never exposes them for replay. Every
 /// [`Self::run_if_current_within`] checks the exact binding-owned call and
-/// its retained plan against current owners again.
+/// its retained plan against current owners again. A reviewed call that
+/// continues with further governed steps after its single consuming entry
+/// uses the entry's typed witness instead ([`Self::into_entered`],
+/// [`EnteredDispatchOperation`]).
 #[derive(Debug, Clone)]
 pub struct GovernedDispatchOperation {
     context: ToolDispatchContext,
@@ -1016,18 +1021,29 @@ impl GovernedDispatchOperation {
     pub(crate) fn current(
         &self,
     ) -> Result<crate::authorization::PreparedOperationCheck, crate::ToolError> {
+        self.current_decision().map_err(crate::ToolError::from)
+    }
+
+    /// [`Self::current`], as the owners answered it.
+    fn current_decision(
+        &self,
+    ) -> Result<crate::authorization::PreparedOperationCheck, crate::OperationAuthorizationError>
+    {
+        let malformed = || {
+            crate::OperationAuthorizationError::Refused(
+                crate::authorization::OperationRefused::new(
+                    crate::authorization::OperationRefusalKind::MalformedFacts,
+                ),
+            )
+        };
         let (Some(work), Some(prepared)) = (
             self.context.work_authorization.as_ref(),
             self.context.prepared_authorization.as_ref(),
         ) else {
-            return Err(governed_malformed());
+            return Err(malformed());
         };
-        let (call, plan) = prepared
-            .tool_dispatch_parts()
-            .ok_or_else(governed_malformed)?;
-        prepared
-            .current_tool(work, call, Some(plan), self.context.run_id())
-            .map_err(crate::ToolError::from)
+        let (call, plan) = prepared.tool_dispatch_parts().ok_or_else(malformed)?;
+        prepared.current_tool(work, call, Some(plan), self.context.run_id())
     }
 
     /// Run `operation` only while this exact prepared operation is
@@ -1035,7 +1051,9 @@ impl GovernedDispatchOperation {
     /// retained owners (see `WorkAuthorization::run_if_current_within`),
     /// under those owners' non-waiting exclusion held through `operation`.
     /// An entry that requires review refuses: no review runs here. The
-    /// prepared check, binding and call never leave core.
+    /// prepared check, binding and call never leave core. After the call's
+    /// single consuming entry, a reviewed operation runs its further steps
+    /// through the entry's witness ([`EnteredDispatchOperation`]).
     ///
     /// # Errors
     /// A refused, unavailable or no longer current operation; `operation`
@@ -1072,7 +1090,11 @@ impl GovernedDispatchOperation {
     /// An R3 decision never reaches a dispatcher outside such an attempt.
     /// This is the dispatch's single consuming entry: for R2 and R3 a second
     /// call finds the review spent (`AlreadyConsumed`), while an R1 entry
-    /// spends nothing and can issue again. The returned box carries the grant
+    /// spends nothing and can issue again. A reviewed call that issues more
+    /// than one child, or admits other governed steps too, enters once with
+    /// [`ToolDispatchContext::enter_governed_operation`] and issues through
+    /// that witness ([`EnteredDispatchOperation::issue_child_if_current_within`])
+    /// instead, never through this method. The returned box carries the grant
     /// owner's typed outcome, which callers must keep: an outer `Ok` is no
     /// receipt.
     ///
@@ -1122,6 +1144,32 @@ impl GovernedDispatchOperation {
     pub fn work_authorization(&self) -> &crate::WorkAuthorizationContext {
         // Constructed only from a governed context, which carries one.
         &self.work
+    }
+
+    /// The typed witness of this operation's entered effect, for a leaf that
+    /// already made the dispatch's single consuming entry itself
+    /// ([`ToolDispatchContext::enter_reviewed_effect_held`], or
+    /// [`ReviewedEntryTicket::enter`] on a worker). `custody` must be the one
+    /// this dispatch's own entry returned; nothing is spent here. An
+    /// unreviewed (R1) dispatch passes the inert custody its entry returned,
+    /// and its entered tier is R1. See [`EnteredDispatchOperation`].
+    ///
+    /// Accepted: this dispatch's own held custody while its entry is entered
+    /// (R2 or R3), or an inert custody when this dispatch's entry is
+    /// unreviewed or absent (R1).
+    ///
+    /// # Errors
+    /// The effect may already have begun, so no error says that nothing
+    /// entered: custody of another dispatch, an inert custody for a reviewed
+    /// dispatch, or a review that was not spent is `AuthorizationRefused`
+    /// (`MalformedFacts`); a dispatch that already ended, or whose spend
+    /// entered nothing, is `AuthorizationRefused` (`Denied`). Neither carries
+    /// a not-dispatched certificate.
+    pub fn into_entered(
+        self,
+        custody: crate::approval::review::ReviewedEntryCustody,
+    ) -> Result<EnteredDispatchOperation, crate::ToolError> {
+        EnteredDispatchOperation::from_custody(self, custody)
     }
 }
 

@@ -1531,6 +1531,43 @@ impl ReviewEntry {
         Arc::ptr_eq(&self.0, &other.0)
     }
 
+    /// What this entry says about the effect its dispatch entered: the basis
+    /// of the dispatch's entered witness. Reads the entry only; it spends,
+    /// releases and observes nothing.
+    pub(crate) fn entered_basis(&self) -> EnteredBasis {
+        let inner = self.0.lock();
+        match &inner.state {
+            ReviewEntryState::NotRequired => EnteredBasis::Unreviewed,
+            ReviewEntryState::Entered(entered) => {
+                match (entered.handle.as_ref(), inner.review.as_ref()) {
+                    (Some(handle), Some(review)) => EnteredBasis::Entered {
+                        spent: entered.spent.clone(),
+                        steps: EnteredSteps {
+                            entry: self.clone(),
+                            review: Arc::clone(review),
+                            attempt: Arc::new(handle.twin()),
+                        },
+                    },
+                    // Handed back already: nothing is entered any more.
+                    _ => EnteredBasis::Ended,
+                }
+            }
+            ReviewEntryState::Retained(_) | ReviewEntryState::Consent(_) => EnteredBasis::NotSpent,
+            ReviewEntryState::Consumed | ReviewEntryState::Settled => EnteredBasis::Ended,
+        }
+    }
+
+    /// Reports settled by a later step of the entered effect, deferred with
+    /// the spend's own `Used` projection: they run once the admitting
+    /// dispatch ended and no entered custody is held, never inside a step
+    /// (which may run under a store's lock).
+    fn defer(&self, reports: SettledReports) {
+        self.0
+            .lock()
+            .deferred
+            .extend(PendingObservations::default().with_reports(reports));
+    }
+
     /// Test adapter: the check point's settled projection.
     #[cfg(test)]
     pub(crate) fn check(&self, entering: &PreparedOperationCheck) -> Result<(), crate::ToolError> {
@@ -1697,6 +1734,12 @@ impl ReviewedEntryCustody {
     pub(crate) fn none() -> Self {
         Self(None)
     }
+
+    /// The entry this custody holds, `None` for an inert custody (an
+    /// unreviewed entry, which names no dispatch).
+    pub(crate) fn entry(&self) -> Option<&ReviewEntry> {
+        self.0.as_ref()
+    }
 }
 
 impl fmt::Debug for ReviewedEntryCustody {
@@ -1741,6 +1784,76 @@ impl Drop for ReviewDispatchGuard {
         if let Some(entry) = self.0.take() {
             entry.end_dispatch(false);
         }
+    }
+}
+
+/// What a dispatch's own review entry says about the effect it entered.
+pub(crate) enum EnteredBasis {
+    /// Not reviewed (R1): nothing was spent and no attempt exists.
+    Unreviewed,
+    /// Entered with the entry's one spend: the decision spent, and the
+    /// generated owner's custody of the spent attempt for the effect's later
+    /// steps.
+    Entered {
+        spent: PreparedOperationCheck,
+        steps: EnteredSteps,
+    },
+    /// Not spent: a retained review allow or consent.
+    NotSpent,
+    /// The admitting dispatch ended, or the spend entered nothing.
+    Ended,
+}
+
+/// Custody of one entered effect's spent attempt for the effect's later
+/// steps: each is admitted by the generated owner (`AdmitEnteredStep`) and
+/// finished when its guard drops (`FinishEnteredStep`). Neither spends, and
+/// this custody keeps nothing registered: the attempt stays `Used` only
+/// while the owner says so (the admitting dispatch is live or an admitted
+/// step is in flight).
+#[derive(Clone)]
+pub(crate) struct EnteredSteps {
+    entry: ReviewEntry,
+    review: Arc<BoundOperationReview>,
+    attempt: Arc<ReviewAttemptHandle>,
+}
+
+impl EnteredSteps {
+    /// Admit one later step of the entered effect for exactly `binding` and
+    /// `work`, never waiting: a held owner is `Unavailable` at once, and the
+    /// review inputs queued behind an earlier holder are settled into the
+    /// owner before it decides. The step is in flight until the returned
+    /// guard drops. Every report this settles is deferred with the entry's
+    /// `Used` projection, so none runs inside the step.
+    pub(crate) fn admit(
+        &self,
+        binding: &crate::authorization::PreparedAuthorizationBinding,
+        work: &WorkAuthorizationContext,
+    ) -> Result<EnteredStep, ReviewOwnerError> {
+        let (admitted, reports) =
+            self.review
+                .approvals
+                .admit_entered_step(&self.attempt, binding, work);
+        self.entry.defer(reports);
+        admitted.map(|()| EnteredStep(self.clone()))
+    }
+}
+
+/// One admitted step of an entered effect, in flight until dropped. Its drop
+/// finishes the step (`FinishEnteredStep`) on every exit path, an unwind
+/// included, without waiting: a held owner gets the finish queued for its
+/// next holder, so no finish is lost. The last finish of a closing effect
+/// releases its attempt.
+#[must_use = "the step is in flight until the guard drops"]
+pub(crate) struct EnteredStep(EnteredSteps);
+
+impl Drop for EnteredStep {
+    fn drop(&mut self) {
+        let reports = self
+            .0
+            .review
+            .approvals
+            .finish_entered_step(self.0.attempt.id());
+        self.0.entry.defer(reports);
     }
 }
 
@@ -1942,7 +2055,11 @@ impl RetainedConsent {
         match entered {
             Ok(()) => Ok((
                 PendingObservations::consent(projections),
-                EnteredAttempt::new(Arc::clone(&self.review), self.candidate.entered_attempt()),
+                EnteredAttempt::new(
+                    Arc::clone(&self.review),
+                    self.candidate.entered_attempt(),
+                    entering.clone(),
+                ),
             )),
             Err(refusal) => {
                 let mut pending = PendingObservations::consent(projections);
@@ -1953,6 +2070,7 @@ impl RetainedConsent {
                         EnteredAttempt::new(
                             Arc::clone(&self.review),
                             self.candidate.entered_attempt(),
+                            entering.clone(),
                         )
                         .release(),
                     );
@@ -1979,13 +2097,21 @@ pub(crate) struct EnteredAttempt {
     review: Arc<BoundOperationReview>,
     /// `None` once released.
     handle: Option<ReviewAttemptHandle>,
+    /// The decision this entry's one spend entered: its review tier is the
+    /// entered tier and its validity bounds every later step of the effect.
+    spent: PreparedOperationCheck,
 }
 
 impl EnteredAttempt {
-    fn new(review: Arc<BoundOperationReview>, handle: ReviewAttemptHandle) -> Self {
+    fn new(
+        review: Arc<BoundOperationReview>,
+        handle: ReviewAttemptHandle,
+        spent: PreparedOperationCheck,
+    ) -> Self {
         Self {
             review,
             handle: Some(handle),
+            spent,
         }
     }
 
@@ -2369,6 +2495,7 @@ impl RetainedReview {
                 let entered = EnteredAttempt {
                     review: Arc::clone(&self.review),
                     handle: self.handle.take(),
+                    spent: entering.clone(),
                 };
                 Ok((pending, entered))
             }

@@ -168,6 +168,29 @@ them.
   A bounded TLC audit in the canonical TLC lane
   (`specs/machines/approval_lifecycle/entered_step_audit.sh`) checks the
   entered state against the spends, steps and dispatch end it records.
+- `meerkat-core`: entered governed operations. A governed tool call whose
+  operation requires review (R2, or R3 human consent) spends it once, at
+  its effect's entry. `ToolDispatchContext::enter_governed_operation(call)`
+  makes that entry and returns `EnteredDispatchOperation`, the typed witness
+  of the entered operation; `GovernedDispatchOperation::into_entered(custody)`
+  mints it from the custody a leaf's own entry returned
+  (`enter_reviewed_effect_held`, `ReviewedEntryTicket::enter`). With it the
+  same call performs further governed steps of the same exact operation
+  without a second spend and without running any review:
+  `EnteredDispatchOperation::run_if_current_within` and
+  `issue_child_if_current_within`. Each step is decided afresh by the work's
+  own owners under their single exclusion, is refused when the current
+  decision needs more review than was entered (`entered_tier`), stays within
+  the entered decision's validity, and is admitted by the review owner only
+  while the admitting dispatch is live: a step admitted before the dispatch
+  ended runs to completion, and the review stays in use until the last such
+  step has finished. A step answers `AuthorizationRefused` (with no
+  not-dispatched certificate) or `OperationAuthorizationUnavailable`, never a
+  review settlement, and speaks only for itself. An unreviewed (R1) entry's
+  witness spends nothing and, like the plain R1 path, is bounded by its run.
+  `WorkAuthorization` gains the provided method
+  `run_entered_if_current_within`, whose default is unavailable (fail
+  closed).
 - `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
   and `retract_wake_route` keep, per seated member, a route to the owner that
   can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route
