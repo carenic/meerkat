@@ -514,14 +514,17 @@ check_space() {
   # last. An action's line is
   # `<Action line L, col C to line L, col C of module model>: D:T`, with D the
   # new distinct states it found and T the successor states it generated; an
-  # action that fires only into known states has D = 0, so T counts.
+  # action that fires only into known states has D = 0, so T counts. An arm
+  # applied with a state-level argument (the stale feedback for the last
+  # minted attempt) stays its own action, and TLC adds the application's
+  # location before the `>`: `... of module model (L C L C)>: D:T`.
   local coverage="${work_dir}/${run}-coverage.txt"
   awk '/^The coverage statistics at / { block = ""; next } { block = block $0 "\n" } END { printf "%s", block }' \
     "${log}" > "${coverage}"
   local action generated
   for action in "$@"; do
     generated="$(awk -v head="<${action} line " '
-      index($0, head) == 1 && $0 ~ / of module (model|member_residency_audit)>: [0-9]+:[0-9]+$/ {
+      index($0, head) == 1 && $0 ~ / of module (model|member_residency_audit)( \([0-9]+ [0-9]+ [0-9]+ [0-9]+\))?>: [0-9]+:[0-9]+$/ {
         split($NF, counts, ":"); total += counts[2]; found = 1
       }
       END { if (found) print total }' "${coverage}")"
