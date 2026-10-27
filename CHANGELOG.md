@@ -191,6 +191,25 @@ them.
   `WorkAuthorization` gains the provided method
   `run_entered_if_current_within`, whose default is unavailable (fail
   closed).
+- `meerkat-authorization`, `meerkat-runtime`, `meerkat`: entered governed
+  operations run on the native owners. The native work owner implements
+  `run_entered_if_current_within` with the issuance's tier rule (the current
+  decision may require no more review than was entered), and both production
+  wrappers forward it (the audited work authorization, and the runtime's
+  run-custody wrapper, which checks run custody first).
+  `GovernedHelperAdmissionFence::from_entered` and
+  `GovernedHelperChildIssuance::from_entered` build the governed helper
+  WorkGraph admission and the helper child issuance as further steps of a
+  call's `EnteredDispatchOperation`: one witness serves the fence and every
+  issuance of the call, each decided afresh, none spending again, so a
+  reviewed call can admit its helper item and issue several children with one
+  review spend (retrying an issued intent answers `Recovered`). A refused step
+  answers `Denied` (an ended dispatch, a source cancelled, revoked or no
+  longer retained, a decision needing more review than was entered, an
+  expired window) or `Unavailable` (contention, a rebuild request, owners
+  that cannot answer now), and speaks only for its own step. See
+  docs/rust/native-authorization.mdx, "Continue a reviewed call with governed
+  helper steps".
 - `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
   and `retract_wake_route` keep, per seated member, a route to the owner that
   can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route
