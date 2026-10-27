@@ -229,6 +229,13 @@ fn worker(index: usize) -> AgentIdentity {
 
 /// A mob whose members were spawned on a persistent session service and
 /// shut down, ready to resume on the same service and stores.
+///
+/// A row resumes a `SpawnedMob` once, as a restart does (a failed resume may
+/// be followed by the one that brings the mob back). Rows that compare two
+/// resumes spawn two of them: a second resume of one mob after its first
+/// resume shut down runs over what that incarnation left in this process (a
+/// handle that is shut down but still held, and the service's one runtime
+/// adapter); a restart sees neither.
 struct SpawnedMob {
     mob_id: MobId,
     service: Arc<meerkat_session::PersistentSessionService<HeldRestoreBuilder>>,
@@ -479,14 +486,14 @@ fn every_member_back(mob: &RestoredMob) {
 
 /// A resume of 8 members at concurrency 1 takes 8 provision rounds, one
 /// member at a time; at concurrency 4 it takes 2, with 4 members' provisions
-/// waiting at once. Both resumes run on the same seeded stores and leave the
-/// same mob: every member back on its own session, the same MobMachine
+/// waiting at once. The two resumes run on two mobs seeded the same way, each
+/// the first resume of its mob in this process ([`SpawnedMob`]), and leave
+/// the same mob: every member back on its own session, the same MobMachine
 /// entries, no restore failure, and the same events appended.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_resume_restores_members_up_to_its_concurrency_and_leaves_the_serial_mob() {
-    let mob = SpawnedMob::spawn(MEMBERS).await;
-
-    let serial = mob.resume_held(1).await;
+    let serial_mob = SpawnedMob::spawn(MEMBERS).await;
+    let serial = serial_mob.resume_held(1).await;
     assert_eq!(serial.rounds, MEMBERS, "one member at a time");
     assert_eq!(serial.max_held, 1);
     every_member_back(&serial.mob);
@@ -496,7 +503,8 @@ async fn a_resume_restores_members_up_to_its_concurrency_and_leaves_the_serial_m
         .await
         .expect("shut the serial resume down");
 
-    let concurrent = mob.resume_held(4).await;
+    let concurrent_mob = SpawnedMob::spawn(MEMBERS).await;
+    let concurrent = concurrent_mob.resume_held(4).await;
     assert_eq!(
         concurrent.rounds,
         MEMBERS.div_ceil(4),
@@ -766,12 +774,12 @@ async fn a_turn_that_fails_the_resume_fails_it_as_at_concurrency_one_and_leaves_
 /// A member whose restore fails alone (its host customizer refuses it) is
 /// restored by neither resume, with the same diagnostic, while every other
 /// member comes back: the concurrent resume leaves the mob the serial one
-/// does.
+/// does. The two resumes run on two mobs seeded the same way, each the first
+/// resume of its mob in this process.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_restore_that_fails_alone_fails_alone_as_in_a_serial_resume() {
-    let mob = SpawnedMob::spawn(MEMBERS).await;
-
-    let (serial, serial_mob) = mob
+    let (serial, serial_mob) = SpawnedMob::spawn(MEMBERS)
+        .await
         .resume(1, Some(RestoreCustomizer::new(Some(worker(FAILING)), None)))
         .await
         .expect("the serial resume succeeds");
@@ -801,7 +809,8 @@ async fn a_member_restore_that_fails_alone_fails_alone_as_in_a_serial_resume() {
         .await
         .expect("shut the serial resume down");
 
-    let (concurrent, concurrent_mob) = mob
+    let (concurrent, concurrent_mob) = SpawnedMob::spawn(MEMBERS)
+        .await
         .resume(4, Some(RestoreCustomizer::new(Some(worker(FAILING)), None)))
         .await
         .expect("the concurrent resume succeeds");
@@ -1043,8 +1052,13 @@ async fn a_service_without_durable_sessions_recreates_members_as_it_does_one_at_
 /// alongside it are recreated) leaves none of the members after it with a
 /// live session. At concurrency 4 the resume recreated each of the three
 /// holding a permit on a fresh session and retired that session before it
-/// returned its error; at 1 it recreated none of them. The next resume
-/// recreates every member.
+/// returned its error; at 1 it recreated none of them.
+///
+/// No resume follows in this process. worker-02 keeps the fresh session the
+/// failed resume provisioned for it (a restore of one member at a time
+/// leaves it too); its runtime registration on this mock's one runtime
+/// adapter names the failed resume's mob, whose signal queue is gone, so the
+/// next resume's orphan sweep cannot retire it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_resume_retires_the_fresh_sessions_it_created_but_did_not_apply() {
     for concurrency in [1, 4] {
@@ -1088,22 +1102,6 @@ async fn a_failed_resume_retires_the_fresh_sessions_it_created_but_did_not_apply
             }
             assert!(!mob.live(spawned).await, "{identity}'s spawned session");
         }
-
-        probe.stop_failing_turns();
-        let resumed = mob.resume(concurrency).await;
-        assert!(
-            resumed.restore_diagnostics.read().await.is_empty(),
-            "no member restore failed"
-        );
-        let listed = resumed.list_members().await;
-        for (identity, _) in &mob.sessions {
-            let status = listed
-                .iter()
-                .find(|entry| &entry.agent_identity == identity)
-                .map(|entry| format!("{:?}", entry.status));
-            assert_eq!(status.as_deref(), Some("Active"), "{identity}");
-        }
-        resumed.shutdown().await.expect("shut the resume down");
     }
 }
 
@@ -1295,6 +1293,10 @@ async fn a_cold_resume_repoints_a_member_to_its_successor_while_other_members_ho
         Some(mob.successor.clone()),
         "the member is repointed to its successor"
     );
+    // Two appends, as a restore of one member at a time makes them: the
+    // member's turn repoints its binding to the successor (no endpoint is
+    // recovered yet), and after the pass the resume upgrades that binding
+    // with the endpoint the rebuilt member exposes.
     let repointed = mob
         .storage
         .events
@@ -1302,16 +1304,23 @@ async fn a_cold_resume_repoints_a_member_to_its_successor_while_other_members_ho
         .await
         .expect("read the mob journal")
         .iter()
-        .filter(|event| {
-            event
-                .kind
-                .member_session_binding_recovered()
-                .is_some_and(|recovered| recovered.agent_identity == mob.member)
+        .filter_map(|event| event.kind.member_session_binding_recovered())
+        .filter(|recovered| recovered.agent_identity == mob.member)
+        .map(|recovered| {
+            (
+                recovered.bridge_session_id().cloned(),
+                recovered.member_peer_endpoint().is_some(),
+            )
         })
-        .count();
+        .collect::<Vec<_>>();
     assert_eq!(
-        repointed, 1,
-        "the member's turn appended its repointed binding to the journal"
+        repointed,
+        vec![
+            (Some(mob.successor.clone()), false),
+            (Some(mob.successor.clone()), true),
+        ],
+        "the member's turn repoints its binding to the successor, then the resume records \
+         the successor's endpoint"
     );
     let views = migration.views();
     assert!(
