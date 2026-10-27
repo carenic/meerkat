@@ -37,15 +37,6 @@ them.
 
 ### Breaking
 
-- Behaviour-only (not measured by the gate): `meerkat-core`:
-  `dispatch_retained_consent_attempt`, which hosts call directly, now
-  resolves a retained call afresh when its plan names another dispatcher
-  allocation (the session's agent rebuilt in this process), where it refused
-  before and left the consent spendable. A fresh plan that is the same
-  durable execution is rebound and spent once. One that is not, or a
-  re-decision the run's owners refuse or no longer review as R3, now
-  withdraws the consent instead of leaving it spendable.
-
 - `meerkat-runtime`: `meerkat_runtime::completion::CompletionOutcome` gains
   `OutcomeUnknown { run_id }`, the finalized answer to an input that run
   `run_id` consumed at a boundary a recovery committed without the input's
@@ -55,6 +46,7 @@ them.
   completed, and never resubmit or redeliver the input because of it, since
   its run may have acted on it. Only a terminal-receipt read meets it; a
   live completion waiter never does.
+
 - `meerkat-runtime`, `meerkat-machine-schema`, `meerkat-machine-kernels`: the
   MeerkatMachine completion vocabulary gains
   `RuntimeCompletionObservedOutcome::OutcomeUnknown`,
@@ -79,6 +71,7 @@ them.
   arm. Surfaces map it by its refusal: `RedirectMismatch` to the reason
   `invalid_target`, `Changed` to `attempt_mismatch`, the others to
   `configuration_invalid`.
+
 - `meerkat-core` (pre-registered MCP OAuth clients): `PersistedAuthMode`
   gains the variant `McpOauthClient` (serialized `mcp_oauth_client`),
   appended last: the custody row of an MCP credential slot's client
@@ -87,53 +80,121 @@ them.
   outside the crate needs the arm. It is not a credential: no resolver
   accepts it, it has no AuthMachine lifecycle, and the auth profile
   surfaces cannot create it.
-- `meerkat` (pre-registered MCP OAuth clients):
-  `HostAuthService::mcp_registered_redirect_uri` is now `async`: it reads
-  the slot's client profile and answers the exact redirect the slot's
-  registered-callback login uses (the profile's, which may be the
+
+- Not measured by the gate (a signature change): `meerkat` (pre-registered MCP
+  OAuth clients): `HostAuthService::mcp_registered_redirect_uri` is now
+  `async`: it reads the slot's client profile and answers the exact redirect
+  the slot's registered-callback login uses (the profile's, which may be the
   registered base itself, or the derived redirect without a profile), and
   `None` for a slot whose profile is a loopback client. A caller adds
-  `.await`; `McpOAuthAuthority::registered_redirect_uri` stays the
-  synchronous derived redirect.
+  `.await`; `McpOAuthAuthority::registered_redirect_uri` stays the synchronous
+  derived redirect.
+
+- Behaviour-only (not measured by the gate): `meerkat-core`:
+  `dispatch_retained_consent_attempt`, which hosts call directly, now
+  resolves a retained call afresh when its plan names another dispatcher
+  allocation (the session's agent rebuilt in this process), where it refused
+  before and left the consent spendable. A fresh plan that is the same
+  durable execution is rebound and spent once. One that is not, or a
+  re-decision the run's owners refuse or no longer review as R3, now
+  withdraws the consent instead of leaving it spendable.
 
 ### Added
 
-- `meerkat-schedule`: `meerkat_schedule_occurrences` takes optional bounded
-  read arguments. `occurrence_id` returns one occurrence with all of its
-  delivery receipts and answers not found when it belongs to another
-  schedule. `due_after_utc` / `due_before_utc` (inclusive, RFC 3339 with any
-  offset) and `phase` filter in the store query. `limit` (default 100 once any
-  of these options or `view: "summary"` is given, maximum 500) pages the rows
-  in due order with a `page` object (`returned`, `has_more`, `next_cursor`),
-  and `cursor` (opaque) continues after the last row, stable while new
-  occurrences are planned or a revision supersedes old ones; a cursor page
-  reads a bounded number of rows, never the rest of the history.
-  `view: "summary"` drops the trigger, the target action and prompt and the
-  machine state, in both the list and the exact read (whose receipts are
-  summarized too), and adds the due time in a calendar trigger's own
-  timezone. A call with only `schedule_id`, or with only `view: "full"`,
-  returns exactly what it returned before. `ScheduleService` gains
-  `list_occurrences_matching`, `get_schedule_occurrence` and
-  `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
-  documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
-  limit it already followed.
+- `meerkat-runtime`, `meerkat-session`, `meerkat-mob`: a host that takes over
+  a durable session whose earlier process ended without unregistering it (a
+  crash or a power cut) can settle the runtime work that process left before
+  it registers the session, without serving it.
+  `PersistentSessionService::settle_cold_predecessor_before(id, claim,
+  deadline)` runs under the caller's own cross-process hosting claim of the
+  session (`grant_session_hosting`, an OS lock) on a HeadCanonical runtime
+  store. It commits the durable tail the earlier process left; ends every
+  input that never ended `Abandoned { Stopped }`, publishing the terminal a
+  directed input's requester waits for; finalizes every terminal receipt and
+  publication still owed; and answers an input a recovered boundary consumed
+  without a receipt as outcome unknown. The session is left unregistered and
+  registrable. The caller keeps its claim until its own registration has
+  published, so that registration joins the claim's lineage and does not
+  settle the lost owner's consents a second time. `Ok` is a complete census
+  (`meerkat_runtime::ColdPredecessorSettlement`): the tail commit, every
+  settled input with its finalized receipt and, for a directed input, the
+  sequence of its published terminal, the owner-loss outcome, the number of
+  durable input rows read closed, and the rows whose receipt a migration made
+  permanently unavailable. A refusal
+  (`meerkat_session::ColdPredecessorSettleError`, which the facade re-exports
+  with its refusal enum) carries only final evidence; a deadline, a cancelled
+  call or an error certifies nothing, and a repeat converges from the store. A
+  settlement that stops after its sweep commit can leave an outcome-unknown
+  answer owed: until a repeat converges it, an archive or a stop of the
+  session refuses, typed, so repeat the settlement first. A host that governs
+  consents registers the session only on the owner-loss outcome `Completed` or
+  `NotOwed`: `NoConsentOwner` means no issuing consent owner is installed on
+  the runtime, a composition defect, so install it and repeat the call.
+  Directed work needs the service's event store (`with_event_projection`):
+  without one, publishing a directed input's terminal refuses after the input
+  ended, and the terminal stays owed until a service with an event store
+  repeats the call.
+  `MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`
+  is the same call for a mob's session service (the persistent service
+  forwards it, as the mob session services of `rkat-rpc` and the CLI do; the
+  default refuses `Unsupported`). The service composes the runtime's
+  settlement steps, which hosts do not call themselves:
+  `MeerkatMachine::begin_predecessor_settlement_before`,
+  `settle_predecessor_tail_with_lease`,
+  `end_predecessor_work_with_lease_before`,
+  `finish_predecessor_settlement_before`, and, for a settlement that stops
+  before its drain, `remove_predecessor_settlement_registration_before`.
+
+- `meerkat-runtime`, `meerkat-core`, `meerkat-mob`, SDKs: an input that a run
+  consumed at a boundary a recovery committed without the input's receipt is
+  answered once a settlement reaches it. Its terminal receipt finalizes with
+  `CompletionOutcome::OutcomeUnknown { run_id }` (completion type
+  `outcome_unknown`, class `CompletionClass::OutcomeUnknown`), naming that
+  run: what the run did for the input is not known. A directed input's
+  requester gets `interaction_failed` with the new reason kind
+  `outcome_unknown` (`InteractionFailureReason::OutcomeUnknown`), which the
+  TypeScript and Python SDKs parse. A turn result that meets it answers an
+  error that says not to resubmit the input (RPC `kind: "outcome_unknown"`,
+  REST and the facade `TURN_OUTCOME_UNKNOWN`, each with `resumable: false`),
+  and a mob's bounded turn answers `BoundedTurnFailure::OutcomeUnknown {
+  session_id, run_id }`.
+
+- `meerkat-core`: `HostingClaim::completed_owner_loss` reports the owner-loss
+  proof a claim's lineage settled once a registration completed it, and
+  `HostingClaim::same_lineage` whether two claims belong to the very same
+  live cross-process lineage. Both are read-only observations.
+
+- `meerkat-core`, `meerkat-session`, `meerkat-mob`: a run the runtime
+  settles without resuming it has a typed terminal payload,
+  `meerkat_core::lifecycle::SettledRunTerminal` (the session id, the run's
+  transcript identity under its run id, and a `SettledRunCause`:
+  `RequeueExpired`, `ResumeRefused` or `Cancelled`), and its
+  `run_failed_event` is the existing `AgentEvent::RunFailed` of class
+  `Cancelled`, with no reason or cause kind. `CoreExecutorPublicationHandle`
+  gains `publish_settled_run_terminal`, which publishes that event through
+  the handle's exact live actor and answers unsupported by default.
+  `EphemeralSessionService` and `PersistentSessionService` gain
+  `publish_settled_run_terminal_for_actor`, and `MobSessionService` gains the
+  same method, unsupported by default. The publication handles of the
+  `meerkat` surfaces, `meerkat-rpc` and `meerkat-mob` implement it.
+
 - `meerkat-mob`: `QueuedInputsOnShutdown::Keep` (the enum is
   `#[non_exhaustive]`, so the variant is additive). A mob Shutdown with it
   unregisters each member with the runtime's `UnregisterQueuedInputs::Keep`,
   and changes nothing it finds: a member whose registration served no live
   work keeps every input it recovered as the Shutdown finds it, with no
-  requeue mark, and the run its session left open, and an autonomous
-  member's kickoff stays open. The boot's ordinary recovery may still
-  normalize a staged input whose run cannot continue to queued, as every
-  start does; the Keep leaves that as it is. A member whose registration
-  served live work is stopped, as under `Stop`. For a host that boots over
-  a store another host serves, holds its members' run starts, and must
-  hand back unchanged what it finds. While a
-  member's host holds its run starts, a kickoff an earlier Shutdown kept in
-  flight is re-attached at the host's release
-  (`MobHandle::release_member_run_starts`) instead of at the member's
+  requeue mark, and the run its session left open, and an autonomous member's
+  kickoff stays open. The boot's ordinary recovery may still normalize a
+  staged input whose run cannot continue to queued, as every start does; the
+  Keep leaves that as it is. A member whose registration served live work is
+  stopped, as under `Stop`. It is meant for a host that boots over a store
+  another host serves, holds its members' run starts, and must hand back
+  unchanged what it finds. While a member's host holds its run starts, a
+  kickoff an earlier Shutdown kept in flight is re-attached at the host's
+  release (`MobHandle::release_member_run_starts`) instead of at the member's
   restore, so the restore serves the member no work and a `Keep` Shutdown
   keeps the kickoff open.
+
 - `meerkat-runtime`: `MeerkatMachine::registration_run_start_hold_staged`
   answers whether a run-start hold reason is staged for a session's
   registration, as a host's hold on a member's run starts stays until the
@@ -177,26 +238,13 @@ them.
   identity scope's commit, chunk batches included, and not for a session
   document's chunk batches), and that Core sets no deadline on a commit.
 
-- `meerkat-core`, `meerkat-session`, `meerkat-mob`: a run the runtime
-  settles without resuming it has a typed terminal payload,
-  `meerkat_core::lifecycle::SettledRunTerminal` (the session id, the run's
-  transcript identity under its run id, and a `SettledRunCause`:
-  `RequeueExpired`, `ResumeRefused` or `Cancelled`), and its
-  `run_failed_event` is the existing `AgentEvent::RunFailed` of class
-  `Cancelled`, with no reason or cause kind. `CoreExecutorPublicationHandle`
-  gains `publish_settled_run_terminal`, which publishes that event through
-  the handle's exact live actor and answers unsupported by default.
-  `EphemeralSessionService` and `PersistentSessionService` gain
-  `publish_settled_run_terminal_for_actor`, and `MobSessionService` gains the
-  same method, unsupported by default. The publication handles of the
-  `meerkat` surfaces, `meerkat-rpc` and `meerkat-mob` implement it.
-
 - `meerkat-core`: `BoundOperationReview::consent_notice_issuer` returns the
   approval owner that issues the review's human consent, present exactly
   when R3 routes to human consent, as `consent_owner_loss_settlement` is. A
   host composes it into its delivery owner's consent notice projection
   (`ConsentNoticeProjector`), so the notices that owner owes are projected
   for exactly the owner that issued the consent.
+
 - `meerkat`: the provided `RetainedJobSource::admission_committed` (by
   default it records nothing). The governed admission of a retained
   completion reports each committed admission (its session and input) to
@@ -206,69 +254,6 @@ them.
   confirmed the job, routed as `retained_job`, as the `meerkat-mob-mcp`
   composition now does for a host source's declared namespaces
   (`MobMcpState::with_host_job_source`).
-
-- `meerkat-runtime`, `meerkat-session`, `meerkat-mob`: a host that takes
-  over a durable session whose earlier process ended without unregistering
-  it (a crash or a power cut) can settle the runtime work that process left
-  before it registers the session, without serving it.
-  `PersistentSessionService::settle_cold_predecessor_before(id, claim,
-  deadline)` runs under the caller's own cross-process hosting claim of the
-  session (`grant_session_hosting`, an OS lock) on a HeadCanonical runtime
-  store. It commits the durable tail the earlier process left; ends every
-  input that never ended `Abandoned { Stopped }`, publishing the terminal a
-  directed input's requester waits for; finalizes every terminal receipt and
-  publication still owed; and answers an input a recovered boundary consumed
-  without a receipt as outcome unknown. The session is left unregistered and
-  registrable. The caller keeps its claim until its own registration has
-  published, so that registration joins the claim's lineage and does not
-  settle the lost owner's consents a second time. `Ok` is a complete census
-  (`meerkat_runtime::ColdPredecessorSettlement`): the tail commit, every
-  settled input with its finalized receipt and, for a directed input, the
-  sequence of its published terminal, the owner-loss outcome, the number of
-  durable input rows read closed, and the rows whose receipt a migration made
-  permanently unavailable. A refusal (`meerkat_session::ColdPredecessorSettleError`,
-  which the facade re-exports with its refusal enum) carries only final
-  evidence; a deadline, a cancelled call or an error
-  certifies nothing, and a repeat converges from the store. A settlement that
-  stops after its sweep commit can leave an outcome-unknown answer owed:
-  until a repeat converges it, an archive or a stop of the session refuses,
-  typed, so repeat the settlement first. A host that governs consents
-  registers the session only on the owner-loss outcome
-  `Completed` or `NotOwed`: `NoConsentOwner` means no issuing consent owner
-  is installed on the runtime, a composition defect, so install it and
-  repeat the call. Directed work needs the service's event store
-  (`with_event_projection`): without one, publishing a directed input's
-  terminal refuses after the input ended, and the terminal stays owed until
-  a service with an event store repeats the call.
-  `MobSessionService::settle_cold_predecessor_with_mob_lifecycle_authority_before`
-  is the same call for a mob's session service (the persistent service
-  forwards it, as the mob session services of `rkat-rpc` and the CLI do; the
-  default refuses `Unsupported`). The service composes the
-  runtime's settlement steps, which hosts do not call themselves:
-  `MeerkatMachine::begin_predecessor_settlement_before`,
-  `settle_predecessor_tail_with_lease`,
-  `end_predecessor_work_with_lease_before`,
-  `finish_predecessor_settlement_before`, and, for a settlement that stops
-  before its drain, `remove_predecessor_settlement_registration_before`.
-
-- `meerkat-runtime`, `meerkat-core`, `meerkat-mob`, SDKs: an input that a run
-  consumed at a boundary a recovery committed without the input's receipt is
-  answered once a settlement reaches it. Its terminal receipt finalizes with
-  `CompletionOutcome::OutcomeUnknown { run_id }` (completion type
-  `outcome_unknown`, class `CompletionClass::OutcomeUnknown`), naming that
-  run: what the run did for the input is not known. A directed input's
-  requester gets `interaction_failed` with the new reason kind
-  `outcome_unknown` (`InteractionFailureReason::OutcomeUnknown`), which the
-  TypeScript and Python SDKs parse. A turn result that meets it answers an
-  error that says not to resubmit the input (RPC `kind: "outcome_unknown"`,
-  REST and the facade `TURN_OUTCOME_UNKNOWN`, each with `resumable: false`),
-  and a mob's bounded turn answers `BoundedTurnFailure::OutcomeUnknown {
-  session_id, run_id }`.
-
-- `meerkat-core`: `HostingClaim::completed_owner_loss` reports the owner-loss
-  proof a claim's lineage settled once a registration completed it, and
-  `HostingClaim::same_lineage` whether two claims belong to the very same
-  live cross-process lineage. Both are read-only observations.
 
 - `meerkat-auth-core`, `meerkat`: pre-registered (fixed, confidential) OAuth
   clients for remote MCP servers whose authorization server offers no
@@ -326,6 +311,34 @@ them.
   `exchange_refresh_token_with_client_auth` (HTTP Basic sends the
   form-encoded client id and secret, RFC 6749 section 2.3.1). No RPC, REST
   or SDK method installs a profile.
+
+- `meerkat-schedule`: `meerkat_schedule_occurrences` takes optional bounded
+  read arguments. `occurrence_id` returns one occurrence with all of its
+  delivery receipts and answers not found when it belongs to another
+  schedule. `due_after_utc` / `due_before_utc` (inclusive, RFC 3339 with any
+  offset) and `phase` filter in the store query. `limit` (default 100 once any
+  of these options or `view: "summary"` is given, maximum 500) pages the rows
+  in due order with a `page` object (`returned`, `has_more`, `next_cursor`),
+  and `cursor` (opaque) continues after the last row, stable while new
+  occurrences are planned or a revision supersedes old ones; a cursor page
+  reads a bounded number of rows, never the rest of the history.
+  `view: "summary"` drops the trigger, the target action and prompt and the
+  machine state, in both the list and the exact read (whose receipts are
+  summarized too), and adds the due time in a calendar trigger's own
+  timezone. A call with only `schedule_id`, or with only `view: "full"`,
+  returns exactly what it returned before. `ScheduleService` gains
+  `list_occurrences_matching`, `get_schedule_occurrence` and
+  `list_occurrence_receipts`, and `ScheduleStore::list_occurrences` now
+  documents the `(due_at, schedule_revision, occurrence_ordinal)` order and
+  limit it already followed.
+
+- `meerkat-core`: the provided
+  `CompactionCommitCoordinator::authorize_committed_projection` authorizes
+  finalizing a compaction projection whose transcript rewrite the runtime
+  store already committed. It defaults to `authorize_projection`; the
+  runtime's coordinator implements it so that a revived mob member finalizes a
+  committed intent before its runtime is placed (see Fixed, a compaction with
+  durable semantic memory inside a run).
 
 ### Changed
 
@@ -493,9 +506,17 @@ them.
   actor; nor do a retire, a destroy or a reset, which end a kept run without
   settling it; nor does a suspension the runtime refuses.
 
-- `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
-  schedules are included; the tool lists active and paused schedules only, and
-  the description now says so.
+- `meerkat-runtime`: a run left open across a restart (kept by a graceful
+  stop, or cut by a crash after a round commit) now resumes when a run-start
+  hold on its session is released after the session registered. A host that
+  holds a restored member's run starts until it is ready
+  (`MobBuilder::hold_restored_member_run_starts`, released with
+  `MobHandle::release_member_run_starts`) left the open run waiting for the
+  member's next input: the registration's wake for the run came while the
+  hold stood, and `MeerkatMachine::release_run_starts` woke the runtime
+  loop only for queued input, while the open run's inputs are bound to the
+  run. The release now also wakes the loop when it leaves no hold and the
+  session keeps a resumable run.
 
 - `meerkat-runtime`: an executor attachment whose startup fails keeps the
   inputs its registration recovered from the store, as the cleanup of a
@@ -509,18 +530,6 @@ them.
   start, unless the registration served live work. A retire or an archive
   that meets an unserved attachment still stops every input.
 
-- `meerkat-runtime`: a run left open across a restart (kept by a graceful
-  stop, or cut by a crash after a round commit) now resumes when a run-start
-  hold on its session is released after the session registered. A host that
-  holds a restored member's run starts until it is ready
-  (`MobBuilder::hold_restored_member_run_starts`, released with
-  `MobHandle::release_member_run_starts`) left the open run waiting for the
-  member's next input: the registration's wake for the run came while the
-  hold stood, and `MeerkatMachine::release_run_starts` woke the runtime
-  loop only for queued input, while the open run's inputs are bound to the
-  run. The release now also wakes the loop when it leaves no hold and the
-  session keeps a resumable run.
-
 - `meerkat`: consent notices now record their delivery receipts. The
   governed admission of an Approved, Denied or Withdrawn notice records
   `Admitted` for its session and input (reported through
@@ -529,6 +538,7 @@ them.
   its notice starts. A notice whose delivery was settled as refused records
   `Failed`, which withdraws approved parked consent. A round also records
   the receipt of a notice whose admission applied without one.
+
 - `meerkat-core`: a resumed run now spends, once, the human consent the
   approval owner moved into it by the receipt of one of its staged notice
   inputs: a boundary of the run attempts the exact retained call, as for
@@ -542,6 +552,7 @@ them.
   boundary, it acts as for consent the run requested itself. Moved consent
   the run never spends (it has no later boundary, or its attempt was
   refused) is withdrawn unspent at the run's close.
+
 - `meerkat-core`: a decided consent moved into a resumed run is now spent
   once even when the session's agent was rebuilt in the same process (for
   example a session unregistered with its queued inputs kept, then resumed).
@@ -571,7 +582,32 @@ them.
   below them. They now land above every sequence the line holds, a later
   actor allocates above them, and a repeated publication inserts nothing.
 
+- `meerkat-schedule`: the `meerkat_schedule_list` description said deleted
+  schedules are included; the tool lists active and paused schedules only, and
+  the description now says so.
+
 ### Upgrade notes
+
+- No storage migration: 0.9.6 opens every 0.9.5 store as it is. No SQLite
+  schema or record format changed, and outside the two opt-in paths below
+  every row 0.9.6 writes has a shape and version that 0.9.5 reads. Take a
+  WAL-complete backup before upgrading: after a graceful stop, copy each
+  SQLite file with `sqlite3 <db> ".backup <copy>"` or `VACUUM INTO`, or
+  together with its `-wal` and `-shm` files, and keep the rest of the realm
+  root (event logs, blobs) with it.
+
+- Rolling back to 0.9.5 in place is safe for ordinary use, but not after
+  either of two opt-in paths:
+  - The cold-predecessor settlement is one-way for a session where it answers
+    an input as outcome unknown: 0.9.5 cannot read those answers (the next
+    three entries give the details). A settlement that stopped half way makes
+    0.9.5 refuse that session until 0.9.6 repeats the settlement.
+  - Pre-registered MCP OAuth client profiles: 0.9.5 ignores the profile file,
+    and the credential of a server that logged in through a profile needs a
+    new login there, which 0.9.5 makes only by dynamic registration. Remove a
+    profile on 0.9.6 first to delete its stored client secret.
+
+  A rollback also brings back the 0.9.5 defects this release fixes.
 
 - A cold-predecessor settlement that stops between its internal registration
   and its sweep commit can leave the session's runtime lifecycle row at
@@ -596,9 +632,90 @@ them.
   decode that event when it reads the session's events; an SDK without this
   release reads the reason as an unknown kind with its raw kind.
 
-- A `MobSessionService` wrapper outside this repository must forward
-  `settle_cold_predecessor_with_mob_lifecycle_authority_before`; its default
-  refuses (`Unsupported`), touching nothing.
+- Wrappers and decorators outside this repository must forward the new
+  provided methods, whose defaults refuse or do nothing:
+  - a `MobSessionService` wrapper:
+    `settle_cold_predecessor_with_mob_lifecycle_authority_before` (its default
+    refuses `Unsupported`, touching nothing) and
+    `publish_settled_run_terminal_for_actor` (its default answers unsupported,
+    so a settled run publishes no `RunFailed`);
+  - a `CoreExecutorPublicationHandle`: `publish_settled_run_terminal` (its
+    default publishes nothing and answers unsupported);
+  - a composed `RetainedJobSource`: `admission_committed`, routed to the
+    source that confirmed the job (its default records nothing, so delivered
+    consent notices stay owed);
+  - a `RuntimeStore` decorator: `import_whole_blob_session` (its default
+    answers `Unsupported`);
+  - a `CompactionCommitCoordinator` wrapper: `authorize_committed_projection`
+    (its default asks `authorize_projection`, which the runtime's coordinator
+    refuses before a mob member's runtime is placed).
+
+### Known limitations
+
+- No native credential continuity witness: a host cannot prove later that a
+  realm service secret or an OAuth credential is unchanged since an earlier
+  call. The evidence is per call only.
+
+- `meerkat-auth-core` (pre-registered MCP OAuth clients): a client profile
+  does not pin the token endpoint. The secret goes to the token endpoint that
+  the bound issuer's authorization server metadata names; under an `https`
+  issuer that endpoint must use `https` too.
+
+- `meerkat-auth-core`: a server that reports OAuth errors with HTTP 200 does
+  not end a credential, for a pre-registered client as for Core's other OAuth
+  refreshes: every use retries and fails with a typed error, and the
+  credential's status can still read `Authorized`.
+
+- `meerkat`: only a native host installs, replaces or removes a pre-registered
+  MCP OAuth client profile (`HostAuthService`); no RPC, REST or SDK method
+  does.
+
+- `meerkat-core`: when the session's agent was rebuilt in the same process,
+  consent moved into a resumed run is rebound only to the same durable
+  execution, and that comparison has accepted limits: an MCP server is
+  compared by its configured name, so a name re-pointed to another endpoint
+  compares equal when the account does not name the endpoint, and an account
+  the owner cannot state compares equal to another such account. A process
+  restart still ends the consent, and the next call asks for fresh consent.
+
+- `meerkat-core`: a notice receipt that commits after a resumed run's first
+  boundary read the consent moved into it can let the model call the operation
+  again first. That call asks for fresh consent once more, and approving it
+  runs the operation again; the moved consent still runs once, at the run's
+  next boundary.
+
+- `meerkat-runtime`: the `RunFailed` that a run settled instead of resumed
+  publishes (see Fixed) is not part of the settlement's commit. A crash in
+  between, or a start whose tail repair leaves a tail standing, loses it, and
+  no later start publishes it. A surface without the attachment's publication
+  capability publishes none, and an archive, a retire, a destroy or a reset
+  that ends a kept run publishes no run terminal.
+
+- `meerkat-runtime`: a process-local completion waiter still fails
+  `AuthorityUnavailable` when its registration adopts a terminal that a
+  durable-tail recovery staged (see Changed), and an archive's own recovery
+  leaves that terminal batch pending in the archived session.
+
+- `meerkat-runtime`: rows that 0.9.5 wrote keep its behaviour. A run that
+  0.9.5 started from a kept queued prompt, and that a crash cut before the
+  upgrade, still has its inputs ended as `RequeueExpired` and is closed as
+  interrupted by a start past the stop's max age, and a kept run that 0.9.5
+  settled still reads as a terminal without a receipt.
+
+- Three 0.9.5 known limitations that named the 0.9.6 line still apply, since
+  this release carries fixes only: role-target admission and each flow step's
+  choice of targets are checks the mob actor and the flow engine make over the
+  mob machine's member facts; a channel-scoped `execution_identity`
+  (gpt-live-1) is served for a mob member local to the JSON-RPC server only;
+  and lifecycle disposal closes a channel opened under such an identity
+  without the execution-identity authority's close. Each moves to a later
+  release; the 0.9.5 notes give the details and workarounds.
+
+- The optional live WebRTC path (`meerkat-live`'s `webrtc` feature) still
+  carries RUSTSEC-2026-0387 and the unmaintained audiopus_sys
+  (RUSTSEC-2026-0150), as the 0.9.5 Security notes describe; the port to
+  webrtc 0.20 or later is still to come. Builds without that feature are
+  unaffected.
 
 ## [0.9.5] - 2026-10-23
 
