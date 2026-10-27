@@ -35,6 +35,47 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
+  how many members `MobBuilder::resume` restores at once. The default is 16;
+  `1` restores one member at a time, as before; `0` counts as `1`.
+
+### Changed
+
+- `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
+  concurrently, up to the builder's restore concurrency, instead of one at a
+  time. A member counts against the bound from the start of its restore until
+  its writes are applied. Each member's session reads and provision run
+  alongside other members', so a resume no longer takes the member count times
+  the session store's latency. Everything a restore writes (the mob's
+  MobMachine authority, roster, journal and restore diagnostics, and each
+  member's runtime binding) is still applied one member at a time in roster
+  order, so the resumed mob is the one a restore of one member at a time
+  leaves; at concurrency 1 it is that restore, with one difference at any
+  concurrency: a restore no longer checks the recovered MobMachine state
+  against the machine's invariants for each member. On a state that breaks
+  one, a durable member was left unrestored with a restore failure and a
+  recreated member failed the resume; each member is now restored on it as
+  on any other state. A fork of a member of the same mob, a member bound to
+  the session an earlier member is bound to, and, from its successor search
+  on, a member whose bound session is absent are restored in their own turn,
+  after every member before them. The first failure in roster order fails
+  the resume with the error it failed with before. Once a member's restore
+  or turn has failed the resume, no further member's restore starts; the
+  restores already running finish first, and every member they restored but
+  that the resume does not apply (at most the bound minus one) then has its
+  provision released: a resumed session is detached and kept durable, as a
+  failed revival's is, and a session a service without durable sessions
+  recreated is retired. The error is returned after those restores and
+  releases; detaching a resumed session waits for a turn that session is
+  already running to end. The spawn member customizer and the default
+  external tools provider stay synchronous calls on the resume's task, never
+  two at once, but one that blocks holds up every member restore in flight.
+  The member runtime registration hook runs inside each member's provision,
+  so for several members at once, in no fixed order across members; each
+  member's own calls keep their order.
+
 ### Fixed
 
 - `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its
