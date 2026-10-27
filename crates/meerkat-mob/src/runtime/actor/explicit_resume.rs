@@ -972,8 +972,15 @@ async fn provision_explicit_resume_member(
         };
     };
     let finalized = async {
+        // One rule for every readiness path: an autonomous or wired member
+        // requires its drain; an unwired turn-driven one binds it only when
+        // its runtime has comms.
         readiness
-            .ensure_mob_comms_drain(&work.rebuild.entry.agent_identity, &work.rebuild.member_ref)
+            .ensure_member_comms_drain(
+                &work.rebuild.entry.agent_identity,
+                &work.rebuild.member_ref,
+                work.drain_required,
+            )
             .await?;
         if work.rebuild.superseded_session_id.is_none()
             || work.rebuild.recovered_peer_endpoint.is_some()

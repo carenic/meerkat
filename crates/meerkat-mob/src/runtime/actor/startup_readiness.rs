@@ -69,12 +69,14 @@ impl MobActor {
     /// explicit resume rebuilt). The Live-only target set leaves them out.
     pub(super) async fn held_member_readiness_targets(&self) -> Vec<MemberReadinessTarget> {
         let roster = self.roster.read().await;
+        let state = self.dsl_authority.state();
         self.startup_boot_attempts
             .keys()
             .filter_map(|identity| roster.get(identity))
             .map(|entry| MemberReadinessTarget {
                 entry: entry.clone(),
                 stage: member_readiness_stage(entry),
+                drain_required: member_requires_comms_drain(state, entry),
             })
             .collect()
     }
