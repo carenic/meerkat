@@ -8473,6 +8473,10 @@ pub(super) struct ExplicitResumeMemberWork {
     /// The wake attempt `AuthorizeExplicitResumeMember` opened (or joined)
     /// for the member: every resolution of this rebuild is fenced by it.
     wake_attempt: Option<u64>,
+    /// Whether the rebuilt member requires its comms drain
+    /// ([`member_requires_comms_drain`]), read from the machine when the
+    /// work was planned, as every other readiness path reads it.
+    drain_required: bool,
 }
 
 pub(super) enum ExplicitResumeLiveObservation {
@@ -21846,6 +21850,7 @@ impl MobActor {
                 .member_wake_attempts
                 .get(&dsl_identity)
                 .copied();
+            let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
             self.spawn_explicit_resume_member_observation(Arc::new(ExplicitResumeMemberWork {
                 rebuild: ExplicitResumeMemberRebuild {
                     entry,
@@ -21859,6 +21864,7 @@ impl MobActor {
                 attempt,
                 binding,
                 wake_attempt,
+                drain_required,
             }));
         }
         if let Some(error) = first_infrastructure_error {

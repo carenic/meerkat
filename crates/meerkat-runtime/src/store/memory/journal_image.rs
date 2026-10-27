@@ -196,6 +196,11 @@ const _: () = assert!(
 /// The entry key of the boot facts, pinned in every runtime head.
 pub(crate) const BOOT_FACTS_KEY: &str = "boot";
 
+/// The pinned value of a runtime's boot facts, in the folded form.
+fn boot_facts_value(facts: &BootFactsV1) -> Result<Arc<Vec<u8>>, RuntimeStoreError> {
+    crate::store::recovery_obligation::encode_folded_boot_facts(facts)
+}
+
 fn entry_key(group: &str, sub: &str) -> String {
     format!("{group}/{sub}")
 }
@@ -656,7 +661,7 @@ impl InMemoryRuntimeStore {
                     if runtime_is_empty(&inner, &ops, rt) {
                         None
                     } else {
-                        Some(to_json(&boot_facts(&inner, &ops, rt))?)
+                        Some(boot_facts_value(&boot_facts(&inner, &ops, rt))?)
                     },
                 ));
             }
@@ -690,7 +695,7 @@ impl InMemoryRuntimeStore {
         {
             image.insert(
                 BOOT_FACTS_KEY.to_string(),
-                to_json(&boot_facts(&inner, &ops, rt))?,
+                boot_facts_value(&boot_facts(&inner, &ops, rt))?,
             );
         }
         Ok(image)

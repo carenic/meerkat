@@ -302,6 +302,13 @@ them.
   owed, so the owner is not woken for it and does not run its continuation
   a second time.
 
+- Upgrade note, behaviour-only: the first start after upgrading a host-store
+  deployment restores members whose runtime heads predate 0.9.7. Such a
+  head may not record a background operation completion its runtime still
+  owes, so the obligation scan reads it as holding work and the start wakes
+  its member, once: the runtime's next commit records its facts in full, and
+  a release before 0.9.7 still reads them.
+
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
   time. A member counts against the bound from the start of its restore until

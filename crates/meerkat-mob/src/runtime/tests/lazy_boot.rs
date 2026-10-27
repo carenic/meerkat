@@ -1726,3 +1726,47 @@ async fn s19_retiring_a_waking_member_leaves_no_session_live_and_nothing_stuck()
         state.runtime_retire_pending_sessions
     );
 }
+
+/// One comms drain rule for every readiness path: an explicit resume that
+/// rebuilds an unwired turn-driven member whose runtime has no comms
+/// requires no drain for it, so the resume succeeds and the member is
+/// settled Live, as its wake and its restore readiness settle it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_explicit_resume_rebuilds_an_unwired_comms_less_member_without_a_drain() {
+    let (handle, service, _events) = seat_mob("resume-comms-less", |builder| builder).await;
+    let member = worker(0);
+    handle
+        .spawn_spec(turn_driven(&member))
+        .await
+        .expect("spawn the member");
+    let session = handle
+        .resolve_bridge_session_id(&member)
+        .await
+        .expect("a session-backed member");
+    handle.stop().await.expect("stop the mob");
+    // The resume must rebuild the member's session, and the rebuilt runtime
+    // has no comms.
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard the live session");
+    service.set_missing_comms_runtime(&session).await;
+    tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the resume answers")
+        .expect("the explicit resume succeeds");
+    assert_eq!(handle.status().await.expect("phase"), MobState::Running);
+    let status = handle
+        .member_status(&member)
+        .await
+        .expect("the member's status");
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{status:?}"
+    );
+    assert_ne!(
+        phase_of(&handle, &member),
+        Some(dsl::MemberMaterializationPhase::Waking),
+        "the resume settled the member"
+    );
+}
