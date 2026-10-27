@@ -520,7 +520,7 @@ async fn a_seat_on_an_archived_session_is_answered_typed() {
     assert_eq!(journal_kinds(&events).await, before);
 }
 
-/// R13 (lead decision): a fresh spec that owes a kickoff is not seated: it
+/// R13: a fresh spec that owes a kickoff is not seated: it
 /// is spawned, live, on the seat's name-based session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r13_a_fresh_autonomous_spec_is_embodied_on_its_name_based_session() {
