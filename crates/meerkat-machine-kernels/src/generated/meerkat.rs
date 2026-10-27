@@ -20427,6 +20427,7 @@ pub mod effects {
     pub struct RuntimeBound {
         pub agent_runtime_id: AgentRuntimeId,
         pub fence_token: FenceToken,
+        pub runtime_epoch_id: Option<RuntimeEpochId>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct RuntimeRetired {
@@ -22098,6 +22099,12 @@ pub mod effects {
     pub struct RunSuspendedForStop {
         pub run_id: RunId,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RuntimeRegistrationReleased {
+        pub agent_runtime_id: Option<AgentRuntimeId>,
+        pub fence_token: Option<FenceToken>,
+        pub runtime_epoch_id: Option<RuntimeEpochId>,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -22373,6 +22380,7 @@ pub enum Effect {
     ResumableRunReleased(effects::ResumableRunReleased),
     ResumableRunSettled(effects::ResumableRunSettled),
     RunSuspendedForStop(effects::RunSuspendedForStop),
+    RuntimeRegistrationReleased(effects::RuntimeRegistrationReleased),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -22635,6 +22643,7 @@ pub enum EffectKind {
     ResumableRunReleased,
     ResumableRunSettled,
     RunSuspendedForStop,
+    RuntimeRegistrationReleased,
 }
 
 pub mod command_capabilities {

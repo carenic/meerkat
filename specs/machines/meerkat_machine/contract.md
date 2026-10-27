@@ -918,7 +918,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `EnsureDrainRunning`
 
 ## Effects
-- `RuntimeBound`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
+- `RuntimeBound`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, runtime_epoch_id: Option<RuntimeEpochId>)
 - `RuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `RuntimeDestroyed`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
 - `TurnRunStarted`(run_id: RunId)
@@ -1177,6 +1177,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResumableRunReleased`(run_id: RunId)
 - `ResumableRunSettled`(run_id: RunId, reason: InputAbandonReason)
 - `RunSuspendedForStop`(run_id: RunId)
+- `RuntimeRegistrationReleased`(agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>)
 
 ## Helpers
 - `runtime_authority_reconcile_decision`(observation_kind: RuntimeAuthorityObservationKind, state: Option<RuntimeLifecycleObservedState>, agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_generation: Option<Generation>, runtime_epoch_id: Option<RuntimeEpochId>, current_run_id: Option<RunId>, pre_run_phase: Option<PreRunPhase>, malformed_reclaim_safe: Bool) -> `RuntimeAuthorityReconcileDecision`
@@ -2612,6 +2613,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `completion_waiters_drained`
   - `live_channels_closed`
   - `live_recovery_obligations_settled`
+- Emits: `RuntimeRegistrationReleased`
 - To: `Idle`
 
 ### `UnregisterSessionAttached`
@@ -2629,6 +2631,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `completion_waiters_drained`
   - `live_channels_closed`
   - `live_recovery_obligations_settled`
+- Emits: `RuntimeRegistrationReleased`
 - To: `Idle`
 
 ### `UnregisterSessionRunning`
@@ -2646,6 +2649,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `completion_waiters_drained`
   - `live_channels_closed`
   - `live_recovery_obligations_settled`
+- Emits: `RuntimeRegistrationReleased`
 - To: `Idle`
 
 ### `UnregisterSessionRetired`
@@ -2663,6 +2667,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `completion_waiters_drained`
   - `live_channels_closed`
   - `live_recovery_obligations_settled`
+- Emits: `RuntimeRegistrationReleased`
 - To: `Retired`
 
 ### `UnregisterSessionStopped`
@@ -2680,6 +2685,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `completion_waiters_drained`
   - `live_channels_closed`
   - `live_recovery_obligations_settled`
+- Emits: `RuntimeRegistrationReleased`
 - To: `Idle`
 
 ### `ResolveRuntimeOpsLifecycleDurabilityIdle`

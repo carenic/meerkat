@@ -4365,6 +4365,216 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AdmitDestroyMemberRetireRuntimeEndedStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `SeedMemberResidencyRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SeedMemberResidencyStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SeedMemberResidencyCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberAuthorizedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberJoinedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberAlreadyLiveRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberRefusedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberRefusedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberRefusedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WakeMemberRefusedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PlanBootMaterializationWake`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PlanBootMaterializationVerify`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PlanBootMaterializationStayDormant`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `SealBootMaterializationPlan`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyPeerNoticeRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyPeerNoticeStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyPeerNoticeCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyPeerNoticeDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitDormantSeatRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberHostPreparationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberHostPreparationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberHostPreparationCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BeginMemberRotationRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BeginMemberRotationStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationLiveRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationLiveStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationRetiredRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationRetiredStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalBoundRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalRetryableRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeDormantRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeBrokenRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalBoundStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalBoundStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalBoundStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalBoundStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSucceededStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSucceededStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSucceededStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSucceededStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalFailedStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalFailedStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalFailedStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalFailedStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalHostRefusedStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalRetryableStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalRetryableStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalRetryableStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalRetryableStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AbandonMemberWakeStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRecreatedMemberSessionSucceededStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRecreatedMemberSessionSucceededStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRecreatedMemberSessionSucceededStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRecreatedMemberSessionSucceededStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationReleasedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationReleasedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationReleasedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReleaseMemberMaterializationStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyMemberLiveMaterializationTerminalDormant`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeExplicitResumeMemberLiveRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AuthorizeExplicitResumeMemberJoinRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -4814,6 +5024,45 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireAtScopeResolved`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `MaterializeMember`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `VerifyMember`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `BootMaterializationPlanned`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `MemberWakeClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `MemberWakeFeedbackResolved`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `MemberWakesAbandoned`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CloseMemberPeerIngress`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ReopenMemberPeerIngress`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PublishWakeRoute`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RetractWakeRoute`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RebuildWakeRoutes`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `PeerNoticeClassified`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `MemberMaterializationReleased`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Invariants
 - `stopped_mob_holds_member_run_starts`
@@ -4976,6 +5225,54 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `failed_or_canceled_runs_have_only_terminal_steps`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `materialization_domain_is_session_bound_membership`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `local_session_bound_member_is_live_or_wakeable`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `dormant_is_local`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `broken_member_has_no_phase`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `dormant_member_has_durable_endpoint`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `endpoint_pending_member_has_no_endpoint`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `dormant_member_requests_no_runtime_binding`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `wiring_edges_connect_seated_members`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `live_member_records_its_epoch`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `waking_is_one_attempt`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `retiring_incarnation_never_waking`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `candidate_composition_never_wakes`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `waking_has_an_open_attempt`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `attempt_and_epoch_follow_the_phase`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `only_a_running_mob_wakes`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `rotation_intent_is_a_retiring_member`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

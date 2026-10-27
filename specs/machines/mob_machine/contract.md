@@ -112,7 +112,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `runtime_retire_pending_sessions`: `Map<AgentRuntimeId, SessionId>`
 - `remote_runtime_retired_ids`: `Set<AgentRuntimeId>`
 - `remote_supervisor_revoked_ids`: `Set<AgentRuntimeId>`
-- `member_revival_pending`: `Set<AgentIdentity>`
+- `member_materialization`: `Map<AgentIdentity, MemberMaterializationPhase>`
 - `explicit_resume_attempt`: `Option<ResumeAttemptId>`
 - `explicit_resume_cancel_requested`: `Bool`
 - `explicit_resume_preparation_pending`: `Bool`
@@ -290,6 +290,18 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `operator_grant_scopes`: `Map<PrincipalId, Set<ControlScope>>`
 - `operator_grant_expiries`: `Map<PrincipalId, Option<u64>>`
 - `spawn_profile_authority_resolved_spec_digests`: `Map<AgentIdentity, String>`
+- `member_wake_attempts`: `Map<AgentIdentity, u64>`
+- `member_wake_attempt_sequence`: `u64`
+- `member_wake_bound`: `Set<AgentIdentity>`
+- `member_materialization_epoch`: `Map<AgentIdentity, Option<RuntimeEpochId>>`
+- `member_materialization_drift_count`: `u64`
+- `member_boot_obligation_owed`: `Map<AgentIdentity, MemberBootObligationCause>`
+- `member_restore_policy`: `MemberRestorePolicyKind`
+- `composition_authority`: `CompositionAuthorityKind`
+- `member_host_preparation_pending`: `Set<AgentIdentity>`
+- `boot_plan_sealed`: `Bool`
+- `member_rotation_session_ids`: `Map<AgentIdentity, SessionId>`
+- `member_rotation_peer_endpoints`: `Map<AgentIdentity, MemberPeerEndpoint>`
 
 ## Inputs
 - `RunFlow`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_status: Map<StepId, Option<StepRunStatus>>, output_recorded: Map<StepId, Bool>, step_condition_results: Map<StepId, Option<Bool>>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, step_target_counts: Map<StepId, u64>, step_target_success_counts: Map<StepId, u64>, step_target_terminal_failure_counts: Map<StepId, u64>, escalation_threshold: u64, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
@@ -524,9 +536,18 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SettleExplicitResumeCleanup`(attempt: ResumeAttemptId)
 - `FinishExplicitResume`(attempt: ResumeAttemptId)
 - `RetireAtScope`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId)
+- `SeedMemberResidency`(policy: MemberRestorePolicyKind, composition_authority: CompositionAuthorityKind, host_pending: Set<AgentIdentity>)
+- `WakeMember`(agent_identity: AgentIdentity, cause: MemberWakeCause, observed_missing: Bool, input_class: PeerInputClass, sender_waking: Bool)
+- `PlanBootMaterialization`(agent_identity: AgentIdentity, obligation: MemberRecoveryObligationKind, host_required: Bool, orchestrator_notified: Bool)
+- `SealBootMaterializationPlan`
+- `ClassifyPeerNotice`(recipient: AgentIdentity, sender: AgentIdentity, notice_class: PeerInputClass)
+- `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
+- `ResolveMemberHostPreparation`(agent_identity: AgentIdentity)
+- `BeginMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId, peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
+- `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool)
 
 ## Signals
-- `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
+- `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, runtime_epoch_id: Option<RuntimeEpochId>)
 - `RetireMember`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: Option<SessionId>)
 - `AdmitDestroyMemberRetire`(mob_id: MobId, agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>)
 - `ObserveRuntimeRetired`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken)
@@ -574,9 +595,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RecoverCommittedPlacedSpawn`(spawn_id: PlacedSpawnId, agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, generation: Generation, fence_token: FenceToken, host_id: HostId, host_binding_generation: u64, member_session_id: SessionId, member_peer_endpoint: MemberPeerEndpoint, profile_name: String, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool, provision_operation_id: String, operation_owner_session_id: SessionId)
 - `RecoverPlacedCarrierCleanup`(obligation: PlacedCarrierCleanupObligation)
 - `ClassifyMemberLiveMaterialization`(agent_identity: AgentIdentity, observation: MemberLiveMaterializationObservationKind, reason: String)
-- `ResolveMemberRevivalSucceeded`(agent_identity: AgentIdentity)
-- `ResolveRecreatedMemberSessionSucceeded`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, bridge_session_id: SessionId)
-- `ResolveMemberRevivalFailed`(agent_identity: AgentIdentity, reason: String)
+- `ResolveMemberRevivalSucceeded`(agent_identity: AgentIdentity, attempt: u64)
+- `ResolveRecreatedMemberSessionSucceeded`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, bridge_session_id: SessionId, attempt: u64)
+- `ResolveMemberRevivalFailed`(agent_identity: AgentIdentity, reason: String, attempt: u64)
 - `AdmitDestroyCleanup`
 - `AdmitDestroyStorageFinalizing`
 - `MarkCompleted`
@@ -602,8 +623,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CreateRun`
 - `RecoverIdentityGenerationHighwater`(agent_identity: AgentIdentity, generation: Generation)
 - `SealIdentityGenerationHighwater`
-- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
+- `ResolveMemberRevivalHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String, attempt: u64)
 - `RecoverMemberRestoreHostRefused`(agent_identity: AgentIdentity, refusal_code: String, reason: String)
+- `ResolveMemberRevivalBound`(agent_identity: AgentIdentity, attempt: u64)
+- `ResolveMemberRevivalRetryable`(agent_identity: AgentIdentity, attempt: u64, kind: MemberWakeRetryableKind)
+- `AbandonMemberWake`(agent_identity: AgentIdentity, attempt: u64, kind: MemberWakeAbandonKind, reason: String)
+- `ReleaseMemberMaterialization`(agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>, cause: MemberMaterializationLossCause)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -664,7 +689,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SpawnPolicyResolutionRecorded`(agent_identity: AgentIdentity, revision: u64, profile_name: Option<String>, runtime_mode: Option<SpawnPolicyRuntimeMode>)
 - `OwnerBridgeSessionBound`(bridge_session_id: SessionId, destroy_on_owner_archive: Bool, implicit_delegation_mob: Bool)
 - `RespawnTopologyRestoreResolved`(agent_identity: AgentIdentity, result: RespawnTopologyRestoreResultKind, failed_peer_ids: Seq<RespawnTopologyPeerId>)
-- `MemberLiveMaterializationClassified`(agent_identity: AgentIdentity, observation: MemberLiveMaterializationObservationKind, verdict: MemberRevivalVerdictKind, reason: String)
+- `MemberLiveMaterializationClassified`(agent_identity: AgentIdentity, observation: MemberLiveMaterializationObservationKind, verdict: MemberRevivalVerdictKind, reason: String, attempt: Option<u64>)
 - `SpawnManyFailureClassified`(observation: MobSpawnManyFailureObservationKind, cause: MobSpawnManyFailureCauseKind)
 - `MemberWaitClassified`(agent_identity: AgentIdentity, result: MemberWaitClassificationKind)
 - `FlowDelegationEdgeAdmissionResolved`(from_role: String, to_role: String, admission: MobFlowDelegationEdgeAdmissionKind)
@@ -755,9 +780,25 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ExplicitResumeMemberOutcomeClassified`(attempt: ResumeAttemptId, agent_identity: AgentIdentity, binding: ResumeMemberBinding, disposition: ResumeMemberOutcomeDisposition)
 - `ExplicitResumeFinished`(attempt: ResumeAttemptId, cancelled: Bool)
 - `RetireAtScopeResolved`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, verdict: RetireAtScopeVerdictKind, expected_fence_token: Option<FenceToken>, actual_fence_token: Option<FenceToken>, current_session_id: Option<SessionId>)
+- `MaterializeMember`(agent_identity: AgentIdentity, cause: MemberWakeCause, attempt: u64)
+- `VerifyMember`(agent_identity: AgentIdentity)
+- `BootMaterializationPlanned`(agent_identity: AgentIdentity, verdict: BootMaterializationKind, attempt: Option<u64>)
+- `MemberWakeClassified`(agent_identity: AgentIdentity, cause: MemberWakeCause, verdict: MemberWakeVerdictKind, refusal: Option<MemberWakeRefusalKind>, attempt: Option<u64>, session_id: Option<SessionId>)
+- `MemberWakeFeedbackResolved`(agent_identity: AgentIdentity, attempt: u64, verdict: MemberWakeFeedbackVerdict)
+- `MemberWakesAbandoned`(cause: MemberWakeAbandonCause)
+- `CloseMemberPeerIngress`(reason: MemberWakeRefusalKind)
+- `ReopenMemberPeerIngress`
+- `PublishWakeRoute`(agent_identity: AgentIdentity)
+- `RetractWakeRoute`(agent_identity: AgentIdentity)
+- `RebuildWakeRoutes`
+- `PeerNoticeClassified`(recipient: AgentIdentity, sender: AgentIdentity, notice_class: PeerInputClass, disposition: PeerNoticeDisposition)
+- `MemberMaterializationReleased`(agent_runtime_id: Option<AgentRuntimeId>, cause: MemberMaterializationLossCause, outcome: MemberMaterializationReleaseOutcome)
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
+- `member_wake_refusal`(member_present: Bool, session_bound: Bool, placed: Bool, broken: Bool, retiring: Bool, mob_admitting: Bool, composition_authoritative: Bool, origin_open: Bool, host_pending: Bool, input_class: PeerInputClass, sender_waking: Bool, observed_missing: Bool, phase: Option<MemberMaterializationPhase>) -> `Option<MemberWakeRefusalKind>`
+- `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool) -> `BootMaterializationKind`
+- `peer_notice_disposition`(recipient_phase: Option<MemberMaterializationPhase>, sender_phase: Option<MemberMaterializationPhase>, notice_class: PeerInputClass) -> `PeerNoticeDisposition`
 
 ## Command Plans
 ### `AuthorizedMobSpawnStart`
@@ -904,6 +945,22 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `remote_turn_custody_sequences_are_bounded_and_injective`
 - `placed_completion_sequences_are_bounded`
 - `failed_or_canceled_runs_have_only_terminal_steps`
+- `materialization_domain_is_session_bound_membership`
+- `local_session_bound_member_is_live_or_wakeable`
+- `dormant_is_local`
+- `broken_member_has_no_phase`
+- `dormant_member_has_durable_endpoint`
+- `endpoint_pending_member_has_no_endpoint`
+- `dormant_member_requests_no_runtime_binding`
+- `wiring_edges_connect_seated_members`
+- `live_member_records_its_epoch`
+- `waking_is_one_attempt`
+- `retiring_incarnation_never_waking`
+- `candidate_composition_never_wakes`
+- `waking_has_an_open_attempt`
+- `attempt_and_epoch_follow_the_phase`
+- `only_a_running_mob_wakes`
+- `rotation_intent_is_a_retiring_member`
 
 ## Transitions
 ### `ClassifyFlowRunTerminalityTerminalRunning`
@@ -3712,7 +3769,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_is_next`
   - `replacing_absent`
   - `bridge_session_present`
-- Emits: `RequestRuntimeBinding`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`
+- Emits: `RequestRuntimeBinding`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
 - To: `Running`
 
 ### `CommitSpawnMembershipFreshPeerOnly`
@@ -4387,7 +4444,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_recovered`
   - `no_prior_session_binding`
   - `replacing_absent`
-- Emits: `MemberSessionBindingChanged`, `SessionProvisionOperationOwnerAuthorized`
+  - `endpoint_present_after_seal`
+- Emits: `MemberSessionBindingChanged`, `SessionProvisionOperationOwnerAuthorized`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RecoverMemberSessionBindingReplacingRunning`
@@ -4400,7 +4458,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `replacing_present`
   - `replacing_matches_current`
   - `replacement_changes_binding`
-- Emits: `MemberSessionBindingChanged`, `SessionProvisionOperationOwnerAuthorized`
+- Emits: `MemberSessionBindingChanged`, `SessionProvisionOperationOwnerAuthorized`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RecoverMemberSessionBindingAlreadyCurrentRunning`
@@ -4428,7 +4486,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_endpoint_not_registered`
   - `prior_endpoint_history_absent`
   - `peer_id_available_for_identity`
-- Emits: `MemberPeerRegistered`
+- Emits: `MemberPeerRegistered`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RecoverSpawnedMemberPeerEndpointAlreadyCurrentRunning`
@@ -4461,7 +4519,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `no_member_wiring_edges`
   - `no_external_peer_edges`
   - `peer_id_available_for_identity`
-- Emits: `MemberPeerRegistered`
+- Emits: `MemberPeerRegistered`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RecoverMemberPeerEndpointAlreadyCurrentRunning`
@@ -4494,7 +4552,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `recovered_peer_id_changed`
   - `recovered_peer_id_available_for_identity`
   - `no_external_peer_edges`
-- Emits: `MemberPeerRegistered`
+- Emits: `MemberPeerRegistered`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RecoverRosterMemberResetRunning`
@@ -4512,6 +4570,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `previous_runtime_retirement_closed`
   - `previous_runtime_retire_refusal_closed`
   - `placed_kickoff_custody_absent`
+  - `replay_not_sealed`
+  - `member_not_materialized`
 - To: `Running`
 
 ### `RecoverRosterMemberRetirementStartedReleasing`
@@ -4986,7 +5046,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ObserveRuntimeReady`
 - From: `Running`
-- On: `ObserveRuntimeReady`(agent_runtime_id, fence_token)
+- On: `ObserveRuntimeReady`(agent_runtime_id, fence_token, runtime_epoch_id)
 - Guards:
   - `current_binding_matches`
   - `fence_token_matches`
@@ -7372,7 +7432,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_member_session_absent`
   - `remote_retirement_session_absent`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveRemoteMemberRetirementArchivedAndSupervisorRevokedStopped`
@@ -7389,13 +7449,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_member_session_absent`
   - `remote_retirement_session_absent`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveMemberRetirementArchivedLive`
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7408,13 +7470,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedLivePreservingTopology`
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7427,13 +7491,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedLiveStopped`
 - From: `Stopped`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7446,13 +7512,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveMemberRetirementArchivedRetired`
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7465,13 +7533,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`
+- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedRetiredPreservingTopology`
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7484,13 +7554,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`
+- Emits: `AppendLifecycleJournal`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedRetiredStopped`
 - From: `Stopped`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
+  - `rotation_not_pending`
+  - `host_preparation_not_pending`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7503,7 +7575,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_present`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`
+- Emits: `AppendLifecycleJournal`, `WiringGraphChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveMemberRetirementArchivedPlacedLiveRunning`
@@ -7521,7 +7593,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_retirement_session_absent`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedPlacedLiveStopped`
@@ -7539,7 +7611,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_retirement_session_absent`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `EmitMemberLifecycleNotice`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveMemberRetirementArchivedPlacedRetiredRunning`
@@ -7557,7 +7629,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_retirement_session_absent`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveMemberRetirementArchivedPlacedRetiredStopped`
@@ -7575,7 +7647,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `remote_retirement_session_absent`
   - `session_binding_matches_or_cleared`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `WiringGraphChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveMemberRetirementArchivedStaleRuntime`
@@ -7668,7 +7740,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_retiring`
   - `retirement_session_matches`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`
+- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveDestroyMemberRetirementArchivedLiveStopped`
@@ -7687,7 +7759,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_retiring`
   - `retirement_session_matches`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`
+- Emits: `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveDestroyMemberRetirementArchivedRetiredRunning`
@@ -7706,7 +7778,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_retiring`
   - `retirement_session_matches`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `MemberSessionBindingChanged`
+- Emits: `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveDestroyMemberRetirementArchivedRetiredStopped`
@@ -7725,7 +7797,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_retiring`
   - `retirement_session_matches`
   - `kickoff_quiesced`
-- Emits: `AppendLifecycleJournal`, `MemberSessionBindingChanged`
+- Emits: `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveDestroyMemberRetirementArchivedPlacedLiveRunning`
@@ -7745,7 +7817,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveDestroyMemberRetirementArchivedPlacedLiveStopped`
@@ -7765,7 +7837,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `EmitMemberLifecycleNotice`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveDestroyMemberRetirementArchivedPlacedRetiredRunning`
@@ -7785,7 +7857,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_not_live`
   - `member_retiring`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Running`
 
 ### `ObserveDestroyMemberRetirementArchivedPlacedRetiredStopped`
@@ -7805,7 +7877,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_not_live`
   - `member_retiring`
   - `kickoff_quiesced`
-- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`
+- Emits: `PlacedCarrierCleanupRequested`, `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `RetractWakeRoute`
 - To: `Stopped`
 
 ### `ObserveDestroyMemberRetirementArchivedAlreadyClearedRunning`
@@ -7870,9 +7942,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lifecycle_origin_open`
   - `identity_present`
   - `session_binding_present`
-  - `not_broken`
-  - `revival_not_pending`
+  - `member_live`
   - `no_explicit_resume_work`
+  - `composition_authoritative`
+  - `endpoint_present_after_seal`
   - `durable_snapshot_present`
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
@@ -7883,8 +7956,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `identity_present`
   - `session_binding_present`
-  - `not_broken`
-  - `revival_not_pending`
+  - `member_live`
   - `no_explicit_resume_work`
   - `durable_snapshot_missing`
 - Emits: `MemberLiveMaterializationClassified`
@@ -7892,22 +7964,20 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ResolveMemberRevivalSucceededRunningLocal`
 - From: `Running`
-- On: `ResolveMemberRevivalSucceeded`(agent_identity)
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
 - Guards:
-  - `revival_pending`
+  - `attempt_open`
   - `member_is_local`
-  - `runtime_binding_present`
-  - `fence_binding_present`
-  - `generation_binding_present`
-  - `session_binding_present`
-- Emits: `RequestRuntimeBinding`
+  - `binding_requested`
+- Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
 ### `ResolveRecreatedMemberSessionSucceededRunningLocal`
 - From: `Running`
-- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id)
+- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id, attempt)
 - Guards:
   - `lifecycle_origin_open`
+  - `attempt_open`
   - `member_is_local`
   - `identity_runtime_matches`
   - `runtime_live`
@@ -7917,26 +7987,25 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `runtime_fence_matches`
   - `generation_matches`
   - `session_binding_matches`
-  - `not_broken`
-  - `revival_not_pending`
-  - `no_explicit_resume_work`
-- Emits: `RequestRuntimeBinding`
+- Emits: `RequestRuntimeBinding`, `MemberWakeFeedbackResolved`
 - To: `Running`
 
 ### `ResolveMemberRevivalSucceededRunningPlaced`
 - From: `Running`
-- On: `ResolveMemberRevivalSucceeded`(agent_identity)
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
 - Guards:
-  - `revival_pending`
+  - `attempt_open`
   - `member_is_placed`
   - `placed_carrier_binding_active`
+- Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
 ### `ResolveMemberRevivalFailedRunning`
 - From: `Running`
-- On: `ResolveMemberRevivalFailed`(agent_identity, reason)
+- On: `ResolveMemberRevivalFailed`(agent_identity, reason, attempt)
 - Guards:
-  - `revival_pending`
+  - `attempt_open`
+- Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
 ### `AdmitDestroyCleanup`
@@ -7946,7 +8015,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `adaptive_lifecycle_drained`
   - `placed_completion_quiesce_started`
   - `placed_completion_destroy_intent`
-- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`
+- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`, `MemberWakesAbandoned`
 - To: `Running`
 
 ### `AdmitDestroyStorageFinalizing`
@@ -7967,7 +8036,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `placed_completion_pending_drained`
   - `placed_completion_cancel_requested_drained`
   - `placed_completion_resolved_drained`
-- Emits: `EmitMemberLifecycleNotice`
+- Emits: `EmitMemberLifecycleNotice`, `MemberWakesAbandoned`, `CloseMemberPeerIngress`
 - To: `Completed`
 
 ### `DestroyMob`
@@ -7997,7 +8066,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `committed_placed_spawns_drained`
   - `kickoff_waiters_quiesced`
   - `pending_spawns_drained`
-- Emits: `RequestRuntimeDestroy`
+- Emits: `RequestRuntimeDestroy`, `RebuildWakeRoutes`
 - To: `Destroyed`
 
 ### `ObserveRuntimeDestroyed`
@@ -8130,7 +8199,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `placed_completion_pending_drained`
   - `placed_completion_cancel_requested_drained`
   - `placed_completion_resolved_drained`
-- Emits: `AppendLifecycleJournal`, `EmitRunLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `EmitRunLifecycleNotice`, `MemberWakesAbandoned`, `CloseMemberPeerIngress`
 - To: `Stopped`
 
 ### `ResumeStopped`
@@ -8140,7 +8209,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `explicit_resume_preparation_settled`
   - `explicit_resume_not_cancelled`
   - `placed_completion_stop_intent`
-- Emits: `PersistPlacedCompletionLifecycleIntent`, `AppendLifecycleJournal`, `EmitRunLifecycleNotice`, `ReleaseMemberRunStarts`
+- Emits: `PersistPlacedCompletionLifecycleIntent`, `AppendLifecycleJournal`, `EmitRunLifecycleNotice`, `ReleaseMemberRunStarts`, `ReopenMemberPeerIngress`
 - To: `Running`
 
 ### `CompleteRunning`
@@ -8154,7 +8223,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `placed_completion_pending_drained`
   - `placed_completion_cancel_requested_drained`
   - `placed_completion_resolved_drained`
-- Emits: `AppendLifecycleJournal`, `EmitRunLifecycleNotice`
+- Emits: `AppendLifecycleJournal`, `EmitRunLifecycleNotice`, `MemberWakesAbandoned`, `CloseMemberPeerIngress`
 - To: `Completed`
 
 ### `ResetToRunning`
@@ -8181,6 +8250,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lifecycle_origin_open`
   - `edge_not_already_wired`
+  - `edge_endpoints_seated_or_held`
 - Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
 - To: `Running`
 
@@ -8191,6 +8261,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lifecycle_origin_open`
   - `edge_not_already_wired`
   - `edge_matches_members`
+  - `edge_endpoints_seated_or_held`
   - `a_member_peer_registered`
   - `b_member_peer_registered`
   - `a_member_endpoint_registered`
@@ -8220,6 +8291,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `RecoverRosterWiring`(edge)
 - Guards:
   - `edge_not_already_recovered`
+  - `edge_endpoints_seated_or_held_after_seal`
 - To: `Running`
 
 ### `RecoverRosterWiringAlreadyRecovered`
@@ -8359,6 +8431,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_matches`
   - `fence_token_matches`
   - `member_retiring`
+  - `edge_endpoints_seated_or_held`
 - Emits: `WiringGraphChanged`
 - To: `Running`
 
@@ -8373,6 +8446,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `generation_matches`
   - `fence_token_matches`
   - `member_retiring`
+  - `edge_endpoints_seated_or_held`
 - Emits: `WiringGraphChanged`
 - To: `Stopped`
 
@@ -8415,7 +8489,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fresh_spawn_or_no_retained_topology`
   - `peer_id_available_for_identity`
   - `member_peer_id_is_not_host`
-- Emits: `MemberPeerRegistered`
+- Emits: `MemberPeerRegistered`, `PublishWakeRoute`
 - To: `Running`
 
 ### `RegisterMemberPeerAlreadyCurrentRunning`
@@ -10146,6 +10220,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `placed_completion_quiesce_started`
   - `placed_completion_complete_intent`
   - `cleanup_custody_present`
+- Emits: `MemberWakesAbandoned`
 - To: `Completed`
 
 ### `RecordPlacedCompletionObligationFresh`
@@ -11889,7 +11964,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `explicit_resume_settled`
   - `adaptive_lifecycle_drained`
-- Emits: `EmitRunLifecycleNotice`, `HoldMemberRunStarts`
+- Emits: `EmitRunLifecycleNotice`, `HoldMemberRunStarts`, `MemberWakesAbandoned`, `CloseMemberPeerIngress`
 - To: `Stopped`
 
 ### `ShutdownStopped`
@@ -13406,6 +13481,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `committed_placed_spawns_drained`
   - `kickoff_waiters_quiesced`
   - `pending_spawns_drained`
+- Emits: `RebuildWakeRoutes`
 - To: `Destroyed`
 
 ### `RespawnRunning`
@@ -13652,6 +13728,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_runtime`
   - `current_fence`
   - `current_session`
+  - `member_dormant`
+  - `composition_authoritative`
 - To: `Running`
 
 ### `ClassifyExplicitResumeMemberLiveRevivable`
@@ -13666,8 +13744,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_runtime`
   - `current_fence`
   - `current_session`
-  - `not_broken`
-  - `revival_not_pending`
+  - `member_waking`
   - `durable_snapshot_present`
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
@@ -13683,8 +13760,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_runtime`
   - `current_fence`
   - `current_session`
-  - `not_broken`
-  - `revival_not_pending`
+  - `member_waking`
   - `durable_snapshot_missing`
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
@@ -13722,6 +13798,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_runtime`
   - `current_fence`
   - `current_session`
+  - `attempt_closed`
 - To: `Running`
 
 ### `SettleExplicitResumeMemberReplacedRunning`
@@ -13731,6 +13808,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `exact_resume_attempt`
   - `member_work_pending`
   - `member_replaced`
+  - `attempt_closed_or_incarnation_replaced`
 - To: `Running`
 
 ### `BeginExplicitResumeReadinessStopped`
@@ -15308,9 +15386,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ResolveMemberRevivalHostRefusedRunning`
 - From: `Running`
-- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason)
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason, attempt)
 - Guards:
-  - `revival_pending`
+  - `attempt_open`
+- Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
 ### `RecoverMemberRestoreHostRefusedRunning`
@@ -15423,6 +15502,687 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `session_binding_matches`
 - Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
 - To: `Stopped`
+
+### `SeedMemberResidencyRunning`
+- From: `Running`
+- On: `SeedMemberResidency`(policy, composition_authority, host_pending)
+- Guards:
+  - `boot_plan_not_sealed`
+  - `no_open_wake_attempt`
+- To: `Running`
+
+### `SeedMemberResidencyStopped`
+- From: `Stopped`
+- On: `SeedMemberResidency`(policy, composition_authority, host_pending)
+- Guards:
+  - `boot_plan_not_sealed`
+  - `no_open_wake_attempt`
+- To: `Stopped`
+
+### `SeedMemberResidencyCompleted`
+- From: `Completed`
+- On: `SeedMemberResidency`(policy, composition_authority, host_pending)
+- Guards:
+  - `boot_plan_not_sealed`
+  - `no_open_wake_attempt`
+- To: `Completed`
+
+### `WakeMemberAuthorizedRunning`
+- From: `Running`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Guards:
+  - `wake_not_refused`
+  - `member_dormant`
+- Emits: `MemberWakeClassified`, `MaterializeMember`
+- To: `Running`
+
+### `WakeMemberJoinedRunning`
+- From: `Running`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Guards:
+  - `wake_not_refused`
+  - `member_waking`
+- Emits: `MemberWakeClassified`
+- To: `Running`
+
+### `WakeMemberAlreadyLiveRunning`
+- From: `Running`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Guards:
+  - `wake_not_refused`
+  - `member_live`
+- Emits: `MemberWakeClassified`
+- To: `Running`
+
+### `WakeMemberRefusedRunning`
+- From: `Running`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Guards:
+  - `wake_refused`
+- Emits: `MemberWakeClassified`
+- To: `Running`
+
+### `WakeMemberRefusedStopped`
+- From: `Stopped`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Emits: `MemberWakeClassified`
+- To: `Stopped`
+
+### `WakeMemberRefusedCompleted`
+- From: `Completed`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Emits: `MemberWakeClassified`
+- To: `Completed`
+
+### `WakeMemberRefusedDestroyed`
+- From: `Destroyed`
+- On: `WakeMember`(agent_identity, cause, observed_missing, input_class, sender_waking)
+- Emits: `MemberWakeClassified`
+- To: `Destroyed`
+
+### `PlanBootMaterializationWake`
+- From: `Running`
+- On: `PlanBootMaterialization`(agent_identity, obligation, host_required, orchestrator_notified)
+- Guards:
+  - `member_dormant`
+  - `boot_verdict_wake`
+- Emits: `MaterializeMember`, `BootMaterializationPlanned`
+- To: `Running`
+
+### `PlanBootMaterializationVerify`
+- From: `Running`
+- On: `PlanBootMaterialization`(agent_identity, obligation, host_required, orchestrator_notified)
+- Guards:
+  - `member_dormant`
+  - `boot_verdict_verify`
+- Emits: `VerifyMember`, `BootMaterializationPlanned`
+- To: `Running`
+
+### `PlanBootMaterializationStayDormant`
+- From: `Running`
+- On: `PlanBootMaterialization`(agent_identity, obligation, host_required, orchestrator_notified)
+- Guards:
+  - `member_dormant`
+  - `boot_verdict_stay_dormant`
+- Emits: `BootMaterializationPlanned`
+- To: `Running`
+
+### `SealBootMaterializationPlan`
+- From: `Running`
+- On: `SealBootMaterializationPlan`()
+- Guards:
+  - `unmaterialized_members_have_endpoints`
+  - `edges_join_seated_or_held_members`
+- Emits: `RebuildWakeRoutes`
+- To: `Running`
+
+### `ClassifyPeerNoticeRunning`
+- From: `Running`
+- On: `ClassifyPeerNotice`(recipient, sender, notice_class)
+- Emits: `PeerNoticeClassified`
+- To: `Running`
+
+### `ClassifyPeerNoticeStopped`
+- From: `Stopped`
+- On: `ClassifyPeerNotice`(recipient, sender, notice_class)
+- Emits: `PeerNoticeClassified`
+- To: `Stopped`
+
+### `ClassifyPeerNoticeCompleted`
+- From: `Completed`
+- On: `ClassifyPeerNotice`(recipient, sender, notice_class)
+- Emits: `PeerNoticeClassified`
+- To: `Completed`
+
+### `ClassifyPeerNoticeDestroyed`
+- From: `Destroyed`
+- On: `ClassifyPeerNotice`(recipient, sender, notice_class)
+- Emits: `PeerNoticeClassified`
+- To: `Destroyed`
+
+### `CommitDormantSeatRunning`
+- From: `Running`
+- On: `CommitDormantSeat`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived)
+- Guards:
+  - `lifecycle_origin_open`
+  - `composition_authoritative`
+  - `spawn_exec_opened`
+  - `no_prior_session_binding`
+  - `current_binding_absent`
+  - `generation_is_next`
+  - `member_not_placed`
+  - `runtime_not_live`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `session_not_archived`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+  - `member_peer_not_registered`
+  - `member_endpoint_not_registered`
+- Emits: `AppendLifecycleJournal`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
+- To: `Running`
+
+### `ResolveMemberHostPreparationRunning`
+- From: `Running`
+- On: `ResolveMemberHostPreparation`(agent_identity)
+- To: `Running`
+
+### `ResolveMemberHostPreparationStopped`
+- From: `Stopped`
+- On: `ResolveMemberHostPreparation`(agent_identity)
+- To: `Stopped`
+
+### `ResolveMemberHostPreparationCompleted`
+- From: `Completed`
+- On: `ResolveMemberHostPreparation`(agent_identity)
+- To: `Completed`
+
+### `BeginMemberRotationRunning`
+- From: `Running`
+- On: `BeginMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, peer_endpoint, session_archived)
+- Guards:
+  - `composition_authoritative`
+  - `identity_binding_matches`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `member_not_placed`
+  - `rotation_not_pending`
+  - `new_session`
+  - `session_not_archived`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- To: `Running`
+
+### `BeginMemberRotationStopped`
+- From: `Stopped`
+- On: `BeginMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, peer_endpoint, session_archived)
+- Guards:
+  - `composition_authoritative`
+  - `identity_binding_matches`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `member_not_placed`
+  - `rotation_not_pending`
+  - `new_session`
+  - `session_not_archived`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- To: `Stopped`
+
+### `CommitMemberRotationLiveRunning`
+- From: `Running`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_live`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
+- To: `Running`
+
+### `CommitMemberRotationLiveStopped`
+- From: `Stopped`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_live`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
+- To: `Stopped`
+
+### `CommitMemberRotationRetiredRunning`
+- From: `Running`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
+- To: `Running`
+
+### `CommitMemberRotationRetiredStopped`
+- From: `Stopped`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`
+- To: `Stopped`
+
+### `ResolveMemberRevivalBoundRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalBound`(agent_identity, attempt)
+- Guards:
+  - `attempt_open`
+  - `member_is_local`
+  - `runtime_binding_present`
+  - `fence_binding_present`
+  - `generation_binding_present`
+  - `session_binding_present`
+- Emits: `RequestRuntimeBinding`, `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalRetryableRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalRetryable`(agent_identity, attempt, kind)
+- Guards:
+  - `attempt_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `AbandonMemberWakeDormantRunning`
+- From: `Running`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_open`
+  - `abandon_to_dormant`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `AbandonMemberWakeBrokenRunning`
+- From: `Running`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_open`
+  - `abandon_to_broken`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalBoundStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalBound`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalBoundStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalBound`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalBoundStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalBound`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalBoundStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalBound`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ResolveMemberRevivalSucceededStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalSucceededStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalSucceededStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalSucceededStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalSucceeded`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ResolveMemberRevivalFailedStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalFailed`(agent_identity, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalFailedStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalFailed`(agent_identity, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalFailedStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalFailed`(agent_identity, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalFailedStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalFailed`(agent_identity, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ResolveMemberRevivalHostRefusedStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalHostRefusedStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalHostRefusedStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalHostRefusedStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalHostRefused`(agent_identity, refusal_code, reason, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ResolveMemberRevivalRetryableStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalRetryable`(agent_identity, attempt, kind)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalRetryableStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalRetryable`(agent_identity, attempt, kind)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalRetryableStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalRetryable`(agent_identity, attempt, kind)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalRetryableStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalRetryable`(agent_identity, attempt, kind)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `AbandonMemberWakeStaleRunning`
+- From: `Running`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `AbandonMemberWakeStaleStopped`
+- From: `Stopped`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `AbandonMemberWakeStaleCompleted`
+- From: `Completed`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `AbandonMemberWakeStaleDestroyed`
+- From: `Destroyed`
+- On: `AbandonMemberWake`(agent_identity, attempt, kind, reason)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ResolveRecreatedMemberSessionSucceededStaleRunning`
+- From: `Running`
+- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveRecreatedMemberSessionSucceededStaleStopped`
+- From: `Stopped`
+- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveRecreatedMemberSessionSucceededStaleCompleted`
+- From: `Completed`
+- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveRecreatedMemberSessionSucceededStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveRecreatedMemberSessionSucceeded`(agent_identity, agent_runtime_id, fence_token, generation, bridge_session_id, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `ReleaseMemberMaterializationReleasedRunning`
+- From: `Running`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Running`
+
+### `ReleaseMemberMaterializationReleasedStopped`
+- From: `Stopped`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Stopped`
+
+### `ReleaseMemberMaterializationReleasedCompleted`
+- From: `Completed`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Completed`
+
+### `ReleaseMemberMaterializationStaleRunning`
+- From: `Running`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `no_exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Running`
+
+### `ReleaseMemberMaterializationStaleStopped`
+- From: `Stopped`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `no_exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Stopped`
+
+### `ReleaseMemberMaterializationStaleCompleted`
+- From: `Completed`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `no_exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Completed`
+
+### `ReleaseMemberMaterializationStaleDestroyed`
+- From: `Destroyed`
+- On: `ReleaseMemberMaterialization`(agent_runtime_id, fence_token, runtime_epoch_id, cause)
+- Guards:
+  - `no_exact_live_registration`
+- Emits: `MemberMaterializationReleased`
+- To: `Destroyed`
+
+### `ClassifyMemberLiveMaterializationTerminalDormant`
+- From: `Running`
+- On: `ClassifyMemberLiveMaterialization`(agent_identity, observation, reason)
+- Guards:
+  - `identity_present`
+  - `session_binding_present`
+  - `member_dormant`
+  - `no_explicit_resume_work`
+  - `durable_snapshot_missing`
+- Emits: `MemberLiveMaterializationClassified`
+- To: `Running`
+
+### `AuthorizeExplicitResumeMemberLiveRunning`
+- From: `Running`
+- On: `AuthorizeExplicitResumeMember`(attempt, agent_identity, binding)
+- Guards:
+  - `exact_resume_attempt`
+  - `resume_not_cancelled`
+  - `preparation_settled`
+  - `readiness_not_started`
+  - `member_work_not_pending`
+  - `current_definition`
+  - `current_runtime`
+  - `current_fence`
+  - `current_session`
+  - `member_live`
+  - `composition_authoritative`
+  - `endpoint_present_after_seal`
+- To: `Running`
+
+### `AuthorizeExplicitResumeMemberJoinRunning`
+- From: `Running`
+- On: `AuthorizeExplicitResumeMember`(attempt, agent_identity, binding)
+- Guards:
+  - `exact_resume_attempt`
+  - `resume_not_cancelled`
+  - `preparation_settled`
+  - `readiness_not_started`
+  - `member_work_not_pending`
+  - `current_definition`
+  - `current_runtime`
+  - `current_fence`
+  - `current_session`
+  - `member_waking`
+- To: `Running`
 
 ## Coverage
 ### Code Anchors
