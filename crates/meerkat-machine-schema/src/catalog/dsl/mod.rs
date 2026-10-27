@@ -4154,7 +4154,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
             NamedTypeBinding::string_enum("PeerTransportKind", &["Inproc", "Tcp", "Uds"]),
             NamedTypeBinding::string_enum(
                 "MemberBootObligationCause",
-                &["Obligation", "EndpointPending"],
+                &["Obligation", "EndpointPending", "PlacedPeerWired"],
             ),
             NamedTypeBinding::string_enum(
                 "MemberReleaseVerdict",
