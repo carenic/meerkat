@@ -21352,7 +21352,7 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation started"
             );
-            let requires_materialization = self
+            let mut requires_materialization = self
                 .provisioner
                 .prepare_member_session_for_explicit_resume(
                     &session_id,
@@ -21374,28 +21374,31 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation completed"
             );
-            if !requires_materialization {
+            // A fork-derived member's request is its own durable records, not
+            // customized, like its first build (see `fork_build`), and names
+            // no auth binding of its own.
+            let customized = entry.fork_source.is_none() && self.spawn_member_customizer.is_some();
+            if !requires_materialization && !customized {
                 continue;
             }
 
             // The cold explicit-resume request is customized before either
             // exact-session admission or successor search. This makes a
             // one-shot resume_from_role declaration part of the actual
-            // recovery request instead of an after-the-fact build tweak.
-            // A fork-derived member's request is its own durable records, not
-            // customized, like its first build (see `fork_build`).
+            // recovery request instead of an after-the-fact build tweak. A
+            // member whose live actor the preparation kept is customized too:
+            // the actor is kept only on the auth binding its request names.
             // What the bound session holds, read once, for the customizer's
             // resume view (an ordinary member only).
-            let restore_view =
-                if entry.fork_source.is_none() && self.spawn_member_customizer.is_some() {
-                    super::fork_build::load_resumed_member_view(
-                        self.session_service.as_ref(),
-                        &session_id,
-                    )
-                    .await?
-                } else {
-                    super::handle::ResumedMemberView::new(session_id.clone(), None)
-                };
+            let restore_view = if customized {
+                super::fork_build::load_resumed_member_view(
+                    self.session_service.as_ref(),
+                    &session_id,
+                )
+                .await?
+            } else {
+                super::handle::ResumedMemberView::new(session_id.clone(), None)
+            };
             let mut restore_spec = super::fork_build::rebuild_resume_spec(
                 &self.definition.id,
                 self.spawn_member_customizer.as_ref(),
@@ -21431,6 +21434,46 @@ impl ExplicitResumePreparationContext {
                 )));
             }
             let resume_from_role = resume_from_role.clone();
+            if !requires_materialization {
+                // A live actor is kept only when it runs the binding the
+                // member's request names (the one check every live-actor
+                // reuse runs). On a conflict its exact attachment is retired
+                // and the member is rebuilt on its request; when nothing
+                // could be retired, its live observation refuses the member,
+                // typed.
+                let Some(requested) = restore_spec.auth_binding.as_ref() else {
+                    continue;
+                };
+                match super::live_actor_binding::verify_live_actor_auth_binding(
+                    self.session_service.as_ref(),
+                    &entry.agent_identity,
+                    &session_id,
+                    requested,
+                )
+                .await
+                {
+                    Ok(()) => continue,
+                    Err(conflict @ MobError::MemberAuthBindingConflict { .. }) => {
+                        let retired = self
+                            .provisioner
+                            .retire_live_member_session_for_explicit_resume(
+                                &session_id,
+                                Instant::now()
+                                    + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                            )
+                            .await?;
+                        tracing::info!(
+                            agent_identity = %entry.agent_identity,
+                            %session_id,
+                            %conflict,
+                            retired,
+                            "explicit resume rebuilds a member whose live actor runs another auth binding"
+                        );
+                        requires_materialization = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
             // Post-preparation work reports progress at every durable read so
             // the explicit-resume watchdog observes an advancing resume rather
@@ -21887,6 +21930,7 @@ impl MobActor {
 
     fn spawn_explicit_resume_member_observation(&mut self, work: Arc<ExplicitResumeMemberWork>) {
         let service = Arc::clone(&self.session_service);
+        let provisioner = Arc::clone(&self.provisioner);
         let definition = Arc::clone(&self.definition);
         let profiles = self.realm_profile_store.clone();
         let command_tx = self.command_tx.clone();
@@ -21894,7 +21938,55 @@ impl MobActor {
             let observation = async {
                 let session_id = &work.rebuild.bridge_session_id;
                 match service.has_live_session(session_id).await {
-                    Ok(true) => return Ok(ExplicitResumeLiveObservation::AlreadyLive),
+                    Ok(true) => {
+                        // A live actor is kept only when it runs the binding
+                        // the member's request names (the one check every
+                        // live-actor reuse runs). On a conflict its exact
+                        // attachment is retired and the member is observed
+                        // as its durable session, so it is rebuilt on its
+                        // request. When nothing could be retired, the member
+                        // is refused, typed, and its live actor retired, so
+                        // no surface reaches the old binding.
+                        let Some(requested) = work.rebuild.restore_spec.auth_binding.as_ref()
+                        else {
+                            return Ok(ExplicitResumeLiveObservation::AlreadyLive);
+                        };
+                        let checked = super::live_actor_binding::verify_live_actor_auth_binding(
+                            service.as_ref(),
+                            &work.rebuild.entry.agent_identity,
+                            session_id,
+                            requested,
+                        )
+                        .await;
+                        let conflict = match checked {
+                            Ok(()) => return Ok(ExplicitResumeLiveObservation::AlreadyLive),
+                            Err(conflict @ MobError::MemberAuthBindingConflict { .. }) => conflict,
+                            Err(error) => return Err(error),
+                        };
+                        let retired = provisioner
+                            .retire_live_member_session_for_explicit_resume(
+                                session_id,
+                                Instant::now()
+                                    + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                            )
+                            .await?;
+                        if !retired {
+                            if let Err(error) =
+                                super::live_actor_binding::retire_conflicting_live_actor(
+                                    service.as_ref(),
+                                    session_id,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    %session_id,
+                                    %error,
+                                    "a refused member's live actor on another auth binding could not be retired"
+                                );
+                            }
+                            return Err(conflict);
+                        }
+                    }
                     Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {}
                     Err(error) => return Err(MobError::SessionError(error)),
                 }
