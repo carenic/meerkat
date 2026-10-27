@@ -412,6 +412,9 @@ pub use store::{
     MobOperatorGrantRecord, MobRunStore, MobRuntimeMetadataStore, MobSpecStore, MobStoreError,
     RealmProfileStore, StoredRealmProfile, SupervisorAuthorityRecord, SystemMobIdentityStoreClock,
 };
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub use store::{ParkedStoreReadForTest, StoreReadReleaseForTest, park_next_store_read_for_test};
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::{
     SqliteMobEventStore, SqliteMobObserverDrain, SqliteMobObserverDrainRefused,

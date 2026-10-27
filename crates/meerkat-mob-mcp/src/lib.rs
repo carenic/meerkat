@@ -20119,6 +20119,109 @@ mod tests {
         assert!(existing_storage_files(&storage_path).is_empty());
     }
 
+    /// A store read of the mob whose caller is cancelled while its blocking
+    /// work holds the connection open, as the actor's teardown aborts its
+    /// reconcilers' scans, keeps the mob's database until that work returns:
+    /// the destroy's storage cleanup never removes the files under it, and
+    /// the same id is created again at once on a sound database. A database
+    /// removed and created anew under a connection still open on the old
+    /// file shares its WAL and shared-memory files with that connection,
+    /// which corrupts it.
+    #[tokio::test]
+    async fn a_destroy_never_removes_the_database_under_a_read_its_mob_entered() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let state = persistent_destroy_state(&svc, root.path());
+        let mob_id = state
+            .mob_create_definition(explicit_definition("parked-read-destroy"))
+            .await
+            .expect("create explicit mob");
+        let storage_path = destroy_test_storage_path(root.path(), &mob_id);
+        let events = state
+            .handle_for(&mob_id)
+            .await
+            .expect("mob handle")
+            .events();
+
+        // The next store read of the database parks with its connection
+        // open. The hook lets it go on its second call, once the cleanup
+        // retries a refused drain; dropping the park lets it go on every
+        // other way out of this test, since the runtime's shutdown waits for
+        // blocking work.
+        let mut parked = meerkat_mob::park_next_store_read_for_test(&storage_path);
+        let database_at_hook = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (seen, release, database) = (
+            Arc::clone(&database_at_hook),
+            parked.release_handle(),
+            storage_path.clone(),
+        );
+        let hook: MobAfterDestroy = Arc::new(move |_: &MobId| {
+            let mut seen = seen
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            seen.push(database.exists());
+            if seen.len() == 2 {
+                release.release();
+            }
+        });
+        state
+            .set_after_destroy(hook)
+            .expect("bind the destroy hook");
+        let read = tokio::spawn(async move { events.latest_cursor().await });
+        assert!(
+            tokio::time::timeout(Duration::from_secs(30), parked.opened())
+                .await
+                .expect("a store read of the mob reaches the park"),
+            "the parked read opened its connection"
+        );
+        // Cancelled, unless a read of the mob's own reconcilers took the
+        // park first and this one already returned.
+        read.abort();
+        let _ = read.await;
+
+        // The released read may still be returning when the cleanup's bounded
+        // retries end; the same caller's retry continues the cleanup then.
+        let deadline = Instant::now() + Duration::from_secs(60);
+        let report = loop {
+            match state.mob_destroy(&mob_id).await {
+                Ok(report) => break report,
+                Err(MobMcpDestroyError::Incomplete { report }) if Instant::now() < deadline => {
+                    assert!(
+                        report
+                            .errors
+                            .iter()
+                            .any(|error| error.contains("owner handle")),
+                        "only the read keeps the cleanup outstanding: {report:?}"
+                    );
+                }
+                Err(error) => panic!("the destroy completes once the read returned: {error:?}"),
+            }
+        };
+        assert!(report.errors.is_empty(), "{report:?}");
+        let seen = database_at_hook
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            seen.len() >= 2 && seen[..2] == [true, true],
+            "the cleanup kept the database while the read was parked, \
+             and retried its drain after the hook: {seen:?}"
+        );
+        assert!(existing_storage_files(&storage_path).is_empty());
+
+        let recreated = state
+            .mob_create_definition(explicit_definition("parked-read-destroy"))
+            .await
+            .expect("the destroyed mob's id is free again at once");
+        assert_eq!(recreated, mob_id);
+        let check: String =
+            meerkat_sqlite::open(&storage_path, meerkat_sqlite::ConnectionProfile::ReadOnly)
+                .expect("open the re-created database")
+                .query_row("PRAGMA quick_check", [], |row| row.get(0))
+                .expect("quick_check the re-created database");
+        assert_eq!(check, "ok");
+    }
+
     /// A mob whose phase is `Destroyed` is not handed out by
     /// `mob_handles_snapshot` while its managed entry remains, as after a
     /// destroy through the mob's own handle: a snapshot taken then would hold

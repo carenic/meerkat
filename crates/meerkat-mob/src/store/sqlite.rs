@@ -2687,7 +2687,174 @@ fn open_existing_read_connection(path: &Path) -> Result<Connection, MobStoreErro
     // maintenance fence; reader quiescence during maintenance happens at the
     // SQLite layer. No schema preflight either: a read-only open never
     // mutates the file, and refusal belongs to the write-capable openers.
-    meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly).map_err(se)
+    let conn =
+        meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly).map_err(se)?;
+    #[cfg(any(test, feature = "test-support"))]
+    store_read_park::park_if_armed(path);
+    Ok(conn)
+}
+
+/// Test-support seam: the next store operation that opens the mob database
+/// at `path` read-only parks right after its connection opened, before its
+/// first statement, until the returned park is released or dropped. Only a
+/// store operation's blocking work parks (see `run_sqlite_task`), never an
+/// observer catch-up. The seam fires once.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn park_next_store_read_for_test(path: &Path) -> ParkedStoreReadForTest {
+    store_read_park::arm(path)
+}
+
+/// A store read armed by [`park_next_store_read_for_test`]. Dropping it lets
+/// the read go on, and disarms the seam when no read reached it.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ParkedStoreReadForTest {
+    key: PathBuf,
+    id: u64,
+    opened: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: StoreReadReleaseForTest,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ParkedStoreReadForTest {
+    /// Resolves once the parked read opened its connection: `true` then,
+    /// `false` when this was awaited before.
+    pub async fn opened(&mut self) -> bool {
+        match self.opened.take() {
+            Some(opened) => opened.await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// A handle that lets the parked read go on from elsewhere.
+    pub fn release_handle(&self) -> StoreReadReleaseForTest {
+        self.release.clone()
+    }
+
+    /// Let the parked read go on; a read that reaches the seam later does
+    /// not wait.
+    pub fn release(&self) {
+        self.release.release();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ParkedStoreReadForTest {
+    fn drop(&mut self) {
+        self.release.release();
+        store_read_park::disarm(&self.key, self.id);
+    }
+}
+
+/// Lets a read parked by [`park_next_store_read_for_test`] go on.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct StoreReadReleaseForTest(std::sync::mpsc::Sender<()>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl StoreReadReleaseForTest {
+    /// Let the parked read go on. Releasing again does nothing.
+    pub fn release(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// The seam behind [`park_next_store_read_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+mod store_read_park {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+
+    use super::{ParkedStoreReadForTest, StoreReadReleaseForTest};
+
+    /// One armed park.
+    struct Armed {
+        id: u64,
+        opened: tokio::sync::oneshot::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    fn armed() -> MutexGuard<'static, HashMap<PathBuf, Armed>> {
+        static ARMED: OnceLock<Mutex<HashMap<PathBuf, Armed>>> = OnceLock::new();
+        ARMED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    thread_local! {
+        /// Set while this thread runs a store operation's blocking work.
+        static IN_STORE_OPERATION: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Marks this thread as running a store operation's blocking work until
+    /// dropped.
+    pub(super) struct StoreOperation {
+        outer: bool,
+    }
+
+    impl StoreOperation {
+        pub(super) fn enter() -> Self {
+            Self {
+                outer: IN_STORE_OPERATION.with(|flag| flag.replace(true)),
+            }
+        }
+    }
+
+    impl Drop for StoreOperation {
+        fn drop(&mut self) {
+            IN_STORE_OPERATION.with(|flag| flag.set(self.outer));
+        }
+    }
+
+    pub(super) fn arm(path: &Path) -> ParkedStoreReadForTest {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        // The stores open their database under its canonical path.
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        armed().insert(
+            key.clone(),
+            Armed {
+                id,
+                opened: opened_tx,
+                release: release_rx,
+            },
+        );
+        ParkedStoreReadForTest {
+            key,
+            id,
+            opened: Some(opened_rx),
+            release: StoreReadReleaseForTest(release_tx),
+        }
+    }
+
+    pub(super) fn disarm(key: &Path, id: u64) {
+        let mut parks = armed();
+        if parks.get(key).is_some_and(|park| park.id == id) {
+            parks.remove(key);
+        }
+    }
+
+    /// Park a store operation's read of the armed database `path`, its
+    /// connection open, until the park is released or dropped.
+    pub(super) fn park_if_armed(path: &Path) {
+        if !IN_STORE_OPERATION.with(Cell::get) {
+            return;
+        }
+        let Some(park) = armed().remove(path) else {
+            return;
+        };
+        let _ = park.opened.send(());
+        let _ = park.release.recv();
+    }
 }
 
 fn initialize_identity_store_instance(conn: &Connection) -> Result<String, MobStoreError> {
@@ -2870,9 +3037,13 @@ async fn run_sqlite_task<T>(
 where
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(task)
-        .await
-        .map_err(|error| MobStoreError::Internal(format!("sqlite task join failed: {error}")))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        let _store_operation = store_read_park::StoreOperation::enter();
+        task()
+    })
+    .await
+    .map_err(|error| MobStoreError::Internal(format!("sqlite task join failed: {error}")))?
 }
 
 // ---------------------------------------------------------------------------
@@ -13755,54 +13926,68 @@ mod tests {
         );
     }
 
-    // Multi-threaded: this test blocks its own thread while the spawned read
-    // must still be polled into its blocking work.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn observer_drain_does_not_cover_a_cancelled_unguarded_read() {
-        let (_dir, path) = temp_db_path();
-        let stores = SqliteMobStores::open(&path).unwrap();
-        wait_for_watch_registrations(&path);
-        let catch_up = Arc::clone(&stores.event_bus.catch_up);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let (done_tx, done_rx) = mpsc::channel();
-        let read_path = path.clone();
-        // An unguarded store read whose awaiting future is cancelled: the
-        // blocking work keeps running with its connection.
-        let read = tokio::spawn(run_sqlite_task(move || {
-            let conn = open_existing_read_connection(&read_path)?;
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv();
-            let events = poll_events_from_connection(&conn, 0, 10);
-            drop(conn);
-            let _ = done_tx.send(());
-            events
-        }));
-        entered_rx
-            .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the read holds its connection");
-        read.abort();
-        assert!(read.await.unwrap_err().is_cancelled());
-
-        drop(stores);
+    /// Drain the observer of `path` on a thread of its own, within the hang
+    /// guard.
+    fn drain_observers_within_hang_guard(
+        path: &Path,
+    ) -> Result<SqliteMobObserverDrain, SqliteMobObserverDrainRefused> {
         let (drain_tx, drain_rx) = mpsc::channel();
-        let drain_path = path.clone();
+        let drain_path = path.to_path_buf();
         std::thread::spawn(move || {
             let _ = drain_tx.send(SqliteMobStores::drain_observers(&drain_path));
         });
-        let outcome = drain_rx
+        drain_rx
             .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the drain never waits for store reads");
-        assert_eq!(outcome, Ok(closed_report(true, 1, 0, false)));
-        assert!(
-            done_rx.try_recv().is_err(),
-            "the cancelled read still holds its connection: the drain's scope ends at the observer"
-        );
+            .expect("the drain returns within the hang guard")
+    }
 
-        release_tx.send(()).unwrap();
-        done_rx
-            .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the released read finishes on its own");
+    /// A store read whose caller is cancelled while its blocking work holds
+    /// the connection open, as an actor's teardown aborts its background
+    /// tasks, owns the observer until that work returns: the observer drain
+    /// refuses meanwhile, and drains once the connection closed. A drain that
+    /// settled with the read still running would let the database be
+    /// removed, and a new one created under its path, under that connection.
+    #[tokio::test]
+    async fn an_aborted_read_keeps_the_observer_drain_refused_until_its_connection_closes() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        wait_for_watch_registrations(&path);
+        let catch_up = registered_catch_up(&path);
+        let events = stores.event_store();
+        // Dropping the park releases the read on every way out of this test:
+        // the runtime's shutdown waits for blocking work.
+        let mut parked = park_next_store_read_for_test(&path);
+        let read = tokio::spawn(async move { events.latest_cursor().await });
+        assert!(
+            tokio::time::timeout(OBSERVER_HANG_GUARD, parked.opened())
+                .await
+                .expect("the read reaches the park within the hang guard"),
+            "the read parks with its connection open"
+        );
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        drop(stores);
+
+        assert_eq!(
+            drain_observers_within_hang_guard(&path),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 1 }),
+            "the cancelled read's blocking work still owns the observer"
+        );
+        assert!(!catch_up.is_closed(), "the refusal closed nothing");
+
+        parked.release();
+        let deadline = std::time::Instant::now() + OBSERVER_HANG_GUARD;
+        while catch_up.live_owner().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released read returns within the hang guard"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            drain_observers_within_hang_guard(&path),
+            Ok(closed_report(true, 1, 0, false))
+        );
         drop(catch_up);
     }
 
