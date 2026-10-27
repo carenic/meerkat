@@ -357,9 +357,10 @@ reads; and a mob's event log grows the mob's own scope.
 **At open.** After it acquires the fence and before its first commit, Core
 reads:
 
-- **Every head, once.** `list_heads` for each of the four scope kinds, 256
-  heads per call and at least one call per kind, archived sessions and chunk
-  scopes included.
+- **Every head, once.** `list_heads` for each of the four scope kinds,
+  asking for 2048 heads per call (256 before 0.9.7) and at least one call
+  per kind, archived sessions and chunk scopes included. A store may answer
+  fewer heads per call with `HeadPage::next` set; Core reads on from there.
 - **Head entries kept as chunks.** A head entry over 32 KiB is kept in a
   chunk scope: one `load_head` and its rows for each such entry of every
   runtime, dormant or not, and of every realm record.
@@ -371,7 +372,8 @@ reads:
   run (a lifecycle record Core cannot decode counts as one). Core reads its
   visible rows from the first visible row, 16 rows per `read_rows` call, then
   the chunks its rows and live entries refer to. An archived runtime is never
-  read at open.
+  read at open: one whose session was archived, or whose runtime was retired
+  or destroyed (a retired mob member's, for example).
 
 No other row is read at open.
 
@@ -403,7 +405,9 @@ it is not read again.
 **Rarely.** A start whose recovery scan fails wakes every member, and says so
 (`MobHandle::boot_set_basis`). A start that finds a woken member's session
 gone searches the realm's other sessions for its successor, reading each
-candidate once.
+candidate once. A writer that stopped (a failed renew, or its self-fence
+window closed) and acquires the fence again lists every head once more, as
+at open, to check that no other writer committed meanwhile.
 
 **The first start after an upgrade to 0.9.7.** A runtime head that an
 earlier release wrote cannot show that no background operation completion
@@ -412,9 +416,18 @@ archived as holding work: it wakes its mob member once and reads its
 session. The runtime's next commit records its facts in full, and later
 starts read only what this section lists.
 
-For example, a realm of 500 sessions where only one holds work, whose
-pinned entries are all inline and whose other kinds hold at most 256 scopes
-each, takes at open one `acquire_fence`, two `list_heads` calls for the
+**Listing pages from 0.9.7.** Core asks `list_heads` for 2048 heads per
+call, eight times as many as before, so one answer of typical runtime heads
+is several MiB. If your backend or transport caps an answer below that (a
+message or page size limit), answer the heads that fit with `HeadPage::next`
+set, and leave `next` empty only when no scope of the kind is left to list.
+A store that sets `next` only when it answered a full page of `limit` heads
+ends the listing early once its cap cuts a page short, and Core then opens
+without the scopes it was not given.
+
+For example, a realm of 5,000 sessions where only one holds work, whose
+pinned entries are all inline and whose other kinds hold at most 2048 scopes
+each, takes at open one `acquire_fence`, three `list_heads` calls for the
 sessions and one for each other kind, and the `read_rows` calls of that one
 session.
 

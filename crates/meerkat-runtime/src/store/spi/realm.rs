@@ -131,8 +131,16 @@ pub const CHECKPOINT_MIN_BYTES: u64 = 256 * 1024;
 /// Rows read per host call when loading.
 pub(crate) const READ_PAGE_ROWS: usize = 16;
 
-/// Heads read per host call when listing.
-pub(crate) const LIST_PAGE_HEADS: usize = 256;
+/// The most heads one `list_heads` call asks for, when the realm opens and
+/// when a stopped writer re-acquires. A listing visits every scope the realm
+/// holds, archived sessions and chunk scopes included, and a store's cost is
+/// often per call, so a page is large: the calls of a listing are
+/// `ceil(scopes / LIST_PAGE_HEADS)` per kind, at least one. A store may
+/// answer fewer heads with `next` set, and the listing reads on from there.
+/// A page of typical runtime heads (a few KiB each) is a few MiB; each head
+/// stays under [`HEAD_LIMIT`]. 256 before 0.9.7; no stored format depends on
+/// it.
+pub(crate) const LIST_PAGE_HEADS: usize = 2048;
 
 /// Values at least this large keep their allocation in the stamp, so an
 /// unchanged value (the same allocation) is recognized without hashing.

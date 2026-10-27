@@ -81,6 +81,9 @@ pub(crate) struct Faults {
     pub(crate) renew_delay: Option<Duration>,
     /// How long the next listing call takes before it answers (once).
     pub(crate) list_delay: Option<Duration>,
+    /// The most heads every listing call answers, whatever limit it was
+    /// asked for: a store whose pages are shorter than Core's.
+    pub(crate) list_page_cap: Option<usize>,
 }
 
 /// The test host store.
@@ -307,10 +310,14 @@ impl HostStore for TestHost {
     ) -> Result<HeadPage, HostStoreError> {
         self.count_read();
         self.record(HostCall::ListHeads { kind });
-        let delay = self.faults().list_delay.take();
+        let (delay, cap) = {
+            let mut faults = self.faults();
+            (faults.list_delay.take(), faults.list_page_cap)
+        };
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
+        let limit = cap.map_or(limit, |cap| limit.min(cap));
         let state = self.state();
         let mut heads = Vec::new();
         let mut more = false;

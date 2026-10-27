@@ -9,6 +9,13 @@
 //! ([`RuntimeStore::list_runtimes_with_recovery_work`](super::RuntimeStore::list_runtimes_with_recovery_work))
 //! asks it to choose the runtimes it lists, so the two cannot disagree.
 //!
+//! An archived runtime holds no recovery work. Archived is the session
+//! owner's rule ([`runtime_is_archived`]): the catalog entry carries the
+//! Archived terminal, or the machine lifecycle record names a Retired or
+//! Destroyed runtime. A runtime-backed archive (a retire) records only the
+//! second: it commits the lifecycle row and never rewrites the session body
+//! the catalog terminal is projected from.
+//!
 //! The work a runtime's ops lifecycle snapshot owes (an undelivered
 //! background operation completion, a running detached job wait:
 //! `PersistedOpsSnapshot::holds_recovery_work`) is part of the
@@ -24,6 +31,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use super::{MachineLifecycleObservation, RuntimeSessionCatalogEntry, RuntimeStoreError};
+use crate::runtime_state::RuntimeState;
 
 /// Facts a boot reads from a runtime's head to decide whether recovery must
 /// act on it, refreshed by every commit of the runtime.
@@ -107,28 +115,60 @@ pub(crate) fn lifecycle_has_current_run(bytes: Option<&[u8]>) -> bool {
     }
 }
 
-/// Whether a runtime's session catalog entry marks it archived.
+/// Whether a runtime's session catalog entry marks it archived. The entry's
+/// terminal is projected from the session body, which a runtime-backed
+/// archive never rewrites: [`runtime_is_archived`] is the whole rule.
 pub(crate) fn catalog_entry_is_archived(catalog: Option<&RuntimeSessionCatalogEntry>) -> bool {
     catalog
         .and_then(RuntimeSessionCatalogEntry::lifecycle_terminal)
         .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived)
 }
 
+/// Whether a runtime's machine lifecycle record names an absorbing terminal:
+/// a Retired or Destroyed runtime. A record that does not decode, or names
+/// no state, is not taken as one ([`lifecycle_has_current_run`] reads such a
+/// record as work: recovery must look at it).
+pub(crate) fn lifecycle_is_archived(bytes: Option<&[u8]>) -> bool {
+    match bytes.map(super::classify_machine_lifecycle_record) {
+        Some(MachineLifecycleObservation::Decoded { record, .. }) => matches!(
+            record.runtime_state(),
+            Some(RuntimeState::Retired | RuntimeState::Destroyed)
+        ),
+        _ => false,
+    }
+}
+
+/// Whether a runtime is archived, by the rule its session owner applies
+/// (`PersistentSessionService::session_archived_by_authority`): its catalog
+/// entry carries the Archived terminal, or its machine lifecycle record
+/// names a Retired or Destroyed runtime. Either committed terminal archives,
+/// and a retire commits only the second.
+pub(crate) fn runtime_is_archived(
+    catalog: Option<&RuntimeSessionCatalogEntry>,
+    lifecycle: Option<&[u8]>,
+) -> bool {
+    catalog_entry_is_archived(catalog) || lifecycle_is_archived(lifecycle)
+}
+
 /// Whether recovery must act on a runtime: it holds work recovery owns
-/// ([`runtime_holds_recovery_work`]) and it is not archived.
+/// ([`runtime_holds_recovery_work`]) and it is not archived
+/// ([`runtime_is_archived`]).
 ///
 /// `facts` are the runtime's boot facts ([`BootFactsV1::default`] for a
 /// runtime that holds nothing), `lifecycle` its machine lifecycle record as
-/// stored, `catalog` its session catalog entry. A runtime whose catalog
-/// entry is archived holds no recovery work, whatever its other facts say.
-/// The SQLite scan asks the two halves itself, so that it decodes a catalog
-/// entry only for a runtime that holds work.
+/// stored, `catalog` its session catalog entry. An archived runtime holds no
+/// recovery work, whatever its other facts say. A retired runtime's work
+/// stays durable and runs once its session is revived (a resume that names
+/// it, or the next wake of a mob member still seated on it); a destroyed
+/// runtime's session is never revived. The SQLite scan asks the parts
+/// itself, so that it decodes a catalog entry or an ops lifecycle snapshot
+/// only when the answer needs it.
 pub(crate) fn runtime_has_recovery_obligation(
     facts: &BootFactsV1,
     lifecycle: Option<&[u8]>,
     catalog: Option<&RuntimeSessionCatalogEntry>,
 ) -> bool {
-    !catalog_entry_is_archived(catalog) && runtime_holds_recovery_work(facts, lifecycle)
+    !runtime_is_archived(catalog, lifecycle) && runtime_holds_recovery_work(facts, lifecycle)
 }
 
 /// Whether a runtime holds work recovery owns, archived or not: nonterminal
@@ -178,9 +218,25 @@ pub(crate) mod scan_contract {
     pub(crate) struct ScanFixture {
         /// One runtime for each kind of recovery work.
         pub(crate) listed: HashSet<LogicalRuntimeId>,
-        /// An idle runtime, an archived one that holds a nonterminal input,
-        /// and one whose ops lifecycle snapshot's completion was delivered.
+        /// An idle runtime, one whose ops lifecycle snapshot's completion
+        /// was delivered, and archived runtimes that would otherwise hold
+        /// work: a document archived with a nonterminal input, a runtime
+        /// retired with an owed completion, an archived document with an
+        /// owed completion, and a runtime destroyed with a nonterminal
+        /// input.
         pub(crate) unlisted: HashSet<LogicalRuntimeId>,
+        /// The listed runtime whose only work is the background operation
+        /// completion its ops lifecycle snapshot owes.
+        pub(crate) owed_completion: LogicalRuntimeId,
+        /// A runtime retired as 0.9.x retires one: its lifecycle names
+        /// Retired with everything its unregister clears cleared, its
+        /// session body carries no terminal, and it keeps an ops lifecycle
+        /// snapshot that owes the same kind of completion.
+        pub(crate) retired_owed_completion: LogicalRuntimeId,
+        /// A runtime whose session document carries the Archived terminal
+        /// (as an imported archived document does), keeping an ops
+        /// lifecycle snapshot that owes the same kind of completion.
+        pub(crate) document_archived_owed_completion: LogicalRuntimeId,
     }
 
     impl ScanFixture {
@@ -226,6 +282,19 @@ pub(crate) mod scan_contract {
                 Some("epoch-1".to_string()),
             ),
             MachineLifecycleRunFacts::new(current_run, Some(MachineLifecyclePreRunPhase::Idle)),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            None,
+        )
+    }
+
+    /// The lifecycle a runtime keeps once it ended in `state` (Retired or
+    /// Destroyed) and its unregister completed: no binding, no run, no
+    /// unregister progress, as the generated final image records it.
+    pub(crate) fn ended_lifecycle(state: RuntimeState) -> MachineLifecycleCommit {
+        MachineLifecycleCommit::new_with_binding_run_and_unregister_progress(
+            state,
+            MachineLifecycleBindingFacts::default(),
+            MachineLifecycleRunFacts::default(),
             SupervisorAuthoritySnapshot::UnboundNoReceipt,
             None,
         )
@@ -438,7 +507,56 @@ pub(crate) mod scan_contract {
             .persist_ops_lifecycle(&undelivered, &completed_background_operation(None))
             .await
             .unwrap();
-        listed.insert(undelivered);
+        listed.insert(undelivered.clone());
+
+        // Retired as 0.9.x retires a runtime, keeping an ops lifecycle
+        // snapshot that owes the same kind of completion: the retire commits
+        // the lifecycle row, its unregister keeps the snapshot, and the
+        // session body is never rewritten. An archived runtime holds no
+        // recovery work, whatever its snapshot says.
+        let mut retired_session = meerkat_core::Session::new();
+        retired_session.push(Message::User(UserMessage::text("a retired session")));
+        let retired_owed = commit_session(store, &retired_session).await;
+        store
+            .persist_ops_lifecycle(&retired_owed, &completed_background_operation(None))
+            .await
+            .unwrap();
+        store
+            .commit_machine_lifecycle(&retired_owed, ended_lifecycle(RuntimeState::Retired), &[])
+            .await
+            .unwrap();
+        unlisted.insert(retired_owed.clone());
+
+        // The same owed completion beside a session document that carries
+        // the Archived terminal itself, as an imported archived document
+        // does.
+        let mut archived_document = meerkat_core::Session::new();
+        archived_document.push(Message::User(UserMessage::text("an archived document")));
+        let document_archived_owed = LogicalRuntimeId::for_session(archived_document.id());
+        store
+            .persist_ops_lifecycle(
+                &document_archived_owed,
+                &completed_background_operation(None),
+            )
+            .await
+            .unwrap();
+        archived_document
+            .set_lifecycle_terminal(meerkat_core::SessionLifecycleTerminal::Archived)
+            .unwrap();
+        commit_session(store, &archived_document).await;
+        unlisted.insert(document_archived_owed.clone());
+
+        // Destroyed, though it still holds a nonterminal input.
+        let destroyed = LogicalRuntimeId::new("scan-destroyed-nonterminal-input");
+        store
+            .persist_input_state(&destroyed, &accepted())
+            .await
+            .unwrap();
+        store
+            .commit_machine_lifecycle(&destroyed, ended_lifecycle(RuntimeState::Destroyed), &[])
+            .await
+            .unwrap();
+        unlisted.insert(destroyed);
 
         // An ops lifecycle snapshot holding a running detached job wait, and
         // nothing else.
@@ -465,7 +583,13 @@ pub(crate) mod scan_contract {
             .unwrap();
         unlisted.insert(delivered);
 
-        ScanFixture { listed, unlisted }
+        ScanFixture {
+            listed,
+            unlisted,
+            owed_completion: undelivered,
+            retired_owed_completion: retired_owed,
+            document_archived_owed_completion: document_archived_owed,
+        }
     }
 
     /// The scan of a store that holds exactly `fixture` lists each runtime
@@ -480,6 +604,18 @@ pub(crate) mod scan_contract {
             unique.len(),
             listed.len(),
             "each runtime is listed once: {listed:?}"
+        );
+        assert!(
+            unique.contains(&fixture.owed_completion),
+            "a completion its ops lifecycle snapshot owes is recovery work"
+        );
+        assert!(
+            !unique.contains(&fixture.retired_owed_completion),
+            "a retired runtime holds no recovery work, whatever its kept snapshot owes"
+        );
+        assert!(
+            !unique.contains(&fixture.document_archived_owed_completion),
+            "an archived document holds no recovery work, whatever its kept snapshot owes"
         );
         assert_eq!(
             unique, fixture.listed,
@@ -527,6 +663,21 @@ mod tests {
                 Some("epoch-1".to_string()),
             ),
             MachineLifecycleRunFacts::new(current_run, Some(MachineLifecyclePreRunPhase::Idle)),
+            SupervisorAuthoritySnapshot::UnboundNoReceipt,
+            None,
+        )
+        .store_record()
+        .encode()
+        .unwrap()
+    }
+
+    /// The stored bytes of a lifecycle in `state`, with no binding and no
+    /// run.
+    fn lifecycle_in(state: RuntimeState) -> Vec<u8> {
+        MachineLifecycleCommit::new_with_binding_run_and_unregister_progress(
+            state,
+            MachineLifecycleBindingFacts::default(),
+            MachineLifecycleRunFacts::default(),
             SupervisorAuthoritySnapshot::UnboundNoReceipt,
             None,
         )
@@ -699,6 +850,57 @@ mod tests {
                 !runtime_has_recovery_obligation(facts, *lifecycle, Some(&archived)),
                 "{name}: an archived runtime holds no recovery work"
             );
+        }
+    }
+
+    /// A Retired or Destroyed runtime is archived by its lifecycle record
+    /// alone (a retire never writes the catalog terminal), and holds no
+    /// recovery work whatever its facts and catalog entry say. A runtime
+    /// stopped by runtime control, or one whose record does not decode, is
+    /// not archived.
+    #[test]
+    fn boot_obligation_scan_predicate_reads_a_retired_or_destroyed_lifecycle_as_archived() {
+        let retired = lifecycle_in(RuntimeState::Retired);
+        let destroyed = lifecycle_in(RuntimeState::Destroyed);
+        let stopped = lifecycle_in(RuntimeState::Stopped);
+        let idle = lifecycle(None);
+        let undecodable = b"not a lifecycle record".to_vec();
+        let unmarked = catalog(None);
+        let active = catalog(Some(SessionLifecycleTerminal::Active));
+        let rows: [(&str, Option<&[u8]>, bool); 6] = [
+            ("no lifecycle record", None, false),
+            ("an idle lifecycle", Some(idle.as_slice()), false),
+            ("a stopped lifecycle", Some(stopped.as_slice()), false),
+            (
+                "a lifecycle that does not decode",
+                Some(undecodable.as_slice()),
+                false,
+            ),
+            ("a retired lifecycle", Some(retired.as_slice()), true),
+            ("a destroyed lifecycle", Some(destroyed.as_slice()), true),
+        ];
+        for (name, lifecycle, archived) in rows {
+            assert_eq!(lifecycle_is_archived(lifecycle), archived, "{name}");
+            for entry in [None, Some(&unmarked), Some(&active)] {
+                assert_eq!(
+                    runtime_is_archived(entry, lifecycle),
+                    archived,
+                    "{name} beside {entry:?}"
+                );
+            }
+        }
+        let every_kind_of_work = facts(true, true, true, true);
+        for (name, lifecycle) in [("retired", &retired), ("destroyed", &destroyed)] {
+            for entry in [None, Some(&unmarked), Some(&active)] {
+                assert!(
+                    !runtime_has_recovery_obligation(
+                        &every_kind_of_work,
+                        Some(lifecycle.as_slice()),
+                        entry
+                    ),
+                    "a {name} runtime holds no recovery work, beside {entry:?}"
+                );
+            }
         }
     }
 }

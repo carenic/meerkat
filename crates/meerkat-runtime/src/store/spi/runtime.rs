@@ -51,8 +51,7 @@ use crate::ops_lifecycle::PersistedOpsSnapshot;
 use crate::store::memory::journal::{self, TouchScope, Touches};
 use crate::store::memory::journal_image::{BOOT_FACTS_KEY, ScopeExport};
 use crate::store::recovery_obligation::{
-    BootFactsV1, boot_facts_predate_ops_fold, catalog_entry_is_archived,
-    runtime_has_recovery_obligation,
+    BootFactsV1, boot_facts_predate_ops_fold, runtime_holds_recovery_work, runtime_is_archived,
 };
 use crate::store::{
     AuthOAuthFlowSnapshotUpdate, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
@@ -182,10 +181,11 @@ fn memory_error(error: RuntimeStoreError) -> SpiError {
 
 /// Whether a runtime's pinned boot facts were written before the ops
 /// lifecycle's work was folded into them, for a runtime that is not
-/// archived: they may leave out an undelivered background completion or a
-/// running detached job wait, so the obligation scan lists the runtime as
-/// holding work (fail closed) until its next commit pins the folded form.
-/// A head without boot facts holds no rows at all, so it owes nothing.
+/// archived ([`runtime_is_archived`] over its `cat` and `lc` entries): they
+/// may leave out an undelivered background completion or a running
+/// detached job wait, so the obligation scan lists the runtime as holding
+/// work (fail closed) until its next commit pins the folded form. A head
+/// without boot facts holds no rows at all, so it owes nothing.
 pub(super) fn head_predates_ops_fold(
     pinned: &BTreeMap<String, Arc<Vec<u8>>>,
 ) -> Result<bool, SpiError> {
@@ -200,13 +200,16 @@ pub(super) fn head_predates_ops_fold(
         .map(|bytes| serde_json::from_slice::<RuntimeSessionCatalogEntry>(bytes))
         .transpose()
         .map_err(|error| SpiError::Corrupt(format!("catalog entry: {error}")))?;
-    Ok(!catalog_entry_is_archived(catalog.as_ref()))
+    let lifecycle = pinned.get("lc").map(|bytes| bytes.as_slice());
+    Ok(!runtime_is_archived(catalog.as_ref(), lifecycle))
 }
 
-/// Whether a runtime's body loads at boot: recovery must act on it
-/// ([`runtime_has_recovery_obligation`] over its pinned entries, the same
-/// predicate the obligation scan asks). An archived runtime never loads at
-/// boot, and its boot facts are not read.
+/// Whether a runtime's body loads at boot: recovery must act on it, by the
+/// predicate the obligation scan asks
+/// (`runtime_has_recovery_obligation`) over its pinned entries. An archived
+/// runtime ([`runtime_is_archived`]: its `cat` entry carries the Archived
+/// terminal, or its `lc` entry names a Retired or Destroyed runtime) never
+/// loads at boot, and its boot facts are not read.
 pub(super) fn needs_body_at_boot(
     pinned: &BTreeMap<String, Arc<Vec<u8>>>,
 ) -> Result<bool, SpiError> {
@@ -215,18 +218,15 @@ pub(super) fn needs_body_at_boot(
         .map(|bytes| serde_json::from_slice::<RuntimeSessionCatalogEntry>(bytes))
         .transpose()
         .map_err(|error| SpiError::Corrupt(format!("catalog entry: {error}")))?;
-    let facts = match pinned.get(BOOT_FACTS_KEY) {
-        Some(bytes) if !catalog_entry_is_archived(catalog.as_ref()) => {
-            BootFactsV1::decode(bytes).map_err(memory_error)?
-        }
-        _ => BootFactsV1::default(),
-    };
     let lifecycle = pinned.get("lc").map(|bytes| bytes.as_slice());
-    Ok(runtime_has_recovery_obligation(
-        &facts,
-        lifecycle,
-        catalog.as_ref(),
-    ))
+    if runtime_is_archived(catalog.as_ref(), lifecycle) {
+        return Ok(false);
+    }
+    let facts = match pinned.get(BOOT_FACTS_KEY) {
+        Some(bytes) => BootFactsV1::decode(bytes).map_err(memory_error)?,
+        None => BootFactsV1::default(),
+    };
+    Ok(runtime_holds_recovery_work(&facts, lifecycle))
 }
 
 /// The changes one scope's export makes: every whole group's entries, the
