@@ -216,6 +216,7 @@ pub use boot_plan::{
 };
 mod dormant_seat;
 pub use dormant_seat::DormantSeatOutcome;
+pub(crate) use dormant_seat::{SeatBuild, SeatBuildInputs, SeatLocalBuildInputs};
 mod builder;
 pub mod composition;
 pub mod conditions;

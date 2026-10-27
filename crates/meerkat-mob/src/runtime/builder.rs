@@ -10069,6 +10069,7 @@ impl MobBuilder {
         // order. See `restore_resumed_members`.
         let restore_set = resume_restore_set(
             &roster_entries,
+            roster,
             dsl_authority.state(),
             &definition.id,
             &boot_plan.materialize,
@@ -11487,6 +11488,11 @@ pub(super) struct ResumeRestoreCandidate {
     /// source's, or a member bound to the session an earlier member is bound
     /// to.
     pub(super) in_turn: bool,
+    /// What the member's seat carries to the first build of its unborn
+    /// session ([`super::SeatBuild`]), set on its restore request before the
+    /// customizer is asked. `None` for a member whose session a build
+    /// created.
+    pub(super) seat_build: Option<Arc<super::SeatBuild>>,
 }
 
 /// The members a cold resume restores, in `entries`' order (every in-mob
@@ -11502,6 +11508,7 @@ pub(super) struct ResumeRestoreCandidate {
 #[cfg(feature = "runtime-adapter")]
 fn resume_restore_set(
     entries: &[RosterEntry],
+    roster: &Roster,
     machine_state: &crate::machines::mob_machine::MobMachineState,
     mob_id: &MobId,
     boot_set: &BTreeSet<AgentIdentity>,
@@ -11531,6 +11538,7 @@ fn resume_restore_set(
                 entry: entry.clone(),
                 machine_session_id: machine_session_id.clone(),
                 in_turn: shares_session || member_restore_follows_in_mob_source(entry, mob_id),
+                seat_build: roster.seat_build(&entry.agent_identity),
             })
         })
         .collect()
