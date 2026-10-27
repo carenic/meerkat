@@ -359,6 +359,10 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # invariants violated, its two RetireAtScope mutants' invariants violated,
 # its mint mutant's action property violated, and its three destroyed-runtime
 # mutants' action property violated.
+# member_residency_audit.sh requires a final distinct-state count at or above
+# each run's floor, a coverage block in which each covered action of its four
+# runs generated a state, its seventeen witnesses violated, and with --mutants
+# each seeded defect's invariant, action property or assumption refused.
 # durable_tail_classification_audit.sh requires its Ready witness violated,
 # and with --mutants each seeded defect's target invariant violated.
 # durable_tail_recovery_ownership_audit.sh requires its four witnesses
@@ -505,10 +509,50 @@ printf '%s\n' \
   'echo "Error: Invariant AuditHostRecoversAsARestartDoes is violated."' \
   'echo "Error: Invariant AuditWriterRecoversAsRetired is violated."' \
   'echo "Error: Invariant AuditWriterNeverContinues is violated."' \
+  'echo "Error: Invariant NotAuditWitnessSealedDormant is violated."' \
+  'echo "Error: Invariant NotAuditWitnessSealedEndpointPending is violated."' \
+  'echo "Error: Invariant NotAuditWitnessStaleInStopped is violated."' \
+  'echo "Error: Invariant NotAuditWitnessDrift is violated."' \
+  'echo "Error: Invariant NotAuditWitnessBrokenWake is violated."' \
+  'echo "Error: Invariant NotAuditWitnessHeldEdge is violated."' \
+  'echo "Error: Invariant NotAuditWitnessBothSeated is violated."' \
+  'echo "Error: Invariant NotAuditWitnessSeatEndpointPending is violated."' \
+  'echo "Error: Action property NotAuditWitnessWokeLive is violated."' \
+  'echo "Error: Action property NotAuditWitnessReleased is violated."' \
+  'echo "Error: Action property NotAuditWitnessStopCloses is violated."' \
+  'echo "Error: Action property NotAuditWitnessRetireCloses is violated."' \
+  'echo "Error: Action property NotAuditWitnessResumeJoins is violated."' \
+  'echo "Error: Action property NotAuditWitnessResumeReservesLive is violated."' \
+  'echo "Error: Action property NotAuditWitnessResumeFinishedLive is violated."' \
+  'echo "Error: Action property NotAuditWitnessRotated is violated."' \
+  'echo "Error: Action property NotAuditWitnessReleasedSpawn is violated."' \
+  'echo "Error: Invariant materialization_domain_is_session_bound_membership is violated."' \
+  'echo "Error: Invariant local_session_bound_member_is_live_or_wakeable is violated."' \
+  'echo "Error: Invariant broken_member_has_no_phase is violated."' \
+  'echo "Error: Invariant dormant_member_has_durable_endpoint is violated."' \
+  'echo "Error: Invariant endpoint_pending_member_has_no_endpoint is violated."' \
+  'echo "Error: Invariant dormant_member_requests_no_runtime_binding is violated."' \
+  'echo "Error: Invariant live_member_records_its_epoch is violated."' \
+  'echo "Error: Invariant waking_is_one_attempt is violated."' \
+  'echo "Error: Invariant retiring_incarnation_never_waking is violated."' \
+  'echo "Error: Invariant candidate_composition_never_wakes is violated."' \
+  'echo "Error: Invariant waking_has_an_open_attempt is violated."' \
+  'echo "Error: Invariant wake_bookkeeping_follows_phase is violated."' \
+  'echo "Error: Invariant only_a_running_mob_wakes is violated."' \
+  'echo "Error: Invariant AuditWakingClosable is violated."' \
+  'echo "Error: Invariant AuditWakeExactlyOne is violated."' \
+  'echo "Error: Invariant wiring_edges_connect_seated_members is violated."' \
+  'echo "Error: Invariant rotation_intent_is_a_retiring_member is violated."' \
+  'echo "Error: Invariant member_peer_id_ownership_is_global_across_generations is violated."' \
+  'echo "Error: Action property AuditRecoverKeepsPhase is violated."' \
+  'echo "Error: Action property AuditAttemptEndsClosed is violated."' \
+  'echo "Error: Action property AuditLifecycleNeverWakes is violated."' \
+  'echo "Error: Assumption line 1, col 1 to line 1, col 2 of module member_residency_audit is false."' \
   'echo "Error: The first argument of <= should be an integer, but instead it is:"' \
   'echo "100000 states generated, 100000 distinct states found, 0 states left on queue."' \
   'echo "The coverage statistics at 2026-01-01 00:00:00"' \
   'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning ObserveMemberProgressChangedOpenRunning ObserveMemberProgressChangedIdleRunning ObserveMemberProgressUnchangedIdleRunning ObserveMemberProgressUnchangedOpenHealthyRunning ObserveMemberProgressUnchangedOpenDegradedRunning ObserveMemberProgressUnchangedOpenWedgedRunning ObserveMemberProgressStaleRunning RetireRunningReleasing RetireRunningPreservingBinding RetireRunningNoBinding RetireStoppedReleasing RetireStoppedPreservingBinding RetireStoppedNoBinding RetireAbsentRunning RetireAbsentStopped RetireMember SessionIngressDetachedForMobDestroyRunning ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped ObserveMemberRetirementArchivedAlreadyCleared ObserveMemberRetirementArchivedStaleRuntimeAlreadyCleared ObserveMemberRetirementArchivedAlreadyClearedStopped ObserveMemberRetirementArchivedStaleRuntimeAlreadyClearedStopped BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped BeginPlacedCompletionLifecycleQuiesceFresh MarkCompleted DestroyMob RetireAtScopeCurrentRunning RetireAtScopeCurrentStopped RetireAtScopeNoCurrentIncarnationRunning RetireAtScopeNoCurrentIncarnationStopped RetireAtScopeStaleFenceTokenRunning RetireAtScopeStaleFenceTokenStopped RetireAtScopeStaleSessionBindingRunning RetireAtScopeStaleSessionBindingStopped RetireAtScopeMobNotRunningCompleted RetireAtScopeMobNotRunningDestroyed RecoverRosterMemberResetRunning RecoverMemberSessionBindingReplacingRunning RecoverMemberSessionBindingAlreadyCurrentRunning RetireMemberPeerOnly SessionIngressDetachedForMobDestroyStopped RecoverRosterMemberRetiringRunning RecoverRosterMemberRetiringReplay RecoverRosterMemberRetiredRunning RecoverRosterMemberRetiredCurrentAlreadyAbsent RecoverRosterMemberRetiredStaleGeneration RecoverRosterMemberRetiredStaleIncarnation RecoverRosterMemberRetirementStartedReleasing RecoverRosterMemberRetirementStartedReleasingAlreadyApplied RecoverRosterMemberRetirementStartedPreservingBinding RecoverRosterMemberRetirementStartedPeerOnly RecoverRosterMemberAddressabilityRunning ObserveMemberRetirementArchivedLivePreservingTopology ObserveMemberRetirementArchivedRetiredPreservingTopology ObserveRuntimeDestroyed ObserveRuntimeDestroyedStopped ObserveRuntimeDestroyedCompleted AdmitDestroyCleanup AuditStartRun FinishRunRunning; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
+  'for action in RecoverRosterMemberRunning RecoverMemberSessionBindingFreshRunning RecoverMemberSessionBindingAlreadyCurrentRunning RecoverMemberPeerEndpointFreshRunning RegisterMemberPeerRunning RecoverRosterMemberRetiredRunning SeedMemberResidencyRunning SeedMemberResidencyStopped SeedMemberResidencyCompleted ResolveMemberHostPreparationRunning ResolveMemberHostPreparationStopped ResolveMemberHostPreparationCompleted PlanBootMaterializationWake PlanBootMaterializationVerify PlanBootMaterializationStayDormant SealBootMaterializationPlan WakeMemberAuthorizedRunning WakeMemberJoinedRunning WakeMemberAlreadyLiveRunning WakeMemberRefusedRunning WakeMemberRefusedStopped WakeMemberRefusedCompleted WakeMemberRefusedDestroyed ResolveMemberRevivalBoundRunning ResolveMemberRevivalSucceededRunningLocal ResolveMemberRevivalFailedRunning ResolveMemberRevivalHostRefusedRunning ResolveMemberRevivalRetryableRunning AbandonMemberWakeDormantRunning AbandonMemberWakeBrokenRunning ResolveRecreatedMemberSessionSucceededRunningLocal ResolveMemberRevivalBoundStaleRunning ResolveMemberRevivalBoundStaleStopped ResolveMemberRevivalBoundStaleCompleted ResolveMemberRevivalBoundStaleDestroyed ResolveMemberRevivalSucceededStaleRunning ResolveMemberRevivalSucceededStaleStopped ResolveMemberRevivalSucceededStaleCompleted ResolveMemberRevivalSucceededStaleDestroyed ResolveMemberRevivalFailedStaleRunning ResolveMemberRevivalFailedStaleStopped ResolveMemberRevivalFailedStaleCompleted ResolveMemberRevivalFailedStaleDestroyed ResolveMemberRevivalHostRefusedStaleRunning ResolveMemberRevivalHostRefusedStaleStopped ResolveMemberRevivalHostRefusedStaleCompleted ResolveMemberRevivalHostRefusedStaleDestroyed ResolveMemberRevivalRetryableStaleRunning ResolveMemberRevivalRetryableStaleStopped ResolveMemberRevivalRetryableStaleCompleted ResolveMemberRevivalRetryableStaleDestroyed AbandonMemberWakeStaleRunning AbandonMemberWakeStaleStopped AbandonMemberWakeStaleCompleted AbandonMemberWakeStaleDestroyed ResolveRecreatedMemberSessionSucceededStaleRunning ResolveRecreatedMemberSessionSucceededStaleStopped ResolveRecreatedMemberSessionSucceededStaleCompleted ResolveRecreatedMemberSessionSucceededStaleDestroyed ObserveRuntimeReady ReleaseMemberMaterializationReleasedRunning ReleaseMemberMaterializationReleasedStopped ReleaseMemberMaterializationReleasedCompleted ReleaseMemberMaterializationStaleRunning ReleaseMemberMaterializationStaleStopped ReleaseMemberMaterializationStaleCompleted ReleaseMemberMaterializationStaleDestroyed ClassifyMemberLiveMaterializationRevivable ClassifyMemberLiveMaterializationTerminal ClassifyMemberLiveMaterializationTerminalDormant ClassifyPeerNoticeRunning ClassifyPeerNoticeStopped ClassifyPeerNoticeCompleted ClassifyPeerNoticeDestroyed BeginPlacedCompletionLifecycleQuiesceFreshStop StopRunning ResumeStopped BeginPlacedCompletionLifecycleQuiesceFresh CompleteRunning MarkCompleted AdmitDestroyCleanup DestroyMob ShutdownRunning RetireRunningReleasing RetireRunningPreservingBinding RetireStoppedReleasing SessionIngressDetachedForMobDestroyRunning SessionIngressDetachedForMobDestroyStopped ObserveRuntimeRetired ObserveRuntimeRetiredStopped ObserveMemberRetirementArchivedLive ObserveMemberRetirementArchivedRetired ObserveMemberRetirementArchivedLiveStopped ObserveMemberRetirementArchivedRetiredStopped RecoverMemberSessionBindingReplacingRunning BeginExplicitResumeStopped SettleExplicitResumePreparationStopped AuthorizeExplicitResumeMemberRunning AuthorizeExplicitResumeMemberLiveRunning AuthorizeExplicitResumeMemberJoinRunning ClassifyExplicitResumeMemberLiveRevivable ClassifyExplicitResumeMemberLiveMissing SettleExplicitResumeMemberRunning SettleExplicitResumeMemberReplacedRunning BeginExplicitResumeReadinessRunning SettleExplicitResumeReadinessRunning BeginExplicitResumeTopologyRunning SettleExplicitResumeTopologyRunning FinishExplicitResumeRunning RecoverRosterWiringRunning WireMembersRunning ObserveMemberRetirementArchivedLivePreservingTopology AuthorizeSpawnProfileRunning BeginSpawnExecFresh CommitDormantSeatRunning CommitSpawnMembershipFresh BeginMemberRotationRunning CommitMemberRotationLiveRunning CommitMemberRotationRetiredRunning; do echo "<$action line 1, col 1 to line 1, col 2 of module model>: 1:1"; done' \
   'echo "State 1: <Initial predicate>"' \
   > "$tlc_env_tmp/tlc"
 chmod +x "$tlc_env_tmp/tlc"

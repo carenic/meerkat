@@ -137,7 +137,7 @@ pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-comms/src/router.rs",
         "send_with_id",
-        "R91: trust miss, unreachable for a seated, wired member with an endpoint. R109: a seated member with no durable endpoint has no key and no trust row yet; the owed boot retry records its endpoint and publishes its wake route, and until then a peer cannot address it",
+        "R91: trust miss, unreachable for a seated, wired member with an endpoint. R122: a seated member with no durable endpoint has no key and no trust row yet; the owed boot retry records its endpoint and publishes its wake route, and until then a peer cannot address it",
     ),
     settled(
         "crates/meerkat-comms/src/runtime/comms_runtime.rs",
@@ -147,7 +147,7 @@ pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-comms/src/mcp/tools.rs",
         "ensure_peer_id_is_trusted",
-        "R109: the tool-boundary trust miss; a seated member with no durable endpoint has no key and no trust row until the owed boot retry records its endpoint",
+        "R122: the tool-boundary trust miss; a seated member with no durable endpoint has no key and no trust row until the owed boot retry records its endpoint",
     ),
     settled(
         "crates/meerkat-comms/src/mcp/tools.rs",
@@ -255,10 +255,10 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
         "finish_retained_resume_durable_convergence",
         "provisioner durable-convergence mechanics at the provision boundary",
     ),
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/handle.rs",
         "ensure_member_live",
-        "becomes WakeMember(Operator): the machine verdict, not a session probe",
+        "the drift observation: the probe only feeds observed_missing to WakeMember(Operator), whose verdict decides",
     ),
     pending(
         "crates/meerkat-mob/src/runtime/actor.rs",
@@ -275,30 +275,30 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
 /// Every registered member-session discard in meerkat-mob besides the release
 /// seam and the session-service adapters.
 pub(crate) const MOB_MEMBER_SESSION_DISCARDS: &[SiteAllowance] = &[
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "retire_exact_attachment_for_explicit_resume_owned",
-        "explicit-resume preparation discard: route through discard_member_session_with_release",
+        "explicit-resume lift: the member is Waking under the resume's own attempt, so a release would be Stale; the attempt's resolution decides the phase",
     ),
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "create_attached_session_actor_recovery_owned",
-        "attached-actor recovery discard: route through discard_member_session_with_release",
+        "in-attempt rollback: the member is Waking (or not yet seated), so a release would be Stale; the attempt's Retryable, Abandon or Failed verdict decides the phase",
     ),
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "discard_actor_then_roll_back_after_boundary",
-        "provision rollback discard: route through discard_member_session_with_release",
+        "in-attempt provision rollback: the member is Waking, so a release would be Stale; the attempt's verdict decides the phase",
     ),
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "cleanup",
-        "pending-provision cleanup discard: route through discard_member_session_with_release",
+        "pending-provision cleanup inside an open attempt or for an unseated spawn: a release would be Stale; the attempt's verdict decides the phase",
     ),
-    pending(
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "reload_degraded_runtime_registration",
-        "durability-reload discard: route through discard_member_session_with_release",
+        "durability reload keeps the registration: the reload's drift classification (ClassifyMemberLiveMaterialization, a counted fault path) moves the Live member to Waking under its own attempt",
     ),
 ];
 

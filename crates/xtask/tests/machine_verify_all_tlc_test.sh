@@ -499,6 +499,37 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${member_lifecycle_audit}" --mutants
 fi
 
+# MobMachine member residency (Dormant, Waking, Live) is empty in the ci
+# sweep, whose AgentIdentityValues are {}, so the residency invariants
+# (I1-I14) hold there only vacuously. A hand-written audit over the same
+# generated model checks four runs over their whole reachable space, under a
+# cap of two minted wake attempts and the member lifecycle audit's VIEW
+# (model_step_count and topology_epoch left out, checked first): one
+# identity through the build seed, the boot plan and seal, every WakeMember
+# arm, every attempt-fenced resolution and its stale twin in every phase, the
+# runtime-ready observation, every release shape, the drift and terminal
+# classifications, the peer notice classification and the mob's lifecycle
+# arms; one identity through an explicit resume; two identities and one
+# wiring edge (I8); and two identities from the spawn ladder's Opened phase
+# through the dormant seat (R5), the embodied spawn, the release (R12) and
+# the rotation. Under every generated invariant plus AP1 (no recovery or
+# seat arm overwrites a phase), AP2 (an open attempt is never replaced and
+# ends only Live, Dormant or without a phase, and every Waking member has an
+# enabled closing arm), AP3 (a Lifecycle input never wakes) and WakeMember
+# totality, with the I5 ASSUME over the wake refusal helper. It runs with TLC
+# coverage and requires every listed arm to fire and a floor of distinct
+# states, requires its seventeen witnesses reached, and refuses one seeded
+# defect per residency invariant and property (--mutants).
+member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
+if [[ ! -x "${member_residency_audit}" ]]; then
+  echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2
+  exit 1
+fi
+if run_part audits-c; then
+  echo "running member residency TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${member_residency_audit}" --mutants
+fi
+
 # The MobMachine arm-coverage gate: every arm of the generated model's Next
 # relation is either in a hand-written audit runner's covered_actions array
 # (each runner checks with TLC coverage that every listed arm fires) or named
@@ -626,7 +657,9 @@ run_machine_verify() {
 # audits-c = materialization-rollback keep with --mutants 185 (237),
 # run-start hold 144 (243), live media health 104 (153), requeue-across-stop
 # 90 (131), live-context causal-tail batch with --mutants 74 (110),
-# generation high-water with --mutants 38 (55): about 635 s (930 s).
+# generation high-water with --mutants 38 (55): about 635 s (930 s), plus
+# the member residency audit with --mutants, which joined audits-c as the
+# lightest shard and is not measured on hosted runners yet.
 # With the durable-tail recovery ownership and materialization-rollback keep
 # audits both in audits-b, that shard ran 1143 s on the pull request, past
 # the 1080 s execution budget, and hit the 20-minute job timeout on the
