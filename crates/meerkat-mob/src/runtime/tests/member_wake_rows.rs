@@ -823,6 +823,94 @@ async fn a_host_turn_to_a_released_member_wakes_it_and_runs_once() {
     fixture.finish().await;
 }
 
+/// A member whose runtime has no comms (its session builder makes none) has
+/// no peer endpoint and owes none, and needs no comms drain as an unwired
+/// turn-driven member: once released, a host turn wakes it like any member
+/// and it serves the turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_comms_less_member_wakes_and_serves() {
+    let handle = create_test_mob_with_persistent_service(with_unique_mob_id(
+        sample_definition(),
+        "wake-comms-less",
+    ))
+    .await;
+    let member = AgentIdentity::from(format!("comms-less-{}", Uuid::new_v4().simple()));
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let wait_residency = |expected: mob_dsl::MemberMaterializationPhase| {
+        let mut state = handle.machine_state_watch_rx.clone();
+        let key = key.clone();
+        async move {
+            tokio::time::timeout(
+                WAIT,
+                state.wait_for(|state| state.member_materialization.get(&key) == Some(&expected)),
+            )
+            .await
+            .expect("the member reaches the residency in time")
+            .expect("the machine state stays published");
+        }
+    };
+    tokio::time::timeout(
+        WAIT,
+        handle.spawn_with_options(
+            ProfileName::from("worker"),
+            member.clone(),
+            None,
+            Some(crate::MobRuntimeMode::TurnDriven),
+            None,
+        ),
+    )
+    .await
+    .expect("the spawn answers")
+    .expect("spawn a member whose runtime has no comms");
+    wait_residency(mob_dsl::MemberMaterializationPhase::Live).await;
+    assert!(
+        !handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_peer_endpoints
+            .contains_key(&key),
+        "a member whose runtime has no comms has no peer endpoint"
+    );
+
+    tokio::time::timeout(WAIT, handle.release_member(&member))
+        .await
+        .expect("the release answers")
+        .expect("release the quiescent member");
+    wait_residency(mob_dsl::MemberMaterializationPhase::Dormant).await;
+
+    let entry = handle
+        .get_member(&member)
+        .await
+        .expect("roster read")
+        .expect("a seated member");
+    let turn = tokio::time::timeout(
+        WAIT,
+        handle.start_work_with_mode(
+            entry.agent_runtime_id,
+            entry.fence_token,
+            WorkRef::new(),
+            WorkSpec::new("serve this turn", WorkOrigin::Internal),
+            HandlingMode::Queue,
+        ),
+    )
+    .await
+    .expect("the delivery is admitted in time")
+    .expect("the delivery wakes the member and is admitted");
+    tokio::time::timeout(WAIT, turn.wait())
+        .await
+        .expect("the turn finishes")
+        .expect("the woken member serves the turn");
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&key),
+        Some(&mob_dsl::MemberMaterializationPhase::Live)
+    );
+    let _ = tokio::time::timeout(WAIT, handle.shutdown()).await;
+}
+
 /// R26 (operator wake) and the attempt-keyed waiters (G13).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ensure_member_live_wakes_a_released_member_once_for_concurrent_callers() {

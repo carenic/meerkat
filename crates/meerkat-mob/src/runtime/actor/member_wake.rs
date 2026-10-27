@@ -344,18 +344,26 @@ pub(in crate::runtime) struct RunningMemberWake {
 
 /// Continuity intents by member, caught up from the mob's journal by cursor
 /// (the same fold `recorded_continuity_intents` makes over a full replay,
-/// without replaying the journal per wake).
+/// without replaying the journal per wake). It starts caught up to the
+/// journal the actor's start replayed, so a wake folds only the events
+/// appended since.
 pub(in crate::runtime) struct MemberContinuityIndex {
     last_cursor: u64,
     recorded: super::super::builder::RecordedContinuity,
 }
 
 impl MemberContinuityIndex {
-    fn new() -> Self {
-        Self {
+    /// The index caught up to `replayed`, the journal the actor's start
+    /// replayed.
+    fn seeded(replayed: &[MobEvent], mob_id: &MobId) -> Self {
+        let mut index = Self {
             last_cursor: 0,
             recorded: HashMap::new(),
+        };
+        for event in replayed {
+            index.fold(event, mob_id);
         }
+        index
     }
 
     const PAGE: usize = 256;
@@ -369,37 +377,41 @@ impl MemberContinuityIndex {
         loop {
             let batch = events.poll(self.last_cursor, Self::PAGE).await?;
             let complete = batch.len() < Self::PAGE;
-            for event in batch {
-                self.last_cursor = event.cursor;
-                if &event.mob_id != mob_id {
-                    continue;
-                }
-                match &event.kind {
-                    MobEventKind::MobReset => self.recorded.clear(),
-                    MobEventKind::MemberSpawned(spawned) => {
-                        self.recorded.insert(
-                            spawned.agent_identity.clone(),
-                            (spawned.generation, spawned.continuity_intent.clone()),
-                        );
-                    }
-                    MobEventKind::MemberReset {
-                        agent_identity,
-                        previous_generation,
-                        new_generation,
-                        ..
-                    } => {
-                        if let Some((generation, _)) = self.recorded.get_mut(agent_identity)
-                            && *generation == *previous_generation
-                        {
-                            *generation = *new_generation;
-                        }
-                    }
-                    _ => {}
-                }
+            for event in &batch {
+                self.fold(event, mob_id);
             }
             if complete {
                 return Ok(());
             }
+        }
+    }
+
+    fn fold(&mut self, event: &MobEvent, mob_id: &MobId) {
+        self.last_cursor = self.last_cursor.max(event.cursor);
+        if &event.mob_id != mob_id {
+            return;
+        }
+        match &event.kind {
+            MobEventKind::MobReset => self.recorded.clear(),
+            MobEventKind::MemberSpawned(spawned) => {
+                self.recorded.insert(
+                    spawned.agent_identity.clone(),
+                    (spawned.generation, spawned.continuity_intent.clone()),
+                );
+            }
+            MobEventKind::MemberReset {
+                agent_identity,
+                previous_generation,
+                new_generation,
+                ..
+            } => {
+                if let Some((generation, _)) = self.recorded.get_mut(agent_identity)
+                    && *generation == *previous_generation
+                {
+                    *generation = *new_generation;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -447,16 +459,29 @@ pub(in crate::runtime) struct MemberWakes {
     /// The concrete provisioner B4's cold recipe runs on.
     pub(in crate::runtime) provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
     pub(in crate::runtime) continuity: MemberContinuityIndex,
-    /// Consecutive owed-boot retries per member (backoff state).
-    owed_retries: BTreeMap<AgentIdentity, u32>,
+    /// Owed-boot retry state per member: the backoff step, and whether its
+    /// one retry timer is armed.
+    owed_retries: BTreeMap<AgentIdentity, OwedMemberWakeRetry>,
+}
+
+/// One member's owed-boot retry: consecutive retries (the backoff step) and
+/// whether a retry timer is armed. A member has at most one armed timer, so
+/// two refusals before it fires do not step the backoff twice.
+#[derive(Debug, Default)]
+struct OwedMemberWakeRetry {
+    retries: u32,
+    armed: bool,
 }
 
 impl MemberWakes {
+    /// `replayed` is the journal the actor's start replayed: the continuity
+    /// index starts caught up to it.
     pub(in crate::runtime) fn new(
         provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
         mob_id: &MobId,
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
+        replayed: &[MobEvent],
     ) -> Result<Self, MobError> {
         let namespace = meerkat_core::mob_realm_id(mob_id.as_str())
             .map_err(|error| {
@@ -477,7 +502,7 @@ impl MemberWakes {
             running: BTreeMap::new(),
             ingress: VecDeque::new(),
             provisioner,
-            continuity: MemberContinuityIndex::new(),
+            continuity: MemberContinuityIndex::seeded(replayed, mob_id),
             owed_retries: BTreeMap::new(),
         })
     }
@@ -1430,17 +1455,32 @@ impl MobActor {
             Some(mob_dsl::MemberMaterializationPhase::Dormant)
         );
         if !owed || !dormant {
-            self.member_wakes.owed_retries.remove(identity);
+            // Nothing to retry now; the backoff restarts at the next owed
+            // refusal. An armed timer stays the member's one timer.
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.member_wakes.owed_retries.entry(identity.clone())
+            {
+                if entry.get().armed {
+                    entry.get_mut().retries = 0;
+                } else {
+                    entry.remove();
+                }
+            }
             return;
         }
         let backoff = self.member_residency.owed_wake_retry;
-        let retries = self
+        let retry = self
             .member_wakes
             .owed_retries
             .entry(identity.clone())
-            .or_insert(0);
-        let delay = backoff.delay(*retries);
-        *retries = retries.saturating_add(1);
+            .or_default();
+        if retry.armed {
+            // Its timer is already armed: the retry it fires covers this one.
+            return;
+        }
+        let delay = backoff.delay(retry.retries);
+        retry.retries = retry.retries.saturating_add(1);
+        retry.armed = true;
         let command_tx = self.command_tx.clone();
         let agent_identity = identity.clone();
         self.actor_io_tasks.spawn(async move {
@@ -1472,6 +1512,10 @@ impl MobActor {
     /// An owed-boot retry is due: wake the member for its boot work again,
     /// unless its obligation is gone or a delivery already woke it.
     pub(in crate::runtime) async fn retry_owed_member_wake(&mut self, identity: AgentIdentity) {
+        // This is the member's armed timer firing.
+        if let Some(retry) = self.member_wakes.owed_retries.get_mut(&identity) {
+            retry.armed = false;
+        }
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&identity);
         let owed = state
@@ -1672,12 +1716,28 @@ impl MobActor {
         }
     }
 
-    /// The release's preconditions, read on the actor: the member, its local
-    /// session and its runtime owner. `None` when nothing is materialized.
+    /// The release, as MobMachine classifies it (`ClassifyMemberRelease`),
+    /// realized on the actor: the member's local session and its runtime
+    /// owner when it releases, `None` when nothing is materialized.
     async fn prepare_member_release(
-        &self,
+        &mut self,
         identity: &AgentIdentity,
     ) -> Result<Option<MemberReleaseTarget>, MobError> {
+        let verdict = self.classify_member_release(identity)?;
+        match verdict {
+            mob_dsl::MemberReleaseVerdict::Release | mob_dsl::MemberReleaseVerdict::HostOwned => {}
+            mob_dsl::MemberReleaseVerdict::NotAMember => {
+                return Err(MobError::MemberNotFound(identity.clone()));
+            }
+            mob_dsl::MemberReleaseVerdict::WakeInFlight => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("member wake of '{identity}'"),
+                });
+            }
+            // Dormant, or not materialized at all (Broken, retiring): nothing
+            // is materialized here to release.
+            mob_dsl::MemberReleaseVerdict::NothingMaterialized => return Ok(None),
+        }
         let entry = self
             .roster
             .read()
@@ -1685,26 +1745,11 @@ impl MobActor {
             .get(identity)
             .cloned()
             .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
-        if super::super::member_runtime_is_host_owned(self.dsl_authority.state(), identity) {
+        if verdict == mob_dsl::MemberReleaseVerdict::HostOwned {
             return Err(MobError::UnsupportedForMode {
                 mode: entry.runtime_mode,
                 reason: "a placed member's materialization is owned by its member host".to_string(),
             });
-        }
-        match self
-            .dsl_authority
-            .state()
-            .member_materialization
-            .get(&mob_dsl::AgentIdentity::from_domain(identity))
-        {
-            Some(mob_dsl::MemberMaterializationPhase::Live) => {}
-            Some(mob_dsl::MemberMaterializationPhase::Waking) => {
-                return Err(MobError::LifecycleOperationPending {
-                    intent: format!("member wake of '{identity}'"),
-                });
-            }
-            // Dormant, or no phase (Broken): nothing is materialized here.
-            Some(mob_dsl::MemberMaterializationPhase::Dormant) | None => return Ok(None),
         }
         let member_ref = self.machine_member_ref_for_behavior(&entry, "release member")?;
         let session_id = member_ref.bridge_session_id().cloned().ok_or_else(|| {
@@ -1799,6 +1844,36 @@ impl MobActor {
         )
     }
 
+    /// MobMachine's release verdict for `identity` (`ClassifyMemberRelease`,
+    /// a pure verdict legal in every phase the actor serves).
+    fn classify_member_release(
+        &mut self,
+        identity: &AgentIdentity,
+    ) -> Result<mob_dsl::MemberReleaseVerdict, MobError> {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        let transition = self.apply_dsl_input_collect_transition(
+            mob_dsl::MobMachineInput::ClassifyMemberRelease {
+                agent_identity: dsl_identity.clone(),
+            },
+            "classify_member_release",
+        )?;
+        transition
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::MemberReleaseClassified {
+                    agent_identity,
+                    verdict,
+                } if agent_identity == &dsl_identity => Some(*verdict),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "MobMachine classified no release of member '{identity}'"
+                ))
+            })
+    }
+
     /// Whether `attempt` is still `identity`'s open wake attempt.
     pub(in crate::runtime) fn member_wake_attempt_is_open(
         &self,
@@ -1861,5 +1936,98 @@ async fn release_member_registration(
         Err(error) => Err(MobError::Internal(format!(
             "release of member '{identity}' could not close its registration: {error}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod continuity_index_tests {
+    use super::*;
+    use crate::event::{MemberSpawnedEvent, NewMobEvent};
+    use crate::ids::{FenceToken, Generation, ProfileName};
+    use crate::store::InMemoryMobEventStore;
+
+    fn spawned(identity: &AgentIdentity, generation: Generation) -> MobEventKind {
+        let mut spawned = MemberSpawnedEvent::new(
+            identity.clone(),
+            generation,
+            FenceToken::new(1),
+            crate::ids::AgentRuntimeId::new(identity.clone(), generation),
+            ProfileName::from("worker"),
+        );
+        spawned.continuity_intent = crate::runtime::SpawnContinuityIntent::DurableIdentity {
+            continuity_key: identity.as_str().to_string(),
+        };
+        MobEventKind::MemberSpawned(spawned)
+    }
+
+    /// The index an actor start seeds from its replay holds what the full
+    /// journal fold holds, at the replay's last cursor, so a wake after the
+    /// start folds only the events appended since (here a reset carrying a
+    /// member's spawn to its next generation).
+    #[tokio::test]
+    async fn a_seeded_continuity_index_folds_only_the_events_appended_after_the_start() {
+        let mob_id = MobId::from("continuity-seed");
+        let first = AgentIdentity::from("worker-1");
+        let second = AgentIdentity::from("worker-2");
+        let store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        for kind in [
+            spawned(&first, Generation::new(0)),
+            spawned(&second, Generation::new(0)),
+        ] {
+            store
+                .append(NewMobEvent::for_test(mob_id.clone(), kind))
+                .await
+                .expect("append a spawn");
+        }
+        let replayed = store.replay_all().await.expect("replay the journal");
+        let mut index = MemberContinuityIndex::seeded(&replayed, &mob_id);
+        assert_eq!(
+            index.last_cursor,
+            store.latest_cursor().await.expect("latest cursor"),
+            "the seeded index starts at the replay's last cursor"
+        );
+        assert_eq!(
+            index.recorded,
+            crate::runtime::builder::recorded_continuity_intents(&replayed),
+            "the seed holds what the full journal fold holds"
+        );
+
+        store
+            .append(NewMobEvent::for_test(
+                mob_id.clone(),
+                MobEventKind::MemberReset {
+                    agent_identity: first.clone(),
+                    previous_generation: Generation::new(0),
+                    new_generation: Generation::new(1),
+                    fence_token: FenceToken::new(2),
+                    agent_runtime_id: crate::ids::AgentRuntimeId::new(
+                        first.clone(),
+                        Generation::new(1),
+                    ),
+                },
+            ))
+            .await
+            .expect("append a reset");
+        index
+            .refresh(&store, &mob_id)
+            .await
+            .expect("refresh the index");
+        let journal = store.replay_all().await.expect("replay the journal");
+        assert_eq!(
+            index.recorded,
+            crate::runtime::builder::recorded_continuity_intents(&journal),
+            "the refresh folds the appended reset"
+        );
+        assert_eq!(
+            index
+                .slice_for(&first)
+                .get(&first)
+                .map(|(generation, _)| *generation),
+            Some(Generation::new(1))
+        );
+        assert_eq!(
+            index.last_cursor,
+            store.latest_cursor().await.expect("latest cursor")
+        );
     }
 }

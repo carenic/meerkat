@@ -10286,6 +10286,7 @@ impl MobBuilder {
                 &definition.id,
                 command_tx.clone(),
                 machine_state_watch_tx.subscribe(),
+                &durable_events,
             )?;
             let mut actor = MobActor {
                 definition,

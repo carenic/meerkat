@@ -361,7 +361,9 @@ impl std::fmt::Display for MemberRuntimeDetachment {
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum MemberWakeRefusal {
-    /// The member is being retired.
+    /// The member is being retired. Its token is the peer-message wire's,
+    /// `member_retiring`.
+    #[serde(rename = "member_retiring")]
     Retiring,
     /// The member is placed on a member host, which owns its materialization.
     HostOwned,
@@ -406,7 +408,7 @@ impl MemberWakeRefusal {
     /// Stable snake_case token.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::Retiring => "retiring",
+            Self::Retiring => "member_retiring",
             Self::HostOwned => "host_owned",
             Self::MobNotRunning => "mob_not_running",
             Self::LifecycleOriginFenced => "lifecycle_origin_fenced",
@@ -3080,11 +3082,14 @@ impl MobError {
                 // A refused member wake: the member's runtime could not be
                 // made available now (retry later), is held by its own
                 // lifecycle (busy), or is never materialized here.
+                // The member will not run for this delivery: its mob is not
+                // running or is quiescing, or the member is being retired.
+                // The data's `retryable` says whether a later delivery can
+                // succeed.
                 Self::MemberWakeRefused { refusal, .. } => Some(match refusal {
-                    MemberWakeRefusal::Retiring | MemberWakeRefusal::LifecycleOriginFenced => {
-                        meerkat_contracts::ErrorCode::SessionBusy
-                    }
-                    MemberWakeRefusal::MobNotRunning => {
+                    MemberWakeRefusal::Retiring
+                    | MemberWakeRefusal::LifecycleOriginFenced
+                    | MemberWakeRefusal::MobNotRunning => {
                         meerkat_contracts::ErrorCode::SessionNotRunning
                     }
                     MemberWakeRefusal::HostOwned

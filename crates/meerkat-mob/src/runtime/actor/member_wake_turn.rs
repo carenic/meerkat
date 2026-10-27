@@ -758,7 +758,10 @@ impl MobActor {
         Ok(())
     }
 
-    /// Readiness: the woken member's comms drain.
+    /// Readiness: the woken member's comms drain, required as a spawn
+    /// requires it. An autonomous member and a wired member need their
+    /// drain; an unwired turn-driven member whose runtime has no comms has
+    /// none, and wakes without one.
     async fn dispatch_member_wake_readiness(
         &mut self,
         run: WakeRun,
@@ -768,6 +771,8 @@ impl MobActor {
             self.roll_back_member_wake(run, rollback);
             return;
         };
+        let drain_required = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost
+            || self.member_has_machine_wiring(&run.identity);
         let readiness = self.detached_member_readiness_context();
         let identity = run.identity.clone();
         let member_ref = entry.member_ref.clone();
@@ -777,13 +782,32 @@ impl MobActor {
             rollback,
             "member_wake_readiness",
             async move {
-                WakeStep::Ready(
+                WakeStep::Ready(if drain_required {
                     readiness
                         .ensure_mob_comms_drain(&identity, &member_ref)
-                        .await,
-                )
+                        .await
+                } else {
+                    readiness
+                        .ensure_mob_comms_drain_if_comms(&identity, &member_ref)
+                        .await
+                })
             },
         );
+    }
+
+    /// Whether MobMachine holds a wiring edge of `identity` (to a member or
+    /// to an external peer).
+    fn member_has_machine_wiring(&self, identity: &AgentIdentity) -> bool {
+        let local = mob_dsl::AgentIdentity::from_domain(identity);
+        let state = self.dsl_authority.state();
+        state
+            .wiring_edges
+            .iter()
+            .any(|edge| edge.a == local || edge.b == local)
+            || state
+                .external_peer_edges_by_key
+                .values()
+                .any(|edge| edge.local == local)
     }
 
     async fn member_wake_ready(
@@ -1439,6 +1463,24 @@ async fn live_member_endpoint(
 ) -> WakeEndpoint {
     let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
     live_member_endpoint_for_ref(provisioner, definition, entry, &member_ref).await
+}
+
+impl super::DetachedMemberReadinessContext {
+    /// The member's comms drain when its runtime has comms; nothing when it
+    /// has none (as a turn-driven spawn binds it).
+    async fn ensure_mob_comms_drain_if_comms(
+        &self,
+        agent_identity: &AgentIdentity,
+        member_ref: &MemberRef,
+    ) -> Result<(), MobError> {
+        if self.runtime_adapter.is_none()
+            || self.provisioner.comms_runtime(member_ref).await.is_none()
+        {
+            return Ok(());
+        }
+        self.ensure_mob_comms_drain(agent_identity, member_ref)
+            .await
+    }
 }
 
 /// The endpoint the member's live comms runtime presents, as a boot reads

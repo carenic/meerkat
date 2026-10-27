@@ -59,6 +59,7 @@ from .generated.types import (
     CommsSendErrorDataSendFailed as CommsSendErrorDataSendFailed,
     CommsSendRequiredAction as CommsSendRequiredAction,
     PeerWakeRefusal as PeerWakeRefusal,
+    DurableResumeHold as DurableResumeHold,
     GoalAttentionTarget as GoalAttentionTarget,
     GoalStatusRequest as GoalStatusRequest,
     GoalStatusResult as GoalStatusResult,
