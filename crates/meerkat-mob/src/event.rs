@@ -213,7 +213,9 @@ impl<'de> Deserialize<'de> for MemberRef {
 // `MemberSpawnedEvent.runtime_mode` are required.
 // v9: stored member lifecycle events may carry the internal canonical
 // `placed_spawn_id` ABA fence and exact peer endpoints; public event payloads
-// still exclude every replay-only field.
+// still exclude every replay-only field. A stored `MemberSpawned` may also
+// carry the internal `kickoff_prompt` of the kickoff its incarnation owes; a
+// reader that predates it ignores it.
 const CURRENT_STORED_MOB_EVENT_SCHEMA_VERSION: u32 = 9;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1105,6 +1107,15 @@ pub struct MemberSpawnedEvent {
     /// event surfaces.
     #[serde(skip, default)]
     pub(crate) direct_member_fence: Option<BridgeDirectMemberFence>,
+    /// The prompt of the kickoff this incarnation owes, when its spec named
+    /// one: a rotation records the next incarnation's kickoff pending
+    /// (`MemberKickoffUpdated`), and the kickoff runs this prompt once the
+    /// incarnation is live, in this process or after a restart. Absent, an
+    /// owed kickoff runs the role's fallback prompt. Stored only by the
+    /// internal event codec, like `bridge_member_ref`; journals written
+    /// before it decode it as absent.
+    #[serde(skip, default)]
+    pub(crate) kickoff_prompt: Option<meerkat_core::types::ContentInput>,
 }
 
 impl MemberSpawnedEvent {
@@ -1136,7 +1147,20 @@ impl MemberSpawnedEvent {
             placed_spawn_id: None,
             member_peer_endpoint: None,
             direct_member_fence: None,
+            kickoff_prompt: None,
         }
+    }
+
+    pub(crate) fn with_kickoff_prompt(
+        mut self,
+        kickoff_prompt: Option<meerkat_core::types::ContentInput>,
+    ) -> Self {
+        self.kickoff_prompt = kickoff_prompt;
+        self
+    }
+
+    pub(crate) fn kickoff_prompt(&self) -> Option<&meerkat_core::types::ContentInput> {
+        self.kickoff_prompt.as_ref()
     }
 
     pub(crate) fn with_bridge_member_ref(mut self, bridge_member_ref: Option<MemberRef>) -> Self {
@@ -1451,6 +1475,15 @@ pub(crate) fn encode_stored_mob_event(event: &MobEvent) -> Result<Vec<u8>, serde
             serde_json::to_value(direct_member_fence)?,
         );
     }
+    if let Some(member_spawned) = event.kind.member_spawned()
+        && let Some(kickoff_prompt) = member_spawned.kickoff_prompt()
+        && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
+    {
+        kind.insert(
+            "kickoff_prompt".to_string(),
+            serde_json::to_value(kickoff_prompt)?,
+        );
+    }
     if let Some(recovered) = event.kind.member_session_binding_recovered()
         && let Some(bridge_session_id) = recovered.bridge_session_id()
         && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
@@ -1599,6 +1632,18 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
         })
         .map(serde_json::from_value)
         .transpose()?;
+    let spawned_kickoff_prompt = value
+        .get_mut("kind")
+        .and_then(Value::as_object_mut)
+        .and_then(|kind| {
+            if kind.get("type").and_then(Value::as_str) == Some("member_spawned") {
+                kind.remove("kickoff_prompt")
+            } else {
+                None
+            }
+        })
+        .map(serde_json::from_value)
+        .transpose()?;
     let recovered_bridge_session_id = value
         .get_mut("kind")
         .and_then(Value::as_object_mut)
@@ -1710,6 +1755,11 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
         && let Some(member_spawned) = event.kind.member_spawned_mut()
     {
         member_spawned.direct_member_fence = Some(direct_member_fence);
+    }
+    if let Some(kickoff_prompt) = spawned_kickoff_prompt
+        && let Some(member_spawned) = event.kind.member_spawned_mut()
+    {
+        member_spawned.kickoff_prompt = Some(kickoff_prompt);
     }
     if let Some(bridge_session_id) = recovered_bridge_session_id
         && let Some(recovered) = event.kind.member_session_binding_recovered_mut()
@@ -2169,6 +2219,60 @@ mod tests {
                 );
                 assert_eq!(member_spawned.placed_spawn_id(), Some(&placed_spawn_id));
                 assert_eq!(member_spawned.member_peer_endpoint(), Some(&endpoint));
+            }
+            other => panic!("expected MemberSpawned, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_stored_member_spawned_roundtrip_preserves_the_owed_kickoff_prompt() {
+        let sid = SessionId::from_uuid(Uuid::nil());
+        let identity = AgentIdentity::from("rotated");
+        let prompt = meerkat_core::types::ContentInput::from("start the owed work");
+        let event = MobEvent {
+            cursor: 1,
+            timestamp: Utc::now(),
+            mob_id: MobId::from("test-mob"),
+            kind: MobEventKind::MemberSpawned(
+                MemberSpawnedEvent::new(
+                    identity.clone(),
+                    Generation::new(1),
+                    FenceToken::new(2),
+                    AgentRuntimeId::new(identity, Generation::new(1)),
+                    ProfileName::from("worker"),
+                )
+                .with_bridge_member_ref(Some(MemberRef::from_bridge_session_id(sid)))
+                .with_kickoff_prompt(Some(prompt.clone())),
+            ),
+        };
+
+        let public = serde_json::to_value(&event).expect("public event payload");
+        assert!(
+            public["kind"].get("kickoff_prompt").is_none(),
+            "the public event never carries the kickoff prompt"
+        );
+        let encoded = encode_stored_mob_event(&event).expect("encode");
+        let mut stored: serde_json::Value = serde_json::from_slice(&encoded).expect("parse");
+        assert_eq!(stored["schema_version"], 9);
+        assert!(stored["event"]["kind"].get("kickoff_prompt").is_some());
+        match decode_stored_mob_event(&encoded).expect("decode").kind {
+            MobEventKind::MemberSpawned(member_spawned) => {
+                assert_eq!(member_spawned.kickoff_prompt(), Some(&prompt));
+            }
+            other => panic!("expected MemberSpawned, got {other:?}"),
+        }
+
+        // A journal written before the field decodes it as absent.
+        let removed = stored
+            .get_mut("event")
+            .and_then(|event| event.get_mut("kind"))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|kind| kind.remove("kickoff_prompt"));
+        assert!(removed.is_some());
+        let legacy = serde_json::to_vec(&stored).expect("encode without the prompt");
+        match decode_stored_mob_event(&legacy).expect("decode").kind {
+            MobEventKind::MemberSpawned(member_spawned) => {
+                assert_eq!(member_spawned.kickoff_prompt(), None);
             }
             other => panic!("expected MemberSpawned, got {other:?}"),
         }

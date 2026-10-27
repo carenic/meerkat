@@ -92,6 +92,15 @@ impl RosterAuthority {
         self.roster.get_by_identity(identity)
     }
 
+    /// The prompt of the kickoff the current incarnation of `identity` owes,
+    /// when its spawn row named one ([`Roster::owed_kickoff_prompt`]).
+    pub(crate) fn owed_kickoff_prompt(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<&meerkat_core::types::ContentInput> {
+        self.roster.owed_kickoff_prompt(identity)
+    }
+
     pub(crate) fn list(&self) -> impl Iterator<Item = &RosterEntry> {
         self.roster.list()
     }

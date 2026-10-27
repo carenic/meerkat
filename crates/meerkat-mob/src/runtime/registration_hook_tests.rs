@@ -2023,12 +2023,15 @@ async fn resume_after_crash(
     let machine = governed_machine(&restarted);
     crash_stop_and_release_routes(handle).await;
     drop(service);
+    // The rows assert what the start's restore asks the host, so the start
+    // materializes the member.
     let builder = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         Arc::clone(events),
         Arc::clone(runtime_metadata),
     ))
     .with_session_service(restarted.clone())
-    .with_member_runtime_registration_hook(host);
+    .with_member_runtime_registration_hook(host)
+    .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager);
     let builder = match customizer {
         Some(customizer) => builder.with_spawn_member_customizer(customizer),
         None => builder,
@@ -2666,6 +2669,8 @@ async fn recreated_mob(second_boot: Arc<SelectingHost>) -> RecreatedMob {
     let machine = governed_machine(&restarted);
     crash_stop_and_release_routes(handle).await;
     drop(service);
+    // The rows assert the members the start recreates, so the start
+    // materializes every member.
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
@@ -2673,6 +2678,7 @@ async fn recreated_mob(second_boot: Arc<SelectingHost>) -> RecreatedMob {
     .with_session_service(restarted)
     .with_member_runtime_registration_hook(second_boot)
     .allow_ephemeral_sessions(true)
+    .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("the boot recreates every member; a host refusal breaks only the member refused");

@@ -124,20 +124,29 @@ impl MobActor {
     }
 
     /// MobMachine's verdict on one lifecycle notice from `sender` to
-    /// `recipient` (R4), realized through the notice consumer: true only
-    /// for `Deliver`. A notice that is not delivered is skipped because of
-    /// that verdict, never because of the recipient's endpoint.
+    /// `recipient`, realized through the notice consumer: true only for
+    /// `Deliver`. A notice that is not delivered is skipped because of that
+    /// verdict, never because of the recipient's endpoint.
     pub(super) fn lifecycle_notice_delivers(
         &mut self,
         recipient: &AgentIdentity,
         sender: &AgentIdentity,
     ) -> Result<bool, MobError> {
+        self.peer_notice_delivers(recipient, sender, mob_dsl::PeerInputClass::Lifecycle)
+    }
+
+    /// MobMachine's verdict on one notice of `class` from `sender` to
+    /// `recipient`: true only for `Deliver`. A kickoff status notice is
+    /// content: it is delivered like a message, and its delivery wakes a
+    /// recipient that is not materialized through its wake route.
+    pub(super) fn peer_notice_delivers(
+        &mut self,
+        recipient: &AgentIdentity,
+        sender: &AgentIdentity,
+        class: mob_dsl::PeerInputClass,
+    ) -> Result<bool, MobError> {
         Ok(matches!(
-            self.realize_peer_notice_disposition(
-                recipient,
-                sender,
-                mob_dsl::PeerInputClass::Lifecycle,
-            )?,
+            self.realize_peer_notice_disposition(recipient, sender, class)?,
             super::member_wake::PeerNoticeRealization::Deliver
         ))
     }

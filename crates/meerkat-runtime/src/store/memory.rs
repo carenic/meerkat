@@ -253,9 +253,23 @@ fn sync_runtime_session_catalog_lifecycle(
     }
 }
 
-/// The boot facts of runtime `rt` as `inner` holds them. The host store
-/// adapter pins exactly these in the runtime's head.
-fn boot_facts(inner: &Inner, rt: &str) -> BootFactsV1 {
+/// The boot facts of runtime `rt` as `inner` and `ops` hold them. The host
+/// store adapter pins exactly these in the runtime's head.
+fn boot_facts(inner: &Inner, ops: &OpsLifecycleState, rt: &str) -> BootFactsV1 {
+    let mut facts = row_boot_facts(inner, rt);
+    // Work the runtime's ops lifecycle snapshot owes (an undelivered
+    // background operation completion, a running detached job wait) is
+    // pending work, as a nonterminal input is.
+    facts.nonterminal |= ops
+        .snapshots
+        .get(rt)
+        .is_some_and(PersistedOpsSnapshot::holds_recovery_work);
+    facts
+}
+
+/// The boot facts of runtime `rt` from its input and tail rows alone, without
+/// its ops lifecycle snapshot.
+fn row_boot_facts(inner: &Inner, rt: &str) -> BootFactsV1 {
     BootFactsV1 {
         v: BootFactsV1::VERSION,
         nonterminal: inner
@@ -274,11 +288,11 @@ fn boot_facts(inner: &Inner, rt: &str) -> BootFactsV1 {
     }
 }
 
-/// Every runtime `inner` holds whose facts carry recovery work
+/// Every runtime `inner` and `ops` hold whose facts carry recovery work
 /// ([`runtime_has_recovery_obligation`]), in runtime id order. A runtime
 /// carries work only through the maps read here, so their keys are the
 /// candidates.
-fn runtimes_with_recovery_work(inner: &Inner) -> Vec<LogicalRuntimeId> {
+fn runtimes_with_recovery_work(inner: &Inner, ops: &OpsLifecycleState) -> Vec<LogicalRuntimeId> {
     let candidates: BTreeSet<&str> = inner
         .input_states
         .keys()
@@ -286,13 +300,14 @@ fn runtimes_with_recovery_work(inner: &Inner) -> Vec<LogicalRuntimeId> {
         .chain(inner.recovery_nonterminal_inputs.keys())
         .chain(inner.whole_blob_provisional_tails.keys())
         .chain(inner.runtime_lifecycle.keys())
+        .chain(ops.snapshots.keys())
         .map(String::as_str)
         .collect();
     candidates
         .into_iter()
         .filter(|rt| {
             runtime_has_recovery_obligation(
-                &boot_facts(inner, rt),
+                &boot_facts(inner, ops, rt),
                 inner.runtime_lifecycle.get(*rt).map(Vec::as_slice),
                 inner.session_catalog.get(*rt),
             )
@@ -3170,12 +3185,17 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .collect())
     }
 
-    /// The facts of every runtime the store holds, read under its one lock.
+    /// The facts of every runtime the store holds, read under its locks:
+    /// `inner`, then the ops lifecycle state.
     async fn list_runtimes_with_recovery_work(
         &self,
     ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
         let inner = self.inner.lock().await;
-        Ok(runtimes_with_recovery_work(&inner))
+        let ops = self
+            .ops_lifecycle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        Ok(runtimes_with_recovery_work(&inner, &ops))
     }
 
     async fn list_runtime_delivery_records(

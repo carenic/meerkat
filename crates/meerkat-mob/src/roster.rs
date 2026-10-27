@@ -191,6 +191,12 @@ pub struct Roster {
     entries: BTreeMap<AgentIdentity, RosterEntry>,
     #[serde(skip)]
     pub(crate) creation_history: std::sync::Arc<crate::member_creation::MemberCreationProjection>,
+    /// The prompt of the kickoff each member's incarnation owes, with that
+    /// incarnation's generation, from its `MemberSpawned` row
+    /// (`MemberSpawnedEvent::kickoff_prompt`). MobMachine owns whether the
+    /// kickoff is still owed; this is only its content.
+    #[serde(skip)]
+    owed_kickoff_prompts: BTreeMap<AgentIdentity, (Generation, meerkat_core::types::ContentInput)>,
 }
 
 impl Roster {
@@ -251,6 +257,18 @@ impl Roster {
                     fork_source: member_spawned.fork_source.clone(),
                     fork_overlay: member_spawned.fork_overlay,
                 });
+                match member_spawned.kickoff_prompt() {
+                    Some(prompt) => {
+                        self.owed_kickoff_prompts.insert(
+                            member_spawned.agent_identity.clone(),
+                            (member_spawned.generation, prompt.clone()),
+                        );
+                    }
+                    None => {
+                        self.owed_kickoff_prompts
+                            .remove(&member_spawned.agent_identity);
+                    }
+                }
             }
             // Retirement admission is not roster terminality. Keep the spawn
             // projection intact so a restart retains the cleanup anchor.
@@ -270,6 +288,13 @@ impl Roster {
                     .is_some_and(|entry| entry.generation == *generation)
                 {
                     self.remove_by_identity(agent_identity);
+                }
+                if self
+                    .owed_kickoff_prompts
+                    .get(agent_identity)
+                    .is_some_and(|(owed, _)| owed == generation)
+                {
+                    self.owed_kickoff_prompts.remove(agent_identity);
                 }
             }
             MobEventKind::RespawnTopologyAbandoned { agent_identity, .. } => {
@@ -381,6 +406,7 @@ impl Roster {
             }
             MobEventKind::MobReset => {
                 self.entries.clear();
+                self.owed_kickoff_prompts.clear();
             }
             _ => {}
         }
@@ -422,6 +448,7 @@ impl Roster {
     pub(crate) fn from_projected_entries(entries: impl IntoIterator<Item = RosterEntry>) -> Self {
         let mut projected = Self {
             creation_history: Default::default(),
+            owed_kickoff_prompts: BTreeMap::new(),
             entries: entries
                 .into_iter()
                 .map(|entry| (entry.agent_identity.clone(), entry))
@@ -515,6 +542,17 @@ impl Roster {
     #[doc(hidden)]
     pub fn get(&self, agent_identity: &AgentIdentity) -> Option<&RosterEntry> {
         self.entries.get(agent_identity)
+    }
+
+    /// The prompt of the kickoff the current incarnation of `agent_identity`
+    /// owes, when its `MemberSpawned` row named one. Whether the kickoff is
+    /// still owed is MobMachine's (`member_kickoff_pending`).
+    pub(crate) fn owed_kickoff_prompt(
+        &self,
+        agent_identity: &AgentIdentity,
+    ) -> Option<&meerkat_core::types::ContentInput> {
+        let (generation, prompt) = self.owed_kickoff_prompts.get(agent_identity)?;
+        (self.entries.get(agent_identity)?.generation == *generation).then_some(prompt)
     }
 
     /// Get a mutable roster entry by identity.

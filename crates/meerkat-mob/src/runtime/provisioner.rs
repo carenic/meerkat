@@ -1588,7 +1588,7 @@ pub trait MobProvisioner: Send + Sync {
     ) -> Result<MemberSpawnReceipt, MobError>;
 
     /// Create a fresh member's empty durable session without materializing
-    /// the member: a dormant seat's session (design R14). `create_session`
+    /// the member: a dormant seat's session. `create_session`
     /// is the create request a fresh spawn sends, already carrying the
     /// session's pre-assigned id; the session is persisted by the same
     /// session-service create a fresh spawn's provision runs, with no

@@ -1,6 +1,8 @@
 use super::*;
 
 mod before_activation;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod boot_obligation_rows;
 #[cfg(feature = "openai-live")]
 mod existing_live_delegation;
 mod historical_metadata;
@@ -21106,6 +21108,8 @@ async fn test_a_host_holds_exactly_the_restored_members_it_lists() {
         crate::HostRunStartHoldReason::ToolsNotPublished,
         [listed.clone()],
     )
+    // The row reads each restored member's registration right after the start.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("restore the stopped mob");
@@ -21213,6 +21217,8 @@ async fn assert_stopped_restart_resume_publishes_preserved_member_peer_endpoint(
     ))
     .with_session_service(service.clone())
     .notify_orchestrator_on_resume(false)
+    // The row reads the restored member's live comms trust right after the resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("reconstruct stopped mob");
@@ -21398,6 +21404,8 @@ async fn test_stopped_cold_restart_resume_breaks_only_the_member_with_a_changed_
     ))
     .with_session_service(restarted.clone())
     .notify_orchestrator_on_resume(false)
+    // The endpoint mismatch is found by the restore, so every member is restored.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("reconstruct stopped mob");
@@ -21450,6 +21458,8 @@ async fn test_stopped_cold_restart_resume_breaks_only_the_member_with_a_changed_
     ))
     .with_session_service(second)
     .notify_orchestrator_on_resume(false)
+    // The endpoint mismatch is found by the restore, so every member is restored.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("a Running cold boot with one Broken member still boots the mob");
@@ -21564,6 +21574,8 @@ async fn test_running_cold_restart_breaks_only_the_member_with_a_changed_endpoin
     ))
     .with_session_service(restarted)
     .notify_orchestrator_on_resume(false)
+    // The endpoint mismatch is found by the restore, so every member is restored.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("one member's endpoint mismatch must not abort the Running cold boot");
@@ -31149,6 +31161,8 @@ async fn fork_child_restored_by_explicit_resume_is_built_as_its_source() {
         .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
             source: source_identity.clone(),
         }))
+        // The row checks the restore-time rebuild of the fork child and its source.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -31359,6 +31373,8 @@ async fn fork_child_restored_after_a_crash_is_built_as_its_source() {
         .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
             source: source_identity.clone(),
         }))
+        // The row checks the restore-time rebuild of the fork child and its source.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -31389,6 +31405,8 @@ async fn restart_with_identity_overlays(
         .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
             source: source_identity.clone(),
         }))
+        // The rows check the restore-time rebuild of the fork child and its source.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -32224,6 +32242,8 @@ async fn grandchild_forked_after_its_forker_lost_its_source_follows_the_forker()
     let resumed = MobBuilder::for_resume(restart_storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(customizer())
+        // The row checks the restore-time rebuild of the forked members.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -32298,6 +32318,8 @@ async fn assert_fork_child_rebuild_is_not_recustomized(explicit_resume: bool) {
         .with_spawn_member_customizer(Arc::new(RewritingResumeCustomizer {
             source: source_identity.clone(),
         }))
+        // The row checks the restore-time rebuild and its customizer calls.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -32520,6 +32542,8 @@ async fn assert_resume_migrates_one_provider_knob(explicit_resume: bool) {
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(migration.clone())
+        // The row checks the customizer at the restore-time rebuild.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -32591,6 +32615,8 @@ async fn resume_customizer_is_asked_again_for_a_successor_session() {
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(migration.clone())
+        // The row checks the customizer at the explicit resume's rebuild.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume the stopped mob");
@@ -32690,6 +32716,8 @@ async fn refused_restore_is_per_member_and_recovers_once_admitted() {
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(Arc::new(RefusingUntilAdmitted::default()))
+        // The refusal comes from the restore, so the start restores every member.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("the mob resumes");
@@ -32719,6 +32747,8 @@ async fn refused_restore_is_per_member_and_recovers_once_admitted() {
     let restarted = MobBuilder::for_resume(next_start_storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(Arc::new(admitted))
+        // The row checks that the next start restores the admitted member.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("the next start resumes");
@@ -32753,6 +32783,8 @@ async fn spawn_only_customizer_resume_keeps_the_durable_provider_params() {
     let _resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(recorder.clone())
+        // The row checks the customizer at the restore-time rebuild.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");
@@ -32784,6 +32816,8 @@ async fn unreadable_resume_view_fails_the_member_restore_not_the_mob() {
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(migration.clone())
+        // The read failure comes from the restore, so the start restores every member.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("the mob resumes");
@@ -32818,6 +32852,8 @@ async fn unreadable_resume_view_fails_an_explicit_resume_typed() {
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
         .with_spawn_member_customizer(Arc::new(PromptCacheMigration::default()))
+        // The read failure comes from the explicit resume's restore.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume the stopped mob");
@@ -33200,6 +33236,8 @@ async fn a_restored_durable_worker_keeps_its_resume_gate() {
     let resumed = MobBuilder::for_resume(restart_storage)
         .with_session_service(service.clone())
         .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        // The row reads the restored worker's registration right after the start.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume the mob");
@@ -33251,6 +33289,8 @@ async fn an_explicitly_resumed_durable_worker_keeps_its_resume_gate() {
     let resumed = MobBuilder::for_resume(restart_storage)
         .with_session_service(service.clone())
         .with_durable_resume_gate(Arc::new(ContinueResumeGate))
+        // The row reads the rebuilt worker's registration right after the explicit resume.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume the stopped mob");
@@ -35949,6 +35989,8 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
+    // The row checks a restored member's readiness recovery, so the start restores it.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("cold resume running mob");
@@ -36373,6 +36415,8 @@ async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
         })
         .with_session_service(restarted_service.clone())
         .notify_orchestrator_on_resume(false)
+        // The runtime ends during the start's readiness pass, so the start restores members.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume(),
     );
     tokio::time::timeout(Duration::from_secs(10), entered)
@@ -36588,6 +36632,8 @@ async fn assert_cold_running_local_resume_fails_closed(
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
+    // The comms fault hits the restore's readiness check, so the start restores members.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await;
 
@@ -37438,6 +37484,8 @@ async fn test_resume_restores_missing_sessions_with_same_session_and_history() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the restored live session right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -37532,6 +37580,8 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
     ))
     .with_session_service(service.clone())
     .register_tool_bundle("bundle-a", Arc::new(EchoBundleDispatcher))
+    // The row reads the restored session's tools right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -37611,6 +37661,8 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The missing session is found by the explicit resume's restore.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -37783,6 +37835,8 @@ async fn test_member_builds_type_a_spawn_as_a_mint_and_a_revival_as_a_resume() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row checks the build the explicit resume's restore makes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("reconstruct the mob");
@@ -37871,6 +37925,8 @@ async fn test_resume_repoints_snapshotless_member_head_to_latest_persisted_sessi
         runtime_metadata.clone(),
     ))
     .with_session_service(service.clone())
+    // The row checks the repoint the explicit resume's restore makes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -37945,6 +38001,8 @@ async fn test_resume_repoints_snapshotless_member_head_to_latest_persisted_sessi
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row checks that the next start's restore does not churn.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("repeat resume should replay durable self-heal");
@@ -38150,6 +38208,8 @@ async fn test_snapshotless_recovery_never_publishes_foreign_attachment_endpoint(
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row checks the replacement the explicit resume's restore materializes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -38241,12 +38301,11 @@ async fn test_snapshotless_recovery_never_publishes_foreign_attachment_endpoint(
 /// `test_snapshotless_recovery_never_publishes_foreign_attachment_endpoint`
 /// flake, driven directly instead of by load. The stopped member's session
 /// runtime is taken to Stopped (to terminal, through the exact registration)
-/// before the host restarts, so the cold actor's cleanup-delivery recovery
-/// re-registers a stopped session and the runtime refuses the unbound
-/// endpoint with the typed, pre-effect `RegistrationOwned`: the previous
-/// attachment's retained cleanup tail still owns the registration. The
-/// actor must keep admitting commands, leave custody with that owner, and
-/// let the explicit resume take the member over.
+/// before the host restarts, so the previous attachment's retained cleanup
+/// tail still owns the registration. The member holds no work, so the cold
+/// Stopped start leaves it dormant and registers nothing for it. The actor
+/// must keep admitting commands, the explicit resume must succeed, and the
+/// member's first touch must take it over.
 #[tokio::test]
 async fn cold_actor_startup_serves_while_a_stopped_members_registration_is_owned() {
     let service = Arc::new(MockSessionService::new());
@@ -38301,15 +38360,10 @@ async fn cold_actor_startup_serves_while_a_stopped_members_registration_is_owned
         MobState::Stopped,
         "reconstruction must not implicitly resume the mob"
     );
-    let owned = adapter
-        .current_session_registration_witness(&session_id)
-        .await
-        .expect("re-registered stopped session");
-    assert!(
-        !adapter
-            .registration_is_current_without_runtime_owner(&owned)
-            .await,
-        "delivery custody stays with the registration's current owner"
+    assert_eq!(
+        resumed.member_materialization_for_test(&identity),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant),
+        "the Stopped start materialized nothing"
     );
 
     // Before the fix the actor exited during cleanup-delivery recovery, so
@@ -38317,7 +38371,7 @@ async fn cold_actor_startup_serves_while_a_stopped_members_registration_is_owned
     resumed
         .resume()
         .await
-        .expect("explicit resume takes the owned member over");
+        .expect("the explicit resume succeeds");
     assert_eq!(
         resumed.status().await.expect("status after resume"),
         MobState::Running
@@ -38330,6 +38384,10 @@ async fn cold_actor_startup_serves_while_a_stopped_members_registration_is_owned
             .is_some(),
         "the member is still projected after resume"
     );
+    resumed
+        .ensure_member_live(&identity)
+        .await
+        .expect("the member's first touch takes the owned session over");
 }
 
 /// A Running mob restarted with its startup paused right before the binding
@@ -38396,6 +38454,8 @@ async fn paused_running_start(
     ))
     .with_session_service(service.clone())
     .notify_orchestrator_on_resume(false)
+    // The rows act on a member the start restores before its binding restore.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("restart the Running mob");
@@ -39574,6 +39634,8 @@ async fn test_resume_stamps_legacy_recovered_binding_endpoint_exactly_once() {
         runtime_metadata.clone(),
     ))
     .with_session_service(service.clone())
+    // The row checks the endpoint stamp the explicit resume's restore writes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -39597,6 +39659,8 @@ async fn test_resume_stamps_legacy_recovered_binding_endpoint_exactly_once() {
         runtime_metadata,
     ))
     .with_session_service(service)
+    // The row checks that the next start's restore writes no second stamp.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("repeat resume should replay without another endpoint stamp");
@@ -39765,6 +39829,8 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         runtime_metadata.clone(),
     ))
     .with_session_service(service.clone())
+    // The row checks the repoint and trust the explicit resume's restore installs.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -39856,6 +39922,12 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
     .resume()
     .await
     .expect("restart should replay recovered endpoint authority");
+    // The survivor holds no work, so the restart leaves it dormant: wake it,
+    // so the retry sweeps the trust of a live survivor.
+    restarted
+        .ensure_member_live(&survivor)
+        .await
+        .expect("wake the survivor");
     let restarted_survivor_runtime = {
         let sessions = service.sessions.read().await;
         sessions
@@ -39943,6 +40015,8 @@ async fn test_resume_skips_wiring_for_broken_peer_and_keeps_partial_resume() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The missing session is found by the explicit resume's restore.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -40061,6 +40135,8 @@ async fn test_resume_restores_missing_live_session_even_when_list_reports_inacti
             runtime_metadata,
         ))
         .with_session_service(service)
+        // The row reads the restored comms runtime right after the explicit resume.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("stopped mob reconstruction should succeed");
@@ -40300,6 +40376,8 @@ async fn test_wire_broken_member_returns_restore_failed_error() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("partial resume should still succeed");
@@ -40383,6 +40461,8 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -40461,6 +40541,8 @@ async fn test_respawn_broken_member_clears_restore_diagnostic() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("partial resume should still succeed");
@@ -40588,6 +40670,8 @@ async fn test_respawn_refuses_a_broken_member_whose_session_was_lost_after_cold_
         runtime_metadata,
     ))
     .with_session_service(restarted_service.clone())
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -40770,6 +40854,8 @@ async fn test_resume_restores_persisted_behavior_metadata() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the restored live session right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -40872,6 +40958,8 @@ async fn test_resume_marks_comms_name_mismatch_as_broken() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The comms name mismatch is found by the explicit resume's restore.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -42625,6 +42713,8 @@ async fn test_resume_reconciles_mixed_topology_without_losing_external_member_re
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the restored member's trust right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mixed-topology mob reconstruction should succeed");
@@ -42770,6 +42860,8 @@ async fn test_resume_replaces_foreign_live_owner_before_trust_repair() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the rebuilt member's trust right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -42902,6 +42994,8 @@ async fn test_resume_rebuilds_all_foreign_attachments_before_trust_repair() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the rebuilt members' trust right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -43117,6 +43211,8 @@ async fn test_resume_reestablishes_missing_trust() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the restored members' trust right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -49990,6 +50086,8 @@ async fn test_spawn_skips_broken_role_peers_in_role_wiring_selection() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("partial resume should succeed");
@@ -64894,6 +64992,8 @@ async fn test_resume_from_events_restarts_autonomous_host_loops_from_runtime_mod
         MobBuilder::for_resume(storage_for_resume)
             .with_session_service(service.clone())
             .notify_orchestrator_on_resume(false)
+            // The row reads the replacement attachment right after the explicit resume.
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
             .resume(),
     )
     .await
@@ -65001,6 +65101,8 @@ async fn test_explicit_resume_retains_wedged_attachment_retirement_for_level_tri
     let resumed = MobBuilder::for_resume(storage_for_resume)
         .with_session_service(service.clone())
         .notify_orchestrator_on_resume(false)
+        // The row checks the takeover the explicit resume's restore makes.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("reconstruct stopped mob");
@@ -65303,6 +65405,8 @@ async fn test_explicit_resume_member_preparation_progress_rearms_inactivity_watc
     let resumed = MobBuilder::for_resume(storage_for_resume)
         .with_session_service(service.clone())
         .notify_orchestrator_on_resume(false)
+        // The row counts the restores the explicit resume makes.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("reconstruct stopped mob");
@@ -65658,6 +65762,8 @@ async fn cold_resume_crew_for_test(
     let resumed = MobBuilder::for_resume(storage_for_resume)
         .with_session_service(service.clone())
         .notify_orchestrator_on_resume(false)
+        // The rows check faults in the explicit resume's member restores.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("reconstruct stopped mob");
@@ -66666,6 +66772,8 @@ async fn test_resume_skips_broken_autonomous_member_in_host_loop_startup() {
     ))
     .with_session_service(service)
     .notify_orchestrator_on_resume(false)
+    // The member is Broken only once the explicit resume's restore ran.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
@@ -81187,6 +81295,8 @@ async fn test_per_spawn_external_tools_are_not_restored_from_storage() {
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row checks the build the explicit resume's restore makes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -81316,6 +81426,8 @@ async fn test_cold_restart_restores_per_spawn_profile_override_without_customize
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row checks the build the explicit resume's restore makes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -81378,6 +81490,8 @@ async fn test_cold_restart_does_not_replay_persisted_system_prompt_configuration
         runtime_metadata,
     ))
     .with_session_service(service.clone())
+    // The row reads the restored live session right after the explicit resume.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -81809,6 +81923,8 @@ async fn test_restore_seeded_per_spawn_tools_survive_machine_authorized_revival(
     ))
     .with_session_service(service.clone())
     .with_spawn_member_customizer(Arc::new(ResumeOverlayCustomizer))
+    // The row checks the customizer at the explicit resume's rebuild.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -82450,6 +82566,8 @@ async fn test_resume_reconciliation_runs_spawn_customizer_for_missing_session_re
     ))
     .with_session_service(service.clone())
     .with_spawn_member_customizer(Arc::new(customizer.clone()))
+    // The row checks the customizer at the restore-time rebuild.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -82935,6 +83053,8 @@ async fn test_restored_member_gets_external_tools() {
     ))
     .with_session_service(service.clone())
     .with_default_external_tools_provider(Some(provider))
+    // The row checks the build the explicit resume's restore makes.
+    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("resume");
@@ -96448,6 +96568,8 @@ async fn spawn_then_add_role_deny_and_restart(
         .expect("the author adds the deny to the stored definition");
     let resumed = MobBuilder::for_resume(restart_storage)
         .with_session_service(service.clone())
+        // The rows check the rebuild the restart or the explicit resume makes.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume");

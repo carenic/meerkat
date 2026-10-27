@@ -17999,6 +17999,13 @@ mod tests {
             }
             self.inner.delete_ops_lifecycle(runtime_id).await
         }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<meerkat_runtime::LogicalRuntimeId>, meerkat_runtime::RuntimeStoreError>
+        {
+            self.inner.list_runtimes_with_recovery_work().await
+        }
     }
 
     fn make_runtime_with_failing_runtime_store(

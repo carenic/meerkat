@@ -2,13 +2,13 @@
 //!
 //! The members a crash-path start materialized (its boot set) leave the
 //! builder bound and Waking: their readiness and topology settle before
-//! MobMachine holds them Live (R7). The topology settled in the builder;
+//! MobMachine holds them Live (Live means ready). The topology settled in the builder;
 //! this pass runs their readiness with the readiness of every other member
 //! materialized in this process, then applies each boot member's
 //! `ResolveMemberRevivalSucceeded` under its open attempt.
 //!
 //! A member's readiness failure is that member's outcome, never the
-//! mob's (X6): a boot member's attempt is abandoned with the typed
+//! mob's: a boot member's attempt is abandoned with the typed
 //! readiness failure, which records it Broken; a Live member whose comms
 //! runtime is gone is woken again through the drift arm; any other Live
 //! member failure records that member Broken. The mob keeps serving every
@@ -31,23 +31,15 @@ impl MobActor {
     /// published through MobMachine's startup readiness transition: durable
     /// membership alone is not readiness.
     pub(super) async fn ensure_startup_member_readiness(&mut self) -> Result<(), MobError> {
-        let boot_attempts = std::mem::take(&mut self.startup_boot_attempts);
         let Some(mut targets) = self.collect_member_readiness_targets(false).await? else {
+            // No readiness runs while a lifecycle cleanup owns the mob: the
+            // boot set is settled as every other member is, without one.
+            let _ = self.settle_held_member_readiness(Vec::new()).await;
             return Ok(());
         };
-        {
-            // The boot set is Waking, so the Live-only target set leaves it
-            // out: its readiness is this start's to run.
-            let roster = self.roster.read().await;
-            for identity in boot_attempts.keys() {
-                if let Some(entry) = roster.get(identity) {
-                    targets.push(MemberReadinessTarget {
-                        entry: entry.clone(),
-                        stage: member_readiness_stage(entry),
-                    });
-                }
-            }
-        }
+        // The boot set is Waking, so the Live-only target set leaves it out:
+        // its readiness is this start's to run.
+        targets.extend(self.held_member_readiness_targets().await);
         #[cfg(feature = "runtime-adapter")]
         let targets = self
             .break_members_whose_runtime_ended_outside_the_mob(targets)
@@ -56,25 +48,14 @@ impl MobActor {
         let readiness = self.spawn_member_readiness_tasks(targets, None);
         let outcomes =
             collect_member_readiness_outcomes(readiness, expected, &self.definition.id).await;
+        // A boot member's failure is its own (it is Broken); the start goes on.
+        let (outcomes, _) = self.settle_held_member_readiness(outcomes).await;
         let mut settled = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
-            let boot_attempt = boot_attempts.get(&outcome.entry.agent_identity).copied();
-            match (&outcome.result, boot_attempt) {
-                (Ok(()), Some(attempt)) => {
-                    self.settle_startup_boot_member_live(&outcome.entry, attempt)
-                        .await;
-                }
-                (Err(error), Some(attempt)) => {
-                    self.abandon_startup_boot_member(&outcome.entry, attempt, error)
-                        .await;
-                    continue;
-                }
-                (Err(error), None) => {
-                    self.resolve_startup_live_member_failure(&outcome.entry, error)
-                        .await;
-                    continue;
-                }
-                (Ok(()), None) => {}
+            if let Err(error) = &outcome.result {
+                self.resolve_startup_live_member_failure(&outcome.entry, error)
+                    .await;
+                continue;
             }
             settled.push(outcome);
         }
@@ -83,8 +64,83 @@ impl MobActor {
         self.apply_member_readiness_outcomes(settled).await
     }
 
+    /// The readiness targets of the members held Waking for a readiness pass
+    /// (`startup_boot_attempts`: a start's boot set, or the members an
+    /// explicit resume rebuilt). The Live-only target set leaves them out.
+    pub(super) async fn held_member_readiness_targets(&self) -> Vec<MemberReadinessTarget> {
+        let roster = self.roster.read().await;
+        self.startup_boot_attempts
+            .keys()
+            .filter_map(|identity| roster.get(identity))
+            .map(|entry| MemberReadinessTarget {
+                entry: entry.clone(),
+                stage: member_readiness_stage(entry),
+            })
+            .collect()
+    }
+
+    /// Settle every member held Waking for this readiness pass from its
+    /// outcome: Live once its readiness succeeded (Live means ready), Broken
+    /// with the readiness failure otherwise (member-scoped; the pass goes
+    /// on). A held member the pass recorded Broken before its readiness (its
+    /// runtime ended outside the mob) has its attempt closed with that
+    /// failure. A held member the pass ran no readiness for (none runs while
+    /// a lifecycle cleanup owns the mob, or the pass was not dispatched) is
+    /// settled Live as every other member is then. Returns the outcomes
+    /// left to apply (every other member's, and each held member's
+    /// success) and the first held member's readiness failure, which a
+    /// caller may report.
+    pub(super) async fn settle_held_member_readiness(
+        &mut self,
+        outcomes: Vec<MemberReadinessOutcome>,
+    ) -> (Vec<MemberReadinessOutcome>, Option<MobError>) {
+        let mut held = std::mem::take(&mut self.startup_boot_attempts);
+        let mut rest = Vec::with_capacity(outcomes.len());
+        let mut first_failure = None;
+        for outcome in outcomes {
+            match (held.remove(&outcome.entry.agent_identity), outcome.result) {
+                (Some(attempt), Ok(())) => {
+                    self.settle_startup_boot_member_live(&outcome.entry, attempt)
+                        .await;
+                    rest.push(MemberReadinessOutcome {
+                        result: Ok(()),
+                        ..outcome
+                    });
+                }
+                (Some(attempt), Err(error)) => {
+                    self.abandon_startup_boot_member(&outcome.entry, attempt, &error)
+                        .await;
+                    first_failure.get_or_insert(error);
+                }
+                (None, result) => rest.push(MemberReadinessOutcome { result, ..outcome }),
+            }
+        }
+        for (identity, attempt) in held {
+            let entry = self.roster.read().await.get(&identity).cloned();
+            // A member that left the roster closed its attempt as it left.
+            let Some(entry) = entry else {
+                continue;
+            };
+            let broken = self
+                .dsl_authority
+                .state()
+                .member_restore_failures
+                .get(&mob_dsl::AgentIdentity::from_domain(&identity))
+                .cloned();
+            match broken {
+                Some(reason) => {
+                    let error = MobError::Internal(reason.to_string());
+                    self.abandon_startup_boot_member(&entry, attempt, &error)
+                        .await;
+                }
+                None => self.settle_startup_boot_member_live(&entry, attempt).await,
+            }
+        }
+        (rest, first_failure)
+    }
+
     /// A boot member's readiness settled: MobMachine holds it Live under the
-    /// attempt its plan opened (R7: Live means ready). A stale attempt (the
+    /// attempt its plan opened (Live means ready). A stale attempt (the
     /// member's attempt closed meanwhile) is the machine's no-op.
     async fn settle_startup_boot_member_live(&mut self, entry: &RosterEntry, attempt: u64) {
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
@@ -113,12 +169,18 @@ impl MobActor {
                 );
             }
             Err(error) => {
+                // A refused readiness never leaves the member Waking under an
+                // attempt nothing closes (every later delivery would wait on
+                // it): the attempt is abandoned, member-scoped, with the
+                // refusal as the reason.
                 tracing::error!(
                     mob_id = %self.definition.id,
                     agent_identity = %entry.agent_identity,
                     %error,
-                    "MobMachine refused the startup readiness of a boot member"
+                    "MobMachine refused the startup readiness of a boot member; its attempt is abandoned"
                 );
+                self.abandon_startup_boot_member(entry, attempt, &error)
+                    .await;
             }
         }
     }
@@ -220,20 +282,52 @@ impl MobActor {
             "member readiness failed at startup; the outcome is the member's, the mob keeps running"
         );
         if lost_materialization {
-            if let Err(classify_error) = self.apply_dsl_signal(
+            let transition = match self.apply_dsl_signal_collect_transition(
                 mob_dsl::MobMachineSignal::ClassifyMemberLiveMaterialization {
-                    agent_identity: identity,
+                    agent_identity: identity.clone(),
                     observation:
                         mob_dsl::MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
                     reason: format!("the member's comms runtime is missing at startup: {error}"),
                 },
                 "startup_member_materialization_lost",
             ) {
-                tracing::error!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %entry.agent_identity,
-                    error = %classify_error,
-                    "MobMachine refused the startup drift observation of a member"
+                Ok(transition) => transition,
+                Err(classify_error) => {
+                    tracing::error!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %entry.agent_identity,
+                        error = %classify_error,
+                        "MobMachine refused the startup drift observation of a member"
+                    );
+                    return;
+                }
+            };
+            // The drift arm opens a wake attempt and hands nothing off
+            // itself: the member's materialization is queued here, as the
+            // wake path queues its own drift, so the member does not stay
+            // Waking under an attempt nothing realizes.
+            let authorized = transition.effects().iter().find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::MemberLiveMaterializationClassified {
+                    agent_identity,
+                    verdict: mob_dsl::MemberRevivalVerdictKind::ReviveAuthorized,
+                    attempt: Some(attempt),
+                    ..
+                } if agent_identity == &identity => Some(*attempt),
+                _ => None,
+            });
+            if let Some(attempt) = authorized
+                && !self
+                    .member_wakes
+                    .pending
+                    .iter()
+                    .any(|pending| pending.attempt == attempt)
+            {
+                self.member_wakes.pending.push_back(
+                    super::member_wake::PendingMemberMaterialization {
+                        identity: entry.agent_identity.clone(),
+                        cause: mob_dsl::MemberWakeCause::Boot,
+                        attempt,
+                    },
                 );
             }
             return;

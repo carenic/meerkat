@@ -62,7 +62,9 @@ them.
   - `MobHandle::boot_set_basis` with `MobBootSetBasis` and
     `MobBootSetUnobservedCause`: whether the latest start could tell which
     members hold durable work; a start that could not materialized every
-    member, and the cause names the read the store could not make.
+    member, and the cause names the read the store could not make, or is
+    `ScanFailed` for a read that failed (a failed read does not fail the
+    start).
   - `MobHandle::seat_dormant_members(specs)` with `DormantSeatOutcome`:
     seats members Dormant without materializing them, at most 256 per
     journal batch, one typed outcome per spec. A fresh spec gets a new
@@ -75,8 +77,13 @@ them.
   - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
     reset): its current incarnation is retired and the next one is seated
     Dormant on a new empty session in the retirement's terminal step, both
-    journal rows in one batch, so the identity is never a non-member. The
-    new incarnation owes no kickoff and keeps no wiring.
+    journal rows in one batch, so the identity is never a non-member. A spec
+    that owes a kickoff (an `AutonomousHost` member, or an initial message)
+    records it on the new incarnation in the same batch: it wakes the new
+    incarnation once and runs exactly once on its new session, also across
+    a restart. The new incarnation keeps no wiring. A rotation is refused
+    typed unless the mob is Running, and a refused rotation retires
+    nothing.
 
 - `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the
   runtimes whose durable state holds recovery work, from the head summary
@@ -93,22 +100,32 @@ them.
   `MobBuilder::resume` and the lift of a stopped mob (`MobHandle::resume`)
   no longer materialize every member. Under the default `OnDemand` policy a
   start materializes the members that hold durable work (an open or
-  suspended run, queued inputs, a provisional tail, a pending delivery), a
+  suspended run, queued inputs, a provisional tail, a pending delivery, a
+  background operation completion not yet delivered), a
   member whose endpoint is a network transport or that has no durable
   endpoint, an orchestrator the resume notifies, and the members the host
   requires; every other member stays Dormant and is materialized by its
   first delivery, on its own session. Reads (member lists, status, history,
   console projections) never materialize a member: a Dormant member's
   status reports its peer connectivity from MobMachine's membership and its
-  capabilities from its durable session and profile. Wiring and unwiring
+  capabilities from the catalog model its wake binds (its profile with its
+  model override). Wiring and unwiring
   with a Dormant member commit the edge without waking it, and lifecycle
   notices to or from a member that is not materialized are not sent (its
-  wake installs the trust they carry). This holds for an edge to an external
+  wake installs the trust they carry). A kickoff status notice is content,
+  not a lifecycle notice: it wakes a Dormant recipient and is delivered. This holds for an edge to an external
   peer too; a wire or unwire of one whose member is being woken waits for
   that wake. Retiring a Dormant member, and destroying a mob with Dormant
   members, archive their durable sessions without waking them, and so does
-  a retirement that a restart recovered. `MemberRestorePolicy::Eager`
+  a retirement that a restart recovered. The start of a stopped mob
+  registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
   restores the previous start.
+
+- `meerkat-runtime`: a background operation completion delivered to its
+  owner (injected as a continuation, or applied by the agent) is recorded
+  durably with the ops lifecycle snapshot. A restart no longer reads it as
+  owed, so the owner is not woken for it and does not run its continuation
+  a second time.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a

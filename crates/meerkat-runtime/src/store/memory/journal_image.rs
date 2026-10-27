@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 use super::journal::{Group, TouchScope, Touches, receipt_sub};
 use super::{
     CompactionOutboxEntry, InMemoryRuntimeStore, Inner, OpsLifecycleState, ReceiptKey,
-    StoredWholeBlobProvisionalTail, boot_facts,
+    StoredWholeBlobProvisionalTail, boot_facts, row_boot_facts,
 };
 use crate::input_state::StoredInputState;
 use crate::ops_lifecycle::PersistedOpsSnapshot;
@@ -656,7 +656,7 @@ impl InMemoryRuntimeStore {
                     if runtime_is_empty(&inner, &ops, rt) {
                         None
                     } else {
-                        Some(to_json(&boot_facts(&inner, rt))?)
+                        Some(to_json(&boot_facts(&inner, &ops, rt))?)
                     },
                 ));
             }
@@ -690,7 +690,7 @@ impl InMemoryRuntimeStore {
         {
             image.insert(
                 BOOT_FACTS_KEY.to_string(),
-                to_json(&boot_facts(&inner, rt))?,
+                to_json(&boot_facts(&inner, &ops, rt))?,
             );
         }
         Ok(image)
@@ -1000,11 +1000,12 @@ impl InMemoryRuntimeStore {
     }
 
     /// Whether a runtime is archived and recovery has nothing to act on:
-    /// its body may leave memory.
+    /// its body may leave memory. Its ops lifecycle snapshot is not read: no
+    /// recovery delivers an archived runtime's background operation work.
     pub(crate) async fn journal_archived_idle(&self, rt: &str) -> bool {
         let inner = self.inner.lock().await;
         let archived = catalog_entry_is_archived(inner.session_catalog.get(rt));
-        let facts = boot_facts(&inner, rt);
+        let facts = row_boot_facts(&inner, rt);
         archived
             && !facts.nonterminal
             && !facts.pending_owners

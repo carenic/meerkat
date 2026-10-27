@@ -9382,14 +9382,25 @@ impl MobHandle {
     /// the retirement its current incarnation is Retiring, and deliveries to
     /// it are refused typed. Returns the new session.
     ///
-    /// The spec launches `Fresh`. The new incarnation owes no kickoff: an
-    /// `AutonomousHost` member rotated this way starts on its next delivery.
-    /// Its wiring is not carried over. An identity that is not seated (its
-    /// last retirement already completed) is seated as one fresh seat.
-    /// Re-calling it after a crash is safe: the rotation of a retirement
-    /// still in flight is recorded on that retirement, and the same
-    /// generation always names the same session. Needs the members' comms
-    /// transport, as [`Self::seat_dormant_members`] does.
+    /// The spec launches `Fresh`. When it owes a kickoff (an
+    /// `AutonomousHost` member's one kickoff turn, or an initial message),
+    /// the new incarnation owes it: the kickoff wakes it once and runs
+    /// exactly once on its new session. Its wiring is not carried over. An
+    /// identity that is not seated (its last retirement already completed) is
+    /// seated as one fresh seat, which a spec that owes a kickoff spawns live,
+    /// as [`Self::seat_dormant_members`] does. Refused typed unless the mob is
+    /// Running; a refused rotation retires nothing.
+    ///
+    /// The rotation's intent lives in this process until its terminal step.
+    /// A host that may crash between the call and its answer must record its
+    /// own intent durably, and on its next start pass the identity to
+    /// [`super::MobBuilder::with_host_pending_members`] and call this again
+    /// with the same spec: the restarted mob does not finish the interrupted
+    /// retirement as a plain one while the identity is host-pending, and the
+    /// re-issued rotation re-seats it on the same name-based session (the
+    /// same generation always names the same session). A host that does not
+    /// may find the identity retired, not rotated, after such a crash. Needs
+    /// the members' comms transport, as [`Self::seat_dormant_members`] does.
     pub async fn rotate_member(&self, mut spec: SpawnMemberSpec) -> Result<SessionId, MobError> {
         use super::dormant_seat::DormantSeatCommitEntry;
 
@@ -9399,44 +9410,63 @@ impl MobHandle {
         ) {
             spec.mark_agent_creation();
         }
-        let super::dormant_seat::MemberRotationPlan {
-            candidate,
-            seated,
-            endpoint_source,
-            provisioner,
-        } = self
+        let plan = self
             .send_actor_command(|reply_tx| MobCommand::PlanMemberRotation {
                 spec: Box::new(spec),
                 reply_tx,
             })
             .await??;
-        let entry = super::dormant_seat::prepare_dormant_seat(
-            self.session_service.as_ref(),
-            provisioner.as_ref(),
-            endpoint_source.as_ref(),
-            &self.definition.id,
-            candidate,
-        )
-        .await
-        .map_err(|outcome| (*outcome).into_unseated_error())?;
-        if seated {
-            let DormantSeatCommitEntry::Seat {
+        let entry = match plan {
+            super::dormant_seat::MemberRotationPlan::Seat {
                 candidate,
-                endpoint,
-            } = entry
-            else {
-                return Err(MobError::Internal(
-                    "a rotation's preparation produced no seat".into(),
-                ));
-            };
-            return self
-                .send_actor_command(|reply_tx| MobCommand::StartMemberRotation {
+                seated,
+                endpoint_source,
+                provisioner,
+            } => {
+                let entry = super::dormant_seat::prepare_dormant_seat(
+                    self.session_service.as_ref(),
+                    provisioner.as_ref(),
+                    endpoint_source.as_ref(),
+                    &self.definition.id,
                     candidate,
-                    endpoint,
-                    reply_tx,
-                })
-                .await?;
-        }
+                )
+                .await
+                .map_err(|outcome| (*outcome).into_unseated_error())?;
+                if seated {
+                    let DormantSeatCommitEntry::Seat {
+                        candidate,
+                        endpoint,
+                    } = entry
+                    else {
+                        return Err(MobError::Internal(
+                            "a rotation's preparation produced no seat".into(),
+                        ));
+                    };
+                    return self
+                        .send_actor_command(|reply_tx| MobCommand::StartMemberRotation {
+                            candidate,
+                            endpoint,
+                            reply_tx,
+                        })
+                        .await?;
+                }
+                entry
+            }
+            // An identity that is not seated, whose spec owes a kickoff: a
+            // seat of it, which is a spawn; the commit step clears its host
+            // preparation as it does for a seat chunk's spawn.
+            super::dormant_seat::MemberRotationPlan::Embody(spec) => {
+                let agent_identity = spec.identity.clone();
+                let member_ref = Box::pin(self.spawn_spec_internal(*spec)).await?;
+                let session_id = member_ref.bridge_session_id().cloned().ok_or_else(|| {
+                    MobError::Internal(format!("the spawn of '{agent_identity}' bound no session"))
+                })?;
+                DormantSeatCommitEntry::Embodied {
+                    agent_identity,
+                    session_id,
+                }
+            }
+        };
         let outcome = self
             .send_actor_command(|reply_tx| MobCommand::CommitDormantSeats {
                 entries: vec![entry],
@@ -9448,7 +9478,8 @@ impl MobHandle {
             .ok_or_else(|| MobError::Internal("a rotation's seat was not answered".into()))?;
         match outcome {
             super::DormantSeatOutcome::Seated { session_id, .. }
-            | super::DormantSeatOutcome::AlreadySeated { session_id, .. } => Ok(session_id),
+            | super::DormantSeatOutcome::AlreadySeated { session_id, .. }
+            | super::DormantSeatOutcome::Embodied { session_id, .. } => Ok(session_id),
             other => Err(other.into_unseated_error()),
         }
     }
@@ -9487,7 +9518,7 @@ impl MobHandle {
                         session_id,
                     },
                 )),
-                // R13: spawned exactly as a spawn is, under this handle's
+                // Spawned exactly as a spawn is, under this handle's
                 // authority, one at a time as the host's own embodiment was.
                 DormantSeatPlanEntry::Embody(spec) => {
                     let agent_identity = spec.identity.clone();
@@ -16514,15 +16545,26 @@ impl MobHandle {
                 if super::member_runtime_is_host_owned(machine_state, &entry.agent_identity) {
                     machine_state.placed_member_ready_for_identity(&dsl_identity)
                 } else {
-                    machine_state
-                        .identity_to_runtime
-                        .get(&dsl_identity)
-                        .is_some_and(|runtime_id| {
-                            machine_state
-                                .member_startup_runtime_ready
-                                .contains(runtime_id)
-                                || machine_state.member_startup_ready.contains(runtime_id)
-                        })
+                    match super::boot_plan::member_materialization_phase(
+                        machine_state,
+                        &dsl_identity,
+                    ) {
+                        // A Dormant member's startup is owed only at its
+                        // wake: as a member it is ready, and the wait never
+                        // materializes it.
+                        Some(mob_dsl::MemberMaterializationPhase::Dormant) => true,
+                        // A Waking member's startup is in flight: wait for it.
+                        Some(mob_dsl::MemberMaterializationPhase::Waking) => false,
+                        Some(mob_dsl::MemberMaterializationPhase::Live) | None => machine_state
+                            .identity_to_runtime
+                            .get(&dsl_identity)
+                            .is_some_and(|runtime_id| {
+                                machine_state
+                                    .member_startup_runtime_ready
+                                    .contains(runtime_id)
+                                    || machine_state.member_startup_ready.contains(runtime_id)
+                            }),
+                    }
                 }
             }
             mob_dsl::MobMemberLifecycleStatus::Retiring
@@ -16961,18 +17003,15 @@ impl MobHandle {
             };
             if unmaterialized {
                 // A member that is not materialized has no live registration:
-                // its capabilities are those its durable session's model
-                // resolves to, the resolution its wake binds. Read-only: no
-                // session is registered and nothing wakes.
-                let metadata = self
-                    .session_service
-                    .load_persisted_session_metadata(&session_id)
-                    .await
-                    .ok()
-                    .flatten()?
-                    .session_metadata?;
-                let profile =
-                    meerkat_models::canonical().profile_for(metadata.provider, &metadata.model)?;
+                // its capabilities are those of the model its wake binds
+                // (its incarnation's model override over its profile),
+                // resolved through the model catalog as a live member's are.
+                // Read-only: no session is registered and nothing wakes. A
+                // model the catalog does not hold (a realm-configured or
+                // self-hosted one) has no capabilities to report until the
+                // member is live.
+                let (provider, model) = self.dormant_member_llm_identity(identity).await?;
+                let profile = meerkat_models::canonical().profile_for(provider, &model)?;
                 return Some(
                     meerkat_runtime::SessionLlmCapabilitySurface::from_model_profile(&profile)
                         .to_wire_resolved(),
@@ -16991,6 +17030,34 @@ impl MobHandle {
             let _ = snapshot;
             None
         }
+    }
+
+    /// The provider and model a dormant member's wake binds: its
+    /// incarnation's profile (the spawn's effective profile, or the
+    /// definition's for its role) with its model override applied, as every
+    /// materialization of the member applies it. `None` when the profile no
+    /// longer resolves or its provider is not known for the model.
+    #[cfg(feature = "runtime-adapter")]
+    async fn dormant_member_llm_identity(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<(meerkat_core::Provider, String)> {
+        let entry = self.roster.read().await.get(identity).cloned()?;
+        let mut profile = match entry.effective_profile_override.clone() {
+            Some(profile) => profile,
+            None => self
+                .definition
+                .resolve_profile(&entry.role, self.realm_profile_store.as_ref())
+                .await
+                .ok()?,
+        };
+        if let Some(model) = entry.effective_model_override.clone() {
+            profile.model = model;
+        }
+        let provider = profile
+            .provider
+            .or_else(|| meerkat_models::infer_provider(&profile.model))?;
+        Some((provider, profile.model))
     }
 
     async fn project_external_member_observation(
@@ -17113,6 +17180,8 @@ impl MobHandle {
     }
 
     /// Wait until all current members are startup-ready for orchestration.
+    /// A Dormant member is ready (its startup is owed only at its wake, and
+    /// the wait does not materialize it); a member being woken is waited for.
     pub async fn wait_for_ready(
         &self,
         timeout: Option<Duration>,
@@ -17134,6 +17203,8 @@ impl MobHandle {
     }
 
     /// Wait until the given members are startup-ready for orchestration.
+    /// A Dormant member is ready (its startup is owed only at its wake, and
+    /// the wait does not materialize it); a member being woken is waited for.
     pub async fn wait_for_members_ready(
         &self,
         ids: &[AgentIdentity],

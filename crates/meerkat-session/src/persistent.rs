@@ -24771,6 +24771,12 @@ mod tests {
         > {
             self.inner.load_ops_lifecycle(runtime_id).await
         }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
+        }
     }
 
     struct GatedSnapshotRuntimeStore {
@@ -25768,6 +25774,12 @@ mod tests {
             meerkat_runtime::store::RuntimeStoreError,
         > {
             self.inner.load_ops_lifecycle(runtime_id).await
+        }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
         }
     }
 
@@ -29978,6 +29990,12 @@ mod tests {
                 .load_committed_whole_blob_snapshot(runtime_id)
                 .await
         }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
+        }
     }
 
     impl WholeBlobAuthorityReadProbe {
@@ -30985,6 +31003,12 @@ mod tests {
             runtime_id: &LogicalRuntimeId,
         ) -> Result<(), meerkat_runtime::store::RuntimeStoreError> {
             self.inner.delete_ops_lifecycle(runtime_id).await
+        }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
         }
     }
 
@@ -54755,6 +54779,12 @@ mod tests {
             meerkat_runtime::store::RuntimeStoreError,
         > {
             self.inner.load_ops_lifecycle(runtime_id).await
+        }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
         }
     }
 

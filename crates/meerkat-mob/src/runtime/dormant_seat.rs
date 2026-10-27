@@ -1,22 +1,21 @@
-//! Dormant seats: an identity becomes a member without being materialized
-//! (design section 10 and 4.3j; rows R5, R6, R13, R14, G12, F8, F9).
+//! Dormant seats: an identity becomes a member without being materialized.
 //!
 //! [`super::MobHandle::seat_dormant_members`] takes each chunk of specs
 //! through three steps:
 //! 1. The actor plans each spec, reading nothing durable beyond the profile
 //!    resolution a spawn also makes there. The plan is a typed answer, the
-//!    spawn of a fresh spec that owes a kickoff (R13: such a member is
+//!    spawn of a fresh spec that owes a kickoff (such a member is
 //!    embodied exactly as a spawn is), or what the seat needs.
 //! 2. The handle prepares each seat off the actor: the session's archived
 //!    state from the session owner's pinned observation (no body load), a
 //!    fresh seat's empty session through the fresh-spawn create path when it
-//!    does not exist yet (R14, under its name-based id, G12), and the
+//!    does not exist yet (under its name-based id), and the
 //!    endpoint from the session's stored comms key.
-//! 3. The actor commits the chunk in one step (F8): on one prepared
+//! 3. The actor commits the chunk in one step: on one prepared
 //!    authority, per identity `AuthorizeSpawnProfile`, `BeginSpawnExec` and
 //!    `CommitDormantSeat` as one batch (an identity the machine refuses is
 //!    undone and answered alone), then one runtime obligation scan and each
-//!    seated identity's `PlanBootMaterialization` (F9), then the
+//!    seated identity's `PlanBootMaterialization`, then the
 //!    `MemberSpawned` rows in one `append_batch` before the base-checked
 //!    commit.
 
@@ -121,7 +120,7 @@ pub(crate) enum MemberSeatEndpointSource {
     Network,
 }
 
-/// The name-based id of a fresh seat's session (G12): the same mob, mob
+/// The name-based id of a fresh seat's session: the same mob, mob
 /// incarnation, identity and generation always name the same session, so a
 /// seat re-driven after a crash finds the session its earlier attempt
 /// created, and no ownerless session can exist.
@@ -204,18 +203,36 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     pub(in crate::runtime) authorized:
         super::spawn_profile_authority::AuthorizedSpawnProfileMaterial,
     pub(in crate::runtime) observations: super::actor::SpawnExecObservations,
+    /// Whether the spec owes a kickoff: a fresh AutonomousHost life (its one
+    /// kickoff turn) or an initial message. A seat that owes one is
+    /// embodied instead (never seated); a rotation records it as an owed
+    /// kickoff that wakes the next incarnation once.
+    pub(in crate::runtime) kickoff_owed: bool,
+    /// The owed kickoff's prompt when the spec carries an initial message;
+    /// `None` runs the role's fallback prompt, as a spawn does.
+    pub(in crate::runtime) kickoff_prompt: Option<meerkat_core::types::ContentInput>,
+    /// The objective the owed kickoff resolves under (the spec's, or the
+    /// default a spawn uses).
+    pub(in crate::runtime) kickoff_objective_id: meerkat_core::interaction::ObjectiveId,
 }
 
-/// The plan of a rotation (`rotate_member`): the next incarnation's seat.
-pub(in crate::runtime) struct MemberRotationPlan {
-    pub(in crate::runtime) candidate: Box<DormantSeatCandidate>,
-    /// Whether the identity is seated now: its current incarnation is then
-    /// retired and the next one seated in the retirement's terminal step.
-    /// Otherwise (its last retirement already completed) the rotation is one
-    /// fresh seat.
-    pub(in crate::runtime) seated: bool,
-    pub(in crate::runtime) endpoint_source: Option<MemberSeatEndpointSource>,
-    pub(in crate::runtime) provisioner: Arc<dyn super::provisioner::MobProvisioner>,
+/// The plan of a rotation (`rotate_member`).
+pub(in crate::runtime) enum MemberRotationPlan {
+    /// The next incarnation's dormant seat.
+    Seat {
+        candidate: Box<DormantSeatCandidate>,
+        /// Whether the identity is seated now: its current incarnation is
+        /// then retired and the next one seated in the retirement's terminal
+        /// step. Otherwise (its last retirement already completed) the
+        /// rotation is one fresh seat.
+        seated: bool,
+        endpoint_source: Option<MemberSeatEndpointSource>,
+        provisioner: Arc<dyn super::provisioner::MobProvisioner>,
+    },
+    /// An identity that is not seated, whose spec owes a kickoff: spawned
+    /// through the ordinary spawn path on its name-based session, as a seat
+    /// of that spec is.
+    Embody(Box<super::handle::SpawnMemberSpec>),
 }
 
 /// One entry of a seat chunk's commit, in the chunk's order.
@@ -316,7 +333,7 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
     let endpoint = match endpoint_source {
         MemberSeatEndpointSource::Network => None,
         MemberSeatEndpointSource::SessionScopedInproc { identity_root } => {
-            let public_key = stored_member_comms_key(identity_root, &session_id)
+            let public_key = stored_member_comms_key(identity_root, &session_id, candidate.launch)
                 .await
                 .map_err(&refused)?;
             // The key the session's own build loaded must be the stored one:
@@ -369,21 +386,43 @@ async fn created_dormant_session_key(
 }
 
 /// The public key of a member session's stored comms identity: one local
-/// key-store read, no session load. A session whose identity does not exist
-/// yet gets the one its first build will load.
+/// key-store read, no session load. A fresh seat's session whose identity
+/// does not exist yet gets the one its first build will load. A resumed
+/// session's identity must exist: an existing session built its identity
+/// already, so a missing one means the configured root is not the session
+/// service's, and the seat is refused typed instead of minting a key its
+/// wake would disagree with.
 #[cfg(not(target_arch = "wasm32"))]
 async fn stored_member_comms_key(
     identity_root: &std::path::Path,
     session_id: &SessionId,
+    launch: DormantSeatLaunch,
 ) -> Result<[u8; 32], MobError> {
-    let keypair =
-        meerkat_comms::Keypair::load_or_generate(&identity_root.join(session_id.to_string()))
-            .await
-            .map_err(|error| {
-                MobError::WiringError(format!(
-                    "the comms identity of session '{session_id}' could not be read: {error}"
-                ))
-            })?;
+    let dir = identity_root.join(session_id.to_string());
+    let loaded = match launch {
+        DormantSeatLaunch::Fresh => meerkat_comms::Keypair::load_or_generate(&dir).await,
+        DormantSeatLaunch::Resume => {
+            let exists = tokio::fs::try_exists(dir.join("identity.key"))
+                .await
+                .map_err(|error| {
+                    MobError::WiringError(format!(
+                        "the comms identity of session '{session_id}' could not be read: {error}"
+                    ))
+                })?;
+            if !exists {
+                return Err(MobError::WiringError(format!(
+                    "session '{session_id}' has no comms identity under the configured member \
+                     comms identity root"
+                )));
+            }
+            meerkat_comms::Keypair::load(&dir).await
+        }
+    };
+    let keypair = loaded.map_err(|error| {
+        MobError::WiringError(format!(
+            "the comms identity of session '{session_id}' could not be read: {error}"
+        ))
+    })?;
     Ok(*keypair.public_key().as_bytes())
 }
 
@@ -391,6 +430,7 @@ async fn stored_member_comms_key(
 async fn stored_member_comms_key(
     _identity_root: &std::path::Path,
     session_id: &SessionId,
+    _launch: DormantSeatLaunch,
 ) -> Result<[u8; 32], MobError> {
     Err(MobError::WiringError(format!(
         "a browser runtime keeps no durable comms identity for session '{session_id}'"

@@ -1371,6 +1371,13 @@ async fn members_unwired_written_persistent_poll_outage_fail_stops_then_cold_com
     );
     assert!(route_installs_at_rest(&controlling).await);
     let a1_session = controlling.member_session_id(&identity("a1")).await;
+    // The member holds no work, so the start leaves it dormant: its wake
+    // builds the comms runtime the row sends from.
+    controlling
+        .handle
+        .ensure_member_live(&identity("a1"))
+        .await
+        .expect("wake a1");
     let a1_runtime = controlling.member_comms_runtime(&a1_session).await;
     assert_send_not_admitted(
         &a1_runtime,

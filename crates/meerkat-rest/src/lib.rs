@@ -10069,6 +10069,14 @@ mod tests {
             meerkat_runtime::RuntimeStore::delete_ops_lifecycle(self.inner.as_ref(), runtime_id)
                 .await
         }
+
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<meerkat_runtime::LogicalRuntimeId>, meerkat_runtime::RuntimeStoreError>
+        {
+            meerkat_runtime::RuntimeStore::list_runtimes_with_recovery_work(self.inner.as_ref())
+                .await
+        }
     }
 
     #[tokio::test]

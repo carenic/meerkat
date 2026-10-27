@@ -1089,7 +1089,10 @@ impl RuntimeStore for SpiRuntimeStore {
     /// recovery work at the open or changed since. A runtime whose body is
     /// still on the host had no work at the open and has not changed since,
     /// and from its pinned entries alone the predicate again answers that
-    /// it has none.
+    /// it has none. The pinned facts carry the work an ops lifecycle
+    /// snapshot owes from the runtime's first commit that computed it: a
+    /// head committed before then names none until the runtime's next
+    /// commit.
     async fn list_runtimes_with_recovery_work(
         &self,
     ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {

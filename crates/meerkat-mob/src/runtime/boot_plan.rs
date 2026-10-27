@@ -40,7 +40,8 @@ use crate::roster::RosterEntry;
 pub enum MemberRestorePolicy {
     /// Materialize at start only the members that must be live: members
     /// with recovery work (an open or suspended run, queued inputs, a
-    /// provisional tail, a pending delivery), a kickoff owed, a network
+    /// provisional tail, a pending delivery, an undelivered background
+    /// operation completion), a kickoff owed, a network
     /// transport endpoint, an orchestrator the mob notifies on resume, no
     /// durable endpoint, or a host requirement. Every other member is
     /// materialized by its first delivery.
@@ -130,6 +131,9 @@ pub enum MobBootSetUnobservedCause {
     /// The runtime store cannot list its delivery authorities, so a
     /// delivery may be pending for any member.
     DeliveryListingUnsupported,
+    /// The runtime store's scan failed (a read error, or a store that
+    /// refused the read), so any member may hold recovery work.
+    ScanFailed,
 }
 
 /// The default bound on one member wake (see
@@ -303,6 +307,9 @@ struct ObligationCandidate {
 struct BootObligationIndex<'a> {
     mob_id: &'a MobId,
     incarnation: meerkat_core::service::MobIncarnationId,
+    /// Every seated local session-bound member: the members a scan that
+    /// cannot answer reads as holding work.
+    members: BTreeSet<mob_dsl::AgentIdentity>,
     by_session_runtime: HashMap<meerkat_runtime::LogicalRuntimeId, mob_dsl::AgentIdentity>,
     by_identity: HashMap<String, ObligationCandidate>,
 }
@@ -314,6 +321,7 @@ impl<'a> BootObligationIndex<'a> {
         mob_id: &'a MobId,
         incarnation: meerkat_core::service::MobIncarnationId,
     ) -> Result<Self, MobError> {
+        let mut members = BTreeSet::new();
         let mut by_session_runtime = HashMap::new();
         let mut by_identity = HashMap::new();
         for (identity, session) in &state.member_session_bindings {
@@ -338,6 +346,7 @@ impl<'a> BootObligationIndex<'a> {
                 meerkat_runtime::LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
                 identity.clone(),
             );
+            members.insert(identity.clone());
             if let Some(generation) = state.identity_runtime_generations.get(identity) {
                 by_identity.insert(
                     identity.0.clone(),
@@ -351,9 +360,25 @@ impl<'a> BootObligationIndex<'a> {
         Ok(Self {
             mob_id,
             incarnation,
+            members,
             by_session_runtime,
             by_identity,
         })
+    }
+
+    /// Every seated local member read as holding recovery work: the scan
+    /// could not tell which do, for `cause`.
+    fn unobserved(&self, cause: MobBootSetUnobservedCause) -> BootObligations {
+        let by_member = self
+            .members
+            .iter()
+            .cloned()
+            .map(|identity| (identity, mob_dsl::MemberRecoveryObligationKind::Unobserved))
+            .collect();
+        BootObligations {
+            by_member,
+            basis: MobBootSetBasis::Unobserved { cause },
+        }
     }
 
     /// The seated member `runtime_id` names, if any. A member delivery
@@ -399,9 +424,12 @@ impl<'a> BootObligationIndex<'a> {
 ///
 /// It reads the head summary every runtime scope already pins (no body
 /// load, no per-member read) plus the pending-delivery scan. A store that
-/// cannot answer the recovery-work scan yields `Unobserved` for every seated
-/// local member, which the boot rule reads as an obligation: the start fails
-/// closed to materializing them all, and says so ([`MobBootSetBasis`]).
+/// cannot answer the scan, because it does not implement a read or because
+/// the read failed, yields `Unobserved` for every seated local
+/// session-bound member, which the boot rule reads as an obligation: the
+/// start, lift or seat goes ahead and fails closed to waking every such
+/// member, and says so ([`MobBootSetBasis`]). A failed scan never fails the
+/// operation that planned with it.
 #[cfg(feature = "runtime-adapter")]
 pub(crate) async fn scan_boot_obligations(
     runtime_adapter: Option<&Arc<meerkat_runtime::MeerkatMachine>>,
@@ -414,13 +442,19 @@ pub(crate) async fn scan_boot_obligations(
         return Ok(BootObligations::none());
     };
     let index = BootObligationIndex::new(state, mob_id, incarnation)?;
-    let scanned = adapter.boot_recovery_obligations().await.map_err(|error| {
-        MobError::Internal(format!(
-            "mob '{mob_id}' could not scan its runtime store for member recovery work: {error}"
-        ))
-    })?;
+    let scanned = match adapter.boot_recovery_obligations().await {
+        Ok(scanned) => scanned,
+        Err(error) => {
+            tracing::warn!(
+                %mob_id,
+                %error,
+                "the runtime obligation scan failed; every seated member is planned as holding recovery work"
+            );
+            return Ok(index.unobserved(MobBootSetUnobservedCause::ScanFailed));
+        }
+    };
     let mut by_member = BTreeMap::new();
-    let basis = match &scanned.recovery_work {
+    match &scanned.recovery_work {
         meerkat_runtime::RuntimeRecoveryWork::Unobserved(cause) => {
             let cause = match cause {
                 meerkat_runtime::RuntimeRecoveryWorkUnobserved::RecoveryScanUnsupported => {
@@ -433,15 +467,9 @@ pub(crate) async fn scan_boot_obligations(
             tracing::warn!(
                 %mob_id,
                 ?cause,
-                "the runtime store cannot tell which runtimes hold recovery work; this start materializes every seated member"
+                "the runtime store cannot tell which runtimes hold recovery work; every seated member is planned as holding recovery work"
             );
-            for candidate in index.by_identity.values() {
-                by_member.insert(
-                    candidate.identity.clone(),
-                    mob_dsl::MemberRecoveryObligationKind::Unobserved,
-                );
-            }
-            MobBootSetBasis::Unobserved { cause }
+            return Ok(index.unobserved(cause));
         }
         meerkat_runtime::RuntimeRecoveryWork::Observed(runtimes) => {
             for runtime_id in runtimes {
@@ -452,9 +480,8 @@ pub(crate) async fn scan_boot_obligations(
                     );
                 }
             }
-            MobBootSetBasis::Observed
         }
-    };
+    }
     for runtime_id in &scanned.pending_deliveries {
         if let Some(identity) = index.member_for(runtime_id) {
             by_member
@@ -462,7 +489,10 @@ pub(crate) async fn scan_boot_obligations(
                 .or_insert(mob_dsl::MemberRecoveryObligationKind::PendingDelivery);
         }
     }
-    Ok(BootObligations { by_member, basis })
+    Ok(BootObligations {
+        by_member,
+        basis: MobBootSetBasis::Observed,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -638,7 +668,7 @@ pub(crate) fn apply_boot_materialization_plan(
 }
 
 /// Seal a start's plan once its boot set settled: from here on every Dormant
-/// or Waking member has a durable endpoint (I6). Returns the seal's effects
+/// or Waking member has a durable endpoint. Returns the seal's effects
 /// (the wake-route rebuild) for the actor to realize.
 pub(crate) fn seal_boot_materialization_plan(
     authority: &mut mob_dsl::MobMachineAuthority,
@@ -980,5 +1010,87 @@ mod tests {
         assert_eq!(plan.materialize, BTreeSet::from([AgentIdentity::from("a")]));
         assert_eq!(plan.verify, BTreeSet::from([AgentIdentity::from("b")]));
         assert!(plan.residency_effects.is_empty());
+    }
+
+    /// A scan that fails does not fail the plan: every seated local
+    /// session-bound member reads as holding work, whether or not it has a
+    /// runtime generation, and the basis names the failure. A placed member
+    /// stays out.
+    #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+    #[tokio::test]
+    async fn a_failed_obligation_scan_plans_every_local_session_bound_member_unobserved() {
+        use meerkat_runtime::store::{RuntimeDeliveryAuthorityRecord, RuntimeStore};
+
+        let store = Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+        // A delivery authority that does not decode fails the scan's
+        // pending-delivery listing.
+        store
+            .compare_and_swap_runtime_delivery_authority(
+                &meerkat_runtime::LogicalRuntimeId::new("undecodable-delivery-authority"),
+                None,
+                RuntimeDeliveryAuthorityRecord::from_parts(1, b"not a delivery authority".to_vec()),
+                None,
+            )
+            .await
+            .expect("the store keeps the record it is given");
+        let adapter = Arc::new(
+            meerkat_runtime::MeerkatMachine::persistent_without_blobs(
+                store as Arc<dyn RuntimeStore>,
+            )
+            .expect("construct runtime authority"),
+        );
+        let mut state = mob_dsl::MobMachineState::default();
+        for (name, generation) in [
+            ("with-generation", Some(1)),
+            ("without-generation", None),
+            ("placed", Some(1)),
+        ] {
+            let identity = mob_dsl::AgentIdentity(name.to_string());
+            state.member_session_bindings.insert(
+                identity.clone(),
+                mob_dsl::SessionId(meerkat_core::types::SessionId::new().to_string()),
+            );
+            state.identity_to_runtime.insert(
+                identity.clone(),
+                mob_dsl::AgentRuntimeId(format!("{name}-runtime")),
+            );
+            if let Some(generation) = generation {
+                state
+                    .identity_runtime_generations
+                    .insert(identity, mob_dsl::Generation(generation));
+            }
+        }
+        state.member_placement.insert(
+            mob_dsl::AgentIdentity("placed".to_string()),
+            mob_dsl::HostId("host".to_string()),
+        );
+
+        let obligations = scan_boot_obligations(
+            Some(&adapter),
+            &state,
+            &MobId::from("failed-scan"),
+            meerkat_core::service::MobIncarnationId::mint(),
+        )
+        .await
+        .expect("a failed scan never fails the plan");
+        assert_eq!(
+            obligations.basis,
+            MobBootSetBasis::Unobserved {
+                cause: MobBootSetUnobservedCause::ScanFailed,
+            }
+        );
+        assert_eq!(
+            obligations.by_member,
+            BTreeMap::from([
+                (
+                    mob_dsl::AgentIdentity("with-generation".to_string()),
+                    mob_dsl::MemberRecoveryObligationKind::Unobserved,
+                ),
+                (
+                    mob_dsl::AgentIdentity("without-generation".to_string()),
+                    mob_dsl::MemberRecoveryObligationKind::Unobserved,
+                ),
+            ])
+        );
     }
 }
