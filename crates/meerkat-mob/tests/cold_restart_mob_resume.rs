@@ -11925,7 +11925,7 @@ async fn a_lift_whose_resume_notification_turn_spawns_a_member_reaches_ready() {
         handle
             .resolve_bridge_session_id(&spawned)
             .await
-            .unwrap_or_else(|error| panic!("{spawned} is a session-backed member: {error}"));
+            .unwrap_or_else(|| panic!("{spawned} is a session-backed member"));
     }
     let status = handle.status().await;
     assert!(
