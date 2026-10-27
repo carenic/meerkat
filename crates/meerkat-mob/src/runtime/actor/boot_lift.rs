@@ -56,6 +56,9 @@ pub(in crate::runtime) struct ExplicitResumeBootMember {
     /// frees its slot of the plan when it closes; the lift has nothing of it
     /// to settle.
     authorized: bool,
+    /// Whether the plan only watches this wake: a delivery opened it before
+    /// the plan reached the member, and the plan opened none.
+    watched: bool,
 }
 
 /// The lift's plan between two dispatches: the members it has not reached
@@ -323,6 +326,7 @@ impl MobActor {
                     resume_attempt: resume_attempt.clone(),
                     wake_attempt,
                     authorized,
+                    watched: !authorized,
                 })
             })
             .collect()
@@ -462,7 +466,7 @@ impl MobActor {
         member: Box<ExplicitResumeBootMember>,
         joined: bool,
     ) {
-        if !joined {
+        if !joined && !member.watched {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 agent_identity = %member.agent_identity,
@@ -482,8 +486,18 @@ impl MobActor {
         }
         if !member.authorized {
             // The lift never took this wake over, so it has nothing to
-            // settle; it goes on only when this close moved its plan.
+            // settle; it goes on only when this close moved its plan. The
+            // lift waited for a watched wake: its close is the lift's
+            // progress.
             if dispatched {
+                if member.watched
+                    && let Some(pending) = self.pending_resume_lifecycle.as_ref()
+                {
+                    pending.progress.member_progress(
+                        &member.agent_identity,
+                        super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+                    );
+                }
                 self.continue_explicit_resume_after_rebuild().await;
             }
             return;

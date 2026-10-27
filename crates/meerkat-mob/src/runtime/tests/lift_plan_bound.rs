@@ -38,9 +38,12 @@ const BOUND: usize = 2;
 /// bound.
 const MEMBERS: usize = 5;
 
-/// The wake bound of the row that lets a delivery's wake time out: far above
-/// what a wake of the mock service takes, and it ends the wake held past it.
-const WAKE_BOUND: Duration = Duration::from_secs(2);
+/// The wake bound of the row that lets a delivery's wake time out. The
+/// delivery's wake must still be open when the plan reaches its member, after
+/// the plan's first wake is released and three more run one after another,
+/// so it is far above what those wakes take even on a loaded runner; the row
+/// then waits about this long for the bound to end the held wake.
+const WAKE_BOUND: Duration = Duration::from_secs(10);
 
 fn worker(index: usize) -> AgentIdentity {
     AgentIdentity::from(format!("plan-bound-{index}"))
