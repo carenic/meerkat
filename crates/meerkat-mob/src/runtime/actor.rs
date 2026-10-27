@@ -20305,7 +20305,8 @@ impl MobActor {
             .saturating_add(self.retirements.len())
             .saturating_add(usize::from(self.retirement_batch.is_some()))
             .saturating_add(state.pending_respawn_topology.len())
-            .saturating_add(state.member_revival_pending.len())
+            // A Waking member (an open wake attempt) is a roster transition.
+            .saturating_add(state.member_wake_attempts.len())
             .saturating_add(state.member_kickoff_pending.len())
             .saturating_add(state.member_kickoff_starting.len())
             .saturating_add(usize::from(state.explicit_resume_attempt.is_some()))
@@ -29263,7 +29264,7 @@ impl MobActor {
                                 let state = self.dsl_authority.state();
                                 let runtime_id = state.identity_to_runtime.get(&dsl_identity);
                                 MobError::Internal(format!(
-                                    "{error}; remote-turn admission facts: placement={:?}, host_phase={:?}, durable={:?}, tracked_cancel={:?}, protocol={:?}..={:?}, session={:?}, runtime={runtime_id:?}, live={}, startup_ready={}, retiring={:?}, revival_pending={}, spawn_phase={:?}, materialization_failure={}, generation={:?}, fence={:?}, dispatch_highwater={}",
+                                    "{error}; remote-turn admission facts: placement={:?}, host_phase={:?}, durable={:?}, tracked_cancel={:?}, protocol={:?}..={:?}, session={:?}, runtime={runtime_id:?}, live={}, startup_ready={}, retiring={:?}, waking={}, spawn_phase={:?}, materialization_failure={}, generation={:?}, fence={:?}, dispatch_highwater={}",
                                     state.member_placement.get(&dsl_identity),
                                     state.host_bind_phase.get(&host_id),
                                     state.host_durable_sessions.get(&host_id),
@@ -29274,7 +29275,7 @@ impl MobActor {
                                     runtime_id.is_some_and(|runtime_id| state.live_runtime_ids.contains(runtime_id)),
                                     runtime_id.is_some_and(|runtime_id| state.member_startup_ready.contains(runtime_id)),
                                     runtime_id.and_then(|runtime_id| state.member_state_markers.get(runtime_id)),
-                                    state.member_revival_pending.contains(&dsl_identity),
+                                    state.member_wake_attempts.contains_key(&dsl_identity),
                                     state.spawn_exec_phase.get(&dsl_identity),
                                     state.member_materialization_failures.contains_key(&dsl_identity),
                                     state.identity_runtime_generations.get(&dsl_identity),
@@ -29927,7 +29928,8 @@ impl MobActor {
                             .clone(),
                         remote_runtime_retired_ids: dsl.remote_runtime_retired_ids.clone(),
                         remote_supervisor_revoked_ids: dsl.remote_supervisor_revoked_ids.clone(),
-                        member_revival_pending: dsl.member_revival_pending.clone(),
+                        member_materialization: dsl.member_materialization.clone(),
+                        member_wake_attempts: dsl.member_wake_attempts.clone(),
                         member_kickoff_objective_ids: dsl.member_kickoff_objective_ids.clone(),
                         objective_owner_ids: dsl.objective_owner_ids.clone(),
                         objective_outcomes: dsl.objective_outcomes.clone(),

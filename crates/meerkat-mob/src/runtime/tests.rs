@@ -76887,8 +76887,8 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
     );
     assert!(
         !machine_state
-            .member_revival_pending
-            .contains(&machine_identity),
+            .member_wake_attempts
+            .contains_key(&machine_identity),
         "successful revival must resolve the machine-owned revival obligation"
     );
 
@@ -77121,8 +77121,8 @@ async fn test_ownerless_stale_runtime_binding_is_redriven_by_missing_live_dispat
     assert!(lifecycle.error.is_none());
     assert!(
         !machine_state
-            .member_revival_pending
-            .contains(&machine_identity),
+            .member_wake_attempts
+            .contains_key(&machine_identity),
         "successful materialization must resolve the machine-owned revival obligation"
     );
 }
@@ -77306,8 +77306,8 @@ async fn test_revival_already_active_identity_is_idempotent_success() {
     );
     assert!(
         !machine_state
-            .member_revival_pending
-            .contains(&machine_identity),
+            .member_wake_attempts
+            .contains_key(&machine_identity),
         "already-live revival success must resolve the machine-owned obligation"
     );
 }
@@ -77387,8 +77387,8 @@ async fn test_revival_failure_is_typed_terminal_without_retry_loop() {
     );
     assert!(
         !machine_state
-            .member_revival_pending
-            .contains(&machine_identity),
+            .member_wake_attempts
+            .contains_key(&machine_identity),
         "failed revival must resolve the machine-owned revival obligation"
     );
 
@@ -77525,8 +77525,8 @@ async fn test_revival_already_active_without_live_session_is_typed_terminal() {
     );
     assert!(
         !machine_state
-            .member_revival_pending
-            .contains(&machine_identity),
+            .member_wake_attempts
+            .contains_key(&machine_identity),
         "failed revival must resolve the machine-owned revival obligation"
     );
 }
@@ -85609,7 +85609,8 @@ struct MobRuntimeParitySnapshotSummary {
     runtime_retire_pending_sessions: BTreeMap<String, String>,
     remote_runtime_retired_ids: BTreeSet<String>,
     remote_supervisor_revoked_ids: BTreeSet<String>,
-    member_revival_pending: BTreeSet<String>,
+    member_materialization: BTreeMap<String, String>,
+    member_wake_attempts: BTreeMap<String, u64>,
     supervisor_authority_peer_id: Option<String>,
     supervisor_authority_signing_key: Option<String>,
     supervisor_authority_epoch: Option<u64>,
@@ -86943,7 +86944,7 @@ async fn mob_runtime_parity_snapshot_summary(
         member_peer_endpoints,
         member_prior_peer_endpoints,
         member_restore_failures,
-        member_revival_pending,
+        (member_materialization, member_wake_attempts),
         supervisor_authority_peer_id,
         supervisor_authority_signing_key,
         supervisor_authority_epoch,
@@ -87038,10 +87039,16 @@ async fn mob_runtime_parity_snapshot_summary(
                     .into_iter()
                     .map(|(k, v)| (format!("{k:?}"), v))
                     .collect::<BTreeMap<_, _>>(),
-                snap.member_revival_pending
-                    .into_iter()
-                    .map(|id| format!("{id:?}"))
-                    .collect::<BTreeSet<_>>(),
+                (
+                    snap.member_materialization
+                        .into_iter()
+                        .map(|(k, v)| (format!("{k:?}"), format!("{v:?}")))
+                        .collect::<BTreeMap<_, _>>(),
+                    snap.member_wake_attempts
+                        .into_iter()
+                        .map(|(k, v)| (format!("{k:?}"), v))
+                        .collect::<BTreeMap<_, _>>(),
+                ),
                 snap.supervisor_authority_peer_id
                     .map(|peer_id| format!("{peer_id:?}")),
                 snap.supervisor_authority_signing_key
@@ -87174,7 +87181,7 @@ async fn mob_runtime_parity_snapshot_summary(
                 BTreeMap::new(),
                 BTreeMap::new(),
                 BTreeMap::new(),
-                BTreeSet::new(),
+                (BTreeMap::new(), BTreeMap::new()),
                 None,
                 None,
                 None,
@@ -87269,7 +87276,8 @@ async fn mob_runtime_parity_snapshot_summary(
         runtime_retire_pending_sessions,
         remote_runtime_retired_ids,
         remote_supervisor_revoked_ids,
-        member_revival_pending,
+        member_materialization,
+        member_wake_attempts,
         supervisor_authority_peer_id,
         supervisor_authority_signing_key,
         supervisor_authority_epoch,
@@ -87506,8 +87514,32 @@ fn mob_runtime_parity_field_value(
         "remote_supervisor_revoked_ids" => Some(MobRuntimeParityExprValue::Set(
             snapshot.remote_supervisor_revoked_ids.clone(),
         )),
-        "member_revival_pending" => Some(MobRuntimeParityExprValue::Set(
-            snapshot.member_revival_pending.clone(),
+        "member_materialization" => Some(MobRuntimeParityExprValue::Map(
+            snapshot
+                .member_materialization
+                .keys()
+                .map(|key| (key.clone(), 0))
+                .collect(),
+        )),
+        "member_wake_attempts" => Some(MobRuntimeParityExprValue::Map(
+            snapshot.member_wake_attempts.clone(),
+        )),
+        // Residency bookkeeping the parity snapshot does not project yet:
+        // the parity probes never read it.
+        "member_wake_bound" | "member_host_preparation_pending" => {
+            Some(MobRuntimeParityExprValue::Set(BTreeSet::new()))
+        }
+        "member_materialization_epoch"
+        | "member_boot_obligation_owed"
+        | "member_rotation_session_ids"
+        | "member_rotation_peer_endpoints" => Some(MobRuntimeParityExprValue::Map(BTreeMap::new())),
+        "member_wake_attempt_sequence" | "member_materialization_drift_count" => {
+            Some(MobRuntimeParityExprValue::U64(0))
+        }
+        "boot_plan_sealed" => Some(MobRuntimeParityExprValue::Bool(false)),
+        "member_restore_policy" => Some(MobRuntimeParityExprValue::String("OnDemand".to_string())),
+        "composition_authority" => Some(MobRuntimeParityExprValue::String(
+            "Authoritative".to_string(),
         )),
         "member_kickoff_objective_ids" => Some(MobRuntimeParityExprValue::Map(
             snapshot

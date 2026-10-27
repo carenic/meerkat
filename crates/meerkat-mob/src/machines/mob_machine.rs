@@ -2796,6 +2796,40 @@ mod tests {
         bridge_session_id
     }
 
+    /// The shape replay leaves a seeded member in: Dormant, with no epoch and
+    /// no startup binding ladder (replay never materializes; only the boot
+    /// plan or a wake does).
+    fn as_replayed_dormant(
+        mut state: MobMachineState,
+        identity: &AgentIdentity,
+        runtime_id: &AgentRuntimeId,
+    ) -> MobMachineState {
+        state
+            .member_materialization
+            .insert(identity.clone(), MemberMaterializationPhase::Dormant);
+        state.member_materialization_epoch.remove(identity);
+        state.member_startup_binding_requested.remove(runtime_id);
+        state.member_startup_runtime_ready.remove(runtime_id);
+        state.member_startup_ready.remove(runtime_id);
+        state
+    }
+
+    fn abandon_open_wake(authority: &mut MobMachineAuthority, identity: &AgentIdentity) {
+        let attempt = *authority
+            .state()
+            .member_wake_attempts
+            .get(identity)
+            .expect("the explicit resume holds an open wake attempt");
+        authority
+            .apply_signal(MobMachineSignal::AbandonMemberWake {
+                agent_identity: identity.clone(),
+                attempt,
+                kind: MemberWakeAbandonKind::Unsettled,
+                reason: "explicit resume rolled back".to_string(),
+            })
+            .expect("the rollback abandons its open attempt");
+    }
+
     fn explicit_resume_fixture() -> (
         MobMachineAuthority,
         ResumeAttemptId,
@@ -3058,6 +3092,21 @@ mod tests {
             )
             .is_err()
         );
+        // The resume settles from its wake attempt's outcome: while the
+        // attempt is open the member has an owner, and the settle waits.
+        assert!(
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::SettleExplicitResumeMember {
+                    attempt: attempt.clone(),
+                    agent_identity: identity.clone(),
+                    binding: binding.clone(),
+                },
+            )
+            .is_err(),
+            "an open wake attempt keeps the member's resume work unsettled"
+        );
+        abandon_open_wake(&mut authority, &identity);
         MobMachineMutator::apply(
             &mut authority,
             MobMachineInput::SettleExplicitResumeMember {
@@ -3229,6 +3278,9 @@ mod tests {
                 ..
             }
         )));
+        // The same incarnation's session changed under the resume's open
+        // attempt: the rollback closes that attempt before the settle.
+        abandon_open_wake(&mut authority, &identity);
         MobMachineMutator::apply(
             &mut authority,
             MobMachineInput::SettleExplicitResumeMember {
@@ -4328,14 +4380,60 @@ mod tests {
     }
 
     fn test_member_peer_endpoint(name: &str, signing_key: [u8; 32]) -> MemberPeerEndpoint {
-        MemberPeerEndpoint {
-            name: PeerName(name.to_string()),
-            peer_id: PeerId(
-                meerkat_core::comms::PeerId::from_ed25519_pubkey(&signing_key).to_string(),
-            ),
-            address: PeerAddress(format!("inproc://{name}")),
-            signing_key: PeerSigningKey(signing_key),
-            transport: PeerTransportKind::Inproc,
+        MemberPeerEndpoint::new(
+            PeerName(name.to_string()),
+            PeerId(meerkat_core::comms::PeerId::from_ed25519_pubkey(&signing_key).to_string()),
+            PeerAddress(format!("inproc://{name}")),
+            PeerSigningKey(signing_key),
+        )
+    }
+
+    /// N9 drift guard: a member endpoint's transport is derived from its
+    /// address on every construction path (the constructor, the trusted
+    /// descriptor and the stored shape), never set by hand. An address that
+    /// does not parse counts as a network transport.
+    #[test]
+    fn member_endpoint_transport_is_derived_from_its_address() {
+        for (address, expected) in [
+            ("inproc://alice", PeerTransportKind::Inproc),
+            ("tcp://127.0.0.1:4200", PeerTransportKind::Tcp),
+            ("uds:///tmp/peer.sock", PeerTransportKind::Uds),
+            ("no-scheme", PeerTransportKind::Tcp),
+        ] {
+            let endpoint = MemberPeerEndpoint::new(
+                PeerName("peer".to_string()),
+                PeerId("peer-id".to_string()),
+                PeerAddress(address.to_string()),
+                PeerSigningKey([1; 32]),
+            );
+            assert_eq!(endpoint.transport, expected, "{address}");
+            let stored = serde_json::to_value(&endpoint).expect("serialize endpoint");
+            assert!(
+                stored.get("transport").is_none(),
+                "the stored endpoint shape is unchanged: {stored}"
+            );
+            let restored: MemberPeerEndpoint =
+                serde_json::from_value(stored).expect("deserialize endpoint");
+            assert_eq!(restored, endpoint, "{address}");
+        }
+        for address in [
+            "inproc://alice",
+            "tcp://127.0.0.1:4200",
+            "uds:///tmp/peer.sock",
+        ] {
+            let descriptor = meerkat_core::comms::TrustedPeerDescriptor::test_only_unsigned(
+                "alice",
+                "11111111-2222-5333-8444-555555555555",
+                address,
+            )
+            .expect("descriptor")
+            .with_pubkey([7; 32]);
+            let endpoint = MemberPeerEndpoint::from(&descriptor);
+            assert_eq!(
+                endpoint.transport,
+                PeerTransportKind::from_address_str(endpoint.address.0.as_str()),
+                "{address}"
+            );
         }
     }
 
@@ -6084,7 +6182,7 @@ mod tests {
             },
         )
         .expect("seed reset kickoff failure and error");
-        let base = seeded.state().clone();
+        let base = as_replayed_dormant(seeded.state().clone(), &identity, &runtime_v0);
 
         let reset_signal = |previous_generation, generation, fence_token| {
             MobMachineSignal::RecoverRosterMemberReset {
@@ -6215,13 +6313,12 @@ mod tests {
                 host_id: host.clone(),
                 host_binding_generation: 1,
                 member_session_id: SessionId("member-session".to_string()),
-                member_peer_endpoint: MemberPeerEndpoint {
-                    name: PeerName("mob/worker/ascending-placed-worker".to_string()),
-                    peer_id: PeerId("ascending-peer-id".to_string()),
-                    address: PeerAddress("tcp://placed-member.test:4200".to_string()),
-                    signing_key: PeerSigningKey([3; 32]),
-                    transport: PeerTransportKind::Tcp,
-                },
+                member_peer_endpoint: MemberPeerEndpoint::new(
+                    PeerName("mob/worker/ascending-placed-worker".to_string()),
+                    PeerId("ascending-peer-id".to_string()),
+                    PeerAddress("tcp://placed-member.test:4200".to_string()),
+                    PeerSigningKey([3; 32]),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
                 external_addressable: true,
@@ -6489,13 +6586,12 @@ mod tests {
             )
         }));
 
-        let endpoint = MemberPeerEndpoint {
-            name: PeerName("late-retired-peer".to_string()),
-            peer_id: PeerId(meerkat_core::comms::PeerId::from_ed25519_pubkey(&[9; 32]).to_string()),
-            address: PeerAddress("inproc://late-retired-peer".to_string()),
-            signing_key: PeerSigningKey([9; 32]),
-            transport: PeerTransportKind::Inproc,
-        };
+        let endpoint = MemberPeerEndpoint::new(
+            PeerName("late-retired-peer".to_string()),
+            PeerId(meerkat_core::comms::PeerId::from_ed25519_pubkey(&[9; 32]).to_string()),
+            PeerAddress("inproc://late-retired-peer".to_string()),
+            PeerSigningKey([9; 32]),
+        );
         assert!(
             MobMachineMutator::apply(
                 &mut authority,
@@ -6953,13 +7049,12 @@ mod tests {
                 host_id,
                 host_binding_generation: 1,
                 member_session_id: member_session_id.clone(),
-                member_peer_endpoint: MemberPeerEndpoint {
-                    name: PeerName("mob/worker/scoped-retire-placed".to_string()),
-                    peer_id: PeerId("scoped-retire-placed-peer".to_string()),
-                    address: PeerAddress("tcp://scoped-retire-placed-member.test:4200".to_string()),
-                    signing_key: PeerSigningKey([3; 32]),
-                    transport: PeerTransportKind::Tcp,
-                },
+                member_peer_endpoint: MemberPeerEndpoint::new(
+                    PeerName("mob/worker/scoped-retire-placed".to_string()),
+                    PeerId("scoped-retire-placed-peer".to_string()),
+                    PeerAddress("tcp://scoped-retire-placed-member.test:4200".to_string()),
+                    PeerSigningKey([3; 32]),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
                 external_addressable: true,
@@ -7030,7 +7125,7 @@ mod tests {
         let runtime = AgentRuntimeId::from("generation-exhausted:max");
         let mut seeded = MobMachineAuthority::new();
         seed_live_member(&mut seeded, &identity, &runtime);
-        let mut exhausted_state = seeded.state().clone();
+        let mut exhausted_state = as_replayed_dormant(seeded.state().clone(), &identity, &runtime);
         exhausted_state
             .identity_runtime_generations
             .insert(identity.clone(), Generation(u64::MAX));
@@ -7614,8 +7709,12 @@ mod tests {
         let mut seeded = MobMachineAuthority::new();
         seed_live_member(&mut seeded, &identity, &runtime_v0);
         observe_wedged_member(&mut seeded, &identity);
-        let mut authority = MobMachineAuthority::recover_from_state(seeded.state().clone())
-            .expect("recover a member with an execution-health history");
+        let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            seeded.state().clone(),
+            &identity,
+            &runtime_v0,
+        ))
+        .expect("recover a member with an execution-health history");
         authority
             .apply_signal(MobMachineSignal::RecoverRosterMemberReset {
                 agent_identity: identity.clone(),
@@ -7677,13 +7776,12 @@ mod tests {
                 host_id: host,
                 host_binding_generation: 1,
                 member_session_id: SessionId("placed-health-session".to_string()),
-                member_peer_endpoint: MemberPeerEndpoint {
-                    name: PeerName("mob/worker/placed-health-history".to_string()),
-                    peer_id: PeerId("placed-health-peer".to_string()),
-                    address: PeerAddress("tcp://placed-health-member.test:4200".to_string()),
-                    signing_key: PeerSigningKey([3; 32]),
-                    transport: PeerTransportKind::Tcp,
-                },
+                member_peer_endpoint: MemberPeerEndpoint::new(
+                    PeerName("mob/worker/placed-health-history".to_string()),
+                    PeerId("placed-health-peer".to_string()),
+                    PeerAddress("tcp://placed-health-member.test:4200".to_string()),
+                    PeerSigningKey([3; 32]),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
                 external_addressable: true,
@@ -8213,13 +8311,12 @@ mod tests {
                 host_id: host.clone(),
                 host_binding_generation: 1,
                 member_session_id: SessionId("placed-ext-session".to_string()),
-                member_peer_endpoint: MemberPeerEndpoint {
-                    name: PeerName("mob/worker/placed-ext-worker".to_string()),
-                    peer_id: PeerId("placed-ext-peer".to_string()),
-                    address: PeerAddress("tcp://placed-ext-member.test:4200".to_string()),
-                    signing_key: PeerSigningKey([3; 32]),
-                    transport: PeerTransportKind::Tcp,
-                },
+                member_peer_endpoint: MemberPeerEndpoint::new(
+                    PeerName("mob/worker/placed-ext-worker".to_string()),
+                    PeerId("placed-ext-peer".to_string()),
+                    PeerAddress("tcp://placed-ext-member.test:4200".to_string()),
+                    PeerSigningKey([3; 32]),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
                 external_addressable: true,
@@ -8368,13 +8465,12 @@ mod tests {
         let spawn_id = PlacedSpawnId("committed-spawn-id".to_string());
         let host = HostId("placed-host".to_string());
         let session_id = SessionId("member-session".to_string());
-        let endpoint = MemberPeerEndpoint {
-            name: PeerName("mob/worker/committed-placed-worker".to_string()),
-            peer_id: PeerId("peer-id".to_string()),
-            address: PeerAddress("tcp://placed-member.test:4200".to_string()),
-            signing_key: PeerSigningKey([3; 32]),
-            transport: PeerTransportKind::Tcp,
-        };
+        let endpoint = MemberPeerEndpoint::new(
+            PeerName("mob/worker/committed-placed-worker".to_string()),
+            PeerId("peer-id".to_string()),
+            PeerAddress("tcp://placed-member.test:4200".to_string()),
+            PeerSigningKey([3; 32]),
+        );
         let recovery_signal = || MobMachineSignal::RecoverCommittedPlacedSpawn {
             spawn_id: spawn_id.clone(),
             agent_identity: identity.clone(),
@@ -8468,13 +8564,12 @@ mod tests {
     fn committed_placed_recovery_rejects_peer_ids_owned_by_members_or_hosts() {
         let host = HostId("placed-host".to_string());
         let owner = SessionId("owner-session".to_string());
-        let shared_endpoint = MemberPeerEndpoint {
-            name: PeerName("mob/worker/shared-peer".to_string()),
-            peer_id: PeerId("shared-peer-id".to_string()),
-            address: PeerAddress("tcp://placed-member.test:4200".to_string()),
-            signing_key: PeerSigningKey([3; 32]),
-            transport: PeerTransportKind::Tcp,
-        };
+        let shared_endpoint = MemberPeerEndpoint::new(
+            PeerName("mob/worker/shared-peer".to_string()),
+            PeerId("shared-peer-id".to_string()),
+            PeerAddress("tcp://placed-member.test:4200".to_string()),
+            PeerSigningKey([3; 32]),
+        );
         let mut authority = MobMachineAuthority::new();
         authority
             .apply_signal(MobMachineSignal::RecoverOwnerBridgeSession {
@@ -9004,13 +9099,12 @@ mod tests {
                 host_id: host_id.clone(),
                 host_binding_generation: 1,
                 member_session_id: member_session_id.clone(),
-                member_peer_endpoint: MemberPeerEndpoint {
-                    name: PeerName("mob/worker/placed-kickoff-worker".to_string()),
-                    peer_id: PeerId("placed-kickoff-peer".to_string()),
-                    address: PeerAddress("tcp://placed-kickoff-member.test:4200".to_string()),
-                    signing_key: PeerSigningKey([3; 32]),
-                    transport: PeerTransportKind::Tcp,
-                },
+                member_peer_endpoint: MemberPeerEndpoint::new(
+                    PeerName("mob/worker/placed-kickoff-worker".to_string()),
+                    PeerId("placed-kickoff-peer".to_string()),
+                    PeerAddress("tcp://placed-kickoff-member.test:4200".to_string()),
+                    PeerSigningKey([3; 32]),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
                 external_addressable: true,

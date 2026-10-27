@@ -4765,6 +4765,17 @@ runtime_internal_inputs!(
         // classifier in the same command as the step it guards, so it is
         // never a standalone surface command.
         RetireAtScope,
+        // Member residency: the builder seeds and plans, the actor wakes,
+        // seats, rotates and classifies notices. None is a surface command.
+        SeedMemberResidency,
+        WakeMember,
+        PlanBootMaterialization,
+        SealBootMaterializationPlan,
+        ClassifyPeerNotice,
+        CommitDormantSeat,
+        ResolveMemberHostPreparation,
+        BeginMemberRotation,
+        CommitMemberRotation,
     ]
 );
 

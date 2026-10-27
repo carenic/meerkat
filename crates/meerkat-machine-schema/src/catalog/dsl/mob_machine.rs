@@ -2887,8 +2887,9 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // The boot verdict for one Dormant local member (section 5 and
-        // 4.3h). A candidate composition and a pending host preparation keep
-        // every member Dormant, obligated ones included; otherwise a member
+        // 4.3h). A candidate composition, a pending host preparation and a
+        // lifecycle cleanup that owns the mob (no new work origin) keep every
+        // member Dormant, obligated ones included; otherwise a member
         // wakes for the Eager policy, a recovery obligation (Unobserved counts:
         // fail closed), an owed kickoff, a network transport (Tcp or Uds), an
         // orchestrator notification, a missing durable endpoint or the host's
@@ -2898,6 +2899,7 @@ macro_rules! mob_catalog_machine_dsl {
             policy: Enum<MemberRestorePolicyKind>,
             composition_authoritative: bool,
             host_pending: bool,
+            origin_open: bool,
             obligation: Enum<MemberRecoveryObligationKind>,
             kickoff_pending: bool,
             network_transport: bool,
@@ -2909,6 +2911,9 @@ macro_rules! mob_catalog_machine_dsl {
                 BootMaterializationKind::StayDormant
             } else {
             if host_pending == true {
+                BootMaterializationKind::StayDormant
+            } else {
+            if origin_open == false {
                 BootMaterializationKind::StayDormant
             } else {
             if policy == MemberRestorePolicyKind::Eager {
@@ -2936,7 +2941,7 @@ macro_rules! mob_catalog_machine_dsl {
                 BootMaterializationKind::VerifyThenDormant
             } else {
                 BootMaterializationKind::StayDormant
-            }}}}}}}}}}
+            }}}}}}}}}}}
         }
 
         // The machine verdict for one peer notice, in both directions (R4).
@@ -21244,6 +21249,15 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.identity_runtime_fence_tokens.get_copied(agent_identity) != Some(binding.fence_token)
                 || self.member_session_bindings.get_cloned(agent_identity) != Some(binding.session_id)
             }
+            // A replaced incarnation's attempt was closed by its retirement
+            // (any open attempt is the successor's own wake); when only the
+            // session changed, the resume's attempt is still this member's and
+            // the settle waits for its outcome, as the exact arm does (R3).
+            guard "attempt_closed_or_incarnation_replaced" {
+                self.member_wake_attempts.contains_key(agent_identity) == false
+                || self.identity_to_runtime.get_cloned(agent_identity) != Some(binding.agent_runtime_id)
+                || self.identity_runtime_fence_tokens.get_copied(agent_identity) != Some(binding.fence_token)
+            }
             update { self.explicit_resume_member_work.remove(agent_identity); }
             to Running
         }
@@ -23903,6 +23917,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_restore_policy,
                     self.composition_authority == CompositionAuthorityKind::Authoritative,
                     self.member_host_preparation_pending.contains(agent_identity),
+                    self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     self.member_peer_endpoints.contains_key(agent_identity) == true
@@ -23948,6 +23963,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_restore_policy,
                     self.composition_authority == CompositionAuthorityKind::Authoritative,
                     self.member_host_preparation_pending.contains(agent_identity),
+                    self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     self.member_peer_endpoints.contains_key(agent_identity) == true
@@ -23975,6 +23991,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_restore_policy,
                     self.composition_authority == CompositionAuthorityKind::Authoritative,
                     self.member_host_preparation_pending.contains(agent_identity),
+                    self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     self.member_peer_endpoints.contains_key(agent_identity) == true
@@ -24246,7 +24263,7 @@ macro_rules! mob_catalog_machine_dsl {
                     agent_identity)
             }
             // The next incarnation's seat guards (R5, and the spawn mint).
-            guard "next_generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
+            guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
                 && next_agent_runtime_id != agent_runtime_id
@@ -24400,7 +24417,7 @@ macro_rules! mob_catalog_machine_dsl {
                     agent_identity)
             }
             // The next incarnation's seat guards (R5, and the spawn mint).
-            guard "next_generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
+            guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
                 && next_agent_runtime_id != agent_runtime_id
@@ -24703,8 +24720,8 @@ macro_rules! mob_catalog_machine_dsl {
         // G1/F5: a runtime registration was released while its member stays
         // seated (the composition route from MeerkatMachine's
         // RuntimeRegistrationReleased, or the mob-owned discard seam). Only
-        // the exact registration of a Live, local member with a durable
-        // endpoint (N3) is released: Live -> Dormant, its epoch and binding
+        // the exact registration of a Live, local member (with a durable
+        // endpoint once the boot plan is sealed, N3) is released: Live -> Dormant, its epoch and binding
         // ladder cleared (R12). Anything else (an older epoch after a newer
         // wake, a Waking member, a wake's own claim rollback, a non-member)
         // is a normal, accepted Stale no-op that never demotes a wake.
@@ -24717,7 +24734,7 @@ macro_rules! mob_catalog_machine_dsl {
                     && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
                     && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
                     && self.member_placement.contains_key(member_id) == false
-                    && self.member_peer_endpoints.contains_key(member_id) == true
+                    && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
                     && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id))
             }
             update {
@@ -24726,7 +24743,7 @@ macro_rules! mob_catalog_machine_dsl {
                         && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
                         && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
                         && self.member_placement.contains_key(member_id) == false
-                        && self.member_peer_endpoints.contains_key(member_id) == true
+                        && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
                         && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id)
                     {
                         self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
@@ -24750,7 +24767,7 @@ macro_rules! mob_catalog_machine_dsl {
                     && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
                     && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
                     && self.member_placement.contains_key(member_id) == false
-                    && self.member_peer_endpoints.contains_key(member_id) == true
+                    && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
                     && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id))
             }
             update {}
@@ -27260,6 +27277,10 @@ impl PeerTransportKind {
             meerkat_core::comms::PeerTransport::Inproc => Self::Inproc,
             meerkat_core::comms::PeerTransport::Tcp => Self::Tcp,
             meerkat_core::comms::PeerTransport::Uds => Self::Uds,
+            // The core transport is non-exhaustive: a transport this twin
+            // does not know yet counts as a network transport (fail toward
+            // reachability, as an unparseable address does).
+            _ => Self::Tcp,
         }
     }
 }
