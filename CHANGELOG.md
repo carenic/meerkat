@@ -523,12 +523,6 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
-- `meerkat-mob`: a delivery to a member whose live session actor was
-  discarded under it (for example after a failed durable write) while its
-  runtime executor stayed attached now revives the member before the turn
-  runs, as it does for a member with no executor. Before, the wake counted
-  the attached executor as a served member, answered ready, and the turn
-  ended with "session not found".
 - `meerkat-mob`: `MobHandle::member_history` of a member whose session is
   unborn (seated and not woken yet, or the next life a rotation seated)
   answers an empty page, and the read does not wake the member. Before, it
