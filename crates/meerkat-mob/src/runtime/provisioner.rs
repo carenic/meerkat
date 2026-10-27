@@ -14459,6 +14459,11 @@ impl ProvisionFinish {
             held,
         } = self;
         let backend = &backend;
+        // The generated binding this attempt installs (one the session did
+        // not hold before it), released if the attempt fails before it
+        // publishes its receipt.
+        let mut installed_generated_binding = None;
+        let binding_session_id = created_bridge_session_id.clone();
         let finalize_result = async {
         // Runtime-backed paths retain the exact prepared materialization for
         // the subsequent attachment transaction.
@@ -14556,11 +14561,20 @@ impl ProvisionFinish {
                         );
                     }
                 } else {
+                    let held_before = backend
+                        .ops_adapter
+                        .capture_session_binding_witness(&created_bridge_session_id)
+                        .is_some();
                     backend.ops_adapter.bind_session_registry(
                         created_bridge_session_id.clone(),
                         generated_owner_session_id,
                         registry,
                     )?;
+                    if !held_before {
+                        installed_generated_binding = backend
+                            .ops_adapter
+                            .capture_session_binding_witness(&created_bridge_session_id);
+                    }
                 }
                 tracing::debug!(
                     bridge_session_id = %created_bridge_session_id,
@@ -14659,9 +14673,27 @@ impl ProvisionFinish {
         }
         .await;
         if let Err(error) = finalize_result {
-            if let Some(transaction) = actor_transaction.take()
-                && let Err(cleanup_error) = transaction.abort().await
+            let cleanup = match actor_transaction.take() {
+                Some(transaction) => transaction.abort().await,
+                None => Ok(()),
+            };
+            // A failed attempt leaves no generated binding it installed: it
+            // names the registry of the attempt's own registration, and a
+            // binding left behind would refuse the session's next
+            // registration (the next restore or wake) as a different
+            // incarnation. A replayed Running operation keeps its binding
+            // through the operation rollback, so this is where it goes.
+            if let Some(installed) = installed_generated_binding.as_ref()
+                && backend
+                    .ops_adapter
+                    .release_unpublished_session_binding(&binding_session_id, installed)
             {
+                tracing::debug!(
+                    bridge_session_id = %binding_session_id,
+                    "SessionBackend::provision_member released the generated binding of a failed attempt"
+                );
+            }
+            if let Err(cleanup_error) = cleanup {
                 return Err(MobError::Internal(format!(
                     "provision failed: {error}; exact actor/materialization cleanup failed: {cleanup_error}"
                 )));

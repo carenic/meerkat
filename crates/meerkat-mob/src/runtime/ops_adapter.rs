@@ -798,6 +798,35 @@ impl MobOpsAdapter {
         Ok(ExplicitResumeSessionBindingRelease::Cleared)
     }
 
+    /// Release the generic session binding a failed provision installed and
+    /// never published, while it is still exactly that binding (`installed`)
+    /// with no provision claim. The attempt published no receipt, so nothing
+    /// holds the binding as established, and the registry it names was the
+    /// attempt's own preparation: the session's next registration binds
+    /// afresh instead of meeting it as a different incarnation. The operation
+    /// it names is durable state and is left as it is. Answers whether it
+    /// released the binding.
+    pub(crate) fn release_unpublished_session_binding(
+        &self,
+        child_session_id: &SessionId,
+        installed: &SessionOpsBindingWitness,
+    ) -> bool {
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let mut bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unpublished = bindings.get(&member_key).is_some_and(|current| {
+            current.binding_id == installed.binding_id
+                && current.unpublished_attempt
+                && current.provision_claim.is_none()
+        });
+        if unpublished {
+            bindings.remove(&member_key);
+        }
+        unpublished
+    }
+
     /// Release the member's session binding after a failed resumed SPAWN
     /// was rolled back.
     ///

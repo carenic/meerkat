@@ -460,6 +460,13 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a member whose restore at a mob's start fails after its
+  operation binding was set up no longer stops the whole start. The failed
+  restore now releases the binding it set up, so the start re-binds the
+  member's session and the mob comes up Running with that member Broken
+  and repairable. Before, the start refused the member's session as
+  holding "a different operation-registry binding incarnation", stopped
+  the mob, and a host had to resume it to bring the other members back.
 - `meerkat-mob`: resuming a stopped mob (`MobHandle::resume`), as a host
   does after a graceful restart, no longer stalls while members' runs that
   the restart suspended are still running. The resume answers once its own
