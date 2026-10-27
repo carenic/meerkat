@@ -408,7 +408,10 @@ impl SpawnedMob {
                             .map(|session| session.0 == spawned.to_string()),
                         state.member_profile_names.get(&dsl_identity),
                         state.member_runtime_modes.get(&dsl_identity),
-                        state.member_materialization.get(&dsl_identity),
+                        crate::runtime::boot_plan::member_materialization_phase(
+                            &state,
+                            &dsl_identity,
+                        ),
                         state.member_restore_failures.get(&dsl_identity),
                         state
                             .spawn_profile_authority_profile_names
