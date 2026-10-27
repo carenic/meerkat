@@ -45,23 +45,30 @@ them.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
-  time. Each member's session reads, spawn customizer calls and provision run
+  time. A member counts against the bound from the start of its restore until
+  its writes are applied. Each member's session reads and provision run
   alongside other members', so a resume no longer takes the member count times
   the session store's latency. Everything a restore writes (the mob's
   MobMachine authority, roster, journal and restore diagnostics, and each
   member's runtime binding) is still applied one member at a time in roster
   order, so the resumed mob is the one a restore of one member at a time
-  leaves. A fork of a member of the same mob, a member bound to the session an
-  earlier member is bound to, and, from its successor search on, a member
-  whose bound session is absent are restored in their own turn, after every
-  member before them. The first failure in roster order fails the resume with
-  the error it failed with before; once a member's restore has failed the
-  resume, no further member's restore starts, and the restores already
-  running finish without being applied. The host callbacks a restore makes
-  (the spawn member customizer, the default external tools provider, the
-  member runtime registration hook and the durable resume gate) are now made
-  for several members at once, in no fixed order across members; each
-  member's own calls keep their order.
+  leaves; at concurrency 1 it is that restore. A fork of a member of the same
+  mob, a member bound to the session an earlier member is bound to, and, from
+  its successor search on, a member whose bound session is absent are
+  restored in their own turn, after every member before them. The first
+  failure in roster order fails the resume with the error it failed with
+  before. Once a member's restore or turn has failed the resume, no further
+  member's restore starts; the restores already running finish first, so the
+  error is returned after them, and every member they restored but that the
+  resume does not apply (at most the bound minus one) has its provision
+  released: a resumed session is detached and kept durable, as a failed
+  revival's is, and a session a service without durable sessions recreated
+  is retired. The spawn member customizer and the default external tools
+  provider stay synchronous calls on the resume's task, never two at once,
+  but one that blocks holds up every member restore in flight. The member
+  runtime registration hook runs inside each member's provision, so for
+  several members at once, in no fixed order across members; each member's
+  own calls keep their order.
 
 ## [0.9.6] - 2026-10-27
 
