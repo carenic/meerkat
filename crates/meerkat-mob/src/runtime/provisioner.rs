@@ -1733,15 +1733,18 @@ pub trait MobProvisioner: Send + Sync {
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
 
-    /// Retire a member whose host refused its registration, as MobMachine
-    /// records it. The refusal left the member no owner operation binding in
-    /// this process, so its retirement projects into one only when one is
+    /// Retire a member whose retirement is archive-only: MobMachine routes
+    /// it no runtime retire (it was not materialized in this process when its
+    /// retirement started, or its retirement was recovered at a start), or
+    /// its host refused its registration, as MobMachine records it. Such a
+    /// member holds no owner operation binding in this process unless one
+    /// was bound since, so its retirement projects into one only when one is
     /// bound, where the fresh archive of any other member fails closed on a
     /// missing binding. `deadline` bounds it as in
     /// [`Self::retire_member_until`]; without one it retires under
     /// [`Self::retire_member`]'s budget. The default retires it as any
     /// member.
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         member_identity: &AgentIdentity,
@@ -6456,18 +6459,18 @@ impl SessionBackend {
 
     /// Dispose a session-backed member's session under `deadline`, then
     /// project its retirement into its owner operation binding. A member
-    /// whose host refused its registration holds no such binding here (see
-    /// [`MobProvisioner::retire_refused_member`]), so its projection runs
-    /// only when one is bound.
+    /// whose retirement is archive-only may hold no such binding here (see
+    /// [`MobProvisioner::retire_member_archive_only`]), so its projection
+    /// runs only when one is bound.
     async fn retire_session_member_until(
         &self,
         member_ref: &MemberRef,
         deadline: Instant,
-        registration_refused: bool,
+        archive_only: bool,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
         tracing::debug!(
             member_ref = ?member_ref,
-            registration_refused,
+            archive_only,
             "SessionBackend::retire_member start"
         );
         let session_id = Self::require_session(member_ref, "retire")?;
@@ -6484,7 +6487,7 @@ impl SessionBackend {
             disposal,
             MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
         ) {
-            if registration_refused {
+            if archive_only {
                 self.ops_adapter
                     .mark_member_retired_if_bound(member_ref)
                     .await?;
@@ -15233,7 +15236,7 @@ impl MobProvisioner for SessionBackend {
             .await
     }
 
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         _member_identity: &AgentIdentity,
@@ -18948,15 +18951,15 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
     }
 
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         member_identity: &AgentIdentity,
         deadline: Option<Instant>,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
         match member_ref {
-            // A peer-only member has no session here whose registration a
-            // host could refuse.
+            // A peer-only member has no session here: it is retired as any
+            // peer-only member.
             MemberRef::BackendPeer {
                 session_id: None, ..
             } => match deadline {
@@ -18968,7 +18971,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             },
             _ => {
                 self.session
-                    .retire_refused_member(member_ref, member_identity, deadline)
+                    .retire_member_archive_only(member_ref, member_identity, deadline)
                     .await
             }
         }

@@ -14,6 +14,15 @@
 //! verdict (`ClassifyPeerNotice`): a member that is not materialized can
 //! neither send nor receive them, they are suppressed, and the trust its wake
 //! installs carries their content.
+//!
+//! An edge to an external peer is the member's own trust row and nothing
+//! else. MobMachine's verdict on the wire or unwire says whether that row is
+//! owed now: for a Dormant member it is not (no trust obligation is
+//! emitted), so the machine edge and its durable event are committed alone,
+//! and the member's wake installs the rows of the external edges the machine
+//! holds then. A row that is owed while the member's wake has not yet built
+//! its comms runtime waits for that wake (see
+//! [`MobActor::external_wiring_awaits_wake`]).
 
 use super::*;
 
@@ -435,5 +444,185 @@ impl MobActor {
                 "unwire rollback: failed to reinstall the live side's trust"
             );
         }
+    }
+
+    /// Whether `command` is an external-peer wire or unwire that waits for
+    /// its local member's wake (a deferral predicate of
+    /// `resume_member_control_is_pending`): the member's wake attempt is
+    /// open, so its comms runtime is the wake's to build, and MobMachine's
+    /// verdict owes the member a trust row change. The command runs once the
+    /// attempt closed, on the member as the wake left it: Live, the row
+    /// changes there; Dormant again, the verdict owes no row; Broken, the
+    /// verb refuses typed. Every other command runs now.
+    pub(super) fn external_wiring_awaits_wake(&self, command: &MobCommand) -> bool {
+        use super::super::handle::PeerTarget;
+        let (local, input) = match command {
+            MobCommand::Wire { local, target, .. } => {
+                let spec = match target {
+                    PeerTarget::External(descriptor) => descriptor.clone(),
+                    PeerTarget::ExternalBinding(binding) => {
+                        match Self::trusted_peer_descriptor_from_external_binding(binding.clone()) {
+                            Ok(descriptor) => descriptor,
+                            // The verb refuses the binding itself.
+                            Err(_) => return false,
+                        }
+                    }
+                    PeerTarget::Local(_) | PeerTarget::ExternalName(_) => return false,
+                };
+                let edge = Self::external_peer_edge(local, &spec);
+                let key = Self::external_peer_key_for_edge(&edge);
+                (
+                    local,
+                    mob_dsl::MobMachineInput::WireExternalPeer { key, edge },
+                )
+            }
+            MobCommand::Unwire { local, target, .. } => {
+                let name = match target {
+                    PeerTarget::Local(id) => {
+                        if self
+                            .dsl_authority
+                            .state()
+                            .identity_to_runtime
+                            .contains_key(&mob_dsl::AgentIdentity::from_domain(id))
+                        {
+                            return false;
+                        }
+                        id.as_str().to_string()
+                    }
+                    PeerTarget::ExternalName(name) => name.as_str().to_string(),
+                    PeerTarget::External(descriptor) => descriptor.name.as_str().to_string(),
+                    PeerTarget::ExternalBinding(binding) => binding.name.clone(),
+                };
+                let Ok(peer_name) = meerkat_core::comms::PeerName::new(name) else {
+                    return false;
+                };
+                // An edge the machine does not hold owes no row change.
+                let Some(edge) = self.external_peer_edge_for_name(local, &peer_name) else {
+                    return false;
+                };
+                let key = Self::external_peer_key_for_edge(&edge);
+                (
+                    local,
+                    mob_dsl::MobMachineInput::UnwireExternalPeer { key, edge },
+                )
+            }
+            _ => return false,
+        };
+        if !self
+            .dsl_authority
+            .state()
+            .member_wake_attempts
+            .contains_key(&mob_dsl::AgentIdentity::from_domain(local))
+        {
+            return false;
+        }
+        let Ok(prepared) =
+            self.prepare_dsl_input_transition(input.clone(), "external_wiring_wake_probe")
+        else {
+            // The verb answers the machine's refusal itself.
+            return false;
+        };
+        let effects = prepared.transition.effects();
+        match &input {
+            mob_dsl::MobMachineInput::WireExternalPeer { edge, .. } => {
+                Self::external_peer_trust_row_owed(effects, edge)
+            }
+            mob_dsl::MobMachineInput::UnwireExternalPeer { edge, .. } => {
+                Self::external_peer_trust_removal_owed(effects, edge)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether MobMachine's external-peer wire verdict owes the local
+    /// member's runtime a trust row for `edge` now: a new edge's wiring
+    /// obligation, or an existing edge's repair. A member that is not
+    /// materialized is owed none.
+    pub(super) fn external_peer_trust_row_owed(
+        effects: &[mob_dsl::MobMachineEffect],
+        edge: &mob_dsl::ExternalPeerEdge,
+    ) -> bool {
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                mob_dsl::MobMachineEffect::ExternalPeerTrustWiringRequested { edge: owed, .. }
+                    | mob_dsl::MobMachineEffect::ExternalPeerTrustRepairRequested {
+                        edge: owed,
+                        ..
+                    } if owed == edge
+            )
+        })
+    }
+
+    /// Whether MobMachine's external-peer unwire verdict owes the local
+    /// member's runtime the removal of its trust row for `edge`.
+    pub(super) fn external_peer_trust_removal_owed(
+        effects: &[mob_dsl::MobMachineEffect],
+        edge: &mob_dsl::ExternalPeerEdge,
+    ) -> bool {
+        effects.iter().any(|effect| {
+            matches!(
+                effect,
+                mob_dsl::MobMachineEffect::ExternalPeerTrustUnwiringRequested { edge: owed, .. }
+                    if owed == edge
+            )
+        })
+    }
+
+    /// Commit an external-peer wire whose verdict owes the local member no
+    /// trust row (see the module docs): a new edge commits once its
+    /// `ExternalPeerWired` event is durable; a wire of an edge the machine
+    /// already holds changes and publishes nothing.
+    pub(super) async fn commit_external_wire_without_trust_row(
+        &mut self,
+        prepared: PreparedDslTransition,
+        local: AgentIdentity,
+        spec: TrustedPeerDescriptor,
+    ) -> Result<(), MobError> {
+        if !Self::effects_include_wiring_graph_change(prepared.transition.effects()) {
+            return self.commit_prepared_dsl_transition(prepared);
+        }
+        let events = self.events.clone();
+        let event = NewMobEvent {
+            mob_id: self.definition.id.clone(),
+            timestamp: None,
+            kind: MobEventKind::ExternalPeerWired { local, spec },
+        };
+        let stored = self
+            .commit_prepared_dsl_transition_after(prepared, move || async move {
+                events.append(event).await.map_err(MobError::from)
+            })
+            .await?;
+        self.roster.write().await.apply_event(&stored);
+        Ok(())
+    }
+
+    /// Commit an external-peer unwire whose verdict owes the local member no
+    /// trust row removal (see the module docs): the edge leaves the graph
+    /// once its `ExternalPeerUnwired` event is durable.
+    pub(super) async fn commit_external_unwire_without_trust_row(
+        &mut self,
+        prepared: PreparedDslTransition,
+        local: AgentIdentity,
+        peer_name: meerkat_core::comms::PeerName,
+    ) -> Result<(), MobError> {
+        if !Self::effects_include_wiring_graph_change(prepared.transition.effects()) {
+            return Err(MobError::WiringError(format!(
+                "external unwire for '{local}' -> '{peer_name}' was not authorized by MobMachine"
+            )));
+        }
+        let events = self.events.clone();
+        let event = NewMobEvent {
+            mob_id: self.definition.id.clone(),
+            timestamp: None,
+            kind: MobEventKind::ExternalPeerUnwired { local, peer_name },
+        };
+        let stored = self
+            .commit_prepared_dsl_transition_after(prepared, move || async move {
+                events.append(event).await.map_err(MobError::from)
+            })
+            .await?;
+        self.roster.write().await.apply_event(&stored);
+        Ok(())
     }
 }

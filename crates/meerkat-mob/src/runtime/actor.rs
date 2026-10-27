@@ -12296,6 +12296,20 @@ impl MobActor {
             .is_some()
     }
 
+    /// Whether MobMachine retires `agent_runtime_id` archive-only: the member
+    /// was not materialized in this process when its retirement started, or
+    /// its retirement was recovered at a start. No runtime of this process
+    /// holds its session, so its retirement routes no runtime retire, removes
+    /// no trust row of its own, and archives its durable session with no
+    /// owner operation binding required. Retiring members only; the
+    /// retirement's terminal clears it.
+    pub(super) fn runtime_retire_archive_only(&self, agent_runtime_id: &AgentRuntimeId) -> bool {
+        self.dsl_authority
+            .state()
+            .runtime_retire_archive_only
+            .contains(&mob_dsl::AgentRuntimeId::from_domain(agent_runtime_id))
+    }
+
     /// The typed host refusal `agent_identity` is Broken with, read from
     /// MobMachine's recorded restore-failure code, so asking again answers
     /// the same refusal without asking the host.
@@ -12478,6 +12492,11 @@ impl MobActor {
         // #1105: a control that would move or retire a member whose wiring
         // effects this actor still owns must wait for that exact ledger.
         if self.wiring_io_control_is_pending(command) {
+            return true;
+        }
+        // An external-peer wire or unwire whose verdict owes a member being
+        // woken a trust row change waits for that wake.
+        if self.external_wiring_awaits_wake(command) {
             return true;
         }
         // Same rule for any other owned detached member effect on the shared
@@ -13722,6 +13741,17 @@ impl MobActor {
         session_id: &mob_dsl::SessionId,
         context: &str,
     ) -> Result<(), MobError> {
+        // MobMachine retires an archive-only runtime with no runtime retire
+        // (it refuses RetryRuntimeRetire for it): nothing is routed.
+        if self
+            .dsl_authority
+            .state()
+            .runtime_retire_archive_only
+            .contains(agent_runtime_id)
+        {
+            self.discard_queued_runtime_retire_for(agent_runtime_id);
+            return Ok(());
+        }
         if self
             .dsl_authority
             .state()
@@ -47590,6 +47620,23 @@ impl MobActor {
             )
         };
 
+        // MobMachine's verdict says what the local member's runtime is owed:
+        // a member that is not materialized is owed no trust row now (its
+        // wake installs the row from the machine edge), so the edge and its
+        // event are committed alone.
+        let prepared = self.prepare_dsl_input_transition(
+            mob_dsl::MobMachineInput::WireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+            "wire_external_peer",
+        )?;
+        if !Self::external_peer_trust_row_owed(prepared.transition.effects(), &edge) {
+            Box::pin(self.commit_external_wire_without_trust_row(prepared, local, spec)).await?;
+            return Ok(wiring_io::WiringPreparation::Settled);
+        }
+        drop(prepared);
+
         // Resolve the local session's comms runtime for trust install.
         let comms = self.provisioner_comms(&member_ref).await.ok_or_else(|| {
             MobError::WiringError(format!(
@@ -47766,6 +47813,25 @@ impl MobActor {
         let edge = authority_edge
             .unwrap_or_else(|| Self::external_peer_edge(&local_identity, &prior_spec));
         let key = Self::external_peer_key_for_edge(&edge);
+        // MobMachine's verdict says whether the local member holds a row to
+        // remove: one that is not materialized holds none, and its wake
+        // installs only the edges the machine still holds.
+        let prepared = self.prepare_dsl_input_transition(
+            mob_dsl::MobMachineInput::UnwireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+            "unwire_external_peer",
+        )?;
+        if !Self::external_peer_trust_removal_owed(prepared.transition.effects(), &edge) {
+            return Box::pin(self.commit_external_unwire_without_trust_row(
+                prepared,
+                local_identity,
+                peer_name,
+            ))
+            .await;
+        }
+        drop(prepared);
         let comms = self.provisioner_comms(&member_ref).await.ok_or_else(|| {
             MobError::WiringError(format!(
                 "unwire requires comms runtime for '{local}' (external peer unwire)"
@@ -49230,11 +49296,14 @@ impl MobActor {
         // A retiring placed member's external rows live on its host and die
         // with the exact ReleaseMember (its member-member rows likewise):
         // there is no local comms runtime to clean, so the observed-absent
-        // machine cleanup applies.
+        // machine cleanup applies. An archive-only retirement's member holds
+        // no row of its own in this process either (MobMachine refuses its
+        // trust-bearing cleanup).
         let comms = if super::member_runtime_is_host_owned(
             self.dsl_authority.state(),
             &entry.agent_identity,
-        ) {
+        ) || self.runtime_retire_archive_only(&entry.agent_runtime_id)
+        {
             None
         } else {
             self.provisioner_comms(&entry.member_ref).await
@@ -50970,9 +51039,14 @@ impl MobActor {
             member_ref = ?ctx.entry.member_ref,
             "MobActor::dispose_archive_session retiring member via provisioner"
         );
-        let disposal_result = if ctx.registration_refused {
+        // A host-refused member, and one MobMachine retires archive-only (no
+        // runtime of this process holds its session), may hold no owner
+        // operation binding here.
+        let archive_only = ctx.registration_refused
+            || self.runtime_retire_archive_only(&ctx.entry.agent_runtime_id);
+        let disposal_result = if archive_only {
             self.provisioner
-                .retire_refused_member(
+                .retire_member_archive_only(
                     &ctx.entry.member_ref,
                     &ctx.entry.agent_identity,
                     ctx.retirement_deadline,

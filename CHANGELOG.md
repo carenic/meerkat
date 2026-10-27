@@ -103,8 +103,12 @@ them.
   capabilities from its durable session and profile. Wiring and unwiring
   with a Dormant member commit the edge without waking it, and lifecycle
   notices to or from a member that is not materialized are not sent (its
-  wake installs the trust they carry). `MemberRestorePolicy::Eager` restores
-  the previous start.
+  wake installs the trust they carry). This holds for an edge to an external
+  peer too; a wire or unwire of one whose member is being woken waits for
+  that wake. Retiring a Dormant member, and destroying a mob with Dormant
+  members, archive their durable sessions without waking them, and so does
+  a retirement that a restart recovered. `MemberRestorePolicy::Eager`
+  restores the previous start.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
