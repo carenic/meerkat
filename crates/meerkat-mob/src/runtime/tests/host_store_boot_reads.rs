@@ -9,6 +9,12 @@
 //! chunk: the start reads every head and the mob's own scopes, and the counts
 //! do not change with the history.
 //!
+//! The session service is the mock one, whose durable session documents live
+//! in the mock, so a session-service read never reaches the host here: the
+//! row also requires that the restarted service's reads of each member's
+//! session (`read`, metadata, persisted session, resume authority, resume
+//! verdict) do not move across the start and the lift.
+//!
 //! Unrun until the candidate's validation.
 
 use super::*;
@@ -390,6 +396,38 @@ fn runtime_over(store: &Arc<SpiRuntimeStore>) -> Arc<MeerkatMachine> {
     )
 }
 
+/// What the session service read of one member's session, as the mock
+/// session service counts it: its reads (`SessionService::read`), its
+/// metadata reads, and its durable reads (the persisted session, the resume
+/// authority, the resume verdict). Over the mock these never reach the host,
+/// so the row counts them on the service itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MemberSessionReads {
+    reads: u64,
+    metadata_reads: u64,
+    durable: DurableSessionReadCounts,
+}
+
+/// The session service's reads of each member's session so far.
+fn member_session_reads(
+    service: &MockSessionService,
+    sessions: &[(AgentIdentity, SessionId)],
+) -> Vec<(AgentIdentity, MemberSessionReads)> {
+    sessions
+        .iter()
+        .map(|(identity, session)| {
+            (
+                identity.clone(),
+                MemberSessionReads {
+                    reads: service.session_reads_of(session).calls,
+                    metadata_reads: service.persisted_session_metadata_reads_for(session),
+                    durable: service.durable_reads_of(session),
+                },
+            )
+        })
+        .collect()
+}
+
 /// What one history's restart read from the host: at the start (realm open,
 /// runtime store open, the mob's storage and its resume to ready), and at
 /// the lift of the mob stopped after it.
@@ -400,6 +438,10 @@ struct RestartReads {
     scopes: BTreeMap<String, usize>,
     /// The host names of the members' session scopes and their chunks.
     member_scopes: BTreeSet<String>,
+    /// The restarted session service's reads of each member's session,
+    /// before the start and after the lift.
+    service_reads_before: Vec<(AgentIdentity, MemberSessionReads)>,
+    service_reads_after: Vec<(AgentIdentity, MemberSessionReads)>,
 }
 
 /// Create a mob in a host store realm, spawn its members, crash, write
@@ -500,6 +542,7 @@ async fn restart_after_history(label: &str, settled: usize) -> RestartReads {
         .expect("open the mob's storage")
         .storage();
     restarted.set_runtime_adapter(runtime_over(&store));
+    let service_reads_before = member_session_reads(&restarted, &sessions);
     let builder = MobBuilder::for_resume(storage)
         .with_session_service(restarted.clone())
         .notify_orchestrator_on_resume(false);
@@ -531,6 +574,7 @@ async fn restart_after_history(label: &str, settled: usize) -> RestartReads {
             "the lift leaves {identity} Dormant"
         );
     }
+    let service_reads_after = member_session_reads(&restarted, &sessions);
     crash_stop_and_release_routes(handle).await;
     drop((mobs, store, realm));
     RestartReads {
@@ -538,6 +582,8 @@ async fn restart_after_history(label: &str, settled: usize) -> RestartReads {
         lift,
         scopes,
         member_scopes,
+        service_reads_before,
+        service_reads_after,
     }
 }
 
@@ -602,6 +648,11 @@ async fn a_start_and_a_lift_read_no_dormant_members_rows_whatever_their_history(
                 .any(|name| tag_of(name) == MOB_FAMILY.tag),
             "the start reads the mob's own storage from the host: {:?}",
             reads.start
+        );
+        assert_eq!(
+            reads.service_reads_after, reads.service_reads_before,
+            "the start and the lift after {settled} settled operations read no Dormant \
+             member's session through the session service"
         );
         summaries.push((
             settled,
