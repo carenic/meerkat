@@ -26,7 +26,8 @@
 # - retire (AuditRetireSpec): one identity woken, released and retired, the
 #   routed and archive-only retirement starts, the routed retire retry, the
 #   archives, the replayed starts, a rotation finished in Running and in
-#   Stopped, a host-pending seed, and the mob's destroy;
+#   Stopped, a host-pending seed, the identity seated again on its first
+#   seat's session, and the mob's destroy;
 # - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
 # - resume (AuditResumeSpec): one identity through an explicit resume;
 # - edge (AuditEdgeSpec): two identities and one wiring edge and its
@@ -52,7 +53,8 @@
 # plan never leaves a member that blocks the seal. The retire run checks that
 # no runtime retire is routed for a member with no registration, that a
 # settled retirement can always archive and under an admitted destroy nothing
-# holds it, and that no rotation begins or commits under an admitted destroy.
+# holds it, that no rotation begins or commits under an admitted destroy, and
+# that a resume seat is unborn exactly when no build created its session.
 # TLC evaluates the module's wake refusal ASSUME (a present, bound member with
 # a phase is never refused as not a member) and its release ASSUMEs (the
 # verdict helper, and no member wired to a placed member is releasable) at the
@@ -391,7 +393,8 @@ write_cfg() {
       run_properties="
   AuditAttemptEndsClosed
   AuditRetireRoutesOnlyRegistered
-  AuditDestroyFencesRotation"
+  AuditDestroyFencesRotation
+  AuditReseatUnbornIffNeverBorn"
       run_invariants="
   AuditWakingClosable
   AuditRetirementArchivable"
@@ -589,6 +592,7 @@ for witness in \
   "resume:Action property:ResumeFinishedLive" \
   "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
   "wake:Action property:UnbornCreated" "retire:Action property:UnbornArchived" \
+  "retire:Action property:ReseatCreated" \
   "seat:Invariant:SeatUnborn" "seat:Action property:RotatedUnborn" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
   "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
@@ -855,6 +859,19 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate wake fresh_create_without_unborn \
     "Error: Action property AuditFreshCreateOnlyUnborn is violated" \
     'drop_guard("ResolveMemberRevivalSessionCreatedRunning", "member_seat_session_unborn")' "$@"
+  # An unborn seat that records no never-created session.
+  mutate seat seat_records_no_session \
+    "Error: Invariant unborn_seat_session_is_recorded is violated" \
+    'keep_var("CommitDormantSeatRunning", "unborn_seat_sessions")' "$@"
+  # A seat naming a session no build created, seated born (its absence would
+  # read as lost).
+  mutate retire reseat_never_born_seats_born \
+    "Error: Action property AuditReseatUnbornIffNeverBorn is violated" \
+    'drop_guard("CommitDormantSeatRunning", "(session_unborn = TRUE)")' "$@"
+  # A resume seat of a lost session seated unborn (created afresh, empty).
+  mutate retire lost_session_seats_unborn \
+    "Error: Action property AuditReseatUnbornIffNeverBorn is violated" \
+    'drop_guard("CommitDormantSeatRunning", "(fresh_launch = TRUE)")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \

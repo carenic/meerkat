@@ -88009,7 +88009,8 @@ fn mob_runtime_parity_field_value(
         | "runtime_retire_archive_only"
         | "owed_edge_repairs"
         | "owed_external_edge_repairs"
-        | "member_seat_session_unborn" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
+        | "member_seat_session_unborn"
+        | "unborn_seat_sessions" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
         "member_materialization_epoch"
         | "member_boot_obligation_owed"
         | "member_rotation_session_ids"

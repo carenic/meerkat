@@ -361,7 +361,7 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # mutants' action property violated.
 # member_residency_audit.sh requires a final distinct-state count at or above
 # each run's floor, a coverage block in which each covered action of its eight
-# runs generated a state and its twenty-nine witnesses violated; the lane
+# runs generated a state and its thirty witnesses violated; the lane
 # runs it without --mutants, whose refusal lines are listed for a run by hand.
 # One of its arms is printed as TLC prints an application with a state-level
 # argument, with the location suffix "(L C L C)" before the ">", so the
@@ -525,6 +525,7 @@ printf '%s\n' \
   'echo "Error: Action property NotAuditWitnessUnbornArchived is violated."' \
   'echo "Error: Invariant NotAuditWitnessSeatUnborn is violated."' \
   'echo "Error: Action property NotAuditWitnessRotatedUnborn is violated."' \
+  'echo "Error: Action property NotAuditWitnessReseatCreated is violated."' \
   'echo "Error: Invariant NotAuditWitnessBothSeated is violated."' \
   'echo "Error: Invariant NotAuditWitnessSeatEndpointPending is violated."' \
   'echo "Error: Action property NotAuditWitnessWokeLive is violated."' \
@@ -580,6 +581,8 @@ printf '%s\n' \
   'echo "Error: Invariant seat_session_unborn_is_seated is violated."' \
   'echo "Error: Invariant seat_session_unborn_is_never_bound is violated."' \
   'echo "Error: Action property AuditFreshCreateOnlyUnborn is violated."' \
+  'echo "Error: Invariant unborn_seat_session_is_recorded is violated."' \
+  'echo "Error: Action property AuditReseatUnbornIffNeverBorn is violated."' \
   'echo "Error: Action property NotAuditWitnessSessionOwnedRetires is violated."' \
   'echo "Error: Action property NotAuditWitnessCompositionKeepsServing is violated."' \
   'echo "Error: Action property NotAuditWitnessQueuedKeepsServing is violated."' \

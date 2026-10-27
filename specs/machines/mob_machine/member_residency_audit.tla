@@ -28,7 +28,8 @@
 \*     retry, the runtime retire observation, the session ingress detach, the
 \*     plain archives, the replayed retirement starts, a rotation with its
 \*     terminal in Running and Stopped, a host-pending seed and its
-\*     carry-out, and the mob's destroy: its admission, its member retirement
+\*     carry-out, the identity seated again on the session its first seat
+\*     named, and the mob's destroy: its admission, its member retirement
 \*     and archive arms and DestroyMob.
 \*   terminal (AuditTerminalSpec): one identity in the Completed and
 \*     Destroyed phases: Complete, MarkCompleted, the destroy, Shutdown, the
@@ -96,8 +97,10 @@
 \*     for a member with no registration), AuditRetirementArchivable (a
 \*     retiring member whose ingress detach closed has an enabled archive
 \*     terminal, and under an admitted destroy no rotation and no host
-\*     carry-out holds it) and AuditDestroyFencesRotation (no rotation
-\*     begins or commits under an admitted destroy);
+\*     carry-out holds it), AuditDestroyFencesRotation (no rotation
+\*     begins or commits under an admitted destroy) and
+\*     AuditReseatUnbornIffNeverBorn (a resume seat is unborn exactly when no
+\*     build created its session);
 \*   seat: AuditSeatLeavesDormant (a dormant seat leaves its identity
 \*     Dormant, with its endpoint or owed EndpointPending, and requests no
 \*     runtime binding).
@@ -480,6 +483,17 @@ RCommitRotation ==
     \/ CommitMemberRotationRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
 RotationArms == RBeginRotation \/ RCommitRotation
 
+\* Member 1 seated again after its retirement, as a resume seat on the session
+\* its first seat named, at generation 1 with runtime 2 (no endpoint): the
+\* seat is unborn exactly when no build created that session.
+RReseatOpen ==
+    BeginSpawnExecFresh(Id1, Rid2, 2, 1, AuditDigest, FALSE, AuditMode, Some(Sess1), None, None,
+                        FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE, FALSE,
+                        None, None, None, None, FALSE, FALSE)
+RReseat ==
+    \E unborn \in BOOLEAN :
+        CommitDormantSeatRunning(Id1, Rid2, 2, 1, FALSE, AuditMode, Sess1, None, FALSE, FALSE, unborn, FALSE)
+
 \* The host marks member 1's preparation pending at build (a rotation lost in
 \* a crash is re-driven by the host), or not.
 RSeedHostPending == \E hp \in {{}, {Id1}} : SeedMemberResidencyRunning("OnDemand", "Authoritative", hp)
@@ -512,6 +526,8 @@ AuditRetireNext ==
     \/ RRecoverStarted
     \/ RAuthorize
     \/ RotationArms
+    \/ RReseatOpen
+    \/ RReseat
     \/ AuditQuiesceStop
     \/ StopRunning
     \/ ResumeStopped
@@ -691,7 +707,7 @@ SOpenArm == \E id \in {Id1, Id2} : SOpen(id, SIncarnation(id).rid, SIncarnation(
 SSeat ==
     \E id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None} :
         CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
-                                 SIncarnation(id).session, ep, FALSE, FALSE, id = Id2)
+                                 SIncarnation(id).session, ep, FALSE, FALSE, id = Id2, TRUE)
 
 SCommit ==
     \E id \in {Id1, Id2} :
@@ -747,9 +763,10 @@ AuditSeatSpec == Init /\ [][AuditSeatNext]_vars
 \* A dormant seat leaves its identity Dormant, with its endpoint or owed
 \* EndpointPending, and requests no runtime binding.
 AuditSeatLeavesDormant ==
-    [][\A id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None}, unborn \in BOOLEAN :
+    [][\A id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None}, unborn \in BOOLEAN,
+          fresh \in BOOLEAN :
          CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
-                                  SIncarnation(id).session, ep, FALSE, FALSE, unborn)
+                                  SIncarnation(id).session, ep, FALSE, FALSE, unborn, fresh)
            => /\ id \in DOMAIN member_materialization'
               /\ member_materialization'[id] = "Dormant"
               /\ \/ id \in DOMAIN member_peer_endpoints'
@@ -986,6 +1003,15 @@ AuditFreshCreateOnlyUnborn ==
          ResolveMemberRevivalSessionCreatedRunning(Id1, a) => Id1 \in member_seat_session_unborn
       ]_vars
 
+\* A resume seat of member 1 on the session its first seat named is unborn
+\* exactly when no build created that session: a never-born session is
+\* seated unborn (its first wake creates it), a lost one never is.
+AuditReseatUnbornIffNeverBorn ==
+    [][\A unborn \in BOOLEAN :
+         CommitDormantSeatRunning(Id1, Rid2, 2, 1, FALSE, AuditMode, Sess1, None, FALSE, FALSE, unborn, FALSE)
+           => (Id1 \in member_seat_session_unborn' <=> Sess1 \in unborn_seat_sessions)
+      ]_vars
+
 \* No arm routes a runtime retire for a member with no registration (a
 \* Dormant or Waking member, or an archive-only retirement).
 AuditRetireRoutesOnlyRegistered ==
@@ -1141,6 +1167,12 @@ AuditWitnessUnbornArchivedStep ==
     /\ Id1 \in member_seat_session_unborn
     /\ Id1 \notin DOMAIN identity_to_runtime'
     /\ Id1 \notin member_seat_session_unborn'
+\* Retire run: member 1, retired before its first wake, is seated again on
+\* the session its first seat named, and its first wake creates it.
+AuditWitnessReseatCreatedStep ==
+    /\ Id1 \in DOMAIN identity_to_runtime
+    /\ identity_to_runtime[Id1] = Rid2
+    /\ \E a \in AuditAttempts : ResolveMemberRevivalSessionCreatedRunning(Id1, a)
 \* Seat run: a fresh launch's seat is unborn.
 AuditWitnessSeatUnborn == \E id \in {Id1, Id2} : id \in member_seat_session_unborn
 \* Seat run: a rotation seats its next incarnation unborn.
@@ -1198,6 +1230,7 @@ NotAuditWitnessUnbornCreated == [][~AuditWitnessUnbornCreatedStep]_vars
 NotAuditWitnessUnbornArchived == [][~AuditWitnessUnbornArchivedStep]_vars
 NotAuditWitnessSeatUnborn == ~AuditWitnessSeatUnborn
 NotAuditWitnessRotatedUnborn == [][~AuditWitnessRotatedUnbornStep]_vars
+NotAuditWitnessReseatCreated == [][~AuditWitnessReseatCreatedStep]_vars
 NotAuditWitnessBrokenWake == ~AuditWitnessBrokenWake
 NotAuditWitnessCommsLessWokeLive == [][~AuditWitnessCommsLessWokeLiveStep]_vars
 NotAuditWitnessRetireCloses == [][~AuditWitnessRetireClosesStep]_vars
