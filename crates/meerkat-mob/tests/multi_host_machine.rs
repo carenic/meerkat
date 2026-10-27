@@ -3249,7 +3249,7 @@ fn release_registration(
         .expect("the release outcome is emitted")
 }
 
-/// F2 on release: a Live local member that a wiring edge joins to a placed
+/// On release: a Live local member that a wiring edge joins to a placed
 /// member is pinned Live, so its placed peer can always reach it. Its release
 /// verdict is PinnedByPlacedPeer, never Release, and the release of its
 /// registration is a Stale no-op. Unwiring the last such edge makes it
@@ -3433,7 +3433,7 @@ fn wire_input(edge: &WiringEdge, trust: bool) -> MobMachineInput {
     }
 }
 
-/// F2 at wiring: wiring a Dormant local member to a placed member wakes it
+/// At wiring: wiring a Dormant local member to a placed member wakes it
 /// through the machine, never a shell decision. The wiring opens one wake
 /// attempt and emits its materialization (cause PlacedPeerWired), owed until
 /// Live (cause PlacedPeerWired) like a boot wake. Both wiring inputs, both

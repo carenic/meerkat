@@ -1,5 +1,5 @@
 #![allow(clippy::expect_used, clippy::panic)]
-//! No phase predicate inside a member-residency guard (R11).
+//! No phase predicate inside a member-residency guard.
 //!
 //! Schema lowering (meerkat-machine-dsl-core `strip_phase_guards`) removes a
 //! `self.lifecycle_phase` comparison from a guard, removes a guard CALL that
@@ -424,7 +424,7 @@ fn residency_helpers_take_member_facts_only() {
         assert!(
             !signature_and_body.contains("lifecycle_phase")
                 && !signature_and_body.contains("MobPhase"),
-            "residency helper {name} takes or reads the lifecycle phase; give each lifecycle phase its own arm instead (R11)"
+            "residency helper {name} takes or reads the lifecycle phase; give each lifecycle phase its own arm instead"
         );
         checked.push(name);
         cursor = close;

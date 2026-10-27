@@ -27,32 +27,33 @@
 #   Stopped, a host-pending seed, and the mob's destroy;
 # - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
 # - resume (AuditResumeSpec): one identity through an explicit resume;
-# - edge (AuditEdgeSpec): two identities and one wiring edge (I8) and its
+# - edge (AuditEdgeSpec): two identities and one wiring edge and its
 #   trust realization outcomes (an owed edge repair);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
 #   through the dormant seat, the embodied spawn commit, the release and the
 #   rotation;
 # - wake2 (AuditWake2Spec): two identities woken beside each other.
-# Every run checks every generated invariant (I1-I14 among them), AP2 (an open
-# attempt is never replaced and ends only Live, Dormant or without a phase;
-# every Waking member has an enabled closing arm for every kind) and, where
-# the run has recovery or seat arms, AP1 (no such arm overwrites a phase). The
-# wake run also checks AP3 (a Lifecycle input never wakes, a notice
-# classification never changes residency), that exactly one WakeMember arm
-# answers every input shape, that a local wake never closes Live without an
-# endpoint while it owes EndpointPending and can always close Live when it
-# owes no endpoint cause, that the release verdict is Release exactly when the
-# Released arm would honour the member's own registration, that a refused
-# binding request applies only to the wake it belongs to, and that a release
-# of another epoch never demotes. The seed run checks that the boot plan never
-# leaves a member that blocks the seal. The retire run checks that no runtime
-# retire is routed for a member with no registration (R27), that a settled
-# retirement can always archive and under an admitted destroy nothing holds it
-# (R124), and that no rotation begins or commits under an admitted destroy
-# (R124). TLC evaluates the module's I5 ASSUME (a present, bound member with a
-# phase is never refused as not a member) and its release ASSUMEs (the verdict
-# helper, and no member wired to a placed member is releasable) at the start
-# of every run.
+# Every run checks every generated invariant (the residency invariants among
+# them), AuditAttemptEndsClosed and AuditWakingClosable (an open attempt is
+# never replaced and ends only Live, Dormant or without a phase; every Waking
+# member has an enabled closing arm for every kind) and, where the run has
+# recovery or seat arms, its RecoverKeepsPhase property (no such arm overwrites
+# a phase). The wake run also checks AuditLifecycleNeverWakes (a Lifecycle
+# input never wakes, a notice classification never changes residency), that
+# exactly one WakeMember arm answers every input shape, that a local wake never
+# closes Live without an endpoint while it owes EndpointPending and can always
+# close Live when it owes no endpoint cause, that the release verdict is
+# Release exactly when the Released arm would honour the member's own
+# registration, that a refused binding request applies only to the wake it
+# belongs to, and that a release of another epoch never demotes. The seed run
+# checks that the boot plan never leaves a member that blocks the seal. The
+# retire run checks that no runtime retire is routed for a member with no
+# registration, that a settled retirement can always archive and under an
+# admitted destroy nothing holds it, and that no rotation begins or commits
+# under an admitted destroy. TLC evaluates the module's wake refusal ASSUME (a
+# present, bound member with a phase is never refused as not a member) and its
+# release ASSUMEs (the verdict helper, and no member wired to a placed member
+# is releasable) at the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -715,54 +716,54 @@ PY
     echo "mutant ${name} refused by $(grep -oE "${refusal}" "${log}" | head -1)"
   }
 
-  # I1: an unseating replay that keeps the residency phase.
+  # An unseating replay that keeps the residency phase.
   mutate terminal replay_unseat_keeps_phase \
     "Error: Invariant materialization_domain_is_session_bound_membership is violated" \
     'keep_var("RecoverRosterMemberRetiredRunning", "member_materialization")' "$@"
-  # I2: the one seating arm binds the member without seating it Dormant.
+  # The one seating arm binds the member without seating it Dormant.
   mutate wake bind_seats_no_phase \
     "Error: Invariant local_session_bound_member_is_live_or_wakeable is violated" \
     'keep_var("RecoverMemberSessionBindingFreshRunning", "member_materialization")' "$@"
-  # I4: a terminal classification records Broken and keeps the phase.
+  # A terminal classification records Broken and keeps the phase.
   mutate wake broken_keeps_phase \
     "Error: Invariant broken_member_has_no_phase is violated" \
     'keep_var("ClassifyMemberLiveMaterializationTerminal", "member_materialization")' "$@"
-  # I6: the seal without its endpoint guard.
+  # The seal without its endpoint guard.
   mutate seed seal_without_endpoint_guard \
     "Error: Invariant dormant_member_has_durable_endpoint is violated" \
     'drop_guard("SealBootMaterializationPlan", "member_boot_obligation_owed")' "$@"
-  # The I6 exception: registering an endpoint keeps EndpointPending owed.
+  # The seal's exception: registering an endpoint keeps EndpointPending owed.
   mutate seed endpoint_keeps_pending \
     "Error: Invariant endpoint_pending_member_has_no_endpoint is violated" \
     'keep_var("RecoverMemberPeerEndpointFreshRunning", "member_boot_obligation_owed")' "$@"
-  # I7: an abandoned wake keeps its binding request.
+  # An abandoned wake keeps its binding request.
   mutate wake abandon_keeps_binding_request \
     "Error: Invariant dormant_member_requests_no_runtime_binding is violated" \
     'keep_var("AbandonMemberWakeDormantRunning", "member_startup_binding_requested")' "$@"
-  # I9: the runtime-ready observation records no epoch.
+  # The runtime-ready observation records no epoch.
   mutate wake ready_records_no_epoch \
     "Error: Invariant live_member_records_its_epoch is violated" \
     'keep_var("ObserveRuntimeReady", "member_materialization_epoch")' "$@"
-  # I10: an authorized wake records no attempt.
+  # An authorized wake records no attempt.
   mutate wake wake_records_no_attempt \
     "Error: Invariant waking_is_one_attempt is violated" \
     'keep_var("WakeMemberAuthorizedRunning", "member_wake_attempts")' "$@"
-  # I11: a retirement start keeps the member's open wake (a Waking member
+  # A retirement start keeps the member's open wake (a Waking member
   # retires through the archive-only twin).
   mutate retire retire_start_keeps_wake \
     "Error: Invariant retiring_incarnation_never_waking is violated" \
     'for var in ("member_materialization", "member_wake_attempts", "member_wake_bound", "member_materialization_epoch", "member_boot_obligation_owed"):
     keep_var("RetireRunningPreservingBindingArchiveOnly", var)' "$@"
-  # I12: the build seed turns the composition non-authoritative over an open
+  # The build seed turns the composition non-authoritative over an open
   # attempt.
   mutate seed seed_over_open_attempt \
     "Error: Invariant candidate_composition_never_wakes is violated" \
     'drop_guard("SeedMemberResidencyRunning", "member_wake_attempts")' "$@"
-  # I13: an authorized wake mints no attempt id.
+  # An authorized wake mints no attempt id.
   mutate wake wake_mints_nothing \
     "Error: Invariant waking_has_an_open_attempt is violated" \
     'keep_var("WakeMemberAuthorizedRunning", "member_wake_attempt_sequence")' "$@"
-  # I14: a wake that closes Live keeps its attempt.
+  # A wake that closes Live keeps its attempt.
   mutate wake live_keeps_attempt \
     "Error: Invariant attempt_and_epoch_follow_the_phase is violated" \
     'keep_var("ResolveMemberRevivalSucceededRunningLocal", "member_wake_attempts")' "$@"
@@ -782,7 +783,7 @@ keep_var("WakeMemberAuthorizedRunning", "member_wake_attempt_sequence")
 rewrite_frame("WakeMemberAuthorizedRunning", {
     "member_boot_obligation_owed": "MapRemove(member_boot_obligation_owed, agent_identity)",
 })' "$@"
-  # AP1: a recovery arm that writes Dormant over a Live member (with its epoch
+  # A recovery arm that writes Dormant over a Live member (with its epoch
   # and startup ladder cleared and, after the seal, its endpoint present, so
   # only the property can refuse it).
   mutate wake recover_writes_dormant \
@@ -795,18 +796,18 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
     "member_startup_runtime_ready": "IF " + mutable + " THEN member_startup_runtime_ready \\ {agent_runtime_id} ELSE member_startup_runtime_ready",
     "member_startup_ready": "IF " + mutable + " THEN member_startup_ready \\ {agent_runtime_id} ELSE member_startup_ready",
 })' "$@"
-  # AP2: a joined wake replaces the open attempt with a fresh one.
+  # A joined wake replaces the open attempt with a fresh one.
   mutate wake join_replaces_attempt \
     "Error: Action property AuditAttemptEndsClosed is violated" \
     'rewrite_frame("WakeMemberJoinedRunning", {
     "member_wake_attempt_sequence": "member_wake_attempt_sequence + 1",
     "member_wake_attempts": "MapSet(member_wake_attempts, agent_identity, member_wake_attempt_sequence + 1)",
 })' "$@"
-  # AP3: the wake refusal helper ignores the Lifecycle input class.
+  # The wake refusal helper ignores the Lifecycle input class.
   mutate wake lifecycle_wakes \
     "Error: Action property AuditLifecycleNeverWakes is violated" \
     'replace_in_operator("member_wake_refusal", "(input_class = \"Lifecycle\")", "FALSE")' "$@"
-  # AP2, ENABLED form: the shell's abandon is refused before the Bound step.
+  # The shell's abandon is refused before the Bound step (the ENABLED form).
   mutate wake abandon_needs_bound \
     "Error: Invariant AuditWakingClosable is violated" \
     'add_guard("AbandonMemberWakeDormantRunning", "(agent_identity \\in member_wake_bound)")' "$@"
@@ -814,25 +815,30 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate wake joined_overlaps \
     "Error: Invariant AuditWakeExactlyOne is violated" \
     'drop_guard("WakeMemberJoinedRunning", "= Some(\"Waking\"))")' "$@"
-  # I5: the refusal helper refuses every member as not a member. The helper's
+  # The refusal helper refuses every member as not a member. The helper's
   # `phase` parameter renders as arg_phase (it would shadow the machine's
   # phase variable).
   mutate wake helper_refuses_members \
     "Assumption .* is false" \
     'replace_in_operator("member_wake_refusal", "(arg_phase = None)", "TRUE")' "$@"
-  # I8: an archive that keeps the archived identity's wiring edges.
+  # An archive that keeps the archived identity's wiring edges.
   mutate edge archive_keeps_edges \
     "Error: Invariant wiring_edges_connect_seated_members is violated" \
     'keep_var("ObserveMemberRetirementArchivedLive", "wiring_edges")' "$@"
+  # A preserved-topology archive that keeps the archived end's owed edge
+  # repair: the repair then names an unseated member.
+  mutate edge preserved_archive_keeps_repair \
+    "Error: Invariant owed_edge_repairs_join_seated_members is violated" \
+    'keep_var("ObserveMemberRetirementArchivedLivePreservingTopology", "owed_edge_repairs")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \
     'drop_guard("BeginMemberRotationRunning", "= Some(\"Retiring\"))")' "$@"
-  # I7 and the seat property: a dormant seat that requests a runtime binding.
+  # A dormant seat that requests a runtime binding.
   mutate seat seat_requests_binding \
     "Error: (Invariant dormant_member_requests_no_runtime_binding|Action property AuditSeatLeavesDormant) is violated" \
     'replace_in_update("CommitDormantSeatRunning", "member_startup_binding_requested", "member_startup_binding_requested \\ {agent_runtime_id}", "member_startup_binding_requested \\cup {agent_runtime_id}")' "$@"
-  # R5: a dormant seat without its peer-id guard takes another member's peer id.
+  # A dormant seat without its peer-id guard takes another member's peer id.
   mutate seat seat_duplicate_peer_id \
     "Error: Invariant (member_peer_id_ownership_is_global_across_generations|live_member_peer_ids_are_unique) is violated" \
     'drop_guard("CommitDormantSeatRunning", "mob_machine_member_peer_id_available_for_identity")' "$@"
@@ -899,27 +905,27 @@ add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (ag
   mutate seed stay_dormant_owes_nothing \
     "Error: Action property AuditPlanLeavesSealable is violated" \
     'keep_var("PlanBootMaterializationStayDormant", "member_boot_obligation_owed")' "$@"
-  # R27: the routed retirement start without its Dormant guard routes a
+  # The routed retirement start without its Dormant guard routes a
   # runtime retire for a member with no registration.
   mutate retire archive_only_routes \
     "Error: Action property AuditRetireRoutesOnlyRegistered is violated" \
     'drop_guard("RetireRunningReleasing", "# Some(\"Dormant\")")' "$@"
-  # R27: an archive terminal keeps the runtime's archive-only mark.
+  # An archive terminal keeps the runtime's archive-only mark.
   mutate retire archive_keeps_archive_only \
     "Error: Invariant archive_only_retirement_is_retiring is violated" \
     'keep_var("ObserveMemberRetirementArchivedLive", "runtime_retire_archive_only")' "$@"
-  # R124: the plain archive terminals wait for the rotation even under an
+  # The plain archive terminals wait for the rotation even under an
   # admitted destroy.
   mutate retire destroy_waits_on_rotation \
     "Error: Invariant AuditRetirementArchivable is violated" \
     'for arm in ("ObserveMemberRetirementArchivedLive", "ObserveMemberRetirementArchivedRetired", "ObserveMemberRetirementArchivedLiveStopped", "ObserveMemberRetirementArchivedRetiredStopped"):
     drop_guard(arm, "member_rotation_session_ids")
     add_guard(arm, "((agent_identity \\in DOMAIN member_rotation_session_ids) = FALSE)")' "$@"
-  # R124: the rotation commits under an admitted destroy.
+  # The rotation commits under an admitted destroy.
   mutate retire commit_rotation_after_destroy \
     "Error: Action property AuditDestroyFencesRotation is violated" \
     'drop_guard("CommitMemberRotationLiveRunning", "destroy_admitted")' "$@"
-  # R124: the destroy keeps the pending host preparations.
+  # The destroy keeps the pending host preparations.
   mutate retire destroy_keeps_host_pending \
     "Error: Invariant destroyed_mob_holds_no_member_lifecycle is violated" \
     'keep_var("DestroyMob", "member_host_preparation_pending")' "$@"

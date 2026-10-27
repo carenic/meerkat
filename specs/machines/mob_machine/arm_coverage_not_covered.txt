@@ -194,7 +194,7 @@ AdmitDestroyStorageFinalizing destroy storage finalization; no audit drives it
 AdmitDestroyCleanupStopped destroy admission outside Running; the audits drive AdmitDestroyCleanup
 AdmitDestroyCleanupCompleted destroy admission outside Running; the audits drive AdmitDestroyCleanup
 SeedOrphan* orphan budget seed; no audit drives it
-StartupMark* startup readiness ladder step after the runtime-ready observation; member residency reads only the runtime-ready rung (I9), no audit drives it
+StartupMark* startup readiness ladder step after the runtime-ready observation; member residency reads only the runtime-ready rung (live_member_records_its_epoch), no audit drives it
 SessionIngressDetachFailed* session ingress detach failure for a mob destroy; no audit drives it
 RequestPending* session ingress detach request for a mob destroy; no audit drives it
 MemberTerminalized* member terminal notice bookkeeping; no audit drives it

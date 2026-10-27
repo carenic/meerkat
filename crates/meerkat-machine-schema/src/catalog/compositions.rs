@@ -947,7 +947,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                 )
             },
             // The bound registration's epoch reaches the mob with the binding
-            // (G1, G2): a later release is honoured only for that epoch.
+            // so that a later release is honoured only for that epoch.
             route(
                 "runtime_bound_reaches_mob",
                 "meerkat",
@@ -961,7 +961,7 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                     bind("runtime_epoch_id", "runtime_epoch_id"),
                 ],
             ),
-            // G1: every released registration (each UnregisterSession arm)
+            // Every released registration (each UnregisterSession arm)
             // reaches the owning mob, which demotes exactly that Live
             // materialization to Dormant. A stale release is an accepted no-op
             // on the mob side. A mob member's empty resume never unregisters
@@ -2513,7 +2513,7 @@ fn seam_destroy_mob_signal() -> CompositionWitnessInput {
     )
 }
 
-/// G1/V3: unregistering a mob-bound registration leaves its member Dormant,
+/// Unregistering a mob-bound registration leaves its member Dormant,
 /// never Live. The spawned member is Live and records the bound registration's
 /// epoch (runtime_bound_reaches_mob); the runtime's unregister saga ends in
 /// UnregisterSessionAttached, whose RuntimeRegistrationReleased reaches the mob

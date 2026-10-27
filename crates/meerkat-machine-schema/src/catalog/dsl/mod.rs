@@ -3805,7 +3805,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     TypePathStructField::named("peer_id", "PeerId"),
                     TypePathStructField::named("address", "PeerAddress"),
                     TypePathStructField::named("signing_key", "PeerSigningKey"),
-                    // Derived from the parsed address (G3); the boot plan
+                    // Derived from the parsed address; the boot plan
                     // wakes a network (Tcp or Uds) member.
                     TypePathStructField::named("transport", "PeerTransportKind"),
                 ],
