@@ -1171,6 +1171,19 @@ async fn members_unwired_no_write_restart_repairs_routes_on_authenticated_host_s
         a1.wired_to.contains(&identity("b2")),
         "cold replay of the no-write outcome restores the durable wired graph"
     );
+    // a1 holds no work, but it is wired to b2 on another host, which reaches
+    // it only through its live comms runtime (the acceptor's reverse lane):
+    // the start's boot verdict wakes it, with no touch.
+    wait_until(
+        "the start to wake a1, wired to a member on another host",
+        || async {
+            controlling
+                .handle
+                .member_materialization_for_test(&identity("a1"))
+                == Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Live)
+        },
+    )
+    .await;
     // Controller-only restart: the host and its materialized b2 runtime stay
     // live throughout. Recovery re-derives the pending Install before the
     // replacement actor starts; the next authenticated periodic HostStatus

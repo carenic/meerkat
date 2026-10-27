@@ -109,6 +109,11 @@ impl CrashedStoreMob {
     /// Spawn `members` workers, crash, and restart the session service over
     /// the same runtime store.
     async fn new(label: &str, members: usize) -> Self {
+        Self::with_stop(label, members, false).await
+    }
+
+    /// [`Self::new`], with the mob stopped before the crash when `stop`.
+    async fn with_stop(label: &str, members: usize, stop: bool) -> Self {
         let definition = with_unique_mob_id(sample_definition(), label);
         let store = Arc::new(InMemoryRuntimeStore::new());
         let service = Arc::new(MockSessionService::new());
@@ -133,6 +138,9 @@ impl CrashedStoreMob {
                 .await
                 .expect("a session-backed worker");
             sessions.push((identity, session));
+        }
+        if stop {
+            handle.stop().await.expect("stop before the crash");
         }
         let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
         crash_stop_and_release_routes(handle).await;
@@ -269,5 +277,70 @@ async fn a_failed_scan_leaves_the_start_running_with_every_member_planned_wake()
             Some(dsl::MemberMaterializationPhase::Live),
             "{identity}"
         );
+    }
+}
+
+/// A stopped mob's start registers and materializes nothing for its dormant
+/// members, and work a member's runtime still owes is not dropped by that:
+/// a background operation completion it owes is boot work at the lift,
+/// which wakes exactly that member and delivers the completion with no
+/// touch. Every other member stays Dormant and runs nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn work_a_dormant_member_of_a_stopped_mob_owes_is_delivered_at_the_lift() {
+    let mob = CrashedStoreMob::with_stop("boot-rows-stopped-owed-work", 3, true).await;
+    let owed = mob.session(1);
+    mob.store
+        .persist_ops_lifecycle(
+            &LogicalRuntimeId::for_session(&owed),
+            &undelivered_completion(&owed),
+        )
+        .await
+        .expect("the completion is durable");
+
+    let handle = mob.resume().await;
+    assert_eq!(
+        handle.status().await.expect("the mob's phase"),
+        MobState::Stopped
+    );
+    assert!(
+        mob.materialized().await.is_empty(),
+        "the stopped start materialized nothing"
+    );
+    for (identity, _) in &mob.sessions {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+    }
+
+    tokio::time::timeout(ROW_STEP, handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift succeeds");
+    tokio::time::timeout(ROW_STEP, async {
+        while !mob.service.has_started_turn_for(&owed).await {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("the lift wakes the member and its runtime delivers the completion");
+    assert_eq!(
+        mob.materialized().await,
+        vec![owed.clone()],
+        "the lift woke exactly the member that owes the completion"
+    );
+    for (identity, session) in &mob.sessions {
+        if session != &owed {
+            assert_eq!(
+                phase_of(&handle, identity),
+                Some(dsl::MemberMaterializationPhase::Dormant),
+                "{identity}"
+            );
+            assert!(
+                !mob.service.has_started_turn_for(session).await,
+                "{identity} ran no turn"
+            );
+        }
     }
 }
