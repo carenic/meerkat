@@ -415,7 +415,14 @@ impl MobActor {
                     self.roll_back_member_wake(run, rollback);
                     return;
                 }
-                if result.is_err() {
+                if let Err(error) = &result {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %run.identity,
+                        peer = %peer,
+                        %error,
+                        "a woken member's wiring edge could not be realized"
+                    );
                     topology.failed.push(peer);
                 }
                 self.advance_member_wake_topology(run, rollback, topology)
@@ -883,7 +890,16 @@ impl MobActor {
                         return;
                     }
                 }
-                Err(_) => topology.failed.push(peer),
+                Err(error) => {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %run.identity,
+                        peer = %peer,
+                        %error,
+                        "a woken member's wiring edge could not be prepared"
+                    );
+                    topology.failed.push(peer);
+                }
             }
         }
         if let Err(error) =
