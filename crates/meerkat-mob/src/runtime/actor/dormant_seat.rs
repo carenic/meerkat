@@ -345,6 +345,13 @@ impl MobActor {
             self.dsl_authority.state(),
             &session_id,
         );
+        // Whether this mob recorded the session's comms endpoint: then its
+        // key pair must exist, and a missing one is refused, never minted.
+        let session_endpoint_recorded = self
+            .roster
+            .read()
+            .await
+            .session_endpoint_recorded(&session_id);
         Ok(DormantSeatPlanEntry::Seat(Box::new(DormantSeatCandidate {
             agent_identity,
             profile_name: spec.role_name.clone(),
@@ -352,6 +359,7 @@ impl MobActor {
             session_id,
             generation,
             session_never_born,
+            session_endpoint_recorded,
             // Decided by the preparation, from the session owner's
             // observation: a fresh seat's absent session is unborn, as is a
             // session no build created.

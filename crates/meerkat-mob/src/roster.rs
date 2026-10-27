@@ -210,6 +210,13 @@ pub struct Roster {
     /// first build applies.
     #[serde(skip)]
     seat_builds: BTreeMap<SessionId, Arc<crate::runtime::SeatBuild>>,
+    /// The sessions whose member comms endpoint (and so its public key) a
+    /// journal row of this mob recorded: a `MemberSpawned` or a
+    /// `MemberSessionBindingRecovered` row naming the session with its
+    /// endpoint. Peers of this mob trusted that key, so a seat of such a
+    /// session never mints another one.
+    #[serde(skip)]
+    sessions_with_recorded_endpoint: BTreeSet<SessionId>,
 }
 
 impl Roster {
@@ -250,6 +257,10 @@ impl Roster {
                 };
                 if let Some(session_id) = member_ref.bridge_session_id() {
                     self.record_seat_build(session_id, member_spawned);
+                    if member_spawned.member_peer_endpoint().is_some() {
+                        self.sessions_with_recorded_endpoint
+                            .insert(session_id.clone());
+                    }
                 }
                 self.add(RosterAddEntry {
                     agent_identity: member_spawned.agent_identity.clone(),
@@ -362,6 +373,10 @@ impl Roster {
                     if recovered.records_seat_session_born() {
                         self.seat_builds.remove(bridge_session_id);
                     }
+                    if recovered.member_peer_endpoint.is_some() {
+                        self.sessions_with_recorded_endpoint
+                            .insert(bridge_session_id.clone());
+                    }
                 }
             }
             MobEventKind::MemberKickoffUpdated { member, kickoff } => {
@@ -435,6 +450,7 @@ impl Roster {
                 self.entries.clear();
                 self.owed_kickoff_prompts.clear();
                 self.seat_builds.clear();
+                self.sessions_with_recorded_endpoint.clear();
             }
             _ => {}
         }
@@ -478,6 +494,7 @@ impl Roster {
             creation_history: Default::default(),
             owed_kickoff_prompts: BTreeMap::new(),
             seat_builds: BTreeMap::new(),
+            sessions_with_recorded_endpoint: BTreeSet::new(),
             entries: entries
                 .into_iter()
                 .map(|entry| (entry.agent_identity.clone(), entry))
@@ -598,6 +615,14 @@ impl Roster {
             .member_ref
             .bridge_session_id()?;
         self.seat_builds.get(session_id).cloned()
+    }
+
+    /// Whether a journal row of this mob recorded the member comms endpoint
+    /// of `session_id` (its public key): peers trusted that key, so a seat of
+    /// the session whose key pair is missing is refused rather than given a
+    /// new one.
+    pub(crate) fn session_endpoint_recorded(&self, session_id: &SessionId) -> bool {
+        self.sessions_with_recorded_endpoint.contains(session_id)
     }
 
     /// Keep `local`, the process-local build inputs of the seat just

@@ -395,6 +395,12 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     /// plan): its member was retired before its first wake. Such a session
     /// is seated unborn again, whatever the store shows.
     pub(in crate::runtime) session_never_born: bool,
+    /// Whether a journal row of this mob recorded the comms endpoint (the
+    /// public key) of the seat's session, read at the plan: peers trusted
+    /// that key, so its key pair must exist. A session no row recorded (one
+    /// imported without its key pair) gets a fresh one, as its first build
+    /// would.
+    pub(in crate::runtime) session_endpoint_recorded: bool,
     /// Whether no build has created the seat's session: a fresh launch whose
     /// session the preparation found absent, or a session no build created
     /// ([`Self::session_never_born`]). Nothing is created at the seat;
@@ -563,11 +569,17 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
         MemberSeatEndpointSource::Network => None,
         MemberSeatEndpointSource::SessionScopedInproc { identity_root } => {
             // The member's first build loads this key; its wake checks that
-            // the endpoint it built is the one recorded here.
+            // the endpoint it built is the one recorded here. A key pair is
+            // minted where none exists unless this mob recorded the session's
+            // endpoint: a fresh seat, an unborn session and a built session
+            // whose key no row recorded (an imported one) get the key pair
+            // their first build would load.
             let public_key = stored_member_comms_key(
                 identity_root,
                 &session_id,
-                candidate.launch == DormantSeatLaunch::Fresh || candidate.session_unborn,
+                candidate.launch == DormantSeatLaunch::Fresh
+                    || candidate.session_unborn
+                    || !candidate.session_endpoint_recorded,
             )
             .await
             .map_err(&refused)?;
@@ -589,20 +601,21 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
 }
 
 /// The public key of a member session's stored comms identity: one local
-/// key-store read, no session load. A session no build created yet (a fresh
-/// seat's, or an unborn one: `unbuilt`) whose identity does not exist yet
-/// gets the one its first build will load. A resumed session's identity must
-/// exist: an existing session built its identity already, so a missing one
-/// means the configured root is not the session service's, and the seat is
-/// refused typed instead of minting a key its wake would disagree with.
+/// key-store read, no session load. With `mint`, an identity that does not
+/// exist yet is generated where the session's builds load it, as a build
+/// does (`load_or_generate`). Without it the identity must exist:
+/// this mob recorded the session's endpoint, peers trust that key, and a
+/// missing one means the configured root is not the session service's or the
+/// key was lost, so the seat is refused typed instead of minting a key those
+/// peers would not know.
 #[cfg(not(target_arch = "wasm32"))]
 async fn stored_member_comms_key(
     identity_root: &std::path::Path,
     session_id: &SessionId,
-    unbuilt: bool,
+    mint: bool,
 ) -> Result<[u8; 32], MobError> {
     let dir = identity_root.join(session_id.to_string());
-    let loaded = if unbuilt {
+    let loaded = if mint {
         meerkat_comms::Keypair::load_or_generate(&dir).await
     } else {
         let exists = tokio::fs::try_exists(dir.join("identity.key"))
@@ -632,7 +645,7 @@ async fn stored_member_comms_key(
 async fn stored_member_comms_key(
     _identity_root: &std::path::Path,
     session_id: &SessionId,
-    _unbuilt: bool,
+    _mint: bool,
 ) -> Result<[u8; 32], MobError> {
     Err(MobError::WiringError(format!(
         "a browser runtime keeps no durable comms identity for session '{session_id}'"

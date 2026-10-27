@@ -18,6 +18,8 @@ mod member_creation_upcall;
 mod parallel_resume_restore;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_build_inputs;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod seat_comms_key;
 use crate::definition::{
     BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowSpec,
     FlowStepSpec, LimitsSpec, MobDefinition, OrchestratorConfig, PolicyMode, RoleWiringRule,
