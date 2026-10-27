@@ -52,15 +52,29 @@ impl BootFactsV1 {
     pub(crate) const VERSION: u32 = 1;
 }
 
-/// The byte that ends boot facts pinned by a writer that folds the ops
-/// lifecycle's work into `nonterminal`. Writers before that fold pinned the
-/// compact JSON alone and rewrite it on every commit of the runtime, so the
-/// folded form never survives an older writer's commit. Every reader
-/// decodes both forms to the same facts: trailing whitespace is valid JSON.
+/// The rollback-compatibility marker of boot facts pinned by a writer that
+/// folds the ops lifecycle's work into `nonterminal`: one trailing newline
+/// after the JSON.
+///
+/// It is a byte, not a field, because releases before the fold decode the
+/// pinned facts strictly (`BootFactsV1` with `deny_unknown_fields` in 0.9.6,
+/// `store/memory/journal_image.rs:181`, decoded at `:195` and read by the
+/// host store open at `store/spi/runtime.rs:193`, where a decode error fails
+/// the open): a typed field would make a rollback unable to open the store.
+/// Those releases decode both forms to the same facts (trailing whitespace
+/// is valid JSON), pin the compact JSON and rewrite it on every commit of
+/// the runtime, so the marker never survives an older writer's commit. A
+/// separate entry in the `boot` group (which those releases ignore) would
+/// survive their commits unchanged and vouch for facts they rewrote. A head
+/// that lost the marker, to an older writer or a JSON normaliser, reads as
+/// predating the fold: its runtime is listed as holding work (fail closed)
+/// until its next commit. One writer ([`encode_folded_boot_facts`]) and one
+/// reader ([`boot_facts_predate_ops_fold`]) use it.
 const FOLDED_BOOT_FACTS_TERMINATOR: u8 = b'\n';
 
-/// The boot facts in the form a folding writer pins: the JSON, then
-/// [`FOLDED_BOOT_FACTS_TERMINATOR`].
+/// The boot facts in the form a folding writer pins: the JSON, then the
+/// rollback-compatibility marker [`FOLDED_BOOT_FACTS_TERMINATOR`]. The one
+/// writer of the marker.
 pub(crate) fn encode_folded_boot_facts(
     facts: &BootFactsV1,
 ) -> Result<Arc<Vec<u8>>, RuntimeStoreError> {
@@ -71,11 +85,12 @@ pub(crate) fn encode_folded_boot_facts(
     Ok(Arc::new(bytes))
 }
 
-/// Whether pinned boot facts were written before the ops lifecycle's work
-/// was folded into them: they may leave out an undelivered background
-/// completion or a running detached job wait, so a boot reads their runtime
-/// as holding recovery work (fail closed) until its next commit pins the
-/// folded form.
+/// Whether pinned boot facts lack the rollback-compatibility marker
+/// [`FOLDED_BOOT_FACTS_TERMINATOR`]: written before the ops lifecycle's work
+/// was folded into them, or normalised since. They may leave out an
+/// undelivered background completion or a running detached job wait, so a
+/// boot reads their runtime as holding recovery work (fail closed) until its
+/// next commit pins the folded form. The one reader of the marker.
 pub(crate) fn boot_facts_predate_ops_fold(bytes: &[u8]) -> bool {
     bytes.last() != Some(&FOLDED_BOOT_FACTS_TERMINATOR)
 }
@@ -535,22 +550,26 @@ mod tests {
 
     /// Boot facts pinned in the folded form decode as the compact form an
     /// earlier writer pinned (a reader of either version reads both), and
-    /// only the compact form reads as predating the ops fold.
+    /// only the folded form carries the marker: an earlier writer's compact
+    /// form and a JSON normaliser's rewrite of the folded form both read as
+    /// predating the ops fold.
     #[test]
     fn boot_obligation_scan_folded_boot_facts_are_told_apart_from_an_earlier_writers() {
         let pinned = facts(false, true, false, true);
         let folded = encode_folded_boot_facts(&pinned).unwrap();
         let compact = serde_json::to_vec(&pinned).unwrap();
-        assert_eq!(
-            serde_json::from_slice::<BootFactsV1>(&folded).unwrap(),
-            pinned
-        );
-        assert_eq!(
-            serde_json::from_slice::<BootFactsV1>(&compact).unwrap(),
-            pinned
-        );
+        let normalised =
+            serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&folded).unwrap())
+                .unwrap();
+        for bytes in [folded.as_slice(), compact.as_slice(), normalised.as_slice()] {
+            assert_eq!(
+                serde_json::from_slice::<BootFactsV1>(bytes).unwrap(),
+                pinned
+            );
+        }
         assert!(!boot_facts_predate_ops_fold(&folded));
         assert!(boot_facts_predate_ops_fold(&compact));
+        assert!(boot_facts_predate_ops_fold(&normalised));
     }
 
     /// An ops lifecycle snapshot holds work while a completion has reached

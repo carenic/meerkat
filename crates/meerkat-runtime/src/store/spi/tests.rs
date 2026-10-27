@@ -1597,11 +1597,12 @@ async fn boot_obligation_scan_spi_store_lists_the_runtimes_with_work_without_hos
     }
 }
 
-// Unrun until the candidate's validation. Boot facts an earlier writer
-// pinned (the compact form, before the ops lifecycle's work was folded into
-// them) may leave such work out: the scan lists their runtime as holding
-// work, fail closed, without the open loading its body, until the runtime's
-// next commit pins the folded form.
+// Unrun until the candidate's validation. Boot facts without the folded
+// form's rollback-compatibility marker (an earlier writer's compact form, or
+// a JSON normaliser's rewrite, which drops it) may leave the ops lifecycle's
+// work out: the scan lists their runtime as holding work, fail closed,
+// without the open loading its body, until the runtime's next commit pins
+// the folded form.
 #[tokio::test]
 async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the_ops_fold() {
     let host = Arc::new(TestHost::new());
@@ -1627,7 +1628,8 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
         "a folded head with no work is not listed"
     );
 
-    // The same facts in the compact form an earlier writer pinned.
+    // The same facts as a JSON normaliser rewrites them: the marker is
+    // gone, as in the compact form an earlier writer pinned.
     let id = ScopeId::new(super::RUNTIME_FAMILY, quiet.0.clone());
     let folded = {
         let cell = opened.0.cell(&id);
@@ -1644,14 +1646,15 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
         Some(&b'\n'),
         "this writer pins the folded form"
     );
-    let compact = folded[..folded.len() - 1].to_vec();
+    let normalised =
+        serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&folded).unwrap()).unwrap();
     commit_one(
         &opened.0,
         &id,
-        ScopeDelta::Changes(vec![("boot".into(), Some(Arc::new(compact)))]),
+        ScopeDelta::Changes(vec![("boot".into(), Some(Arc::new(normalised)))]),
     )
     .await
-    .expect("an earlier writer's head");
+    .expect("a head that lost the marker");
 
     let reopened = reopen(&host, opened).await;
     assert!(
@@ -1661,7 +1664,7 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
             .await
             .expect("the scan answers")
             .contains(&quiet),
-        "a head pinned before the fold is listed, fail closed"
+        "a head without the marker is listed, fail closed"
     );
     assert!(
         !reopened.1.runtime_loaded_for_test("quiet").await,
