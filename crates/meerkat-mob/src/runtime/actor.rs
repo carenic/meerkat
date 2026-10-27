@@ -30932,8 +30932,10 @@ impl MobActor {
                     };
                     match wake {
                         None
-                        | Some(member_wake::MemberWakeAdmission::Ready)
-                        | Some(member_wake::MemberWakeAdmission::LifecycleNoticeConsumed) => {
+                        | Some(
+                            member_wake::MemberWakeAdmission::Ready
+                            | member_wake::MemberWakeAdmission::LifecycleNoticeConsumed,
+                        ) => {
                             self.handle_member_live_open(
                                 agent_identity,
                                 turning_mode,
@@ -31434,9 +31436,9 @@ impl MobActor {
         // off materializations, and they must not wait for an unrelated
         // command to be realized.
         if !self.durable_uncertainty_fail_stop.is_set()
-            && !(self.destroy_admitted()
-                && !self.destroy_cleanup_active
-                && !self.pending_routed_effects.is_empty())
+            && (!self.destroy_admitted()
+                || self.destroy_cleanup_active
+                || self.pending_routed_effects.is_empty())
         {
             boxed_arm_future(|| self.answer_closed_member_wakes()).await;
             boxed_arm_future(|| self.realize_member_peer_ingress_changes()).await;

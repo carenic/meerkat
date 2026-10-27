@@ -66308,8 +66308,8 @@ async fn a_resume_never_reuses_a_live_actor_on_another_binding() {
                 recorded,
             }) if member_id == &identity
                 && session_id == &session
-                && requested == &scoped_auth_binding()
-                && recorded.as_ref() == Some(&other_auth_binding())
+                && **requested == scoped_auth_binding()
+                && recorded.as_deref() == Some(&other_auth_binding())
         ),
         "a live actor on another binding is not reused: {refused:?}"
     );
@@ -66408,7 +66408,7 @@ async fn the_live_actor_binding_check_accepts_only_the_requested_binding() {
         matches!(
             check(other.clone()).await,
             Err(MobError::MemberAuthBindingConflict { ref recorded, .. })
-                if recorded.as_ref() == Some(&other_auth_binding())
+                if recorded.as_deref() == Some(&other_auth_binding())
         ),
         "another binding is the typed conflict"
     );
