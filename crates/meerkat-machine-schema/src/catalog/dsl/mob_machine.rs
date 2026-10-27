@@ -25407,8 +25407,10 @@ macro_rules! mob_catalog_machine_dsl {
                 peer_id: endpoint.peer_id.clone(),
                 address: endpoint.address.clone(),
                 signing_key: endpoint.signing_key.clone(),
+                // Derived from the address, as every member endpoint is; the
+                // string form serves both instantiations' PeerAddress twins.
+                transport: PeerTransportKind::from_address_str(endpoint.address.0.as_str()),
             }
-            transport: PeerTransportKind::from_peer_address(&endpoint.address),
         }
 
         fn mob_machine_member_peer_overlay_complete(
