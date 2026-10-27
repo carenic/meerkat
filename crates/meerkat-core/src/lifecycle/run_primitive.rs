@@ -653,11 +653,9 @@ pub struct OpenAiPromptCacheOptions {
     /// Automatic (`implicit`) placement or Meerkat-authored explicit placement.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mode: Option<OpenAiPromptCacheMode>,
-    /// Minimum cache lifetime. GPT-5.6 currently accepts only `30m`.
-    // The doc line above is released text the adaptive mobpack
-    // LayerDecision schema pins (0.9.1 hosts compare it), so it stays as it
-    // is. GPT-5.6 and later accept `30m` and `12h`; each model's
-    // `params_schema` lists the values it accepts.
+    /// Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later.
+    // The adaptive mobpack LayerDecision schema keeps this field's released
+    // 0.9.1 description (`meerkat_mob::adaptive::layer_decision_schema`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ttl: Option<OpenAiPromptCacheTtl>,
 }

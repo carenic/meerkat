@@ -280,9 +280,12 @@ Prompt caching uses the `provider_tag` keys above:
   `prompt_cache_retention = "in_memory"` when the agent is built.
   They also accept TTL `12h`, never a default: a 12-hour minimum lifetime
   for a stable prefix reused across longer gaps (a long-lived agent that
-  responds every few hours). Its cache writes cost 2.5x the uncached input
-  rate, against 1.25x for `30m`. Rows without this cache regime
-  (`gpt-5.5`, `gpt-5.5-pro` and earlier) refuse any TTL before sending.
+  responds every few hours). The TTL applies to every breakpoint of the
+  request, so every cache write of a `12h` request costs 2.5x the uncached
+  input rate, the conversation tail included, against 1.25x for `30m`.
+  Rows without this cache regime (`gpt-5.5`, `gpt-5.5-pro` and earlier)
+  refuse any TTL when the agent is built (a per-turn override, before its
+  request is sent).
   `prompt_cache_enabled = false` opts out: the request then carries only
   `prompt_cache_options = {"mode": "explicit"}` with no breakpoints, so
   nothing is cached.

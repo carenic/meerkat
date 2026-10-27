@@ -341,7 +341,8 @@ pub struct FinishResult {
 /// So is the `12h` OpenAI prompt-cache TTL (`prompt_cache_options.ttl`), for
 /// the same reason: a decision that carries it anyway is parsed and judged by
 /// the member's build like any other request, which accepts it on the models
-/// whose catalog row lists it.
+/// whose catalog row lists it. The TTL field keeps its released description
+/// here; every other schema describes both lifetimes.
 #[cfg(feature = "schema")]
 pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
     let mut schema = serde_json::to_value(schemars::schema_for!(LayerDecision))?;
@@ -385,7 +386,7 @@ pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
         properties.remove("durable");
     }
     // Nor the 12-hour OpenAI prompt-cache TTL, which the released schema
-    // does not carry.
+    // does not carry, and the TTL field keeps its released description.
     if let Some(ttls) = schema
         .pointer_mut("/$defs/OpenAiPromptCacheTtl/enum")
         .and_then(serde_json::Value::as_array_mut)
@@ -398,8 +399,20 @@ pub fn layer_decision_schema() -> Result<serde_json::Value, serde_json::Error> {
                 )
         });
     }
+    if let Some(description) =
+        schema.pointer_mut("/$defs/OpenAiPromptCacheOptions/properties/ttl/description")
+    {
+        *description = serde_json::Value::from(RELEASED_OPENAI_PROMPT_CACHE_TTL_DESCRIPTION);
+    }
     Ok(schema)
 }
+
+/// The released (0.9.1) description of `prompt_cache_options.ttl` that the
+/// pinned LayerDecision schema keeps: 0.9.1 hosts compare a pack's bundled
+/// schema with their own, doc text included.
+#[cfg(feature = "schema")]
+const RELEASED_OPENAI_PROMPT_CACHE_TTL_DESCRIPTION: &str =
+    "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`.";
 
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -3847,6 +3860,32 @@ mod tests {
             &serde_json::to_value(schemars::schema_for!(LayerDecision)).expect("derived schema"),
         );
         assert_eq!(derived, ["30m", "12h"], "the type itself carries 12h");
+    }
+
+    /// The pinned schema keeps the released description of
+    /// `prompt_cache_options.ttl` while the type's own doc describes both
+    /// lifetimes. (Fails-old: the reworded doc reached the pinned schema.)
+    #[cfg(feature = "schema")]
+    #[test]
+    fn layer_decision_schema_keeps_the_released_prompt_cache_ttl_description() {
+        let description = |schema: &serde_json::Value| {
+            schema
+                .pointer("/$defs/OpenAiPromptCacheOptions/properties/ttl/description")
+                .and_then(serde_json::Value::as_str)
+                .expect("prompt_cache_options.ttl description")
+                .to_owned()
+        };
+        assert_eq!(
+            description(&layer_decision_schema().expect("canonical schema serializes")),
+            "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+        );
+        assert_eq!(
+            description(
+                &serde_json::to_value(schemars::schema_for!(LayerDecision))
+                    .expect("derived schema")
+            ),
+            "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
+        );
     }
 
     #[cfg(feature = "schema")]

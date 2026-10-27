@@ -1900,6 +1900,47 @@ fn validate_openai_prompt_cache_retention(
     }
 }
 
+/// Refuse a `prompt_cache_options.ttl` the resolved OpenAI catalog row does
+/// not accept when the agent is built, instead of failing its first request.
+/// The request lowering keeps the same check, with the same text, as the
+/// backstop for per-turn overrides. Uncatalogued models keep the
+/// pass-through, and a disabled cache sends no TTL.
+fn validate_openai_prompt_cache_ttl(
+    provider: Provider,
+    model: &str,
+    provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+) -> Result<(), BuildAgentError> {
+    use meerkat_core::lifecycle::run_primitive::ProviderTag;
+    if provider != Provider::OpenAI {
+        return Ok(());
+    }
+    let Some(ProviderTag::OpenAi(tag)) =
+        provider_params.and_then(|params| params.provider_tag.as_ref())
+    else {
+        return Ok(());
+    };
+    let Some(ttl) = tag
+        .prompt_cache_options
+        .and_then(|options| options.ttl)
+        .filter(|_| tag.prompt_cache_enabled != Some(false))
+    else {
+        return Ok(());
+    };
+    let Some(capabilities) = meerkat_models::capabilities_for(Provider::OpenAI, model) else {
+        return Ok(());
+    };
+    if capabilities
+        .openai_responses_params
+        .is_some_and(|params| params.prompt_cache_ttls.contains(&ttl))
+    {
+        return Ok(());
+    }
+    Err(BuildAgentError::Config(format!(
+        "OpenAI model '{model}' does not support prompt cache TTL '{}'",
+        ttl.as_wire_str()
+    )))
+}
+
 /// Refuse Anthropic request-shaping knobs the resolved catalog row rejects
 /// (a thinking type or budget the model does not accept, `top_k` without
 /// top-k support, `between_tools` or a capped `disabled` above `high`
@@ -9318,6 +9359,7 @@ impl AgentFactory {
             &model,
             build_config.provider_params.as_ref(),
         )?;
+        validate_openai_prompt_cache_ttl(provider, &model, build_config.provider_params.as_ref())?;
         validate_anthropic_request_shaping(
             provider,
             &model,
@@ -13124,6 +13166,86 @@ mod tests {
             )
             .is_ok(),
             "rows without GPT-5.6-and-later cache capabilities keep accepting it"
+        );
+    }
+
+    /// A `prompt_cache_options.ttl` the cataloged OpenAI row does not accept
+    /// is refused when the agent is built, with the request lowering's own
+    /// text; accepted TTLs, a disabled cache, uncatalogued models and other
+    /// providers pass.
+    #[test]
+    fn unsupported_prompt_cache_ttl_is_refused_at_build() {
+        use meerkat_core::lifecycle::run_primitive::{
+            OpenAiPromptCacheOptions, OpenAiProviderTag, ProviderParamsOverride, ProviderTag,
+        };
+        use meerkat_core::model_profile::capabilities::OpenAiPromptCacheTtl;
+        let params = |ttl: OpenAiPromptCacheTtl, enabled: Option<bool>| ProviderParamsOverride {
+            provider_tag: Some(ProviderTag::OpenAi(OpenAiProviderTag {
+                prompt_cache_enabled: enabled,
+                prompt_cache_options: Some(OpenAiPromptCacheOptions {
+                    mode: None,
+                    ttl: Some(ttl),
+                }),
+                ..Default::default()
+            })),
+            ..Default::default()
+        };
+        for model in ["gpt-5.5", "gpt-5.5-pro", "gpt-5.4"] {
+            let Err(BuildAgentError::Config(message)) = validate_openai_prompt_cache_ttl(
+                Provider::OpenAI,
+                model,
+                Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+            ) else {
+                panic!("{model} must refuse the 12h prompt-cache TTL at build");
+            };
+            assert_eq!(
+                message,
+                format!("OpenAI model '{model}' does not support prompt cache TTL '12h'")
+            );
+            assert!(
+                validate_openai_prompt_cache_ttl(
+                    Provider::OpenAI,
+                    model,
+                    Some(&params(OpenAiPromptCacheTtl::TwelveHours, Some(false))),
+                )
+                .is_ok(),
+                "{model}: a disabled cache sends no TTL"
+            );
+        }
+        for model in ["gpt-5.6-sol", "gpt-6-astra"] {
+            for ttl in [
+                OpenAiPromptCacheTtl::ThirtyMinutes,
+                OpenAiPromptCacheTtl::TwelveHours,
+            ] {
+                assert!(
+                    validate_openai_prompt_cache_ttl(
+                        Provider::OpenAI,
+                        model,
+                        Some(&params(ttl, None)),
+                    )
+                    .is_ok(),
+                    "{model} accepts {}",
+                    ttl.as_wire_str()
+                );
+            }
+        }
+        assert!(
+            validate_openai_prompt_cache_ttl(
+                Provider::OpenAI,
+                "gpt-5.9-future",
+                Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+            )
+            .is_ok(),
+            "uncatalogued models keep the pass-through"
+        );
+        assert!(
+            validate_openai_prompt_cache_ttl(
+                Provider::SelfHosted,
+                "gpt-5.5",
+                Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+            )
+            .is_ok(),
+            "only the OpenAI provider is checked"
         );
     }
 

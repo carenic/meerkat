@@ -6139,22 +6139,30 @@ describe("Session fork result parse boundary (row 88)", () => {
   });
 
   it("parses evidence authored under the 12-hour prompt-cache TTL", () => {
+    // The evidence ttl is advisory: a lifetime this SDK does not know reads
+    // as { unknown: <value> } instead of failing the fork result; a
+    // missing, empty or non-string ttl is still malformed.
     const forkResult = (ttl) => ({
       source_session_id: "src-1",
       session_id: "fork-1",
       message_count: 4,
       cache_inheritance: forkCacheAvailable(ttl),
     });
-    const result = MeerkatClient.parseSessionForkResult(forkResult("twelve_hours"));
-    assert.equal(result.cacheInheritance.status, "available");
-    assert.equal(
-      result.cacheInheritance.forkPoint.authoredCacheBreakpoint.ttl,
-      "twelve_hours",
-    );
-    assert.throws(
-      () => MeerkatClient.parseSessionForkResult(forkResult("twelve_hour")),
-      (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
-    );
+    const parsedTtl = (ttl) => {
+      const result = MeerkatClient.parseSessionForkResult(forkResult(ttl));
+      assert.equal(result.cacheInheritance.status, "available");
+      return result.cacheInheritance.forkPoint.authoredCacheBreakpoint.ttl;
+    };
+    assert.equal(parsedTtl("twelve_hours"), "twelve_hours");
+    assert.equal(parsedTtl("thirty_minutes"), "thirty_minutes");
+    assert.deepEqual(parsedTtl("forty_eight_hours"), { unknown: "forty_eight_hours" });
+    for (const malformed of [12, "", null]) {
+      assert.throws(
+        () => MeerkatClient.parseSessionForkResult(forkResult(malformed)),
+        (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+        JSON.stringify(malformed),
+      );
+    }
   });
 
   it("throws INVALID_RESPONSE when cache_inheritance is missing", () => {

@@ -1115,6 +1115,10 @@ ForkCacheTtl = Literal[
     "provider_default",
     "twelve_hours",
 ]
+# A cache lifetime this SDK does not know, as the server sent it: the evidence
+# vocabulary grows with provider cache lifetimes, and an unknown value is
+# surfaced, not refused.
+ForkCacheTtlUnknown = TypedDict("ForkCacheTtlUnknown", {"unknown": str})
 ForkCacheInheritanceUnavailableReason = Literal[
     "no_authored_breakpoint_at_boundary",
     "provider_model_mismatch",
@@ -1154,7 +1158,7 @@ class ForkAuthoredCacheBreakpoint:
     rendered_prefix_sha256: str
     rendered_prefix_bytes: int
     lowered_request_provenance: ForkCacheLoweredRequestProvenance
-    ttl: ForkCacheTtl
+    ttl: ForkCacheTtl | ForkCacheTtlUnknown
 
 
 @dataclass(frozen=True, slots=True)

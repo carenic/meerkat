@@ -11790,7 +11790,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -20465,7 +20465,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -45921,7 +45921,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -48292,7 +48292,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
