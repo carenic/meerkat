@@ -1418,7 +1418,7 @@ impl From<MemberPeerEndpointWire> for MemberPeerEndpoint {
 }
 
 impl MemberPeerEndpoint {
-    /// An endpoint whose transport is derived from its address (G3). Build
+    /// An endpoint whose transport is derived from its address. Build
     /// endpoints with this or `From<&TrustedPeerDescriptor>`, never with a
     /// struct literal, so the transport cannot drift from the address.
     pub fn new(
@@ -4389,7 +4389,7 @@ mod tests {
         )
     }
 
-    /// N9 drift guard: a member endpoint's transport is derived from its
+    /// Drift guard: a member endpoint's transport is derived from its
     /// address on every construction path (the constructor, the trusted
     /// descriptor and the stored shape), never set by hand. An address that
     /// does not parse counts as a network transport.
@@ -9977,9 +9977,9 @@ mod tests {
     }
 
     // -----------------------------------------------------------------
-    // Archive-only retirement (R27), destroy beats rotation (R124),
-    // Dormant external wiring (R125), the endpoint at a wake's close and
-    // the seat's kickoff refusal (R13).
+    // Archive-only retirement, destroy beats rotation,
+    // Dormant external wiring, the endpoint at a wake's close and
+    // the seat's kickoff refusal.
     // -----------------------------------------------------------------
 
     struct SeatedMember {
@@ -10079,7 +10079,7 @@ mod tests {
         }
     }
 
-    /// R27: a Dormant member holds no runtime registration, so its retirement
+    /// A Dormant member holds no runtime registration, so its retirement
     /// routes no runtime retire. It is archive-only: the retry refuses to route
     /// one, and the session archive alone terminates the member.
     #[test]
@@ -10123,7 +10123,7 @@ mod tests {
         assert!(authority.state().runtime_retire_archive_only.is_empty());
     }
 
-    /// R27 with F3: a Waking member's retirement closes its open attempt in
+    /// A Waking member's retirement closes its open attempt in
     /// the same step and is archive-only; the in-flight attempt's late
     /// feedback is a typed StaleAttempt no-op.
     #[test]
@@ -10167,7 +10167,7 @@ mod tests {
         )));
     }
 
-    /// R27 control: a Live member holds its registration, so its retirement
+    /// The control: a Live member holds its registration, so its retirement
     /// still routes the runtime retire and is not archive-only.
     #[test]
     fn a_live_member_retirement_still_routes_its_runtime_retire() {
@@ -10182,7 +10182,7 @@ mod tests {
         assert!(authority.state().runtime_retire_archive_only.is_empty());
     }
 
-    /// R27: the mob's destroy retires a Dormant member archive-only and
+    /// The mob's destroy retires a Dormant member archive-only and
     /// archives it with no runtime retire.
     #[test]
     fn the_destroy_retires_a_dormant_member_archive_only() {
@@ -10235,7 +10235,7 @@ mod tests {
         assert!(authority.state().runtime_retire_archive_only.is_empty());
     }
 
-    /// R27: no retiring member is woken after a restart, so a replayed
+    /// No retiring member is woken after a restart, so a replayed
     /// retirement start is archive-only and its re-drive routes nothing.
     #[test]
     fn a_recovered_retirement_start_is_archive_only() {
@@ -10261,7 +10261,7 @@ mod tests {
         assert!(MobMachineMutator::apply(&mut authority, retry_runtime_retire(&member)).is_err());
     }
 
-    /// R124: the destroy beats an in-flight rotation and a pending host
+    /// The destroy beats an in-flight rotation and a pending host
     /// carry-out. Once the destroy is admitted the rotation's terminal is
     /// refused, and the plain archive terminal archives the rotating,
     /// host-pending identity and drops its intent with no wait. DestroyMob
@@ -10374,7 +10374,7 @@ mod tests {
         assert!(authority.state().member_rotation_session_ids.is_empty());
     }
 
-    /// R125: a Dormant member holds no comms runtime, so its external edge
+    /// A Dormant member holds no comms runtime, so its external edge
     /// commits, re-commits and is removed with no trust obligation (its wake
     /// realizes the trust). A Live member keeps the obligation.
     #[test]
@@ -11189,7 +11189,7 @@ mod tests {
         )));
     }
 
-    /// R13: a seat owes no kickoff. A spec that owes one spawns
+    /// A seat owes no kickoff. A spec that owes one spawns
     /// embodied, so the machine refuses a seat that would owe one.
     #[test]
     fn a_seat_that_owes_a_kickoff_is_refused() {

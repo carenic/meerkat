@@ -8660,7 +8660,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
             // A graceful requeue stop left the in-flight run resumable.
             RunSuspendedForStop { run_id: RunId },
-            // A session's runtime registration was released (G1): every
+            // A session's runtime registration was released: every
             // unregister (a Session-owned registration's empty-resume teardown
             // included; a Composition-owned one keeps serving) publishes the
             // released registration's exact runtime id, fence and epoch. The
