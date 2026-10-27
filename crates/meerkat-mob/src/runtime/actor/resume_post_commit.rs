@@ -56,6 +56,17 @@ impl MobActor {
                 {
                     continue;
                 }
+                // A Dormant member has no session actor in this process: the
+                // provision of its wake (the shared cold recipe) binds its
+                // owner context, so its session is neither read nor
+                // registered here, exactly as at startup. MobMachine's
+                // residency decides it.
+                if crate::runtime::boot_plan::domain_member_is_dormant(
+                    self.dsl_authority.state(),
+                    &entry.agent_identity,
+                ) {
+                    continue;
+                }
                 // Nothing acts on a member whose custody restore stays
                 // deferred.
                 if self.deferred_member_custody.contains(&entry.agent_identity) {

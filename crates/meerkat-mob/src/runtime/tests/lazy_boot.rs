@@ -201,6 +201,63 @@ async fn the_lift_of_a_stopped_mob_materializes_no_member_without_work() {
     }
 }
 
+/// The lift binds the operation owners of the members it holds live, and
+/// only those: a member left Dormant gets its binding at its wake, through
+/// the shared cold recipe, so the lift's post-commit work neither reads its
+/// persisted session nor registers a runtime for it. Here the host requires
+/// one member, which the lift's plan materializes; every other member's
+/// durable reads are refused, so a read of one fails the lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lift_binds_only_the_members_it_holds_live() {
+    let mob = CrashedMob::new("lazy-lift-bindings", 6, false, true).await;
+    let live = worker(0);
+    let handle = mob
+        .resume(mob.builder().with_host_required_members([live.clone()]))
+        .await;
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+    let dormant = mob
+        .sessions
+        .iter()
+        .filter(|(identity, _)| identity != &live)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (_, session) in &dormant {
+        mob.service
+            .refuse_persisted_session_reads(session, PersistedSessionReadRefusal::StoreFailure);
+    }
+
+    tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift reads no dormant member's session");
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    assert_eq!(
+        phase_of(&handle, &live),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    let runtime = mob.service.enable_runtime_adapter();
+    assert!(
+        runtime.contains_session(&mob.session(0)).await,
+        "the live member's runtime is registered"
+    );
+    for (identity, session) in &dormant {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+        assert!(
+            !runtime.contains_session(session).await,
+            "the lift registers no runtime for the dormant member {identity}"
+        );
+    }
+    assert_eq!(
+        mob.materialized().await,
+        vec![mob.session(0)],
+        "the lift built the live member only"
+    );
+}
+
 /// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eager_policy_materializes_every_member() {
