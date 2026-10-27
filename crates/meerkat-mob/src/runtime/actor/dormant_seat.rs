@@ -126,6 +126,19 @@ impl MobActor {
         if !phase_admits {
             return Err(self.invalid_transition_to(MobState::Running));
         }
+        // A non-authoritative composition seats nothing (the machine refuses
+        // the seat); refused here before a fresh seat's session is created in
+        // the store it must not write.
+        if self.dsl_authority.state().composition_authority
+            == mob_dsl::CompositionAuthorityKind::NonAuthoritative
+        {
+            return Err(MobError::MobMachineRejected {
+                context: "dormant_seat",
+                reason: format!(
+                    "'{agent_identity}' is not seated: this composition of the mob is not authoritative"
+                ),
+            });
+        }
         if agent_identity.is_system_reserved() {
             return Err(MobError::WiringError(format!(
                 "meerkat id '{agent_identity}' uses reserved system identifier namespace"
