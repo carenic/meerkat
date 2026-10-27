@@ -1308,6 +1308,13 @@ pub struct MobMcpState {
     /// The host's fork instruction policy for every mob this state creates
     /// or resumes ([`Self::with_fork_instruction_policy`]).
     fork_instruction_policy: meerkat_core::ForkInstructionPolicy,
+    /// The host's member restore policy for every mob this state creates or
+    /// resumes, child mobs included ([`Self::with_member_restore_policy`]).
+    member_restore_policy: meerkat_mob::MemberRestorePolicy,
+    /// How many members a resume of a mob this state manages restores at
+    /// once ([`Self::with_resume_restore_concurrency`]); `None` keeps the
+    /// builder's default.
+    resume_restore_concurrency: Option<usize>,
     /// The console principal this state serves (phase 5, chokepoint (b) —
     /// DEC-P5E-8). Injected at construction, never ambient (gotcha #19):
     /// every v1 local surface (RPC/REST/stdio/public-MCP/CLI/embedder)
@@ -1445,6 +1452,8 @@ impl MobMcpState {
             member_live_host: std::sync::RwLock::new(None),
             controlling_acceptor: None,
             fork_instruction_policy: meerkat_core::ForkInstructionPolicy::default(),
+            member_restore_policy: meerkat_mob::MemberRestorePolicy::default(),
+            resume_restore_concurrency: None,
         }
     }
 
@@ -1457,6 +1466,26 @@ impl MobMcpState {
         policy: meerkat_core::ForkInstructionPolicy,
     ) -> Self {
         self.fork_instruction_policy = policy;
+        self
+    }
+
+    /// Set the host's member restore policy for every mob this state creates
+    /// or resumes ([`meerkat_mob::MobBuilder::with_member_restore_policy`]),
+    /// the child mobs its agents create with `mob_create` and `delegate`
+    /// included. A host that builds mobs of its own with a policy passes the
+    /// same one here, so the mobs this state manages start the same way. The
+    /// default is the builder's, [`meerkat_mob::MemberRestorePolicy::OnDemand`].
+    pub fn with_member_restore_policy(mut self, policy: meerkat_mob::MemberRestorePolicy) -> Self {
+        self.member_restore_policy = policy;
+        self
+    }
+
+    /// Set how many members a resume of a mob this state manages restores at
+    /// once ([`meerkat_mob::MobBuilder::with_resume_restore_concurrency`]),
+    /// child mobs included. Without it each resume uses the builder's
+    /// default. `0` counts as `1`.
+    pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
+        self.resume_restore_concurrency = Some(concurrency);
         self
     }
 
@@ -3400,6 +3429,12 @@ impl MobMcpState {
         }
         if let Some(acceptor) = &self.controlling_acceptor {
             builder = builder.with_controlling_acceptor(acceptor.clone());
+        }
+        // Every mob this state manages starts the way the host starts its
+        // own: child mobs follow the host's restore policy and concurrency.
+        builder = builder.with_member_restore_policy(self.member_restore_policy);
+        if let Some(concurrency) = self.resume_restore_concurrency {
+            builder = builder.with_resume_restore_concurrency(concurrency);
         }
         builder.with_fork_instruction_policy(self.fork_instruction_policy)
     }
@@ -11797,6 +11832,77 @@ mod tests {
         >,
         /// Archives of these sessions park until their hold is released.
         archive_holds: std::sync::Mutex<HashMap<SessionId, Arc<InsertHold>>>,
+        /// When set, every session activation waits at this gate until the
+        /// test releases it ([`MockSessionSvc::hold_activations`]).
+        activation_gate: std::sync::Mutex<Option<Arc<ActivationGate>>>,
+    }
+
+    /// Holds each session activation (each member a restore materializes)
+    /// until the test releases one, and counts how many wait at once.
+    struct ActivationGate {
+        /// Activations that reached the gate so far.
+        arrivals: tokio::sync::watch::Sender<u64>,
+        /// One permit lets one waiting activation go on.
+        releases: tokio::sync::Semaphore,
+        /// Activations waiting at the gate now.
+        held: AtomicU64,
+        /// The most activations that waited at the gate at once.
+        max_held: AtomicU64,
+    }
+
+    impl ActivationGate {
+        fn new() -> Arc<Self> {
+            Arc::new(Self {
+                arrivals: tokio::sync::watch::Sender::new(0),
+                releases: tokio::sync::Semaphore::new(0),
+                held: AtomicU64::new(0),
+                max_held: AtomicU64::new(0),
+            })
+        }
+
+        /// Wait at the gate until the test releases this activation.
+        async fn hold(&self) {
+            let held = self.held.fetch_add(1, Ordering::SeqCst) + 1;
+            self.max_held.fetch_max(held, Ordering::SeqCst);
+            self.arrivals.send_modify(|arrived| *arrived += 1);
+            if let Ok(permit) = self.releases.acquire().await {
+                permit.forget();
+            }
+            self.held.fetch_sub(1, Ordering::SeqCst);
+        }
+
+        /// Wait until `count` activations reached the gate. Woken by each
+        /// arrival; the bound is a hang guard only.
+        async fn wait_for_arrivals(&self, count: u64) {
+            let mut arrivals = self.arrivals.subscribe();
+            let reached = tokio::time::timeout(
+                Duration::from_secs(60),
+                arrivals.wait_for(|arrived| *arrived >= count),
+            )
+            .await;
+            assert!(
+                matches!(reached, Ok(Ok(_))),
+                "{count} activations reach the gate ({} arrived)",
+                self.arrived()
+            );
+        }
+
+        fn arrived(&self) -> u64 {
+            *self.arrivals.borrow()
+        }
+
+        fn held(&self) -> u64 {
+            self.held.load(Ordering::SeqCst)
+        }
+
+        fn max_held(&self) -> u64 {
+            self.max_held.load(Ordering::SeqCst)
+        }
+
+        /// Let one waiting activation go on.
+        fn release_one(&self) {
+            self.releases.add_permits(1);
+        }
     }
 
     impl MockSessionSvc {
@@ -11820,6 +11926,7 @@ mod tests {
                 build_policies: std::sync::Mutex::default(),
                 scripted_observations: std::sync::Mutex::default(),
                 archive_holds: std::sync::Mutex::default(),
+                activation_gate: std::sync::Mutex::default(),
             }
         }
 
@@ -11917,6 +12024,7 @@ mod tests {
                 build_policies: std::sync::Mutex::new(self.build_policies_snapshot()),
                 scripted_observations: std::sync::Mutex::default(),
                 archive_holds: std::sync::Mutex::default(),
+                activation_gate: std::sync::Mutex::default(),
             }
         }
 
@@ -11925,6 +12033,14 @@ mod tests {
             req: CreateSessionRequest,
             actor_witness_slot: &meerkat_session::LiveSessionActorWitnessSlot,
         ) -> Result<RunResult, SessionError> {
+            let gate = self
+                .activation_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            if let Some(gate) = gate {
+                gate.hold().await;
+            }
             self.session_activations.fetch_add(1, Ordering::Relaxed);
             let build = req.build;
             let tool_restrictions =
@@ -12133,6 +12249,17 @@ mod tests {
 
         fn session_activation_count(&self) -> u64 {
             self.session_activations.load(Ordering::Relaxed)
+        }
+
+        /// Hold every later session activation at the returned gate until
+        /// the test releases it.
+        fn hold_activations(&self) -> Arc<ActivationGate> {
+            let gate = ActivationGate::new();
+            *self
+                .activation_gate
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(Arc::clone(&gate));
+            gate
         }
 
         fn start_turn_call_count(&self) -> u64 {
@@ -16801,6 +16928,91 @@ mod tests {
         )
     }
 
+    /// [`restored_state`] whose host materializes every member at start:
+    /// the mobs it restores, child mobs included, follow the host's
+    /// [`meerkat_mob::MemberRestorePolicy::Eager`].
+    fn restored_state_eager(svc: &Arc<MockSessionSvc>, root: &std::path::Path) -> Arc<MobMcpState> {
+        Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.to_path_buf()))
+                .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager),
+        )
+    }
+
+    /// Wait until MobMachine holds `identity` Live in the mob `handle`
+    /// serves. Woken by each machine state change; the bound is a hang guard
+    /// only.
+    async fn wait_until_member_live(handle: &MobHandle, identity: &AgentIdentity) {
+        let mut changes = handle.machine_state_changes();
+        let live = tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                if handle.member_materialization_for_test(identity)
+                    == Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Live)
+                {
+                    return true;
+                }
+                if changes.changed().await.is_err() {
+                    return false;
+                }
+            }
+        })
+        .await;
+        assert!(
+            matches!(live, Ok(true)),
+            "{identity} becomes Live: {:?}",
+            handle.member_materialization_for_test(identity)
+        );
+    }
+
+    /// [`seat_child_worker_then_exit`] with every one of `workers` seated.
+    /// Returns the restarted service, the mob and its owner session.
+    async fn seat_child_workers_then_exit(
+        svc: &Arc<MockSessionSvc>,
+        root: &std::path::Path,
+        mob_name: &str,
+        workers: &[&str],
+    ) -> (Arc<MockSessionSvc>, MobId, SessionId) {
+        let state = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.to_path_buf())),
+        );
+        let owner = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(owner.clone()))
+            .await;
+        let mob_id = state
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition(mob_name),
+                owner.clone(),
+                true,
+                false,
+            )
+            .await
+            .expect("create child mob");
+        for worker in workers {
+            state
+                .mob_spawn(
+                    &mob_id,
+                    ProfileName::from("worker"),
+                    AgentIdentity::from(*worker),
+                    Some(MobRuntimeMode::TurnDriven),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap_or_else(|error| panic!("spawn {worker}: {error}"));
+        }
+        state
+            .handle_for(&mob_id)
+            .await
+            .expect("predecessor mob handle")
+            .shutdown()
+            .await
+            .expect("retire the predecessor supervisor route");
+        (Arc::new(svc.cold_restart().await), mob_id, owner)
+    }
+
     /// A lookup of a held child mob answers its hold: the runtime-unavailable
     /// class with the bounded `reason` token, never a missing mob.
     fn assert_held_before_activation(result: Result<MobHandle, MobError>, reason: &str) {
@@ -16843,14 +17055,48 @@ mod tests {
         files.remove(0)
     }
 
-    /// A child mob whose owner is committed restores and activates its members:
-    /// each member is rebuilt on demand, at its first touch.
+    /// A child mob whose owner is committed restores. Under a host whose
+    /// restore policy is `Eager`, the mob follows it and activates its
+    /// members at start.
     #[tokio::test]
     async fn restored_child_mob_with_a_committed_owner_activates() {
         let svc = Arc::new(MockSessionSvc::new());
         let root = tempfile::tempdir().expect("tempdir");
         let (svc, mob_id, owner, _worker_session) =
             seat_child_worker_then_exit(&svc, root.path(), "owner-committed").await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
+        );
+        let activations_before = svc.session_activation_count();
+        let restored = restored_state_eager(&svc, root.path());
+        let worker = AgentIdentity::from("worker-1");
+        let status = restored
+            .mob_member_status(&mob_id, &worker)
+            .await
+            .expect("restore member status");
+        assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        assert!(
+            svc.session_activation_count() > activations_before,
+            "control: an activating restore rebuilds the member session"
+        );
+        wait_until_member_live(
+            &restored.handle_for(&mob_id).await.expect("child handle"),
+            &worker,
+        )
+        .await;
+    }
+
+    /// A child mob starts the way the host's own mobs do. Under the default
+    /// policy (`OnDemand`) its restore seats the member without materializing
+    /// it: the member reads active, and neither the restore nor the read
+    /// rebuilds its session.
+    #[tokio::test]
+    async fn a_restored_child_mob_leaves_its_members_dormant_under_the_default_policy() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, owner, _worker_session) =
+            seat_child_worker_then_exit(&svc, root.path(), "default-policy-child").await;
         svc.script_observation(
             &owner,
             Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
@@ -16863,17 +17109,68 @@ mod tests {
             .await
             .expect("restore member status");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
-        restored
-            .handle_for(&mob_id)
-            .await
-            .expect("the activated child mob")
-            .ensure_member_live(&worker)
-            .await
-            .expect("the member's first touch rebuilds it");
-        assert!(
-            svc.session_activation_count() > activations_before,
-            "control: an activated child mob's member session is rebuilt"
+        assert_eq!(
+            svc.session_activation_count(),
+            activations_before,
+            "neither the restore nor the read rebuilds the member session"
         );
+        assert_eq!(
+            restored
+                .handle_for(&mob_id)
+                .await
+                .expect("child handle")
+                .member_materialization_for_test(&worker),
+            Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        );
+    }
+
+    /// The host's restore concurrency reaches the mobs this state resumes: a
+    /// child mob resumed at concurrency 1 materializes one member at a time.
+    /// Each member's session activation waits until the test releases it,
+    /// and the next one reaches the gate only after that release.
+    #[tokio::test]
+    async fn a_child_mob_resumes_at_the_hosts_restore_concurrency() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let workers = ["worker-1", "worker-2", "worker-3"];
+        let (svc, mob_id, owner) =
+            seat_child_workers_then_exit(&svc, root.path(), "concurrency-child", &workers).await;
+        svc.script_observation(
+            &owner,
+            Ok(meerkat_mob::LiveDurableSourceObservation::Committed { revision: None }),
+        );
+        let gate = svc.hold_activations();
+        let restored = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.path().to_path_buf()))
+                .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
+                .with_resume_restore_concurrency(1),
+        );
+        let restore = tokio::spawn({
+            let restored = Arc::clone(&restored);
+            async move { restored.mob_list().await }
+        });
+        for arrived in 1..=u64::try_from(workers.len()).expect("member count") {
+            gate.wait_for_arrivals(arrived).await;
+            assert_eq!(
+                gate.arrived(),
+                arrived,
+                "no member's activation starts while another one's waits"
+            );
+            assert_eq!(gate.held(), 1, "one member is materialized at a time");
+            gate.release_one();
+        }
+        let listed = tokio::time::timeout(Duration::from_secs(60), restore)
+            .await
+            .expect("the restore finishes")
+            .expect("the restore task")
+            .expect("the restore");
+        assert!(
+            listed.iter().any(|(id, _)| *id == mob_id),
+            "the child mob is restored: {listed:?}"
+        );
+        assert_eq!(gate.max_held(), 1, "the restore never ran two at once");
     }
 
     /// A child mob whose owner is confirmed archived is torn down at restore
@@ -18084,14 +18381,51 @@ mod tests {
 
     /// #1701: restoring a child mob asks the host customizer for each member's
     /// rebuild through `customize_resume`, with the member's bound session.
-    /// The rebuild is on demand: a status read leaves the member Dormant and
-    /// asks nothing, and the member's first touch rebuilds it.
+    /// The host restores every member at start (`Eager`), so the rebuild is
+    /// part of the restore; under `OnDemand` it comes at the member's first
+    /// touch (`a_dormant_child_member_is_customized_with_its_resume_view_at_its_first_touch`).
     #[tokio::test]
     async fn restored_child_mob_members_are_customized_with_their_resume_view() {
         let svc = Arc::new(MockSessionSvc::new());
         let root = tempfile::tempdir().expect("tempdir");
         let (svc, mob_id, session) =
             seat_worker_then_exit(&svc, root.path(), true, "restored-customized-child").await;
+        let host = Arc::new(WideningHostCustomizer::default());
+        let restored = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.path().to_path_buf()))
+                .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
+                .with_child_spawn_member_customizer(host.clone()),
+        );
+        let status = restored
+            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .await
+            .expect("restore member status");
+        assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        let calls = host.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|(mob, source, member, view)| mob == &mob_id
+                    && *source == meerkat_mob::SpawnSource::Resume
+                    && member.as_str() == "worker-1"
+                    && view.as_ref() == Some(&session)),
+            "the restore asks the host customizer with the worker's session: {calls:?}"
+        );
+    }
+
+    /// #1701 under the default restore policy (`OnDemand`): a restored child
+    /// mob's member is rebuilt at its first touch, and that rebuild asks the
+    /// host customizer through `customize_resume` with the member's bound
+    /// session. A status read before it leaves the member Dormant and asks
+    /// nothing.
+    #[tokio::test]
+    async fn a_dormant_child_member_is_customized_with_its_resume_view_at_its_first_touch() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, session) =
+            seat_worker_then_exit(&svc, root.path(), true, "first-touch-customized-child").await;
         let host = Arc::new(WideningHostCustomizer::default());
         let restored = Arc::new(
             MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
@@ -18139,13 +18473,12 @@ mod tests {
 
     /// #1701 restore ordering, under the joint child-policy decision: a
     /// restored mob is classified as a child mob before any member is
-    /// rebuilt, so its members' rebuilds run under the child policy. A
+    /// restored, so its members' rebuilds run under the child policy. A
     /// managed host without a child policy still restores everything: the
     /// child mob comes up, and its members are not brought back unconstrained.
-    /// A member is rebuilt on demand, so the refusal comes at its first touch:
-    /// the member then carries a typed restore failure saying why and naming
-    /// the fixes, and calls into it return that refusal. (Recovery once the
-    /// refusal lifts is proved in meerkat-mob:
+    /// Each carries a typed restore failure saying why and naming the fixes,
+    /// and calls into it return that refusal. (Recovery once the refusal
+    /// lifts is proved in meerkat-mob:
     /// `refused_restore_is_per_member_and_recovers_once_admitted`.)
     #[tokio::test]
     async fn unconfigured_child_policy_refuses_restored_child_members_not_the_restore() {
@@ -18171,6 +18504,112 @@ mod tests {
             .expect("create child mob");
         let host_mob = seating
             .mob_create_definition(explicit_definition("restored-policy-host"))
+            .await
+            .expect("create host mob");
+        for mob_id in [&child, &host_mob] {
+            seating
+                .mob_spawn(
+                    mob_id,
+                    ProfileName::from("worker"),
+                    worker.clone(),
+                    Some(MobRuntimeMode::TurnDriven),
+                    None,
+                    None,
+                )
+                .await
+                .expect("spawn worker");
+            seating
+                .handle_for(mob_id)
+                .await
+                .expect("predecessor mob handle")
+                .shutdown()
+                .await
+                .expect("retire the predecessor supervisor route");
+        }
+        let svc = Arc::new(svc.cold_restart().await);
+
+        // The host restores every member at start (`Eager`), so the refusal
+        // is the restore's; under `OnDemand` it comes at the member's first
+        // touch (`an_unconfigured_child_policy_refuses_a_dormant_child_member_at_its_first_touch`).
+        let unconfigured = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.path().to_path_buf()))
+                .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
+                .with_tool_consequence_policy_registry(managed_policy_registry()),
+        );
+        let mobs = unconfigured
+            .mob_list()
+            .await
+            .expect("the restore completes");
+        for mob_id in [&child, &host_mob] {
+            assert!(
+                mobs.iter().any(|(id, _)| id == mob_id),
+                "{mob_id} is restored: {mobs:?}"
+            );
+        }
+        assert_eq!(
+            unconfigured
+                .mob_member_status(&host_mob, &worker)
+                .await
+                .expect("host mob member status")
+                .status,
+            meerkat_mob::MobMemberStatus::Active,
+            "the host mob's member restores"
+        );
+        let refusal = unconfigured
+            .handle_for(&child)
+            .await
+            .expect("the child mob is restored")
+            .member(&worker)
+            .await
+            .err()
+            .expect("the child member is refused");
+        let MobError::MemberRestoreFailed { reason, .. } = &refusal else {
+            panic!("a typed restore failure, got {refusal:?}");
+        };
+        for needle in [
+            "no child application tool policy is configured",
+            "MobMcpState::with_child_application_tool_policy(binding)",
+            "child_application_tool_policy",
+            "ApplicationToolPolicyBinding::Unmanaged",
+        ] {
+            assert!(reason.contains(needle), "{needle} missing from: {reason}");
+        }
+    }
+
+    /// #1701 under the default restore policy (`OnDemand`): a managed host
+    /// without a child policy restores the child mob, and the child member's
+    /// rebuild is refused at its first touch. The touch and every later call
+    /// into the member answer the typed restore failure naming the fixes. (The
+    /// refusal at an `Eager` restore is
+    /// `unconfigured_child_policy_refuses_restored_child_members_not_the_restore`;
+    /// recovery once the refusal lifts is proved in meerkat-mob:
+    /// `refused_restore_is_per_member_and_recovers_once_admitted`.)
+    #[tokio::test]
+    async fn an_unconfigured_child_policy_refuses_a_dormant_child_member_at_its_first_touch() {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let worker = AgentIdentity::from("worker-1");
+        let seating = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.path().to_path_buf())),
+        );
+        let owner = SessionId::new();
+        svc.insert_persisted_session(Session::with_id(owner.clone()))
+            .await;
+        let child = seating
+            .mob_create_definition_with_owner_bridge_session(
+                explicit_definition("first-touch-policy-child"),
+                owner,
+                true,
+                false,
+            )
+            .await
+            .expect("create child mob");
+        let host_mob = seating
+            .mob_create_definition(explicit_definition("first-touch-policy-host"))
             .await
             .expect("create host mob");
         for mob_id in [&child, &host_mob] {
@@ -18352,15 +18791,57 @@ mod tests {
     /// #1701 control: the managed host without a child policy that refuses a
     /// restored child mob's members (above) restores a host-created mob's
     /// members as before: it is never classified as a child mob, so the child
-    /// policy does not govern its members' rebuilds. The rebuild is on
-    /// demand: the member's first touch builds it once more, with the binding
-    /// it was seated with.
+    /// policy does not govern its members' rebuilds. The host restores every
+    /// member at start (`Eager`), so the rebuild is the restore's; under
+    /// `OnDemand` it comes at the member's first touch
+    /// (`a_dormant_host_mob_member_is_rebuilt_once_at_its_first_touch_with_its_seated_binding`).
     #[tokio::test]
     async fn host_mob_restore_is_untouched_by_the_child_policy() {
         let svc = Arc::new(MockSessionSvc::new());
         let root = tempfile::tempdir().expect("tempdir");
         let (svc, mob_id, session) =
             seat_worker_then_exit(&svc, root.path(), false, "restored-host-mob").await;
+        let activations_before = svc.session_activation_count();
+        let restored = Arc::new(
+            MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
+                .expect("runtime custody")
+                .with_persistent_storage_root(Some(root.path().to_path_buf()))
+                .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
+                .with_tool_consequence_policy_registry(managed_policy_registry()),
+        );
+        let worker = AgentIdentity::from("worker-1");
+        let status = restored
+            .mob_member_status(&mob_id, &worker)
+            .await
+            .expect("the host mob restores");
+        assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        assert!(
+            svc.session_activation_count() > activations_before,
+            "control: the restore rebuilds the member"
+        );
+        let rebuilt_on = restored
+            .mob_resolve_bridge_session_id(&mob_id, &worker)
+            .await
+            .expect("resolve bridge session")
+            .expect("the restored member has a session");
+        assert_eq!(
+            svc.build_policies_for(&rebuilt_on).last(),
+            svc.build_policies_for(&session).last(),
+            "the restored member is built with the binding it was seated with"
+        );
+    }
+
+    /// #1701 control under the default restore policy (`OnDemand`): a
+    /// host-created mob is never a child mob, so the child policy does not
+    /// govern its member's rebuild. The member's first touch builds it once
+    /// more, on its own session, with the binding it was seated with.
+    #[tokio::test]
+    async fn a_dormant_host_mob_member_is_rebuilt_once_at_its_first_touch_with_its_seated_binding()
+    {
+        let svc = Arc::new(MockSessionSvc::new());
+        let root = tempfile::tempdir().expect("tempdir");
+        let (svc, mob_id, session) =
+            seat_worker_then_exit(&svc, root.path(), false, "first-touch-host-mob").await;
         let restored = Arc::new(
             MobMcpState::new(svc.clone(), meerkat_mob::MobControlPrincipal::Owner)
                 .expect("runtime custody")

@@ -172,7 +172,26 @@ them.
   `RuntimeRecoveryWorkUnobserved` reads it with the pending-delivery scan.
   `SessionLlmCapabilitySurface::from_model_profile`.
 
+- `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
+  `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
+  or resumes, the child mobs its agents create included, starts with that
+  member restore policy and restore concurrency
+  (`MobBuilder::with_member_restore_policy`,
+  `MobBuilder::with_resume_restore_concurrency`). A host that builds mobs of
+  its own with a policy passes the same one here, so its child mobs start the
+  way its own mobs do. Without them a mob gets the builder's defaults.
+
 ### Changed
+
+- Behaviour-only (not measured by the gate): `meerkat-mob-mcp`: the agent
+  tool `mob_spawn_member` reports what `auto_wire_parent` did. Its result
+  carries `wired`, true only when the caller and the new member are wired
+  peers once the spawn returns, and `parent_wiring`: `member_peer`,
+  `not_requested`, `caller_outside_mob` (the caller is not a member of the
+  target mob, so nothing is wired to it) or `not_wired`. Both are read from
+  the target mob's committed wiring. The result carried neither before, and
+  the tool's description promised a wiring to "the mob's orchestrator" that
+  a caller outside the mob never got.
 
 - Behaviour-only (not measured by the gate): `meerkat-mob`:
   `MobBuilder::resume` and the lift of a stopped mob (`MobHandle::resume`)
