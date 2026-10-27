@@ -1937,10 +1937,13 @@ impl MobMcpState {
     /// observer that cloned the handle just before the destroy, then lets go
     /// within the attempt.
     ///
-    /// This settles the observer and the files only. A read already entered
-    /// through a handle that was then dropped, an opener that attaches after
-    /// the drain, and other processes stay outside it, so it never states
-    /// that deleting the storage was safe.
+    /// This settles the observer and the files only. A store operation on the
+    /// database (one of the mob's own, or one entered through a handle that
+    /// was then dropped) owns the observer until its blocking work returns,
+    /// also once the caller awaiting it was cancelled, so the drain refuses
+    /// while one runs and the files are never removed under its connection.
+    /// An opener that attaches after the drain and other processes stay
+    /// outside it, so it never states that deleting the storage was safe.
     #[cfg(not(target_arch = "wasm32"))]
     async fn settle_owed_storage_cleanup(
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
@@ -20050,12 +20053,17 @@ mod tests {
             .await
             .expect("a panicking hook does not fail the destroy");
         assert!(report.errors.is_empty(), "{report:?}");
-        assert_eq!(
-            *still_managed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
-            vec![false],
-            "the hook ran once, after the destroyed mob left the managed set"
+        // At least once: a store read of the destroyed mob still running at
+        // the first drain (its reconcilers scan the store in the background)
+        // owns the database until it returns, and the cleanup runs the hook
+        // again before each retried drain.
+        let seen = still_managed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        assert!(
+            !seen.is_empty() && seen.iter().all(|managed| !managed),
+            "the hook ran, each time after the destroyed mob left the managed set: {seen:?}"
         );
         assert!(existing_storage_files(&storage_path).is_empty());
         state

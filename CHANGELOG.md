@@ -435,6 +435,12 @@ them.
   build. A host that changed a member's binding between launches no longer
   gets the member back on the old account, or broken when the old credential
   is gone.
+- `meerkat-mob`: destroying a mob and immediately re-creating the same id
+  could corrupt the new mob's database if a background read of the destroyed
+  mob was still in flight. A store read or write now holds on to the database
+  until it finishes, even when its caller was cancelled, and the destroy
+  removes the files only after that (`SqliteMobStores::drain_observers`
+  refuses while one runs).
 
 ### Known limitations
 
