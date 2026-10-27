@@ -2011,3 +2011,32 @@ async fn a_late_binding_refusal_of_an_abandoned_attempt_leaves_the_newer_wake_ru
     );
     fixture.finish().await;
 }
+
+/// A wake queued from a member-effect completion, not from a command,
+/// starts with no further command: the actor starts the materializations
+/// MobMachine handed off on every loop pass, not only after a command, so a
+/// first touch never waits for an unrelated command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_command() {
+    let fixture = WakeFixture::new("wake-from-effect").await;
+    let member = fixture.spawn("from-effect-member").await;
+    fixture.release(&member).await;
+
+    fixture
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::WakeMemberFromEffectForTest {
+            agent_identity: member.clone(),
+            reply_tx,
+        })
+        .await
+        .expect("send the effect-completion wake")
+        .await
+        .expect("the actor answers")
+        .expect("the actor dispatched the effect");
+
+    // No further command is sent: the member is woken all the same.
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Live))
+        .await;
+    fixture.finish().await;
+}

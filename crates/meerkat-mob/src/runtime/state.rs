@@ -1334,6 +1334,14 @@ pub(super) enum MobCommand {
         effect: super::composition::MobSeamEffect,
         reply_tx: oneshot::Sender<Result<(), MobError>>,
     },
+    /// Apply an operator wake of `agent_identity` from a member-effect
+    /// completion rather than from a command, so a row can show that a wake
+    /// queued there starts with no further command.
+    #[cfg(test)]
+    WakeMemberFromEffectForTest {
+        agent_identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
     /// Snapshot the T2 DSL field projections (member state markers, wiring
     /// edges, identity→runtime map, tasks + task id sets) directly from the
     /// DSL authority. Test-only read seam used by the runtime-parity
@@ -2094,6 +2102,8 @@ impl MobCommand {
             #[cfg(test)]
             Self::QueueRoutedEffectForTest { .. } => ShutdownAnswerClass::CallerRequest,
             #[cfg(test)]
+            Self::WakeMemberFromEffectForTest { .. } => ShutdownAnswerClass::CallerRequest,
+            #[cfg(test)]
             Self::DslT2Snapshot { .. } => ShutdownAnswerClass::CallerRequest,
             Self::StartupKickoffSnapshot { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ProjectMemberList { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2300,6 +2310,8 @@ impl MobCommand {
             Self::ParkActorForObservationTest { .. } => "ParkActorForObservationTest",
             #[cfg(test)]
             Self::QueueRoutedEffectForTest { .. } => "QueueRoutedEffectForTest",
+            #[cfg(test)]
+            Self::WakeMemberFromEffectForTest { .. } => "WakeMemberFromEffectForTest",
             #[cfg(test)]
             Self::SpawnLiveMutationAwaitingActorForTest { .. } => {
                 "SpawnLiveMutationAwaitingActorForTest"

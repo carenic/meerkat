@@ -13867,6 +13867,23 @@ impl MobActor {
                             );
                             return Ok(());
                         }
+                        if refusal_consumed_in_terminal_phase(phase, effect.body()) {
+                            // A binding or ingress refusal deferred while the
+                            // mob was Stopped and carried into a terminal
+                            // phase: no machine arm takes it there (both are
+                            // Running-only), and the mob never activates
+                            // again to take it. It is consumed: nothing is
+                            // recorded broken, no error, never fatal.
+                            tracing::warn!(
+                                mob_id = %self.definition.id,
+                                effect = ?effect.body(),
+                                refusal_code = %error.error_code(),
+                                rejection = %rejection,
+                                "dropping a routed-effect refusal carried into terminal phase {phase:?}"
+                            );
+                            self.pending_routed_effects.remove(0);
+                            continue;
+                        }
                         // In any other phase a rejection for a runtime the
                         // machine still runs is a real disagreement between
                         // the machine and this shell: report it as before.
@@ -30022,6 +30039,14 @@ impl MobActor {
                     let _ = reply_tx.send(Ok(()));
                 }
                 #[cfg(test)]
+                MobCommand::WakeMemberFromEffectForTest {
+                    agent_identity,
+                    reply_tx,
+                } => {
+                    self.dispatch_wake_member_from_effect_for_test(agent_identity);
+                    let _ = reply_tx.send(Ok(()));
+                }
+                #[cfg(test)]
                 MobCommand::ParkActorForObservationTest {
                     entered_tx,
                     release_rx,
@@ -31317,6 +31342,19 @@ impl MobActor {
             self.retain_lifecycle_delivery_error(error);
         }
         boxed_arm_future(|| self.drain_completed_member_live_mutations()).await;
+        // Member wakes, as at the loop boundary: a detached completion (a
+        // wake step, a reload, a start's recovery) can close attempts or hand
+        // off materializations, and they must not wait for an unrelated
+        // command to be realized.
+        if !self.durable_uncertainty_fail_stop.is_set()
+            && !(self.destroy_admitted()
+                && !self.destroy_cleanup_active
+                && !self.pending_routed_effects.is_empty())
+        {
+            boxed_arm_future(|| self.answer_closed_member_wakes()).await;
+            boxed_arm_future(|| self.realize_member_peer_ingress_changes()).await;
+            boxed_arm_future(|| self.start_pending_member_materializations()).await;
+        }
         if self.durable_uncertainty_fail_stop.is_set() {
             return ActorLoopWakeSelection::Continue;
         }
@@ -62539,6 +62577,24 @@ impl ClosedRuntimeEffectRefusal {
 /// generated refusal-feedback input. Absence or multiplicity is a composition
 /// contract break; the shell never infers a fallback class from the original
 /// dispatch error.
+/// Whether a routed refusal whose feedback MobMachine rejects is consumed in
+/// `phase`: a binding or ingress refusal carried into a terminal phase
+/// (Completed or Destroyed) has no machine arm there (both are Running-only)
+/// and the mob never activates again to take it.
+fn refusal_consumed_in_terminal_phase(
+    phase: mob_dsl::MobPhase,
+    effect: &mob_dsl::MobMachineEffect,
+) -> bool {
+    matches!(
+        phase,
+        mob_dsl::MobPhase::Completed | mob_dsl::MobPhase::Destroyed
+    ) && matches!(
+        effect,
+        mob_dsl::MobMachineEffect::RequestRuntimeBinding { .. }
+            | mob_dsl::MobMachineEffect::RequestRuntimeIngress { .. }
+    )
+}
+
 /// Whether a routed refusal's feedback was answered stale
 /// (`RuntimeBindingRefusalStale`, no refusal classification): the refused
 /// binding request belongs to no open wake of the member.
@@ -64996,6 +65052,35 @@ mod routed_effect_containment_tests {
             None,
             "a delivery with a live caller must run"
         );
+    }
+
+    /// A binding refusal deferred while the mob was Stopped and carried into
+    /// Completed or Destroyed has no machine arm there: the routed flush
+    /// consumes it (no Broken, no error, never fatal). A retire refusal is
+    /// not consumed this way, and a binding refusal in Running or Stopped
+    /// keeps its machine handling.
+    #[test]
+    fn a_binding_refusal_carried_into_a_terminal_phase_is_consumed() {
+        let binding = mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            agent_identity: mob_dsl::AgentIdentity::from("worker"),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from("worker:1"),
+            fence_token: mob_dsl::FenceToken(1),
+            generation: Some(mob_dsl::Generation(1)),
+            session_id: mob_dsl::SessionId::from("session-worker"),
+            attempt: None,
+        };
+        let retire = mob_dsl::MobMachineEffect::RequestRuntimeRetire {
+            agent_identity: mob_dsl::AgentIdentity::from("worker"),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from("worker:1"),
+            session_id: mob_dsl::SessionId::from("session-worker"),
+        };
+        for phase in [mob_dsl::MobPhase::Completed, mob_dsl::MobPhase::Destroyed] {
+            assert!(refusal_consumed_in_terminal_phase(phase, &binding));
+            assert!(!refusal_consumed_in_terminal_phase(phase, &retire));
+        }
+        for phase in [mob_dsl::MobPhase::Running, mob_dsl::MobPhase::Stopped] {
+            assert!(!refusal_consumed_in_terminal_phase(phase, &binding));
+        }
     }
 
     #[test]
