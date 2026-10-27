@@ -83,8 +83,9 @@
 \*     release verdict is Release exactly when the Released arm would honour
 \*     the member's own registration) and AuditReleaseEpochFence (a release
 \*     whose epoch is not the member's recorded one never demotes it) and
-\*     AuditBindingRefusalFenced (a refused binding request of a wake ends the
-\*     member's attempt only when it belongs to its open attempt);
+\*     AuditBindingRefusalFenced (a refused binding request applies only to
+\*     the wake it belongs to: its open attempt, or with no attempt only while
+\*     no wake is open);
 \*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (R124: a
 \*     retiring member whose ingress detach closed has an enabled archive
@@ -897,13 +898,17 @@ AuditReleaseVerdictMatchesArm ==
                        "RegistrationReleased")
         IN (verdict = "Release") <=> released
 
-\* The attempt fence on the routed binding refusal: the refusal of a wake's
-\* request ends member 1's attempt only when that request belongs to its open
-\* attempt; a late refusal of another attempt changes nothing.
+\* Member 1's open wake attempt as an option.
+OpenAttempt1 == IF Id1 \in DOMAIN member_wake_attempts THEN Some(member_wake_attempts[Id1]) ELSE None
+
+\* The attempt fence on the routed binding refusal: a refusal applies only to
+\* the wake it belongs to (a wake's request while that attempt is open, the
+\* spawn's, with no attempt, only while no wake is open); any other refusal
+\* changes nothing.
 AuditBindingRefusalFenced ==
-    [][\A a \in AuditAttempts :
-         ResolveRuntimeBindingRefusalRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, Some(a))
-           => (Id1 \in DOMAIN member_wake_attempts /\ member_wake_attempts[Id1] = a)
+    [][\A att \in {None} \cup {Some(a) : a \in AuditAttempts} :
+         ResolveRuntimeBindingRefusalRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
+           => OpenAttempt1 = att
       ]_vars
 
 \* The boot plan never leaves a member that blocks the seal: after its plan a
