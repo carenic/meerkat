@@ -76,8 +76,10 @@
 \*     AuditWakeExactlyOne (exactly one WakeMember arm answers every input
 \*     shape), AuditSucceededLeavesEndpoint (a local wake never closes Live
 \*     without an endpoint while it owes EndpointPending),
-\*     AuditWakeClosesLiveUnlessEndpointOwed (a bound wake that owes no
-\*     endpoint can always close Live) and AuditReleaseEpochFence (a release
+\*     AuditWakeClosesLiveUnlessEndpointOwed (a bound wake owing no endpoint
+\*     cause can always close Live), AuditReleaseVerdictMatchesArm (the
+\*     release verdict is Release exactly when the Released arm would honour
+\*     the member's own registration) and AuditReleaseEpochFence (a release
 \*     whose epoch is not the member's recorded one never demotes it);
 \*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (R124: a
@@ -90,8 +92,9 @@
 \*     runtime binding).
 \* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
-\* member. A second ASSUME pins the release verdict helper: Release exactly for
-\* a seated, local, Live member, WakeInFlight exactly for a Waking one.
+\* member. A second ASSUME pins the release verdict helper: Release or
+\* NotYetReleasable exactly for a seated, local, Live member, WakeInFlight
+\* exactly for a Waking one.
 \*
 \* Not covered: I3 (a Dormant member is local) needs a placed member, which
 \* only the placement arms create; the placed revival arm likewise. The machine
@@ -204,41 +207,40 @@ AuditWakePath(id) ==
         \/ AbandonMemberWakeDormantRunning(id, a, "Unsettled", AuditReason)
 
 \* Late feedback for the last minted attempt (stale once it closed): a typed
-\* StaleAttempt no-op, in Running and Stopped.
+\* StaleAttempt no-op, in Running and Stopped. Each disjunct is a plain
+\* application (no LET), so TLC coverage names it after its generated arm.
 AuditStaleFeedback(id, rid, fence, g, s) ==
-    LET a == member_wake_attempt_sequence IN
-        \/ ResolveMemberRevivalBoundStaleRunning(id, a)
-        \/ ResolveMemberRevivalBoundStaleStopped(id, a)
-        \/ ResolveMemberRevivalSucceededStaleRunning(id, a)
-        \/ ResolveMemberRevivalSucceededStaleStopped(id, a)
-        \/ ResolveMemberRevivalFailedStaleRunning(id, AuditReason, a)
-        \/ ResolveMemberRevivalFailedStaleStopped(id, AuditReason, a)
-        \/ ResolveMemberRevivalHostRefusedStaleRunning(id, AuditCode, AuditReason, a)
-        \/ ResolveMemberRevivalHostRefusedStaleStopped(id, AuditCode, AuditReason, a)
-        \/ ResolveMemberRevivalRetryableStaleRunning(id, a, "WakeTimedOut")
-        \/ ResolveMemberRevivalRetryableStaleStopped(id, a, "WakeTimedOut")
-        \/ AbandonMemberWakeStaleRunning(id, a, "Unsettled", AuditReason)
-        \/ AbandonMemberWakeStaleStopped(id, a, "Unsettled", AuditReason)
-        \/ ResolveRecreatedMemberSessionSucceededStaleRunning(id, rid, fence, g, s, a)
-        \/ ResolveRecreatedMemberSessionSucceededStaleStopped(id, rid, fence, g, s, a)
+    \/ ResolveMemberRevivalBoundStaleRunning(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalBoundStaleStopped(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSucceededStaleRunning(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSucceededStaleStopped(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalFailedStaleRunning(id, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalFailedStaleStopped(id, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalHostRefusedStaleRunning(id, AuditCode, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalHostRefusedStaleStopped(id, AuditCode, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalRetryableStaleRunning(id, member_wake_attempt_sequence, "WakeTimedOut")
+    \/ ResolveMemberRevivalRetryableStaleStopped(id, member_wake_attempt_sequence, "WakeTimedOut")
+    \/ AbandonMemberWakeStaleRunning(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
+    \/ AbandonMemberWakeStaleStopped(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
+    \/ ResolveRecreatedMemberSessionSucceededStaleRunning(id, rid, fence, g, s, member_wake_attempt_sequence)
+    \/ ResolveRecreatedMemberSessionSucceededStaleStopped(id, rid, fence, g, s, member_wake_attempt_sequence)
 
 \* The same late feedback in the Completed and Destroyed phases.
 AuditStaleFeedbackTerminal(id, rid, fence, g, s) ==
-    LET a == member_wake_attempt_sequence IN
-        \/ ResolveMemberRevivalBoundStaleCompleted(id, a)
-        \/ ResolveMemberRevivalBoundStaleDestroyed(id, a)
-        \/ ResolveMemberRevivalSucceededStaleCompleted(id, a)
-        \/ ResolveMemberRevivalSucceededStaleDestroyed(id, a)
-        \/ ResolveMemberRevivalFailedStaleCompleted(id, AuditReason, a)
-        \/ ResolveMemberRevivalFailedStaleDestroyed(id, AuditReason, a)
-        \/ ResolveMemberRevivalHostRefusedStaleCompleted(id, AuditCode, AuditReason, a)
-        \/ ResolveMemberRevivalHostRefusedStaleDestroyed(id, AuditCode, AuditReason, a)
-        \/ ResolveMemberRevivalRetryableStaleCompleted(id, a, "WakeTimedOut")
-        \/ ResolveMemberRevivalRetryableStaleDestroyed(id, a, "WakeTimedOut")
-        \/ AbandonMemberWakeStaleCompleted(id, a, "Unsettled", AuditReason)
-        \/ AbandonMemberWakeStaleDestroyed(id, a, "Unsettled", AuditReason)
-        \/ ResolveRecreatedMemberSessionSucceededStaleCompleted(id, rid, fence, g, s, a)
-        \/ ResolveRecreatedMemberSessionSucceededStaleDestroyed(id, rid, fence, g, s, a)
+    \/ ResolveMemberRevivalBoundStaleCompleted(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalBoundStaleDestroyed(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSucceededStaleCompleted(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSucceededStaleDestroyed(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalFailedStaleCompleted(id, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalFailedStaleDestroyed(id, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalHostRefusedStaleCompleted(id, AuditCode, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalHostRefusedStaleDestroyed(id, AuditCode, AuditReason, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalRetryableStaleCompleted(id, member_wake_attempt_sequence, "WakeTimedOut")
+    \/ ResolveMemberRevivalRetryableStaleDestroyed(id, member_wake_attempt_sequence, "WakeTimedOut")
+    \/ AbandonMemberWakeStaleCompleted(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
+    \/ AbandonMemberWakeStaleDestroyed(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
+    \/ ResolveRecreatedMemberSessionSucceededStaleCompleted(id, rid, fence, g, s, member_wake_attempt_sequence)
+    \/ ResolveRecreatedMemberSessionSucceededStaleDestroyed(id, rid, fence, g, s, member_wake_attempt_sequence)
 
 \* The release arms of one shape in the Running and Stopped phases.
 ReleaseArm(rid, fence, ep) ==
@@ -835,14 +837,14 @@ Owed1EndpointPending ==
     /\ member_boot_obligation_owed[Id1] = "EndpointPending"
 
 \* A local wake never closes Live without an endpoint while its member owes
-\* EndpointPending, so a member with comms is reachable when Live.
+\* EndpointPending, so a Live member is reachable.
 AuditSucceededLeavesEndpoint ==
     [][(\E a \in AuditAttempts : ResolveMemberRevivalSucceededRunningLocal(Id1, a))
            => (Id1 \in DOMAIN member_peer_endpoints' \/ ~Owed1EndpointPending)
       ]_vars
 
-\* A bound local wake of a member that owes no endpoint can always close Live:
-\* a member with no comms endpoint is never held Waking for one.
+\* A bound local wake of a member owing no endpoint cause can always close
+\* Live: it is never held Waking for an endpoint.
 AuditWakeClosesLiveUnlessEndpointOwed ==
     \A id \in DOMAIN member_wake_attempts :
         (/\ phase = "Running"
@@ -851,6 +853,30 @@ AuditWakeClosesLiveUnlessEndpointOwed ==
          /\ ~(/\ id \in DOMAIN member_boot_obligation_owed
               /\ member_boot_obligation_owed[id] = "EndpointPending"))
             => ENABLED ResolveMemberRevivalSucceededRunningLocal(id, member_wake_attempts[id])
+
+\* The release verdict and the Released arm cannot drift: member 1's verdict is
+\* Release exactly when the Released arm would honour the release of its own
+\* registration (its runtime, fence and recorded epoch).
+AuditReleaseVerdictMatchesArm ==
+    (/\ phase = "Running"
+     /\ Id1 \in DOMAIN identity_to_runtime
+     /\ Id1 \in DOMAIN identity_runtime_fence_tokens) =>
+        LET placed1 == Id1 \in DOMAIN member_placement
+            verdict ==
+                member_release_verdict(
+                    TRUE, placed1, Phase1,
+                    member_registration_releasable(
+                        Phase1, placed1, boot_plan_sealed,
+                        Id1 \in DOMAIN member_peer_endpoints,
+                        Id1 \in DOMAIN member_materialization_epoch))
+            released ==
+                /\ Id1 \in DOMAIN member_materialization_epoch
+                /\ ENABLED ReleaseMemberMaterializationReleasedRunning(
+                       Some(identity_to_runtime[Id1]),
+                       Some(identity_runtime_fence_tokens[Id1]),
+                       member_materialization_epoch[Id1],
+                       "RegistrationReleased")
+        IN (verdict = "Release") <=> released
 
 \* The boot plan never leaves a member that blocks the seal: after its plan a
 \* member has a durable endpoint or owes EndpointPending.
@@ -922,13 +948,13 @@ ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, or
                             host_pending, input_class, sender_waking, observed_missing, residency)
             # Some("NotAMember")
 
-\* The release verdict: Release exactly for a seated, local, Live member, and
-\* WakeInFlight exactly for a seated, local, Waking one.
-ASSUME \A seated, placed \in BOOLEAN,
+\* The release verdict: Release or NotYetReleasable exactly for a seated,
+\* local, Live member, and WakeInFlight exactly for a seated, local, Waking one.
+ASSUME \A seated, placed, releasable \in BOOLEAN,
           residency \in {None, Some("Dormant"), Some("Waking"), Some("Live")} :
-    /\ (member_release_verdict(seated, placed, residency) = "Release")
+    /\ (member_release_verdict(seated, placed, residency, releasable) \in {"Release", "NotYetReleasable"})
            <=> (seated /\ ~placed /\ residency = Some("Live"))
-    /\ (member_release_verdict(seated, placed, residency) = "WakeInFlight")
+    /\ (member_release_verdict(seated, placed, residency, releasable) = "WakeInFlight")
            <=> (seated /\ ~placed /\ residency = Some("Waking"))
 
 (***************************************************************************)
@@ -962,7 +988,8 @@ AuditWitnessStaleInStopped ==
 AuditWitnessDrift == member_materialization_drift_count > 0
 \* Wake run: a wake verdict records Broken.
 AuditWitnessBrokenWake == Id1 \in DOMAIN member_restore_failures /\ Id1 \in DOMAIN identity_to_runtime
-\* Wake run: a member that owes no endpoint wakes and closes Live without one.
+\* Wake run: a member owing no endpoint cause closes Live before an endpoint is
+\* registered (the shape of the owed-endpoint guard).
 AuditWitnessCommsLessWokeLiveStep ==
     /\ Phase1 = Some("Waking")
     /\ Phase1Next = Some("Live")
