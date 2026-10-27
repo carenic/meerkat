@@ -3002,25 +3002,31 @@ macro_rules! mob_catalog_machine_dsl {
         // The member facts a registration release needs, shared by the
         // Released arm and the release verdict so the two cannot drift: a
         // Live local member whose registration's epoch is recorded (the
-        // routed binding landed) and which, after the seal, has a durable
-        // endpoint.
+        // routed binding landed), which after the seal has a durable
+        // endpoint, and which no wiring edge joins to a placed member. A
+        // placed peer, in another process, cannot wake a member through an
+        // inproc route, so a member wired to one stays Live (the boot plan
+        // and the wiring wake it for the same reason) until that edge goes.
         helper member_registration_releasable(
             residency: Option<Enum<MemberMaterializationPhase>>,
             placed: bool,
             sealed: bool,
             has_endpoint: bool,
-            epoch_recorded: bool
+            epoch_recorded: bool,
+            wired_to_placed: bool
         ) -> bool {
             residency == Some(MemberMaterializationPhase::Live)
                 && placed == false
                 && (sealed == false || has_endpoint == true)
                 && epoch_recorded == true
+                && wired_to_placed == false
         }
 
         // The release verdict for one member. An identity that is not seated
         // is not a member; a placed member's member host owns its
         // materialization; a local Live member releases its registration
-        // when the Released arm would honour that release, and is not yet
+        // when the Released arm would honour that release, is pinned Live
+        // while a wiring edge joins it to a placed member, and is not yet
         // releasable otherwise; a Waking member has a wake in flight;
         // anything else (Dormant, or no phase: Broken, retiring, unbound)
         // has nothing materialized.
@@ -3028,7 +3034,8 @@ macro_rules! mob_catalog_machine_dsl {
             seated: bool,
             placed: bool,
             residency: Option<Enum<MemberMaterializationPhase>>,
-            releasable: bool
+            releasable: bool,
+            wired_to_placed: bool
         ) -> Enum<MemberReleaseVerdict> {
             if seated == false {
                 MemberReleaseVerdict::NotAMember
@@ -3039,6 +3046,9 @@ macro_rules! mob_catalog_machine_dsl {
             if residency == Some(MemberMaterializationPhase::Live) && releasable == true {
                 MemberReleaseVerdict::Release
             } else {
+            if residency == Some(MemberMaterializationPhase::Live) && wired_to_placed == true {
+                MemberReleaseVerdict::PinnedByPlacedPeer
+            } else {
             if residency == Some(MemberMaterializationPhase::Live) {
                 MemberReleaseVerdict::NotYetReleasable
             } else {
@@ -3046,7 +3056,7 @@ macro_rules! mob_catalog_machine_dsl {
                 MemberReleaseVerdict::WakeInFlight
             } else {
                 MemberReleaseVerdict::NothingMaterialized
-            }}}}}
+            }}}}}}
         }
 
         disposition DefinitionEpochAdvanced => local seam SurfaceResultAlignment,
@@ -13623,9 +13633,13 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Waking);
                 self.member_wake_attempts.insert(agent_identity, self.member_wake_attempt_sequence);
                 self.member_wake_bound.remove(agent_identity);
-                // The lost registration's epoch and binding ladder go with it
-                // (R12): the wake registers anew.
-                self.member_materialization_epoch.remove(agent_identity);
+                // The binding ladder goes (R12): the wake binds anew. The
+                // registration's epoch stays, as an explicit resume keeps it:
+                // a wake that registers anew overwrites it with the new
+                // registration's (the routed binding), and a wake that finds
+                // the registration kept (a false miss, whose bind is an exact
+                // repeat and routes no new binding) keeps it, so the member
+                // is releasable again once the wake closes Live.
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
                 self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
@@ -14459,6 +14473,50 @@ macro_rules! mob_catalog_machine_dsl {
                 && (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
                     || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge)) == true)
             }
+            // A Dormant local end that the edge joins to a placed member is
+            // woken by the PlacedPeerWake arms (after the residency arms).
+            guard "first_end_owes_no_placed_peer_wake" {
+                self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == false
+                || self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                || self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge)) != Some(MemberMaterializationPhase::Dormant)
+                || member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_a(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_a(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge))) != None
+            }
+            guard "second_end_owes_no_placed_peer_wake" {
+                self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == false
+                || self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                || self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge)) != Some(MemberMaterializationPhase::Dormant)
+                || member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_b(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_b(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge))) != None
+            }
             update {
                 self.wiring_edges.insert(edge);
                 self.topology_epoch += 1;
@@ -14486,6 +14544,50 @@ macro_rules! mob_catalog_machine_dsl {
             guard "b_member_peer_registered" { self.member_peer_ids.contains_key(b_identity) == true }
             guard "a_member_endpoint_registered" { self.member_peer_endpoints.contains_key(a_identity) == true }
             guard "b_member_endpoint_registered" { self.member_peer_endpoints.contains_key(b_identity) == true }
+            // A Dormant local end that the edge joins to a placed member is
+            // woken by the PlacedPeerWake arms (after the residency arms).
+            guard "first_end_owes_no_placed_peer_wake" {
+                self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == false
+                || self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                || self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge)) != Some(MemberMaterializationPhase::Dormant)
+                || member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_a(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_a(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge))) != None
+            }
+            guard "second_end_owes_no_placed_peer_wake" {
+                self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == false
+                || self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                || self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge)) != Some(MemberMaterializationPhase::Dormant)
+                || member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_b(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_b(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge))) != None
+            }
             update {
                 self.wiring_edges.insert(edge);
                 self.topology_epoch += 1;
@@ -25500,12 +25602,13 @@ macro_rules! mob_catalog_machine_dsl {
         // G1/F5: a runtime registration was released while its member stays seated
         // (the composition route from MeerkatMachine's RuntimeRegistrationReleased,
         // or the mob-owned discard seam). Only the exact registration of a Live,
-        // local member (with a durable endpoint once the boot plan is sealed, N3) is
-        // released: Live -> Dormant, its epoch and binding ladder cleared (R12). The
-        // member facts come from member_registration_releasable, which the release
-        // verdict shares. Anything else (an older epoch after a newer wake, a Waking
-        // member, a wake's own claim rollback, a non-member) is a normal, accepted
-        // Stale no-op that never demotes a wake.
+        // local member (with a durable endpoint once the boot plan is sealed, N3,
+        // and no wiring edge to a placed member) is released: Live -> Dormant, its
+        // epoch and binding ladder cleared (R12). The member facts come from
+        // member_registration_releasable, which the release verdict shares.
+        // Anything else (an older epoch after a newer wake, a Waking member, a
+        // member pinned Live by a placed peer, a wake's own claim rollback, a
+        // non-member) is a normal, accepted Stale no-op that never demotes a wake.
         transition ReleaseMemberMaterializationReleased {
             per_phase [Running, Stopped, Completed]
             on signal ReleaseMemberMaterialization { agent_runtime_id, fence_token, runtime_epoch_id, cause }
@@ -25519,9 +25622,17 @@ macro_rules! mob_catalog_machine_dsl {
                         self.member_placement.contains_key(member_id),
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(member_id),
-                        self.member_materialization_epoch.contains_key(member_id)))
+                        self.member_materialization_epoch.contains_key(member_id),
+                        exists(edge in self.wiring_edges,
+                            (mob_machine_wiring_edge_a(edge) == member_id
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                            || (mob_machine_wiring_edge_b(edge) == member_id
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))))
             }
             update {
+                // The guard admitted this registration's member, its pin
+                // included (a registration is one member's): the fold names
+                // that member by the registration.
                 for member_id in self.identity_to_runtime.keys() {
                     if self.identity_to_runtime.get_cloned(member_id) == agent_runtime_id
                         && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
@@ -25531,7 +25642,8 @@ macro_rules! mob_catalog_machine_dsl {
                             self.member_placement.contains_key(member_id),
                             self.boot_plan_sealed,
                             self.member_peer_endpoints.contains_key(member_id),
-                            self.member_materialization_epoch.contains_key(member_id))
+                            self.member_materialization_epoch.contains_key(member_id),
+                            false)
                     {
                         self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
                         self.member_materialization_epoch.remove(member_id);
@@ -25558,7 +25670,12 @@ macro_rules! mob_catalog_machine_dsl {
                         self.member_placement.contains_key(member_id),
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(member_id),
-                        self.member_materialization_epoch.contains_key(member_id)))
+                        self.member_materialization_epoch.contains_key(member_id),
+                        exists(edge in self.wiring_edges,
+                            (mob_machine_wiring_edge_a(edge) == member_id
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                            || (mob_machine_wiring_edge_b(edge) == member_id
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))))
             }
             update {}
             to Running
@@ -25679,7 +25796,17 @@ macro_rules! mob_catalog_machine_dsl {
                         self.member_placement.contains_key(agent_identity),
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(agent_identity),
-                        self.member_materialization_epoch.contains_key(agent_identity)))
+                        self.member_materialization_epoch.contains_key(agent_identity),
+                        exists(edge in self.wiring_edges,
+                            (mob_machine_wiring_edge_a(edge) == agent_identity
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                            || (mob_machine_wiring_edge_b(edge) == agent_identity
+                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))),
+                    exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)))
             }
         }
 
@@ -26062,6 +26189,309 @@ macro_rules! mob_catalog_machine_dsl {
                 agent_runtime_id: agent_runtime_id,
                 session_id: session_id,
                 attempt: attempt
+            }
+        }
+
+        // F2 at wiring: an edge that joins a Dormant local member to a placed
+        // member wakes the Dormant end (one arm per end and wiring input), so
+        // the member is not left Dormant behind an inproc wake route that the
+        // placed peer, in another process, cannot use. The member's own wake
+        // gate (member_wake_refusal, as for a delivery) admits the wake. A
+        // refused one is the plain arm's: a candidate composition or a
+        // pending host preparation leaves the member to its boot plan, and a
+        // retiring member or an admitted destroy ends it. The edge is wired
+        // exactly as by the plain arms.
+        transition WireMembersPlacedPeerWakeFirstEnd {
+            on input WireMembers { edge }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
+            guard "edge_endpoints_seated_or_held" {
+                (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_a(edge)) == true)
+                && (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge)) == true)
+            }
+            guard "first_end_local" { self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == false }
+            guard "second_end_placed" { self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true }
+            guard "first_end_dormant" { self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(MemberMaterializationPhase::Dormant) }
+            guard "first_end_wake_admitted" {
+                member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_a(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_a(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge))) == None
+            }
+            update {
+                self.wiring_edges.insert(edge);
+                self.topology_epoch += 1;
+                self.member_wake_attempt_sequence += 1;
+                self.member_materialization.insert(mob_machine_wiring_edge_a(edge), MemberMaterializationPhase::Waking);
+                self.member_wake_attempts.insert(mob_machine_wiring_edge_a(edge), self.member_wake_attempt_sequence);
+                self.member_wake_bound.remove(mob_machine_wiring_edge_a(edge));
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder.
+                self.member_materialization_epoch.remove(mob_machine_wiring_edge_a(edge));
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                // Owed until Live, as a boot wake is: a retryable failure
+                // leaves the member Dormant and owed, so the owner wakes it
+                // again. A member with no durable endpoint owes
+                // EndpointPending (I6).
+                if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::Obligation);
+                } else {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::EndpointPending);
+                }
+            }
+            to Running
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
+            // The handoff obligation: one materialization attempt, realized
+            // like any wake's and closed by the attempt-fenced resolutions.
+            emit MaterializeMember {
+                agent_identity: mob_machine_wiring_edge_a(edge),
+                cause: MemberWakeCause::PlacedPeerWired,
+                attempt: self.member_wake_attempt_sequence
+            }
+        }
+
+        transition WireMembersPlacedPeerWakeSecondEnd {
+            on input WireMembers { edge }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
+            guard "edge_endpoints_seated_or_held" {
+                (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_a(edge)) == true)
+                && (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge)) == true)
+            }
+            guard "second_end_local" { self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == false }
+            guard "first_end_placed" { self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true }
+            guard "second_end_dormant" { self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(MemberMaterializationPhase::Dormant) }
+            guard "second_end_wake_admitted" {
+                member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_b(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_b(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge))) == None
+            }
+            update {
+                self.wiring_edges.insert(edge);
+                self.topology_epoch += 1;
+                self.member_wake_attempt_sequence += 1;
+                self.member_materialization.insert(mob_machine_wiring_edge_b(edge), MemberMaterializationPhase::Waking);
+                self.member_wake_attempts.insert(mob_machine_wiring_edge_b(edge), self.member_wake_attempt_sequence);
+                self.member_wake_bound.remove(mob_machine_wiring_edge_b(edge));
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder.
+                self.member_materialization_epoch.remove(mob_machine_wiring_edge_b(edge));
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                // Owed until Live, as a boot wake is: a retryable failure
+                // leaves the member Dormant and owed, so the owner wakes it
+                // again. A member with no durable endpoint owes
+                // EndpointPending (I6).
+                if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::Obligation);
+                } else {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::EndpointPending);
+                }
+            }
+            to Running
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
+            // The handoff obligation: one materialization attempt, realized
+            // like any wake's and closed by the attempt-fenced resolutions.
+            emit MaterializeMember {
+                agent_identity: mob_machine_wiring_edge_b(edge),
+                cause: MemberWakeCause::PlacedPeerWired,
+                attempt: self.member_wake_attempt_sequence
+            }
+        }
+
+        transition WireMembersWithTrustPlacedPeerWakeFirstEnd {
+            on input WireMembersWithTrust { edge, a_identity, b_identity }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
+            guard "edge_matches_members" { mob_machine_wiring_edge_matches_members(edge, a_identity, b_identity) }
+            guard "a_member_peer_registered" { self.member_peer_ids.contains_key(a_identity) == true }
+            guard "b_member_peer_registered" { self.member_peer_ids.contains_key(b_identity) == true }
+            guard "a_member_endpoint_registered" { self.member_peer_endpoints.contains_key(a_identity) == true }
+            guard "b_member_endpoint_registered" { self.member_peer_endpoints.contains_key(b_identity) == true }
+            guard "edge_endpoints_seated_or_held" {
+                (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_a(edge)) == true)
+                && (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge)) == true)
+            }
+            guard "first_end_local" { self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == false }
+            guard "second_end_placed" { self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true }
+            guard "first_end_dormant" { self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(MemberMaterializationPhase::Dormant) }
+            guard "first_end_wake_admitted" {
+                member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_a(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_a(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge))) == None
+            }
+            update {
+                self.wiring_edges.insert(edge);
+                self.topology_epoch += 1;
+                self.member_wake_attempt_sequence += 1;
+                self.member_materialization.insert(mob_machine_wiring_edge_a(edge), MemberMaterializationPhase::Waking);
+                self.member_wake_attempts.insert(mob_machine_wiring_edge_a(edge), self.member_wake_attempt_sequence);
+                self.member_wake_bound.remove(mob_machine_wiring_edge_a(edge));
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder.
+                self.member_materialization_epoch.remove(mob_machine_wiring_edge_a(edge));
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
+                // Owed until Live, as a boot wake is: a retryable failure
+                // leaves the member Dormant and owed, so the owner wakes it
+                // again. A member with no durable endpoint owes
+                // EndpointPending (I6).
+                if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::Obligation);
+                } else {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::EndpointPending);
+                }
+            }
+            to Running
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit MemberTrustWiringRequested {
+                edge: edge,
+                a_peer_id: self.member_peer_ids.get_cloned(a_identity).get("value"),
+                b_peer_id: self.member_peer_ids.get_cloned(b_identity).get("value"),
+                a_endpoint: self.member_peer_endpoints.get_cloned(a_identity).get("value"),
+                b_endpoint: self.member_peer_endpoints.get_cloned(b_identity).get("value"),
+                epoch: self.topology_epoch
+            }
+            emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
+            // The handoff obligation: one materialization attempt, realized
+            // like any wake's and closed by the attempt-fenced resolutions.
+            emit MaterializeMember {
+                agent_identity: mob_machine_wiring_edge_a(edge),
+                cause: MemberWakeCause::PlacedPeerWired,
+                attempt: self.member_wake_attempt_sequence
+            }
+        }
+
+        transition WireMembersWithTrustPlacedPeerWakeSecondEnd {
+            on input WireMembersWithTrust { edge, a_identity, b_identity }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
+            guard "edge_matches_members" { mob_machine_wiring_edge_matches_members(edge, a_identity, b_identity) }
+            guard "a_member_peer_registered" { self.member_peer_ids.contains_key(a_identity) == true }
+            guard "b_member_peer_registered" { self.member_peer_ids.contains_key(b_identity) == true }
+            guard "a_member_endpoint_registered" { self.member_peer_endpoints.contains_key(a_identity) == true }
+            guard "b_member_endpoint_registered" { self.member_peer_endpoints.contains_key(b_identity) == true }
+            guard "edge_endpoints_seated_or_held" {
+                (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_a(edge)) == true)
+                && (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
+                    || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge)) == true)
+            }
+            guard "second_end_local" { self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == false }
+            guard "first_end_placed" { self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true }
+            guard "second_end_dormant" { self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(MemberMaterializationPhase::Dormant) }
+            guard "second_end_wake_admitted" {
+                member_wake_refusal(
+                    self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_session_bindings.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)),
+                    self.member_restore_failures.contains_key(mob_machine_wiring_edge_b(edge)),
+                    exists(rid in self.member_state_markers.keys(),
+                        self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(rid)
+                        && self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring)),
+                    self.destroy_admitted == false,
+                    self.composition_authority == CompositionAuthorityKind::Authoritative,
+                    self.placed_completion_lifecycle_quiescing == false,
+                    self.member_host_preparation_pending.contains(mob_machine_wiring_edge_b(edge)),
+                    PeerInputClass::Content,
+                    false,
+                    false,
+                    self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge))) == None
+            }
+            update {
+                self.wiring_edges.insert(edge);
+                self.topology_epoch += 1;
+                self.member_wake_attempt_sequence += 1;
+                self.member_materialization.insert(mob_machine_wiring_edge_b(edge), MemberMaterializationPhase::Waking);
+                self.member_wake_attempts.insert(mob_machine_wiring_edge_b(edge), self.member_wake_attempt_sequence);
+                self.member_wake_bound.remove(mob_machine_wiring_edge_b(edge));
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder.
+                self.member_materialization_epoch.remove(mob_machine_wiring_edge_b(edge));
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
+                // Owed until Live, as a boot wake is: a retryable failure
+                // leaves the member Dormant and owed, so the owner wakes it
+                // again. A member with no durable endpoint owes
+                // EndpointPending (I6).
+                if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::Obligation);
+                } else {
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::EndpointPending);
+                }
+            }
+            to Running
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit MemberTrustWiringRequested {
+                edge: edge,
+                a_peer_id: self.member_peer_ids.get_cloned(a_identity).get("value"),
+                b_peer_id: self.member_peer_ids.get_cloned(b_identity).get("value"),
+                a_endpoint: self.member_peer_endpoints.get_cloned(a_identity).get("value"),
+                b_endpoint: self.member_peer_endpoints.get_cloned(b_identity).get("value"),
+                epoch: self.topology_epoch
+            }
+            emit EmitWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
+            // The handoff obligation: one materialization attempt, realized
+            // like any wake's and closed by the attempt-fenced resolutions.
+            emit MaterializeMember {
+                agent_identity: mob_machine_wiring_edge_b(edge),
+                cause: MemberWakeCause::PlacedPeerWired,
+                attempt: self.member_wake_attempt_sequence
             }
         }
     }
@@ -28284,7 +28714,9 @@ pub enum MemberMaterializationPhase {
 }
 
 /// Why a member is being woken. Deliveries and the operator wake a member; a
-/// read never does, so there is deliberately no read cause.
+/// read never does, so there is deliberately no read cause. PlacedPeerWired:
+/// a wiring edge joined the Dormant member to a placed member, which cannot
+/// wake it through an inproc route.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MemberWakeCause {
     #[default]
@@ -28292,6 +28724,7 @@ pub enum MemberWakeCause {
     HostDelivery,
     PeerDelivery,
     Operator,
+    PlacedPeerWired,
 }
 
 /// The machine's wake verdict for one member.
@@ -28512,6 +28945,10 @@ pub enum MemberReleaseVerdict {
     /// its registration's epoch is not recorded (the routed binding has not
     /// landed), or after the seal it has no durable endpoint.
     NotYetReleasable,
+    /// A Live member that a wiring edge joins to a placed member: the placed
+    /// peer, in another process, cannot wake it through an inproc route, so
+    /// it stays Live and nothing is released until that edge is unwired.
+    PinnedByPlacedPeer,
 }
 
 /// A runtime registration epoch, as the composition route carries it.

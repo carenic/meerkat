@@ -4063,7 +4063,13 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum(
                 "MemberWakeCause",
-                &["Boot", "HostDelivery", "PeerDelivery", "Operator"],
+                &[
+                    "Boot",
+                    "HostDelivery",
+                    "PeerDelivery",
+                    "Operator",
+                    "PlacedPeerWired",
+                ],
             ),
             NamedTypeBinding::string_enum(
                 "MemberWakeVerdictKind",
@@ -4159,6 +4165,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     "HostOwned",
                     "NotAMember",
                     "NotYetReleasable",
+                    "PinnedByPlacedPeer",
                 ],
             ),
             NamedTypeBinding::string("RuntimeEpochId"),

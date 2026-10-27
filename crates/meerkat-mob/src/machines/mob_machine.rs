@@ -10668,6 +10668,94 @@ mod tests {
         );
     }
 
+    /// A drift reopens a Live member's wake, and the wake can find the
+    /// member's registration kept (a false miss): its bind is then an exact
+    /// repeat, which routes no new binding. The drift keeps the registration's
+    /// epoch, so once the wake closes Live the member is releasable again and
+    /// the release of that registration returns it to Dormant.
+    #[test]
+    fn a_kept_registration_is_released_after_a_drift() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "drift-kept", 41);
+        let epoch = RuntimeEpochId("drift-kept-epoch".to_string());
+        authority
+            .apply_signal(MobMachineSignal::ObserveRuntimeReady {
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                runtime_epoch_id: Some(epoch.clone()),
+            })
+            .expect("the routed binding records the registration's epoch");
+        authority
+            .apply_signal(MobMachineSignal::ClassifyMemberLiveMaterialization {
+                agent_identity: member.identity.clone(),
+                observation: MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
+                reason: "a routing miss observed the member missing".to_string(),
+            })
+            .expect("the drift arm reopens the Live member's wake");
+        let attempt = *authority
+            .state()
+            .member_wake_attempts
+            .get(&member.identity)
+            .expect("the drift opened an attempt");
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the wake's Bound step applies");
+        // The kept registration re-binds idempotently: no routed binding
+        // (ObserveRuntimeReady) arrives before the wake closes Live.
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the wake closes Live");
+        assert_eq!(
+            authority
+                .state()
+                .member_materialization
+                .get(&member.identity),
+            Some(&MemberMaterializationPhase::Live)
+        );
+        let verdict = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::ClassifyMemberRelease {
+                agent_identity: member.identity.clone(),
+            },
+        )
+        .expect("the release verdict answers")
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            MobMachineEffect::MemberReleaseClassified { verdict, .. } => Some(*verdict),
+            _ => None,
+        });
+        assert_eq!(verdict, Some(MemberReleaseVerdict::Release));
+        let released = authority
+            .apply_signal(MobMachineSignal::ReleaseMemberMaterialization {
+                agent_runtime_id: Some(member.runtime_id.clone()),
+                fence_token: Some(member.fence_token),
+                runtime_epoch_id: Some(epoch),
+                cause: MemberMaterializationLossCause::RegistrationReleased,
+            })
+            .expect("the kept registration's release is answered");
+        assert!(released.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::MemberMaterializationReleased {
+                outcome: MemberMaterializationReleaseOutcome::Released,
+                ..
+            }
+        )));
+        assert_eq!(
+            authority
+                .state()
+                .member_materialization
+                .get(&member.identity),
+            Some(&MemberMaterializationPhase::Dormant)
+        );
+    }
+
     /// The routed binding refusal is fenced by the wake its request belongs
     /// to: a late refusal of an earlier attempt's request, or a spawn-era one
     /// (no attempt) while a wake is open, is a typed stale no-op that never

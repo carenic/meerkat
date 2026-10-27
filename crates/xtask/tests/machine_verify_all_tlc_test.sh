@@ -554,7 +554,7 @@ fi
 # refusal helper. It runs with TLC coverage and requires every listed arm to
 # fire and a floor of distinct states per run, and requires its twenty-four
 # witnesses reached. Its --mutants mode (run by hand, outside the shard's
-# budget) refuses thirty-seven seeded defects, one per residency invariant and
+# budget) refuses thirty-eight seeded defects, one per residency invariant and
 # property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
