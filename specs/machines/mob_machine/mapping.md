@@ -4722,6 +4722,27 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveExternalEdgeRealizationStaleDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveMemberRevivalSessionCreatedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSessionCreatedStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSessionCreatedStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSessionCreatedStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveMemberRevivalSessionCreatedStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverMemberSeatSessionUnbornRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `RecoverMemberSeatSessionBornRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -5225,6 +5246,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `OwedEdgeRepairsRecorded`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `PersistMemberSeatSessionBorn`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Invariants
 - `stopped_mob_holds_member_run_starts`
@@ -5438,6 +5462,15 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `archive_only_retirement_is_retiring`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `seat_session_unborn_is_seated`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `seat_session_unborn_is_never_bound`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `unborn_seat_session_is_recorded`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `owed_edge_repairs_join_seated_members`
