@@ -4638,6 +4638,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `ResolveRuntimeBindingRefusalStaleDestroyed`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `WireMembersPlacedPeerWakeFirstEnd`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WireMembersPlacedPeerWakeSecondEnd`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WireMembersWithTrustPlacedPeerWakeFirstEnd`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WireMembersWithTrustPlacedPeerWakeSecondEnd`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -5133,6 +5145,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RuntimeBindingRefusalStale`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `OwedMemberWakesRecorded`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

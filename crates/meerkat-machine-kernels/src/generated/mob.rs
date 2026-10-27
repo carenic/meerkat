@@ -3149,12 +3149,15 @@ pub enum MemberBootObligationCause {
     Obligation,
     #[serde(rename = "EndpointPending")]
     EndpointPending,
+    #[serde(rename = "PlacedPeerWired")]
+    PlacedPeerWired,
 }
 impl MemberBootObligationCause {
     pub fn as_str(&self) -> &'static str {
         match self {
             Self::Obligation => "Obligation",
             Self::EndpointPending => "EndpointPending",
+            Self::PlacedPeerWired => "PlacedPeerWired",
         }
     }
 }
@@ -3164,6 +3167,7 @@ impl std::convert::TryFrom<&str> for MemberBootObligationCause {
         match value {
             "Obligation" => Ok(Self::Obligation),
             "EndpointPending" => Ok(Self::EndpointPending),
+            "PlacedPeerWired" => Ok(Self::PlacedPeerWired),
             other => Err(format!("invalid MemberBootObligationCause value `{other}`")),
         }
     }
@@ -3756,6 +3760,8 @@ pub enum MemberReleaseVerdict {
     NotAMember,
     #[serde(rename = "NotYetReleasable")]
     NotYetReleasable,
+    #[serde(rename = "PinnedByPlacedPeer")]
+    PinnedByPlacedPeer,
 }
 impl MemberReleaseVerdict {
     pub fn as_str(&self) -> &'static str {
@@ -3766,6 +3772,7 @@ impl MemberReleaseVerdict {
             Self::HostOwned => "HostOwned",
             Self::NotAMember => "NotAMember",
             Self::NotYetReleasable => "NotYetReleasable",
+            Self::PinnedByPlacedPeer => "PinnedByPlacedPeer",
         }
     }
 }
@@ -3779,6 +3786,7 @@ impl std::convert::TryFrom<&str> for MemberReleaseVerdict {
             "HostOwned" => Ok(Self::HostOwned),
             "NotAMember" => Ok(Self::NotAMember),
             "NotYetReleasable" => Ok(Self::NotYetReleasable),
+            "PinnedByPlacedPeer" => Ok(Self::PinnedByPlacedPeer),
             other => Err(format!("invalid MemberReleaseVerdict value `{other}`")),
         }
     }
@@ -4146,6 +4154,8 @@ pub enum MemberWakeCause {
     PeerDelivery,
     #[serde(rename = "Operator")]
     Operator,
+    #[serde(rename = "PlacedPeerWired")]
+    PlacedPeerWired,
 }
 impl MemberWakeCause {
     pub fn as_str(&self) -> &'static str {
@@ -4154,6 +4164,7 @@ impl MemberWakeCause {
             Self::HostDelivery => "HostDelivery",
             Self::PeerDelivery => "PeerDelivery",
             Self::Operator => "Operator",
+            Self::PlacedPeerWired => "PlacedPeerWired",
         }
     }
 }
@@ -4165,6 +4176,7 @@ impl std::convert::TryFrom<&str> for MemberWakeCause {
             "HostDelivery" => Ok(Self::HostDelivery),
             "PeerDelivery" => Ok(Self::PeerDelivery),
             "Operator" => Ok(Self::Operator),
+            "PlacedPeerWired" => Ok(Self::PlacedPeerWired),
             other => Err(format!("invalid MemberWakeCause value `{other}`")),
         }
     }
@@ -11975,6 +11987,8 @@ pub mod effects {
         pub session_id: SessionId,
         pub attempt: Option<u64>,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct OwedMemberWakesRecorded {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12148,6 +12162,7 @@ pub enum Effect {
     MemberMaterializationReleased(effects::MemberMaterializationReleased),
     MemberReleaseClassified(effects::MemberReleaseClassified),
     RuntimeBindingRefusalStale(effects::RuntimeBindingRefusalStale),
+    OwedMemberWakesRecorded(effects::OwedMemberWakesRecorded),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -12316,6 +12331,7 @@ pub enum EffectKind {
     MemberMaterializationReleased,
     MemberReleaseClassified,
     RuntimeBindingRefusalStale,
+    OwedMemberWakesRecorded,
 }
 
 pub mod command_capabilities {
@@ -13991,6 +14007,10 @@ pub enum TransitionId {
     ResolveRuntimeBindingRefusalStaleStopped,
     ResolveRuntimeBindingRefusalStaleCompleted,
     ResolveRuntimeBindingRefusalStaleDestroyed,
+    WireMembersPlacedPeerWakeFirstEnd,
+    WireMembersPlacedPeerWakeSecondEnd,
+    WireMembersWithTrustPlacedPeerWakeFirstEnd,
+    WireMembersWithTrustPlacedPeerWakeSecondEnd,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

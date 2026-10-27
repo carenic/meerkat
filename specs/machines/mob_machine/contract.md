@@ -798,14 +798,15 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `MemberMaterializationReleased`(agent_runtime_id: Option<AgentRuntimeId>, cause: MemberMaterializationLossCause, outcome: MemberMaterializationReleaseOutcome)
 - `MemberReleaseClassified`(agent_identity: AgentIdentity, verdict: MemberReleaseVerdict)
 - `RuntimeBindingRefusalStale`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, attempt: Option<u64>)
+- `OwedMemberWakesRecorded`
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
 - `member_wake_refusal`(member_present: Bool, session_bound: Bool, placed: Bool, broken: Bool, retiring: Bool, mob_admitting: Bool, composition_authoritative: Bool, origin_open: Bool, host_pending: Bool, input_class: PeerInputClass, sender_waking: Bool, observed_missing: Bool, phase: Option<MemberMaterializationPhase>) -> `Option<MemberWakeRefusalKind>`
 - `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool) -> `BootMaterializationKind`
 - `peer_notice_disposition`(recipient_phase: Option<MemberMaterializationPhase>, sender_phase: Option<MemberMaterializationPhase>, notice_class: PeerInputClass) -> `PeerNoticeDisposition`
-- `member_registration_releasable`(residency: Option<MemberMaterializationPhase>, placed: Bool, sealed: Bool, has_endpoint: Bool, epoch_recorded: Bool) -> `Bool`
-- `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>, releasable: Bool) -> `MemberReleaseVerdict`
+- `member_registration_releasable`(residency: Option<MemberMaterializationPhase>, placed: Bool, sealed: Bool, has_endpoint: Bool, epoch_recorded: Bool, wired_to_placed: Bool) -> `Bool`
+- `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>, releasable: Bool, wired_to_placed: Bool) -> `MemberReleaseVerdict`
 
 ## Command Plans
 ### `AuthorizedMobSpawnStart`
@@ -4119,7 +4120,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `spawn_profile_name_authorized`
   - `spawn_profile_authorized`
   - `spawn_profile_addressability_authorized`
-- Emits: `PersistPendingPlacedSpawn`, `RequestMemberMaterialization`
+- Emits: `PersistPendingPlacedSpawn`, `RequestMemberMaterialization`, `OwedMemberWakesRecorded`
 - To: `Running`
 
 ### `RecordMemberMaterializationFailureRunning`
@@ -8327,6 +8328,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lifecycle_origin_open`
   - `edge_not_already_wired`
   - `edge_endpoints_seated_or_held`
+  - `first_end_owes_no_placed_peer_wake`
+  - `second_end_owes_no_placed_peer_wake`
 - Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`
 - To: `Running`
 
@@ -8342,6 +8345,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `b_member_peer_registered`
   - `a_member_endpoint_registered`
   - `b_member_endpoint_registered`
+  - `first_end_owes_no_placed_peer_wake`
+  - `second_end_owes_no_placed_peer_wake`
 - Emits: `WiringGraphChanged`, `MemberTrustWiringRequested`, `EmitWiringLifecycleNotice`
 - To: `Running`
 
@@ -8508,7 +8513,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `edge_endpoints_seated_or_held`
-- Emits: `WiringGraphChanged`
+- Emits: `WiringGraphChanged`, `OwedMemberWakesRecorded`
 - To: `Running`
 
 ### `RestoreRetiringMemberWiringStopped`
@@ -8523,7 +8528,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `edge_endpoints_seated_or_held`
-- Emits: `WiringGraphChanged`
+- Emits: `WiringGraphChanged`, `OwedMemberWakesRecorded`
 - To: `Stopped`
 
 ### `WireExternalPeerRunning`
@@ -16546,6 +16551,72 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `refusal_stale`
 - Emits: `RuntimeBindingRefusalStale`
 - To: `Destroyed`
+
+### `WireMembersPlacedPeerWakeFirstEnd`
+- From: `Running`
+- On: `WireMembers`(edge)
+- Guards:
+  - `lifecycle_origin_open`
+  - `edge_not_already_wired`
+  - `edge_endpoints_seated_or_held`
+  - `first_end_local`
+  - `second_end_placed`
+  - `first_end_dormant`
+  - `first_end_wake_admitted`
+- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`, `MaterializeMember`
+- To: `Running`
+
+### `WireMembersPlacedPeerWakeSecondEnd`
+- From: `Running`
+- On: `WireMembers`(edge)
+- Guards:
+  - `lifecycle_origin_open`
+  - `edge_not_already_wired`
+  - `edge_endpoints_seated_or_held`
+  - `second_end_local`
+  - `first_end_placed`
+  - `second_end_dormant`
+  - `second_end_wake_admitted`
+- Emits: `WiringGraphChanged`, `EmitWiringLifecycleNotice`, `MaterializeMember`
+- To: `Running`
+
+### `WireMembersWithTrustPlacedPeerWakeFirstEnd`
+- From: `Running`
+- On: `WireMembersWithTrust`(edge, a_identity, b_identity)
+- Guards:
+  - `lifecycle_origin_open`
+  - `edge_not_already_wired`
+  - `edge_matches_members`
+  - `a_member_peer_registered`
+  - `b_member_peer_registered`
+  - `a_member_endpoint_registered`
+  - `b_member_endpoint_registered`
+  - `edge_endpoints_seated_or_held`
+  - `first_end_local`
+  - `second_end_placed`
+  - `first_end_dormant`
+  - `first_end_wake_admitted`
+- Emits: `WiringGraphChanged`, `MemberTrustWiringRequested`, `EmitWiringLifecycleNotice`, `MaterializeMember`
+- To: `Running`
+
+### `WireMembersWithTrustPlacedPeerWakeSecondEnd`
+- From: `Running`
+- On: `WireMembersWithTrust`(edge, a_identity, b_identity)
+- Guards:
+  - `lifecycle_origin_open`
+  - `edge_not_already_wired`
+  - `edge_matches_members`
+  - `a_member_peer_registered`
+  - `b_member_peer_registered`
+  - `a_member_endpoint_registered`
+  - `b_member_endpoint_registered`
+  - `edge_endpoints_seated_or_held`
+  - `second_end_local`
+  - `first_end_placed`
+  - `second_end_dormant`
+  - `second_end_wake_admitted`
+- Emits: `WiringGraphChanged`, `MemberTrustWiringRequested`, `EmitWiringLifecycleNotice`, `MaterializeMember`
+- To: `Running`
 
 ## Coverage
 ### Code Anchors
