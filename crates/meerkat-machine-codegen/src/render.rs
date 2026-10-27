@@ -556,6 +556,27 @@ const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
             "RecoverMemberSeatSessionBornRunning",
         ],
     ),
+    // The entered-step arms of the review attempt lifecycle (0.9.7), after
+    // every arm 0.9.6 published. Every ApprovalLifecycleMachine arm added
+    // after them is appended here too, so none of them moves.
+    (
+        "ApprovalLifecycleMachine",
+        &[
+            "AdmitEnteredStepRejectedMissing",
+            "AdmitEnteredStepRejectedConsentLinked",
+            "AdmitEnteredStepRejectedRetired",
+            "AdmitEnteredStepRejectedNotEntered",
+            "AdmitEnteredStep",
+            "AdmitEnteredStepRejectedClosing",
+            "ReleaseReviewUsedClosing",
+            "ReleaseReviewRejectedClosing",
+            "FinishEnteredStepRejectedMissing",
+            "FinishEnteredStepRejectedNotInFlight",
+            "FinishEnteredStepOpen",
+            "FinishEnteredStepClosing",
+            "FinishEnteredStepReleases",
+        ],
+    ),
 ];
 
 #[cfg(not(test))]

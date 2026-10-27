@@ -84,6 +84,33 @@ them.
   that owns the session, once the unregister committed; the mob demotes exactly
   that materialization of its member to dormant, and a release for any other
   registration changes nothing.
+- `meerkat-core` (`generated::approval_lifecycle`), `meerkat-machine-schema`
+  (`catalog::dsl::approval_lifecycle`) and `meerkat-machine-kernels`
+  (`generated::approval_lifecycle`): the approval lifecycle machine
+  (`ApprovalLifecycleMachine`, version 6) gains the inputs
+  `AdmitEnteredStep { review_id }` and `FinishEnteredStep { review_id }`,
+  which admit and finish a later step of an entered reviewed effect (see
+  Added, the entered state of a reviewed effect).
+  `ApprovalLifecycleInput` (meerkat-core and meerkat-machine-schema),
+  `ApprovalLifecycleInputVariant` (meerkat-machine-schema) and the kernel
+  `Input` and `InputKind` gain `AdmitEnteredStep` and `FinishEnteredStep`,
+  appended last. The kernel `TransitionId` gains
+  `AdmitEnteredStepRejectedMissing`, `AdmitEnteredStepRejectedConsentLinked`,
+  `AdmitEnteredStepRejectedRetired`, `AdmitEnteredStepRejectedNotEntered`,
+  `AdmitEnteredStep`, `AdmitEnteredStepRejectedClosing`,
+  `ReleaseReviewUsedClosing`, `ReleaseReviewRejectedClosing`,
+  `FinishEnteredStepRejectedMissing`, `FinishEnteredStepRejectedNotInFlight`,
+  `FinishEnteredStepOpen`, `FinishEnteredStepClosing` and
+  `FinishEnteredStepReleases`, appended last, so no existing implicit
+  discriminant changes. The enums are exhaustive: a `match` outside the
+  crates needs the new arms.
+- `meerkat-machine-schema` (`catalog::dsl::approval_lifecycle`) and
+  `meerkat-machine-kernels` (`generated::approval_lifecycle`):
+  `ApprovalLifecycleMachineState` and the kernel `State` gain
+  `review_entered_phase` and `review_entered_steps`, the entered phase and
+  the admitted steps in flight of each spent attempt. Code that builds
+  either with a struct literal must set them (empty maps for a state with no
+  entered attempt).
 - Behaviour: a Resume-mode spawn (attaching an existing session, an idempotent
   `ensure_member` that resumes a session) whose session has a live actor
   reuses that actor only when it runs the auth binding the spec names: the
@@ -124,6 +151,23 @@ them.
 
 ### Added
 
+- `meerkat-core`, `meerkat-machine-schema`, `meerkat-machine-kernels`: the
+  entered state of a reviewed effect is machine-owned
+  (`ApprovalLifecycleMachine` version 6). A spend at an effect's entry (a
+  model review's allow, or a consented candidate's human consent) now leaves
+  its attempt registered as `Used`, with an entered phase (the new public
+  enum `EnteredEffectPhase`: `Open`, `Closing`) and a count of admitted
+  steps in flight. `AdmitEnteredStep` admits a later step of that effect
+  only while it is `Open`, and `FinishEnteredStep` ends one; neither spends.
+  The admitting dispatch's end releases the attempt when no admitted step is
+  in flight, and otherwise closes the effect: no new step is admitted, and
+  the last admitted step's finish releases the attempt. The generated
+  authority `ApprovalLifecycleMachineAuthority` (meerkat-core) gains
+  `admit_entered_step` and `finish_entered_step`, and the kernel gains the
+  input structs `inputs::AdmitEnteredStep` and `inputs::FinishEnteredStep`.
+  A bounded TLC audit in the canonical TLC lane
+  (`specs/machines/approval_lifecycle/entered_step_audit.sh`) checks the
+  entered state against the spends, steps and dispatch end it records.
 - `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
   and `retract_wake_route` keep, per seated member, a route to the owner that
   can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route

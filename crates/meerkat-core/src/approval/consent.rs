@@ -365,6 +365,14 @@ impl ConsentCandidate {
         &self.admitted
     }
 
+    /// Custody of this candidate's attempt once its consent was spent at an
+    /// entry: the spend removed the candidate from the owner's live custody
+    /// and left the attempt registered as `Used` for the entered effect,
+    /// until the admitting dispatch ends and releases it.
+    pub(crate) fn entered_attempt(&self) -> ReviewAttemptHandle {
+        self.attempt.twin()
+    }
+
     /// Whether this custody keeps the very claim lineage `reservation`
     /// holds: it was admitted under the same live claim of its session.
     pub(super) fn keeps_lineage_of(
@@ -1460,9 +1468,11 @@ impl ApprovalService {
     /// Spend one authenticated consent once at the candidate's physical
     /// entry, under ONE non-blocking reservation: identity, the retained
     /// decision's coherent currentness and validity are rechecked there; then
-    /// the generated owner's linked spend, the attempt's disposal and the
-    /// stored row's consumption commit together, conditional on the row the
-    /// owner checked. A proven no-commit (contention, a store that wrote
+    /// the generated owner's linked spend and the stored row's consumption
+    /// commit together, conditional on the row the owner checked. The spent
+    /// attempt stays registered (`Used`) for the entered effect until the
+    /// admitting dispatch ends; a refusal after the commit releases it at
+    /// once (the caller). A proven no-commit (contention, a store that wrote
     /// nothing) leaves the consent spendable. A conflicting or uncertain
     /// commit retires the custody (no entry, no refund) and marks the row for
     /// reconciliation. A changed decision or expiry withdraws the candidate
@@ -1591,14 +1601,14 @@ impl ApprovalService {
         }
         let attempt_id = candidate.attempt.id().to_owned();
         let mut authority = state.authority.clone();
+        // The spent attempt stays registered (`Used`), the entered state of
+        // the effect, until the admitting dispatch ends and releases it.
         if review_status_from_outcome(
-            authority.consume_consent_for_entry(approval_id.to_string(), attempt_id.clone()),
+            authority.consume_consent_for_entry(approval_id.to_string(), attempt_id),
         ) != Ok(ReviewAttemptStatus::Used)
         {
             return Err(ConsentRefusal::NoConsent);
         }
-        // Same reservation: no second acquisition before the effect.
-        let _ = review_status_from_outcome(authority.release_review(attempt_id));
         let mut consumed = record.clone();
         consumed.updated_at = now;
         consumed.consent = Some(ApprovalConsentRecord {

@@ -1444,10 +1444,13 @@ impl ApprovalService {
     /// 2. under it, check the attempt's identity binding and run
     ///    `final_check` (deadline and currentness) immediately before the
     ///    conditional commit;
-    /// 3. commit, and for a spend also dispose the attempt in the same
-    ///    reservation, so nothing waits on this owner and no queued report
-    ///    runs between the spend and the leaf's effect; a refusal retires and
-    ///    disposes the attempt in the same reservation.
+    /// 3. commit; a refusal retires and disposes the attempt in the same
+    ///    reservation. A spend leaves the attempt registered as `Used`, the
+    ///    entered state of its effect: the admitting dispatch's end releases
+    ///    it ([`Self::dispose_review`], never waiting), and until then the
+    ///    effect's later steps are admitted against it (the generated
+    ///    `AdmitEnteredStep`). Nothing waits on this owner and no queued
+    ///    report runs between the spend and the leaf's effect.
     ///
     /// On refusal the returned disposal is the owner's settled result, or
     /// `None` when it was queued (`on_queued` then reports it once settled).
@@ -1465,7 +1468,7 @@ impl ApprovalService {
         commit: impl FnOnce(
             &mut ApprovalLifecycleMachineAuthority,
         ) -> Result<ApprovalLifecycleOutcome, ApprovalLifecycleError>,
-        dispose_on_commit: bool,
+        spend: bool,
         retirement: impl FnOnce(&ReservedReviewError<E>) -> ReviewRetirementReason,
         on_queued: impl FnOnce() -> QueuedDisposalReport,
     ) -> Result<(ReviewAttemptStatus, SettledReports), RefusedReviewCommit<E>> {
@@ -1508,18 +1511,10 @@ impl ApprovalService {
         };
         let result = match refused {
             Some(error) => Err(error),
-            None => match review_status_from_outcome(commit(&mut state.authority)) {
-                Ok(status) => {
-                    if dispose_on_commit {
-                        // Same reservation: no second acquisition before the effect.
-                        let _ = review_status_from_outcome(
-                            state.authority.release_review(handle.id().to_owned()),
-                        );
-                    }
-                    Ok(status)
-                }
-                Err(error) => Err(ReservedReviewError::Owner(error)),
-            },
+            // A spend keeps the attempt registered (`Used`) for its effect's
+            // later steps; the admitting dispatch's end releases it.
+            None => review_status_from_outcome(commit(&mut state.authority))
+                .map_err(ReservedReviewError::Owner),
         };
         let result = result.map_err(|error| {
             let reason = retirement(&error);
@@ -1542,7 +1537,7 @@ impl ApprovalService {
             // callback-free retained check runs again here, immediately
             // before the effect handoff. A refusal now has zero effect; the
             // committed spend stays spent (no refund).
-            Ok(status) if dispose_on_commit => match final_check() {
+            Ok(status) if spend => match final_check() {
                 Ok(()) => Ok((status, reports)),
                 Err(failure) => Err(RefusedReviewCommit {
                     error: ReservedReviewError::FinalCheck(failure),
@@ -1820,8 +1815,11 @@ impl ApprovalService {
     }
 
     /// Spend the allow once, only for the exact operation binding and work
-    /// association the attempt was issued for, and dispose the attempt, all
-    /// under the single commit reservation after `final_check`.
+    /// association the attempt was issued for, under the single commit
+    /// reservation after `final_check`. The attempt stays registered as
+    /// `Used`, the entered state of its effect, until its admitting dispatch
+    /// ends; a spend refused by its final check after the commit is released
+    /// by the caller at once, since nothing entered.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn consume_review_for_entry<E>(
         &self,
