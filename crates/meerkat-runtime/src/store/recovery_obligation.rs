@@ -13,11 +13,17 @@
 //! background operation completion, a running detached job wait:
 //! `PersistedOpsSnapshot::holds_recovery_work`) is part of the
 //! `nonterminal` fact, so the pinned facts carry it in the wire form every
-//! released reader decodes.
+//! released reader decodes. A writer that folds that work pins the facts in
+//! their folded form ([`encode_folded_boot_facts`]); facts pinned by an
+//! earlier writer may leave such work out, so a head that carries them is
+//! read as holding work ([`boot_facts_predate_ops_fold`]) until the
+//! runtime's next commit pins the folded form.
+
+use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use super::{MachineLifecycleObservation, RuntimeSessionCatalogEntry};
+use super::{MachineLifecycleObservation, RuntimeSessionCatalogEntry, RuntimeStoreError};
 
 /// Facts a boot reads from a runtime's head to decide whether recovery must
 /// act on it, refreshed by every commit of the runtime.
@@ -44,6 +50,34 @@ pub(crate) struct BootFactsV1 {
 impl BootFactsV1 {
     /// The format version every writer stamps and every reader requires.
     pub(crate) const VERSION: u32 = 1;
+}
+
+/// The byte that ends boot facts pinned by a writer that folds the ops
+/// lifecycle's work into `nonterminal`. Writers before that fold pinned the
+/// compact JSON alone and rewrite it on every commit of the runtime, so the
+/// folded form never survives an older writer's commit. Every reader
+/// decodes both forms to the same facts: trailing whitespace is valid JSON.
+const FOLDED_BOOT_FACTS_TERMINATOR: u8 = b'\n';
+
+/// The boot facts in the form a folding writer pins: the JSON, then
+/// [`FOLDED_BOOT_FACTS_TERMINATOR`].
+pub(crate) fn encode_folded_boot_facts(
+    facts: &BootFactsV1,
+) -> Result<Arc<Vec<u8>>, RuntimeStoreError> {
+    let mut bytes = serde_json::to_vec(facts).map_err(|error| {
+        RuntimeStoreError::WriteFailed(format!("host store encode: boot facts: {error}"))
+    })?;
+    bytes.push(FOLDED_BOOT_FACTS_TERMINATOR);
+    Ok(Arc::new(bytes))
+}
+
+/// Whether pinned boot facts were written before the ops lifecycle's work
+/// was folded into them: they may leave out an undelivered background
+/// completion or a running detached job wait, so a boot reads their runtime
+/// as holding recovery work (fail closed) until its next commit pins the
+/// folded form.
+pub(crate) fn boot_facts_predate_ops_fold(bytes: &[u8]) -> bool {
+    bytes.last() != Some(&FOLDED_BOOT_FACTS_TERMINATOR)
 }
 
 /// Whether a lifecycle record names a current run. A record that does not
@@ -497,6 +531,26 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// Boot facts pinned in the folded form decode as the compact form an
+    /// earlier writer pinned (a reader of either version reads both), and
+    /// only the compact form reads as predating the ops fold.
+    #[test]
+    fn boot_obligation_scan_folded_boot_facts_are_told_apart_from_an_earlier_writers() {
+        let pinned = facts(false, true, false, true);
+        let folded = encode_folded_boot_facts(&pinned).unwrap();
+        let compact = serde_json::to_vec(&pinned).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<BootFactsV1>(&folded).unwrap(),
+            pinned
+        );
+        assert_eq!(
+            serde_json::from_slice::<BootFactsV1>(&compact).unwrap(),
+            pinned
+        );
+        assert!(!boot_facts_predate_ops_fold(&folded));
+        assert!(boot_facts_predate_ops_fold(&compact));
     }
 
     /// An ops lifecycle snapshot holds work while a completion has reached
