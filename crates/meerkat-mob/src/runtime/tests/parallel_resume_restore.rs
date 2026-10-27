@@ -241,11 +241,16 @@ impl SpawnedMob {
     /// Resume at `concurrency`, holding every member's provision at the
     /// gate and releasing them in rounds.
     async fn resume_held(&self, concurrency: usize) -> HeldResume {
+        // A restart finds no live session: every member is restored through
+        // its provision.
         for (identity, session) in &self.sessions {
-            assert!(
-                !self.service.live_session_actor_registered(session).await,
-                "{identity}: the shutdown left no live session, so the resume restores it"
-            );
+            if self.service.live_session_actor_registered(session).await {
+                MobSessionService::discard_live_session(self.service.as_ref(), session)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{identity}: discard the live session the shutdown kept: {error}")
+                    });
+            }
         }
         self.gate
             .arm(self.sessions.iter().map(|(_, session)| session.clone()));
