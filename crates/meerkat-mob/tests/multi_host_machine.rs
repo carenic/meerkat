@@ -22,9 +22,10 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use meerkat_mob::machines::mob_machine::{
-    AgentIdentity, AgentRuntimeId, AutonomousShutdownMemberActionKind, ControlScope, FenceToken,
-    FlowStepDispatchKind, Generation, HostBindPhase, HostId, InputId, LiveWsEndpointUrl,
-    MemberLiveMaterializationObservationKind, MemberOperatorRejectKind, MemberPeerEndpoint,
+    AgentIdentity, AgentRuntimeId, AutonomousShutdownMemberActionKind, BootMaterializationKind,
+    ControlScope, FenceToken, FlowStepDispatchKind, Generation, HostBindPhase, HostId, InputId,
+    LiveWsEndpointUrl, MemberLiveMaterializationObservationKind, MemberMaterializationPhase,
+    MemberOperatorRejectKind, MemberPeerEndpoint, MemberRecoveryObligationKind,
     MemberRevivalVerdictKind, MemberSessionDisposal, MobId, MobLifecycleJournalKind,
     MobMachineAuthority, MobMachineEffect, MobMachineInput, MobMachineMutator, MobMachineSignal,
     MobMachineState, MobPhase, MobSpawnMemberAdmissionKind, PeerAddress, PeerId, PeerName,
@@ -3103,6 +3104,100 @@ fn route_removal_before_unwire_is_ephemeral_authority_not_pending_ledger() {
     )));
     assert!(authority.state().wiring_edges.contains(&edge));
     assert!(authority.state().pending_route_installs.is_empty());
+}
+
+/// A local member wired to a placed member is network-reachable for the boot
+/// verdict: the placed peer, in another process, cannot use an inproc wake
+/// route, so the boot plan wakes the member although its own endpoint is
+/// inproc. Without that edge the same member stays Dormant (lazy by default).
+#[test]
+fn a_local_member_wired_to_a_placed_member_wakes_at_boot() {
+    let mut authority = MobMachineAuthority::new();
+    let host = host_id("host-b");
+    bind_owner_bridge(&mut authority);
+    bind_host(&mut authority, &host, 1, HostCaps::FULL);
+    seed_remote_member(
+        &mut authority,
+        "alpha",
+        0,
+        &host,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+    seed_local_member(
+        &mut authority,
+        "beta",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+    MobMachineMutator::apply(
+        &mut authority,
+        MobMachineInput::RegisterMemberPeer {
+            agent_identity: identity("beta"),
+            agent_runtime_id: runtime_id("beta", 0),
+            generation: Generation(0),
+            fence_token: FenceToken(1),
+            peer_endpoint: MemberPeerEndpoint::new(
+                PeerName("beta".to_string()),
+                PeerId("peer-beta".to_string()),
+                PeerAddress("inproc://beta".to_string()),
+                PeerSigningKey([6; 32]),
+            ),
+        },
+    )
+    .expect("the local member's inproc endpoint is registered");
+    // Replay leaves the local member Dormant: nothing is registered in this
+    // process after a cold restart.
+    let replayed_dormant = |state: &MobMachineState| {
+        let mut state = state.clone();
+        let beta_runtime = runtime_id("beta", 0);
+        state
+            .member_materialization
+            .insert(identity("beta"), MemberMaterializationPhase::Dormant);
+        state.member_materialization_epoch.remove(&identity("beta"));
+        state.member_startup_binding_requested.remove(&beta_runtime);
+        state.member_startup_runtime_ready.remove(&beta_runtime);
+        state.member_startup_ready.remove(&beta_runtime);
+        MobMachineAuthority::recover_from_state(state)
+            .expect("a replay-shaped Dormant member recovers")
+    };
+    let plan = MobMachineInput::PlanBootMaterialization {
+        agent_identity: identity("beta"),
+        obligation: MemberRecoveryObligationKind::None,
+        host_required: false,
+        orchestrator_notified: false,
+    };
+    let planned_verdict = |authority: &mut MobMachineAuthority| {
+        MobMachineMutator::apply(authority, plan.clone())
+            .expect("the boot plan answers for the Dormant member")
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                MobMachineEffect::BootMaterializationPlanned { verdict, .. } => Some(*verdict),
+                _ => None,
+            })
+            .expect("the boot plan emits its verdict")
+    };
+
+    let mut unwired = replayed_dormant(authority.state());
+    assert_eq!(
+        planned_verdict(&mut unwired),
+        BootMaterializationKind::StayDormant,
+        "an inproc member with no edge to a placed member stays lazy"
+    );
+
+    MobMachineMutator::apply(
+        &mut authority,
+        MobMachineInput::WireMembers {
+            edge: WiringEdge::new(identity("alpha"), identity("beta")),
+        },
+    )
+    .expect("wire accepted");
+    let mut wired = replayed_dormant(authority.state());
+    assert_eq!(
+        planned_verdict(&mut wired),
+        BootMaterializationKind::Wake,
+        "a member wired to a placed member wakes so the placed peer can reach it"
+    );
 }
 
 /// Phase 4 — the `host_bound` guard on `RecordRouteInstall{Install}`
