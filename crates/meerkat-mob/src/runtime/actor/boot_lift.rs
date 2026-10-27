@@ -22,10 +22,15 @@
 //! close. A member the plan has not reached yet stays Dormant, its true
 //! state: it holds no wake attempt, so no wake bound runs for it, and a
 //! delivery wakes it at once through a wake of its own, never queued behind
-//! the plan. A member that is no longer Dormant when the plan reaches it (a
-//! delivery woke it meanwhile) gets no plan input: its own wake, or its live
-//! materialization, stands. The plan dispatches nothing more once the mob
-//! leaves Running or the lift is cancelled or superseded. The members the
+//! the plan. When the plan reaches a member a delivery woke meanwhile, it
+//! applies nothing to it while that wake runs (never a second wake): it
+//! watches that wake, counts it against its bound and waits for it, and if
+//! the wake leaves the member Dormant again (it ended retryably) the plan
+//! reaches the member again and applies its input then, so the member's
+//! boot work is owed and retried as for any member the plan materializes. A
+//! member the plan finds Live or Broken is left as it is. The plan
+//! dispatches nothing more once the mob leaves Running or the lift is
+//! cancelled or superseded. The members the
 //! plan verifies (`OnDemandVerified`) are read once it has reached every
 //! member, those still Dormant then: a verified member a delivery woke
 //! meanwhile reads its durable session in its own wake. A start of a
@@ -34,16 +39,20 @@
 
 use super::*;
 
-/// One member the lift's plan materializes, as the explicit resume tracks
-/// it: Waking under the plan's wake attempt, joined by the lift.
+/// One wake of the lift's plan, as the explicit resume tracks it: a member
+/// Waking under the plan's wake attempt, joined by the lift, or a member a
+/// delivery woke before the plan reached it, whose own wake the plan
+/// watches.
 #[derive(Debug, Clone)]
 pub(in crate::runtime) struct ExplicitResumeBootMember {
     pub(in crate::runtime) agent_identity: AgentIdentity,
     resume_attempt: mob_dsl::ResumeAttemptId,
     binding: mob_dsl::ResumeMemberBinding,
     wake_attempt: u64,
-    /// Whether the explicit resume took this wake over
-    /// (`AuthorizeExplicitResumeMember`). A wake it could not take over still
+    /// Whether the explicit resume takes this wake over
+    /// (`AuthorizeExplicitResumeMember`): a wake of the plan's own, until
+    /// MobMachine refuses the take-over. A wake the plan only watches (a
+    /// delivery's) gets no input. A wake the lift does not take over still
     /// frees its slot of the plan when it closes; the lift has nothing of it
     /// to settle.
     authorized: bool,
@@ -61,8 +70,13 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     /// The members Dormant when the plan started, in identity order, that it
     /// has not reached yet.
     queue: VecDeque<mob_dsl::AgentIdentity>,
-    /// The plan's wakes still open, by member, with their attempts.
+    /// The wakes the plan counts against its bound, by member, with their
+    /// attempts: its own, and the ones it watches (`watched`).
     open: BTreeMap<mob_dsl::AgentIdentity, u64>,
+    /// The members of `open` a delivery woke before the plan reached them:
+    /// the plan applied nothing to them, and reaches them again once that
+    /// wake closes.
+    watched: BTreeSet<mob_dsl::AgentIdentity>,
     /// The members the plan verified (`VerifyMember`), read once it has
     /// reached every member (those still Dormant then).
     verify: BTreeSet<AgentIdentity>,
@@ -115,6 +129,7 @@ impl MobActor {
             notified,
             queue,
             open: BTreeMap::new(),
+            watched: BTreeSet::new(),
             verify: BTreeSet::new(),
             bound,
         });
@@ -122,13 +137,14 @@ impl MobActor {
     }
 
     /// Apply the lift's plan to the next members while fewer than its bound
-    /// of wakes are open, and return the members it made Waking, for the
-    /// explicit resume to join. A member that is no longer Dormant is skipped:
-    /// no plan input, never a second wake. Once the plan has reached every
-    /// member, the members it verified that are still Dormant are read and
-    /// the dispatch ends. A dispatch whose lift was cancelled or superseded,
-    /// or whose mob left Running, is dropped with nothing applied; so is one
-    /// that fails.
+    /// of wakes are open, and return the wakes it opened or now watches, for
+    /// the explicit resume to join. A member a delivery woke first gets no
+    /// plan input (never a second wake): its wake is watched, and the member
+    /// is reached again once that wake closes. Once the plan has reached
+    /// every member and watches no wake, the members it verified that are
+    /// still Dormant are read and the dispatch ends. A dispatch whose lift was
+    /// cancelled or superseded, or whose mob left Running, is dropped with
+    /// nothing applied; so is one that fails.
     pub(super) async fn dispatch_explicit_resume_boot_members(
         &mut self,
     ) -> Result<Vec<ExplicitResumeBootMember>, MobError> {
@@ -139,22 +155,48 @@ impl MobActor {
             return Ok(Vec::new());
         }
         {
-            // A wake of the plan that closed (Live, Broken, or Dormant again)
-            // frees its slot.
+            // A wake the plan counts that closed (Live, Broken, or Dormant
+            // again) frees its slot. A member whose watched wake closed goes
+            // back to the front of the queue: the plan reaches it again next.
             let state = self.dsl_authority.state();
+            let mut closed = Vec::new();
             dispatch.open.retain(|identity, attempt| {
-                state
+                let open = state
                     .member_wake_attempts
                     .get(identity)
-                    .is_some_and(|open| *open == *attempt)
+                    .is_some_and(|open| *open == *attempt);
+                if !open {
+                    closed.push(identity.clone());
+                }
+                open
             });
+            for identity in closed.into_iter().rev() {
+                if dispatch.watched.remove(&identity) {
+                    dispatch.queue.push_front(identity);
+                }
+            }
         }
         let mut planned = Vec::new();
+        let mut watching = Vec::new();
         while dispatch.open.len() < dispatch.bound {
             let Some(identity) = dispatch.queue.pop_front() else {
                 break;
             };
-            if !super::super::boot_plan::member_is_dormant(self.dsl_authority.state(), &identity) {
+            let state = self.dsl_authority.state();
+            if !super::super::boot_plan::member_is_dormant(state, &identity) {
+                // A delivery woke the member first. While that wake runs the
+                // plan applies nothing to it, and watches it instead; a member
+                // Live or Broken is left as it is.
+                let waking = matches!(
+                    super::super::boot_plan::member_materialization_phase(state, &identity),
+                    Some(mob_dsl::MemberMaterializationPhase::Waking)
+                );
+                if waking && let Some(attempt) = state.member_wake_attempts.get(&identity).copied()
+                {
+                    dispatch.open.insert(identity.clone(), attempt);
+                    dispatch.watched.insert(identity.clone());
+                    watching.push((identity, attempt));
+                }
                 continue;
             }
             let input = super::super::boot_plan::boot_materialization_input(
@@ -186,7 +228,7 @@ impl MobActor {
                 }
             }
         }
-        let finished = dispatch.queue.is_empty();
+        let finished = dispatch.queue.is_empty() && dispatch.watched.is_empty();
         #[cfg(feature = "runtime-adapter")]
         if finished {
             // A verified member a delivery has woken since reads its durable
@@ -201,7 +243,7 @@ impl MobActor {
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = &dispatch.verify;
         let members = self
-            .explicit_resume_boot_members(&dispatch.resume_attempt, planned)
+            .explicit_resume_boot_members(&dispatch.resume_attempt, planned, watching)
             .await?;
         if !finished {
             self.explicit_resume_boot_dispatch = Some(dispatch);
@@ -234,24 +276,29 @@ impl MobActor {
         current
     }
 
-    /// The explicit resume's record of each member the plan made Waking.
+    /// The explicit resume's record of each wake of a dispatch round: the
+    /// ones the plan opened (`planned`, taken over) and the ones it watches
+    /// (`watched`, no input).
     async fn explicit_resume_boot_members(
         &self,
         resume_attempt: &mob_dsl::ResumeAttemptId,
         planned: Vec<(mob_dsl::AgentIdentity, u64)>,
+        watched: Vec<(mob_dsl::AgentIdentity, u64)>,
     ) -> Result<Vec<ExplicitResumeBootMember>, MobError> {
-        if planned.is_empty() {
+        if planned.is_empty() && watched.is_empty() {
             return Ok(Vec::new());
         }
         let state = self.dsl_authority.state();
         let roster = self.roster.read().await;
         planned
             .into_iter()
-            .map(|(identity, wake_attempt)| {
+            .map(|wake| (wake, true))
+            .chain(watched.into_iter().map(|wake| (wake, false)))
+            .map(|((identity, wake_attempt), authorized)| {
                 let agent_identity = AgentIdentity::from(identity.0.as_str());
                 let entry = roster.get(&agent_identity).ok_or_else(|| {
                     MobError::Internal(format!(
-                        "the lift planned '{agent_identity}', which has no roster entry"
+                        "the lift's plan reached '{agent_identity}', which has no roster entry"
                     ))
                 })?;
                 let session_id = state
@@ -260,7 +307,7 @@ impl MobActor {
                     .cloned()
                     .ok_or_else(|| {
                         MobError::Internal(format!(
-                            "the lift planned '{agent_identity}', which has no session binding"
+                            "the lift's plan reached '{agent_identity}', which has no session binding"
                         ))
                     })?;
                 Ok(ExplicitResumeBootMember {
@@ -275,7 +322,7 @@ impl MobActor {
                     agent_identity,
                     resume_attempt: resume_attempt.clone(),
                     wake_attempt,
-                    authorized: true,
+                    authorized,
                 })
             })
             .collect()
@@ -361,22 +408,25 @@ impl MobActor {
     /// resume settles it once that attempt closes. The first refusal is
     /// returned after every member was tried; a member whose join was refused
     /// is still materialized by its wake, the resume only does not wait for
-    /// it. Every planned wake is watched until it closes either way: its
-    /// close frees its slot of the plan.
+    /// it. A wake the plan only watches (a delivery's) gets no input. Every
+    /// wake of the round is watched until it closes either way: its close
+    /// frees its slot of the plan.
     pub(super) fn join_explicit_resume_boot_members(
         &mut self,
         members: Vec<ExplicitResumeBootMember>,
     ) -> Result<(), MobError> {
         let mut first_error = None;
         for mut member in members {
-            if let Err(error) = self.apply_dsl_input(
-                mob_dsl::MobMachineInput::AuthorizeExplicitResumeMember {
-                    attempt: member.resume_attempt.clone(),
-                    agent_identity: mob_dsl::AgentIdentity::from_domain(&member.agent_identity),
-                    binding: member.binding.clone(),
-                },
-                "join_explicit_resume_boot_member",
-            ) {
+            if member.authorized
+                && let Err(error) = self.apply_dsl_input(
+                    mob_dsl::MobMachineInput::AuthorizeExplicitResumeMember {
+                        attempt: member.resume_attempt.clone(),
+                        agent_identity: mob_dsl::AgentIdentity::from_domain(&member.agent_identity),
+                        binding: member.binding.clone(),
+                    },
+                    "join_explicit_resume_boot_member",
+                )
+            {
                 first_error.get_or_insert(error);
                 member.authorized = false;
             }

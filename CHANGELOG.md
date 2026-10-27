@@ -530,7 +530,8 @@ them.
   earlier one finishes. A member the lift has not reached yet stays dormant,
   so its wake timeout does not run while it waits, and a message or an
   operation for it wakes it at once, never queued behind the lift; the lift
-  then leaves it to that wake. The lift also observes the members it
+  then waits for that wake and, if it ends with the member still dormant,
+  wakes the member itself. The lift also observes the members it
   rebuilds (members still materialized in the process) at most that many at
   a time. On a host store each such wake or observation may read the
   member's stored session.

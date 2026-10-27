@@ -7,7 +7,9 @@
 //! applies `PlanBootMaterialization` to the next member only while fewer
 //! than the restore concurrency of its wakes are open: a member it has not
 //! reached stays Dormant, with no wake attempt (so no wake bound runs for
-//! it), and a delivery wakes it at once through a wake of its own. The rows
+//! it), and a delivery wakes it at once through a wake of its own. When the
+//! plan reaches a member a delivery woke first, it watches that wake and
+//! applies its input once the wake leaves the member Dormant again. The rows
 //! hold the members' cold restores at the wake restore probe and read each
 //! member's phase and wake attempt from the machine state the actor
 //! publishes.
@@ -17,7 +19,7 @@
 use super::*;
 use crate::machines::mob_machine as dsl;
 use crate::runtime::MemberRestorePolicy;
-use crate::runtime::actor::member_wake::MemberWakeOutcome;
+use crate::runtime::actor::member_wake::{MemberWakeFailure, MemberWakeOutcome};
 use crate::runtime::actor::member_wake_turn::probe_member_wake_restores_for_test;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -36,13 +38,17 @@ const BOUND: usize = 2;
 /// bound.
 const MEMBERS: usize = 5;
 
+/// The wake bound of the row that lets a delivery's wake time out: far above
+/// what a wake of the mock service takes, and it ends the wake held past it.
+const WAKE_BOUND: Duration = Duration::from_secs(2);
+
 fn worker(index: usize) -> AgentIdentity {
     AgentIdentity::from(format!("plan-bound-{index}"))
 }
 
 /// A stopped mob of `MEMBERS` turn-driven workers after a restart: the
 /// resumed handle is Stopped, every member Dormant, and its builder asked for
-/// the Eager policy at restore concurrency `BOUND`.
+/// the Eager policy at the row's restore concurrency (and wake bound).
 struct StoppedMob {
     handle: MobHandle,
     service: Arc<MockSessionService>,
@@ -51,7 +57,12 @@ struct StoppedMob {
 }
 
 impl StoppedMob {
+    /// At restore concurrency `BOUND`, with the default wake bound.
     async fn new(label: &str) -> Self {
+        Self::configured(label, BOUND, None).await
+    }
+
+    async fn configured(label: &str, bound: usize, wake_bound: Option<Duration>) -> Self {
         let definition = with_unique_mob_id(sample_definition(), label);
         let service = Arc::new(MockSessionService::new());
         let _ = service.enable_runtime_adapter();
@@ -80,14 +91,17 @@ impl StoppedMob {
         let _ = restarted.enable_runtime_adapter();
         crash_stop_and_release_routes(handle).await;
         drop(service);
-        let builder = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        let mut builder = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
             events,
             runtime_metadata,
         ))
         .with_session_service(restarted.clone())
         .notify_orchestrator_on_resume(false)
         .with_member_restore_policy(MemberRestorePolicy::Eager)
-        .with_resume_restore_concurrency(BOUND);
+        .with_resume_restore_concurrency(bound);
+        if let Some(wake_bound) = wake_bound {
+            builder = builder.with_member_wake_timeout(wake_bound);
+        }
         let handle = tokio::time::timeout(STEP, Box::pin(builder.resume()))
             .await
             .expect("the restart answers")
@@ -169,6 +183,25 @@ impl StoppedMob {
             .member_wake_attempt_sequence
     }
 
+    /// `identity`'s open wake attempt, as the actor last published it.
+    fn wake_attempt_of(&self, identity: &AgentIdentity) -> Option<u64> {
+        self.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_wake_attempts
+            .get(&dsl::AgentIdentity::from_domain(identity))
+            .copied()
+    }
+
+    /// Wait, bounded by `STEP`, until the published state satisfies `done`;
+    /// whether it did.
+    async fn wait_for_state(&self, done: impl Fn(&dsl::MobMachineState) -> bool) -> bool {
+        let mut published = self.handle.machine_state_watch_rx.clone();
+        tokio::time::timeout(STEP, published.wait_for(done))
+            .await
+            .is_ok_and(|seen| seen.is_ok())
+    }
+
     /// Wait, bounded by `STEP`, until the published state holds every member
     /// Live with no wake attempt open. A lift that answered before its plan's
     /// last wakes closed (a failed lift) is read after them.
@@ -178,18 +211,15 @@ impl StoppedMob {
             .iter()
             .map(|(identity, _)| dsl::AgentIdentity::from_domain(identity))
             .collect();
-        let mut published = self.handle.machine_state_watch_rx.clone();
-        let _ = tokio::time::timeout(
-            STEP,
-            published.wait_for(|state| {
+        let _ = self
+            .wait_for_state(|state| {
                 members.iter().all(|id| {
                     state.member_materialization.get(id)
                         == Some(&dsl::MemberMaterializationPhase::Live)
                         && !state.member_wake_attempts.contains_key(id)
                 })
-            }),
-        )
-        .await;
+            })
+            .await;
     }
 
     /// How many times the restarted service built each member's session.
@@ -471,6 +501,159 @@ async fn a_peer_message_wakes_a_member_the_lift_has_not_reached_at_once() {
         mob.wake_attempts() - attempts_before,
         MEMBERS as u64,
         "each member woke under exactly one attempt: the plan woke none a second time"
+    );
+    assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
+}
+
+/// At restore concurrency 1, while the plan's first wake is held, a peer
+/// message wakes the last member through a wake of its own, held at its
+/// restore. The plan wakes the other members and reaches the last one while
+/// that wake runs: it applies nothing to it and watches the wake. The wake's
+/// bound then expires (the delivery is answered with the wake timeout) and
+/// leaves the member Dormant again, owing nothing of its own. The plan
+/// reaches it again and applies its input: the member wakes again under one
+/// more attempt, held at its restore while the lift's attempt stays open,
+/// and ends Live once released. The timed-out restore is ended at its start
+/// before it reads anything, so no provision of it overlaps the new one. The
+/// lift's own result is read last.
+///
+/// RED at 642f917f8d (the plan skipped a member no longer Dormant): the plan
+/// applied nothing to the member and did not watch its wake, so the lift
+/// finished with the other members; once that wake timed out nothing woke
+/// the member again: no second restore starts, the lift's attempt is closed
+/// and the member stays Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_a_delivery_woke_first_is_planned_once_that_wake_leaves_it_dormant() {
+    let mob = StoppedMob::configured("lift-plan-rewake", 1, Some(WAKE_BOUND)).await;
+    let first = worker(0);
+    let woken = worker(MEMBERS - 1);
+    let probe =
+        probe_member_wake_restores_for_test(mob.handle.mob_id(), [first.clone(), woken.clone()]);
+    // The plan's later wake of the member is held at its restore too.
+    probe.hold(&woken, 2);
+    let attempts_before = mob.wake_attempts();
+    let lift = mob.lift();
+
+    // The plan's first wake is held at its restore; then a peer message wakes
+    // the last member through a wake of its own, held at its restore too.
+    let first_held = tokio::time::timeout(STEP, probe.wait_for_started(1))
+        .await
+        .is_ok();
+    let answer = mob
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| crate::runtime::state::MobCommand::WakeMember {
+            agent_identity: woken.clone(),
+            cause: dsl::MemberWakeCause::PeerDelivery,
+            observed_missing: false,
+            input_class: dsl::PeerInputClass::Content,
+            sender_waking: false,
+            reply_tx,
+        })
+        .await
+        .expect("the peer wake reaches the actor");
+    let woken_held = tokio::time::timeout(STEP, probe.wait_for_started(2))
+        .await
+        .is_ok();
+    let own_attempt = mob.wake_attempt_of(&woken);
+
+    // The plan wakes the other members one at a time and reaches the last
+    // one while its own wake is still held.
+    probe.release(&first);
+    let others = &mob.sessions[..MEMBERS - 1];
+    let others_live = mob
+        .wait_for_state(|state| {
+            others.iter().all(|(identity, _)| {
+                state
+                    .member_materialization
+                    .get(&dsl::AgentIdentity::from_domain(identity))
+                    == Some(&dsl::MemberMaterializationPhase::Live)
+            })
+        })
+        .await;
+    let at_reach = (mob.residency()[&woken], mob.wake_attempt_of(&woken));
+
+    // The held wake's bound expires: the delivery is answered with the wake
+    // timeout. Its restore is ended at its start, before it reads anything.
+    let delivery = tokio::time::timeout(STEP, answer).await;
+    probe.abort(&woken, 1);
+
+    // The plan reaches the member again and applies its input: its second
+    // restore starts, held, under a new attempt, and the lift waits for it.
+    let replanned = tokio::time::timeout(STEP, probe.wait_for_started(MEMBERS + 1))
+        .await
+        .is_ok();
+    let replanned_attempt = mob.wake_attempt_of(&woken);
+    let lift_open = mob
+        .handle
+        .machine_state_watch_rx
+        .borrow()
+        .explicit_resume_attempt
+        .is_some();
+    probe.release(&woken);
+    let lifted = mob.join_lift(lift).await;
+    mob.settle_live().await;
+
+    assert!(
+        first_held && woken_held,
+        "the plan's first restore and the delivery's restore are held"
+    );
+    assert!(
+        own_attempt.is_some(),
+        "the peer message woke the member under an attempt of its own"
+    );
+    assert!(
+        others_live,
+        "the plan woke the other members while the member's own wake was held"
+    );
+    assert_eq!(
+        at_reach,
+        (
+            (Some(dsl::MemberMaterializationPhase::Waking), true),
+            own_attempt
+        ),
+        "once the plan woke every other member, the member is still Waking under its own wake: the plan opened no wake of its own for it"
+    );
+    assert!(
+        matches!(
+            delivery,
+            Ok(Ok(Err(MemberWakeFailure::Refused(
+                crate::MemberWakeRefusal::WakeTimedOut
+            ))))
+        ),
+        "the delivery's wake timed out: {delivery:?}"
+    );
+    assert!(
+        replanned,
+        "the plan applied the member's input again: its second restore started"
+    );
+    assert!(
+        replanned_attempt.is_some() && replanned_attempt != own_attempt,
+        "the member woke again under one more attempt: {own_attempt:?}, then {replanned_attempt:?}"
+    );
+    assert_eq!(
+        probe
+            .started()
+            .iter()
+            .filter(|identity| **identity == woken)
+            .count(),
+        2,
+        "the member's restore started twice: the delivery's, then the plan's"
+    );
+    for (identity, (phase, attempt)) in mob.residency() {
+        assert_eq!(
+            (phase, attempt),
+            (Some(dsl::MemberMaterializationPhase::Live), false),
+            "{identity} ends Live"
+        );
+    }
+    assert_eq!(
+        mob.wake_attempts() - attempts_before,
+        MEMBERS as u64 + 1,
+        "one attempt per member, and one more for the member the plan reached again"
+    );
+    assert!(
+        lift_open,
+        "the lift waited for the member's second wake (a refused join also ends it early)"
     );
     assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
 }
