@@ -4398,6 +4398,16 @@ impl<'a> MachineSessionArchiveProtocol<'a> {
 }
 
 impl<B: SessionAgentBuilder + 'static> PersistentSessionService<B> {
+    /// The auth binding a build of this service that names `auth_binding`
+    /// records in its session's metadata (see
+    /// [`SessionAgentBuilder::recorded_auth_binding`]).
+    pub async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        self.inner.recorded_auth_binding(auth_binding).await
+    }
+
     /// Commit one typed instruction activation while the caller holds this
     /// session's runtime-turn finalization boundary.
     ///

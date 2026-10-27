@@ -5070,6 +5070,8 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     "meerkat-comms-runtime-test-projection",
                 ),
+                residency_owner:
+                    meerkat_runtime::meerkat_machine::dsl::SessionResidencyOwner::Session,
             },
             "test_projection_add_authority::prepare_bindings",
         )
@@ -5196,6 +5198,8 @@ mod tests {
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(
                     "meerkat-comms-runtime-test-projection",
                 ),
+                residency_owner:
+                    meerkat_runtime::meerkat_machine::dsl::SessionResidencyOwner::Session,
             },
             "test_projection_remove_authority::prepare_bindings",
         )

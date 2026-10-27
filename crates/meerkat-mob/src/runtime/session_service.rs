@@ -2129,6 +2129,19 @@ pub trait MobSessionService:
             })
     }
 
+    /// The auth binding a build of this service that names `auth_binding`
+    /// records in its session's metadata: the same binding stamped with the
+    /// realm that declares it. `Ok(None)` when this service does not resolve
+    /// bindings, so a caller compares the named form alone (the default). A
+    /// wrapper over a builder-backed service forwards it.
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        let _ = auth_binding;
+        Ok(None)
+    }
+
     /// Read the latest committed retained metadata for this exact session id.
     ///
     /// Archived sessions remain observable through this metadata-only seam.
@@ -2587,6 +2600,14 @@ where
             .await;
         #[cfg(target_arch = "wasm32")]
         let _ = session_id;
+    }
+
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        meerkat_session::EphemeralSessionService::<B>::recorded_auth_binding(self, auth_binding)
+            .await
     }
 
     async fn predecessor_tool_restrictions(
@@ -3369,6 +3390,14 @@ where
             .await;
         #[cfg(target_arch = "wasm32")]
         let _ = session_id;
+    }
+
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        meerkat_session::PersistentSessionService::<B>::recorded_auth_binding(self, auth_binding)
+            .await
     }
 
     async fn append_system_notice_under_runtime_turn_boundary(

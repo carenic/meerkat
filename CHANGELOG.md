@@ -76,10 +76,19 @@ them.
 - `meerkat-runtime`: `meerkat_machine::composition::MeerkatSeamSignal::RuntimeBound`
   gains `runtime_epoch_id`, and the enum gains `RuntimeRegistrationReleased {
   agent_runtime_id, fence_token, runtime_epoch_id }`. Every final unregister of
-  a session registration (the idle-executor teardown included) now publishes
-  the released registration to the mob that owns the session, once the
-  unregister committed; the mob demotes exactly that materialization of its
-  member to dormant, and a release for any other registration changes nothing.
+  a session registration now publishes the released registration to the mob
+  that owns the session, once the unregister committed; the mob demotes exactly
+  that materialization of its member to dormant, and a release for any other
+  registration changes nothing.
+- Behaviour: a Resume-mode spawn (attaching an existing session, an idempotent
+  `ensure_member` that resumes a session) whose session has a live actor
+  reuses that actor only when it runs the auth binding the spec names: the
+  binding the session recorded is the named one, or the form a build of it
+  records (stamped with the realm that declares it). Otherwise the spawn is
+  refused with the new `MobError::MemberAuthBindingConflict { member_id,
+  session_id, requested, recorded }` (wire code `INVALID_PARAMS`, structured
+  data kind `member_auth_binding_conflict`), and nothing changes. Before, the
+  live actor was reused on whatever binding it ran.
 
 ### Added
 
@@ -125,6 +134,14 @@ them.
   through which a session-keyed live operation on a session that has no live
   actor asks the session's owner (a mob, for a dormant member's session) to
   wake it first. Interrupts and reads never wake.
+- `meerkat-session`: `SessionAgentBuilder::recorded_auth_binding` (default
+  `Ok(None)`), with `EphemeralSessionService::recorded_auth_binding` and
+  `PersistentSessionService::recorded_auth_binding` forwarding to it: the
+  auth binding a build that names a binding records in its session's
+  metadata, stamped with the realm that declares it. `FactoryAgentBuilder`
+  answers it from the config a build reads. `meerkat-mob`:
+  `MobSessionService::recorded_auth_binding` (default `Ok(None)`) forwards it
+  for the session services.
 
 ### Changed
 
@@ -161,8 +178,38 @@ them.
   so for several members at once, in no fixed order across members; each
   member's own calls keep their order.
 
+- `meerkat-runtime`: a mob member's runtime registration keeps serving after
+  an empty resume (a background operation's completion waking an idle
+  member, or the same wake recovered at a start, that finds nothing pending).
+  The registration retires only on MeerkatMachine's verdict, and the verdict
+  keeps a registration the mob's composition placed (a member's, a placed
+  member's on its host) and one with input queued; a standalone session's
+  registration still retires as before. Before, every such completion
+  detached the member and terminated its other running operations, and peer
+  messages to it found no route until it was revived.
+- `meerkat`: a build that continues a session that already had a model
+  request (a restart, a wake, a revival or a reload of a session) waits for
+  its MCP servers to connect before its first request, bounded by their
+  connect timeout, so that request carries the same tools array as the
+  requests before the rebuild and the provider's prompt cache still matches.
+  A server still connecting at the bound keeps connecting in the background,
+  as before, with a warning. A new session's first build does not wait.
+- `meerkat-mob`: a member's per-spawn external tools (a spawn customizer's or
+  a spawn request's) are listed in name order, whatever order the host
+  returns them in, so a member rebuilt by a wake, which asks the customizer
+  again, sends the tools array it sent before.
+- `meerkat-mob`: `MemberBuildPreparer::member_built` is also told about every
+  member a spawn builds live, once its activation committed (a fresh spawn,
+  a held create once activated, a respawn), not only about woken and
+  restored members, so a host records the tool surface of every member Core
+  built.
+
 ### Fixed
 
+- `meerkat-mob`: a wake feedback MobMachine has no transition for (a
+  precondition no longer holds) closes the member's wake attempt, leaving the
+  member dormant for its next delivery, instead of leaving the attempt open
+  until its bound.
 - `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
   of a stopped mob, a revival or registration reload of a missing live
   materialization, and a Resume-mode spawn such as attaching an existing

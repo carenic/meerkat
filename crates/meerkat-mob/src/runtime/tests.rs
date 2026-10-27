@@ -214,6 +214,7 @@ fn initialized_test_peer_projection_dsl(session_id: String) -> TestMeerkatMachin
             generation: Some(meerkat_runtime::meerkat_machine::dsl::Generation::from(0)),
             runtime_epoch_id: None,
             session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(session_id),
+            residency_owner: meerkat_runtime::meerkat_machine::dsl::SessionResidencyOwner::Session,
         },
         "test::prepare_bindings",
     )
@@ -2296,6 +2297,11 @@ struct MockSessionService {
     /// [`Self::set_session_active`], which also publishes the change to
     /// every activity subscription a stop holds.
     active_sessions: RwLock<HashSet<SessionId>>,
+    /// The form a build records for a named auth binding, as a
+    /// builder-backed service resolves it (`recorded_auth_binding`); a
+    /// binding not listed resolves to `None`.
+    recorded_auth_binding_forms:
+        std::sync::Mutex<Vec<(meerkat_core::AuthBindingRef, meerkat_core::AuthBindingRef)>>,
     /// Per-session activity flags handed to `subscribe_session_activity`.
     activity_flags: std::sync::Mutex<HashMap<SessionId, tokio::sync::watch::Sender<bool>>>,
     /// Sessions whose turn keeps winding down after an interrupt: their
@@ -2483,6 +2489,7 @@ impl MockSessionService {
             session_event_subscribe_barriers: RwLock::new(HashMap::new()),
             session_event_subscribe_started: tokio::sync::Notify::new(),
             active_sessions: RwLock::new(HashSet::new()),
+            recorded_auth_binding_forms: std::sync::Mutex::new(Vec::new()),
             activity_flags: std::sync::Mutex::new(HashMap::new()),
             wind_down_held_sessions: RwLock::new(HashSet::new()),
             interrupt_gates: RwLock::new(HashMap::new()),
@@ -2963,6 +2970,41 @@ impl MockSessionService {
     fn set_fail_inject(&self, enabled: bool) {
         self.fail_inject
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// A build that names `named` records `recorded` (the owner-stamped form
+    /// a builder-backed service resolves).
+    fn resolve_recorded_auth_binding(
+        &self,
+        named: meerkat_core::AuthBindingRef,
+        recorded: meerkat_core::AuthBindingRef,
+    ) {
+        self.recorded_auth_binding_forms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push((named, recorded));
+    }
+
+    /// Record `binding` as the auth binding `session_id`'s build recorded in
+    /// its metadata, live and persisted, as the agent factory records it.
+    async fn record_session_auth_binding(
+        &self,
+        session_id: &SessionId,
+        binding: meerkat_core::AuthBindingRef,
+    ) {
+        let mut session = self
+            .persisted_session_clone(session_id)
+            .await
+            .expect("a stored session");
+        let mut metadata = session
+            .try_session_metadata()
+            .expect("the session metadata decodes")
+            .expect("the session has metadata");
+        metadata.auth_binding = Some(binding);
+        session
+            .set_session_metadata(metadata)
+            .expect("the session metadata encodes");
+        self.replace_live_session(session).await;
     }
 
     /// Mark `session_id`'s turn active or ended, as the real service's
@@ -5211,6 +5253,19 @@ impl MockSessionService {
 
 #[async_trait]
 impl MobSessionService for MockSessionService {
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        Ok(self
+            .recorded_auth_binding_forms
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .find(|(named, _)| named == auth_binding)
+            .map(|(_, recorded)| recorded.clone()))
+    }
+
     async fn controller_route_under_runtime_turn_boundary(
         &self,
         actor: &meerkat_session::LiveSessionActorWitness,
@@ -66168,6 +66223,147 @@ async fn an_attached_session_builds_on_the_specs_binding_not_the_recorded_one() 
         Some(scoped_auth_binding()),
         "the attached session builds on the spec's binding, not the recorded one"
     );
+}
+
+fn other_auth_binding() -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::parse("tenant_b").expect("realm id"),
+        binding: meerkat_core::BindingId::parse("other").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+/// [`scoped_auth_binding`] as a build records it when the binding is
+/// declared by an ancestor realm of `tenant_a`: stamped with that owner.
+fn owner_stamped_scoped_auth_binding() -> meerkat_core::AuthBindingRef {
+    meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::global(),
+        binding: meerkat_core::BindingId::parse("scoped").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    }
+}
+
+/// A session with a live actor running a turn (so a Resume-mode spawn of it
+/// takes the live-reuse path) whose build recorded `recorded`.
+async fn live_session_on_binding_for_test(
+    service: &MockSessionService,
+    identity: &AgentIdentity,
+    recorded: meerkat_core::AuthBindingRef,
+) -> SessionId {
+    let created = service
+        .create_session(CreateSessionRequest {
+            injected_context: Vec::new(),
+            model: "claude-sonnet-4-5".to_string(),
+            prompt: "live session".to_string().into(),
+            system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            build: Some(meerkat_core::service::SessionBuildOptions {
+                comms_name: Some(
+                    super::actor::render_member_comms_name(
+                        sample_definition().id.as_str(),
+                        "worker",
+                        identity.as_str(),
+                    )
+                    .expect("comms name"),
+                ),
+                ..Default::default()
+            }),
+            initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+            deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+            labels: None,
+        })
+        .await
+        .expect("create the live session");
+    service
+        .record_session_auth_binding(&created.session_id, recorded)
+        .await;
+    service.set_session_active(&created.session_id, true).await;
+    created.session_id
+}
+
+/// A Resume-mode spawn reuses a session's live actor only when that actor
+/// runs the binding the spec names. Another binding is refused typed, with
+/// both bindings named; nothing is built and nothing is seated.
+#[tokio::test]
+async fn a_resume_never_reuses_a_live_actor_on_another_binding() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("live-other-binding");
+    let session = live_session_on_binding_for_test(&service, &identity, other_auth_binding()).await;
+    let builds = service.recorded_create_requests().await.len();
+    let mut spec = resume_launch_spec_for_test(&identity, &session);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec.auth_binding = Some(scoped_auth_binding());
+
+    let refused = handle.spawn_spec(spec).await;
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::MemberAuthBindingConflict {
+                member_id,
+                session_id,
+                requested,
+                recorded,
+            }) if member_id == &identity
+                && session_id == &session
+                && requested == &scoped_auth_binding()
+                && recorded.as_ref() == Some(&other_auth_binding())
+        ),
+        "a live actor on another binding is not reused: {refused:?}"
+    );
+    assert_eq!(
+        service.recorded_create_requests().await.len(),
+        builds,
+        "nothing was built"
+    );
+    assert!(
+        handle
+            .get_member(&identity)
+            .await
+            .expect("roster read")
+            .is_none(),
+        "nothing was seated"
+    );
+}
+
+/// A live actor that runs the spec's binding is reused, whether its session
+/// recorded the binding as the spec names it or as a build of it records it
+/// (stamped with the realm that declares it). Nothing is rebuilt.
+#[tokio::test]
+async fn a_resume_reuses_a_live_actor_on_the_specs_binding_in_either_form() {
+    for (label, recorded) in [
+        ("live-named-binding", scoped_auth_binding()),
+        ("live-owner-binding", owner_stamped_scoped_auth_binding()),
+    ] {
+        let (handle, service) = create_test_mob(sample_definition()).await;
+        service.resolve_recorded_auth_binding(
+            scoped_auth_binding(),
+            owner_stamped_scoped_auth_binding(),
+        );
+        let identity = AgentIdentity::from(label);
+        let session = live_session_on_binding_for_test(&service, &identity, recorded).await;
+        let builds = service.recorded_create_requests().await.len();
+        let mut spec = resume_launch_spec_for_test(&identity, &session);
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        spec.auth_binding = Some(scoped_auth_binding());
+
+        handle
+            .spawn_spec(spec)
+            .await
+            .unwrap_or_else(|error| panic!("{label}: the live actor is reused: {error:?}"));
+        assert_eq!(
+            handle.resolve_bridge_session_id(&identity).await.as_ref(),
+            Some(&session),
+            "{label}: the member is seated on the live session"
+        );
+        assert_eq!(
+            service.recorded_create_requests().await.len(),
+            builds,
+            "{label}: the reuse builds nothing"
+        );
+    }
 }
 
 /// #1249: the heavy part of a local Spawn (here the resume-session activity

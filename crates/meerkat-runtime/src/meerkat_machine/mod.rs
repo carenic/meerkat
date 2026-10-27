@@ -13962,7 +13962,7 @@ impl MeerkatMachine {
         }
         // Actor materialization takes the generated authority before its
         // process claim even outside M. Keep the same order here.
-        let authority = entry
+        let mut authority = entry
             .dsl_authority
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -14026,6 +14026,26 @@ impl MeerkatMachine {
                     .into(),
             });
         }
+        // The composition takes its custody back through the machine: a
+        // recovered registration starts session-owned (residency is not
+        // persisted), and the composition's claim of the exact recovered
+        // binding marks it Composition-owned again, so an empty resume keeps
+        // the recovered member serving.
+        dsl::MeerkatMachineMutator::apply(
+            &mut *authority,
+            dsl::MeerkatMachineInput::ClaimCompositionResidency {
+                session_id: dsl::SessionId::from_domain(session_id),
+                agent_runtime_id: runtime_id,
+                fence_token: fence,
+                generation,
+            },
+        )
+        .map_err(|error| RuntimeDriverError::StaleAuthority {
+            reason: format!(
+                "composition recovery could not claim the recovered registration's residency: {}",
+                dsl_authority::map_error(error, "ClaimCompositionResidency")
+            ),
+        })?;
         drop(authority);
         drop(claim);
         entry.composition_signal_dispatcher = Some(dispatcher);

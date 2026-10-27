@@ -317,6 +317,35 @@ impl AssemblyConsequencePolicy {
     }
 }
 
+/// How long a rebuilt session waits for its MCP servers to connect before its
+/// first request: the longest connect timeout among the servers it connects
+/// (each server's `connect_timeout_secs`, or the MCP client's default, which
+/// also bounds the servers a session attached live). `None` when this build
+/// connects no MCP server, so it waits for nothing.
+#[cfg(all(feature = "mcp", not(target_arch = "wasm32")))]
+fn rebuilt_session_mcp_wait_bound(
+    servers: &[meerkat_core::mcp_config::McpServerConfig],
+) -> Option<std::time::Duration> {
+    if servers.is_empty() {
+        return None;
+    }
+    let default_secs = meerkat_mcp::McpConnection::DEFAULT_CONNECT_TIMEOUT_SECS;
+    let secs = servers
+        .iter()
+        .map(|server| server.connect_timeout_secs.unwrap_or(default_secs))
+        .fold(default_secs, u32::max);
+    Some(std::time::Duration::from_secs(u64::from(secs)))
+}
+
+/// Without the native MCP client a build connects no MCP server, so a rebuilt
+/// session has none to wait for.
+#[cfg(not(all(feature = "mcp", not(target_arch = "wasm32"))))]
+fn rebuilt_session_mcp_wait_bound(
+    _servers: &[meerkat_core::mcp_config::McpServerConfig],
+) -> Option<std::time::Duration> {
+    None
+}
+
 /// A trusted host's composition of one construction's own MCP router adapter.
 ///
 /// Called once per construction that creates a router for its configured MCP
@@ -9060,19 +9089,46 @@ impl AgentFactory {
             None
         };
 
-        // 11f. Wait for pending MCP connections when requested.
+        // 11f. Wait for pending MCP connections when requested, and before a
+        // rebuilt session's first request.
         //
         // poll_external_updates() is forwarded through the full dispatcher
-        // chain (CompositeDispatcher → ToolGateway → McpRouterAdapter), so
+        // chain (CompositeDispatcher -> ToolGateway -> McpRouterAdapter), so
         // this drains background MCP connection results regardless of how
         // many dispatchers are composed.
         //
-        // The contract is unconditional: `wait_for_mcp` blocks until every
-        // server finishes connecting (success or failure). Connection-timeout
-        // policy is owned by the per-server `connect_timeout_secs` in the MCP
-        // client — the factory does NOT own a second, hard-coded timeout that
-        // silently releases the first turn while servers are still pending.
-        if build_config.wait_for_mcp {
+        // `wait_for_mcp` blocks until every server finishes connecting
+        // (success or failure). Connection-timeout policy is owned by the
+        // per-server `connect_timeout_secs` in the MCP client - the factory
+        // does NOT own a second, hard-coded timeout that silently releases
+        // the first turn while servers are still pending.
+        //
+        // A rebuild (a build that continues a session that already had a
+        // model request: a restart, a wake, a revival or a reload) waits too,
+        // bounded by its servers' connect timeout. A server still connecting
+        // forces the deferred catalog mode, so a first request sent before it
+        // connects carries a different tools array than the session's
+        // requests before the rebuild, and the provider's prompt cache
+        // misses. A server still pending at the bound keeps connecting in the
+        // background, exactly as without the wait, and the bound is reported
+        // with a WARN. A session with no model response yet has no cached
+        // prefix to keep, so its build does not wait.
+        let rebuilds_a_requested_session = build_config.resume_session_intent
+            == meerkat_core::SessionBuildIntent::Resume
+            && build_config.resume_session.as_ref().is_some_and(|resumed| {
+                resumed.messages().iter().any(|message| {
+                    matches!(message, meerkat_core::types::Message::BlockAssistant(_))
+                })
+            });
+        let rebuild_mcp_wait_bound = if !build_config.wait_for_mcp && rebuilds_a_requested_session {
+            rebuilt_session_mcp_wait_bound(&build_config.mcp_servers)
+        } else {
+            None
+        };
+        if build_config.wait_for_mcp || rebuild_mcp_wait_bound.is_some() {
+            #[cfg(not(target_arch = "wasm32"))]
+            let rebuild_deadline =
+                rebuild_mcp_wait_bound.map(|bound| tokio::time::Instant::now() + bound);
             loop {
                 let update = tools.poll_external_updates().await;
                 // This wait consumes the same completed notices as a model
@@ -9084,6 +9140,16 @@ impl AgentFactory {
                     }
                 }
                 if update.pending.is_empty() {
+                    break;
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                if rebuild_deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline)
+                {
+                    tracing::warn!(
+                        session_id = %session.id(),
+                        pending = ?update.pending,
+                        "a rebuilt session's MCP servers were still connecting at their connect timeout; its first request goes out without their tools, and they keep connecting in the background"
+                    );
                     break;
                 }
                 #[cfg(not(target_arch = "wasm32"))]
@@ -13195,6 +13261,58 @@ mod tests {
         }
     }
 
+    /// A build records an explicitly named auth binding stamped with the
+    /// realm that declares it. The session builder answers that form for a
+    /// named binding, so a caller can match a binding it names with the one
+    /// a session recorded: an inherited binding is answered under its owner,
+    /// a realm's own binding as named, and a binding no realm declares is an
+    /// error.
+    #[tokio::test]
+    async fn the_session_builder_answers_the_recorded_form_of_a_named_binding() {
+        use meerkat_session::SessionAgentBuilder as _;
+        let mut config = Config::default();
+        config.realm.insert(
+            "global".to_string(),
+            inline_realm_section(&[("openai", "test-key")]),
+        );
+        config.realm.insert(
+            "tenant_child".to_string(),
+            inline_realm_section(&[("anthropic", "test-key")]),
+        );
+        let temp = tempfile::tempdir().expect("temp root");
+        let builder = crate::FactoryAgentBuilder::new(
+            AgentFactory::new(temp.path().join("sessions")),
+            config,
+        );
+
+        assert_eq!(
+            builder
+                .recorded_auth_binding(&configured_auth_binding("tenant_child", "default_openai"))
+                .await
+                .expect("an inherited binding resolves"),
+            Some(configured_auth_binding("global", "default_openai")),
+            "an inherited binding is recorded under the realm that declares it"
+        );
+        assert_eq!(
+            builder
+                .recorded_auth_binding(&configured_auth_binding(
+                    "tenant_child",
+                    "default_anthropic"
+                ))
+                .await
+                .expect("a realm's own binding resolves"),
+            Some(configured_auth_binding("tenant_child", "default_anthropic")),
+            "a realm's own binding is recorded as named"
+        );
+        assert!(
+            builder
+                .recorded_auth_binding(&configured_auth_binding("tenant_child", "missing"))
+                .await
+                .is_err(),
+            "a binding no realm declares does not resolve"
+        );
+    }
+
     /// A realm whose OpenAI binding is the private ChatGPT backend.
     fn chatgpt_backend_cache_config() -> (Config, AuthBindingRef) {
         let mut config = Config::default();
@@ -14060,9 +14178,11 @@ mod tests {
         }
 
         /// A child whose durable ceiling witnessed the parent's MCP tools is
-        /// resumed with the retained handoff while its own connection is
-        /// pending again: the ceiling survives the reconnect, and the tool is
-        /// requested, lists and dispatches once the child reconnects.
+        /// resumed with the retained handoff. The resume rebuilds a session
+        /// that already had a model request, so its build reconnects the
+        /// child's own server before the first request (bounded by the
+        /// server's connect timeout): the ceiling survives the reconnect, and
+        /// the tool is requested, lists and dispatches.
         #[tokio::test]
         async fn a_resumed_child_keeps_its_witnessed_mcp_ceiling_across_a_reconnect() {
             let temp = tempfile::tempdir().expect("temp root");
@@ -14102,7 +14222,8 @@ mod tests {
             let session = first.session().clone();
             first.release_owned_resources().await;
 
-            // Resumed with the retained handoff; the connection is pending again.
+            // Resumed with the retained handoff: the rebuild reconnects the
+            // child's own server.
             let mut resumed = build_child(
                 &factory,
                 session,
@@ -14112,15 +14233,11 @@ mod tests {
                 &captured,
             )
             .await
-            .expect("the resume builds while the child's own connection is pending");
+            .expect("the resume builds");
             let adapter = last_adapter(&observed);
-            let pending = resumed.tool_scope_snapshot().expect("resumed scope");
-            assert!(
-                !names_contain(&pending.known_base_names, "echo"),
-                "precondition: the resumed child's connection is pending: {pending:?}"
-            );
+            let rebuilt = resumed.tool_scope_snapshot().expect("resumed scope");
             assert_eq!(
-                &pending.base_filter,
+                &rebuilt.base_filter,
                 ceiling.filter(),
                 "the resumed durable ceiling keeps every witnessed name across the reconnect"
             );
@@ -14159,10 +14276,10 @@ mod tests {
         }
 
         /// An actual incoming narrowing still narrows: a resumed child handed
-        /// a narrower parent snapshot while its connection is pending keeps
-        /// exactly what both ceilings allow. After the reconnect the kept tool
-        /// is requested, lists and dispatches; the narrowed-away tool, though
-        /// mounted, can be neither requested, listed nor called.
+        /// a narrower parent snapshot keeps exactly what both ceilings allow.
+        /// After the reconnect the kept tool is requested, lists and
+        /// dispatches; the narrowed-away tool, though mounted, can be neither
+        /// requested, listed nor called.
         #[tokio::test]
         async fn a_resumed_child_applies_an_incoming_narrowing_to_its_mcp_ceiling() {
             let temp = tempfile::tempdir().expect("temp root");
@@ -14210,15 +14327,11 @@ mod tests {
                 &captured,
             )
             .await
-            .expect("a narrowing resume builds while the narrowed-away source is pending");
+            .expect("a narrowing resume builds");
             let adapter = last_adapter(&observed);
-            let pending = resumed.tool_scope_snapshot().expect("resumed scope");
-            assert!(
-                !names_contain(&pending.known_base_names, "echo"),
-                "precondition: the resumed child's connection is pending: {pending:?}"
-            );
+            let rebuilt = resumed.tool_scope_snapshot().expect("resumed scope");
             assert_eq!(
-                &pending.base_filter,
+                &rebuilt.base_filter,
                 narrowed.filter(),
                 "an incoming narrowing narrows the durable ceiling to what both allow"
             );
@@ -14265,6 +14378,159 @@ mod tests {
 
             resumed.release_owned_resources().await;
             parent.release_owned_resources().await;
+        }
+    }
+
+    /// A rebuild (a build that continues a session that already had a model
+    /// request) waits for the session's MCP servers before its first request,
+    /// bounded by their connect timeout. The rebuilt session's first request
+    /// then carries the tools array it sent before the rebuild, so the
+    /// provider's prompt cache keeps matching. Without the wait, a server
+    /// still connecting forces the deferred catalog and the array changes.
+    #[cfg(all(
+        feature = "test-mcp-oauth-fixtures",
+        feature = "mcp",
+        not(target_arch = "wasm32")
+    ))]
+    mod rebuilt_session_mcp_wait {
+        use super::*;
+        use std::time::Duration;
+
+        type CapturedRequest = Arc<std::sync::Mutex<Option<LlmRequest>>>;
+
+        /// The fixture's one-tool form server (a small catalog, listed
+        /// inline), started only once `gate` exists when one is given.
+        fn form_server(gate: Option<&std::path::Path>) -> meerkat_core::McpServerConfig {
+            let fixture = mcp_test_server::fixture_binary()
+                .to_string_lossy()
+                .to_string();
+            match gate {
+                None => meerkat_core::McpServerConfig::stdio(
+                    "forms",
+                    fixture,
+                    vec!["--form-elicitation".to_string()],
+                    HashMap::new(),
+                ),
+                Some(gate) => meerkat_core::McpServerConfig::stdio(
+                    "forms",
+                    "/bin/sh",
+                    vec![
+                        "-c".to_string(),
+                        "while [ ! -e \"$0\" ]; do sleep 0.02; done; exec \"$1\" --form-elicitation"
+                            .to_string(),
+                        gate.to_string_lossy().to_string(),
+                        fixture,
+                    ],
+                    HashMap::new(),
+                ),
+            }
+        }
+
+        async fn build(
+            factory: &AgentFactory,
+            session: Session,
+            server: meerkat_core::McpServerConfig,
+            wait_for_mcp: bool,
+            captured: &CapturedRequest,
+        ) -> DynAgent {
+            let runtime = meerkat_runtime::MeerkatMachine::ephemeral();
+            let bindings = runtime
+                .prepare_bindings(session.id().clone())
+                .await
+                .expect("session bindings");
+            let mut build = AgentBuildConfig::new("gpt-5.6-sol");
+            build.provider = Some(Provider::OpenAI);
+            build.llm_client_override = Some(Arc::new(CapturingLlmClient {
+                request: Arc::clone(captured),
+            }));
+            build.resume_session = Some(session);
+            build.runtime_build_mode = RuntimeBuildMode::SessionOwned(bindings);
+            build.override_builtins = ToolCategoryOverride::Disable;
+            build.mcp_servers = vec![server];
+            build.wait_for_mcp = wait_for_mcp;
+            factory
+                .build_agent(build, &Config::default())
+                .await
+                .expect("the agent builds")
+        }
+
+        /// One turn; returns every tool its provider request carried, as
+        /// (name, description, input schema).
+        async fn tools_of_a_turn(
+            agent: &mut DynAgent,
+            text: &str,
+            captured: &CapturedRequest,
+        ) -> Vec<(String, String, String)> {
+            agent.set_runtime_execution_kind(Some(
+                meerkat_core::lifecycle::RuntimeExecutionKind::ContentTurn,
+            ));
+            agent
+                .run(meerkat_core::ContentInput::Text(text.into()))
+                .await
+                .expect("an agent turn");
+            captured
+                .lock()
+                .unwrap()
+                .take()
+                .expect("the turn's provider request")
+                .tools
+                .iter()
+                .map(|tool| {
+                    (
+                        tool.name.as_str().to_string(),
+                        tool.description.clone(),
+                        tool.input_schema.to_string(),
+                    )
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn a_rebuilt_session_sends_the_tools_it_sent_before_the_rebuild() {
+            let temp = tempfile::tempdir().expect("temp root");
+            let factory = AgentFactory::new(temp.path().join("sessions")).builtins(false);
+            let captured = CapturedRequest::default();
+
+            // Before the rebuild: the server is connected and its one tool is
+            // listed inline.
+            let mut before =
+                build(&factory, Session::new(), form_server(None), true, &captured).await;
+            let tools_before = tools_of_a_turn(&mut before, "before the rebuild", &captured).await;
+            assert!(
+                tools_before
+                    .iter()
+                    .any(|(name, _, _)| name.contains("mcp_form")),
+                "precondition: the server's tool is listed before the rebuild: {tools_before:?}"
+            );
+            let session = before.session().clone();
+            before.release_owned_resources().await;
+
+            // The rebuild: the same session, its server slower to connect
+            // than a build without a wait takes, and no explicit wait. The
+            // turn runs right after the build.
+            let gate = temp.path().join("server-gate");
+            let opener = {
+                let gate = gate.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1_000)).await;
+                    std::fs::write(&gate, b"open").expect("open the server gate");
+                })
+            };
+            let mut after = build(
+                &factory,
+                session,
+                form_server(Some(&gate)),
+                false,
+                &captured,
+            )
+            .await;
+            let tools_after = tools_of_a_turn(&mut after, "after the rebuild", &captured).await;
+            opener.await.expect("the gate opener");
+            assert_eq!(
+                tools_after, tools_before,
+                "the rebuilt session's first request carries the tools it sent before the rebuild"
+            );
+            after.release_owned_resources().await;
         }
     }
 

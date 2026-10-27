@@ -1509,6 +1509,8 @@ mod tests {
                 generation: Some(meerkat_runtime::meerkat_machine::dsl::Generation::from(0)),
                 runtime_epoch_id: None,
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(session_id),
+                residency_owner:
+                    meerkat_runtime::meerkat_machine::dsl::SessionResidencyOwner::Session,
             },
             "test::prepare_bindings",
         )

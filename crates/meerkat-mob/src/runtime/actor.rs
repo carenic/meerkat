@@ -6666,6 +6666,46 @@ struct DeferredResumeProvision {
     auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
+/// Whether the live actor of `session_id` runs `requested`, the auth binding
+/// a resume of `member` names: the binding its session recorded (persisted
+/// when the actor was built, before it served) is `requested` as named, or
+/// the form a build of `requested` records (stamped with the realm that
+/// declares it). Anything else, a session that recorded no binding
+/// included, refuses the resume typed: a live actor is never reused on
+/// another binding. A read that fails refuses too.
+async fn verify_live_actor_auth_binding(
+    session_service: &dyn super::session_service::MobSessionService,
+    member: &AgentIdentity,
+    session_id: &SessionId,
+    requested: &meerkat_core::AuthBindingRef,
+) -> Result<(), MobError> {
+    let recorded = session_service
+        .load_persisted_session_metadata(session_id)
+        .await
+        .map_err(MobError::SessionError)?
+        .and_then(|view| view.session_metadata)
+        .and_then(|metadata| metadata.auth_binding);
+    if recorded.as_ref() == Some(requested) {
+        return Ok(());
+    }
+    if let Some(recorded_binding) = recorded.as_ref()
+        && session_service
+            .recorded_auth_binding(requested)
+            .await
+            .map_err(MobError::SessionError)?
+            .as_ref()
+            == Some(recorded_binding)
+    {
+        return Ok(());
+    }
+    Err(MobError::MemberAuthBindingConflict {
+        member_id: member.clone(),
+        session_id: session_id.clone(),
+        requested: requested.clone(),
+        recorded,
+    })
+}
+
 impl SpawnProvisionInput {
     fn binding(&self) -> &crate::RuntimeBinding {
         match self {
@@ -34729,6 +34769,18 @@ impl MobActor {
                                 .to_string(),
                         });
                     }
+                    // The live actor is reused below only when it runs the
+                    // binding the spec names; otherwise the resume is refused,
+                    // typed, and nothing is changed.
+                    if let Some(requested) = auth_binding.as_ref() {
+                        verify_live_actor_auth_binding(
+                            preparation_context.session_service.as_ref(),
+                            &agent_identity,
+                            &resume_id,
+                            requested,
+                        )
+                        .await?;
+                    }
                     // Validate interaction-scoped injection for autonomous mode.
                     if selected_runtime_mode == crate::MobRuntimeMode::AutonomousHost
                         && preparation_context.provisioner.interaction_event_injector(&resume_id).await.is_none()
@@ -34915,6 +34967,12 @@ impl MobActor {
                     )
                     .await?;
                     super::tools::attach_declared_bundle_tools(&mut config, precomputed_bundle_tools.clone());
+                    // The spec's binding, as the session path's deferred
+                    // rebuild applies it: a resumed session never keeps the
+                    // binding it recorded under an earlier build.
+                    if let Some(requested) = auth_binding.as_ref() {
+                        config.auth_binding = Some(requested.clone());
+                    }
                     config.tool_dispatch_admission = tool_dispatch_admission.clone();
                     config.keep_alive =
                         selected_runtime_mode == crate::MobRuntimeMode::AutonomousHost;

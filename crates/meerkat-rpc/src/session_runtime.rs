@@ -1489,6 +1489,14 @@ impl SessionServiceHistoryExt for RpcMobSessionService {
 #[cfg(feature = "mob")]
 #[async_trait::async_trait]
 impl meerkat_mob::MobSessionService for RpcMobSessionService {
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, SessionError> {
+        meerkat_mob::MobSessionService::recorded_auth_binding(self.service.as_ref(), auth_binding)
+            .await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &SessionId,
@@ -16306,6 +16314,8 @@ mod tests {
                 generation: Some(meerkat_runtime::meerkat_machine::dsl::Generation::from(0)),
                 runtime_epoch_id: None,
                 session_id: meerkat_runtime::meerkat_machine::dsl::SessionId::from(session_id),
+                residency_owner:
+                    meerkat_runtime::meerkat_machine::dsl::SessionResidencyOwner::Session,
             },
             "test::prepare_bindings",
         )

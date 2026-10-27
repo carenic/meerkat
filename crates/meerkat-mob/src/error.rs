@@ -930,6 +930,25 @@ pub enum MobError {
         refusal: MemberWakeRefusal,
     },
 
+    /// A resume of `member_id` on session `session_id` would reuse the
+    /// session's live actor, but that actor does not run the requested auth
+    /// binding: the binding its session recorded (`recorded`, `None` when it
+    /// recorded none) is neither `requested` nor the form a build of
+    /// `requested` records. A live actor is never reused on another binding.
+    /// Nothing was changed; once that actor's runtime is stopped or released,
+    /// the resume rebuilds the member on the requested binding.
+    #[error(
+        "member {member_id} cannot reuse the live actor of session {session_id}: it runs auth binding {}, not the requested {}",
+        display_auth_binding(.recorded.as_ref()),
+        display_auth_binding(Some(.requested))
+    )]
+    MemberAuthBindingConflict {
+        member_id: AgentIdentity,
+        session_id: meerkat_core::SessionId,
+        requested: meerkat_core::AuthBindingRef,
+        recorded: Option<meerkat_core::AuthBindingRef>,
+    },
+
     /// The mob's startup recovery could not restore member `member_id`'s
     /// session `session_id`, so the mob actor stopped before it admitted any
     /// command. `cause` is the typed failure, for example
@@ -2454,6 +2473,23 @@ impl From<BridgeRejectionReply> for MobError {
     }
 }
 
+/// An auth binding as an error message names it: `realm/binding`, with its
+/// profile when it names one, or `none`.
+fn display_auth_binding(binding: Option<&meerkat_core::AuthBindingRef>) -> String {
+    match binding {
+        None => "none".to_string(),
+        Some(binding) => match binding.profile.as_ref() {
+            Some(profile) => format!(
+                "{}/{}@{}",
+                binding.realm.as_str(),
+                binding.binding.as_str(),
+                profile.as_str()
+            ),
+            None => format!("{}/{}", binding.realm.as_str(), binding.binding.as_str()),
+        },
+    }
+}
+
 impl MobError {
     /// Structured-data `kind` of [`Self::held_before_activation`].
     pub const HELD_BEFORE_ACTIVATION_KIND: &'static str = "mob_held_before_activation";
@@ -2848,6 +2884,19 @@ impl MobError {
                 "retryable": refusal.is_retryable(),
                 "delivered": false,
             })),
+            Self::MemberAuthBindingConflict {
+                member_id,
+                session_id,
+                requested,
+                recorded,
+            } => Some(serde_json::json!({
+                "kind": "member_auth_binding_conflict",
+                "member_id": member_id.as_str(),
+                "session_id": session_id.to_string(),
+                "requested": requested,
+                "recorded": recorded,
+                "retryable": false,
+            })),
             Self::MemberAdmissionBacklogFull { member_id, depth } => Some(serde_json::json!({
                 "kind": "mob_member_admission_backlog_full",
                 "member_id": member_id.as_str(),
@@ -3057,6 +3106,11 @@ impl MobError {
                     Some(meerkat_contracts::ErrorCode::ForkInstructionRefused)
                 }
                 Self::ForkContextTooLarge { .. } => {
+                    Some(meerkat_contracts::ErrorCode::InvalidParams)
+                }
+                // The caller named a binding the session's live actor does
+                // not run.
+                Self::MemberAuthBindingConflict { .. } => {
                     Some(meerkat_contracts::ErrorCode::InvalidParams)
                 }
                 Self::MemberSendIdempotency { refusal, .. } => refusal.error_code(),

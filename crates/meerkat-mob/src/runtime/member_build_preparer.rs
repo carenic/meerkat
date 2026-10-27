@@ -98,8 +98,12 @@ pub trait MemberBuildPreparer: Send + Sync {
     ) -> Result<MemberBuildPrepared, MemberBuildPreparationRefusal>;
 
     /// The member Core built is live, with this tool surface. Called once per
-    /// successful build, off the actor. A build that failed, or a wake that
-    /// was refused or abandoned, is never reported. The default ignores it.
+    /// successful local build, off the actor: a wake's or a boot restore's
+    /// (which Core prepared through this preparer), and a spawn's once its
+    /// activation committed (a fresh or embodied spawn, a held create once
+    /// activated, a respawn), which Core does not prepare. A build that
+    /// failed, or a wake that was refused or abandoned, is never reported.
+    /// The default ignores it.
     async fn member_built(&self, report: MemberBuildReport) {
         let _ = report;
     }
