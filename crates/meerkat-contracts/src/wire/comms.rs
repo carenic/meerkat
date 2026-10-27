@@ -686,19 +686,6 @@ pub enum CommsSendErrorData {
         envelope_id: String,
         message: String,
     },
-    /// The peer is a seated member that was not materialized, and the wake
-    /// the message needed was refused or did not finish. Not delivered:
-    /// nothing reached the peer, so a retry cannot duplicate it. `retryable`
-    /// says whether a later retry can succeed without an operator action
-    /// (the refusal kind decides it). A peer that is not a member is
-    /// `peer_not_found_or_not_trusted`, never this.
-    PeerWakeRefused {
-        peer: String,
-        envelope_id: String,
-        refusal: meerkat_core::comms::PeerWakeRefusal,
-        retryable: bool,
-        message: String,
-    },
     /// The delivery outcome is unknown: the envelope may already be
     /// delivered, so this is not a failed send. Reconcile against durable
     /// work truth by `envelope_id` before any new attempt; a retry can
@@ -714,6 +701,19 @@ pub enum CommsSendErrorData {
         message: String,
     },
     InvalidCommand {
+        message: String,
+    },
+    /// The peer is a seated member that was not materialized, and the wake
+    /// the message needed was refused or did not finish. Not delivered:
+    /// nothing reached the peer, so a retry cannot duplicate it. `retryable`
+    /// says whether a later retry can succeed without an operator action
+    /// (the refusal kind decides it). A peer that is not a member is
+    /// `peer_not_found_or_not_trusted`, never this.
+    PeerWakeRefused {
+        peer: String,
+        envelope_id: String,
+        refusal: meerkat_core::comms::PeerWakeRefusal,
+        retryable: bool,
         message: String,
     },
 }
