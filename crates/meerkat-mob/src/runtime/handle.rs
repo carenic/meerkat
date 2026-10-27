@@ -590,6 +590,59 @@ pub(super) mod retire_at_scope_hold {
     }
 }
 
+/// Test-only record of where a watched mob's seat chunks spend their time,
+/// for the seat scale rows: the plan on the actor, the preparation off it,
+/// and the commit on the actor. Keyed by mob, which each test keeps unique.
+#[cfg(test)]
+pub(super) mod seat_chunk_timing {
+    use crate::ids::MobId;
+    use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex, PoisonError};
+    use std::time::Duration;
+
+    /// One seat chunk's steps.
+    #[derive(Debug, Clone, Copy)]
+    pub(crate) struct SeatChunkTiming {
+        /// Specs the chunk carried.
+        pub(crate) specs: usize,
+        /// `PlanDormantSeats` on the actor, the round trip included.
+        pub(crate) plan: Duration,
+        /// Everything between the plan and the commit: each seat's
+        /// preparation off the actor (and any embodied spawn).
+        pub(crate) prepare: Duration,
+        /// `CommitDormantSeats` on the actor, the round trip included.
+        pub(crate) commit: Duration,
+    }
+
+    type Timings = Arc<Mutex<Vec<SeatChunkTiming>>>;
+
+    static WATCHED: Mutex<BTreeMap<MobId, Timings>> = Mutex::new(BTreeMap::new());
+
+    /// Record the seat chunks of `mob_id` from now on, in order.
+    pub(crate) fn watch(mob_id: &MobId) -> Timings {
+        let timings = Timings::default();
+        WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(mob_id.clone(), Arc::clone(&timings));
+        timings
+    }
+
+    pub(super) fn record(mob_id: &MobId, timing: SeatChunkTiming) {
+        let watched = WATCHED
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(mob_id)
+            .cloned();
+        if let Some(timings) = watched {
+            timings
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(timing);
+        }
+    }
+}
+
 #[cfg(test)]
 fn assert_retirement_result_slot_removed_before_publication(
     key: &RetirementOperationKey,
@@ -9537,12 +9590,16 @@ impl MobHandle {
         use super::dormant_seat::{DormantSeatCommitEntry, DormantSeatPlanEntry};
         use futures::StreamExt as _;
 
+        #[cfg(test)]
+        let (chunk_specs, chunk_started) = (specs.len(), std::time::Instant::now());
         let super::dormant_seat::DormantSeatPlan {
             entries,
             endpoint_source,
         } = self
             .send_actor_command(|reply_tx| MobCommand::PlanDormantSeats { specs, reply_tx })
             .await??;
+        #[cfg(test)]
+        let chunk_planned = std::time::Instant::now();
         let mut outcomes = Vec::with_capacity(entries.len());
         outcomes.resize_with(entries.len(), || None);
         let mut to_prepare = Vec::new();
@@ -9620,6 +9677,8 @@ impl MobHandle {
                 Err(outcome) => outcomes[index] = Some(*outcome),
             }
         }
+        #[cfg(test)]
+        let chunk_prepared = std::time::Instant::now();
         if !to_commit.is_empty() {
             to_commit.sort_by_key(|(index, _)| *index);
             let (indices, entries): (Vec<_>, Vec<_>) = to_commit.into_iter().unzip();
@@ -9637,6 +9696,16 @@ impl MobHandle {
                 outcomes[index] = Some(outcome);
             }
         }
+        #[cfg(test)]
+        seat_chunk_timing::record(
+            &self.definition.id,
+            seat_chunk_timing::SeatChunkTiming {
+                specs: chunk_specs,
+                plan: chunk_planned.duration_since(chunk_started),
+                prepare: chunk_prepared.duration_since(chunk_planned),
+                commit: chunk_prepared.elapsed(),
+            },
+        );
         outcomes
             .into_iter()
             .map(|outcome| {
@@ -19558,6 +19627,17 @@ impl MobHandle {
     /// placed member, and a member wired to a placed member (which reaches
     /// it only while it is live), is refused with
     /// [`MobError::UnsupportedForMode`].
+    ///
+    /// On a session service that keeps no durable sessions (an in-memory
+    /// one), a member's session exists only while the member is
+    /// materialized, so the member stays materialized and keeps serving its
+    /// deliveries: a release there is not a stop. The release is refused
+    /// retryably while the member's session holds accepted work that has not
+    /// reached a terminal (queued, held at its start, or running), and
+    /// otherwise answers `Ok` with nothing released. Releasing it would
+    /// discard the session it keeps, and its next delivery could not wake it
+    /// on that session. A host that releases idle members to free memory
+    /// frees nothing on such a service.
     pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
         let agent_identity = identity.clone();
         self.send_actor_command(move |reply_tx| MobCommand::ReleaseMember {

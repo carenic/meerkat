@@ -1188,6 +1188,214 @@ async fn ten_thousand_dormant_members_restart_without_materializing_any() {
     );
 }
 
+/// What one seat-cost run measured.
+struct SeatCostRun {
+    members: usize,
+    /// Writing the import's state: one session and its comms key pair per
+    /// identity. Not part of the boot.
+    setup: Duration,
+    create: Duration,
+    seat: Duration,
+    chunks: Vec<crate::runtime::handle::seat_chunk_timing::SeatChunkTiming>,
+    restart: Duration,
+}
+
+impl SeatCostRun {
+    fn report(&self) {
+        let per_seat = |elapsed: Duration, seats: usize| {
+            elapsed.as_secs_f64() * 1_000_000.0 / seats.max(1) as f64
+        };
+        let millis = |elapsed: Duration| elapsed.as_secs_f64() * 1_000.0;
+        eprintln!("seat cost: {} identities", self.members);
+        eprintln!(
+            "  setup (the import's state, outside the boot): {:?}",
+            self.setup
+        );
+        eprintln!("  create the mob: {:?}", self.create);
+        eprintln!(
+            "  seat: {:?} ({:.0} us per seat)",
+            self.seat,
+            per_seat(self.seat, self.members)
+        );
+        let mut seated = 0_usize;
+        for (index, chunk) in self.chunks.iter().enumerate() {
+            let total = chunk.plan + chunk.prepare + chunk.commit;
+            eprintln!(
+                "    chunk {:>3}: seats {:>5}..{:<5} plan {:>9.1} ms, prepare {:>9.1} ms, \
+                 commit {:>9.1} ms ({:.0} us per seat, commit {:.0} us per seat)",
+                index + 1,
+                seated + 1,
+                seated + chunk.specs,
+                millis(chunk.plan),
+                millis(chunk.prepare),
+                millis(chunk.commit),
+                per_seat(total, chunk.specs),
+                per_seat(chunk.commit, chunk.specs),
+            );
+            seated += chunk.specs;
+        }
+        if let (Some(first), Some(last)) = (self.chunks.first(), self.chunks.last()) {
+            let total = |chunk: &crate::runtime::handle::seat_chunk_timing::SeatChunkTiming| {
+                per_seat(chunk.plan + chunk.prepare + chunk.commit, chunk.specs)
+            };
+            eprintln!(
+                "  per-seat cost, last chunk over first: {:.1}x (commit alone {:.1}x)",
+                total(last) / total(first).max(f64::EPSILON),
+                per_seat(last.commit, last.specs)
+                    / per_seat(first.commit, first.specs).max(f64::EPSILON),
+            );
+        }
+        eprintln!("  restart: {:?}", self.restart);
+    }
+}
+
+/// Seat `members` identities on a fresh mob as a host's first boot after an
+/// import does (Resume seats of sessions that exist, with their comms key
+/// pairs), then crash-stop and restart it, timing each phase and each seat
+/// chunk's steps.
+async fn seat_cost_run(members: usize) -> SeatCostRun {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let definition = with_unique_mob_id(sample_definition(), "seat-cost");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+
+    let started = std::time::Instant::now();
+    let mut specs = Vec::with_capacity(members);
+    for index in 0..members {
+        let session = SessionId::new();
+        service
+            .replace_live_session(Session::with_id(session.clone()))
+            .await;
+        meerkat_comms::Keypair::generate()
+            .save(&keys.path().join(session.to_string()))
+            .await
+            .expect("the session's comms key pair");
+        let mut spec = turn_driven(&AgentIdentity::from(format!("seat-cost-{index:05}")));
+        spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: session,
+            resume_from_role: None,
+        };
+        specs.push(spec);
+    }
+    let setup = started.elapsed();
+
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let started = std::time::Instant::now();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .with_member_comms_identity_root(keys.path())
+        .create()
+        .await
+        .expect("create the mob");
+    let create = started.elapsed();
+
+    let timings = crate::runtime::handle::seat_chunk_timing::watch(handle.mob_id());
+    let started = std::time::Instant::now();
+    let outcomes = handle
+        .seat_dormant_members(specs)
+        .await
+        .expect("seat every identity");
+    let seat = started.elapsed();
+    assert_eq!(outcomes.len(), members);
+    assert!(
+        outcomes
+            .iter()
+            .all(|outcome| matches!(outcome, DormantSeatOutcome::Seated { .. })),
+        "every identity is seated"
+    );
+    let dormant = handle
+        .machine_state_watch_rx
+        .borrow()
+        .member_materialization
+        .values()
+        .filter(|phase| matches!(phase, dsl::MemberMaterializationPhase::Dormant))
+        .count();
+    assert_eq!(dormant, members, "every seat is Dormant");
+    assert!(
+        service.recorded_create_requests().await.is_empty(),
+        "a seat builds and creates nothing"
+    );
+    let chunks = timings
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone();
+    assert_eq!(
+        chunks.iter().map(|chunk| chunk.specs).sum::<usize>(),
+        members,
+        "every seat chunk was timed"
+    );
+
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    let started = std::time::Instant::now();
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(restarted.clone())
+    .with_member_comms_identity_root(keys.path())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("restart the mob");
+    let restart = started.elapsed();
+    assert!(restarted.recorded_create_requests().await.is_empty());
+    assert_eq!(
+        restarted.active_session_count().await,
+        0,
+        "the restart materializes no seated member"
+    );
+    crash_stop_and_release_routes(resumed).await;
+    SeatCostRun {
+        members,
+        setup,
+        create,
+        seat,
+        chunks,
+        restart,
+    }
+}
+
+/// First-boot seat cost at scale. A fresh mob seats 1,000 identities, then a
+/// second fresh mob 10,000, as a host's first boot after an import does
+/// (Resume seats of sessions that exist, with their comms key pairs, through
+/// `seat_dormant_members`), and each mob then restarts. The row prints the
+/// wall time of each phase and of each seat chunk's plan (on the actor),
+/// preparation (off it) and commit (on the actor), so the per-seat cost can
+/// be read against how many members are seated already. Deterministic
+/// counters are the assertions. The 10,000 seats must also fit the
+/// five-minute first-boot bound, and the restart the 60-second restart bound.
+/// The session service is a mock: a store's own read per seat comes on top.
+/// Run explicitly, in the release profile, with the output shown (nextest
+/// `--no-capture`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scale row: run explicitly in the release profile"]
+async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
+    let mut runs = Vec::new();
+    for members in [1_000, 10_000] {
+        let run = seat_cost_run(members).await;
+        run.report();
+        runs.push(run);
+    }
+    let largest = runs.last().expect("the 10,000-identity run");
+    assert!(
+        largest.seat < Duration::from_secs(300),
+        "seating {} identities took {:?}, over the five-minute first-boot bound",
+        largest.members,
+        largest.seat
+    );
+    assert!(
+        largest.restart < Duration::from_secs(60),
+        "the restart over {} seated identities took {:?}",
+        largest.members,
+        largest.restart
+    );
+}
+
 /// A crash after a rotation's retirement durably started and
 /// before its terminal batch. The restart finds the incarnation Retiring
 /// with no rotation intent; the host passes the identity as host-pending (so
@@ -2075,5 +2283,99 @@ async fn an_explicit_resume_rebuilds_an_unwired_comms_less_member_without_a_drai
             .await
             .expect("live session read"),
         "the member serves from its rebuilt session"
+    );
+}
+
+/// A host build preparer that reads who manages each member's identity
+/// through the handle Core hands it before it lets the member's build go
+/// ahead: prepared when the read answers, retryable when it is refused. It
+/// records every read.
+#[derive(Default)]
+struct ManagementReadingPreparer {
+    reads: std::sync::Mutex<Vec<Result<crate::MemberIdentityManagement, String>>>,
+}
+
+impl ManagementReadingPreparer {
+    fn reads(&self) -> Vec<Result<crate::MemberIdentityManagement, String>> {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl crate::runtime::MemberBuildPreparer for ManagementReadingPreparer {
+    async fn prepare_member_build(
+        &self,
+        request: crate::runtime::MemberBuildPreparation,
+    ) -> Result<crate::runtime::MemberBuildPrepared, crate::runtime::MemberBuildPreparationRefusal>
+    {
+        let read = request
+            .handle
+            .identity_management(&request.agent_identity)
+            .await
+            .map_err(|error| error.to_string());
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(read.clone());
+        match read {
+            Ok(_) => Ok(crate::runtime::MemberBuildPrepared::Prepared),
+            Err(reason) => Err(crate::runtime::MemberBuildPreparationRefusal::Retryable { reason }),
+        }
+    }
+}
+
+/// A boot restore hands the host's build preparer the mob's own read-only
+/// view, as a wake does (member_wake_rows'
+/// `a_wake_hands_the_build_preparer_the_mobs_own_read_view`): the authority
+/// the mob's launch minted, the owner's. An Eager start restores the member,
+/// and its preparer's one read of who manages the member's identity is
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boot_restore_hands_the_build_preparer_the_mobs_own_read_view() {
+    let definition = with_unique_mob_id(sample_definition(), "boot-preparer-read-view");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let member = worker(0);
+    handle
+        .spawn_spec(turn_driven(&member))
+        .await
+        .expect("spawn the member");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    let preparer = Arc::new(ManagementReadingPreparer::default());
+    let resumed = tokio::time::timeout(
+        LAZY_STEP,
+        Box::pin(
+            MobBuilder::for_resume(storage)
+                .with_session_service(restarted.clone())
+                .notify_orchestrator_on_resume(false)
+                .with_member_restore_policy(MemberRestorePolicy::Eager)
+                .with_member_build_preparer(preparer.clone())
+                .resume(),
+        ),
+    )
+    .await
+    .expect("the resume answers")
+    .expect("the resume succeeds");
+    assert_eq!(
+        preparer.reads(),
+        vec![Ok(crate::MemberIdentityManagement::CommandDriven)],
+        "the boot restore's one preparation read who manages the member's identity, answered"
+    );
+    assert_eq!(
+        phase_of(&resumed, &member),
+        Some(dsl::MemberMaterializationPhase::Live)
     );
 }
