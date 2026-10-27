@@ -8,19 +8,21 @@
 \* per-run cap:
 \*
 \*   seed (AuditSeedSpec): one identity recovered with no, an inproc or a
-\*     network endpoint, every build seed (restore policy, composition
-\*     authority, host-pending set) in every lifecycle phase, every boot verdict
-\*     (Wake, VerifyThenDormant, StayDormant), the seal and the host
-\*     carry-out, with one authorized wake and its abandon.
+\*     network endpoint and its seat session replayed unborn or born, every
+\*     build seed (restore policy, composition authority, host-pending set) in
+\*     every lifecycle phase, every boot verdict (Wake, VerifyThenDormant,
+\*     StayDormant), the seal and the host carry-out, with one authorized wake
+\*     and its abandon.
 \*   wake (AuditWakeSpec): one identity under the default seed: the boot plan
 \*     and seal, every WakeMember arm for six input shapes, every
-\*     attempt-fenced resolution, the late (StaleAttempt) feedback in Running
-\*     and Stopped, the runtime-ready observation with and without an epoch,
-\*     three release shapes (the recorded epoch, another epoch, no epoch), the
-\*     drift and terminal classifications, the peer notice classification,
-\*     the replayed restore failures, the routed binding refusal (current and
-\*     stale), the spawned-endpoint recovery, the release verdict, Stop and
-\*     Resume.
+\*     attempt-fenced resolution (the fresh create of an unborn seat's session
+\*     among them), the late (StaleAttempt) feedback in Running and Stopped,
+\*     the seat session replay (unborn, born), the runtime-ready observation
+\*     with and without an epoch, three release shapes (the recorded epoch,
+\*     another epoch, no epoch), the drift and terminal classifications, the
+\*     peer notice classification, the replayed restore failures, the routed
+\*     binding refusal (current and stale), the spawned-endpoint recovery, the
+\*     release verdict, Stop and Resume.
 \*   retire (AuditRetireSpec): one identity woken, released and retired: the
 \*     routed and the archive-only retirement starts, the routed retire
 \*     retry, the runtime retire observation, the session ingress detach, the
@@ -45,11 +47,12 @@
 \*     preserved, and its next incarnation recovered.
 \*   seat (AuditSeatSpec): two identities from the spawn ladder's Opened
 \*     phase: the dormant seat with an endpoint, with another member's peer id
-\*     or with none (EndpointPending), the embodied spawn commit, the
-\*     runtime-ready observation and the release that clears the startup ladder,
-\*     the boot plan and seal, the endpoint registration, and the
+\*     or with none (EndpointPending), member 1's over an existing session
+\*     and member 2's over an unborn one, the embodied spawn commit, the
+\*     runtime-ready observation and the release that clears the startup
+\*     ladder, the boot plan and seal, the endpoint registration, and the
 \*     rotation (retirement start, intent, terminal over a live or a retired
-\*     runtime) with and without an endpoint.
+\*     runtime, its next incarnation unborn) with and without an endpoint.
 \*   wake2 (AuditWake2Spec): two identities, each woken, released and
 \*     notified by the other: a peer notice between members, a wake while
 \*     the sender is Waking, and a retirement of one member while the other is
@@ -87,7 +90,8 @@
 \*     whose epoch is not the member's recorded one never demotes it) and
 \*     AuditBindingRefusalFenced (a refused binding request applies only to
 \*     the wake it belongs to: its open attempt, or with no attempt only while
-\*     no wake is open);
+\*     no wake is open) and AuditFreshCreateOnlyUnborn (only an unborn seat's
+\*     session is created afresh);
 \*   retire: AuditRetireRoutesOnlyRegistered (no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (a
 \*     retiring member whose ingress detach closed has an enabled archive
@@ -203,6 +207,7 @@ AuditOperatorWake(id) == WakeArm(id, "Operator", FALSE, "Content", FALSE)
 AuditResolve(id, rid, fence, g, sessions) ==
     \E a \in AuditAttempts :
         \/ ResolveMemberRevivalBoundRunning(id, a)
+        \/ ResolveMemberRevivalSessionCreatedRunning(id, a)
         \/ ResolveMemberRevivalSucceededRunningLocal(id, a)
         \/ ResolveMemberRevivalFailedRunning(id, AuditReason, a)
         \/ ResolveMemberRevivalHostRefusedRunning(id, AuditCode, AuditReason, a)
@@ -211,10 +216,12 @@ AuditResolve(id, rid, fence, g, sessions) ==
         \/ AbandonMemberWakeBrokenRunning(id, a, "ReadinessFailed", AuditReason)
         \/ \E s \in sessions : ResolveRecreatedMemberSessionSucceededRunningLocal(id, rid, fence, g, s, a)
 
-\* The success path of one wake and its plain abandon.
+\* The success path of one wake (the fresh create for an unborn seat) and
+\* its plain abandon.
 AuditWakePath(id) ==
     \E a \in AuditAttempts :
         \/ ResolveMemberRevivalBoundRunning(id, a)
+        \/ ResolveMemberRevivalSessionCreatedRunning(id, a)
         \/ ResolveMemberRevivalSucceededRunningLocal(id, a)
         \/ AbandonMemberWakeDormantRunning(id, a, "Unsettled", AuditReason)
 
@@ -236,6 +243,8 @@ AuditStaleFeedback(id, rid, fence, g, s) ==
     \/ AbandonMemberWakeStaleStopped(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
     \/ ResolveRecreatedMemberSessionSucceededStaleRunning(id, rid, fence, g, s, member_wake_attempt_sequence)
     \/ ResolveRecreatedMemberSessionSucceededStaleStopped(id, rid, fence, g, s, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSessionCreatedStaleRunning(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSessionCreatedStaleStopped(id, member_wake_attempt_sequence)
 
 \* The same late feedback in the Completed and Destroyed phases.
 AuditStaleFeedbackTerminal(id, rid, fence, g, s) ==
@@ -253,6 +262,8 @@ AuditStaleFeedbackTerminal(id, rid, fence, g, s) ==
     \/ AbandonMemberWakeStaleDestroyed(id, member_wake_attempt_sequence, "Unsettled", AuditReason)
     \/ ResolveRecreatedMemberSessionSucceededStaleCompleted(id, rid, fence, g, s, member_wake_attempt_sequence)
     \/ ResolveRecreatedMemberSessionSucceededStaleDestroyed(id, rid, fence, g, s, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSessionCreatedStaleCompleted(id, member_wake_attempt_sequence)
+    \/ ResolveMemberRevivalSessionCreatedStaleDestroyed(id, member_wake_attempt_sequence)
 
 \* The release arms of one shape in the Running and Stopped phases.
 ReleaseArm(rid, fence, ep) ==
@@ -331,6 +342,11 @@ WBindingRefusal ==
         \/ ResolveRuntimeBindingRefusalRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
         \/ ResolveRuntimeBindingRefusalStaleRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
         \/ ResolveRuntimeBindingRefusalStaleStopped(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
+\* The replayed seat session state of member 1: unborn (the seat's row) or
+\* born (the row of its session's creation).
+WSeatSession ==
+    \/ RecoverMemberSeatSessionUnbornRunning(Id1, Rid1, TRUE)
+    \/ RecoverMemberSeatSessionBornRunning(Id1, Rid1, FALSE)
 WReady == \E ep \in AuditEpochs : ObserveRuntimeReady(Rid1, 1, ep)
 WReadyEpoch1 == ObserveRuntimeReady(Rid1, 1, Epoch1)
 WRelease == \E ep \in AuditReleaseEpochs : ReleaseArm(Some(Rid1), Some(1), ep)
@@ -351,12 +367,13 @@ Phase2 == IF Id2 \in DOMAIN member_materialization THEN Some(member_materializat
 
 SEndpointAny == \E e \in {E1Inproc, E1Tcp} : RecoverMemberPeerEndpointFreshRunning(Id1, Rid1, Sess1, e)
 
-SeedRecoverArms == WRecover \/ WBind \/ SEndpointAny
+SeedRecoverArms == WRecover \/ WBind \/ SEndpointAny \/ WSeatSession
 
 AuditSeedNext ==
     \/ WRecover
     \/ WBind
     \/ SEndpointAny
+    \/ WSeatSession
     \/ AuditSeed({{}, {Id1}})
     \/ AuditHostPrepared(Id1)
     \/ AuditPlan(Id1)
@@ -376,7 +393,7 @@ AuditSeedSpec == Init /\ [][AuditSeedNext]_vars
 (***************************************************************************)
 
 \* The recovery and seat arms of the wake run (AuditRecoverKeepsPhase).
-WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WSpawnedEndpoint \/ WRestoreFailure
+WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WSpawnedEndpoint \/ WRestoreFailure \/ WSeatSession
 
 AuditWakeNext ==
     \/ WRecover
@@ -386,6 +403,7 @@ AuditWakeNext ==
     \/ WSpawnedEndpoint
     \/ WRegisterPeer
     \/ WRestoreFailure
+    \/ WSeatSession
     \/ WBindingRefusal
     \/ AuditPlanDefault(Id1)
     \/ SealBootMaterializationPlan
@@ -479,6 +497,7 @@ AuditRetireNext ==
     \/ WRecover
     \/ WBind
     \/ WEndpoint
+    \/ WSeatSession
     \/ RSeedHostPending
     \/ ResolveMemberHostPreparationRunning(Id1)
     \/ AuditOperatorWake(Id1)
@@ -666,11 +685,13 @@ SOpenArm == \E id \in {Id1, Id2} : SOpen(id, SIncarnation(id).rid, SIncarnation(
 
 \* A seat with member 1's endpoint (member 2 then offers a duplicate peer id,
 \* which the peer-id guards refuse), member 2's own endpoint, or none
-\* (EndpointPending). A seat owes no kickoff.
+\* (EndpointPending). Member 1 is seated over an existing session, member 2
+\* over an unborn one (a fresh launch's seat), which keeps the space near its
+\* size without the fact. A seat owes no kickoff.
 SSeat ==
     \E id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None} :
         CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
-                                 SIncarnation(id).session, ep, FALSE, FALSE)
+                                 SIncarnation(id).session, ep, FALSE, FALSE, id = Id2)
 
 SCommit ==
     \E id \in {Id1, Id2} :
@@ -726,9 +747,9 @@ AuditSeatSpec == Init /\ [][AuditSeatNext]_vars
 \* A dormant seat leaves its identity Dormant, with its endpoint or owed
 \* EndpointPending, and requests no runtime binding.
 AuditSeatLeavesDormant ==
-    [][\A id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None} :
+    [][\A id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None}, unborn \in BOOLEAN :
          CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
-                                  SIncarnation(id).session, ep, FALSE, FALSE)
+                                  SIncarnation(id).session, ep, FALSE, FALSE, unborn)
            => /\ id \in DOMAIN member_materialization'
               /\ member_materialization'[id] = "Dormant"
               /\ \/ id \in DOMAIN member_peer_endpoints'
@@ -957,6 +978,14 @@ AuditReleaseEpochFence ==
            => Phase1Next = Phase1
       ]_vars
 
+\* Only an unborn seat's session is created afresh: a member whose session
+\* was ever created takes the successor search, else Broken, never the fresh
+\* create.
+AuditFreshCreateOnlyUnborn ==
+    [][\A a \in AuditAttempts :
+         ResolveMemberRevivalSessionCreatedRunning(Id1, a) => Id1 \in member_seat_session_unborn
+      ]_vars
+
 \* No arm routes a runtime retire for a member with no registration (a
 \* Dormant or Waking member, or an archive-only retirement).
 AuditRetireRoutesOnlyRegistered ==
@@ -1101,6 +1130,23 @@ AuditWitnessResumeFinishedLiveStep ==
     /\ FinishExplicitResumeRunning(AuditResumeAttempt)
     /\ Phase1 = Some("Live")
 
+\* Wake run: an unborn seat's first wake creates its session, which clears
+\* the fact.
+AuditWitnessUnbornCreatedStep ==
+    /\ Id1 \in member_seat_session_unborn
+    /\ Id1 \notin member_seat_session_unborn'
+    /\ \E a \in AuditAttempts : ResolveMemberRevivalSessionCreatedRunning(Id1, a)
+\* Retire run: an unborn member is archived, which clears the fact.
+AuditWitnessUnbornArchivedStep ==
+    /\ Id1 \in member_seat_session_unborn
+    /\ Id1 \notin DOMAIN identity_to_runtime'
+    /\ Id1 \notin member_seat_session_unborn'
+\* Seat run: a fresh launch's seat is unborn.
+AuditWitnessSeatUnborn == \E id \in {Id1, Id2} : id \in member_seat_session_unborn
+\* Seat run: a rotation seats its next incarnation unborn.
+AuditWitnessRotatedUnbornStep ==
+    /\ SCommitRotation
+    /\ Id1 \in member_seat_session_unborn'
 \* Edge run: the edge's trust repair is owed (an unrealized realization).
 AuditWitnessEdgeRepairOwed == AuditEdge \in owed_edge_repairs
 \* Edge run: after the seal an edge endpoint is unseated and held by the
@@ -1148,6 +1194,10 @@ NotAuditWitnessStopCloses == [][~AuditWitnessStopClosesStep]_vars
 NotAuditWitnessStaleInStopped == ~AuditWitnessStaleInStopped
 NotAuditWitnessDrift == ~AuditWitnessDrift
 NotAuditWitnessEdgeRepairOwed == ~AuditWitnessEdgeRepairOwed
+NotAuditWitnessUnbornCreated == [][~AuditWitnessUnbornCreatedStep]_vars
+NotAuditWitnessUnbornArchived == [][~AuditWitnessUnbornArchivedStep]_vars
+NotAuditWitnessSeatUnborn == ~AuditWitnessSeatUnborn
+NotAuditWitnessRotatedUnborn == [][~AuditWitnessRotatedUnbornStep]_vars
 NotAuditWitnessBrokenWake == ~AuditWitnessBrokenWake
 NotAuditWitnessCommsLessWokeLive == [][~AuditWitnessCommsLessWokeLiveStep]_vars
 NotAuditWitnessRetireCloses == [][~AuditWitnessRetireClosesStep]_vars
