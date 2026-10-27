@@ -1931,9 +1931,10 @@ impl MobActor {
     /// session exists only while the member is materialized: closing its
     /// registration would discard the session the release keeps, and its
     /// next wake could only start a new one. Such a member stays
-    /// materialized (MobMachine keeps it Live, which it is): the release is
-    /// refused retryably while it has work in flight, as any release is,
-    /// and otherwise answers with nothing closed.
+    /// materialized (MobMachine keeps it Live, which it is) and keeps
+    /// serving its deliveries: the release is refused retryably while its
+    /// session holds accepted work that has not reached a terminal, and
+    /// otherwise answers with nothing closed.
     pub(in crate::runtime) async fn handle_release_member(
         &mut self,
         identity: AgentIdentity,
@@ -2275,10 +2276,13 @@ enum MemberReleaseTarget {
 #[cfg(not(feature = "runtime-adapter"))]
 type MemberReleaseTarget = std::convert::Infallible;
 
-/// Answer a release that keeps the member materialized as a release
-/// answers: refused retryably while the session holds accepted work that
-/// has not reached a terminal (queued, held at its start, or running), done
-/// otherwise. Nothing is closed, so a read of that work is enough.
+/// Answer a release that keeps the member materialized: refused retryably
+/// while the session holds accepted work that has not reached a terminal
+/// (queued, held at its start, or running), done otherwise. Nothing is
+/// closed, so a read of that work is enough. It asks less than a closing
+/// release's quiescence check, which also counts a run still in progress
+/// whose inputs are terminal: closing nothing, this release interrupts
+/// nothing either way.
 #[cfg(feature = "runtime-adapter")]
 async fn keep_member_materialized(
     adapter: Arc<meerkat_runtime::MeerkatMachine>,

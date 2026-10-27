@@ -19615,11 +19615,13 @@ impl MobHandle {
     ///
     /// On a session service that keeps no durable sessions (an in-memory
     /// one), a member's session exists only while the member is
-    /// materialized, so the member stays materialized: the release is
-    /// refused retryably while it has work in flight, as above, and
+    /// materialized, so the member stays materialized and keeps serving its
+    /// deliveries: a release there is not a stop. The release is refused
+    /// retryably while the member's session holds accepted work that has not
+    /// reached a terminal (queued, held at its start, or running), and
     /// otherwise answers `Ok` with nothing released. Releasing it would
-    /// discard the session it keeps, and its next delivery could not wake
-    /// it on that session. A host that releases idle members to free memory
+    /// discard the session it keeps, and its next delivery could not wake it
+    /// on that session. A host that releases idle members to free memory
     /// frees nothing on such a service.
     pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
         let agent_identity = identity.clone();

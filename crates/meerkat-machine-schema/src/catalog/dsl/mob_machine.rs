@@ -29402,7 +29402,12 @@ pub enum MemberBootObligationCause {
 /// answers through it, never from a shell phase read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MemberReleaseVerdict {
-    /// A local, seated, Live member: its registration is released.
+    /// A local, seated, Live member whose release the machine permits. The
+    /// shell closes its registration, and the close publishes the release
+    /// that demotes it to Dormant, except on a session service that keeps
+    /// no durable sessions: there the member's session exists only while it
+    /// is materialized, so the shell closes nothing and the member stays
+    /// Live.
     #[default]
     Release,
     /// Dormant, or no phase (Broken, retiring, unbound): nothing to release.

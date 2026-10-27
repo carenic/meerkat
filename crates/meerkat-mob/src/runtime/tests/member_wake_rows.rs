@@ -1277,6 +1277,24 @@ async fn a_wake_hands_the_build_preparer_the_mobs_own_read_view() {
         fixture.residency(&member),
         Some(mob_dsl::MemberMaterializationPhase::Live)
     );
+    // The member tools' lane is unchanged: on the agent lane the same read
+    // is still refused for want of the List scope.
+    let agent_lane_read = fixture
+        .handle
+        .clone()
+        .with_command_authority(crate::control_policy::CommandAuthority::agent_lane())
+        .read_handle()
+        .identity_management(&member)
+        .await;
+    assert!(
+        matches!(
+            &agent_lane_read,
+            Err(MobError::ScopeDenied(denial))
+                if denial.required == crate::ControlScope::List && denial.presented.is_empty()
+        ),
+        "the member tools' lane still cannot read the member's identity management: \
+         {agent_lane_read:?}"
+    );
     fixture.finish().await;
 }
 
@@ -2474,8 +2492,8 @@ impl InMemoryWakeFixture {
 
 /// On a session service that keeps no durable sessions, a member's session
 /// exists only while the member is materialized. A release keeps such a
-/// member materialized: it is refused retryably while the member has work in
-/// flight, as any release is, and otherwise answers with nothing released.
+/// member materialized and serving: it is refused retryably while the
+/// member's turn runs, and otherwise answers with nothing released.
 /// The member's next delivery finds it live on the same session, at the same
 /// incarnation and endpoint, and its turns continue that session's
 /// transcript. Releasing it would have discarded the session, and its next

@@ -2285,3 +2285,97 @@ async fn an_explicit_resume_rebuilds_an_unwired_comms_less_member_without_a_drai
         "the member serves from its rebuilt session"
     );
 }
+
+/// A host build preparer that reads who manages each member's identity
+/// through the handle Core hands it before it lets the member's build go
+/// ahead: prepared when the read answers, retryable when it is refused. It
+/// records every read.
+#[derive(Default)]
+struct ManagementReadingPreparer {
+    reads: std::sync::Mutex<Vec<Result<crate::MemberIdentityManagement, String>>>,
+}
+
+impl ManagementReadingPreparer {
+    fn reads(&self) -> Vec<Result<crate::MemberIdentityManagement, String>> {
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl crate::runtime::MemberBuildPreparer for ManagementReadingPreparer {
+    async fn prepare_member_build(
+        &self,
+        request: crate::runtime::MemberBuildPreparation,
+    ) -> Result<crate::runtime::MemberBuildPrepared, crate::runtime::MemberBuildPreparationRefusal>
+    {
+        let read = request
+            .handle
+            .identity_management(&request.agent_identity)
+            .await
+            .map_err(|error| error.to_string());
+        self.reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(read.clone());
+        match read {
+            Ok(_) => Ok(crate::runtime::MemberBuildPrepared::Prepared),
+            Err(reason) => Err(crate::runtime::MemberBuildPreparationRefusal::Retryable { reason }),
+        }
+    }
+}
+
+/// A boot restore hands the host's build preparer the mob's own read-only
+/// view, as a wake does (member_wake_rows'
+/// `a_wake_hands_the_build_preparer_the_mobs_own_read_view`): the authority
+/// the mob's launch minted, the owner's. An Eager start restores the member,
+/// and its preparer's one read of who manages the member's identity is
+/// answered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_boot_restore_hands_the_build_preparer_the_mobs_own_read_view() {
+    let definition = with_unique_mob_id(sample_definition(), "boot-preparer-read-view");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let member = worker(0);
+    handle
+        .spawn_spec(turn_driven(&member))
+        .await
+        .expect("spawn the member");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    let preparer = Arc::new(ManagementReadingPreparer::default());
+    let resumed = tokio::time::timeout(
+        LAZY_STEP,
+        Box::pin(
+            MobBuilder::for_resume(storage)
+                .with_session_service(restarted.clone())
+                .notify_orchestrator_on_resume(false)
+                .with_member_restore_policy(MemberRestorePolicy::Eager)
+                .with_member_build_preparer(preparer.clone())
+                .resume(),
+        ),
+    )
+    .await
+    .expect("the resume answers")
+    .expect("the resume succeeds");
+    assert_eq!(
+        preparer.reads(),
+        vec![Ok(crate::MemberIdentityManagement::CommandDriven)],
+        "the boot restore's one preparation read who manages the member's identity, answered"
+    );
+    assert_eq!(
+        phase_of(&resumed, &member),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+}
