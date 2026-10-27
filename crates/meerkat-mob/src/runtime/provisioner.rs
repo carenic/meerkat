@@ -14460,8 +14460,8 @@ impl ProvisionFinish {
         } = self;
         let backend = &backend;
         // The generated binding this attempt installs (one the session did
-        // not hold before it), released if the attempt fails before it
-        // publishes its receipt.
+        // not hold before it, answered by the bind itself), released if the
+        // attempt fails before it publishes its receipt.
         let mut installed_generated_binding = None;
         let binding_session_id = created_bridge_session_id.clone();
         let finalize_result = async {
@@ -14561,23 +14561,17 @@ impl ProvisionFinish {
                         );
                     }
                 } else {
-                    let held_before = backend
+                    installed_generated_binding = backend
                         .ops_adapter
-                        .capture_session_binding_witness(&created_bridge_session_id)
-                        .is_some();
-                    backend.ops_adapter.bind_session_registry(
-                        created_bridge_session_id.clone(),
-                        generated_owner_session_id,
-                        registry,
-                    )?;
-                    if !held_before {
-                        installed_generated_binding = backend
-                            .ops_adapter
-                            .capture_session_binding_witness(&created_bridge_session_id);
-                    }
+                        .bind_session_registry_installing(
+                            created_bridge_session_id.clone(),
+                            generated_owner_session_id,
+                            registry,
+                        )?;
                     #[cfg(test)]
-                    if provision_finish_test_hooks::take_failure_after_generated_bind(
+                    if provision_finish_test_hooks::take(
                         &created_bridge_session_id,
+                        provision_finish_test_hooks::ProvisionFinishFault::AfterGeneratedBind,
                     ) {
                         return Err(MobError::Internal(format!(
                             "injected failure of the provision of '{created_bridge_session_id}' after its generated bind"
@@ -14609,6 +14603,15 @@ impl ProvisionFinish {
             .ops_adapter
             .prepare_member_provision_operation(&created_bridge_session_id, &peer_name)
             .await?;
+        #[cfg(test)]
+        if provision_finish_test_hooks::take(
+            &created_bridge_session_id,
+            provision_finish_test_hooks::ProvisionFinishFault::AfterOperationClaim,
+        ) {
+            return Err(MobError::Internal(format!(
+                "injected failure of the provision of '{created_bridge_session_id}' after its operation claim"
+            )));
+        }
         let exact_operation_id = prepared_operation.operation_id().clone();
         if let Some(ledger) = backend.settlement_ledger.as_ref() {
             // Retained custody carries the exact ops row a retry must abort.
@@ -14712,40 +14715,50 @@ impl ProvisionFinish {
     }
 }
 
-/// Test seam: a member provision that fails right after it bound its
-/// generated operation owner.
+/// Test seam: a member provision that fails at a named step of its finish.
 #[cfg(test)]
 pub(crate) mod provision_finish_test_hooks {
     use std::sync::{Mutex, PoisonError};
 
     use meerkat_core::types::SessionId;
 
-    static FAILING_AFTER_GENERATED_BIND: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
-
-    /// The next provision of `session` fails right after its generated bind,
-    /// once.
-    pub(crate) fn fail_after_generated_bind(session: &SessionId) {
-        FAILING_AFTER_GENERATED_BIND
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push(session.clone());
+    /// Where the provision's finish fails.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum ProvisionFinishFault {
+        /// Right after it bound its generated operation owner.
+        AfterGeneratedBind,
+        /// Right after it claimed its provision operation (prepared, not yet
+        /// committed).
+        AfterOperationClaim,
     }
 
-    /// Whether the failure armed for `session` has not fired yet.
-    pub(crate) fn failure_after_generated_bind_armed(session: &SessionId) -> bool {
-        FAILING_AFTER_GENERATED_BIND
+    static FAULTS: Mutex<Vec<(SessionId, ProvisionFinishFault)>> = Mutex::new(Vec::new());
+
+    /// The next provision of `session` fails at `fault`, once.
+    pub(crate) fn fail(session: &SessionId, fault: ProvisionFinishFault) {
+        FAULTS
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
-            .contains(session)
+            .push((session.clone(), fault));
     }
 
-    pub(super) fn take_failure_after_generated_bind(session: &SessionId) -> bool {
-        let mut armed = FAILING_AFTER_GENERATED_BIND
+    /// Whether the failure armed for `session` at `fault` has not fired yet.
+    pub(crate) fn armed(session: &SessionId, fault: ProvisionFinishFault) -> bool {
+        FAULTS
             .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        match armed.iter().position(|candidate| candidate == session) {
+            .unwrap_or_else(PoisonError::into_inner)
+            .iter()
+            .any(|(armed, armed_fault)| armed == session && *armed_fault == fault)
+    }
+
+    pub(super) fn take(session: &SessionId, fault: ProvisionFinishFault) -> bool {
+        let mut faults = FAULTS.lock().unwrap_or_else(PoisonError::into_inner);
+        match faults
+            .iter()
+            .position(|(armed, armed_fault)| armed == session && *armed_fault == fault)
+        {
             Some(index) => {
-                armed.remove(index);
+                faults.remove(index);
                 true
             }
             None => false,

@@ -486,6 +486,21 @@ impl MobOpsAdapter {
         owner_bridge_session_id: SessionId,
         registry: Arc<dyn OpsLifecycleRegistry>,
     ) -> Result<(), MobError> {
+        self.bind_session_registry_installing(child_session_id, owner_bridge_session_id, registry)
+            .map(|_| ())
+    }
+
+    /// [`Self::bind_session_registry`], answering the binding it installed:
+    /// `Some` with its witness when the session held no binding and this
+    /// call inserted one, `None` for an exact retry of the binding the
+    /// session already held. Decided in the same critical section as the
+    /// insert, so the witness names exactly the binding this call installed.
+    pub(crate) fn bind_session_registry_installing(
+        &self,
+        child_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
+        registry: Arc<dyn OpsLifecycleRegistry>,
+    ) -> Result<Option<SessionOpsBindingWitness>, MobError> {
         let member_key = MemberOpsKey::Session(child_session_id.clone());
         let mut bindings = self
             .member_bindings
@@ -496,17 +511,25 @@ impl MobOpsAdapter {
                 && Arc::ptr_eq(&existing.registry, &registry)
                 && Self::is_unclaimed_generic_session_binding(existing, &child_session_id);
             if exact_retry {
-                return Ok(());
+                return Ok(None);
             }
             return Err(Self::different_session_binding_incarnation(
                 &child_session_id,
             ));
         }
-        bindings.insert(
-            member_key,
-            Self::new_generic_session_binding(child_session_id, owner_bridge_session_id, registry),
+        let binding = Self::new_generic_session_binding(
+            child_session_id,
+            owner_bridge_session_id.clone(),
+            Arc::clone(&registry),
         );
-        Ok(())
+        let installed = SessionOpsBindingWitness {
+            binding_id: binding.binding_id,
+            registry,
+            owner_bridge_session_id,
+            generic_session_child: true,
+        };
+        bindings.insert(member_key, binding);
+        Ok(Some(installed))
     }
 
     /// Re-establish the generated operation binding MobMachine authorized
@@ -799,13 +822,14 @@ impl MobOpsAdapter {
     }
 
     /// Release the generic session binding a failed provision installed and
-    /// never published, while it is still exactly that binding (`installed`)
-    /// with no provision claim. The attempt published no receipt, so nothing
-    /// holds the binding as established, and the registry it names was the
-    /// attempt's own preparation: the session's next registration binds
-    /// afresh instead of meeting it as a different incarnation. The operation
-    /// it names is durable state and is left as it is. Answers whether it
-    /// released the binding.
+    /// never published, while it is still exactly that binding (`installed`:
+    /// the same incarnation and registry) with no provision claim. The
+    /// attempt published no receipt, so nothing holds the binding as
+    /// established, and the registry it names was the attempt's own
+    /// preparation: the session's next registration binds afresh instead of
+    /// meeting it as a different incarnation. The operation is not touched
+    /// here (the attempt's own abort ends it). Answers whether it released
+    /// the binding.
     pub(crate) fn release_unpublished_session_binding(
         &self,
         child_session_id: &SessionId,
@@ -818,6 +842,7 @@ impl MobOpsAdapter {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let unpublished = bindings.get(&member_key).is_some_and(|current| {
             current.binding_id == installed.binding_id
+                && Arc::ptr_eq(&current.registry, &installed.registry)
                 && current.unpublished_attempt
                 && current.provision_claim.is_none()
         });

@@ -1,11 +1,13 @@
 //! A member whose restore at a mob's start fails after it bound its
 //! generated operation owner. The failed provision releases that binding, so
 //! the start's binding pass binds the member's session afresh: the mob comes
-//! up Running with that member Broken, and a later operation repairs it.
+//! up Running with that member Broken, and a later operation repairs it. Two
+//! routes: a failure right after the bind, and the production one, a failure
+//! after the restore claimed the member's replayed Running operation.
 
 use super::*;
 use crate::runtime::MemberRestorePolicy;
-use crate::runtime::provisioner::provision_finish_test_hooks;
+use crate::runtime::provisioner::provision_finish_test_hooks::{self, ProvisionFinishFault};
 
 const STEP: Duration = Duration::from_secs(60);
 
@@ -50,7 +52,7 @@ async fn a_restore_failing_after_its_generated_bind_leaves_the_start_running() {
     crash_stop_and_release_routes(handle).await;
     drop(service);
 
-    provision_finish_test_hooks::fail_after_generated_bind(&session);
+    provision_finish_test_hooks::fail(&session, ProvisionFinishFault::AfterGeneratedBind);
     let resumed = tokio::time::timeout(
         STEP,
         Box::pin(
@@ -68,7 +70,7 @@ async fn a_restore_failing_after_its_generated_bind_leaves_the_start_running() {
     .expect("the start answers")
     .expect("the start succeeds");
     assert!(
-        !provision_finish_test_hooks::failure_after_generated_bind_armed(&session),
+        !provision_finish_test_hooks::armed(&session, ProvisionFinishFault::AfterGeneratedBind),
         "the member's restore reached its generated bind and failed there"
     );
 
@@ -113,6 +115,107 @@ async fn a_restore_failing_after_its_generated_bind_leaves_the_start_running() {
         repaired.status,
         crate::runtime::handle::MobMemberStatus::Active,
         "{repaired:?}"
+    );
+    let _ = tokio::time::timeout(STEP, resumed.stop()).await;
+}
+
+/// The production route. The runtime keeps its durable state across the
+/// restart, so the boot restore replays the member's Running provision
+/// operation; the provision claims it and fails right after. The operation's
+/// rollback clears the claim and keeps the binding (a Running replay is
+/// established state), the attempt's abort ends the operation, and the
+/// failure path then releases the binding the attempt installed. Before the
+/// fix that binding stayed, named the aborted registration's registry, and
+/// the start's binding pass met it as a different incarnation: the start fell
+/// to Stopped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restore_failing_after_claiming_its_replayed_operation_leaves_the_start_running() {
+    let store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(meerkat_runtime::InMemoryRuntimeStore::new());
+    let definition = with_unique_mob_id(sample_definition(), "startup-binding-replayed");
+    let service = Arc::new(MockSessionService::new());
+    service.set_runtime_adapter(Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the first boot's runtime"),
+    ));
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let failing = AgentIdentity::from("replayed-restore-fails");
+    let healthy = AgentIdentity::from("replayed-restore-succeeds");
+    for identity in [&failing, &healthy] {
+        handle
+            .spawn_spec(turn_driven(identity))
+            .await
+            .expect("spawn a worker");
+    }
+    let session = handle
+        .resolve_bridge_session_id(&failing)
+        .await
+        .expect("a session-backed member");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    // The next boot's runtime reads the same durable state.
+    let runtime = Arc::new(
+        meerkat_runtime::MeerkatMachine::persistent_without_blobs(Arc::clone(&store))
+            .expect("the next boot's runtime"),
+    );
+    restarted.set_runtime_adapter(Arc::clone(&runtime));
+
+    provision_finish_test_hooks::fail(&session, ProvisionFinishFault::AfterOperationClaim);
+    let resumed = tokio::time::timeout(
+        STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events,
+                runtime_metadata,
+            ))
+            .with_session_service(restarted.clone())
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            .notify_orchestrator_on_resume(false)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the start answers")
+    .expect("the start succeeds");
+    assert!(
+        !provision_finish_test_hooks::armed(&session, ProvisionFinishFault::AfterOperationClaim),
+        "the member's restore claimed its operation and failed there"
+    );
+
+    assert_eq!(
+        resumed.status().await.expect("the mob's status"),
+        MobState::Running,
+        "one member's failed restore does not stop the start"
+    );
+    let failed = resumed
+        .member_status(&failing)
+        .await
+        .expect("the failed member's status");
+    assert_eq!(
+        failed.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{failed:?}"
+    );
+    let restored = resumed
+        .member_status(&healthy)
+        .await
+        .expect("the healthy member's status");
+    assert_eq!(
+        restored.status,
+        crate::runtime::handle::MobMemberStatus::Active,
+        "{restored:?}"
+    );
+    assert!(
+        runtime.contains_session(&session).await,
+        "the start's binding pass registered the failed member's session and bound it afresh"
     );
     let _ = tokio::time::timeout(STEP, resumed.stop()).await;
 }
