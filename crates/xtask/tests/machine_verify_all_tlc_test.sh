@@ -518,8 +518,10 @@ fi
 # enabled closing arm), AP3 (a Lifecycle input never wakes) and WakeMember
 # totality, with the I5 ASSUME over the wake refusal helper. It runs with TLC
 # coverage and requires every listed arm to fire and a floor of distinct
-# states, requires its seventeen witnesses reached, and refuses one seeded
-# defect per residency invariant and property (--mutants).
+# states, and requires its seventeen witnesses reached. Its --mutants mode
+# (by hand and in the release validation, outside the shard's budget)
+# refuses twenty-four seeded defects, one per residency invariant and
+# property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
   echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2
@@ -527,7 +529,7 @@ if [[ ! -x "${member_residency_audit}" ]]; then
 fi
 if run_part audits-c; then
   echo "running member residency TLC audit"
-  TLC_WORKERS="${tlc_workers}" "${member_residency_audit}" --mutants
+  TLC_WORKERS="${tlc_workers}" "${member_residency_audit}"
 fi
 
 # The MobMachine arm-coverage gate: every arm of the generated model's Next
@@ -658,8 +660,8 @@ run_machine_verify() {
 # run-start hold 144 (243), live media health 104 (153), requeue-across-stop
 # 90 (131), live-context causal-tail batch with --mutants 74 (110),
 # generation high-water with --mutants 38 (55): about 635 s (930 s), plus
-# the member residency audit with --mutants, which joined audits-c as the
-# lightest shard and is not measured on hosted runners yet.
+# the member residency audit without its mutants, which joined audits-c as
+# the lightest shard and is not measured on hosted runners yet.
 # With the durable-tail recovery ownership and materialization-rollback keep
 # audits both in audits-b, that shard ran 1143 s on the pull request, past
 # the 1080 s execution budget, and hit the 20-minute job timeout on the

@@ -361,8 +361,8 @@ trap 'rm -rf "$tlc_env_tmp"' EXIT
 # mutants' action property violated.
 # member_residency_audit.sh requires a final distinct-state count at or above
 # each run's floor, a coverage block in which each covered action of its four
-# runs generated a state, its seventeen witnesses violated, and with --mutants
-# each seeded defect's invariant, action property or assumption refused.
+# runs generated a state and its seventeen witnesses violated; the lane runs
+# it without --mutants, whose refusal lines are listed for a run by hand.
 # durable_tail_classification_audit.sh requires its Ready witness violated,
 # and with --mutants each seeded defect's target invariant violated.
 # durable_tail_recovery_ownership_audit.sh requires its four witnesses
