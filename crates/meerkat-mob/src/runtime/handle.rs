@@ -19436,8 +19436,9 @@ impl MobHandle {
     /// generation and fence, every surface keeps showing it, and its next
     /// delivery (host or peer) wakes it. A member that is not materialized
     /// has nothing to release. Refused retryably
-    /// ([`MobError::LifecycleOperationPending`]) while it is being woken or
-    /// has work in flight: nothing is interrupted.
+    /// ([`MobError::LifecycleOperationPending`]) while it is being woken,
+    /// while its runtime binding has not landed yet (right after a spawn),
+    /// or while it has work in flight: nothing is closed or interrupted.
     pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
         let agent_identity = identity.clone();
         self.send_actor_command(move |reply_tx| MobCommand::ReleaseMember {

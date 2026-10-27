@@ -12358,7 +12358,7 @@ ControlFlow::Break(()) => return Ok(()),
         })
         .await?;
         let expected_terminal_snapshot = staged.committed_snapshot.clone();
-        // G1: the final unregister publishes the released registration to the
+        // The final unregister publishes the released registration to the
         // owning mob (`RuntimeRegistrationReleased`). That is a post-commit
         // fact, never rolled back: it is held here, the staged commit below
         // dispatches nothing, and it is sent only after the exact entry was
@@ -12578,7 +12578,7 @@ ControlFlow::Break(()) => return Ok(()),
             )
         })
         .await?;
-        // G1: the registration is gone; tell the owning mob, once. A failed
+        // The registration is gone; tell the owning mob, once. A failed
         // send is not rolled back: the mob's member stays Live with nothing
         // materialized until its next delivery observes the loss (the
         // machine's counted drift arm), and a stale release is a no-op there.

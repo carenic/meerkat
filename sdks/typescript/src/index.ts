@@ -364,9 +364,12 @@ export type {
   CommsSendErrorDataPeerInputRejected,
   CommsSendErrorDataPeerNotFoundOrNotTrusted,
   CommsSendErrorDataPeerUnreachable,
+  CommsSendErrorDataPeerWakeRefused,
   CommsSendErrorDataSendAmbiguous,
   CommsSendErrorDataSendFailed,
   CommsSendRequiredAction,
+  DurableResumeHold,
+  PeerWakeRefusal,
 } from "./generated/types.js";
 export { COMMS_SEND_ERROR_CODES, commsSendError } from "./comms-errors.js";
 export { mobDestroyIncompleteReport } from "./mob-destroy-report.js";

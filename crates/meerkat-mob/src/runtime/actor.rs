@@ -6691,46 +6691,6 @@ struct DeferredResumeProvision {
     auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
-/// Whether the live actor of `session_id` runs `requested`, the auth binding
-/// a resume of `member` names: the binding its session recorded (persisted
-/// when the actor was built, before it served) is `requested` as named, or
-/// the form a build of `requested` records (stamped with the realm that
-/// declares it). Anything else, a session that recorded no binding
-/// included, refuses the resume typed: a live actor is never reused on
-/// another binding. A read that fails refuses too.
-async fn verify_live_actor_auth_binding(
-    session_service: &dyn super::session_service::MobSessionService,
-    member: &AgentIdentity,
-    session_id: &SessionId,
-    requested: &meerkat_core::AuthBindingRef,
-) -> Result<(), MobError> {
-    let recorded = session_service
-        .load_persisted_session_metadata(session_id)
-        .await
-        .map_err(MobError::SessionError)?
-        .and_then(|view| view.session_metadata)
-        .and_then(|metadata| metadata.auth_binding);
-    if recorded.as_ref() == Some(requested) {
-        return Ok(());
-    }
-    if let Some(recorded_binding) = recorded.as_ref()
-        && session_service
-            .recorded_auth_binding(requested)
-            .await
-            .map_err(MobError::SessionError)?
-            .as_ref()
-            == Some(recorded_binding)
-    {
-        return Ok(());
-    }
-    Err(MobError::MemberAuthBindingConflict {
-        member_id: member.clone(),
-        session_id: session_id.clone(),
-        requested: requested.clone(),
-        recorded,
-    })
-}
-
 impl SpawnProvisionInput {
     fn binding(&self) -> &crate::RuntimeBinding {
         match self {
@@ -14981,22 +14941,35 @@ impl MobActor {
                     .await
                 {
                     Ok(()) => {
-                        self.apply_dsl_signal(
+                        match self.apply_member_wake_feedback(
+                            agent_identity,
+                            attempt,
                             mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
                                 agent_identity: dsl_identity,
                                 attempt,
                             },
                             "resolve_placed_member_revival_succeeded",
-                        )?;
-                        self.clear_member_restore_failure(agent_identity).await;
-                        tracing::info!(
-                            mob_id = %self.definition.id,
-                            agent_identity = %agent_identity,
-                            host = %host.as_str(),
-                            bridge_session_id = %bridge_session_id,
-                            "machine-authorized placed revival re-materialized the member on its host"
-                        );
-                        Ok(())
+                        ) {
+                            mob_dsl::MemberWakeFeedbackVerdict::Applied => {
+                                self.clear_member_restore_failure(agent_identity).await;
+                                tracing::info!(
+                                    mob_id = %self.definition.id,
+                                    agent_identity = %agent_identity,
+                                    host = %host.as_str(),
+                                    bridge_session_id = %bridge_session_id,
+                                    "machine-authorized placed revival re-materialized the member on its host"
+                                );
+                                Ok(())
+                            }
+                            // The attempt ended while the host re-materialized
+                            // the member (a stop, a retire): this revival did
+                            // not make it Live, and the caller is answered by
+                            // the member's state.
+                            mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt => Err(self
+                                .member_wake_failure_from_state(agent_identity)
+                                .await
+                                .into_mob_error(agent_identity)),
+                        }
                     }
                     Err(error) => {
                         let hold = error.durable_resume_hold();
@@ -28247,7 +28220,7 @@ impl MobActor {
                     if scope.is_missing_live() {
                         // A missing live materialization is woken like
                         // every other: `WakeMember` with the observed miss,
-                        // realized by B4's cold recipe (the customizer is
+                        // realized by the cold restore recipe (the customizer is
                         // asked). Only an in-process reload keeps the warm
                         // recipe below.
                         Box::pin(self.revive_missing_member_through_wake(agent_identity, reply_tx))
@@ -34885,7 +34858,7 @@ impl MobActor {
                     // binding the spec names; otherwise the resume is refused,
                     // typed, and nothing is changed.
                     if let Some(requested) = auth_binding.as_ref() {
-                        verify_live_actor_auth_binding(
+                        super::live_actor_binding::verify_live_actor_auth_binding(
                             preparation_context.session_service.as_ref(),
                             &agent_identity,
                             &resume_id,

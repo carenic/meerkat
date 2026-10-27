@@ -46,7 +46,8 @@ them.
   then delivered once through the ordinary receipt path; when the wake is
   refused or does not finish, the send fails with this code instead of
   `peer_not_found_or_not_trusted`. `peer_not_found_or_not_trusted` is now
-  reserved for peers that are not members. The refusal is the closed
+  reserved for a peer that is not a member, or that the sender does not trust
+  (a member it is not wired to). The refusal is the closed
   `meerkat_core::comms::PeerWakeRefusal` (tagged on `kind`: `member_broken {
   reason, hold }`, `member_retiring`, `mob_not_running`, `admission_closed`,
   `wake_timed_out`, `mob_unavailable`, `materialization_lost`,
@@ -117,7 +118,8 @@ them.
 - `meerkat-mob`: `MobHandle::release_member(identity)` makes a member dormant:
   it releases the member's materialization in its process while the member is
   quiescent, and keeps it seated at the same session, generation and fence;
-  its next delivery wakes it. A member being woken, or with work in flight, is
+  its next delivery wakes it. A member being woken, one whose runtime binding
+  has not landed yet (right after a spawn), or one with work in flight is
   refused retryably (`MobError::LifecycleOperationPending`).
 - `meerkat-mob`: `MemberBuildPreparer` (with `MemberBuildPreparation`,
   `MemberBuildPrepared`, `MemberBuildPreparationRefusal` and
@@ -316,6 +318,17 @@ them.
   build. A host that changed a member's binding between launches no longer
   gets the member back on the old account, or broken when the old credential
   is gone.
+- `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its
+  name-collision filter (which hides external tools whose names another of
+  the member's tools already uses) now pass each allowed tool's review
+  support and mutation class (`review_entry_support`,
+  `tool_mutation_class`) through, so a tool that requires operation review
+  reaches consent and a read-only member can use tools declared read-only.
+  Filtered-out tools stay refused. Before, both filters answered
+  `Unsupported` and `Unknown` for every tool behind them: a call that
+  required review settled as `ReviewUnavailable { UnsupportedEntry }`
+  before any reviewer or consent, and a read-only member was refused every
+  tool behind them.
 
 ### Known limitations
 

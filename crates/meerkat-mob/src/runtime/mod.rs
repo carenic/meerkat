@@ -243,6 +243,7 @@ mod identity_local_services;
 #[cfg(any(test, feature = "test-support"))]
 mod identity_recovery_test_support;
 mod lifecycle_observation;
+mod live_actor_binding;
 #[cfg(feature = "openai-live")]
 mod live_bridge_operation;
 mod member_build_preparer;

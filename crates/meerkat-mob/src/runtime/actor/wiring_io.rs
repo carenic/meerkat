@@ -1041,7 +1041,7 @@ impl MobActor {
         self.start_prepared_wiring(ticket, prepared, reply)
     }
 
-    /// R4: a plan's lifecycle notices are sent only where MobMachine's
+    /// A plan's lifecycle notices are sent only where MobMachine's
     /// disposition says `Deliver`. A notice to or from a member that is not
     /// live is `Suppressed`: it wakes no one, and the member's trust, which
     /// its wake realizes from the machine's edges, carries its content. A

@@ -109,8 +109,8 @@ impl RosterAuthority {
         self.roster.get(agent_identity).cloned()
     }
 
-    /// The roster projection a member restore's turn writes (B4's
-    /// `MemberRestoreCommit`): a runtime wake applies the same writes to the
+    /// The roster projection a member restore's turn writes
+    /// (`MemberRestoreCommit`): a runtime wake applies the same writes to the
     /// actor's roster that a boot restore applies to the roster it builds.
     /// Counted as a mutation.
     #[cfg(feature = "runtime-adapter")]

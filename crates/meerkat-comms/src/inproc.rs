@@ -1122,9 +1122,13 @@ impl InprocRegistry {
                     )
                     .await
                     {
-                        // A closed live route of a seated member is stale:
-                        // nothing was admitted, so the wake path may hand the
-                        // envelope off once to the member's next inbox.
+                        // A closed live route of a seated member is stale.
+                        // The closed inbox refused the envelope, or admitted
+                        // it and lost the receipt with its queue; either way
+                        // the wake path hands the same envelope, with the same
+                        // id, to the member's next inbox once, and the
+                        // runtime's peer-ingress idempotency (one input per
+                        // peer and envelope id) admits it at most once.
                         Err(InprocSendError::InboxClosed) => route,
                         other => return other,
                     }
@@ -1132,7 +1136,7 @@ impl InprocRegistry {
                 (None, Some(route)) => route,
             };
             // The wake path. The first wake answers the miss; one more is
-            // allowed after a miss that follows a ready answer (R8).
+            // allowed after a miss that follows a ready answer.
             if wakes >= 2 {
                 return Err(InprocSendError::WakeRefused(
                     PeerWakeRefusal::MaterializationLost,

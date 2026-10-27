@@ -8,14 +8,14 @@
 //!   attempt MobMachine authorized is still open; take the member's own fork
 //!   of the authority, its overlay rule and the overlays it may follow, its
 //!   continuity intent, and dispatch the restore.
-//! - Step B (off the actor, [`plan_member_wake`]): B4's cold recipe
+//! - Step B (off the actor, [`plan_member_wake`]): the cold restore recipe
 //!   (`restore_resumed_member`) plans the member's restore on its own fork,
 //!   writing nothing shared. A missing bound session searches its successor
 //!   here and provisions it on a fork repointed to it. The woken comms
 //!   runtime's endpoint is checked against the durable one.
 //! - Step C (on the actor, [`MobActor::commit_member_wake_plan`]): the
 //!   attempt is still this wake's (attempt and incarnation fences); a
-//!   successor is repointed (journal first); B4's `apply_member_restore_plan`
+//!   successor is repointed (journal first); `apply_member_restore_plan`
 //!   applies the plan to the actor's authority, rosters and overlays in the
 //!   member's turn, ending in `ResolveMemberRevivalBound` (the runtime
 //!   binding is requested, the member is still Waking).
@@ -25,7 +25,7 @@
 //!   attempt is answered.
 //!
 //! Every wake feedback is attempt-fenced and answered by a machine verdict:
-//! a stale attempt is a no-op, never a fail-stop (F4). A provision a stale or
+//! a stale attempt is a no-op, never a fail-stop. A provision a stale or
 //! failed wake leaves behind is rolled back through its `PendingProvision`.
 
 use super::member_effect_lane::{
@@ -188,7 +188,7 @@ impl MemberEffectCommit for WakeCommit {
 }
 
 /// Everything Step B reads, owned: the effect future outlives the actor's
-/// borrow (B4's lesson: never hand a borrowed item into a `Send` future).
+/// borrow (never hand a borrowed item into a `Send` future).
 struct WakeRestoreInput {
     definition: Arc<MobDefinition>,
     session_service: Arc<dyn MobSessionService>,
@@ -648,7 +648,7 @@ impl MobActor {
             .await;
     }
 
-    /// Apply a plan through B4's `apply_member_restore_plan` over the
+    /// Apply a plan through `apply_member_restore_plan` over the
     /// actor's own state: its authority, its roster, its retained overlays.
     async fn apply_member_wake_plan(
         &mut self,
@@ -758,7 +758,10 @@ impl MobActor {
         Ok(())
     }
 
-    /// Readiness: the woken member's comms drain.
+    /// Readiness: the woken member's comms drain, required as a spawn
+    /// requires it. An autonomous member and a wired member need their
+    /// drain; an unwired turn-driven member whose runtime has no comms has
+    /// none, and wakes without one.
     async fn dispatch_member_wake_readiness(
         &mut self,
         run: WakeRun,
@@ -768,6 +771,8 @@ impl MobActor {
             self.roll_back_member_wake(run, rollback);
             return;
         };
+        let drain_required = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost
+            || self.member_has_machine_wiring(&run.identity);
         let readiness = self.detached_member_readiness_context();
         let identity = run.identity.clone();
         let member_ref = entry.member_ref.clone();
@@ -777,13 +782,32 @@ impl MobActor {
             rollback,
             "member_wake_readiness",
             async move {
-                WakeStep::Ready(
+                WakeStep::Ready(if drain_required {
                     readiness
                         .ensure_mob_comms_drain(&identity, &member_ref)
-                        .await,
-                )
+                        .await
+                } else {
+                    readiness
+                        .ensure_mob_comms_drain_if_comms(&identity, &member_ref)
+                        .await
+                })
             },
         );
+    }
+
+    /// Whether MobMachine holds a wiring edge of `identity` (to a member or
+    /// to an external peer).
+    fn member_has_machine_wiring(&self, identity: &AgentIdentity) -> bool {
+        let local = mob_dsl::AgentIdentity::from_domain(identity);
+        let state = self.dsl_authority.state();
+        state
+            .wiring_edges
+            .iter()
+            .any(|edge| edge.a == local || edge.b == local)
+            || state
+                .external_peer_edges_by_key
+                .values()
+                .any(|edge| edge.local == local)
     }
 
     async fn member_wake_ready(
@@ -899,7 +923,8 @@ impl MobActor {
         self.resolve_member_wake_ready(run, rollback).await;
     }
 
-    /// Waking -> Live, after readiness and topology settled (R7, F11).
+    /// Waking -> Live, after readiness and topology settled (Live means
+    /// ready).
     async fn resolve_member_wake_ready(&mut self, run: WakeRun, rollback: Option<WakeRollback>) {
         let verdict = self.apply_member_wake_feedback(
             &run.identity,
@@ -1291,8 +1316,27 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
             .await
             .unwrap_or(false);
     if successor_live {
-        // A successor live in this process keeps serving: repoint and bind
-        // it, nothing is provisioned.
+        // A successor live in this process keeps serving when it runs the
+        // binding the member's spec names (otherwise the wake fails, typed,
+        // and the live actor is not reused): repoint and bind it, nothing is
+        // provisioned.
+        if let Some(requested) = seated.restore_spec.auth_binding.as_ref()
+            && let Err(conflict) = super::super::live_actor_binding::verify_live_actor_auth_binding(
+                session_service.as_ref(),
+                &entry.agent_identity,
+                &successor,
+                requested,
+            )
+            .await
+        {
+            return Ok(WakePlan::Restore {
+                plan: MemberRestorePlan::Unseated(member_restore_failure(
+                    &successor,
+                    conflict.to_string(),
+                )),
+                endpoint: WakeEndpoint::Matches,
+            });
+        }
         let endpoint = live_member_endpoint(&provisioner, &definition, entry, &successor).await;
         return Ok(WakePlan::Successor {
             successor_session_id: successor,
@@ -1420,6 +1464,24 @@ async fn live_member_endpoint(
 ) -> WakeEndpoint {
     let member_ref = MemberRef::from_bridge_session_id(session_id.clone());
     live_member_endpoint_for_ref(provisioner, definition, entry, &member_ref).await
+}
+
+impl super::DetachedMemberReadinessContext {
+    /// The member's comms drain when its runtime has comms; nothing when it
+    /// has none (as a turn-driven spawn binds it).
+    async fn ensure_mob_comms_drain_if_comms(
+        &self,
+        agent_identity: &AgentIdentity,
+        member_ref: &MemberRef,
+    ) -> Result<(), MobError> {
+        if self.runtime_adapter.is_none()
+            || self.provisioner.comms_runtime(member_ref).await.is_none()
+        {
+            return Ok(());
+        }
+        self.ensure_mob_comms_drain(agent_identity, member_ref)
+            .await
+    }
 }
 
 /// The endpoint the member's live comms runtime presents, as a boot reads

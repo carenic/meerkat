@@ -20,7 +20,7 @@
 //!   a peer send that finds no live inbox for a seated member reaches the
 //!   actor through it as `WakeMember(PeerDelivery)`.
 //!
-//! The wake turn itself (B4's cold recipe off the actor, its plan applied on
+//! The wake turn itself (the cold restore recipe off the actor, its plan applied on
 //! the actor, readiness, topology, the Ready resolution) is in
 //! `member_wake_turn`.
 
@@ -35,7 +35,7 @@ pub(in crate::runtime) enum MemberWakeOutcome {
     /// The member is ready: live, its trust and drain settled.
     Ready,
     /// The request was a silent lifecycle notice the machine consumed for a
-    /// member that is not live, without waking it (R4): its topology at its
+    /// member that is not live, without waking it: its topology at its
     /// next wake carries the notice's content.
     LifecycleNoticeConsumed,
 }
@@ -241,10 +241,14 @@ impl meerkat_comms::InprocPeerWaker for MobPeerWaker {
 }
 
 impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
-    /// A session-keyed live operation on a member's session (R10): the
-    /// member bound to it, per the machine state the actor last published,
-    /// is woken as a host delivery wakes it. A session no member is bound to
-    /// any more answers `NotOwned`.
+    /// A session-keyed live operation on a member's session: the member
+    /// bound to it, per the machine state the actor last published, is woken
+    /// as a host delivery wakes it. A session no member is bound to any more
+    /// answers `NotOwned`. The caller found no live actor serving the
+    /// session, and that observation goes with the wake: a member the
+    /// machine still holds Live has lost its materialization, and the
+    /// machine's drift verdict decides its wake (re-observed on the actor
+    /// first).
     fn wake_session_owner(
         &self,
         session_id: &SessionId,
@@ -268,7 +272,7 @@ impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
             let command = MobCommand::WakeMember {
                 agent_identity: identity.clone(),
                 cause: mob_dsl::MemberWakeCause::HostDelivery,
-                observed_missing: false,
+                observed_missing: true,
                 input_class: mob_dsl::PeerInputClass::Content,
                 sender_waking: false,
                 reply_tx,
@@ -324,7 +328,7 @@ pub(in crate::runtime) struct PendingMemberMaterialization {
     pub(in crate::runtime) attempt: MemberWakeAttempt,
 }
 
-/// A stopped mob's peer-ingress change for its live members (R9).
+/// A stopped mob's peer-ingress change for its live members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum MemberPeerIngressChange {
     Close,
@@ -340,18 +344,26 @@ pub(in crate::runtime) struct RunningMemberWake {
 
 /// Continuity intents by member, caught up from the mob's journal by cursor
 /// (the same fold `recorded_continuity_intents` makes over a full replay,
-/// without replaying the journal per wake).
+/// without replaying the journal per wake). It starts caught up to the
+/// journal the actor's start replayed, so a wake folds only the events
+/// appended since.
 pub(in crate::runtime) struct MemberContinuityIndex {
     last_cursor: u64,
     recorded: super::super::builder::RecordedContinuity,
 }
 
 impl MemberContinuityIndex {
-    fn new() -> Self {
-        Self {
+    /// The index caught up to `replayed`, the journal the actor's start
+    /// replayed.
+    fn seeded(replayed: &[MobEvent], mob_id: &MobId) -> Self {
+        let mut index = Self {
             last_cursor: 0,
             recorded: HashMap::new(),
+        };
+        for event in replayed {
+            index.fold(event, mob_id);
         }
+        index
     }
 
     const PAGE: usize = 256;
@@ -365,37 +377,41 @@ impl MemberContinuityIndex {
         loop {
             let batch = events.poll(self.last_cursor, Self::PAGE).await?;
             let complete = batch.len() < Self::PAGE;
-            for event in batch {
-                self.last_cursor = event.cursor;
-                if &event.mob_id != mob_id {
-                    continue;
-                }
-                match &event.kind {
-                    MobEventKind::MobReset => self.recorded.clear(),
-                    MobEventKind::MemberSpawned(spawned) => {
-                        self.recorded.insert(
-                            spawned.agent_identity.clone(),
-                            (spawned.generation, spawned.continuity_intent.clone()),
-                        );
-                    }
-                    MobEventKind::MemberReset {
-                        agent_identity,
-                        previous_generation,
-                        new_generation,
-                        ..
-                    } => {
-                        if let Some((generation, _)) = self.recorded.get_mut(agent_identity)
-                            && *generation == *previous_generation
-                        {
-                            *generation = *new_generation;
-                        }
-                    }
-                    _ => {}
-                }
+            for event in &batch {
+                self.fold(event, mob_id);
             }
             if complete {
                 return Ok(());
             }
+        }
+    }
+
+    fn fold(&mut self, event: &MobEvent, mob_id: &MobId) {
+        self.last_cursor = self.last_cursor.max(event.cursor);
+        if &event.mob_id != mob_id {
+            return;
+        }
+        match &event.kind {
+            MobEventKind::MobReset => self.recorded.clear(),
+            MobEventKind::MemberSpawned(spawned) => {
+                self.recorded.insert(
+                    spawned.agent_identity.clone(),
+                    (spawned.generation, spawned.continuity_intent.clone()),
+                );
+            }
+            MobEventKind::MemberReset {
+                agent_identity,
+                previous_generation,
+                new_generation,
+                ..
+            } => {
+                if let Some((generation, _)) = self.recorded.get_mut(agent_identity)
+                    && *generation == *previous_generation
+                {
+                    *generation = *new_generation;
+                }
+            }
+            _ => {}
         }
     }
 
@@ -440,19 +456,32 @@ pub(in crate::runtime) struct MemberWakes {
     pub(in crate::runtime) running: BTreeMap<MemberWakeAttempt, RunningMemberWake>,
     /// Peer-ingress changes to realize at the next loop boundary.
     ingress: VecDeque<MemberPeerIngressChange>,
-    /// The concrete provisioner B4's cold recipe runs on.
+    /// The concrete provisioner the cold restore recipe runs on.
     pub(in crate::runtime) provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
     pub(in crate::runtime) continuity: MemberContinuityIndex,
-    /// Consecutive owed-boot retries per member (backoff state).
-    owed_retries: BTreeMap<AgentIdentity, u32>,
+    /// Owed-boot retry state per member: the backoff step, and whether its
+    /// one retry timer is armed.
+    owed_retries: BTreeMap<AgentIdentity, OwedMemberWakeRetry>,
+}
+
+/// One member's owed-boot retry: consecutive retries (the backoff step) and
+/// whether a retry timer is armed. A member has at most one armed timer, so
+/// two refusals before it fires do not step the backoff twice.
+#[derive(Debug, Default)]
+struct OwedMemberWakeRetry {
+    retries: u32,
+    armed: bool,
 }
 
 impl MemberWakes {
+    /// `replayed` is the journal the actor's start replayed: the continuity
+    /// index starts caught up to it.
     pub(in crate::runtime) fn new(
         provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
         mob_id: &MobId,
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
+        replayed: &[MobEvent],
     ) -> Result<Self, MobError> {
         let namespace = meerkat_core::mob_realm_id(mob_id.as_str())
             .map_err(|error| {
@@ -473,7 +502,7 @@ impl MemberWakes {
             running: BTreeMap::new(),
             ingress: VecDeque::new(),
             provisioner,
-            continuity: MemberContinuityIndex::new(),
+            continuity: MemberContinuityIndex::seeded(replayed, mob_id),
             owed_retries: BTreeMap::new(),
         })
     }
@@ -700,7 +729,7 @@ impl MobActor {
         };
         match phase {
             Some(mob_dsl::MemberMaterializationPhase::Live) => Ok(MemberWakeOutcome::Ready),
-            // A retire start closed the attempt (F3).
+            // A retire start closed the attempt.
             Some(_) if retiring => Err(MemberWakeFailure::Refused(
                 crate::MemberWakeRefusal::Retiring,
             )),
@@ -721,12 +750,12 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Wake routes (a declared projection of machine membership, G7).
+    // Wake routes (a declared projection of machine membership).
     // ---------------------------------------------------------------
 
     /// What `identity`'s routes are, read from machine state: a local
     /// session-bound member is routed by its session (session-owner
-    /// registry, R10), and by its durable endpoint's key once it has one
+    /// registry), and by its durable endpoint's key once it has one
     /// (inproc wake route).
     fn member_wake_route_source(&self, identity: &AgentIdentity) -> Option<PublishedMemberRoutes> {
         let state = self.dsl_authority.state();
@@ -937,7 +966,7 @@ impl MobActor {
         }
     }
 
-    /// The counted drift path (G1): a routing miss or a liveness probe
+    /// The counted drift path: a routing miss or a liveness probe
     /// observed the live materialization of a member the machine holds Live.
     /// The machine's drift arm moves it to Waking under a new attempt, which
     /// this actor realizes (the drift arm hands nothing off).
@@ -946,6 +975,14 @@ impl MobActor {
         identity: &AgentIdentity,
         cause: mob_dsl::MemberWakeCause,
     ) -> MemberWakeAdmission {
+        // The miss was observed before this command ran (off the actor, or
+        // by a sender's route lookup), so it may be stale: a concurrent wake
+        // may have served the member since. Observe again here, and a member
+        // whose runtime registration serves it with an executor is ready,
+        // not drifted.
+        if self.member_materialization_served(identity).await {
+            return MemberWakeAdmission::Ready;
+        }
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         let transition = match self.apply_dsl_signal_collect_transition(
             mob_dsl::MobMachineSignal::ClassifyMemberLiveMaterialization {
@@ -1014,6 +1051,36 @@ impl MobActor {
             _ => MemberWakeAdmission::Failed(MemberWakeFailure::Refused(
                 crate::MemberWakeRefusal::MobUnavailable,
             )),
+        }
+    }
+
+    /// Whether `identity`'s session is served in this process right now: its
+    /// runtime registration has an executor attached. The fresh observation
+    /// the drift path takes on the actor before it trusts an earlier miss.
+    async fn member_materialization_served(&self, identity: &AgentIdentity) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let Some(adapter) = self.runtime_adapter.as_ref() else {
+                return false;
+            };
+            let Some(session_id) = self
+                .roster
+                .read()
+                .await
+                .get(identity)
+                .and_then(|entry| entry.member_ref.bridge_session_id().cloned())
+            else {
+                return false;
+            };
+            adapter
+                .session_has_executor(&session_id)
+                .await
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = identity;
+            false
         }
     }
 
@@ -1093,7 +1160,10 @@ impl MobActor {
     }
 
     /// The answer by the member's state alone (no verdict to read).
-    async fn member_wake_failure_from_state(&self, identity: &AgentIdentity) -> MemberWakeFailure {
+    pub(in crate::runtime) async fn member_wake_failure_from_state(
+        &self,
+        identity: &AgentIdentity,
+    ) -> MemberWakeFailure {
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         if state.member_restore_failures.contains_key(&dsl_identity) {
@@ -1101,6 +1171,16 @@ impl MobActor {
         }
         if !state.identity_to_runtime.contains_key(&dsl_identity) {
             return MemberWakeFailure::NotAMember;
+        }
+        // A retirement start closes the member's wake and removes its phase:
+        // the member is retiring, which is the answer.
+        if state
+            .identity_to_runtime
+            .get(&dsl_identity)
+            .and_then(|runtime_id| state.member_state_markers.get(runtime_id))
+            == Some(&mob_dsl::MobMemberState::Retiring)
+        {
+            return MemberWakeFailure::Refused(crate::MemberWakeRefusal::Retiring);
         }
         if !matches!(state.lifecycle_phase, mob_dsl::MobPhase::Running) {
             return MemberWakeFailure::Refused(crate::MemberWakeRefusal::MobNotRunning);
@@ -1176,7 +1256,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Stopped-mob peer ingress (R9), at the loop boundary.
+    // Stopped-mob peer ingress, at the loop boundary.
     // ---------------------------------------------------------------
 
     /// Close or reopen the live members' inproc routes for peer ingress, as
@@ -1222,7 +1302,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // The wake bound (G11) and the owed-boot retry.
+    // The wake bound and the owed-boot retry.
     // ---------------------------------------------------------------
 
     /// Arm the mob's wake bound for one attempt: when it ends, the machine
@@ -1294,7 +1374,7 @@ impl MobActor {
 
     /// Apply one attempt-fenced wake feedback signal and read the machine's
     /// verdict. A transition the machine refuses is recorded as a fault and
-    /// read as stale: wake feedback never fail-stops the mob (F4).
+    /// read as stale: wake feedback never fail-stops the mob.
     pub(in crate::runtime) fn apply_member_wake_feedback(
         &mut self,
         identity: &AgentIdentity,
@@ -1375,17 +1455,32 @@ impl MobActor {
             Some(mob_dsl::MemberMaterializationPhase::Dormant)
         );
         if !owed || !dormant {
-            self.member_wakes.owed_retries.remove(identity);
+            // Nothing to retry now; the backoff restarts at the next owed
+            // refusal. An armed timer stays the member's one timer.
+            if let std::collections::btree_map::Entry::Occupied(mut entry) =
+                self.member_wakes.owed_retries.entry(identity.clone())
+            {
+                if entry.get().armed {
+                    entry.get_mut().retries = 0;
+                } else {
+                    entry.remove();
+                }
+            }
             return;
         }
         let backoff = self.member_residency.owed_wake_retry;
-        let retries = self
+        let retry = self
             .member_wakes
             .owed_retries
             .entry(identity.clone())
-            .or_insert(0);
-        let delay = backoff.delay(*retries);
-        *retries = retries.saturating_add(1);
+            .or_default();
+        if retry.armed {
+            // Its timer is already armed: the retry it fires covers this one.
+            return;
+        }
+        let delay = backoff.delay(retry.retries);
+        retry.retries = retry.retries.saturating_add(1);
+        retry.armed = true;
         let command_tx = self.command_tx.clone();
         let agent_identity = identity.clone();
         self.actor_io_tasks.spawn(async move {
@@ -1417,6 +1512,10 @@ impl MobActor {
     /// An owed-boot retry is due: wake the member for its boot work again,
     /// unless its obligation is gone or a delivery already woke it.
     pub(in crate::runtime) async fn retry_owed_member_wake(&mut self, identity: AgentIdentity) {
+        // This is the member's armed timer firing.
+        if let Some(retry) = self.member_wakes.owed_retries.get_mut(&identity) {
+            retry.armed = false;
+        }
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&identity);
         let owed = state
@@ -1517,7 +1616,7 @@ impl MobActor {
     /// A missing-live revival request (a host's liveness probe, a reload's
     /// re-attachment, a start's recovery of a member it left out): applied
     /// as `WakeMember` with the observed miss and answered in the revival
-    /// vocabulary. The wake runs B4's cold recipe like every other wake.
+    /// vocabulary. The wake runs the cold restore recipe like every other wake.
     pub(in crate::runtime) async fn revive_missing_member_through_wake(
         &mut self,
         identity: AgentIdentity,
@@ -1579,7 +1678,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Make dormant (`MobHandle::release_member`, R6).
+    // Make dormant (`MobHandle::release_member`).
     // ---------------------------------------------------------------
 
     /// Release `identity`'s live materialization: its runtime registration is
@@ -1591,8 +1690,9 @@ impl MobActor {
     ///
     /// A member that is not materialized here (Dormant, or Broken) has
     /// nothing to release. One being woken is refused retryably: its fresh
-    /// registration is the wake's. One with work in flight is refused
-    /// retryably too; nothing is interrupted.
+    /// registration is the wake's. So is one whose registration's binding
+    /// has not reached MobMachine yet, and one with work in flight; nothing
+    /// is closed or interrupted.
     pub(in crate::runtime) async fn handle_release_member(
         &mut self,
         identity: AgentIdentity,
@@ -1617,12 +1717,37 @@ impl MobActor {
         }
     }
 
-    /// The release's preconditions, read on the actor: the member, its local
-    /// session and its runtime owner. `None` when nothing is materialized.
+    /// The release, as MobMachine classifies it (`ClassifyMemberRelease`),
+    /// realized on the actor: the member's local session and its runtime
+    /// owner when it releases, `None` when nothing is materialized.
     async fn prepare_member_release(
-        &self,
+        &mut self,
         identity: &AgentIdentity,
     ) -> Result<Option<MemberReleaseTarget>, MobError> {
+        let verdict = self.classify_member_release(identity)?;
+        match verdict {
+            mob_dsl::MemberReleaseVerdict::Release | mob_dsl::MemberReleaseVerdict::HostOwned => {}
+            mob_dsl::MemberReleaseVerdict::NotAMember => {
+                return Err(MobError::MemberNotFound(identity.clone()));
+            }
+            mob_dsl::MemberReleaseVerdict::WakeInFlight => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("member wake of '{identity}'"),
+                });
+            }
+            // Live, but MobMachine would not honour the release of its
+            // registration yet (the routed binding has not recorded the
+            // registration's epoch): nothing is closed, and a retry releases
+            // it once the binding landed.
+            mob_dsl::MemberReleaseVerdict::NotYetReleasable => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("runtime binding of member '{identity}'"),
+                });
+            }
+            // Dormant, or not materialized at all (Broken, retiring): nothing
+            // is materialized here to release.
+            mob_dsl::MemberReleaseVerdict::NothingMaterialized => return Ok(None),
+        }
         let entry = self
             .roster
             .read()
@@ -1630,26 +1755,11 @@ impl MobActor {
             .get(identity)
             .cloned()
             .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
-        if super::super::member_runtime_is_host_owned(self.dsl_authority.state(), identity) {
+        if verdict == mob_dsl::MemberReleaseVerdict::HostOwned {
             return Err(MobError::UnsupportedForMode {
                 mode: entry.runtime_mode,
                 reason: "a placed member's materialization is owned by its member host".to_string(),
             });
-        }
-        match self
-            .dsl_authority
-            .state()
-            .member_materialization
-            .get(&mob_dsl::AgentIdentity::from_domain(identity))
-        {
-            Some(mob_dsl::MemberMaterializationPhase::Live) => {}
-            Some(mob_dsl::MemberMaterializationPhase::Waking) => {
-                return Err(MobError::LifecycleOperationPending {
-                    intent: format!("member wake of '{identity}'"),
-                });
-            }
-            // Dormant, or no phase (Broken): nothing is materialized here.
-            Some(mob_dsl::MemberMaterializationPhase::Dormant) | None => return Ok(None),
         }
         let member_ref = self.machine_member_ref_for_behavior(&entry, "release member")?;
         let session_id = member_ref.bridge_session_id().cloned().ok_or_else(|| {
@@ -1680,7 +1790,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Peer-notice dispositions (R4): MobMachine's verdict, realized.
+    // Peer-notice dispositions: MobMachine's verdict, realized.
     // ---------------------------------------------------------------
 
     /// MobMachine's disposition of one lifecycle or kickoff notice from
@@ -1742,6 +1852,36 @@ impl MobActor {
                 mob_dsl::PeerNoticeDisposition::Suppressed => PeerNoticeRealization::Suppressed,
             },
         )
+    }
+
+    /// MobMachine's release verdict for `identity` (`ClassifyMemberRelease`,
+    /// a pure verdict legal in every phase the actor serves).
+    fn classify_member_release(
+        &mut self,
+        identity: &AgentIdentity,
+    ) -> Result<mob_dsl::MemberReleaseVerdict, MobError> {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        let transition = self.apply_dsl_input_collect_transition(
+            mob_dsl::MobMachineInput::ClassifyMemberRelease {
+                agent_identity: dsl_identity.clone(),
+            },
+            "classify_member_release",
+        )?;
+        transition
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::MemberReleaseClassified {
+                    agent_identity,
+                    verdict,
+                } if agent_identity == &dsl_identity => Some(*verdict),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "MobMachine classified no release of member '{identity}'"
+                ))
+            })
     }
 
     /// Whether `attempt` is still `identity`'s open wake attempt.
@@ -1806,5 +1946,98 @@ async fn release_member_registration(
         Err(error) => Err(MobError::Internal(format!(
             "release of member '{identity}' could not close its registration: {error}"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod continuity_index_tests {
+    use super::*;
+    use crate::event::{MemberSpawnedEvent, NewMobEvent};
+    use crate::ids::{FenceToken, Generation, ProfileName};
+    use crate::store::InMemoryMobEventStore;
+
+    fn spawned(identity: &AgentIdentity, generation: Generation) -> MobEventKind {
+        let mut spawned = MemberSpawnedEvent::new(
+            identity.clone(),
+            generation,
+            FenceToken::new(1),
+            crate::ids::AgentRuntimeId::new(identity.clone(), generation),
+            ProfileName::from("worker"),
+        );
+        spawned.continuity_intent = crate::runtime::SpawnContinuityIntent::DurableIdentity {
+            continuity_key: identity.as_str().to_string(),
+        };
+        MobEventKind::MemberSpawned(spawned)
+    }
+
+    /// The index an actor start seeds from its replay holds what the full
+    /// journal fold holds, at the replay's last cursor, so a wake after the
+    /// start folds only the events appended since (here a reset carrying a
+    /// member's spawn to its next generation).
+    #[tokio::test]
+    async fn a_seeded_continuity_index_folds_only_the_events_appended_after_the_start() {
+        let mob_id = MobId::from("continuity-seed");
+        let first = AgentIdentity::from("worker-1");
+        let second = AgentIdentity::from("worker-2");
+        let store: Arc<dyn MobEventStore> = Arc::new(InMemoryMobEventStore::new());
+        for kind in [
+            spawned(&first, Generation::new(0)),
+            spawned(&second, Generation::new(0)),
+        ] {
+            store
+                .append(NewMobEvent::for_test(mob_id.clone(), kind))
+                .await
+                .expect("append a spawn");
+        }
+        let replayed = store.replay_all().await.expect("replay the journal");
+        let mut index = MemberContinuityIndex::seeded(&replayed, &mob_id);
+        assert_eq!(
+            index.last_cursor,
+            store.latest_cursor().await.expect("latest cursor"),
+            "the seeded index starts at the replay's last cursor"
+        );
+        assert_eq!(
+            index.recorded,
+            crate::runtime::builder::recorded_continuity_intents(&replayed),
+            "the seed holds what the full journal fold holds"
+        );
+
+        store
+            .append(NewMobEvent::for_test(
+                mob_id.clone(),
+                MobEventKind::MemberReset {
+                    agent_identity: first.clone(),
+                    previous_generation: Generation::new(0),
+                    new_generation: Generation::new(1),
+                    fence_token: FenceToken::new(2),
+                    agent_runtime_id: crate::ids::AgentRuntimeId::new(
+                        first.clone(),
+                        Generation::new(1),
+                    ),
+                },
+            ))
+            .await
+            .expect("append a reset");
+        index
+            .refresh(&store, &mob_id)
+            .await
+            .expect("refresh the index");
+        let journal = store.replay_all().await.expect("replay the journal");
+        assert_eq!(
+            index.recorded,
+            crate::runtime::builder::recorded_continuity_intents(&journal),
+            "the refresh folds the appended reset"
+        );
+        assert_eq!(
+            index
+                .slice_for(&first)
+                .get(&first)
+                .map(|(generation, _)| *generation),
+            Some(Generation::new(1))
+        );
+        assert_eq!(
+            index.last_cursor,
+            store.latest_cursor().await.expect("latest cursor")
+        );
     }
 }

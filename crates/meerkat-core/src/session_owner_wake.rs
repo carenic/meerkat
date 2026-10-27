@@ -16,7 +16,10 @@
 //!   owner's start), keyed by the member's bound session, and retracts it
 //!   with the route (`RetractWakeRoute`).
 //! - Trigger: a session-keyed live operation that finds no live actor for
-//!   its session asks [`SessionOwnerWakeRegistry::wake`] before it fails.
+//!   its session asks [`SessionOwnerWakeRegistry::wake`] before it fails,
+//!   and a cold attach of a session (the session service's own seam every
+//!   surface attaches through) asks it before materializing the session
+//!   itself.
 //!   An operation that only reads, or that cancels (an interrupt, a
 //!   cancel), never wakes: [`SessionOwnerWakeRegistry::owned`] answers
 //!   whether an owner holds the session, so it can answer "no run open"
@@ -63,7 +66,10 @@ pub type SessionOwnerWakeFuture =
 /// its machine and answers once the member is ready, or with the typed
 /// refusal (as a [`SessionError`]). It never runs the operation itself.
 pub trait SessionOwnerWaker: Send + Sync {
-    /// Wake the member that owns `session_id` for a live operation.
+    /// Wake the member that owns `session_id` for a live operation. A wake
+    /// is asked only when the caller found no live actor serving the
+    /// session, so the owner takes that as its observation: a member it
+    /// still holds live has lost its materialization.
     fn wake_session_owner(&self, session_id: &SessionId) -> SessionOwnerWakeFuture;
 }
 
@@ -109,9 +115,9 @@ impl SessionOwnerWakeRegistry {
         self.owner(session_id).is_some()
     }
 
-    /// Ask `session_id`'s owner to wake its member. `None` when no live
-    /// owner holds the session: the caller proceeds as it would without
-    /// this registry.
+    /// Ask `session_id`'s owner to wake its member; the caller found no
+    /// live actor serving the session. `None` when no live owner holds the
+    /// session: the caller proceeds as it would without this registry.
     pub async fn wake(
         &self,
         session_id: &SessionId,

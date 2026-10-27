@@ -393,9 +393,10 @@ fn signal_project_u64(
 
 /// An optional fact the producer projects as an opaque `Option<T>` (a
 /// runtime id or epoch as `Option<String>`, a fence as `Option<u64>`), so an
-/// absent value survives the route as `None`. A field the route does not
-/// project at all also reads as `None`; a projected field of another shape is
-/// refused.
+/// absent value survives the route as `None`. Only that projected `None`
+/// means absent: a field the route does not project at all is refused, as
+/// is a projected field of another shape, so a route that stops projecting
+/// a fact can never turn it into an absent one.
 #[cfg(feature = "runtime-adapter")]
 fn signal_project_optional<T>(
     fields: &[(FieldId, OwnedFieldValue)],
@@ -405,7 +406,10 @@ where
     T: Clone + Send + Sync + 'static,
 {
     match fields.iter().find(|(id, _)| id == field) {
-        None => Ok(None),
+        None => Err(format!(
+            "missing projected signal field `{}`",
+            field.as_str()
+        )),
         Some((_, OwnedFieldValue::Opaque(value))) => {
             value.downcast_ref::<Option<T>>().cloned().ok_or_else(|| {
                 format!(
@@ -508,6 +512,26 @@ impl SignalConsumerSurface for MobSignalConsumerSurface {
         projected_fields: Vec<(FieldId, OwnedFieldValue)>,
     ) -> Result<(), meerkat_runtime::composition::ConsumerError> {
         let signal = build_mob_signal(&variant, &projected_fields)?;
+        #[cfg(test)]
+        let held = match &signal {
+            mob_dsl::MobMachineSignal::ObserveRuntimeReady {
+                agent_runtime_id, ..
+            } => ready_signal_test_hold::held(agent_runtime_id.as_str()),
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some(mut released) = held {
+            let command_tx = self.command_tx.clone();
+            tokio::spawn(async move {
+                let _ = released.wait_for(|released| *released).await;
+                let _ = command_tx
+                    .send(super::scope_gate::RoutedMobCommand::internal(
+                        super::state::MobCommand::ProjectMachineSignal { signal },
+                    ))
+                    .await;
+            });
+            return Ok(());
+        }
         // Machine-internal lifecycle signal projection: the internal
         // authority lane (phase 5, DEC-P5E-2).
         let command = super::scope_gate::RoutedMobCommand::internal(
@@ -534,6 +558,41 @@ impl SignalConsumerSurface for MobSignalConsumerSurface {
                 ))
             }
         }
+    }
+}
+
+/// Test seam: the routed readiness observation (`ObserveRuntimeReady`) of a
+/// member's runtime held until the test releases it, so a row can act in the
+/// window between a member's Live commit and its registration's epoch
+/// record. Keyed by member identity; the runtime id renders as
+/// `identity:generation`.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) mod ready_signal_test_hold {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::tokio::sync::watch;
+
+    static HOLDS: Mutex<BTreeMap<String, watch::Receiver<bool>>> = Mutex::new(BTreeMap::new());
+
+    /// Hold every readiness observation of `identity`'s runtimes until the
+    /// returned sender sends `true`.
+    pub(crate) fn hold(identity: &str) -> watch::Sender<bool> {
+        let (released_tx, released_rx) = watch::channel(false);
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(identity.to_string(), released_rx);
+        released_tx
+    }
+
+    pub(super) fn held(runtime_id: &str) -> Option<watch::Receiver<bool>> {
+        let (identity, _generation) = runtime_id.rsplit_once(':')?;
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(identity)
+            .cloned()
     }
 }
 
@@ -1212,6 +1271,10 @@ mod tests {
                         OwnedFieldValue::Str("rt-deferred".to_string()),
                     ),
                     (seam_facts::fields::fence_token(), OwnedFieldValue::U64(7)),
+                    (
+                        seam_facts::fields::runtime_epoch_id(),
+                        OwnedFieldValue::Opaque(Arc::new(None::<String>)),
+                    ),
                 ],
             ),
         )
@@ -1363,5 +1426,25 @@ mod tests {
                 cause: mob_dsl::MemberMaterializationLossCause::RegistrationReleased,
             }
         ));
+
+        // A release whose route stopped projecting a fact is refused, never
+        // read as a release that names nothing.
+        let unprojected = build_mob_signal(
+            &release,
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Opaque(Arc::new(Some("rt-released".to_string()))),
+                ),
+                (
+                    seam_facts::fields::fence_token(),
+                    OwnedFieldValue::Opaque(Arc::new(Some(9_u64))),
+                ),
+            ],
+        );
+        assert!(
+            unprojected.is_err(),
+            "a release missing its epoch field is refused"
+        );
     }
 }
