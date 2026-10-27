@@ -39,6 +39,47 @@
 
 use super::*;
 
+/// One armed hold of the hand-off of a watched wake's close to the actor:
+/// the watcher reports reaching it, then waits for its release.
+#[cfg(test)]
+type ExplicitResumeBootMemberSettleHold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+#[cfg(test)]
+static HOLD_EXPLICIT_RESUME_BOOT_MEMBER_SETTLE_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), ExplicitResumeBootMemberSettleHold>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Test seam: the next wake of `member` a lift of `mob_id` watches hands its
+/// close to the actor only once released. The receiver resolves once the
+/// wake closed and the hand-off reached the hold; sending on, or dropping,
+/// the sender releases it.
+#[cfg(test)]
+pub(in crate::runtime) fn hold_explicit_resume_boot_member_settle_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    HOLD_EXPLICIT_RESUME_BOOT_MEMBER_SETTLE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((mob_id.clone(), member.clone()), (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+/// The hold armed for the hand-off of `member`'s next watched wake in
+/// `mob_id`, taken once.
+#[cfg(test)]
+fn take_explicit_resume_boot_member_settle_hold_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> Option<ExplicitResumeBootMemberSettleHold> {
+    HOLD_EXPLICIT_RESUME_BOOT_MEMBER_SETTLE_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(mob_id.clone(), member.clone()))
+}
+
 /// One wake of the lift's plan, as the explicit resume tracks it: a member
 /// Waking under the plan's wake attempt, joined by the lift, or a member a
 /// delivery woke before the plan reached it, whose own wake the plan
@@ -459,8 +500,18 @@ impl MobActor {
         }
         let outcome_rx = self.join_member_wake(&member.agent_identity, member.wake_attempt);
         let command_tx = self.command_tx.clone();
+        #[cfg(test)]
+        let settle_hold = take_explicit_resume_boot_member_settle_hold_for_test(
+            &self.definition.id,
+            &member.agent_identity,
+        );
         self.actor_io_tasks.spawn(async move {
             let joined = outcome_rx.await.is_ok_and(|outcome| outcome.is_ok());
+            #[cfg(test)]
+            if let Some((entered, release)) = settle_hold {
+                let _ = entered.send(());
+                let _ = release.await;
+            }
             let _ = command_tx
                 .send(RoutedMobCommand::internal(
                     MobCommand::ResumeLifecycleBootMemberSettled {
@@ -470,6 +521,24 @@ impl MobActor {
                 ))
                 .await;
         });
+    }
+
+    /// The wake attempt the lift must still wait for before it can settle
+    /// `member`'s resume work: the member's open attempt, while MobMachine
+    /// still holds that work for this lift. `None` once the work is not this
+    /// lift's (it settled, or the lift ended) or when no attempt is open.
+    fn explicit_resume_boot_member_open_wake(
+        &self,
+        member: &ExplicitResumeBootMember,
+    ) -> Option<u64> {
+        let state = self.dsl_authority.state();
+        let identity = mob_dsl::AgentIdentity::from_domain(&member.agent_identity);
+        if state.explicit_resume_attempt.as_ref() != Some(&member.resume_attempt)
+            || state.explicit_resume_member_work.get(&identity) != Some(&member.binding)
+        {
+            return None;
+        }
+        state.member_wake_attempts.get(&identity).copied()
     }
 
     /// One planned member's wake closed. The wake path resolved the member
@@ -528,6 +597,26 @@ impl MobActor {
             },
             "settle_explicit_resume_boot_member",
         ) {
+            // MobMachine settles the member's resume work only once no wake
+            // attempt of the member is open. A wake opened after the watched
+            // one closed (a delivery's, or an owed retry) holds the member
+            // until it closes too: the lift watches that attempt and settles
+            // then, so the member's work is never dropped. A dropped settle
+            // left the lift waiting for good, with every Stop, Shutdown and
+            // Destroy parked behind it.
+            if let Some(open_attempt) = self.explicit_resume_boot_member_open_wake(&member) {
+                tracing::debug!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %member.agent_identity,
+                    closed_attempt = member.wake_attempt,
+                    open_attempt,
+                    "the lift waits for the member's open wake before it settles the member"
+                );
+                let mut member = *member;
+                member.wake_attempt = open_attempt;
+                self.watch_explicit_resume_boot_member_wake(member);
+                return;
+            }
             tracing::warn!(%error, "stale resume boot-member settlement left current authority unchanged");
             return;
         }

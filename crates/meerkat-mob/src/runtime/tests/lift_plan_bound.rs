@@ -45,6 +45,11 @@ const MEMBERS: usize = 5;
 /// then waits about this long for the bound to end the held wake.
 const WAKE_BOUND: Duration = Duration::from_secs(10);
 
+/// The wake bound of the row whose plan wake times out at its held restore
+/// while a later wake of the same member is held only briefly: long enough
+/// that the later wake, released within milliseconds, never meets it.
+const SUPERSEDED_WAKE_BOUND: Duration = Duration::from_secs(5);
+
 fn worker(index: usize) -> AgentIdentity {
     AgentIdentity::from(format!("plan-bound-{index}"))
 }
@@ -659,4 +664,123 @@ async fn a_member_a_delivery_woke_first_is_planned_once_that_wake_leaves_it_dorm
         "the lift waited for the member's second wake (a refused join also ends it early)"
     );
     assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
+}
+
+/// At restore concurrency 1 the plan's wake of the first member times out at
+/// its held restore, so the member is Dormant again for a retryable cause,
+/// and a later wake of the member (a peer wake, or the owed retry) opens a
+/// new attempt, held at its restore, before the lift handles the plan wake's
+/// close: that hand-off is held at its test seam until then. MobMachine
+/// settles the member's resume work only once no wake attempt of the member
+/// is open, so the lift watches the later wake and settles when it closes.
+/// The lift answers Ok with every member Live, and a Stop after it is
+/// served.
+///
+/// RED before the fix: the refused settle was dropped, so the member's
+/// resume work was never settled and the lift never answered (the row's
+/// bound ends the wait); a Stop would have been parked behind it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
+    let mob = StoppedMob::configured("lift-plan-superseded", 1, Some(SUPERSEDED_WAKE_BOUND)).await;
+    let member = worker(0);
+    let next = worker(1);
+    let probe = probe_member_wake_restores_for_test(mob.handle.mob_id(), [member.clone()]);
+    // The member's later wake is held at its restore too.
+    probe.hold(&member, 2);
+    let (handed_off, release_hand_off) =
+        crate::runtime::actor::boot_lift::hold_explicit_resume_boot_member_settle_for_test(
+            mob.handle.mob_id(),
+            &member,
+        );
+    let lift = mob.lift();
+
+    // The plan's wake of the member is held at its restore until its bound
+    // ends it; the lift's hand-off of that close is then held at the seam.
+    let plan_held = tokio::time::timeout(STEP, probe.wait_for_started(1))
+        .await
+        .is_ok();
+    let plan_attempt = mob.wake_attempt_of(&member);
+    let plan_closed = tokio::time::timeout(STEP, handed_off).await.is_ok();
+    // The timed-out restore ends at its start, before it reads anything.
+    probe.abort(&member, 1);
+
+    // A later wake opens a new attempt of the member, held at its restore: a
+    // peer wake, which joins the owed retry's wake if that one came first.
+    let answer = mob
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| crate::runtime::state::MobCommand::WakeMember {
+            agent_identity: member.clone(),
+            cause: dsl::MemberWakeCause::PeerDelivery,
+            observed_missing: false,
+            input_class: dsl::PeerInputClass::Content,
+            sender_waking: false,
+            reply_tx,
+        })
+        .await
+        .expect("the peer wake reaches the actor");
+    let later_held = tokio::time::timeout(STEP, probe.wait_for_started(2))
+        .await
+        .is_ok();
+    let later_attempt = mob.wake_attempt_of(&member);
+
+    // The lift handles the plan wake's close while the later wake is open.
+    // That handling frees the plan's one slot, so the next member's restore
+    // starts once it ran.
+    let _ = release_hand_off.send(());
+    let handled = tokio::time::timeout(STEP, async {
+        while !probe.started().contains(&next) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+    let work_pending = mob
+        .handle
+        .machine_state_watch_rx
+        .borrow()
+        .explicit_resume_member_work
+        .contains_key(&dsl::AgentIdentity::from_domain(&member));
+
+    // The later wake ends Live; the lift settles the member and finishes.
+    probe.release(&member);
+    let woken = tokio::time::timeout(STEP, answer).await;
+    let lifted = mob.join_lift(lift).await;
+    mob.settle_live().await;
+    let stopped = tokio::time::timeout(STEP, mob.handle.stop()).await;
+
+    assert!(
+        plan_held && plan_closed,
+        "the plan's wake of the member was held at its restore, and its close reached the hand-off"
+    );
+    assert!(
+        later_held
+            && later_attempt.is_some()
+            && plan_attempt.is_some()
+            && later_attempt != plan_attempt,
+        "a later wake of the member opened a new attempt: {plan_attempt:?}, then {later_attempt:?}"
+    );
+    assert!(
+        handled,
+        "the lift handled the plan wake's close: the next member's restore started"
+    );
+    assert!(
+        work_pending,
+        "the lift holds the member's resume work while the later wake is open"
+    );
+    assert!(
+        matches!(woken, Ok(Ok(Ok(_)))),
+        "the later wake ends Live: {woken:?}"
+    );
+    for (identity, (phase, attempt)) in mob.residency() {
+        assert_eq!(
+            (phase, attempt),
+            (Some(dsl::MemberMaterializationPhase::Live), false),
+            "{identity} ends Live"
+        );
+    }
+    assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
+    assert!(
+        matches!(stopped, Ok(Ok(()))),
+        "a Stop after the lift is served: {stopped:?}"
+    );
 }
