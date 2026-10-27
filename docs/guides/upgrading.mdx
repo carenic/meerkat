@@ -55,6 +55,90 @@ Meerkat is pre-1.0, and patch releases can carry declared breaking changes.
 - `rkat storage doctor` reports no new problems.
 - An SDK `connect()` succeeds.
 
+## Upgrading to 0.9.6
+
+This section is for systems running 0.9.5. The full list of changes is in
+the CHANGELOG under `## [0.9.6]`. 0.9.6 is a fix release. It needs no
+storage migration: it opens every 0.9.5 store as it is, and outside two
+opt-in paths 0.9.5 reads everything it writes (see
+[Downgrading to 0.9.5](#downgrading-to-0-9-5)). Back up the state root as
+the steps above say; take WAL-complete copies of the SQLite files (with
+`sqlite3 <db> ".backup <copy>"`, `VACUUM INTO`, or together with their
+`-wal` and `-shm` files).
+
+### Breaking changes and what to do
+
+#### Outcome-unknown completions
+
+`CompletionOutcome` gains `OutcomeUnknown { run_id }`. The runtime
+machine's completion vocabulary gains
+`RuntimeCompletionObservedOutcome::OutcomeUnknown`,
+`RuntimeCompletionTerminalObservation::OutcomeUnknown` and
+`RuntimeCompletionResultClass::OutcomeUnknown`, and the generated
+`TransitionId` gains six `ResolveRuntimeCompletionResultOutcomeUnknown*`
+values, all appended last.
+
+**Do:** add the arms where you match these enums exhaustively. Read
+`OutcomeUnknown` as not completed, and never resubmit or redeliver the input
+because of it: its run may have acted on it. Only a terminal-receipt read
+meets it, and only after a host has called the new cold-predecessor
+settlement.
+
+#### Pre-registered MCP OAuth clients
+
+`McpOAuthError` gains `ClientProfile { server_name, refusal }`,
+`PersistedAuthMode` gains `McpOauthClient`, and
+`HostAuthService::mcp_registered_redirect_uri` is now `async`.
+
+**Do:** add the arms where you match `McpOAuthError` or `PersistedAuthMode`
+exhaustively, and add `.await` where you call
+`mcp_registered_redirect_uri`.
+
+#### Retained consent after an agent rebuild
+
+`dispatch_retained_consent_attempt` keeps its signature. When a retained
+call's plan names another dispatcher allocation (the session's agent was
+rebuilt in the same process), it now resolves the call afresh: a fresh plan
+that is the same durable execution is spent once, and any other outcome
+withdraws the consent. Before, it refused and left the consent spendable.
+
+**Do:** if your host calls it directly, expect the call to run once or the
+consent to be withdrawn where it used to stay spendable.
+
+### Wrappers and decorators
+
+Forward the new provided methods; their defaults refuse or do nothing:
+
+- a `MobSessionService` wrapper:
+  `settle_cold_predecessor_with_mob_lifecycle_authority_before` and
+  `publish_settled_run_terminal_for_actor`;
+- a `CoreExecutorPublicationHandle`: `publish_settled_run_terminal`;
+- a composed `RetainedJobSource`: `admission_committed`, to the source that
+  confirmed the job;
+- a `RuntimeStore` decorator: `import_whole_blob_session`;
+- a `CompactionCommitCoordinator` wrapper: `authorize_committed_projection`.
+
+### Downgrading to 0.9.5
+
+Starting 0.9.5 on a state root that 0.9.6 used is safe for ordinary use.
+Two opt-in paths do not carry back:
+
+- **Cold-predecessor settlement.** A session in which a settlement answered
+  an input as outcome unknown cannot go back: 0.9.5 cannot decode those
+  input rows or the `interaction_failed` events with reason kind
+  `outcome_unknown`. A settlement that stopped half way leaves a lifecycle
+  record that 0.9.5 refuses for that session; repeat the settlement on 0.9.6
+  until it returns `Ok` before a downgrade.
+- **Pre-registered MCP OAuth clients.** 0.9.5 ignores the client profile
+  file, and a server that logged in through a profile needs a new login,
+  which 0.9.5 makes only by dynamic registration. Remove each profile on
+  0.9.6 first to delete its stored client secret.
+
+A downgrade also brings back the 0.9.5 defects that 0.9.6 fixes, and some
+of them act durably on the state 0.9.6 left: for example, a kept prompt
+whose run a crash cut is ended as `RequeueExpired` by a start past the
+stop's max age. To undo everything 0.9.6 wrote, restore the backup instead.
+
 ## Upgrading to 0.9.5
 
 This section is for systems running 0.9.4. The full list of changes is in

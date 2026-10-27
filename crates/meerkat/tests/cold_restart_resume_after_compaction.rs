@@ -26,9 +26,9 @@
 //! pass here while failing a real restart. The in-process lifetimes cannot
 //! set the kill switch (the env read is process-global; `std::env::set_var`
 //! races sibling test threads).
-//! TODO(evidence): port the memo-free re-exec child idiom — see
+//! TODO(evidence): port the memo-free re-exec child idiom - see
 //! `cold_restart_resume_continues_persisted_history_without_process_memos`
-//! in `crates/meerkat/tests/cold_restart_resume.rs` — to at least the
+//! in `crates/meerkat/tests/cold_restart_resume.rs` - to at least the
 //! compaction-rewrite resume contract here, so the post-compaction cold
 //! decode is also proven without process memos.
 
@@ -2619,7 +2619,7 @@ mod tests {
     }
 
     /// Like `run_prompt`, but returns the outcome (or the error text) instead
-    /// of asserting completion — used for the turn that dies mid-persist.
+    /// of asserting completion - used for the turn that dies mid-persist.
     async fn run_prompt_capture(
         adapter: &Arc<MeerkatMachine>,
         session_id: &meerkat::SessionId,
@@ -3096,7 +3096,7 @@ mod tests {
 
     /// Incremental-store cold-resume equality through the real sqlite store:
     /// create, turn, compact, kill, resume, turn. Pins the incremental-persistence
-    /// contract end to end — the session never writes a legacy whole-blob
+    /// contract end to end - the session never writes a legacy whole-blob
     /// row, the persisted head SHRINKS across the compaction, cold resume
     /// reads are head + one strand range, and the resumed transcript is
     /// byte-equal to the pre-kill authority.
