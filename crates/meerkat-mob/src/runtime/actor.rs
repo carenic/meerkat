@@ -13875,18 +13875,20 @@ impl MobActor {
                         feedback,
                         "close_routed_effect_consumer_refusal",
                     )?;
-                    if refusal_answered_stale_wake_attempt(&transition) {
-                        // The refused binding request belonged to a wake
-                        // attempt that is no longer the member's open one:
-                        // MobMachine answered StaleAttempt and changed
-                        // nothing. That attempt's wake rolls its provision
-                        // back at its next step (its attempt is closed), and
-                        // a newer wake is left alone.
+                    if refusal_answered_stale(&transition) {
+                        // The refused binding request belongs to no open wake
+                        // of the member (an earlier attempt's, the spawn's
+                        // while a wake is open, or one for a session the
+                        // member no longer binds): MobMachine answered it
+                        // stale and changed nothing. Nothing is broken; an
+                        // earlier attempt's wake rolls its provision back at
+                        // its next fenced step, and a newer wake is left
+                        // alone.
                         tracing::warn!(
                             mob_id = %self.definition.id,
                             effect = ?effect.body(),
                             refusal_code = %error.error_code(),
-                            "a refused binding request of an earlier wake attempt was answered stale"
+                            "a refused binding request that belongs to no open wake was answered stale"
                         );
                         self.pending_routed_effects.remove(0);
                         continue;
@@ -62537,18 +62539,14 @@ impl ClosedRuntimeEffectRefusal {
 /// generated refusal-feedback input. Absence or multiplicity is a composition
 /// contract break; the shell never infers a fallback class from the original
 /// dispatch error.
-/// Whether a routed refusal's feedback was answered as a stale wake attempt
-/// (`MemberWakeFeedbackResolved { StaleAttempt }`, no refusal
-/// classification): the refused binding request belonged to a wake attempt
-/// that is no longer open.
-fn refusal_answered_stale_wake_attempt(transition: &mob_dsl::MobMachineTransition) -> bool {
+/// Whether a routed refusal's feedback was answered stale
+/// (`RuntimeBindingRefusalStale`, no refusal classification): the refused
+/// binding request belongs to no open wake of the member.
+fn refusal_answered_stale(transition: &mob_dsl::MobMachineTransition) -> bool {
     transition.effects().iter().any(|effect| {
         matches!(
             effect,
-            mob_dsl::MobMachineEffect::MemberWakeFeedbackResolved {
-                verdict: mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt,
-                ..
-            }
+            mob_dsl::MobMachineEffect::RuntimeBindingRefusalStale { .. }
         )
     })
 }
