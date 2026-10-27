@@ -9,7 +9,9 @@
 //! release rounds: a resume of N members at concurrency C takes ceil(N / C)
 //! rounds. The restore pass probe (`builder::restore_pass_probe`) records
 //! when each member's restore and turn start and finish, and holds or fails
-//! a member's turn.
+//! a member's turn. The rows on a service that keeps no durable sessions,
+//! and the cold successor row, run on the runtime tests' mock session
+//! service.
 
 use super::*;
 use crate::runtime::builder::restore_pass_probe::{self, RestorePassEvent};
@@ -604,29 +606,56 @@ async fn turns_apply_in_roster_order_however_the_restores_finish() {
     handle.shutdown().await.expect("shut the resume down");
 }
 
-/// What a resume whose turn of worker-02 failed left.
-struct FailedTurnResume {
-    error: String,
-    /// Members after worker-02 whose restore started.
-    started_after: Vec<AgentIdentity>,
-    /// Members after worker-02 left with a live session.
-    left_live: Vec<AgentIdentity>,
+/// The member whose turn fails the resume in the failed-turn rows.
+const FAILING_TURN: usize = 2;
+
+/// The members after [`FAILING_TURN`], of `members`, that hold a permit while
+/// its turn runs at `concurrency`: the restores a failure of that turn leaves
+/// restored and not applied.
+fn restored_alongside_the_failing_turn(members: usize, concurrency: usize) -> Vec<AgentIdentity> {
+    (FAILING_TURN + 1..members.min(FAILING_TURN + concurrency))
+        .map(worker)
+        .collect()
 }
 
-/// Resume `members` members at `concurrency` with worker-02's turn failing
-/// the resume, then resume again without the failure, which brings every
-/// member back.
-async fn resume_failing_a_turn(members: usize, concurrency: usize) -> FailedTurnResume {
-    const FAILING_TURN: usize = 2;
-    let mob = SpawnedMob::spawn(members).await;
-    let probe = restore_pass_probe::install(&mob.mob_id);
+/// Make [`FAILING_TURN`]'s next turn wait at its start, then fail the resume.
+fn arm_the_failing_turn(probe: &restore_pass_probe::RestorePassProbe) {
+    probe.hold_turn(&worker(FAILING_TURN));
     probe.fail_turn(&worker(FAILING_TURN));
-    let error = match mob.resume(concurrency, None).await {
-        Ok(_) => panic!("the failed turn fails the resume"),
-        Err(error) => error.to_string(),
-    };
-    let started_after = probe
-        .events()
+}
+
+/// Let the armed turn fail the resume once it has started and every member
+/// in `restored` has finished its restore, so that the failure leaves exactly
+/// those members restored and not applied.
+async fn fail_the_turn_once_restored(
+    probe: &restore_pass_probe::RestorePassProbe,
+    restored: &[AgentIdentity],
+) {
+    let waited = tokio::time::timeout(
+        STEP,
+        probe.wait_for(|events| {
+            events.contains(&RestorePassEvent::TurnStarted(worker(FAILING_TURN)))
+                && restored.iter().all(|identity| {
+                    events.contains(&RestorePassEvent::RestoreFinished(identity.clone()))
+                })
+        }),
+    )
+    .await;
+    assert!(
+        waited.is_ok(),
+        "worker-02's turn starts and {restored:?} finish their restores: {:?}",
+        probe.events()
+    );
+    probe.release_turn(&worker(FAILING_TURN));
+}
+
+/// The members after [`FAILING_TURN`], of `members`, whose restore started,
+/// in roster order.
+fn restores_started_after_the_failing_turn(
+    events: &[RestorePassEvent],
+    members: usize,
+) -> Vec<AgentIdentity> {
+    let mut started = events
         .iter()
         .filter_map(|event| match event {
             RestorePassEvent::RestoreStarted(identity)
@@ -637,16 +666,42 @@ async fn resume_failing_a_turn(members: usize, concurrency: usize) -> FailedTurn
             _ => None,
         })
         .collect::<Vec<_>>();
-    // A released member's live session goes away with its attachment.
+    started.sort();
+    started
+}
+
+/// What a resume whose turn of worker-02 failed left.
+struct FailedTurnResume {
+    error: String,
+    /// Members after worker-02 whose restore started.
+    started_after: Vec<AgentIdentity>,
+    /// Members after worker-02 with a live session when the resume returned
+    /// its error.
+    left_live: Vec<AgentIdentity>,
+}
+
+/// Resume `members` members at `concurrency` with worker-02's turn failing
+/// the resume once every member holding a permit alongside it is restored,
+/// then resume again without the failure, which brings every member back.
+async fn resume_failing_a_turn(members: usize, concurrency: usize) -> FailedTurnResume {
+    let mob = SpawnedMob::spawn(members).await;
+    let probe = restore_pass_probe::install(&mob.mob_id);
+    arm_the_failing_turn(&probe);
+    let resume = mob.spawn_resume(concurrency).await;
+    fail_the_turn_once_restored(
+        &probe,
+        &restored_alongside_the_failing_turn(members, concurrency),
+    )
+    .await;
+    let Err(error) = joined(resume).await else {
+        panic!("the failed turn fails the resume");
+    };
+    let started_after = restores_started_after_the_failing_turn(&probe.events(), members);
+    // The resume returns its error only after its releases, so a released
+    // member's live session is already gone: nothing to wait for.
     let mut left_live = Vec::new();
     for (identity, session) in &mob.sessions[FAILING_TURN + 1..] {
-        let released = tokio::time::timeout(Duration::from_secs(10), async {
-            while mob.service.live_session_actor_registered(session).await {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await;
-        if released.is_err() {
+        if mob.service.live_session_actor_registered(session).await {
             left_live.push(identity.clone());
         }
     }
@@ -661,17 +716,19 @@ async fn resume_failing_a_turn(members: usize, concurrency: usize) -> FailedTurn
     every_member_back(&mob.restored(&handle, Vec::new()).await);
     handle.shutdown().await.expect("shut the resume down");
     FailedTurnResume {
-        error,
+        error: error.to_string(),
         started_after,
         left_live,
     }
 }
 
-/// A turn that fails the resume (worker-02's, failed by the probe) fails it
-/// with the same error at concurrency 1 and 4. At 1 no member after it
-/// started; at 4 at most 3 did, and none of them is left with a live session:
-/// the resume released every provision it did not apply. The next resume
-/// brings every member back.
+/// A turn that fails the resume (worker-02's, failed by the probe once the
+/// members holding a permit alongside it are restored) fails it with the
+/// same error at concurrency 1 and 4. At 1 no member after it started; at 4
+/// exactly the three holding a permit did. When the resume returns its error
+/// none of them has a live session: the resume released every provision it
+/// did not apply before it returned. The next resume brings every member
+/// back.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_turn_that_fails_the_resume_fails_it_as_at_concurrency_one_and_leaves_nothing_unapplied()
 {
@@ -687,11 +744,10 @@ async fn a_turn_that_fails_the_resume_fails_it_as_at_concurrency_one_and_leaves_
     );
     assert_eq!(concurrent.error, serial.error, "the same error");
     assert_eq!(serial.started_after, Vec::<AgentIdentity>::new());
-    assert!(
-        concurrent.started_after.len() < CONCURRENCY,
-        "at most {} members after the failed one started: {:?}",
-        CONCURRENCY - 1,
-        concurrent.started_after
+    assert_eq!(
+        concurrent.started_after,
+        restored_alongside_the_failing_turn(MEMBERS, CONCURRENCY),
+        "the members holding a permit alongside worker-02 started, and no other"
     );
     assert_eq!(serial.left_live, Vec::<AgentIdentity>::new());
     assert_eq!(
@@ -839,61 +895,94 @@ async fn a_fork_child_restored_after_a_crash_is_built_as_its_source_at_any_resto
     }
 }
 
+/// A mob spawned on a service that keeps no durable sessions and shut down,
+/// with its members' live sessions discarded: a resume recreates each member
+/// on a fresh session.
+struct RecreatableMob {
+    mob_id: MobId,
+    service: Arc<MockSessionService>,
+    storage: MobStorage,
+    /// Each member and the session it was spawned on, in roster order.
+    sessions: Vec<(AgentIdentity, SessionId)>,
+}
+
+impl RecreatableMob {
+    async fn spawn(members: usize) -> Self {
+        let service = Arc::new(MockSessionService::new());
+        service.keep_no_durable_sessions();
+        let _ = service.enable_runtime_adapter();
+        let mut definition = with_unique_mob_id(sample_definition(), "parallel-recreate");
+        definition.orchestrator = None;
+        let mob_id = definition.id.clone();
+        let storage = MobStorage::in_memory();
+        let handle = MobBuilder::new(definition, storage.clone())
+            .with_session_service(service.clone())
+            .allow_ephemeral_sessions(true)
+            .create()
+            .await
+            .expect("create a mob without durable sessions");
+        let mut sessions = Vec::with_capacity(members);
+        for index in 0..members {
+            let identity = worker(index);
+            let mut spec = SpawnMemberSpec::new("worker", identity.as_str());
+            spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+            handle.spawn_spec(spec).await.expect("spawn a worker");
+            let session = handle
+                .resolve_bridge_session_id(&identity)
+                .await
+                .expect("session-backed worker");
+            sessions.push((identity, session));
+        }
+        handle
+            .shutdown()
+            .await
+            .expect("shut the first runtime down");
+        let mob = Self {
+            mob_id,
+            service,
+            storage,
+            sessions,
+        };
+        for (identity, session) in &mob.sessions {
+            if mob.live(session).await {
+                MobSessionService::discard_live_session(mob.service.as_ref(), session)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{identity}: discard the live session: {error}")
+                    });
+            }
+        }
+        mob
+    }
+
+    fn resume_builder(&self, concurrency: usize) -> MobBuilder {
+        MobBuilder::for_resume(self.storage.clone())
+            .with_session_service(self.service.clone())
+            .allow_ephemeral_sessions(true)
+            .notify_orchestrator_on_resume(false)
+            .with_resume_restore_concurrency(concurrency)
+    }
+
+    /// Resume at `concurrency`; the resume succeeds.
+    async fn resume(&self, concurrency: usize) -> MobHandle {
+        tokio::time::timeout(STEP, Box::pin(self.resume_builder(concurrency).resume()))
+            .await
+            .expect("the resume answers")
+            .expect("the resume succeeds")
+    }
+
+    async fn live(&self, session: &SessionId) -> bool {
+        MobSessionService::live_session_actor_registered(self.service.as_ref(), session)
+            .await
+            .expect("read the live session registry")
+    }
+}
+
 /// What a resume on a service that keeps no durable sessions left: each
 /// member recreated on a fresh session.
 async fn recreated_members(concurrency: usize) -> Vec<(AgentIdentity, String, bool, bool)> {
-    let service = Arc::new(MockSessionService::new());
-    service.keep_no_durable_sessions();
-    let _ = service.enable_runtime_adapter();
-    let mut definition = with_unique_mob_id(sample_definition(), "parallel-recreate");
-    definition.orchestrator = None;
-    let storage = MobStorage::in_memory();
-    let handle = MobBuilder::new(definition, storage.clone())
-        .with_session_service(service.clone())
-        .allow_ephemeral_sessions(true)
-        .create()
-        .await
-        .expect("create a mob without durable sessions");
-    let mut sessions = Vec::new();
-    for index in 0..6 {
-        let identity = worker(index);
-        let mut spec = SpawnMemberSpec::new("worker", identity.as_str());
-        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
-        handle.spawn_spec(spec).await.expect("spawn a worker");
-        let session = handle
-            .resolve_bridge_session_id(&identity)
-            .await
-            .expect("session-backed worker");
-        sessions.push((identity, session));
-    }
-    handle
-        .shutdown()
-        .await
-        .expect("shut the first runtime down");
-    for (identity, session) in &sessions {
-        if MobSessionService::live_session_actor_registered(service.as_ref(), session)
-            .await
-            .expect("read the live session registry")
-        {
-            MobSessionService::discard_live_session(service.as_ref(), session)
-                .await
-                .unwrap_or_else(|error| panic!("{identity}: discard the live session: {error}"));
-        }
-    }
-    let resumed = tokio::time::timeout(
-        STEP,
-        Box::pin(
-            MobBuilder::for_resume(storage)
-                .with_session_service(service.clone())
-                .allow_ephemeral_sessions(true)
-                .notify_orchestrator_on_resume(false)
-                .with_resume_restore_concurrency(concurrency)
-                .resume(),
-        ),
-    )
-    .await
-    .expect("the resume answers")
-    .expect("the resume succeeds");
+    let mob = RecreatableMob::spawn(6).await;
+    let resumed = mob.resume(concurrency).await;
     assert!(
         resumed.restore_diagnostics.read().await.is_empty(),
         "no member restore failed"
@@ -901,7 +990,7 @@ async fn recreated_members(concurrency: usize) -> Vec<(AgentIdentity, String, bo
     let state = resumed.machine_state_watch_rx.borrow().clone();
     let listed = resumed.list_members().await;
     let mut recreated = Vec::new();
-    for (identity, spawned) in &sessions {
+    for (identity, spawned) in &mob.sessions {
         let status = listed
             .iter()
             .find(|entry| &entry.agent_identity == identity)
@@ -935,4 +1024,305 @@ async fn a_service_without_durable_sessions_recreates_members_as_it_does_one_at_
         assert!(*bound && *fresh, "{identity}: bound to its fresh session");
     }
     assert_eq!(recreated_members(4).await, serial);
+}
+
+/// On a service that keeps no durable sessions, a turn that fails the resume
+/// (worker-02's, failed by the probe once the members holding a permit
+/// alongside it are recreated) leaves none of the members after it with a
+/// live session. At concurrency 4 the resume recreated each of the three
+/// holding a permit on a fresh session and retired that session before it
+/// returned its error; at 1 it recreated none of them. The next resume
+/// recreates every member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_failed_resume_retires_the_fresh_sessions_it_created_but_did_not_apply() {
+    for concurrency in [1, 4] {
+        let mob = RecreatableMob::spawn(6).await;
+        let after = &mob.sessions[FAILING_TURN + 1..];
+        let restored = restored_alongside_the_failing_turn(mob.sessions.len(), concurrency);
+        let mut builds_before = Vec::with_capacity(after.len());
+        for (identity, _) in after {
+            builds_before.push(member_build_count(&mob.service, identity).await);
+        }
+        let probe = restore_pass_probe::install(&mob.mob_id);
+        arm_the_failing_turn(&probe);
+        let resume = tokio::spawn(mob.resume_builder(concurrency).resume());
+        fail_the_turn_once_restored(&probe, &restored).await;
+        let Err(error) = joined(resume).await else {
+            panic!("the failed turn fails the resume at concurrency {concurrency}");
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("injected restore turn failure for 'worker-02'"),
+            "{error}"
+        );
+        assert_eq!(
+            restores_started_after_the_failing_turn(&probe.events(), mob.sessions.len()),
+            restored,
+            "at concurrency {concurrency}, the members holding a permit alongside worker-02 \
+             started, and no other"
+        );
+        for ((identity, spawned), before) in after.iter().zip(builds_before) {
+            let builds = member_build_count(&mob.service, identity).await;
+            if restored.contains(identity) {
+                assert_eq!(builds, before + 1, "{identity} was recreated once");
+                let fresh = last_member_build(&mob.service, identity).await.session_id;
+                assert!(
+                    !mob.live(&fresh).await,
+                    "{identity}'s fresh session was retired before the resume returned its error"
+                );
+            } else {
+                assert_eq!(builds, before, "{identity} was not recreated");
+            }
+            assert!(!mob.live(spawned).await, "{identity}'s spawned session");
+        }
+
+        probe.stop_failing_turns();
+        let resumed = mob.resume(concurrency).await;
+        assert!(
+            resumed.restore_diagnostics.read().await.is_empty(),
+            "no member restore failed"
+        );
+        let listed = resumed.list_members().await;
+        for (identity, _) in &mob.sessions {
+            let status = listed
+                .iter()
+                .find(|entry| &entry.agent_identity == identity)
+                .map(|entry| format!("{:?}", entry.status));
+            assert_eq!(status.as_deref(), Some("Active"), "{identity}");
+        }
+        resumed.shutdown().await.expect("shut the resume down");
+    }
+}
+
+/// A mob of workers seated with [`seated_provider_params`] whose process
+/// restarted after its first worker lost its session. A successor session
+/// persisted under that worker's comms name holds
+/// [`successor_provider_params`]; the restart left it listed and not live.
+struct SuccessorMob {
+    mob_id: MobId,
+    service: Arc<MockSessionService>,
+    storage: MobStorage,
+    /// The worker whose session was lost, first in roster order.
+    member: AgentIdentity,
+    successor: SessionId,
+    /// The other workers and their sessions, in roster order.
+    peers: Vec<(AgentIdentity, SessionId)>,
+}
+
+impl SuccessorMob {
+    async fn seat(peers: usize) -> Self {
+        let service = Arc::new(MockSessionService::new());
+        let _ = service.enable_runtime_adapter();
+        let storage = MobStorage::in_memory();
+        let restart_storage = MobStorage::with_events_and_runtime_metadata(
+            storage.events.clone(),
+            storage.runtime_metadata.clone(),
+        );
+        let mut definition = with_unique_mob_id(provider_params_definition(), "parallel-successor");
+        definition.orchestrator = None;
+        let mob_id = definition.id.clone();
+        let handle = MobBuilder::new(definition, storage)
+            .with_session_service(service.clone())
+            .create()
+            .await
+            .expect("create the mob");
+        // The roster is in identity order: the migrated worker comes first.
+        let member = AgentIdentity::from("migrated-worker");
+        let identities = std::iter::once(member.clone())
+            .chain((0..peers).map(|index| AgentIdentity::from(format!("peer-{index:02}"))))
+            .collect::<Vec<_>>();
+        let mut seated = Vec::with_capacity(identities.len());
+        for identity in identities {
+            let mut spec = SpawnMemberSpec::new("worker", identity.as_str());
+            spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+            handle.spawn_spec(spec).await.expect("spawn a worker");
+            let session = handle
+                .resolve_bridge_session_id(&identity)
+                .await
+                .expect("session-backed worker");
+            seated.push((identity, session));
+        }
+        for (_, session) in &seated {
+            MobSessionService::discard_live_session(service.as_ref(), session)
+                .await
+                .expect("discard the live session");
+        }
+        crash_stop_and_release_routes(handle).await;
+
+        let (_, lost) = seated.remove(0);
+        service.delete_persisted_session(&lost).await;
+        let successor = service
+            .create_session(CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "successor".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    comms_name: Some(
+                        crate::runtime::actor::render_member_comms_name(
+                            mob_id.as_str(),
+                            "worker",
+                            member.as_str(),
+                        )
+                        .expect("comms name"),
+                    ),
+                    provider_params: Some(successor_provider_params()),
+                    mob_member_binding: None,
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            })
+            .await
+            .expect("persist a successor session")
+            .session_id;
+        // The restart leaves the successor persisted and not live. This mock
+        // lists the sessions it holds data for, so the data stays: the
+        // successor search lists the successor, and the resume finds it
+        // neither live nor an orphan to archive.
+        let listed = service
+            .live_session_data
+            .read()
+            .await
+            .get(&successor)
+            .cloned()
+            .expect("the successor's session data");
+        MobSessionService::discard_live_session(service.as_ref(), &successor)
+            .await
+            .expect("discard the successor's live session");
+        service
+            .live_session_data
+            .write()
+            .await
+            .insert(successor.clone(), listed);
+        Self {
+            mob_id,
+            service,
+            storage: restart_storage,
+            member,
+            successor,
+            peers: seated,
+        }
+    }
+}
+
+/// A cold resume at concurrency 4 restores a member whose bound session is
+/// absent on its persisted successor. The member's turn runs while the three
+/// other members hold their permits (restored, not yet applied): in it the
+/// resume finds the successor, repoints the member's binding in the journal,
+/// asks the customizer again with the successor's view and rebuilds the
+/// member on the successor with the successor's params migrated. The other
+/// members come back on their own sessions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cold_resume_repoints_a_member_to_its_successor_while_other_members_hold_permits() {
+    const CONCURRENCY: usize = 4;
+    let mob = SuccessorMob::seat(CONCURRENCY - 1).await;
+    let probe = restore_pass_probe::install(&mob.mob_id);
+    probe.hold_turn(&mob.member);
+    let migration = Arc::new(PromptCacheMigration::default());
+    let resume = tokio::spawn(
+        MobBuilder::for_resume(mob.storage.clone())
+            .with_session_service(mob.service.clone())
+            .with_spawn_member_customizer(migration.clone())
+            .notify_orchestrator_on_resume(false)
+            .with_resume_restore_concurrency(CONCURRENCY)
+            .resume(),
+    );
+    let restored = tokio::time::timeout(
+        STEP,
+        probe.wait_for(|events| {
+            events.contains(&RestorePassEvent::TurnStarted(mob.member.clone()))
+                && mob.peers.iter().all(|(peer, _)| {
+                    events.contains(&RestorePassEvent::RestoreFinished(peer.clone()))
+                })
+        }),
+    )
+    .await;
+    assert!(
+        restored.is_ok(),
+        "the member's turn starts and the other members finish their restores: {:?}",
+        probe.events()
+    );
+    probe.release_turn(&mob.member);
+    let resumed = joined(resume).await.expect("the resume succeeds");
+
+    // The other members held their permits across the member's turn: each
+    // was restored before the turn ended and applied after it.
+    let events = probe.events();
+    let position = |event: RestorePassEvent| {
+        events
+            .iter()
+            .position(|recorded| recorded == &event)
+            .unwrap_or_else(|| panic!("{event:?} is recorded: {events:?}"))
+    };
+    let member_turn_finished = position(RestorePassEvent::TurnFinished(mob.member.clone()));
+    for (peer, _) in &mob.peers {
+        assert!(
+            position(RestorePassEvent::RestoreFinished(peer.clone())) < member_turn_finished,
+            "{peer} is restored before the member's turn ends: {events:?}"
+        );
+        assert!(
+            position(RestorePassEvent::TurnStarted(peer.clone())) > member_turn_finished,
+            "{peer} is applied after the member's turn: {events:?}"
+        );
+    }
+
+    assert!(
+        resumed.restore_diagnostics.read().await.is_empty(),
+        "no member restore failed"
+    );
+    assert_eq!(
+        resumed.resolve_bridge_session_id(&mob.member).await,
+        Some(mob.successor.clone()),
+        "the member is repointed to its successor"
+    );
+    let repointed = mob
+        .storage
+        .events
+        .replay_all()
+        .await
+        .expect("read the mob journal")
+        .iter()
+        .filter(|event| {
+            event
+                .kind
+                .member_session_binding_recovered()
+                .is_some_and(|recovered| recovered.agent_identity == mob.member)
+        })
+        .count();
+    assert_eq!(
+        repointed, 1,
+        "the member's turn appended its repointed binding to the journal"
+    );
+    let views = migration.views();
+    assert!(
+        views.iter().any(|(identity, view)| identity == &mob.member
+            && view.session_id == mob.successor
+            && view
+                .llm_identity
+                .as_ref()
+                .and_then(|identity| identity.provider_params.clone())
+                == Some(successor_provider_params())),
+        "the customizer is asked again with the successor's view: {views:?}"
+    );
+    let rebuilt = last_member_build(&mob.service, &mob.member).await;
+    assert_eq!(rebuilt.resume_session_id, Some(mob.successor.clone()));
+    assert_eq!(
+        rebuilt.provider_params,
+        Some(prompt_cache_enabled(successor_provider_params())),
+        "the rebuild migrates the successor's params"
+    );
+    assert!(rebuilt.provider_params_masked);
+    for (peer, session) in &mob.peers {
+        assert_eq!(
+            resumed.resolve_bridge_session_id(peer).await.as_ref(),
+            Some(session),
+            "{peer} is back on its own session"
+        );
+    }
+    resumed.shutdown().await.expect("shut the resume down");
 }

@@ -7539,12 +7539,20 @@ impl MobBuilder {
     /// leaves. `1` restores one member at a time, as before.
     ///
     /// The first failure in roster order fails the resume with the error it
-    /// failed with before. The restores already running when it fails finish
-    /// first, so the error comes after them; every member they restored but
-    /// that the resume does not apply (at most `concurrency - 1`) has its
-    /// provision released: a resumed session is detached with its durable
-    /// session kept, and a session a service without durable sessions
-    /// recreated is retired.
+    /// failed with before. The restores already running when it fails
+    /// finish first; then every member they restored but that the resume
+    /// does not apply (at most `concurrency - 1`) has its provision
+    /// released: a resumed session is detached with its durable session
+    /// kept, and a session a service without durable sessions recreated is
+    /// retired. The error comes after those restores and releases; detaching
+    /// a resumed session waits for a turn that session is already running to
+    /// end.
+    ///
+    /// A restore no longer checks the recovered machine state against the
+    /// machine's invariants for each member. On a state that breaks one, a
+    /// restore of one member at a time left a durable member unrestored with
+    /// a restore failure and failed the resume on a recreated member; each
+    /// member is now restored on it as on any other state.
     ///
     /// The spawn member customizer and the default external tools provider
     /// stay synchronous calls on the resume's task: never two at once, but one
@@ -11177,10 +11185,12 @@ fn member_restore_reapplied<T>(
 /// before it was applied, as a restore of one member at a time returns it.
 /// Once any restore or turn has failed the resume, no further member's
 /// restore starts. The restores already running finish (a provision is not
-/// cancelled half way), so the error is returned after them; then every
-/// member restored but not applied (at most `concurrency - 1`) has its
-/// provision released ([`release_unapplied_member_restore`]), so no live
-/// session is left that no authority holds.
+/// cancelled half way); then every member restored but not applied (at most
+/// `concurrency - 1`) has its provision released, one after another
+/// ([`release_unapplied_member_restore`]), so no live session is left that
+/// no authority holds; and only then is the error returned. Detaching a
+/// resumed session waits at its turn boundary, so a turn that session is
+/// already running holds the error until the turn ends.
 ///
 /// A resume dropped before it returns (no production caller cancels one)
 /// drops the restores in flight at their await points, as the serial restore
@@ -11197,18 +11207,18 @@ async fn restore_resumed_members(
     use futures::StreamExt as _;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    // Every independent member's restore forks the authority as recovered,
-    // validated once here: what it reads there no other member's restore
-    // writes. Its overlay is its own, so it reads no other member's restored
-    // overlay.
-    let recovered = crate::machines::mob_machine::MobMachineAuthority::recover_from_state(
-        commit.authority.state().clone(),
-    )
-    .map_err(|error| {
-        MobError::Internal(format!(
-            "failed to recover the MobMachine authority the resume restores its members on: {error}"
-        ))
-    })?;
+    // Every independent member's restore forks the authority as recovered:
+    // what it reads there no other member's restore writes. Its overlay is
+    // its own, so it reads no other member's restored overlay.
+    //
+    // A fork, here or in a member's turn, does not check the state against
+    // the MobMachine invariants. The restore of one member at a time rebuilt
+    // each member's provision authority with `recover_from_state`, which
+    // does: on a recovered state that broke an invariant, it left a durable
+    // member unrestored with a restore failure and failed the resume on a
+    // recreated member. Each member is now restored on such a state as on
+    // any other.
+    let recovered = commit.authority.fork();
     let no_restored_overlays: BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>> =
         BTreeMap::new();
     let admission_open = AtomicBool::new(true);
@@ -11572,20 +11582,24 @@ async fn apply_member_restore_turn(
     candidate: &ResumeRestoreCandidate,
     step: MemberRestoreStep,
 ) -> Result<(), MobError> {
-    #[cfg(test)]
-    let probe = restore_pass_probe::probe_for(&ctx.definition.id);
-    #[cfg(test)]
-    if let Some(probe) = &probe {
-        probe.turn_started(&candidate.entry.agent_identity).await?;
+    #[cfg(not(test))]
+    {
+        apply_member_restore_step(ctx, commit, successors, candidate, step).await
     }
-    let applied = apply_member_restore_step(ctx, commit, successors, candidate, step).await;
     #[cfg(test)]
-    if let Some(probe) = &probe {
-        probe.record(restore_pass_probe::RestorePassEvent::TurnFinished(
-            candidate.entry.agent_identity.clone(),
-        ));
+    {
+        let probe = restore_pass_probe::probe_for(&ctx.definition.id);
+        if let Some(probe) = &probe {
+            probe.turn_started(&candidate.entry.agent_identity).await?;
+        }
+        let applied = apply_member_restore_step(ctx, commit, successors, candidate, step).await;
+        if let Some(probe) = &probe {
+            probe.record(restore_pass_probe::RestorePassEvent::TurnFinished(
+                candidate.entry.agent_identity.clone(),
+            ));
+        }
+        applied
     }
-    applied
 }
 
 #[cfg(feature = "runtime-adapter")]
