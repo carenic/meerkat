@@ -317,6 +317,10 @@ impl ActorFlowTurnExecutor {
         message: ContentInput,
         turn_tool_overlay: Option<TurnToolOverlay>,
     ) -> Result<FlowTurnTicket, MobError> {
+        // B6 (N7): a flow step is a host delivery. A member that is not
+        // materialized in this process is woken first (`WakeMember`, cause
+        // HostDelivery); a refused wake fails the step typed.
+        self.handle.wake_member_for_delivery(target).await?;
         let (completion_tx, completion_rx) = oneshot::channel::<FlowTurnOutcome>();
         let scoped_event_tx = self.handle.flow_streams.lock().await.get(run_id).cloned();
         let scope_frame = StreamScopeFrame::MobMember {

@@ -66,6 +66,13 @@ them.
   or answered as an unconfirmed (ambiguous) delivery. The stop closes each live
   member's in-process route for peer ingress and the resume reopens it, so the
   sender retries after the mob resumes.
+- `meerkat-runtime`: `meerkat_machine::composition::MeerkatSeamSignal::RuntimeBound`
+  gains `runtime_epoch_id`, and the enum gains `RuntimeRegistrationReleased {
+  agent_runtime_id, fence_token, runtime_epoch_id }`. Every final unregister of
+  a session registration (the idle-executor teardown included) now publishes
+  the released registration to the mob that owns the session, once the
+  unregister committed; the mob demotes exactly that materialization of its
+  member to dormant, and a release for any other registration changes nothing.
 
 ### Added
 
@@ -79,6 +86,36 @@ them.
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
   `1` restores one member at a time, as before; `0` counts as `1`.
+- `meerkat-mob`: member wakes. A seated member that is not materialized in its
+  process (dormant) is materialized on its first delivery, through MobMachine's
+  wake verdict, and the delivery then proceeds as to a live member: a host
+  delivery (`MobHandle::start_work_*`, steer included), a peer message, a mob
+  peer message it sends, a continuation's address resolution, a session-keyed
+  live operation on its session, and `MobHandle::ensure_member_live`. Every
+  cause of one member joins one wake. A refused wake is typed:
+  `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
+  (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
+  boot restore records it. Reads never wake.
+- `meerkat-mob`: `MobHandle::release_member(identity)` makes a member dormant:
+  it releases the member's materialization in its process while the member is
+  quiescent, and keeps it seated at the same session, generation and fence;
+  its next delivery wakes it. A member being woken, or with work in flight, is
+  refused retryably (`MobError::LifecycleOperationPending`).
+- `meerkat-mob`: `MemberBuildPreparer` (with `MemberBuildPreparation`,
+  `MemberBuildPrepared`, `MemberBuildPreparationRefusal` and
+  `MemberBuildReport`): a host's preparation of each member build, asked once
+  per build right before the member's provision, on every wake and every
+  restore at a mob's start (`Prepared`, or `HoldUntilReleased`, which holds
+  the member's run starts until the host releases them; a retryable refusal
+  leaves the member dormant, a final one records it broken), and told the
+  built tool surface once the member is live (`member_built`).
+  `MemberWakeRetryBackoff` is the backoff of the retry of a member whose
+  boot work is still owed after its boot wake ended retryably.
+- `meerkat-core`: `session_owner_wake` (`SessionOwnerWakeRegistry`,
+  `SessionOwnerWaker`, `SessionOwnerWakeOutcome`): the process-wide registry
+  through which a session-keyed live operation on a session that has no live
+  actor asks the session's owner (a mob, for a dormant member's session) to
+  wake it first. Interrupts and reads never wake.
 
 ### Changed
 

@@ -328,7 +328,9 @@ impl<B: SessionAgentBuilder + 'static> RuntimeBackedScheduleSessionHost<B> {
             // A mob member's executor and exact incarnation are owned by the
             // mob host materializer. The generic schedule surface may use an
             // already-serving attachment, but must never reconstruct or
-            // replace it with ordinary runtime plumbing.
+            // replace it with ordinary runtime plumbing. A dormant member is
+            // woken by its owner first, as a host delivery wakes it.
+            wake_session_owner_if_unserved(&self.runtime_adapter, session_id).await?;
             let incarnation = self.runtime_adapter.member_incarnation(session_id);
             if incarnation.as_ref().is_some_and(|incarnation| {
                 incarnation.mob_id != binding.mob_id
@@ -943,6 +945,29 @@ impl<B: SessionAgentBuilder + 'static> SurfaceScheduleSessionHost
 
 fn schedule_internal(error: impl std::fmt::Display) -> ScheduleDomainError {
     ScheduleDomainError::Internal(error.to_string())
+}
+
+/// A scheduled delivery to a session no runtime registration serves asks the
+/// session's owner first: a mob that holds the session's member dormant
+/// wakes it ([`meerkat_core::session_owner_wake`]), and the delivery then
+/// uses the attachment that wake published. A session no owner holds, or
+/// one its owner no longer binds, proceeds as before.
+async fn wake_session_owner_if_unserved(
+    runtime_adapter: &MeerkatMachine,
+    session_id: &SessionId,
+) -> Result<(), ScheduleDomainError> {
+    if runtime_adapter.contains_session(session_id).await {
+        return Ok(());
+    }
+    match meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global()
+        .wake(session_id)
+        .await
+    {
+        None | Some(Ok(_)) => Ok(()),
+        Some(Err(error)) => Err(ScheduleDomainError::Internal(format!(
+            "the member owning session {session_id} could not be woken: {error}"
+        ))),
+    }
 }
 
 #[cfg(test)]

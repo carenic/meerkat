@@ -289,7 +289,7 @@ impl SpawnActivationWorkerContext {
                         &self.session_service,
                         &self.command_tx,
                         &agent_identity,
-                        &readiness,
+                        readiness,
                         &material.member_ref,
                     )
                     .await?;
@@ -316,7 +316,7 @@ impl SpawnActivationWorkerContext {
                         &self.session_service,
                         &self.command_tx,
                         &agent_identity,
-                        &readiness,
+                        readiness,
                         &member_ref,
                     )
                     .await?;

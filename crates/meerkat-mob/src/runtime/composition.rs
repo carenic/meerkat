@@ -391,11 +391,67 @@ fn signal_project_u64(
         })
 }
 
+/// An optional fact the producer projects as an opaque `Option<T>` (a
+/// runtime id or epoch as `Option<String>`, a fence as `Option<u64>`), so an
+/// absent value survives the route as `None`. A field the route does not
+/// project at all also reads as `None`; a projected field of another shape is
+/// refused.
+#[cfg(feature = "runtime-adapter")]
+fn signal_project_optional<T>(
+    fields: &[(FieldId, OwnedFieldValue)],
+    field: &FieldId,
+) -> Result<Option<T>, String>
+where
+    T: Clone + Send + Sync + 'static,
+{
+    match fields.iter().find(|(id, _)| id == field) {
+        None => Ok(None),
+        Some((_, OwnedFieldValue::Opaque(value))) => {
+            value.downcast_ref::<Option<T>>().cloned().ok_or_else(|| {
+                format!(
+                    "projected signal field `{}` is not an optional `{}`",
+                    field.as_str(),
+                    std::any::type_name::<T>()
+                )
+            })
+        }
+        Some((_, other)) => Err(format!(
+            "projected signal field `{}` is not opaque: {other:?}",
+            field.as_str()
+        )),
+    }
+}
+
 #[cfg(feature = "runtime-adapter")]
 fn build_mob_signal(
     variant: &SignalVariantId,
     projected: &[(FieldId, OwnedFieldValue)],
 ) -> Result<mob_dsl::MobMachineSignal, String> {
+    // A released registration names its own runtime id, fence and epoch,
+    // each absent when it held none: MobMachine demotes exactly the
+    // materialization they name, and a release that names none, or another
+    // one, is its accepted `Stale` no-op. The cause is this consumer's to
+    // supply: the route binds it as a literal, which only the consumer knows.
+    if variant == &seam_facts::signals::release_member_materialization() {
+        return Ok(mob_dsl::MobMachineSignal::ReleaseMemberMaterialization {
+            agent_runtime_id: signal_project_optional::<String>(
+                projected,
+                &seam_facts::fields::agent_runtime_id(),
+            )?
+            .map(mob_dsl::AgentRuntimeId::from),
+            fence_token: signal_project_optional::<u64>(
+                projected,
+                &seam_facts::fields::fence_token(),
+            )?
+            .map(mob_dsl::FenceToken),
+            runtime_epoch_id: signal_project_optional::<String>(
+                projected,
+                &seam_facts::fields::runtime_epoch_id(),
+            )?
+            .map(mob_dsl::RuntimeEpochId),
+            cause: mob_dsl::MemberMaterializationLossCause::RegistrationReleased,
+        });
+    }
     let runtime_id = mob_dsl::AgentRuntimeId::from(
         signal_project_str(projected, &seam_facts::fields::agent_runtime_id())?.to_string(),
     );
@@ -404,9 +460,16 @@ fn build_mob_signal(
         &seam_facts::fields::fence_token(),
     )?);
     if variant == &seam_facts::signals::observe_runtime_ready() {
+        // The bound registration's epoch: recorded for the member, it fences
+        // every later release of that member's materialization.
         Ok(mob_dsl::MobMachineSignal::ObserveRuntimeReady {
             agent_runtime_id: runtime_id,
             fence_token,
+            runtime_epoch_id: signal_project_optional::<String>(
+                projected,
+                &seam_facts::fields::runtime_epoch_id(),
+            )?
+            .map(mob_dsl::RuntimeEpochId),
         })
     } else if variant == &seam_facts::signals::observe_runtime_retired() {
         Ok(mob_dsl::MobMachineSignal::ObserveRuntimeRetired {
@@ -421,7 +484,8 @@ fn build_mob_signal(
     } else {
         Err(format!(
             "mob signal consumer surface does not accept routed signal `{other}`; \
-             only ObserveRuntimeReady/ObserveRuntimeRetired/ObserveRuntimeDestroyed are declared",
+             only ObserveRuntimeReady/ObserveRuntimeRetired/ObserveRuntimeDestroyed/\
+             ReleaseMemberMaterialization are declared",
             other = variant.as_str()
         ))
     }
@@ -1127,6 +1191,7 @@ mod tests {
         let first_signal = mob_dsl::MobMachineSignal::ObserveRuntimeReady {
             agent_runtime_id: mob_dsl::AgentRuntimeId::from("rt-first"),
             fence_token: mob_dsl::FenceToken(1),
+            runtime_epoch_id: None,
         };
         command_tx
             .try_send(super::super::scope_gate::RoutedMobCommand::internal(
@@ -1160,6 +1225,7 @@ mod tests {
                 mob_dsl::MobMachineSignal::ObserveRuntimeReady {
                     agent_runtime_id,
                     fence_token: mob_dsl::FenceToken(1),
+                    ..
                 } if agent_runtime_id.0 == "rt-first"
             )),
             _ => panic!("unexpected command in test queue"),
@@ -1176,9 +1242,126 @@ mod tests {
                 mob_dsl::MobMachineSignal::ObserveRuntimeReady {
                     agent_runtime_id,
                     fence_token: mob_dsl::FenceToken(7),
+                    runtime_epoch_id: None,
                 } if agent_runtime_id.0 == "rt-deferred"
             )),
             _ => panic!("unexpected command in test queue"),
         }
+    }
+
+    /// The bound registration's epoch reaches MobMachine with the readiness
+    /// observation, so a later release is honoured only for that epoch.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn runtime_ready_signal_carries_the_bound_registration_epoch() {
+        let signal = build_mob_signal(
+            &seam_facts::signals::observe_runtime_ready(),
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Str("rt-bound".to_string()),
+                ),
+                (seam_facts::fields::fence_token(), OwnedFieldValue::U64(4)),
+                (
+                    seam_facts::fields::runtime_epoch_id(),
+                    OwnedFieldValue::Opaque(Arc::new(Some("epoch-4".to_string()))),
+                ),
+            ],
+        )
+        .expect("a bound observation with its epoch projects");
+        assert!(matches!(
+            signal,
+            mob_dsl::MobMachineSignal::ObserveRuntimeReady {
+                agent_runtime_id,
+                fence_token: mob_dsl::FenceToken(4),
+                runtime_epoch_id: Some(mob_dsl::RuntimeEpochId(epoch)),
+            } if agent_runtime_id.0 == "rt-bound" && epoch == "epoch-4"
+        ));
+
+        let refused = build_mob_signal(
+            &seam_facts::signals::observe_runtime_ready(),
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Str("rt-bound".to_string()),
+                ),
+                (seam_facts::fields::fence_token(), OwnedFieldValue::U64(4)),
+                (
+                    seam_facts::fields::runtime_epoch_id(),
+                    OwnedFieldValue::Str("epoch-4".to_string()),
+                ),
+            ],
+        );
+        assert!(
+            refused.is_err(),
+            "an epoch projected in another shape is refused, never read as absent"
+        );
+    }
+
+    /// A released registration reaches MobMachine as
+    /// `ReleaseMemberMaterialization` with the cause this consumer supplies,
+    /// whether it names its runtime id, fence and epoch or none of them: a
+    /// release is never dropped for an absent fact (the machine answers it
+    /// `Stale`).
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn registration_release_signal_projects_present_and_absent_facts() {
+        let release = seam_facts::signals::release_member_materialization();
+
+        let named = build_mob_signal(
+            &release,
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Opaque(Arc::new(Some("rt-released".to_string()))),
+                ),
+                (
+                    seam_facts::fields::fence_token(),
+                    OwnedFieldValue::Opaque(Arc::new(Some(9_u64))),
+                ),
+                (
+                    seam_facts::fields::runtime_epoch_id(),
+                    OwnedFieldValue::Opaque(Arc::new(Some("epoch-9".to_string()))),
+                ),
+            ],
+        )
+        .expect("a release naming its registration projects");
+        assert!(matches!(
+            named,
+            mob_dsl::MobMachineSignal::ReleaseMemberMaterialization {
+                agent_runtime_id: Some(agent_runtime_id),
+                fence_token: Some(mob_dsl::FenceToken(9)),
+                runtime_epoch_id: Some(mob_dsl::RuntimeEpochId(epoch)),
+                cause: mob_dsl::MemberMaterializationLossCause::RegistrationReleased,
+            } if agent_runtime_id.0 == "rt-released" && epoch == "epoch-9"
+        ));
+
+        let anonymous = build_mob_signal(
+            &release,
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Opaque(Arc::new(None::<String>)),
+                ),
+                (
+                    seam_facts::fields::fence_token(),
+                    OwnedFieldValue::Opaque(Arc::new(None::<u64>)),
+                ),
+                (
+                    seam_facts::fields::runtime_epoch_id(),
+                    OwnedFieldValue::Opaque(Arc::new(None::<String>)),
+                ),
+            ],
+        )
+        .expect("a release naming nothing still projects");
+        assert!(matches!(
+            anonymous,
+            mob_dsl::MobMachineSignal::ReleaseMemberMaterialization {
+                agent_runtime_id: None,
+                fence_token: None,
+                runtime_epoch_id: None,
+                cause: mob_dsl::MemberMaterializationLossCause::RegistrationReleased,
+            }
+        ));
     }
 }

@@ -137,6 +137,7 @@ pub mod session;
 pub mod session_component_sidecar;
 pub mod session_durable_config_authority;
 pub mod session_hosting;
+pub mod session_owner_wake;
 pub mod session_recovery;
 pub mod session_store;
 pub mod skills;

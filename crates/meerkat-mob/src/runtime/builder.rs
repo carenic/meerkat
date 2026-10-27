@@ -8910,7 +8910,7 @@ impl MobBuilder {
                 storage.runs.clone(),
                 session_service,
                 runtime_adapter,
-                Arc::clone(&runtime_provisioner) as Arc<dyn MobProvisioner>,
+                Arc::clone(&runtime_provisioner),
                 runtime_provisioner.session_ops_adapter(),
                 tool_bundles,
                 default_llm_client,
@@ -9938,7 +9938,6 @@ impl MobBuilder {
                 None => provisioner,
             });
             let session_ops_adapter = provisioner.session_ops_adapter();
-            let provisioner: Arc<dyn MobProvisioner> = provisioner;
             let roster = Arc::new(RwLock::new(RosterAuthority::from_roster(initial_roster)));
             let restore_diagnostics = Arc::new(RwLock::new(HashMap::new()));
             let wiring = RuntimeWiring {
@@ -10025,7 +10024,7 @@ impl MobBuilder {
         run_store: Arc<dyn MobRunStore>,
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: RuntimeAdapterOption,
-        provisioner: Arc<dyn MobProvisioner>,
+        provisioner: Arc<MultiBackendProvisioner>,
         session_ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
@@ -10067,6 +10066,10 @@ impl MobBuilder {
         )>,
     ) -> RuntimeStartFuture {
         Box::pin(async move {
+            // The member wake path runs B4's cold restore recipe, which needs
+            // the concrete provisioner; everything else holds the trait.
+            let member_wake_provisioner = Arc::clone(&provisioner);
+            let provisioner: Arc<dyn MobProvisioner> = provisioner;
             // Recover the actor-local idempotency index from durable public events
             // before spawning any runtime-owned tasks. Private remote-turn custody
             // is then overlaid below from the validated recovery material.
@@ -10278,6 +10281,12 @@ impl MobBuilder {
                     super::actor::member_status_wall_clock_ms()?,
                 )?;
 
+            let member_wakes = super::actor::member_wake::MemberWakes::new(
+                member_wake_provisioner,
+                &definition.id,
+                command_tx.clone(),
+                machine_state_watch_tx.subscribe(),
+            )?;
             let mut actor = MobActor {
                 definition,
                 incarnation: handle.live_incarnation(),
@@ -10436,7 +10445,7 @@ impl MobBuilder {
                 ),
                 #[cfg(feature = "runtime-adapter")]
                 startup_member_recoveries: BTreeMap::new(),
-                member_live_revivals_in_flight: BTreeMap::new(),
+                member_wakes,
                 identity_reconcile_parked: BTreeMap::new(),
                 spawn_panic_log_ledger: Arc::new(
                     super::panic_capture::SpawnPanicLogLedger::default(),

@@ -240,6 +240,81 @@ impl meerkat_comms::InprocPeerWaker for MobPeerWaker {
     }
 }
 
+impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
+    /// A session-keyed live operation on a member's session (R10): the
+    /// member bound to it, per the machine state the actor last published,
+    /// is woken as a host delivery wakes it. A session no member is bound to
+    /// any more answers `NotOwned`.
+    fn wake_session_owner(
+        &self,
+        session_id: &SessionId,
+    ) -> meerkat_core::session_owner_wake::SessionOwnerWakeFuture {
+        use meerkat_core::session_owner_wake::SessionOwnerWakeOutcome;
+        let wanted = mob_dsl::SessionId::from_domain(session_id);
+        let member = self
+            .machine_state
+            .borrow()
+            .member_session_bindings
+            .iter()
+            .find_map(|(identity, bound)| (bound == &wanted).then(|| identity.0.clone()));
+        let command_tx = self.command_tx.clone();
+        let session_id = session_id.clone();
+        Box::pin(async move {
+            let Some(member) = member else {
+                return Ok(SessionOwnerWakeOutcome::NotOwned);
+            };
+            let identity = AgentIdentity::from(member.as_str());
+            let (reply_tx, reply_rx) = oneshot::channel();
+            let command = MobCommand::WakeMember {
+                agent_identity: identity.clone(),
+                cause: mob_dsl::MemberWakeCause::HostDelivery,
+                observed_missing: false,
+                input_class: mob_dsl::PeerInputClass::Content,
+                sender_waking: false,
+                reply_tx,
+            };
+            if command_tx
+                .send(RoutedMobCommand::internal(command))
+                .await
+                .is_err()
+            {
+                return Err(session_owner_wake_error(
+                    &session_id,
+                    MobError::MemberWakeRefused {
+                        member_id: identity,
+                        refusal: crate::MemberWakeRefusal::MobUnavailable,
+                    },
+                ));
+            }
+            MemberWakeAdmission::Pending(reply_rx)
+                .settled_for_host(&identity)
+                .await
+                .map(|()| SessionOwnerWakeOutcome::Ready)
+                .map_err(|error| session_owner_wake_error(&session_id, error))
+        })
+    }
+}
+
+/// A member wake's typed refusal, as the session service reports it to a
+/// session-keyed caller: retryable refusals stay retryable (the session is
+/// busy now), the rest name the member's state.
+fn session_owner_wake_error(
+    session_id: &SessionId,
+    error: MobError,
+) -> meerkat_core::service::SessionError {
+    use meerkat_core::service::SessionError;
+    match &error {
+        MobError::MemberWakeRefused { refusal, .. } if refusal.is_retryable() => {
+            SessionError::Busy {
+                id: session_id.clone(),
+            }
+        }
+        _ => SessionError::Agent(meerkat_core::error::AgentError::InternalError(format!(
+            "the member owning session {session_id} could not be woken: {error}"
+        ))),
+    }
+}
+
 /// A materialization MobMachine handed off (`MaterializeMember`), started at
 /// the actor's next loop boundary.
 #[derive(Debug, Clone)]
@@ -344,9 +419,10 @@ pub(in crate::runtime) struct MemberWakes {
     /// (`mob.<id>`), the same one `build_agent_config` gives every member.
     namespace: String,
     waker: Arc<MobPeerWaker>,
-    /// The key of each wake route this mob published, by member, so a
-    /// retraction removes exactly the route the projection holds.
-    routes: BTreeMap<AgentIdentity, meerkat_comms::PubKey>,
+    /// What this mob published for each member (its inproc wake route and
+    /// its session-owner entry), so a retraction removes exactly what the
+    /// projection holds.
+    routes: BTreeMap<AgentIdentity, PublishedMemberRoutes>,
     /// Callers waiting on each attempt, with the attempt's member.
     waiters: BTreeMap<MemberWakeAttempt, (AgentIdentity, Vec<MemberWakeReply>)>,
     /// Attempts this actor is resolving right now: their callers are
@@ -404,6 +480,14 @@ impl MemberWakes {
         Arc::downgrade(&waker)
     }
 
+    fn session_owner_weak(
+        &self,
+    ) -> std::sync::Weak<dyn meerkat_core::session_owner_wake::SessionOwnerWaker> {
+        let owner: Arc<dyn meerkat_core::session_owner_wake::SessionOwnerWaker> =
+            self.waker.clone();
+        Arc::downgrade(&owner)
+    }
+
     /// Wait on `attempt` of `identity`.
     pub(in crate::runtime) fn join(
         &mut self,
@@ -449,23 +533,41 @@ impl MemberWakes {
 impl Drop for MemberWakes {
     fn drop(&mut self) {
         // The actor is gone: its routes can wake nothing. Waiters see their
-        // channel close (answered `mob_unavailable`); the registry answers
-        // the same for a route whose owner is gone, but retract them anyway
-        // so the keys stop resolving to this mob.
+        // channel close (answered `mob_unavailable`); the registries answer
+        // the same for an entry whose owner is gone, but retract them anyway
+        // so the keys and sessions stop resolving to this mob.
         let registry = meerkat_comms::InprocRegistry::global();
+        let owners = meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global();
         let waker = self.waker_weak();
-        for pubkey in self.routes.values() {
-            registry.retract_wake_route(&self.namespace, pubkey, &waker);
+        let session_owner = self.session_owner_weak();
+        for published in self.routes.values() {
+            if let Some(pubkey) = &published.pubkey {
+                registry.retract_wake_route(&self.namespace, pubkey, &waker);
+            }
+            owners.retract(&published.session, &session_owner);
         }
     }
 }
 
+/// What the wake-route projection published for one member.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::runtime) struct PublishedMemberRoutes {
+    /// Its inproc wake route's key: absent while the member has no durable
+    /// endpoint yet (a legacy member before its first wake).
+    pubkey: Option<meerkat_comms::PubKey>,
+    /// Its bound session, routed to this mob in the session-owner registry.
+    session: SessionId,
+}
+
 impl MobActor {
-    /// Realize MobMachine's member-residency effects. Every apply seam calls
-    /// this (from `queue_routed_effects_from`); the builder hands the effects
-    /// of the transitions it applied before the actor existed to it once, at
-    /// actor start. Wake routes are rebuilt from machine state, so realizing
-    /// a route effect twice is the same projection.
+    /// Realize MobMachine's member-residency effects. Every actor apply seam
+    /// calls this (from `queue_routed_effects_from`). The transitions the
+    /// builder applied before the actor existed are not replayed here: the
+    /// boot restore realized their materializations itself, and the actor
+    /// rebuilds every wake route from machine state when it starts
+    /// ([`Self::start_member_wakes`]). Wake routes are a projection of
+    /// machine state, so realizing a route effect twice is the same
+    /// projection.
     pub(in crate::runtime) fn realize_member_residency_effects(
         &mut self,
         effects: &[mob_dsl::MobMachineEffect],
@@ -481,6 +583,16 @@ impl MobActor {
                 }
                 mob_dsl::MobMachineEffect::RebuildWakeRoutes { .. } => {
                     self.rebuild_member_wake_routes();
+                }
+                // A binding that moved (a successor repoint, a recovered
+                // binding) moves the member's session-owner entry with it.
+                mob_dsl::MobMachineEffect::MemberSessionBindingChanged {
+                    agent_identity, ..
+                } => {
+                    let identity = AgentIdentity::from(agent_identity.0.as_str());
+                    if self.member_wakes.routes.contains_key(&identity) {
+                        self.publish_member_wake_route(&identity);
+                    }
                 }
                 mob_dsl::MobMachineEffect::MaterializeMember {
                     agent_identity,
@@ -567,18 +679,28 @@ impl MobActor {
     }
 
     /// The answer a closed attempt's callers get from the member's state
-    /// alone.
+    /// alone: the closure already happened in the machine (a stop, a retire
+    /// start, a resolution of another path), this only tells the callers.
     async fn member_wake_answer_from_state(&self, identity: &AgentIdentity) -> MemberWakeAnswer {
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
-        let (phase, running) = {
+        let (phase, running, retiring) = {
             let state = self.dsl_authority.state();
             (
                 state.member_materialization.get(&dsl_identity).cloned(),
                 matches!(state.lifecycle_phase, mob_dsl::MobPhase::Running),
+                state
+                    .identity_to_runtime
+                    .get(&dsl_identity)
+                    .and_then(|runtime_id| state.member_state_markers.get(runtime_id))
+                    == Some(&mob_dsl::MobMemberState::Retiring),
             )
         };
         match phase {
             Some(mob_dsl::MemberMaterializationPhase::Live) => Ok(MemberWakeOutcome::Ready),
+            // A retire start closed the attempt (F3).
+            Some(_) if retiring => Err(MemberWakeFailure::Refused(
+                crate::MemberWakeRefusal::Retiring,
+            )),
             _ if !running => Err(MemberWakeFailure::Refused(
                 crate::MemberWakeRefusal::MobNotRunning,
             )),
@@ -599,52 +721,83 @@ impl MobActor {
     // Wake routes (a declared projection of machine membership, G7).
     // ---------------------------------------------------------------
 
-    /// The key and session of `identity`'s wake route, read from machine
-    /// state: a local session-bound member with a durable endpoint.
-    fn member_wake_route_source(&self, identity: &AgentIdentity) -> Option<meerkat_comms::PubKey> {
+    /// What `identity`'s routes are, read from machine state: a local
+    /// session-bound member is routed by its session (session-owner
+    /// registry, R10), and by its durable endpoint's key once it has one
+    /// (inproc wake route).
+    fn member_wake_route_source(&self, identity: &AgentIdentity) -> Option<PublishedMemberRoutes> {
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         if !state.identity_to_runtime.contains_key(&dsl_identity)
-            || !state.member_session_bindings.contains_key(&dsl_identity)
             || state.member_placement.contains_key(&dsl_identity)
         {
             return None;
         }
-        let endpoint = state.member_peer_endpoints.get(&dsl_identity)?;
-        let pubkey = meerkat_comms::PubKey(endpoint.signing_key.0);
-        (!pubkey.is_zero()).then_some(pubkey)
+        let session = state
+            .member_session_bindings
+            .get(&dsl_identity)
+            .and_then(|session| SessionId::parse(&session.0).ok())?;
+        let pubkey = state
+            .member_peer_endpoints
+            .get(&dsl_identity)
+            .map(|endpoint| meerkat_comms::PubKey(endpoint.signing_key.0))
+            .filter(|pubkey| !pubkey.is_zero());
+        Some(PublishedMemberRoutes { pubkey, session })
     }
 
+    /// Publish `identity`'s routes as machine state names them now: a key
+    /// or a session the member no longer has (an endpoint that migrated, a
+    /// binding repointed to a successor) is retracted in the same step.
     pub(in crate::runtime) fn publish_member_wake_route(&mut self, identity: &AgentIdentity) {
-        let registry = meerkat_comms::InprocRegistry::global();
-        let waker = self.member_wakes.waker_weak();
         let source = self.member_wake_route_source(identity);
-        let previous = self.member_wakes.routes.get(identity).copied();
-        if let Some(previous) = previous
-            && Some(previous) != source
-        {
-            // The member's endpoint migrated: the old key is no longer its.
-            registry.retract_wake_route(&self.member_wakes.namespace, &previous, &waker);
-            self.member_wakes.routes.remove(identity);
+        let previous = self.member_wakes.routes.get(identity).cloned();
+        if previous == source {
+            return;
         }
-        if let Some(pubkey) = source {
-            registry.publish_wake_route(
-                &self.member_wakes.namespace,
-                pubkey,
-                identity.as_str(),
-                waker,
-            );
-            self.member_wakes.routes.insert(identity.clone(), pubkey);
+        let registry = meerkat_comms::InprocRegistry::global();
+        let owners = meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global();
+        let waker = self.member_wakes.waker_weak();
+        let session_owner = self.member_wakes.session_owner_weak();
+        if let Some(previous) = previous {
+            if let Some(pubkey) = previous.pubkey
+                && source.as_ref().and_then(|source| source.pubkey) != Some(pubkey)
+            {
+                registry.retract_wake_route(&self.member_wakes.namespace, &pubkey, &waker);
+            }
+            if source.as_ref().map(|source| &source.session) != Some(&previous.session) {
+                owners.retract(&previous.session, &session_owner);
+            }
+        }
+        match source {
+            Some(source) => {
+                if let Some(pubkey) = source.pubkey {
+                    registry.publish_wake_route(
+                        &self.member_wakes.namespace,
+                        pubkey,
+                        identity.as_str(),
+                        waker,
+                    );
+                }
+                owners.publish(source.session.clone(), session_owner);
+                self.member_wakes.routes.insert(identity.clone(), source);
+            }
+            None => {
+                self.member_wakes.routes.remove(identity);
+            }
         }
     }
 
     fn retract_member_wake_route(&mut self, identity: &AgentIdentity) {
-        if let Some(pubkey) = self.member_wakes.routes.remove(identity) {
-            meerkat_comms::InprocRegistry::global().retract_wake_route(
-                &self.member_wakes.namespace,
-                &pubkey,
-                &self.member_wakes.waker_weak(),
-            );
+        if let Some(published) = self.member_wakes.routes.remove(identity) {
+            if let Some(pubkey) = &published.pubkey {
+                meerkat_comms::InprocRegistry::global().retract_wake_route(
+                    &self.member_wakes.namespace,
+                    pubkey,
+                    &self.member_wakes.waker_weak(),
+                );
+            }
+            meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global()
+                .retract(&published.session, &self.member_wakes.session_owner_weak());
         }
     }
 
@@ -834,13 +987,22 @@ impl MobActor {
         );
         match classified {
             Some((mob_dsl::MemberRevivalVerdictKind::ReviveAuthorized, Some(attempt))) => {
-                self.member_wakes
+                // The drift arm hands nothing off itself; should it ever emit
+                // the handoff, the apply seam already queued it.
+                if !self
+                    .member_wakes
                     .pending
-                    .push_back(PendingMemberMaterialization {
-                        identity: identity.clone(),
-                        cause,
-                        attempt,
-                    });
+                    .iter()
+                    .any(|pending| pending.attempt == attempt)
+                {
+                    self.member_wakes
+                        .pending
+                        .push_back(PendingMemberMaterialization {
+                            identity: identity.clone(),
+                            cause,
+                            attempt,
+                        });
+                }
                 MemberWakeAdmission::Pending(self.member_wakes.join(identity, attempt))
             }
             Some((mob_dsl::MemberRevivalVerdictKind::BrokenRecorded, _)) => {
@@ -1314,6 +1476,247 @@ impl MobActor {
         }
     }
 
+    /// Actor start: publish every seated member's wake route from machine
+    /// state (`RebuildWakeRoutes` at actor start), and schedule the retry of
+    /// every boot wake that ended retryably while its obligation is owed.
+    pub(in crate::runtime) fn start_member_wakes(&mut self) {
+        self.rebuild_member_wake_routes();
+        self.schedule_owed_member_wake_retries();
+    }
+
+    /// A missing-live revival request (a host's liveness probe, a reload's
+    /// re-attachment, a start's recovery of a member it left out): applied
+    /// as `WakeMember` with the observed miss and answered in the revival
+    /// vocabulary. The wake runs B4's cold recipe like every other wake.
+    pub(in crate::runtime) async fn revive_missing_member_through_wake(
+        &mut self,
+        identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<MemberLiveRevivalOutcome, MobError>>,
+    ) {
+        match self
+            .apply_member_wake(
+                &identity,
+                mob_dsl::MemberWakeCause::Operator,
+                true,
+                mob_dsl::PeerInputClass::Content,
+                false,
+            )
+            .await
+        {
+            MemberWakeAdmission::Ready | MemberWakeAdmission::LifecycleNoticeConsumed => {
+                let _ = reply_tx.send(Ok(MemberLiveRevivalOutcome::AlreadyLive));
+            }
+            MemberWakeAdmission::Failed(failure) => {
+                let _ = reply_tx.send(Err(failure.into_mob_error(&identity)));
+            }
+            MemberWakeAdmission::Pending(answer) => {
+                self.actor_io_tasks.spawn(async move {
+                    let result = MemberWakeAdmission::Pending(answer)
+                        .settled_for_host(&identity)
+                        .await
+                        .map(|()| MemberLiveRevivalOutcome::Materialized(None));
+                    let _ = reply_tx.send(result);
+                });
+            }
+        }
+    }
+
+    /// Wake `agent_identity` from off the actor and wait for the answer: the
+    /// actor applies `WakeMember` for the cause (with the observed miss, the
+    /// counted drift path for a member MobMachine holds Live) and answers
+    /// once the member is ready, or with the typed refusal.
+    pub(in crate::runtime) async fn request_member_wake(
+        command_tx: &mpsc::Sender<RoutedMobCommand>,
+        agent_identity: &AgentIdentity,
+        cause: mob_dsl::MemberWakeCause,
+        observed_missing: bool,
+    ) -> Result<(), MobError> {
+        let (reply_tx, reply_rx) = oneshot::channel();
+        command_tx
+            .send(RoutedMobCommand::internal(MobCommand::WakeMember {
+                agent_identity: agent_identity.clone(),
+                cause,
+                observed_missing,
+                input_class: mob_dsl::PeerInputClass::Content,
+                sender_waking: false,
+                reply_tx,
+            }))
+            .await
+            .map_err(|_| MobError::ActorCommandChannelClosed)?;
+        MemberWakeAdmission::Pending(reply_rx)
+            .settled_for_host(agent_identity)
+            .await
+    }
+
+    // ---------------------------------------------------------------
+    // Make dormant (`MobHandle::release_member`, R6).
+    // ---------------------------------------------------------------
+
+    /// Release `identity`'s live materialization: its runtime registration is
+    /// closed while it is quiescent (no run, no queued input), and the
+    /// runtime's unregister publishes the release that MobMachine applies
+    /// (`ReleaseMemberMaterialization`, Live -> Dormant, fenced by the
+    /// registration's epoch). The member stays seated, at the same session,
+    /// generation and fence, and every delivery wakes it again.
+    ///
+    /// A member that is not materialized here (Dormant, or Broken) has
+    /// nothing to release. One being woken is refused retryably: its fresh
+    /// registration is the wake's. One with work in flight is refused
+    /// retryably too; nothing is interrupted.
+    pub(in crate::runtime) async fn handle_release_member(
+        &mut self,
+        identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    ) {
+        match self.prepare_member_release(&identity).await {
+            Err(error) => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Ok(None) => {
+                let _ = reply_tx.send(Ok(()));
+            }
+            #[cfg(feature = "runtime-adapter")]
+            Ok(Some((adapter, session_id))) => {
+                self.actor_io_tasks.spawn(async move {
+                    let result = release_member_registration(adapter, session_id, &identity).await;
+                    let _ = reply_tx.send(result);
+                });
+            }
+            #[cfg(not(feature = "runtime-adapter"))]
+            Ok(Some(never)) => match never {},
+        }
+    }
+
+    /// The release's preconditions, read on the actor: the member, its local
+    /// session and its runtime owner. `None` when nothing is materialized.
+    async fn prepare_member_release(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<Option<MemberReleaseTarget>, MobError> {
+        let entry = self
+            .roster
+            .read()
+            .await
+            .get(identity)
+            .cloned()
+            .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
+        if super::super::member_runtime_is_host_owned(self.dsl_authority.state(), identity) {
+            return Err(MobError::UnsupportedForMode {
+                mode: entry.runtime_mode,
+                reason: "a placed member's materialization is owned by its member host".to_string(),
+            });
+        }
+        match self
+            .dsl_authority
+            .state()
+            .member_materialization
+            .get(&mob_dsl::AgentIdentity::from_domain(identity))
+        {
+            Some(mob_dsl::MemberMaterializationPhase::Live) => {}
+            Some(mob_dsl::MemberMaterializationPhase::Waking) => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("member wake of '{identity}'"),
+                });
+            }
+            // Dormant, or no phase (Broken): nothing is materialized here.
+            Some(mob_dsl::MemberMaterializationPhase::Dormant) | None => return Ok(None),
+        }
+        let member_ref = self.machine_member_ref_for_behavior(&entry, "release member")?;
+        let session_id = member_ref.bridge_session_id().cloned().ok_or_else(|| {
+            MobError::UnsupportedForMode {
+                mode: entry.runtime_mode,
+                reason: "release requires a session-backed member".to_string(),
+            }
+        })?;
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let adapter =
+                self.runtime_adapter
+                    .clone()
+                    .ok_or_else(|| MobError::UnsupportedForMode {
+                        mode: entry.runtime_mode,
+                        reason: "release requires a runtime-backed member".to_string(),
+                    })?;
+            Ok(Some((adapter, session_id)))
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = session_id;
+            Err(MobError::UnsupportedForMode {
+                mode: entry.runtime_mode,
+                reason: "release requires a runtime-backed member".to_string(),
+            })
+        }
+    }
+
+    // ---------------------------------------------------------------
+    // Peer-notice dispositions (R4): MobMachine's verdict, realized.
+    // ---------------------------------------------------------------
+
+    /// MobMachine's disposition of one lifecycle or kickoff notice from
+    /// `sender` to `recipient` (`ClassifyPeerNotice`, a pure verdict legal in
+    /// every phase). A notice to or from a member that is not live is not
+    /// sent: its content reaches the member through the trust its wake
+    /// realizes from machine state.
+    pub(in crate::runtime) fn classify_peer_notice(
+        &mut self,
+        recipient: &AgentIdentity,
+        sender: &AgentIdentity,
+        notice_class: mob_dsl::PeerInputClass,
+    ) -> Result<mob_dsl::PeerNoticeDisposition, MobError> {
+        let dsl_recipient = mob_dsl::AgentIdentity::from_domain(recipient);
+        let dsl_sender = mob_dsl::AgentIdentity::from_domain(sender);
+        let transition = self.apply_dsl_input_collect_transition(
+            mob_dsl::MobMachineInput::ClassifyPeerNotice {
+                recipient: dsl_recipient.clone(),
+                sender: dsl_sender.clone(),
+                notice_class,
+            },
+            "classify_peer_notice",
+        )?;
+        transition
+            .effects()
+            .iter()
+            .find_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::PeerNoticeClassified {
+                    recipient,
+                    sender,
+                    notice_class: classified,
+                    disposition,
+                } if recipient == &dsl_recipient
+                    && sender == &dsl_sender
+                    && *classified == notice_class =>
+                {
+                    Some(*disposition)
+                }
+                _ => None,
+            })
+            .ok_or_else(|| {
+                MobError::Internal(format!(
+                    "MobMachine classified no notice from '{sender}' to '{recipient}'"
+                ))
+            })
+    }
+
+    /// [`Self::classify_peer_notice`], answered as what the caller does with
+    /// the notice. `DeferToWake` (a kickoff to a member that is not live) is
+    /// recorded by the caller that owns the kickoff, with its objective, as
+    /// the member's kickoff obligation (`KickoffMarkPending`).
+    pub(in crate::runtime) fn realize_peer_notice_disposition(
+        &mut self,
+        recipient: &AgentIdentity,
+        sender: &AgentIdentity,
+        notice_class: mob_dsl::PeerInputClass,
+    ) -> Result<PeerNoticeRealization, MobError> {
+        Ok(
+            match self.classify_peer_notice(recipient, sender, notice_class)? {
+                mob_dsl::PeerNoticeDisposition::Deliver => PeerNoticeRealization::Deliver,
+                mob_dsl::PeerNoticeDisposition::Suppressed => PeerNoticeRealization::Suppressed,
+                mob_dsl::PeerNoticeDisposition::DeferToWake => PeerNoticeRealization::DeferToWake,
+            },
+        )
+    }
+
     /// Whether `attempt` is still `identity`'s open wake attempt.
     pub(in crate::runtime) fn member_wake_attempt_is_open(
         &self,
@@ -1325,5 +1728,59 @@ impl MobActor {
             .member_wake_attempts
             .get(&mob_dsl::AgentIdentity::from_domain(identity))
             == Some(&attempt)
+    }
+}
+
+/// What a notice sender does with one notice, per MobMachine's disposition.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::runtime) enum PeerNoticeRealization {
+    /// Send it.
+    Deliver,
+    /// Do not send it: the recipient's (or the sender's) wake realizes its
+    /// content from machine state.
+    Suppressed,
+    /// A kickoff to a member that is not live: record it as the member's
+    /// kickoff obligation; its wake runs it.
+    DeferToWake,
+}
+
+/// The runtime owner and session a release closes.
+#[cfg(feature = "runtime-adapter")]
+type MemberReleaseTarget = (Arc<meerkat_runtime::MeerkatMachine>, SessionId);
+/// Without the runtime adapter nothing is released.
+#[cfg(not(feature = "runtime-adapter"))]
+type MemberReleaseTarget = std::convert::Infallible;
+
+/// Close the member's current registration while it is quiescent. The
+/// runtime's unregister saga emits the release that reaches MobMachine.
+#[cfg(feature = "runtime-adapter")]
+async fn release_member_registration(
+    adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: SessionId,
+    identity: &AgentIdentity,
+) -> Result<(), MobError> {
+    let Some(registration) = adapter
+        .current_session_registration_witness(&session_id)
+        .await
+    else {
+        // Nothing is registered: nothing is materialized to release.
+        return Ok(());
+    };
+    match adapter
+        .unregister_session_registration_until_terminal_if_quiescent(&registration)
+        .await
+    {
+        Ok(meerkat_runtime::RuntimeSessionQuiescentClose::Busy) => {
+            Err(MobError::LifecycleOperationPending {
+                intent: format!("release of member '{identity}': its session has work in flight"),
+            })
+        }
+        // Closed, or already closing, or replaced meanwhile: the release the
+        // close publishes reaches MobMachine (a replaced registration is a
+        // newer materialization, which a later release closes).
+        Ok(_) => Ok(()),
+        Err(error) => Err(MobError::Internal(format!(
+            "release of member '{identity}' could not close its registration: {error}"
+        ))),
     }
 }

@@ -1325,6 +1325,35 @@ impl StagedSessionDslInput {
             .iter()
             .any(|effect| composition::lift_routed_signal(effect).is_some())
     }
+
+    /// [`Self::has_routed_signal_effect`] without the registration release
+    /// (G1), which the final unregister holds back and dispatches only once
+    /// its durable finalization committed.
+    fn has_routed_signal_effect_besides_registration_release(&self) -> bool {
+        self.effects.as_slice().iter().any(|effect| {
+            !matches!(
+                effect,
+                dsl::MeerkatMachineEffect::RuntimeRegistrationReleased { .. }
+            ) && composition::lift_routed_signal(effect).is_some()
+        })
+    }
+
+    /// The released registration's routed signal (G1): every final
+    /// unregister publishes the exact runtime id, fence and epoch it released
+    /// to the owning mob.
+    fn registration_release_signals(&self) -> Vec<composition::MeerkatSeamSignal> {
+        self.effects
+            .as_slice()
+            .iter()
+            .filter(|effect| {
+                matches!(
+                    effect,
+                    dsl::MeerkatMachineEffect::RuntimeRegistrationReleased { .. }
+                )
+            })
+            .filter_map(composition::lift_routed_signal)
+            .collect()
+    }
 }
 
 #[derive(Clone, Copy)]
