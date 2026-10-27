@@ -12273,7 +12273,8 @@ pub(super) async fn restore_resumed_member(
     }
     if keeps_live_actor {
         // The live actor runs the binding the spec names, or it is not
-        // reused: this member's restore fails, typed, and nothing is built.
+        // reused: this member's restore fails, typed, nothing is built, and
+        // the live actor is retired so no surface reaches the old binding.
         if let Some(requested) = restore_spec.auth_binding.as_ref()
             && let Err(conflict) = super::live_actor_binding::verify_live_actor_auth_binding(
                 session_service.as_ref(),
@@ -12283,9 +12284,15 @@ pub(super) async fn restore_resumed_member(
             )
             .await
         {
+            let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+                session_service.as_ref(),
+                &bridge_session_id,
+                &conflict,
+            )
+            .await;
             return Ok(MemberRestorePlan::Unseated(member_restore_failure(
                 &bridge_session_id,
-                conflict.to_string(),
+                reason,
             )));
         }
         return Ok(MemberRestorePlan::Kept);
@@ -13105,10 +13112,16 @@ async fn restore_member_on_successor(
         )
         .await
     {
+        let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+            session_service.as_ref(),
+            &replacement_session_id,
+            &conflict,
+        )
+        .await;
         record_member_restore_failure(
             commit.tool_handle,
             entry,
-            member_restore_failure(&replacement_session_id, conflict.to_string()),
+            member_restore_failure(&replacement_session_id, reason),
         )
         .await;
         return Ok(None);

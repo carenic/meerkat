@@ -19509,7 +19509,10 @@ impl MobHandle {
     /// has nothing to release. Refused retryably
     /// ([`MobError::LifecycleOperationPending`]) while it is being woken,
     /// while its runtime binding has not landed yet (right after a spawn),
-    /// or while it has work in flight: nothing is closed or interrupted.
+    /// or while it has work in flight: nothing is closed or interrupted. A
+    /// placed member, and a member wired to a placed member (which reaches
+    /// it only while it is live), is refused with
+    /// [`MobError::UnsupportedForMode`].
     pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
         let agent_identity = identity.clone();
         self.send_actor_command(move |reply_tx| MobCommand::ReleaseMember {

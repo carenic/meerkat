@@ -91,8 +91,13 @@ them.
   records (stamped with the realm that declares it). Otherwise the spawn is
   refused with the new `MobError::MemberAuthBindingConflict { member_id,
   session_id, requested, recorded }` (wire code `INVALID_PARAMS`, structured
-  data kind `member_auth_binding_conflict`), and nothing changes. Before, the
-  live actor was reused on whatever binding it ran.
+  data kind `member_auth_binding_conflict`), and nothing changes. A restore at
+  a mob's start or a wake that would keep a member's live actor, or a live
+  successor session, applies the same check: on a conflict the member's
+  restore or wake fails with that typed reason, the member is recorded
+  broken, and the live actor is retired (its runtime registration closed,
+  work in flight interrupted), so no surface reaches the old binding. Before,
+  the live actor was reused on whatever binding it ran.
 - `meerkat-core`, `meerkat-contracts`: the OpenAI prompt-cache TTL
   vocabulary gains the 12-hour lifetime, appended last:
   `OpenAiPromptCacheTtl::TwelveHours` (`meerkat_core::model_profile::capabilities`,
@@ -140,7 +145,9 @@ them.
   quiescent, and keeps it seated at the same session, generation and fence;
   its next delivery wakes it. A member being woken, one whose runtime binding
   has not landed yet (right after a spawn), or one with work in flight is
-  refused retryably (`MobError::LifecycleOperationPending`).
+  refused retryably (`MobError::LifecycleOperationPending`). A member wired
+  to a placed member stays live while that wiring exists
+  (`MobError::UnsupportedForMode`, as for a placed member itself).
 - `meerkat-mob`: `MemberBuildPreparer` (with `MemberBuildPreparation`,
   `MemberBuildPrepared`, `MemberBuildPreparationRefusal` and
   `MemberBuildReport`): a host's preparation of each member build, asked once

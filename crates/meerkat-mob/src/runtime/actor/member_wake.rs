@@ -605,6 +605,7 @@ impl MobActor {
         effects: &[mob_dsl::MobMachineEffect],
     ) {
         let mut residency_changed = false;
+        let mut owed_wakes_recorded = false;
         for effect in effects {
             match effect {
                 mob_dsl::MobMachineEffect::PublishWakeRoute { agent_identity, .. } => {
@@ -651,6 +652,12 @@ impl MobActor {
                 mob_dsl::MobMachineEffect::MemberWakesAbandoned { .. } => {
                     residency_changed = true;
                 }
+                // Owed wakes recorded without an attempt (several Dormant
+                // members in one step): each is woken by the owed-retry
+                // timer, armed below.
+                mob_dsl::MobMachineEffect::OwedMemberWakesRecorded => {
+                    owed_wakes_recorded = true;
+                }
                 mob_dsl::MobMachineEffect::CloseMemberPeerIngress { .. } => {
                     self.member_wakes
                         .ingress
@@ -671,6 +678,10 @@ impl MobActor {
         }
         if residency_changed || !self.member_wakes.waiters.is_empty() {
             self.note_closed_member_wakes();
+        }
+        if owed_wakes_recorded {
+            // An armed timer stays as it is.
+            self.schedule_owed_member_wake_retries();
         }
     }
 
@@ -1518,9 +1529,19 @@ impl MobActor {
         }
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&identity);
-        let owed = state
+        let owed_cause = state
             .member_boot_obligation_owed
-            .contains_key(&dsl_identity);
+            .get(&dsl_identity)
+            .cloned();
+        let owed = owed_cause.is_some();
+        // The wake carries what it is owed for: a wiring to a placed member
+        // its own cause, every other obligation the boot cause.
+        let cause = match owed_cause {
+            Some(mob_dsl::MemberBootObligationCause::PlacedPeerWired) => {
+                mob_dsl::MemberWakeCause::PlacedPeerWired
+            }
+            _ => mob_dsl::MemberWakeCause::Boot,
+        };
         let dormant = matches!(
             state.member_materialization.get(&dsl_identity),
             Some(mob_dsl::MemberMaterializationPhase::Dormant)
@@ -1536,7 +1557,7 @@ impl MobActor {
         match self
             .apply_member_wake(
                 &identity,
-                mob_dsl::MemberWakeCause::Boot,
+                cause,
                 false,
                 mob_dsl::PeerInputClass::Content,
                 false,
@@ -1742,6 +1763,23 @@ impl MobActor {
             mob_dsl::MemberReleaseVerdict::NotYetReleasable => {
                 return Err(MobError::LifecycleOperationPending {
                     intent: format!("runtime binding of member '{identity}'"),
+                });
+            }
+            // Wired to a placed member, which reaches it only while it is
+            // live: it stays live, closing nothing, and a retry answers the
+            // same until that wiring is gone.
+            mob_dsl::MemberReleaseVerdict::PinnedByPlacedPeer => {
+                let mode = self
+                    .roster
+                    .read()
+                    .await
+                    .get(identity)
+                    .map(|entry| entry.runtime_mode)
+                    .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
+                return Err(MobError::UnsupportedForMode {
+                    mode,
+                    reason: "a member wired to a placed member stays live while that wiring exists"
+                        .to_string(),
                 });
             }
             // Dormant, or not materialized at all (Broken, retiring): nothing

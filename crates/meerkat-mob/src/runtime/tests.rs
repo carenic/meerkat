@@ -66436,6 +66436,43 @@ async fn a_resume_never_reuses_a_live_actor_on_another_binding() {
     );
 }
 
+/// A binding conflict at a restore or a wake retires the live actor it
+/// refused to keep: afterwards the session has no live actor, so no surface
+/// reaches the old binding, and the member's failure names the conflict.
+#[tokio::test]
+async fn a_refused_live_actor_is_retired_so_no_surface_reaches_the_old_binding() {
+    use super::live_actor_binding::{
+        refuse_conflicting_live_actor, verify_live_actor_auth_binding,
+    };
+    let service = Arc::new(MockSessionService::new());
+    let member = AgentIdentity::from("conflict-retire");
+    let session = live_session_on_binding_for_test(&service, &member, other_auth_binding()).await;
+    assert!(
+        MobSessionService::live_session_actor_registered(service.as_ref(), &session)
+            .await
+            .expect("live session read"),
+        "the session's actor is live before the conflict"
+    );
+
+    let conflict =
+        verify_live_actor_auth_binding(service.as_ref(), &member, &session, &scoped_auth_binding())
+            .await
+            .expect_err("another binding conflicts");
+    let reason = refuse_conflicting_live_actor(service.as_ref(), &session, &conflict).await;
+
+    assert_eq!(
+        reason,
+        conflict.to_string(),
+        "the retire succeeded, so the failure is the conflict alone"
+    );
+    assert!(
+        !MobSessionService::live_session_actor_registered(service.as_ref(), &session)
+            .await
+            .unwrap_or(false),
+        "no surface reaches the actor on the old binding"
+    );
+}
+
 /// The one check every live-actor reuse runs (a Resume-mode spawn, a restore
 /// that keeps a live session, a live successor at a restore or a wake): the
 /// session's recorded binding must be the requested one, as named or as a
@@ -88756,6 +88793,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
+        MobError::MemberWakeRefused { refusal, .. } => format!("member_wake_refused:{refusal}"),
+        MobError::MemberAuthBindingConflict { .. } => "member_auth_binding_conflict".to_string(),
         MobError::MemberStartupRecoveryFailed { .. } => {
             "member_startup_recovery_failed".to_string()
         }

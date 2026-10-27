@@ -5,7 +5,8 @@
 //! Resume-mode spawn of a session with a live actor, a restore that keeps a
 //! live session, a wake onto a live successor session), the actor is kept
 //! only when it runs that binding: a live actor is never reused on another
-//! binding.
+//! binding. Where a restore or a wake finds the conflict, the member is
+//! recorded broken and the live actor is retired, so no surface reaches it.
 
 use meerkat_core::types::SessionId;
 
@@ -54,4 +55,62 @@ pub(super) async fn verify_live_actor_auth_binding(
         requested: requested.clone(),
         recorded,
     })
+}
+
+/// Retire the live actor of `session_id` that a binding conflict refused to
+/// keep (at a restore or a wake), so a member recorded broken keeps no live
+/// actor on the old binding that a surface could reach. Fail closed: the
+/// session's exact current runtime registration is unregistered to
+/// terminal, interrupting any work in flight, and the session's live actor
+/// is then discarded (a session already without one is retired).
+pub(super) async fn retire_conflicting_live_actor(
+    session_service: &dyn MobSessionService,
+    session_id: &SessionId,
+) -> Result<(), MobError> {
+    let adapter = session_service
+        .acquire_runtime_adapter(None)
+        .map_err(|error| {
+            MobError::Internal(format!(
+                "retiring the conflicting live actor of session {session_id}: {error}"
+            ))
+        })?;
+    if let Some(adapter) = adapter
+        && let Some(registration) = adapter
+            .current_session_registration_witness(session_id)
+            .await
+    {
+        adapter
+            .unregister_session_registration_until_terminal_if_current(&registration)
+            .await
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "retiring the conflicting runtime registration of session {session_id}: {error}"
+                ))
+            })?;
+    }
+    match session_service.discard_live_session(session_id).await {
+        Ok(()) | Err(meerkat_core::service::SessionError::NotFound { .. }) => Ok(()),
+        Err(error) => Err(MobError::SessionError(error)),
+    }
+}
+
+/// The restore failure of a member whose live actor a binding conflict
+/// refused: the conflict, and, when its live actor could not be retired,
+/// that failure too.
+pub(super) async fn refuse_conflicting_live_actor(
+    session_service: &dyn MobSessionService,
+    session_id: &SessionId,
+    conflict: &MobError,
+) -> String {
+    match retire_conflicting_live_actor(session_service, session_id).await {
+        Ok(()) => conflict.to_string(),
+        Err(error) => {
+            tracing::error!(
+                session_id = %session_id,
+                %error,
+                "a live actor on a conflicting auth binding could not be retired"
+            );
+            format!("{conflict}; its live actor could not be retired: {error}")
+        }
+    }
 }
