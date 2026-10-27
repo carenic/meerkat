@@ -1423,7 +1423,7 @@ macro_rules! mob_catalog_machine_dsl {
             // Generated composition refusal closure. Each input is bound by
             // `meerkat_mob_seam` to one concrete routed effect kind; the shell
             // supplies only the consumer's stable code + display detail.
-            ResolveRuntimeBindingRefusal { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String },
+            ResolveRuntimeBindingRefusal { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String, attempt: Option<u64> },
             ResolveRuntimeIngressRefusal { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId, work_id: WorkId, origin: Enum<WorkOrigin>, refusal_code: String, reason: String },
             ResolveRuntimeRetireRefusal { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String },
             RetryRuntimeRetire { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId },
@@ -1934,7 +1934,7 @@ macro_rules! mob_catalog_machine_dsl {
             HoldMemberRunStarts,
             ReleaseMemberRunStarts,
             DefinitionEpochAdvanced { previous_epoch: u64, epoch: u64 },
-            RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId },
+            RequestRuntimeBinding { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId, attempt: Option<u64> },
             SpawnProfileAuthorized { agent_identity: AgentIdentity, profile_name: String, model: String, profile_material_digest: String, tool_config_digest: String, skills_digest: String, provider_params_digest: Option<String>, output_schema_digest: Option<String>, external_addressable: bool, resolved_spec_digest: Option<String> },
             RequestRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId, work_id: WorkId, origin: Enum<WorkOrigin>, content_attribution: Enum<WorkContentAttribution> },
             RequestPeerRuntimeIngress { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, work_id: WorkId, origin: Enum<WorkOrigin>, content_attribution: Enum<WorkContentAttribution> },
@@ -6773,7 +6773,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_health_class.remove(agent_identity);
             }
             to Running
-            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: Some(generation), session_id: bridge_session_id.get("value") }
+            emit RequestRuntimeBinding { agent_identity: agent_identity, agent_runtime_id: agent_runtime_id, fence_token: fence_token, generation: Some(generation), session_id: bridge_session_id.get("value"), attempt: None }
             emit AppendLifecycleJournal {
                 kind: MobLifecycleJournalKind::MemberSpawned,
                 agent_identity: Some(agent_identity),
@@ -11244,8 +11244,16 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         transition ResolveRuntimeBindingRefusalRunning {
-            on input ResolveRuntimeBindingRefusal { agent_identity, agent_runtime_id, session_id, refusal_code, reason }
+            on input ResolveRuntimeBindingRefusal { agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt }
             guard { self.lifecycle_phase == Phase::Running }
+            // The attempt fence: a refused binding request of a wake applies
+            // only while that wake's attempt is open (the spawn's binding
+            // belongs to no attempt); a refusal of any other attempt is the
+            // Stale twin's.
+            guard "refusal_attempt_current" {
+                attempt == None
+                || self.member_wake_attempts.get_copied(agent_identity) == attempt
+            }
             guard "placement_absent" { self.member_placement.contains_key(agent_identity) == false }
             guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -13726,7 +13734,8 @@ macro_rules! mob_catalog_machine_dsl {
                 agent_runtime_id: self.identity_to_runtime.get_cloned(agent_identity).get("value"),
                 fence_token: self.identity_runtime_fence_tokens.get_copied(agent_identity).get("value"),
                 generation: self.identity_runtime_generations.get_copied(agent_identity),
-                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value")
+                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value"),
+                attempt: Some(attempt)
             }
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::Applied }
         }
@@ -25315,7 +25324,8 @@ macro_rules! mob_catalog_machine_dsl {
                 agent_runtime_id: self.identity_to_runtime.get_cloned(agent_identity).get("value"),
                 fence_token: self.identity_runtime_fence_tokens.get_copied(agent_identity).get("value"),
                 generation: self.identity_runtime_generations.get_copied(agent_identity),
-                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value")
+                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value"),
+                attempt: Some(attempt)
             }
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::Applied }
         }
@@ -26009,6 +26019,22 @@ macro_rules! mob_catalog_machine_dsl {
             emit PublishWakeRoute { agent_identity: agent_identity }
             emit PersistKickoffUpdate { member_id: agent_identity, phase: KickoffPhase::Pending }
             emit EmitKickoffLifecycleNotice { member_id: agent_identity, intent: KickoffIntent::Pending }
+        }
+
+        // A refused binding request of a wake attempt that is no longer the
+        // member's open one (it closed, or a newer wake opened): a typed
+        // StaleAttempt no-op in every lifecycle phase, so a late refusal
+        // never ends a newer wake.
+        transition ResolveRuntimeBindingRefusalStale {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on input ResolveRuntimeBindingRefusal { agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt }
+            guard "refusal_attempt_stale" {
+                attempt != None
+                && self.member_wake_attempts.get_copied(agent_identity) != attempt
+            }
+            update {}
+            to Running
+            emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt.get("value"), verdict: MemberWakeFeedbackVerdict::StaleAttempt }
         }
     }
         }

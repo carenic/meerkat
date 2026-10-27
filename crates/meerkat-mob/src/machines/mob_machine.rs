@@ -10668,6 +10668,90 @@ mod tests {
         );
     }
 
+    /// The routed binding refusal is fenced by the wake attempt its request
+    /// belongs to: a late refusal of an earlier attempt's request is a typed
+    /// StaleAttempt no-op that never ends the newer wake, and the refusal of
+    /// the open attempt's request records the member Broken.
+    #[test]
+    fn a_stale_binding_refusal_never_ends_a_newer_wake() {
+        let (mut authority, member) = dormant_member_authority("fenced-refusal");
+        MobMachineMutator::apply(&mut authority, wake_input(&member.identity))
+            .expect("the Dormant member wakes");
+        let first = *authority
+            .state()
+            .member_wake_attempts
+            .get(&member.identity)
+            .expect("the wake opened an attempt");
+        let bound = authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: member.identity.clone(),
+                attempt: first,
+            })
+            .expect("the wake's Bound step applies");
+        assert!(bound.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::RequestRuntimeBinding { attempt, .. } if *attempt == Some(first)
+        )));
+        authority
+            .apply_signal(MobMachineSignal::AbandonMemberWake {
+                agent_identity: member.identity.clone(),
+                attempt: first,
+                kind: MemberWakeAbandonKind::Unsettled,
+                reason: "the first wake timed out".to_string(),
+            })
+            .expect("the first wake is abandoned");
+        MobMachineMutator::apply(&mut authority, wake_input(&member.identity))
+            .expect("a newer wake opens");
+        let second = *authority
+            .state()
+            .member_wake_attempts
+            .get(&member.identity)
+            .expect("the newer wake opened an attempt");
+        let refusal = |attempt| MobMachineInput::ResolveRuntimeBindingRefusal {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+            session_id: member.session_id.clone(),
+            refusal_code: "binding_refused".to_string(),
+            reason: "the runtime refused the binding".to_string(),
+            attempt: Some(attempt),
+        };
+        let stale = MobMachineMutator::apply(&mut authority, refusal(first))
+            .expect("a refusal of the earlier attempt's request is answered");
+        assert!(stale.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::MemberWakeFeedbackResolved {
+                verdict: MemberWakeFeedbackVerdict::StaleAttempt,
+                ..
+            }
+        )));
+        assert_eq!(
+            authority.state().member_wake_attempts.get(&member.identity),
+            Some(&second),
+            "the late refusal leaves the newer wake open"
+        );
+        assert!(
+            !authority
+                .state()
+                .member_restore_failures
+                .contains_key(&member.identity)
+        );
+        MobMachineMutator::apply(&mut authority, refusal(second))
+            .expect("the refusal of the open attempt's request applies");
+        assert!(
+            authority
+                .state()
+                .member_restore_failures
+                .contains_key(&member.identity),
+            "the open wake's refused binding records the member Broken"
+        );
+        assert!(
+            !authority
+                .state()
+                .member_wake_attempts
+                .contains_key(&member.identity)
+        );
+    }
+
     /// A forced destroy that drops in-flight rotation intents follows the
     /// destroy's admission, whose RotationSessionsAbandoned names each
     /// rotation's next session for the shell to archive.

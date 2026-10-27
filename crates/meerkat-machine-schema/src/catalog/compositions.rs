@@ -1096,6 +1096,9 @@ pub fn meerkat_mob_seam_composition() -> CompositionSchema {
                         refusal_effect_bind("session_id", "session_id"),
                         refusal_code_bind("refusal_code"),
                         refusal_message_bind("reason"),
+                        // The wake attempt the refused request belongs to, so
+                        // a late refusal is fenced like every wake feedback.
+                        refusal_effect_bind("attempt", "attempt"),
                     ],
                 },
                 DriverRefusalClosure {
