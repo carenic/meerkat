@@ -168,6 +168,9 @@ them.
   `SessionError::Busy` (retry later); a final one as an internal agent error
   whose message names the refusal. Do not parse that message: a typed form is
   planned for the next release.
+- A durable job delivery to a dormant member whose wake is refused is never
+  settled: the row stays pending, in order, and is retried on later delivery
+  wakes, also for a broken member, so a repaired member still gets it.
 - A durable worker woken while its host's durable resume gate stays
   unavailable still has its interrupted run settled as refused after the
   runtime's attempts, and that run's own kept inputs are abandoned, as in
