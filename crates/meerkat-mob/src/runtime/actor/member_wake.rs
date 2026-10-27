@@ -1744,6 +1744,23 @@ impl MobActor {
                     intent: format!("runtime binding of member '{identity}'"),
                 });
             }
+            // Wired to a placed member, which reaches it only while it is
+            // live: it stays live, closing nothing, and a retry answers the
+            // same until that wiring is gone.
+            mob_dsl::MemberReleaseVerdict::PinnedByPlacedPeer => {
+                let mode = self
+                    .roster
+                    .read()
+                    .await
+                    .get(identity)
+                    .map(|entry| entry.runtime_mode)
+                    .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
+                return Err(MobError::UnsupportedForMode {
+                    mode,
+                    reason: "a member wired to a placed member stays live while that wiring exists"
+                        .to_string(),
+                });
+            }
             // Dormant, or not materialized at all (Broken, retiring): nothing
             // is materialized here to release.
             mob_dsl::MemberReleaseVerdict::NothingMaterialized => return Ok(None),
