@@ -210,6 +210,14 @@ pub struct Roster {
     /// first build applies.
     #[serde(skip)]
     seat_builds: BTreeMap<SessionId, Arc<crate::runtime::SeatBuild>>,
+    /// The sessions whose member comms endpoint (and so its public key) a
+    /// journal row of this mob recorded: a `MemberSpawned` or a
+    /// `MemberSessionBindingRecovered` row naming the session with its
+    /// endpoint, or a `MemberRetirementStarted` row with the retiring
+    /// runtime's endpoint. Peers of this mob trusted that key, so a seat of
+    /// such a session never mints another one.
+    #[serde(skip)]
+    sessions_with_recorded_endpoint: BTreeSet<SessionId>,
 }
 
 impl Roster {
@@ -250,6 +258,10 @@ impl Roster {
                 };
                 if let Some(session_id) = member_ref.bridge_session_id() {
                     self.record_seat_build(session_id, member_spawned);
+                    if member_spawned.member_peer_endpoint().is_some() {
+                        self.sessions_with_recorded_endpoint
+                            .insert(session_id.clone());
+                    }
                 }
                 self.add(RosterAddEntry {
                     agent_identity: member_spawned.agent_identity.clone(),
@@ -288,8 +300,33 @@ impl Roster {
             }
             // Retirement admission is not roster terminality. Keep the spawn
             // projection intact so a restart retains the cleanup anchor.
-            MobEventKind::MemberRetirementStarted { .. }
-            | MobEventKind::RemoteMemberRuntimeRetired { .. }
+            MobEventKind::MemberRetirementStarted {
+                agent_identity,
+                generation,
+                releasing,
+                session_id,
+                retiring_peer_endpoint,
+                ..
+            } => {
+                // The retiring runtime's endpoint: an older journal may record
+                // a member's endpoint only here.
+                if retiring_peer_endpoint.is_some() {
+                    let retiring_session = session_id
+                        .clone()
+                        .or_else(|| releasing.clone())
+                        .or_else(|| {
+                            self.entries
+                                .get(agent_identity)
+                                .filter(|entry| entry.generation == *generation)
+                                .and_then(|entry| entry.member_ref.bridge_session_id().cloned())
+                        });
+                    if let Some(retiring_session) = retiring_session {
+                        self.sessions_with_recorded_endpoint
+                            .insert(retiring_session);
+                    }
+                }
+            }
+            MobEventKind::RemoteMemberRuntimeRetired { .. }
             | MobEventKind::RemoteMemberSupervisorRevoked { .. } => {}
             MobEventKind::MemberRetired {
                 agent_identity,
@@ -361,6 +398,10 @@ impl Roster {
                     // applied what its seat carried.
                     if recovered.records_seat_session_born() {
                         self.seat_builds.remove(bridge_session_id);
+                    }
+                    if recovered.member_peer_endpoint.is_some() {
+                        self.sessions_with_recorded_endpoint
+                            .insert(bridge_session_id.clone());
                     }
                 }
             }
@@ -435,6 +476,7 @@ impl Roster {
                 self.entries.clear();
                 self.owed_kickoff_prompts.clear();
                 self.seat_builds.clear();
+                self.sessions_with_recorded_endpoint.clear();
             }
             _ => {}
         }
@@ -478,6 +520,7 @@ impl Roster {
             creation_history: Default::default(),
             owed_kickoff_prompts: BTreeMap::new(),
             seat_builds: BTreeMap::new(),
+            sessions_with_recorded_endpoint: BTreeSet::new(),
             entries: entries
                 .into_iter()
                 .map(|entry| (entry.agent_identity.clone(), entry))
@@ -598,6 +641,14 @@ impl Roster {
             .member_ref
             .bridge_session_id()?;
         self.seat_builds.get(session_id).cloned()
+    }
+
+    /// Whether a journal row of this mob recorded the member comms endpoint
+    /// of `session_id` (its public key): peers trusted that key, so a seat of
+    /// the session whose key pair is missing is refused rather than given a
+    /// new one.
+    pub(crate) fn session_endpoint_recorded(&self, session_id: &SessionId) -> bool {
+        self.sessions_with_recorded_endpoint.contains(session_id)
     }
 
     /// Keep `local`, the process-local build inputs of the seat just
@@ -2080,5 +2131,72 @@ mod tests {
             roster.seat_build(&identity).is_none(),
             "the born row removes what the first build applied"
         );
+    }
+
+    /// A session's endpoint counts as recorded when a spawn row carries it,
+    /// and, for an older journal whose spawn row does not, when the
+    /// retirement row of its runtime carries it.
+    #[test]
+    fn a_session_endpoint_is_recorded_by_its_spawn_or_its_retirement_row() {
+        let pubkey = [9u8; 32];
+        let endpoint = TrustedPeerDescriptor::unsigned_with_pubkey(
+            "mob/worker/w",
+            PeerId::from_ed25519_pubkey(&pubkey).to_string(),
+            pubkey,
+            "inproc://mob/worker/w",
+        )
+        .expect("a valid endpoint");
+        let (spawned, retired, unrecorded) = (session_id(), session_id(), session_id());
+        let spawn_with_endpoint = MobEventKind::MemberSpawned(
+            crate::event::MemberSpawnedEvent::new(
+                AgentIdentity::from("spawned"),
+                Generation::INITIAL,
+                FenceToken::new(0),
+                AgentRuntimeId::initial(AgentIdentity::from("spawned")),
+                ProfileName::from("worker"),
+            )
+            .with_bridge_member_ref(Some(MemberRef::from_bridge_session_id(spawned.clone())))
+            .with_member_peer_endpoint(Some(endpoint.clone())),
+        );
+        let mut retirement = MobEventKind::MemberRetirementStarted {
+            agent_identity: AgentIdentity::from("retired"),
+            agent_runtime_id: AgentRuntimeId::initial(AgentIdentity::from("retired")),
+            generation: Generation::INITIAL,
+            role: ProfileName::from("worker"),
+            releasing: Some(retired.clone()),
+            session_id: Some(retired.clone()),
+            retiring_peer_endpoint: None,
+            preserve_machine_topology: false,
+        };
+        retirement
+            .set_retiring_peer_endpoint(endpoint)
+            .expect("a retirement row carries the retiring endpoint");
+        let roster = Roster::project(&[
+            make_event(1, spawn_with_endpoint),
+            make_event(
+                2,
+                spawned_kind(
+                    "retired",
+                    "worker",
+                    MobRuntimeMode::TurnDriven,
+                    MemberRef::from_bridge_session_id(retired.clone()),
+                    BTreeMap::new(),
+                ),
+            ),
+            make_event(3, retirement),
+            make_event(
+                4,
+                spawned_kind(
+                    "unrecorded",
+                    "worker",
+                    MobRuntimeMode::TurnDriven,
+                    MemberRef::from_bridge_session_id(unrecorded.clone()),
+                    BTreeMap::new(),
+                ),
+            ),
+        ]);
+        assert!(roster.session_endpoint_recorded(&spawned));
+        assert!(roster.session_endpoint_recorded(&retired));
+        assert!(!roster.session_endpoint_recorded(&unrecorded));
     }
 }

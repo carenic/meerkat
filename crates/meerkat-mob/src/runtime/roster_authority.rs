@@ -110,6 +110,15 @@ impl RosterAuthority {
         self.roster.seat_build(identity)
     }
 
+    /// Whether a journal row of this mob recorded `session_id`'s member comms
+    /// endpoint ([`Roster::session_endpoint_recorded`]).
+    pub(crate) fn session_endpoint_recorded(
+        &self,
+        session_id: &meerkat_core::types::SessionId,
+    ) -> bool {
+        self.roster.session_endpoint_recorded(session_id)
+    }
+
     /// Keep the process-local build inputs of the seat just committed on the
     /// unborn session `session_id` ([`Roster::retain_seat_local_build_inputs`]).
     pub(crate) fn retain_seat_local_build_inputs(
