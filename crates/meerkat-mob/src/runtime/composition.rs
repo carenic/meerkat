@@ -512,6 +512,26 @@ impl SignalConsumerSurface for MobSignalConsumerSurface {
         projected_fields: Vec<(FieldId, OwnedFieldValue)>,
     ) -> Result<(), meerkat_runtime::composition::ConsumerError> {
         let signal = build_mob_signal(&variant, &projected_fields)?;
+        #[cfg(test)]
+        let held = match &signal {
+            mob_dsl::MobMachineSignal::ObserveRuntimeReady {
+                agent_runtime_id, ..
+            } => ready_signal_test_hold::held(agent_runtime_id.as_str()),
+            _ => None,
+        };
+        #[cfg(test)]
+        if let Some(mut released) = held {
+            let command_tx = self.command_tx.clone();
+            tokio::spawn(async move {
+                let _ = released.wait_for(|released| *released).await;
+                let _ = command_tx
+                    .send(super::scope_gate::RoutedMobCommand::internal(
+                        super::state::MobCommand::ProjectMachineSignal { signal },
+                    ))
+                    .await;
+            });
+            return Ok(());
+        }
         // Machine-internal lifecycle signal projection: the internal
         // authority lane (phase 5, DEC-P5E-2).
         let command = super::scope_gate::RoutedMobCommand::internal(
@@ -538,6 +558,41 @@ impl SignalConsumerSurface for MobSignalConsumerSurface {
                 ))
             }
         }
+    }
+}
+
+/// Test seam: the routed readiness observation (`ObserveRuntimeReady`) of a
+/// member's runtime held until the test releases it, so a row can act in the
+/// window between a member's Live commit and its registration's epoch
+/// record. Keyed by member identity; the runtime id renders as
+/// `identity:generation`.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) mod ready_signal_test_hold {
+    use std::collections::BTreeMap;
+    use std::sync::{Mutex, PoisonError};
+
+    use crate::tokio::sync::watch;
+
+    static HOLDS: Mutex<BTreeMap<String, watch::Receiver<bool>>> = Mutex::new(BTreeMap::new());
+
+    /// Hold every readiness observation of `identity`'s runtimes until the
+    /// returned sender sends `true`.
+    pub(crate) fn hold(identity: &str) -> watch::Sender<bool> {
+        let (released_tx, released_rx) = watch::channel(false);
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(identity.to_string(), released_rx);
+        released_tx
+    }
+
+    pub(super) fn held(runtime_id: &str) -> Option<watch::Receiver<bool>> {
+        let (identity, _generation) = runtime_id.rsplit_once(':')?;
+        HOLDS
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(identity)
+            .cloned()
     }
 }
 

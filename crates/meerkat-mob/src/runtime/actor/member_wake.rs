@@ -1690,8 +1690,9 @@ impl MobActor {
     ///
     /// A member that is not materialized here (Dormant, or Broken) has
     /// nothing to release. One being woken is refused retryably: its fresh
-    /// registration is the wake's. One with work in flight is refused
-    /// retryably too; nothing is interrupted.
+    /// registration is the wake's. So is one whose registration's binding
+    /// has not reached MobMachine yet, and one with work in flight; nothing
+    /// is closed or interrupted.
     pub(in crate::runtime) async fn handle_release_member(
         &mut self,
         identity: AgentIdentity,
@@ -1732,6 +1733,15 @@ impl MobActor {
             mob_dsl::MemberReleaseVerdict::WakeInFlight => {
                 return Err(MobError::LifecycleOperationPending {
                     intent: format!("member wake of '{identity}'"),
+                });
+            }
+            // Live, but MobMachine would not honour the release of its
+            // registration yet (the routed binding has not recorded the
+            // registration's epoch): nothing is closed, and a retry releases
+            // it once the binding landed.
+            mob_dsl::MemberReleaseVerdict::NotYetReleasable => {
+                return Err(MobError::LifecycleOperationPending {
+                    intent: format!("runtime binding of member '{identity}'"),
                 });
             }
             // Dormant, or not materialized at all (Broken, retiring): nothing

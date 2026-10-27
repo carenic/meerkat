@@ -439,6 +439,11 @@ impl WakeFixture {
     /// comms routes are process-wide.
     async fn spawn(&self, label: &str) -> AgentIdentity {
         let identity = AgentIdentity::from(format!("{label}-{}", Uuid::new_v4().simple()));
+        self.spawn_as(identity).await
+    }
+
+    /// [`Self::spawn`] of a given identity.
+    async fn spawn_as(&self, identity: AgentIdentity) -> AgentIdentity {
         let mut spec = SpawnMemberSpec::new("worker", identity.clone());
         spec.continuity_intent = SpawnContinuityIntent::DurableIdentity {
             continuity_key: identity.to_string(),
@@ -1785,5 +1790,58 @@ async fn a_release_stating_an_earlier_registrations_epoch_is_refused_at_the_mob(
         Some(second),
         "the mob keeps the new registration's epoch"
     );
+    fixture.finish().await;
+}
+
+/// A release in the window after a member's spawn committed it Live and
+/// before the routed binding recorded its registration's epoch keeps the
+/// member's session: MobMachine answers that the member is not yet
+/// releasable, the release is refused retryably and nothing is closed. Once
+/// the binding landed, the same release makes the member dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_before_the_binding_lands_keeps_the_session_and_a_retry_releases_it() {
+    let fixture = WakeFixture::new("wake-release-window").await;
+    let member = AgentIdentity::from(format!("release-window-{}", Uuid::new_v4().simple()));
+    let binding = crate::runtime::composition::ready_signal_test_hold::hold(member.as_str());
+    let member = fixture.spawn_as(member).await;
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let epoch_recorded = |state: &mob_dsl::MobMachineState| {
+        state
+            .member_materialization_epoch
+            .get(&key)
+            .is_some_and(Option::is_some)
+    };
+    assert!(
+        !epoch_recorded(&fixture.handle.machine_state_watch_rx.borrow()),
+        "the held binding has not recorded the registration's epoch"
+    );
+
+    let refused = tokio::time::timeout(WAIT, fixture.handle.release_member(&member))
+        .await
+        .expect("the release answers");
+    assert!(
+        matches!(&refused, Err(MobError::LifecycleOperationPending { .. })),
+        "a release before the binding lands is refused retryably: {refused:?}"
+    );
+    let session = fixture.session(&member).await;
+    assert!(
+        MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .expect("live session read"),
+        "the refused release closed nothing"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
+
+    binding.send(true).expect("release the held binding");
+    let mut state = fixture.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(WAIT, state.wait_for(epoch_recorded))
+        .await
+        .expect("the binding records the registration's epoch in time")
+        .expect("the machine state stays published");
+
+    fixture.release(&member).await;
     fixture.finish().await;
 }
