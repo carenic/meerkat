@@ -86,6 +86,20 @@ them.
   before any reviewer or consent, and a read-only member was refused every
   tool behind them.
 
+### Upgrade notes
+
+- Upgrade the Python and TypeScript SDKs with the server before selecting
+  `prompt_cache_options.ttl = "12h"` for a session you fork. Once such a
+  session runs in `explicit` mode (the GPT-5.6 default), its cache-breakpoint
+  evidence names `twelve_hours`, and the SDKs of 0.9.6 and earlier read that
+  field from a closed list: they refuse the whole fork result as
+  `INVALID_RESPONSE`.
+- Rolling back to 0.9.6 after selecting `12h`: 0.9.6 does not know the
+  value, so a stored profile, mob definition or session parameter set that
+  carries `ttl = "12h"` does not parse there, and cache-breakpoint evidence
+  that names `twelve_hours` is dropped as unusable. Remove the setting
+  before rolling back.
+
 ## [0.9.6] - 2026-10-27
 
 ### Breaking
