@@ -3540,6 +3540,275 @@ mod reservation_tests {
         );
     }
 
+    /// This entry's custody of its spent attempt for the effect's later steps.
+    fn entered_steps(entry: &ReviewEntry) -> EnteredSteps {
+        match entry.entered_basis() {
+            EnteredBasis::Entered { steps, .. } => Some(steps),
+            EnteredBasis::Unreviewed | EnteredBasis::NotSpent | EnteredBasis::Ended => None,
+        }
+        .expect("the spend left the effect entered")
+    }
+
+    /// At the owner: the admitting dispatch is cancelled
+    /// while a step admitted under the entered effect is still in flight (a
+    /// store commit blocked inside it). The attempt stays registered as
+    /// `Used`, closing: a new step and a second spend are refused, and `Used`
+    /// is not observed. The blocked step then completes and its finish
+    /// releases the attempt; `Used` is delivered once the effect's custody
+    /// is dropped.
+    #[tokio::test]
+    async fn a_dispatch_cancelled_during_a_step_keeps_the_attempt_until_the_step_ends() {
+        use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason as Reason;
+        let h = harness();
+        let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let entry = admit(&review, &h.check, &h.work)
+            .await
+            .expect("allowed and retained");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let custody = entry.consume_held(&h.check).expect("spend");
+        let attempt = entered_attempt_id(&entry).expect("the spend leaves its attempt entered");
+        let steps = entered_steps(&entry);
+        let blocked = steps
+            .admit(h.check.binding(), &h.work)
+            .expect("a step while the dispatch is live");
+
+        drop(guard);
+        assert_eq!(
+            step_answer(&h.approvals, &attempt),
+            Err(ReviewOwnerError::Rejected(Reason::Expired)),
+            "still registered as Used and closing"
+        );
+        assert_eq!(
+            steps.admit(h.check.binding(), &h.work).err(),
+            Some(ReviewOwnerError::Rejected(Reason::Expired)),
+            "a step after the dispatch end refuses as ended"
+        );
+        assert_eq!(
+            h.approvals
+                .apply_review(|authority| authority.consume_review_for_entry(attempt.clone())),
+            Err(ReviewOwnerError::Rejected(Reason::AlreadyDecided)),
+            "the review is still in use: a second spend refuses"
+        );
+        assert!(!observer.used(), "Used waits for the work");
+
+        drop(blocked);
+        assert_eq!(
+            step_answer(&h.approvals, &attempt),
+            Err(ReviewOwnerError::Rejected(Reason::NotFound)),
+            "the last step's finish released the attempt"
+        );
+        assert!(!observer.used(), "the effect's custody is still held");
+        drop(custody);
+        assert_eq!(
+            observer
+                .statuses()
+                .iter()
+                .filter(|(status, _)| *status == ReviewAttemptStatus::Used)
+                .count(),
+            1,
+            "Used once, after the work"
+        );
+    }
+
+    /// The dispatch end's hand-back, queued behind a held owner and not yet
+    /// settled when the owner frees (seeded under a raw guard, as a reader's
+    /// race leaves it), is settled into the owner by the next step's own
+    /// reservation before the admission: the generated owner alone decides,
+    /// and no step is admitted after the dispatch ended.
+    #[tokio::test]
+    async fn a_queued_dispatch_end_is_settled_before_a_step_is_admitted() {
+        use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason as Reason;
+        let h = harness();
+        let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let entry = admit(&review, &h.check, &h.work)
+            .await
+            .expect("allowed and retained");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let custody = entry.consume_held(&h.check).expect("spend");
+        let steps = entered_steps(&entry);
+        {
+            let state = h.approvals.state.write();
+            guard.complete();
+            assert_eq!(
+                h.approvals.queued_disposals.lock().len(),
+                1,
+                "the hand-back is queued behind the held owner"
+            );
+            drop(state);
+        }
+        assert_eq!(
+            h.approvals.queued_disposals.lock().len(),
+            1,
+            "nothing settled it yet"
+        );
+        assert_eq!(
+            steps.admit(h.check.binding(), &h.work).err(),
+            Some(ReviewOwnerError::Rejected(Reason::NotFound)),
+            "the queued hand-back released the attempt first"
+        );
+        assert!(h.approvals.queued_disposals.lock().is_empty());
+        drop(custody);
+        assert!(observer.used());
+    }
+
+    /// While the owner is held a step is unavailable at once (never
+    /// admitted, never waiting); once the queued dispatch end settles, a
+    /// step is refused as ended.
+    #[tokio::test]
+    async fn a_step_after_a_queued_dispatch_end_is_never_admitted() {
+        use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason as Reason;
+        let h = harness();
+        let (review, _observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let entry = admit(&review, &h.check, &h.work)
+            .await
+            .expect("allowed and retained");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let _custody = entry.consume_held(&h.check).expect("spend");
+        let steps = entered_steps(&entry);
+        let holder = h.hold_reservation();
+        guard.complete();
+        assert_eq!(
+            steps.admit(h.check.binding(), &h.work).err(),
+            Some(ReviewOwnerError::Unavailable),
+            "a held owner admits nothing"
+        );
+        assert!(!holder.is_finished(), "refused while the owner was held");
+        h.release(holder);
+        assert_eq!(
+            steps.admit(h.check.binding(), &h.work).err(),
+            Some(ReviewOwnerError::Rejected(Reason::NotFound)),
+            "released by the queued hand-back: never admitted after the end"
+        );
+    }
+
+    /// A step's finish behind a held owner is queued, never lost: with the
+    /// dispatch's hand-back queued before or after it, the holder settles
+    /// both in order and the attempt is released exactly once, never before
+    /// its step finished.
+    #[tokio::test]
+    async fn a_finish_behind_a_held_owner_is_queued_and_releases_once() {
+        use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason as Reason;
+        for end_first in [false, true] {
+            let h = harness();
+            let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+            let entry = admit(&review, &h.check, &h.work)
+                .await
+                .expect("allowed and retained");
+            let guard = ReviewDispatchGuard::new(entry.clone());
+            let custody = entry.consume_held(&h.check).expect("spend");
+            let attempt = entered_attempt_id(&entry).expect("entered");
+            let steps = entered_steps(&entry);
+            let step = steps
+                .admit(h.check.binding(), &h.work)
+                .expect("a step while the dispatch is live");
+            let holder = h.hold_reservation();
+            if end_first {
+                guard.complete();
+                drop(step);
+            } else {
+                drop(step);
+                guard.complete();
+            }
+            assert_eq!(
+                h.approvals.queued_disposals.lock().len(),
+                2,
+                "both queued behind the held owner (end first: {end_first})"
+            );
+            h.release(holder);
+            assert!(h.approvals.queued_disposals.lock().is_empty());
+            assert_eq!(
+                step_answer(&h.approvals, &attempt),
+                Err(ReviewOwnerError::Rejected(Reason::NotFound)),
+                "released exactly once (end first: {end_first})"
+            );
+            drop(custody);
+            assert!(observer.used());
+        }
+    }
+
+    /// A step that unwinds still finishes: its guard's drop is the finish,
+    /// on every exit path, so the dispatch end then releases the attempt.
+    #[tokio::test]
+    async fn an_unwinding_step_still_finishes() {
+        use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason as Reason;
+        let h = harness();
+        let (review, _observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let entry = admit(&review, &h.check, &h.work)
+            .await
+            .expect("allowed and retained");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let _custody = entry.consume_held(&h.check).expect("spend");
+        let attempt = entered_attempt_id(&entry).expect("entered");
+        let steps = entered_steps(&entry);
+        let unwound = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _step = steps
+                .admit(h.check.binding(), &h.work)
+                .expect("a step while the dispatch is live");
+            std::panic::resume_unwind(Box::new("the step's work failed"));
+        }));
+        assert!(unwound.is_err());
+        guard.complete();
+        assert_eq!(
+            step_answer(&h.approvals, &attempt),
+            Err(ReviewOwnerError::Rejected(Reason::NotFound)),
+            "the unwound step finished, so the dispatch end released the attempt"
+        );
+    }
+
+    /// Reports a step settles with the owner (here a queued disposal's
+    /// observer report, settled by the step's own reservation) never run
+    /// inside the step or at its finish, which may hold a store's lock: they
+    /// run with `Used`, once the dispatch ended and the custody dropped.
+    #[tokio::test]
+    async fn reports_a_step_settles_run_only_after_the_effect() {
+        let h = harness();
+        let (review, observer) = h.review(Arc::new(ImmediateAllow), DEADLINE);
+        let entry = admit(&review, &h.check, &h.work)
+            .await
+            .expect("allowed and retained");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        let custody = entry.consume_held(&h.check).expect("spend");
+        let steps = entered_steps(&entry);
+        let unrelated = h
+            .approvals
+            .begin_review(h.check.binding(), &h.work)
+            .expect("unrelated attempt");
+        let (report_tx, report_rx) = mpsc::channel();
+        {
+            let state = h.approvals.state.write();
+            let (queued, reports) = h.approvals.dispose_review(
+                unrelated.id(),
+                Some(ReviewRetirementReason::Abandoned),
+                move || -> crate::approval::QueuedDisposalReport {
+                    Box::new(move |settled| {
+                        let _ = report_tx.send(settled);
+                    })
+                },
+            );
+            assert!(queued.is_none(), "queued behind the held owner");
+            reports.run();
+            drop(state);
+        }
+        let step = steps
+            .admit(h.check.binding(), &h.work)
+            .expect("a step while the dispatch is live");
+        assert!(
+            h.approvals.queued_disposals.lock().is_empty(),
+            "the step's reservation settled the queue"
+        );
+        assert!(report_rx.try_recv().is_err(), "no report inside the step");
+        drop(step);
+        assert!(report_rx.try_recv().is_err(), "nor at its finish");
+        guard.complete();
+        assert!(report_rx.try_recv().is_err(), "the custody is still held");
+        drop(custody);
+        assert_eq!(
+            report_rx.recv_timeout(BOUND).expect("after the effect"),
+            Ok(ReviewAttemptStatus::Retired)
+        );
+        assert!(observer.used());
+    }
+
     /// A disposal queued DURING a successful spend's own reservation is
     /// settled as that reservation is released, but its report (arbitrary
     /// observer code) runs only after the effect, with `Used`: never between

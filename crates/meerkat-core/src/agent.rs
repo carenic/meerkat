@@ -16,6 +16,8 @@ mod compaction_retention_tests;
 #[cfg(test)]
 mod durable_boundary_tests;
 mod entered_operation;
+#[cfg(test)]
+mod entered_operation_tests;
 mod extraction;
 mod hook_impl;
 #[cfg(all(test, feature = "workspace-tests"))]

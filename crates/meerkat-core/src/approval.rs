@@ -3022,6 +3022,176 @@ mod review_owner_tests {
             .expect("a free store commits");
     }
 
+    /// The generated owner keeps a spent attempt `Used` while its effect is
+    /// entered: later steps are admitted and finished without spending; the
+    /// dispatch end releases it with no step in flight, or closes it so that
+    /// no new step begins and the last admitted step's finish releases it;
+    /// an unspent, retired or consent-linked attempt enters nothing, and a
+    /// consent spend opens the same entered state.
+    #[test]
+    fn the_generated_owner_keeps_an_entered_attempt_until_its_last_step() {
+        use ApprovalLifecycleOutcome::{Rejected, ReviewStatus, Status};
+        use ApprovalLifecycleRejectionReason as Reason;
+        let mut owner = ApprovalLifecycleMachineAuthority::new();
+        let s = |value: &str| value.to_owned();
+        let used = || Ok(ReviewStatus(ReviewAttemptStatus::Used));
+
+        assert_eq!(
+            owner.begin_review(s("r1")),
+            Ok(ReviewStatus(ReviewAttemptStatus::Pending))
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r1")),
+            Ok(Rejected(Reason::ReviewNotSatisfied))
+        );
+        assert_eq!(
+            owner.record_review_verdict(s("r1"), ReviewVerdict::Allow),
+            Ok(ReviewStatus(ReviewAttemptStatus::Allowed))
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r1")),
+            Ok(Rejected(Reason::ReviewNotSatisfied)),
+            "an allowed but unspent review enters nothing"
+        );
+        assert_eq!(
+            owner.finish_entered_step(s("r1")),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "no step in flight to finish"
+        );
+        assert_eq!(owner.consume_review_for_entry(s("r1")), used());
+        assert_eq!(owner.admit_entered_step(s("r1")), used());
+        assert_eq!(
+            owner.admit_entered_step(s("r1")),
+            used(),
+            "two steps in flight, no second spend"
+        );
+        assert_eq!(
+            owner.consume_review_for_entry(s("r1")),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "a second spend is refused while entered"
+        );
+        assert_eq!(
+            owner.release_review(s("r1")),
+            used(),
+            "the dispatch ends with steps in flight: still Used, closing"
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r1")),
+            Ok(Rejected(Reason::Expired)),
+            "no step begins after the dispatch end"
+        );
+        assert_eq!(
+            owner.release_review(s("r1")),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "the dispatch hands its attempt back once"
+        );
+        assert_eq!(
+            owner.retire_review(s("r1"), ReviewRetirementReason::Abandoned),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "an entered attempt is never retired"
+        );
+        assert_eq!(
+            owner.finish_entered_step(s("r1")),
+            used(),
+            "one step finished, one still in flight"
+        );
+        assert_eq!(
+            owner.consume_review_for_entry(s("r1")),
+            Ok(Rejected(Reason::AlreadyDecided)),
+            "still registered while a step is in flight"
+        );
+        assert_eq!(
+            owner.finish_entered_step(s("r1")),
+            used(),
+            "the last finish releases the attempt"
+        );
+        for (input, answer) in [
+            (
+                owner.admit_entered_step(s("r1")),
+                Rejected(Reason::NotFound),
+            ),
+            (
+                owner.finish_entered_step(s("r1")),
+                Rejected(Reason::NotFound),
+            ),
+            (owner.release_review(s("r1")), Rejected(Reason::NotFound)),
+            (
+                owner.consume_review_for_entry(s("r1")),
+                Rejected(Reason::NotFound),
+            ),
+        ] {
+            assert_eq!(input, Ok(answer), "released: unknown to the owner");
+        }
+
+        // With no step in flight the dispatch end releases at once.
+        assert_eq!(
+            owner.begin_review(s("r2")),
+            Ok(ReviewStatus(ReviewAttemptStatus::Pending))
+        );
+        assert_eq!(
+            owner.record_review_verdict(s("r2"), ReviewVerdict::Allow),
+            Ok(ReviewStatus(ReviewAttemptStatus::Allowed))
+        );
+        assert_eq!(owner.consume_review_for_entry(s("r2")), used());
+        assert_eq!(owner.admit_entered_step(s("r2")), used());
+        assert_eq!(
+            owner.finish_entered_step(s("r2")),
+            used(),
+            "a step that ends while the dispatch is live"
+        );
+        assert_eq!(owner.release_review(s("r2")), used());
+        assert_eq!(
+            owner.admit_entered_step(s("r2")),
+            Ok(Rejected(Reason::NotFound))
+        );
+
+        // A retired attempt enters nothing.
+        assert_eq!(
+            owner.begin_review(s("r3")),
+            Ok(ReviewStatus(ReviewAttemptStatus::Pending))
+        );
+        assert_eq!(
+            owner.retire_review(s("r3"), ReviewRetirementReason::ContextChanged),
+            Ok(ReviewStatus(ReviewAttemptStatus::Retired))
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r3")),
+            Ok(Rejected(Reason::ReviewRetired))
+        );
+
+        // A consent-linked attempt enters nothing until its consent is spent,
+        // and the consent spend opens the same entered state.
+        assert_eq!(
+            owner.create_consent_approval(s("a1"), s("r4"), true, true, true),
+            Ok(Status(ApprovalLifecycleStatus::Pending))
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r4")),
+            Ok(Rejected(Reason::ConsentLinked))
+        );
+        assert_eq!(
+            owner.decide_consent(s("a1"), s("r4"), ApprovalLifecycleDecision::Approve, true),
+            Ok(Status(ApprovalLifecycleStatus::Approved))
+        );
+        assert_eq!(
+            owner.admit_entered_step(s("r4")),
+            Ok(Rejected(Reason::ConsentLinked)),
+            "approved but unspent consent enters nothing"
+        );
+        assert_eq!(owner.consume_consent_for_entry(s("a1"), s("r4")), used());
+        assert_eq!(owner.admit_entered_step(s("r4")), used());
+        assert_eq!(
+            owner.consume_consent_for_entry(s("a1"), s("r4")),
+            Ok(Rejected(Reason::AlreadyConsumed))
+        );
+        assert_eq!(owner.release_review(s("r4")), used());
+        assert_eq!(owner.finish_entered_step(s("r4")), used());
+        assert_eq!(
+            owner.admit_entered_step(s("r4")),
+            Ok(Rejected(Reason::NotFound))
+        );
+    }
+
     /// The generated owner holds the consent link and its one-use legality:
     /// only the linked pair moves, only on an authenticated decision; a
     /// generic input never decides the approval or spends its attempt; one
