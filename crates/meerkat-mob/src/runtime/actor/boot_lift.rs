@@ -303,9 +303,21 @@ impl MobActor {
             });
             self.verify_dormant_member_set(&dispatch.verify, Some(&dispatch.progress))
                 .await?;
+            // The pass reported its own reads. The lift still waits for the
+            // plan's wakes that are open: that wait is their host
+            // materialization again, as every watch reports it.
+            if !dispatch.verify.is_empty()
+                && let Some(first) = dispatch.open.keys().next()
+            {
+                dispatch.progress.awaiting_owed_members(
+                    &AgentIdentity::from(first.0.as_str()),
+                    dispatch.open.len(),
+                    super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+                );
+            }
         }
         #[cfg(not(feature = "runtime-adapter"))]
-        let _ = &dispatch.verify;
+        let _ = (&dispatch.verify, &dispatch.progress);
         let members = self
             .explicit_resume_boot_members(&dispatch.resume_attempt, planned, watching)
             .await?;
@@ -409,6 +421,16 @@ impl MobActor {
         if verify.is_empty() {
             return Ok(());
         }
+        // The pass's reads are units of work of the lift, its first read
+        // included: that read gets a budget of its own even when the lift
+        // was waiting on a host build (whose stage has none), so a read that
+        // never returns is answered as a stall instead of holding the lift
+        // for good.
+        if let Some(progress) = progress {
+            progress.stage_progress(
+                super::super::state::LifecycleProgressStage::MemberSessionMetadataProbe,
+            );
+        }
         let (targets, member_bound_sessions) = {
             let roster = self.roster.read().await;
             let state = self.dsl_authority.state();
@@ -444,6 +466,13 @@ impl MobActor {
             .session_service
             .list(meerkat_core::service::SessionQuery::default())
             .await?;
+        // The realm listing is a read of its own, as the rebuild path
+        // reports it.
+        if let Some(progress) = progress {
+            progress.stage_progress(
+                super::super::state::LifecycleProgressStage::MemberSessionMetadataProbe,
+            );
+        }
         let mut successor_index = None;
         let verdicts = super::super::boot_plan::verify_dormant_members(
             &super::super::boot_plan::VerifiedPassContext {

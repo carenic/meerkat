@@ -386,6 +386,66 @@ async fn a_lift_whose_plan_reads_a_slow_store_answers_without_a_stall() {
     );
 }
 
+/// A verified pass that runs in a later round of the lift's plan still
+/// bounds its first read. At restore concurrency 1 the host requires
+/// lazy-00, so the plan wakes it in its first round and reaches lazy-01,
+/// which it verifies, only once that wake closed, while the lift reported
+/// lazy-00's host build, a stage with no inactivity budget. The pass's reads
+/// are units of work with the budget (two seconds in this build): lazy-01's
+/// read, held for three seconds, is answered as a stall at
+/// `member_session_metadata_probe`, the lift goes on, and joining it again
+/// answers Ok once the read returned. Before, the pass's first read ran
+/// under the host build's stage, so a read that never returned held the lift
+/// for good.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_later_verified_pass_whose_first_read_hangs_is_answered_as_a_stall() {
+    let mob = CrashedMob::new("lazy-lift-later-verify", 2, false, true).await;
+    let required = worker(0);
+    let verified = worker(1);
+    let handle = mob
+        .resume(
+            mob.builder()
+                .with_member_restore_policy(MemberRestorePolicy::OnDemandVerified)
+                .with_resume_restore_concurrency(1)
+                .with_host_required_members([required.clone()]),
+        )
+        .await;
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+    // Each read of a member's resume authority now takes three seconds:
+    // longer than the budget.
+    mob.service.set_resume_authority_observe_delay_ms(3_000);
+
+    let first = tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the lift answers");
+    let joined = tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the joined lift answers");
+    mob.service.set_resume_authority_observe_delay_ms(0);
+
+    assert!(
+        matches!(
+            first,
+            Err(MobError::LifecycleOperationProgressStalled { ref stage, .. })
+                if *stage == "member_session_metadata_probe"
+        ),
+        "the held read of the later verified pass is answered as a stall: {first:?}"
+    );
+    assert!(
+        joined.is_ok(),
+        "the lift, joined again, succeeds once the read returned: {joined:?}"
+    );
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    assert_eq!(
+        phase_of(&handle, &required),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    assert_eq!(
+        phase_of(&handle, &verified),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+}
+
 /// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eager_policy_materializes_every_member() {

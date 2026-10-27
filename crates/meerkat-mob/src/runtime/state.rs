@@ -532,6 +532,7 @@ pub(super) enum LifecycleProgressStage {
     DurableResumeTransition,
     /// The lift's runtime obligation scan: two store-wide reads of the
     /// runtime store before its member plan.
+    #[cfg_attr(not(feature = "runtime-adapter"), allow(dead_code))]
     BootObligationScan,
     PostRebuildReadiness,
     ResumeTopologyReconciliation,
@@ -663,6 +664,7 @@ impl LifecycleProgressSignal {
     /// Progress of a unit of work that belongs to no member (`stage`): the
     /// caller's inactivity budget starts again, as after a member's
     /// progress.
+    #[cfg_attr(not(feature = "runtime-adapter"), allow(dead_code))]
     pub(super) fn stage_progress(&self, stage: LifecycleProgressStage) {
         let now = meerkat_core::time_compat::Instant::now();
         let mut elapsed = meerkat_core::time_compat::Duration::ZERO;
