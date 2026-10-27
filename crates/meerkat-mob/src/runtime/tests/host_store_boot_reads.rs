@@ -473,7 +473,7 @@ async fn restart_after_history(label: &str, settled: usize) -> RestartReads {
     host.inner.lapse_fence_leases();
     let mut scopes = BTreeMap::new();
     for kind in LISTED_KINDS {
-        scopes.insert(kind.to_string(), host.scope_count(kind).await);
+        scopes.insert(kind.as_str().to_string(), host.scope_count(kind).await);
     }
     let runtimes: BTreeSet<String> = sessions
         .iter()
@@ -570,7 +570,7 @@ async fn a_start_and_a_lift_read_no_dormant_members_rows_whatever_their_history(
             reads.start
         );
         for kind in LISTED_KINDS {
-            let scopes = reads.scopes[&kind.to_string()];
+            let scopes = reads.scopes[kind.as_str()];
             assert_eq!(
                 reads
                     .start
