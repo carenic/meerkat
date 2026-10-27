@@ -27,7 +27,8 @@
 #   Stopped, a host-pending seed, and the mob's destroy;
 # - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
 # - resume (AuditResumeSpec): one identity through an explicit resume;
-# - edge (AuditEdgeSpec): two identities and one wiring edge (I8);
+# - edge (AuditEdgeSpec): two identities and one wiring edge (I8) and its
+#   trust realization outcomes (an owed edge repair);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
 #   through the dormant seat, the embodied spawn commit, the release and the
 #   rotation;
@@ -257,6 +258,9 @@ edge_covered_actions=(
   RecoverRosterWiringRunning
   WireMembersRunning
   ObserveMemberRetirementArchivedLivePreservingTopology
+  ResolveWiringEdgeRealizationRealizedRunning
+  ResolveWiringEdgeRealizationOwedRunning
+  ResolveWiringEdgeRealizationStaleRunning
 )
 
 seat_covered_actions=(
@@ -570,7 +574,7 @@ for witness in \
   "retire:Action property:RotatedStopped" \
   "resume:Action property:ResumeJoins" "resume:Action property:ResumeReservesLive" \
   "resume:Action property:ResumeFinishedLive" \
-  "edge:Invariant:HeldEdge" \
+  "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
   "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
   "wake2:Action property:CrossNotice" "wake2:Action property:RetireBesideWaking"; do
@@ -819,6 +823,11 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate edge archive_keeps_edges \
     "Error: Invariant wiring_edges_connect_seated_members is violated" \
     'keep_var("ObserveMemberRetirementArchivedLive", "wiring_edges")' "$@"
+  # A preserved-topology archive that keeps the archived end's owed edge
+  # repair: the repair then names an unseated member.
+  mutate edge preserved_archive_keeps_repair \
+    "Error: Invariant owed_edge_repairs_join_seated_members is violated" \
+    'keep_var("ObserveMemberRetirementArchivedLivePreservingTopology", "owed_edge_repairs")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \
@@ -876,11 +885,13 @@ for fold in folds:
     "Error: Action property AuditBindingRefusalFenced is violated" \
     'drop_guard("ResolveRuntimeBindingRefusalRunning", "member_wake_attempts")
 add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (agent_identity \\in DOMAIN member_wake_attempts) THEN Some(member_wake_attempts[agent_identity]) ELSE None) = attempt))")' "$@"
-  # The release verdict drifts from the Released arm: it answers Release for
-  # a Live member whose registration release would be Stale.
+  # The release verdict drifts from the Released arm on the registration
+  # facts: it answers Release for a Live, unpinned member whose registration
+  # release would be Stale. It keeps the pin, so the release ASSUMEs (which
+  # TLC evaluates before any invariant) still hold and the property refuses it.
   mutate wake release_verdict_ignores_registration \
     "Error: Invariant AuditReleaseVerdictMatchesArm is violated" \
-    'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "TRUE")' "$@"
+    'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "((releasable = TRUE) \\/ (wired_to_placed = FALSE))")' "$@"
   # The release predicate without its placed-peer pin: a member wired to a
   # placed member is released (no run places a member; the ASSUME over the
   # helper's whole domain refuses it).

@@ -10830,6 +10830,131 @@ mod tests {
         );
     }
 
+    /// An edge whose trust realization failed is owed a repair while its
+    /// members stay as they are. A later realization of the edge clears it,
+    /// and so do unwiring the edge and an end's retirement. An unrealized
+    /// outcome for an edge that is not repairable (not wired, or an end
+    /// retiring) is a no-op.
+    #[test]
+    fn an_unrealized_edge_owes_a_repair_until_realized_unwired_or_retired() {
+        let (mut authority, dormant) = dormant_member_authority("repair-dormant");
+        let live = seat_live_member_with_endpoint(&mut authority, "repair-live", 52);
+        let edge = WiringEdge::new(dormant.identity.clone(), live.identity.clone());
+        let outcome = |authority: &mut MobMachineAuthority, realized: bool| {
+            authority
+                .apply_signal(MobMachineSignal::ResolveWiringEdgeRealization {
+                    edge: edge.clone(),
+                    realized,
+                })
+                .expect("an edge realization outcome is answered")
+        };
+        let records = |transition: &MobMachineTransition| {
+            transition
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, MobMachineEffect::OwedEdgeRepairsRecorded))
+        };
+        let wire = |authority: &mut MobMachineAuthority| {
+            MobMachineMutator::apply(
+                authority,
+                MobMachineInput::WireMembers { edge: edge.clone() },
+            )
+            .expect("wire accepted");
+        };
+
+        assert!(
+            !records(&outcome(&mut authority, false)),
+            "an unwired edge owes no repair"
+        );
+        wire(&mut authority);
+        assert!(records(&outcome(&mut authority, false)));
+        assert!(authority.state().owed_edge_repairs.contains(&edge));
+        outcome(&mut authority, true);
+        assert!(
+            !authority.state().owed_edge_repairs.contains(&edge),
+            "a realization of the edge clears its repair"
+        );
+
+        outcome(&mut authority, false);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::UnwireMembers { edge: edge.clone() },
+        )
+        .expect("unwire accepted");
+        assert!(
+            !authority.state().owed_edge_repairs.contains(&edge),
+            "unwiring the edge clears its repair"
+        );
+
+        wire(&mut authority);
+        outcome(&mut authority, false);
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&dormant, Some(dormant.session_id.clone())),
+        )
+        .expect("the Dormant end's retirement is admitted");
+        assert!(
+            !records(&outcome(&mut authority, false)),
+            "a retiring end is owed no new repair"
+        );
+        close_ingress_detach(&mut authority, &dormant);
+        authority
+            .apply_signal(archived_signal(&dormant))
+            .expect("the archive terminates the retirement");
+        assert!(
+            authority.state().owed_edge_repairs.is_empty(),
+            "the retired end's repairs go with it"
+        );
+    }
+
+    /// The same for an external peer edge of a local member: owed while
+    /// unrealized, cleared by a realization and by unwiring the edge.
+    #[test]
+    fn an_unrealized_external_edge_owes_a_repair_until_realized_or_unwired() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "external-repair", 53);
+        let edge = external_peer_edge_for_test("external-repair", "repair-peer");
+        let key = ExternalPeerKey::new(member.identity.clone(), edge.endpoint.name.clone());
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::WireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+        )
+        .expect("the external edge is wired");
+        let outcome = |authority: &mut MobMachineAuthority, realized: bool| {
+            authority
+                .apply_signal(MobMachineSignal::ResolveExternalEdgeRealization {
+                    edge: edge.clone(),
+                    realized,
+                })
+                .expect("an external edge realization outcome is answered")
+        };
+        let owed = outcome(&mut authority, false);
+        assert!(
+            owed.effects()
+                .iter()
+                .any(|effect| matches!(effect, MobMachineEffect::OwedEdgeRepairsRecorded))
+        );
+        assert!(authority.state().owed_external_edge_repairs.contains(&edge));
+        outcome(&mut authority, true);
+        assert!(authority.state().owed_external_edge_repairs.is_empty());
+        outcome(&mut authority, false);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::UnwireExternalPeer {
+                key,
+                edge: edge.clone(),
+            },
+        )
+        .expect("the external edge is unwired");
+        assert!(
+            authority.state().owed_external_edge_repairs.is_empty(),
+            "unwiring the external edge clears its repair"
+        );
+    }
+
     /// The routed binding refusal is fenced by the wake its request belongs
     /// to: a late refusal of an earlier attempt's request, or a spawn-era one
     /// (no attempt) while a wake is open, is a typed stale no-op that never

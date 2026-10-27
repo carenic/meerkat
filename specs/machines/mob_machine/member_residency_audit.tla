@@ -39,9 +39,10 @@
 \*     (exact and replaced session), readiness, topology and finish, with the
 \*     wake arms and resolutions it meets and a session replacement.
 \*   edge (AuditEdgeSpec): two identities and one wiring edge (I8): both
-\*     recovered, bound and given endpoints, the edge recovered or wired, the
-\*     seal, one member retired and archived with and without its respawn
-\*     topology preserved, and its next incarnation recovered.
+\*     recovered, bound and given endpoints, the edge recovered or wired, its
+\*     trust realization outcomes (realized, owed repair, no-op), the seal,
+\*     one member retired and archived with and without its respawn topology
+\*     preserved, and its next incarnation recovered.
 \*   seat (AuditSeatSpec): two identities from the spawn ladder's Opened
 \*     phase: the dormant seat with an endpoint, with another member's peer id
 \*     (R5) or with none (EndpointPending), the embodied spawn commit, the
@@ -609,6 +610,13 @@ EEndpoint ==
     \/ RecoverMemberPeerEndpointFreshRunning(Id2, Rid2, Sess2, E2Inproc)
 EWire == RecoverRosterWiringRunning(AuditEdge) \/ WireMembersRunning(AuditEdge)
 EDetach == SessionIngressDetachedForMobDestroyRunning(AuditMob, Rid1)
+\* The edge's trust realization outcome (a wake's topology step or a
+\* repair): realized, owed, or a no-op for an edge that is not repairable.
+ERealize ==
+    \E realized \in BOOLEAN :
+        \/ ResolveWiringEdgeRealizationRealizedRunning(AuditEdge, realized)
+        \/ ResolveWiringEdgeRealizationOwedRunning(AuditEdge, realized)
+        \/ ResolveWiringEdgeRealizationStaleRunning(AuditEdge, realized)
 \* The recovered members are Dormant, so their retirement is archive-only.
 ERetire ==
     \/ RetireRunningReleasingArchiveOnly(AuditMob, Rid1, Id1, 0, Some(Sess1), Some(Sess1))
@@ -624,6 +632,7 @@ AuditEdgeNext ==
     \/ EBind
     \/ EEndpoint
     \/ EWire
+    \/ ERealize
     \/ SealBootMaterializationPlan
     \/ AuditPlan(Id1)
     \/ AuditPlan(Id2)
@@ -1091,6 +1100,8 @@ AuditWitnessResumeFinishedLiveStep ==
     /\ FinishExplicitResumeRunning(AuditResumeAttempt)
     /\ Phase1 = Some("Live")
 
+\* Edge run: the edge's trust repair is owed (an unrealized realization).
+AuditWitnessEdgeRepairOwed == AuditEdge \in owed_edge_repairs
 \* Edge run: after the seal an edge endpoint is unseated and held by the
 \* preserved respawn topology.
 AuditWitnessHeldEdge ==
@@ -1135,6 +1146,7 @@ NotAuditWitnessReleased == [][~AuditWitnessReleasedStep]_vars
 NotAuditWitnessStopCloses == [][~AuditWitnessStopClosesStep]_vars
 NotAuditWitnessStaleInStopped == ~AuditWitnessStaleInStopped
 NotAuditWitnessDrift == ~AuditWitnessDrift
+NotAuditWitnessEdgeRepairOwed == ~AuditWitnessEdgeRepairOwed
 NotAuditWitnessBrokenWake == ~AuditWitnessBrokenWake
 NotAuditWitnessCommsLessWokeLive == [][~AuditWitnessCommsLessWokeLiveStep]_vars
 NotAuditWitnessRetireCloses == [][~AuditWitnessRetireClosesStep]_vars

@@ -530,6 +530,25 @@ const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
             "UnprovenLateNotAdmittedFromDispatching",
         ],
     ),
+    // The member residency twins (archive-only retirements, a Dormant
+    // member's external wiring) sit beside their siblings in the catalog.
+    // Every MobMachine arm added after them is appended here too: an
+    // unlisted arm would be emitted ahead of this tail and move it.
+    (
+        "MobMachine",
+        &[
+            "RetireMemberArchiveOnly",
+            "AdmitDestroyMemberRetireArchiveOnlyRunning",
+            "AdmitDestroyMemberRetireArchiveOnlyStopped",
+            "WireExternalPeerDormantRunning",
+            "WireExternalPeerAlreadyWiredDormant",
+            "UnwireExternalPeerDormantRunning",
+            "RetireRunningReleasingArchiveOnly",
+            "RetireRunningPreservingBindingArchiveOnly",
+            "RetireStoppedReleasingArchiveOnly",
+            "RetireStoppedPreservingBindingArchiveOnly",
+        ],
+    ),
 ];
 
 #[cfg(not(test))]
