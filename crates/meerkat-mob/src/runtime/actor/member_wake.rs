@@ -1917,6 +1917,14 @@ impl MobActor {
     /// registration is the wake's. So is one whose registration's binding
     /// has not reached MobMachine yet, and one with work in flight; nothing
     /// is closed or interrupted.
+    ///
+    /// On a session service that keeps no durable sessions, a member's
+    /// session exists only while the member is materialized: closing its
+    /// registration would discard the session the release keeps, and its
+    /// next wake could only start a new one. Such a member stays
+    /// materialized (MobMachine keeps it Live, which it is): the release is
+    /// refused retryably while it has work in flight, as any release is,
+    /// and otherwise answers with nothing closed.
     pub(in crate::runtime) async fn handle_release_member(
         &mut self,
         identity: AgentIdentity,
@@ -1930,9 +1938,18 @@ impl MobActor {
                 let _ = reply_tx.send(Ok(()));
             }
             #[cfg(feature = "runtime-adapter")]
-            Ok(Some((adapter, session_id))) => {
+            Ok(Some(target)) => {
                 self.actor_io_tasks.spawn(async move {
-                    let result = release_member_registration(adapter, session_id, &identity).await;
+                    let result = match target {
+                        MemberReleaseTarget::Close {
+                            adapter,
+                            session_id,
+                        } => release_member_registration(adapter, session_id, &identity).await,
+                        MemberReleaseTarget::KeepMaterialized {
+                            adapter,
+                            session_id,
+                        } => keep_member_materialized(adapter, session_id, &identity).await,
+                    };
                     let _ = reply_tx.send(result);
                 });
             }
@@ -1943,7 +1960,9 @@ impl MobActor {
 
     /// The release, as MobMachine classifies it (`ClassifyMemberRelease`),
     /// realized on the actor: the member's local session and its runtime
-    /// owner when it releases, `None` when nothing is materialized.
+    /// owner when it releases, `None` when nothing is materialized. On a
+    /// session service that keeps no durable sessions the target keeps the
+    /// member materialized (see `handle_release_member`).
     async fn prepare_member_release(
         &mut self,
         identity: &AgentIdentity,
@@ -2018,7 +2037,20 @@ impl MobActor {
                         mode: entry.runtime_mode,
                         reason: "release requires a runtime-backed member".to_string(),
                     })?;
-            Ok(Some((adapter, session_id)))
+            // The session outlives the materialization only on a service
+            // that keeps sessions: elsewhere the closed registration would
+            // take the session with it, so nothing is closed.
+            if self.session_service.supports_persistent_sessions() {
+                Ok(Some(MemberReleaseTarget::Close {
+                    adapter,
+                    session_id,
+                }))
+            } else {
+                Ok(Some(MemberReleaseTarget::KeepMaterialized {
+                    adapter,
+                    session_id,
+                }))
+            }
         }
         #[cfg(not(feature = "runtime-adapter"))]
         {
@@ -2212,12 +2244,45 @@ pub(in crate::runtime) enum PeerNoticeRealization {
     Suppressed,
 }
 
-/// The runtime owner and session a release closes.
+/// What a release MobMachine permits does with the member's registration.
 #[cfg(feature = "runtime-adapter")]
-type MemberReleaseTarget = (Arc<meerkat_runtime::MeerkatMachine>, SessionId);
+enum MemberReleaseTarget {
+    /// Close the registration while the member is quiescent: the session
+    /// service keeps the session, and the member's next delivery wakes it on
+    /// that session.
+    Close {
+        adapter: Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: SessionId,
+    },
+    /// Close nothing: the session service keeps no durable sessions, so the
+    /// member's session exists only while it is materialized, and the member
+    /// stays materialized.
+    KeepMaterialized {
+        adapter: Arc<meerkat_runtime::MeerkatMachine>,
+        session_id: SessionId,
+    },
+}
 /// Without the runtime adapter nothing is released.
 #[cfg(not(feature = "runtime-adapter"))]
 type MemberReleaseTarget = std::convert::Infallible;
+
+/// Answer a release that keeps the member materialized as a release
+/// answers: refused retryably while the session holds accepted work that
+/// has not reached a terminal (queued, held at its start, or running), done
+/// otherwise. Nothing is closed, so a read of that work is enough.
+#[cfg(feature = "runtime-adapter")]
+async fn keep_member_materialized(
+    adapter: Arc<meerkat_runtime::MeerkatMachine>,
+    session_id: SessionId,
+    identity: &AgentIdentity,
+) -> Result<(), MobError> {
+    if adapter.session_has_active_inputs(&session_id).await {
+        return Err(MobError::LifecycleOperationPending {
+            intent: format!("release of member '{identity}': its session has work in flight"),
+        });
+    }
+    Ok(())
+}
 
 /// Close the member's current registration while it is quiescent. The
 /// runtime's unregister saga emits the release that reaches MobMachine.

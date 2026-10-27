@@ -165,7 +165,11 @@ them.
 - `meerkat-mob`: `MobHandle::release_member(identity)` makes a member dormant:
   it releases the member's materialization in its process while the member is
   quiescent, and keeps it seated at the same session, generation and fence;
-  its next delivery wakes it. A member being woken, one whose runtime binding
+  its next delivery wakes it. On a session service that keeps no durable
+  sessions (an in-memory one), a member's session exists only while the
+  member is materialized, so the member stays materialized and the release
+  closes nothing; a host that releases idle members to free memory frees
+  nothing there. A member being woken, one whose runtime binding
   has not landed yet (right after a spawn), or one with work in flight is
   refused retryably (`MobError::LifecycleOperationPending`). A member wired
   to a placed member stays live while that wiring exists

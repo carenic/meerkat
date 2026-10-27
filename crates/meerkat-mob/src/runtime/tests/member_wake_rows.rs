@@ -2224,3 +2224,272 @@ async fn a_member_waking_among_dormant_neighbours_owes_no_edge_repairs() {
     }
     fixture.finish().await;
 }
+
+/// A mob over an in-memory session service (one that keeps no durable
+/// sessions), with a real factory and real in-process comms: a member's
+/// session exists only while the member is materialized.
+struct InMemoryWakeFixture {
+    _root: tempfile::TempDir,
+    handle: MobHandle,
+    client: ScriptedClient,
+}
+
+impl InMemoryWakeFixture {
+    async fn new(label: &str) -> Self {
+        let root = tempfile::Builder::new()
+            .prefix("meerkat-member-wake-in-memory-")
+            .tempdir()
+            .expect("fixture storage in the system temp dir");
+        let root_path = root.path().canonicalize().expect("absolute fixture root");
+        for directory in ["config", "runtime", "project", "context"] {
+            std::fs::create_dir_all(root_path.join(directory)).expect("fixture root");
+        }
+        let factory = meerkat::AgentFactory::new(root_path.join("factory-store"))
+            .user_config_root(root_path.join("config"))
+            .runtime_root(root_path.join("runtime"))
+            .project_root(root_path.join("project"))
+            .context_root(root_path.join("context"))
+            .builtins(false)
+            .comms(true);
+        let mut config = meerkat::Config::default();
+        config.agent.model = "gpt-5.5".to_string();
+        config.compaction.auto_compact_threshold = 1_000_000;
+        let client = ScriptedClient::new();
+        let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
+        builder.default_llm_client = Some(Arc::new(client.clone()));
+        let service = Arc::new(meerkat_session::EphemeralSessionService::new(builder, 16));
+        let handle = MobBuilder::new(wake_rows_definition(label), MobStorage::in_memory())
+            .with_session_service(service)
+            .allow_ephemeral_sessions(true)
+            .with_default_llm_client(Arc::new(client.clone()))
+            .create()
+            .await
+            .expect("create the mob");
+        Self {
+            _root: root,
+            handle,
+            client,
+        }
+    }
+
+    /// Spawn one turn-driven worker and wait until it is Live and its
+    /// registration's binding landed, so it can be released.
+    async fn spawn(&self, label: &str) -> AgentIdentity {
+        let identity = AgentIdentity::from(format!("{label}-{}", Uuid::new_v4().simple()));
+        tokio::time::timeout(
+            WAIT,
+            self.handle
+                .spawn_spec(SpawnMemberSpec::new("worker", identity.clone())),
+        )
+        .await
+        .expect("the spawn answers")
+        .expect("spawn the worker");
+        let key = mob_dsl::AgentIdentity::from_domain(&identity);
+        let mut state = self.handle.machine_state_watch_rx.clone();
+        let ready = tokio::time::timeout(
+            WAIT,
+            state.wait_for(|state| {
+                state.member_materialization.get(&key).copied()
+                    == Some(mob_dsl::MemberMaterializationPhase::Live)
+                    && state
+                        .member_materialization_epoch
+                        .get(&key)
+                        .is_some_and(Option::is_some)
+            }),
+        )
+        .await;
+        assert!(
+            matches!(ready, Ok(Ok(_))),
+            "member {identity} never became Live with its binding landed"
+        );
+        identity
+    }
+
+    fn residency(&self, identity: &AgentIdentity) -> Option<mob_dsl::MemberMaterializationPhase> {
+        self.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&mob_dsl::AgentIdentity::from_domain(identity))
+            .copied()
+    }
+
+    /// The member's durable endpoint and its restore failure, if any.
+    fn endpoint_and_failure(
+        &self,
+        identity: &AgentIdentity,
+    ) -> (Option<mob_dsl::MemberPeerEndpoint>, Option<String>) {
+        let key = mob_dsl::AgentIdentity::from_domain(identity);
+        let state = self.handle.machine_state_watch_rx.borrow();
+        (
+            state.member_peer_endpoints.get(&key).cloned(),
+            state.member_restore_failures.get(&key).cloned(),
+        )
+    }
+
+    async fn session(&self, identity: &AgentIdentity) -> SessionId {
+        self.handle
+            .resolve_bridge_session_id(identity)
+            .await
+            .expect("a session-bound member")
+    }
+
+    async fn entry(&self, identity: &AgentIdentity) -> RosterEntry {
+        self.handle
+            .get_member(identity)
+            .await
+            .expect("roster read")
+            .expect("a seated member")
+    }
+
+    /// Admit one host turn on `identity` without waiting for it.
+    async fn start_turn(&self, identity: &AgentIdentity, text: &str) -> WorkTurnHandle {
+        let entry = self.entry(identity).await;
+        tokio::time::timeout(
+            WAIT,
+            self.handle.start_work_with_mode(
+                entry.agent_runtime_id,
+                entry.fence_token,
+                WorkRef::new(),
+                WorkSpec::new(text, WorkOrigin::Internal),
+                HandlingMode::Queue,
+            ),
+        )
+        .await
+        .expect("the delivery is admitted in time")
+        .expect("the delivery is admitted")
+    }
+
+    async fn ensure_live(&self, identity: &AgentIdentity) -> Result<(), MobError> {
+        tokio::time::timeout(WAIT, self.handle.ensure_member_live(identity))
+            .await
+            .expect("the wake answers")
+    }
+
+    async fn host_turn(&self, identity: &AgentIdentity, text: &str) {
+        let turn = self.start_turn(identity, text).await;
+        tokio::time::timeout(WAIT, turn.wait())
+            .await
+            .expect("the turn finishes")
+            .expect("the turn succeeds");
+    }
+
+    /// Release `identity` once it is quiescent: a release refused retryably
+    /// because its last turn's input has not reached its terminal yet is
+    /// asked again.
+    async fn release_when_quiescent(&self, identity: &AgentIdentity) {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            match tokio::time::timeout(WAIT, self.handle.release_member(identity))
+                .await
+                .expect("the release answers")
+            {
+                Ok(()) => return,
+                Err(MobError::LifecycleOperationPending { .. })
+                    if tokio::time::Instant::now() < deadline =>
+                {
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+                Err(error) => panic!("release the quiescent member: {error:?}"),
+            }
+        }
+    }
+
+    async fn finish(self) {
+        self.client.release();
+        let _ = tokio::time::timeout(WAIT, self.handle.shutdown()).await;
+    }
+}
+
+/// On a session service that keeps no durable sessions, a member's session
+/// exists only while the member is materialized. A release keeps such a
+/// member materialized: it is refused retryably while the member has work in
+/// flight, as any release is, and otherwise answers with nothing released.
+/// The member's next delivery finds it live on the same session, at the same
+/// incarnation and endpoint, and its turns continue that session's
+/// transcript. Releasing it would have discarded the session, and its next
+/// wake could only build a new session whose comms identity its durable
+/// endpoint refuses: the member would read Broken.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_without_durable_sessions_keeps_the_member_live_on_its_session() {
+    let fixture = InMemoryWakeFixture::new("wake-in-memory-release").await;
+    let member = fixture.spawn("in-memory-release").await;
+    let before = fixture.entry(&member).await;
+    let session = fixture.session(&member).await;
+    let (endpoint, failure) = fixture.endpoint_and_failure(&member);
+    assert!(
+        endpoint.is_some(),
+        "a spawned member has a durable endpoint"
+    );
+    assert_eq!(failure, None);
+    let first = token("in-memory-first");
+    fixture.host_turn(&member, &first).await;
+
+    // Work in flight: refused retryably, nothing changes.
+    fixture.client.block();
+    let started_before = fixture.client.started_count();
+    let busy = fixture.start_turn(&member, &token("in-memory-busy")).await;
+    fixture.client.wait_started(started_before + 1).await;
+    let refused = tokio::time::timeout(WAIT, fixture.handle.release_member(&member))
+        .await
+        .expect("the release answers");
+    assert!(
+        matches!(refused, Err(MobError::LifecycleOperationPending { .. })),
+        "a release with work in flight is refused retryably: {refused:?}"
+    );
+    fixture.client.release();
+    tokio::time::timeout(WAIT, busy.wait())
+        .await
+        .expect("the turn finishes")
+        .expect("the turn succeeds");
+
+    // Quiescent: answered, and nothing is released.
+    fixture.release_when_quiescent(&member).await;
+    let woken = fixture.ensure_live(&member).await;
+    let (endpoint_after, failure_after) = fixture.endpoint_and_failure(&member);
+    assert!(
+        woken.is_ok() && failure_after.is_none(),
+        "the released member's next delivery finds it on its session, not Broken: \
+         {woken:?}, restore failure {failure_after:?}"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live),
+        "the member stays materialized"
+    );
+    assert_eq!(
+        fixture.session(&member).await,
+        session,
+        "no new session is minted"
+    );
+    let after = fixture.entry(&member).await;
+    assert_eq!(
+        (after.agent_runtime_id, after.generation, after.fence_token),
+        (
+            before.agent_runtime_id,
+            before.generation,
+            before.fence_token
+        ),
+        "the member keeps its incarnation"
+    );
+    assert_eq!(endpoint_after, endpoint, "the member keeps its endpoint");
+
+    // Its next turn continues the same session's transcript.
+    let second = token("in-memory-second");
+    fixture.host_turn(&member, &second).await;
+    let requests = fixture.client.requests.lock().expect("recorded requests");
+    let carrying_second = requests
+        .iter()
+        .map(|request| format!("{:?}", request.messages))
+        .filter(|messages| messages.contains(&second))
+        .collect::<Vec<_>>();
+    assert!(
+        !carrying_second.is_empty()
+            && carrying_second
+                .iter()
+                .all(|messages| messages.contains(&first)),
+        "the turn after the release runs on the session that holds the first turn"
+    );
+    drop(requests);
+    fixture.finish().await;
+}

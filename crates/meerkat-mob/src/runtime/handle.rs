@@ -19543,6 +19543,15 @@ impl MobHandle {
     /// placed member, and a member wired to a placed member (which reaches
     /// it only while it is live), is refused with
     /// [`MobError::UnsupportedForMode`].
+    ///
+    /// On a session service that keeps no durable sessions (an in-memory
+    /// one), a member's session exists only while the member is
+    /// materialized, so the member stays materialized: the release is
+    /// refused retryably while it has work in flight, as above, and
+    /// otherwise answers `Ok` with nothing released. Releasing it would
+    /// discard the session it keeps, and its next delivery could not wake
+    /// it on that session. A host that releases idle members to free memory
+    /// frees nothing on such a service.
     pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
         let agent_identity = identity.clone();
         self.send_actor_command(move |reply_tx| MobCommand::ReleaseMember {
