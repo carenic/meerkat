@@ -434,24 +434,42 @@ impl MobActor {
                 first_error.get_or_insert(error);
                 member.authorized = false;
             }
-            let outcome_rx = self.join_member_wake(&member.agent_identity, member.wake_attempt);
-            let command_tx = self.command_tx.clone();
-            self.actor_io_tasks.spawn(async move {
-                let joined = outcome_rx.await.is_ok_and(|outcome| outcome.is_ok());
-                let _ = command_tx
-                    .send(RoutedMobCommand::internal(
-                        MobCommand::ResumeLifecycleBootMemberSettled {
-                            member: Box::new(member),
-                            joined,
-                        },
-                    ))
-                    .await;
-            });
+            self.watch_explicit_resume_boot_member_wake(member);
         }
         match first_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+
+    /// Watch `member`'s wake attempt (`wake_attempt`) until it closes, then
+    /// hand the close to the actor (`ResumeLifecycleBootMemberSettled`).
+    ///
+    /// The lift waits for this wake, to settle the member or to free its slot
+    /// of the plan, and the member's materialization is the host's to finish
+    /// or fail: the wait is reported as the member's host materialization, so
+    /// no platform inactivity budget answers the lift as stalled while the
+    /// host builds (the rebuild path reports its members the same way).
+    fn watch_explicit_resume_boot_member_wake(&mut self, member: ExplicitResumeBootMember) {
+        if let Some(pending) = self.pending_resume_lifecycle.as_ref() {
+            pending.progress.awaiting_member(
+                &member.agent_identity,
+                super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
+        }
+        let outcome_rx = self.join_member_wake(&member.agent_identity, member.wake_attempt);
+        let command_tx = self.command_tx.clone();
+        self.actor_io_tasks.spawn(async move {
+            let joined = outcome_rx.await.is_ok_and(|outcome| outcome.is_ok());
+            let _ = command_tx
+                .send(RoutedMobCommand::internal(
+                    MobCommand::ResumeLifecycleBootMemberSettled {
+                        member: Box::new(member),
+                        joined,
+                    },
+                ))
+                .await;
+        });
     }
 
     /// One planned member's wake closed. The wake path resolved the member

@@ -296,6 +296,44 @@ async fn the_lift_joins_the_wakes_its_plan_opens_after_its_readiness() {
     );
 }
 
+/// A lift whose planned member takes longer to build than the lift's
+/// inactivity budget (two seconds in this build) waits for the build and
+/// answers Ok with the member Live. The lift reports its wait for a joined
+/// wake as the member's host materialization, which no platform budget
+/// ends. Before, it reported nothing between the durable Resume and the
+/// member's settle, so the caller was answered
+/// `LifecycleOperationProgressStalled` at `durable_resume_transition` while
+/// the member still went Live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lift_waits_for_a_slow_planned_build_without_a_stall() {
+    let mob = CrashedMob::new("lazy-lift-slow-build", 2, false, true).await;
+    let required = worker(0);
+    let handle = mob
+        .resume(mob.builder().with_host_required_members([required.clone()]))
+        .await;
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+    // Each session build now outlasts the lift's inactivity budget.
+    mob.service.set_create_session_delay_ms(3_000);
+
+    let lifted = tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the lift answers");
+    assert!(
+        lifted.is_ok(),
+        "the lift waits for the slow build and succeeds: {lifted:?}"
+    );
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    assert_eq!(
+        phase_of(&handle, &required),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    assert_eq!(
+        phase_of(&handle, &worker(1)),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+    assert_eq!(mob.materialized().await, vec![mob.session(0)]);
+}
+
 /// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eager_policy_materializes_every_member() {
