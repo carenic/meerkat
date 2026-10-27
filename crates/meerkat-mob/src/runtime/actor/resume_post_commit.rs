@@ -15,12 +15,11 @@ impl MobActor {
             return;
         };
         // The topology reconciliation settled: MobMachine's topology fence
-        // comes down here, before the post-commit work, not after it. That
-        // work mutates no graph, and it can wait on member runs (an operation
-        // binding, the orchestrator's resume notification turn). A run can in
-        // turn wait on graph work the fence defers (a spawn, wire or retire
-        // tool call), so a fence held across the post-commit work let the
-        // resume and such a run wait on each other forever.
+        // comes down here, before the post-commit work, not after it. The
+        // resume's own post-commit steps mutate no graph. A member run can
+        // wait on graph work the fence defers (a spawn, wire or retire tool
+        // call), so a fence held across post-commit work that waits on such
+        // a run let the resume and the run wait on each other forever.
         if let Err(error) = self.apply_explicit_resume_input(
             |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeTopology { attempt },
             "settle_explicit_resume_topology",
@@ -309,7 +308,10 @@ impl MobActor {
                     ))),
                 };
                 match plan {
-                    Ok(Some(plan)) => {
+                    // A queued injection (a local AutonomousHost orchestrator)
+                    // completes without waiting on the orchestrator's turn: it
+                    // stays this resume's own post-commit work.
+                    Ok(Some(plan)) if plan.realizes_without_a_turn() => {
                         let service = Arc::clone(&self.session_service);
                         let provisioner = Arc::clone(&self.provisioner);
                         self.spawn_resume_post_commit_member(
@@ -322,6 +324,7 @@ impl MobActor {
                             }),
                         );
                     }
+                    Ok(Some(plan)) => self.hand_off_orchestrator_resume_notification_turn(plan),
                     Ok(None) => {}
                     Err(error) => self.retain_resume_post_commit_error(error),
                 }
@@ -333,6 +336,35 @@ impl MobActor {
         if self.resume_post_commit_member_tasks.is_empty() {
             self.finish_resume_post_commit_members();
         }
+    }
+
+    /// Hand a resume notification that runs the orchestrator's turn to the
+    /// actor's lifecycle owner, as the cold resume does
+    /// (`builder::realize_orchestrator_resume_notification_turn`). The
+    /// explicit resume never waits on that turn: the turn's model and tool
+    /// work can wait on this very resume (a mob tool that spawns, wires or
+    /// retires), and a long turn would hold the lift short of ready. A failed
+    /// notification is recorded as a mob event naming the orchestrator and its
+    /// session and surfaces like every other orchestrator lifecycle delivery;
+    /// it does not fail the resume. Nothing in the resume's completion reads
+    /// that turn: MobMachine bound the coordinator (`ResumeOrchestrator`)
+    /// before any notification is planned.
+    fn hand_off_orchestrator_resume_notification_turn(
+        &mut self,
+        plan: crate::runtime::builder::OrchestratorResumeNotification,
+    ) {
+        let emitter = crate::runtime::events::MobEventEmitter::new(
+            Arc::clone(&self.events),
+            self.definition.id.clone(),
+        );
+        self.lifecycle_tasks.spawn(
+            crate::runtime::builder::realize_orchestrator_resume_notification_turn(
+                plan,
+                Arc::clone(&self.session_service),
+                Arc::clone(&self.provisioner),
+                emitter,
+            ),
+        );
     }
 
     fn finish_resume_post_commit_members(&mut self) {
