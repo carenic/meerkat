@@ -69,16 +69,15 @@ if [[ "${1:-}" == "--mutants" ]]; then
   shift
 fi
 # Each run's distinct-state floor is 90% of the whole space its first green
-# run found, so a guard that silently disables arms fails the lane. The
-# counts below are provisional (1) until the first green run reports them.
-seed_states=1
-wake_states=1
-retire_states=1
-terminal_states=1
-resume_states=1
-edge_states=1
-seat_states=1
-wake2_states=1
+# run found, so a guard that silently disables arms fails the lane.
+seed_states=1659
+wake_states=939
+retire_states=4096
+terminal_states=238
+resume_states=3438
+edge_states=831
+seat_states=58102
+wake2_states=1425
 
 # Every arm each run must fire. TLC names an arm after the generated
 # operator, since every audit wrapper here is a plain application.
