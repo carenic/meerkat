@@ -8,6 +8,12 @@
 //! store's obligation scan
 //! ([`RuntimeStore::list_runtimes_with_recovery_work`](super::RuntimeStore::list_runtimes_with_recovery_work))
 //! asks it to choose the runtimes it lists, so the two cannot disagree.
+//!
+//! The work a runtime's ops lifecycle snapshot owes (an undelivered
+//! background operation completion, a running detached job wait:
+//! `PersistedOpsSnapshot::holds_recovery_work`) is part of the
+//! `nonterminal` fact, so the pinned facts carry it in the wire form every
+//! released reader decodes.
 
 use serde::{Deserialize, Serialize};
 
@@ -23,7 +29,9 @@ use super::{MachineLifecycleObservation, RuntimeSessionCatalogEntry};
 #[serde(deny_unknown_fields)]
 pub(crate) struct BootFactsV1 {
     pub(crate) v: u32,
-    /// The runtime has nonterminal inputs.
+    /// The runtime has nonterminal inputs, or work its ops lifecycle snapshot
+    /// owes (an undelivered background operation completion, a running
+    /// detached job wait).
     pub(crate) nonterminal: bool,
     /// The runtime has pending terminal owners.
     pub(crate) pending_owners: bool,
@@ -57,27 +65,35 @@ pub(crate) fn catalog_entry_is_archived(catalog: Option<&RuntimeSessionCatalogEn
         .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived)
 }
 
-/// Whether recovery must act on a runtime: it holds work recovery owns and
-/// it is not archived.
+/// Whether recovery must act on a runtime: it holds work recovery owns
+/// ([`runtime_holds_recovery_work`]) and it is not archived.
 ///
-/// The work: nonterminal inputs, pending terminal owners, a provisional tail
-/// (an open run cursor), a `lifecycle` record that names a current run or
-/// does not decode, or input rows with no lifecycle record. `facts` are the
-/// runtime's boot facts ([`BootFactsV1::default`] for a runtime that holds
-/// nothing), `lifecycle` its machine lifecycle record as stored, `catalog`
-/// its session catalog entry. A runtime whose catalog entry is archived
-/// holds no recovery work, whatever its other facts say.
+/// `facts` are the runtime's boot facts ([`BootFactsV1::default`] for a
+/// runtime that holds nothing), `lifecycle` its machine lifecycle record as
+/// stored, `catalog` its session catalog entry. A runtime whose catalog
+/// entry is archived holds no recovery work, whatever its other facts say.
+/// The SQLite scan asks the two halves itself, so that it decodes a catalog
+/// entry only for a runtime that holds work.
 pub(crate) fn runtime_has_recovery_obligation(
     facts: &BootFactsV1,
     lifecycle: Option<&[u8]>,
     catalog: Option<&RuntimeSessionCatalogEntry>,
 ) -> bool {
-    !catalog_entry_is_archived(catalog)
-        && (facts.nonterminal
-            || facts.pending_owners
-            || facts.tail
-            || lifecycle_has_current_run(lifecycle)
-            || (facts.inputs && lifecycle.is_none()))
+    !catalog_entry_is_archived(catalog) && runtime_holds_recovery_work(facts, lifecycle)
+}
+
+/// Whether a runtime holds work recovery owns, archived or not: nonterminal
+/// inputs or work its ops lifecycle snapshot owes, pending terminal owners,
+/// a provisional tail (an open run cursor), a `lifecycle` record that names
+/// a current run or does not decode, or input rows with no lifecycle record.
+/// The facts are read first: the lifecycle record is decoded only when they
+/// name no work.
+pub(crate) fn runtime_holds_recovery_work(facts: &BootFactsV1, lifecycle: Option<&[u8]>) -> bool {
+    facts.nonterminal
+        || facts.pending_owners
+        || facts.tail
+        || lifecycle_has_current_run(lifecycle)
+        || (facts.inputs && lifecycle.is_none())
 }
 
 /// A contract every [`super::RuntimeStore`] obligation scan meets, seeded
@@ -90,12 +106,18 @@ pub(crate) mod scan_contract {
     use std::sync::Arc;
 
     use meerkat_core::lifecycle::{InputId, RunId};
-    use meerkat_core::types::{Message, UserMessage};
+    use meerkat_core::ops_lifecycle::{
+        CompletionCursorConsumer, OperationId, OperationKind, OperationResult, OperationSource,
+        OperationSpec, OpsLifecycleRegistry,
+    };
+    use meerkat_core::types::{Message, SessionId, UserMessage};
+    use meerkat_core::{EpochCursorState, RuntimeEpochId};
 
     use crate::identifiers::LogicalRuntimeId;
     use crate::input_state::{
         InputLifecycleState, InputStatePersistenceRecord, InputTerminalOutcome, StoredInputState,
     };
+    use crate::ops_lifecycle::{PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry};
     use crate::runtime_state::RuntimeState;
     use crate::store::{
         MachineLifecycleBindingFacts, MachineLifecycleCommit, MachineLifecyclePreRunPhase,
@@ -107,8 +129,8 @@ pub(crate) mod scan_contract {
     pub(crate) struct ScanFixture {
         /// One runtime for each kind of recovery work.
         pub(crate) listed: HashSet<LogicalRuntimeId>,
-        /// An idle runtime and an archived one that holds a nonterminal
-        /// input.
+        /// An idle runtime, an archived one that holds a nonterminal input,
+        /// and one whose ops lifecycle snapshot's completion was delivered.
         pub(crate) unlisted: HashSet<LogicalRuntimeId>,
     }
 
@@ -158,6 +180,83 @@ pub(crate) mod scan_contract {
             SupervisorAuthoritySnapshot::UnboundNoReceipt,
             None,
         )
+    }
+
+    /// The ops lifecycle snapshot of `registry`, as its runtime persists it.
+    pub(crate) fn ops_snapshot(registry: &RuntimeOpsLifecycleRegistry) -> PersistedOpsSnapshot {
+        registry
+            .capture_persistence_snapshot(RuntimeEpochId::new(), &EpochCursorState::new())
+            .expect("the ops lifecycle snapshot")
+    }
+
+    /// An ops lifecycle snapshot holding one completed background tool
+    /// operation, its completion taken by `delivered_to` or by no consumer.
+    pub(crate) fn completed_background_operation(
+        delivered_to: Option<CompletionCursorConsumer>,
+    ) -> PersistedOpsSnapshot {
+        let registry = RuntimeOpsLifecycleRegistry::new();
+        let spec = OperationSpec {
+            id: OperationId::new(),
+            kind: OperationKind::BackgroundToolOp,
+            owner_session_id: SessionId::new(),
+            display_name: "scan background operation".into(),
+            source_label: "scan".into(),
+            operation_source: None,
+            child_session_id: None,
+            expect_peer_channel: false,
+        };
+        let operation_id = spec.id.clone();
+        registry.register_operation(spec).unwrap();
+        registry.provisioning_succeeded(&operation_id).unwrap();
+        registry
+            .complete_operation(
+                &operation_id,
+                OperationResult {
+                    id: operation_id.clone(),
+                    content: "done".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tokens_used: 0,
+                },
+            )
+            .unwrap();
+        if let Some(consumer) = delivered_to {
+            let completion = ops_snapshot(&registry)
+                .completion_entries
+                .iter()
+                .map(|entry| entry.seq)
+                .max()
+                .expect("the completion is in the feed");
+            registry
+                .advance_completion_cursor(consumer, completion, None)
+                .unwrap();
+        }
+        ops_snapshot(&registry)
+    }
+
+    /// An ops lifecycle snapshot holding one detached job wait: running when
+    /// `running`, still provisioning otherwise.
+    pub(crate) fn detached_job_wait(running: bool) -> PersistedOpsSnapshot {
+        let registry = RuntimeOpsLifecycleRegistry::new();
+        let owner_session_id = SessionId::new();
+        let operation_id =
+            OperationId::for_detached_job_wait(&owner_session_id, "scan-realm", "scan-job");
+        registry
+            .register_operation(OperationSpec {
+                id: operation_id.clone(),
+                kind: OperationKind::DetachedJobWait,
+                owner_session_id,
+                display_name: "await detached job".into(),
+                source_label: "await_job".into(),
+                operation_source: Some(OperationSource::detached_job("scan-realm", "scan-job")),
+                child_session_id: None,
+                expect_peer_channel: false,
+            })
+            .unwrap();
+        if running {
+            registry.provisioning_succeeded(&operation_id).unwrap();
+        }
+        ops_snapshot(&registry)
     }
 
     /// Commit `session` as its runtime's committed document.
@@ -283,6 +382,40 @@ pub(crate) mod scan_contract {
         commit_session(store, &archived_session).await;
         unlisted.insert(archived);
 
+        // An ops lifecycle snapshot holding a background operation
+        // completion its session was not woken for, and nothing else.
+        let undelivered = LogicalRuntimeId::new("scan-ops-undelivered-completion");
+        store
+            .persist_ops_lifecycle(&undelivered, &completed_background_operation(None))
+            .await
+            .unwrap();
+        listed.insert(undelivered);
+
+        // An ops lifecycle snapshot holding a running detached job wait, and
+        // nothing else.
+        let waiting = LogicalRuntimeId::new("scan-ops-running-detached-job-wait");
+        store
+            .persist_ops_lifecycle(&waiting, &detached_job_wait(true))
+            .await
+            .unwrap();
+        listed.insert(waiting);
+
+        // An ops lifecycle snapshot whose completion the runtime injected,
+        // beside a lifecycle with no run.
+        let delivered = LogicalRuntimeId::new("scan-ops-delivered-completion");
+        store
+            .commit_machine_lifecycle(&delivered, lifecycle(&delivered, None), &[])
+            .await
+            .unwrap();
+        store
+            .persist_ops_lifecycle(
+                &delivered,
+                &completed_background_operation(Some(CompletionCursorConsumer::RuntimeInjected)),
+            )
+            .await
+            .unwrap();
+        unlisted.insert(delivered);
+
         ScanFixture { listed, unlisted }
     }
 
@@ -364,6 +497,50 @@ mod tests {
             None,
         )
         .unwrap()
+    }
+
+    /// An ops lifecycle snapshot holds work while a completion has reached
+    /// no consumer or a detached job wait that recovery keeps is running.
+    #[test]
+    fn boot_obligation_scan_ops_snapshot_holds_work_until_its_completion_is_delivered() {
+        use meerkat_core::ops_lifecycle::CompletionCursorConsumer;
+
+        use super::scan_contract::{
+            completed_background_operation, detached_job_wait, ops_snapshot,
+        };
+        use crate::ops_lifecycle::RuntimeOpsLifecycleRegistry;
+
+        let rows = [
+            (
+                "no operation",
+                ops_snapshot(&RuntimeOpsLifecycleRegistry::new()),
+                false,
+            ),
+            (
+                "a background operation completion no consumer took",
+                completed_background_operation(None),
+                true,
+            ),
+            (
+                "a completion the runtime injected",
+                completed_background_operation(Some(CompletionCursorConsumer::RuntimeInjected)),
+                false,
+            ),
+            (
+                "a completion the agent applied",
+                completed_background_operation(Some(CompletionCursorConsumer::AgentApplied)),
+                false,
+            ),
+            ("a running detached job wait", detached_job_wait(true), true),
+            (
+                "a detached job wait still provisioning, which recovery discards",
+                detached_job_wait(false),
+                false,
+            ),
+        ];
+        for (name, snapshot, expected) in rows {
+            assert_eq!(snapshot.holds_recovery_work(), expected, "{name}");
+        }
     }
 
     /// Each kind of work, alone, makes an obligation; no work makes none;

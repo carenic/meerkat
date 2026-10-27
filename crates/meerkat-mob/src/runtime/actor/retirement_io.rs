@@ -2058,7 +2058,7 @@ impl MobActor {
             let Some(entry) = entry else {
                 continue;
             };
-            // MobMachine's notice verdict (R4) decides whether this peer
+            // MobMachine's notice verdict decides whether this peer
             // gets the retirement notices (a member that is not
             // materialized, on either side, is Suppressed). The trust
             // cleanup does not depend on it.
@@ -3000,19 +3000,17 @@ impl MobActor {
         self.retirement_stop_host(continuation).await;
     }
 
-    /// Record the cancellation of an autonomous member's in-flight kickoff as
-    /// part of its retirement. Retirement records it as soon as its Retire
-    /// transition commits, before any runtime teardown, so an outcome the
-    /// kickoff waiter delivers afterwards (for example the runtime terminal of
-    /// a kickoff input the teardown abandoned) is a late-arrival no-op, never
-    /// a recorded failure.
+    /// Record the cancellation of a member's in-flight kickoff as part of its
+    /// retirement: an autonomous member's, or the kickoff a rotated member
+    /// owes for its initial message. Retirement records it as soon as its
+    /// Retire transition commits, before any runtime teardown, so an outcome
+    /// the kickoff waiter delivers afterwards (for example the runtime
+    /// terminal of a kickoff input the teardown abandoned) is a late-arrival
+    /// no-op, never a recorded failure.
     async fn retirement_record_kickoff_cancel(
         &mut self,
         continuation: &mut RetirementContinuation,
     ) -> Result<(), MobError> {
-        if continuation.entry.runtime_mode != crate::MobRuntimeMode::AutonomousHost {
-            return Ok(());
-        }
         let identity = continuation.entry.agent_identity.clone();
         let member = mob_dsl::AgentIdentity::from_domain(&identity);
         let state = self.dsl_authority.state();
@@ -3043,11 +3041,9 @@ impl MobActor {
     async fn retirement_stop_host(&mut self, mut continuation: RetirementContinuation) {
         let identity = continuation.entry.agent_identity.clone();
         let autonomous = continuation.entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
-        let handle = if autonomous {
-            self.autonomous_initial_turns.lock().await.remove(&identity)
-        } else {
-            None
-        };
+        // A kickoff waiter of any member: an autonomous member's, or the one a
+        // rotated member's owed initial message started.
+        let handle = self.autonomous_initial_turns.lock().await.remove(&identity);
         // Retirement recorded the kickoff cancellation when it was admitted;
         // a kickoff still in flight here (a redriven retirement) is recorded
         // now, before its waiter is aborted.
@@ -3597,7 +3593,7 @@ impl MobActor {
                 released,
             )?;
             if live && !released {
-                let prepared = self.prepare_dsl_input_transition(
+                let mut prepared = self.prepare_dsl_input_transition(
                     mob_dsl::MobMachineInput::Retire {
                         mob_id: mob_dsl::MobId::from_domain(&self.definition.id),
                         agent_identity: identity.clone(),
@@ -3618,6 +3614,17 @@ impl MobActor {
                     session.clone(),
                     "handle_retire_inner_mark_retiring",
                 )?;
+                // A rotation records itself on the retirement it admits in
+                // the same prepared step, before the durable start: a refused
+                // rotation (a stopped or destroying mob, a held peer id)
+                // journals and commits nothing, and the member stays seated.
+                let mut effects = prepared.transition.effects().to_vec();
+                if let RetirementReply::Rotate { rotation, .. } = &continuation.reply
+                    && let Some(rotation_effects) =
+                        Self::apply_member_rotation_begin(&mut prepared.authority, entry, rotation)?
+                {
+                    effects.extend(rotation_effects);
+                }
                 if !continuation.retirement_started {
                     self.append_retirement_started_event_for_entry(
                         entry,
@@ -3631,12 +3638,21 @@ impl MobActor {
                     crate::generated::protocol_mob_destroying_session_ingress::extract_obligations(
                         &prepared.transition,
                     );
-                self.commit_prepared_dsl_transition(prepared)?;
+                let phase_changed = prepared.transition.from_phase != prepared.transition.to_phase;
+                self.commit_prepared_dsl_input(PreparedDslInput {
+                    authority: prepared.authority,
+                    effects,
+                    phase_changed,
+                })?;
             } else if !retiring || !continuation.retirement_started {
                 return Err(MobError::Internal(format!(
                     "member '{}' has a non-live runtime without an exact durable retirement anchor",
                     entry.agent_identity,
                 )));
+            } else if let RetirementReply::Rotate { rotation, .. } = &continuation.reply {
+                // A rotation re-driven on a retirement that already started
+                // durably records its intent now, if it is missing.
+                self.begin_member_rotation(entry, rotation)?;
             }
             continuation.retirement_started = true;
             if let Some(admission) = continuation.admission.take() {
@@ -3656,18 +3672,6 @@ impl MobActor {
                     "member retirement durably started; owned until it settles"
                 );
                 self.retirement_take_ownership(&mut continuation);
-                // A rotation records itself on the retirement it admitted, in
-                // this same step (F6).
-                let begun = match &continuation.reply {
-                    RetirementReply::Rotate { rotation, .. } => {
-                        self.begin_member_rotation(&continuation.entry, rotation)
-                    }
-                    _ => Ok(()),
-                };
-                if let Err(error) = begun {
-                    self.finish_retirement(continuation, Err(error)).await;
-                    return;
-                }
                 if let Err(error) = self
                     .retirement_record_kickoff_cancel(&mut continuation)
                     .await
@@ -4577,7 +4581,7 @@ impl MobActor {
                             continuation.archive_disposal,
                         ) {
                             // A rotation's terminal retires this incarnation
-                            // and seats the next one in one step (F6).
+                            // and seats the next one in one step.
                             (Some(ctx), Some(disposal)) => match &continuation.reply {
                                 RetirementReply::Rotate { rotation, .. } => {
                                     self.commit_member_rotation(ctx, disposal, rotation).await
@@ -5704,7 +5708,7 @@ impl MobActor {
                         rollback.phase = SpawnRollbackPhase::PlacedTrust;
                         continue;
                     };
-                    // MobMachine's notice verdict (R4): a peer that is not
+                    // MobMachine's notice verdict: a peer that is not
                     // materialized is Suppressed and gets no notice.
                     if !self.lifecycle_notice_delivers(peer, &identity)? {
                         rollback.notice_index += 1;

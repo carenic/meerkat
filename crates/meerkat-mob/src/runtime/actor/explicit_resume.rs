@@ -39,6 +39,9 @@ impl MobActor {
             return;
         };
         if self.dsl_authority.state().explicit_resume_cancel_requested {
+            // The rebuilt members are settled as every other member is: the
+            // lifecycle control that superseded the resume takes them over.
+            let _ = self.settle_held_member_readiness(Vec::new()).await;
             let result =
                 self.finish_explicit_resume_attempt(Err(MobError::LifecycleOperationPending {
                     intent: "explicit_resume superseded by lifecycle control".to_string(),
@@ -50,6 +53,7 @@ impl MobActor {
             .awaiting_stage(crate::runtime::state::LifecycleProgressStage::PostRebuildReadiness);
         match self.collect_member_readiness_targets(false).await {
             Err(error) => {
+                let _ = self.settle_held_member_readiness(Vec::new()).await;
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -59,6 +63,7 @@ impl MobActor {
                 .await;
             }
             Ok(None) => {
+                let _ = self.settle_held_member_readiness(Vec::new()).await;
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -67,7 +72,10 @@ impl MobActor {
                 )
                 .await;
             }
-            Ok(Some(targets)) => {
+            Ok(Some(mut targets)) => {
+                // The rebuilt members are held Waking: the Live-only target
+                // set leaves them out, and their readiness settles them.
+                targets.extend(self.held_member_readiness_targets().await);
                 self.spawn_resume_readiness_fanout(
                     targets,
                     Some(progress.clone()),
@@ -529,7 +537,10 @@ impl MobActor {
         }
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         if let Some(attempt) = work.wake_attempt {
-            self.resolve_explicit_resume_member_wake(&identity, attempt)?;
+            self.resolve_explicit_resume_member_bound(&identity, attempt)?;
+            // Held Waking until the resume's readiness settles it Live.
+            self.startup_boot_attempts
+                .insert(entry.agent_identity.clone(), attempt);
         }
         self.restore_diagnostics
             .write()
@@ -538,45 +549,35 @@ impl MobActor {
         Ok(())
     }
 
-    /// Resolve the wake attempt the rebuild of `identity` holds: bound (the
-    /// member's runtime binding is requested), then live. The explicit
-    /// resume runs the member's readiness and topology after it settles the
-    /// member. A stale attempt (the member's wake was abandoned or superseded
-    /// meanwhile) is the machine's no-op, and the rebuild is refused, so its
-    /// provision is rolled back rather than committed.
-    fn resolve_explicit_resume_member_wake(
+    /// Resolve the wake attempt the rebuild of `identity` holds bound: the
+    /// member's runtime binding is requested, and the member stays Waking.
+    /// The explicit resume's readiness then settles it Live (Live means
+    /// ready), or Broken with its readiness failure; its topology runs after
+    /// that, as for every member the resume finds live. A stale attempt (the
+    /// member's wake was abandoned or superseded meanwhile) is the machine's
+    /// no-op, and the rebuild is refused, so its provision is rolled back
+    /// rather than committed.
+    fn resolve_explicit_resume_member_bound(
         &mut self,
         identity: &mob_dsl::AgentIdentity,
         attempt: u64,
     ) -> Result<(), MobError> {
-        let steps = [
-            (
-                mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
-                    agent_identity: identity.clone(),
-                    attempt,
-                },
-                "resolve_explicit_resume_member_bound",
-            ),
-            (
-                mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
-                    agent_identity: identity.clone(),
-                    attempt,
-                },
-                "resolve_explicit_resume_member_ready",
-            ),
-        ];
-        for (signal, context) in steps {
-            let transition = self.apply_dsl_signal_collect_transition(signal, context)?;
-            if !crate::runtime::boot_plan::wake_feedback_applied(
-                transition.effects(),
-                identity,
+        let transition = self.apply_dsl_signal_collect_transition(
+            mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: identity.clone(),
                 attempt,
-            ) {
-                return Err(MobError::Internal(format!(
-                    "the wake attempt {attempt} of '{}' was superseded before its explicit resume settled",
-                    identity.0
-                )));
-            }
+            },
+            "resolve_explicit_resume_member_bound",
+        )?;
+        if !crate::runtime::boot_plan::wake_feedback_applied(
+            transition.effects(),
+            identity,
+            attempt,
+        ) {
+            return Err(MobError::Internal(format!(
+                "the wake attempt {attempt} of '{}' was superseded before its explicit resume settled",
+                identity.0
+            )));
         }
         Ok(())
     }

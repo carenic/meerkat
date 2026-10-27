@@ -2,7 +2,7 @@
 //! [`super::super::MobHandle::seat_dormant_members`] (see
 //! [`super::super::dormant_seat`] for the three steps).
 //!
-//! The commit is one actor step per chunk (F8): one prepared authority, one
+//! The commit is one actor step per chunk: one prepared authority, one
 //! runtime obligation scan, one `append_batch` before the base-checked
 //! commit. An identity the machine refuses is undone alone (its batch of
 //! inputs restores the prepared authority) and answered typed; only a store
@@ -20,7 +20,8 @@ enum SeatPlanMode {
     /// A dormant seat (`seat_dormant_members`).
     Seat,
     /// A rotation's next incarnation (`rotate_member`): a fresh life seated
-    /// Dormant with no kickoff, the identity seated now or not.
+    /// Dormant, owing the kickoff its spec owes, the identity seated now or
+    /// not.
     Rotation,
 }
 
@@ -96,12 +97,13 @@ impl MobActor {
             .identity_to_runtime
             .contains_key(&dsl_identity);
         match self.plan_dormant_seat(spec, SeatPlanMode::Rotation).await? {
-            DormantSeatPlanEntry::Seat(candidate) => Ok(MemberRotationPlan {
+            DormantSeatPlanEntry::Seat(candidate) => Ok(MemberRotationPlan::Seat {
                 candidate,
                 seated,
                 endpoint_source: self.member_residency.seat_endpoints.clone(),
                 provisioner: Arc::clone(&self.provisioner),
             }),
+            DormantSeatPlanEntry::Embody(spec) if !seated => Ok(MemberRotationPlan::Embody(spec)),
             _ => Err(MobError::Internal(format!(
                 "the rotation of '{agent_identity}' planned no seat"
             ))),
@@ -116,14 +118,10 @@ impl MobActor {
         mode: SeatPlanMode,
     ) -> Result<DormantSeatPlanEntry, MobError> {
         let agent_identity = spec.identity.clone();
-        // CommitDormantSeat is Running-only: a stopped mob seats nothing. A
-        // rotation of a seated member also runs while the mob is Stopped.
-        let phase = self.state();
-        let phase_admits = match mode {
-            SeatPlanMode::Seat => phase == MobState::Running,
-            SeatPlanMode::Rotation => matches!(phase, MobState::Running | MobState::Stopped),
-        };
-        if !phase_admits {
+        // CommitDormantSeat and BeginMemberRotation are Running-only: a
+        // stopped mob seats and rotates nothing, refused here before any
+        // session is created or any retirement starts.
+        if self.state() != MobState::Running {
             return Err(self.invalid_transition_to(MobState::Running));
         }
         // A non-authoritative composition seats nothing (the machine refuses
@@ -185,7 +183,8 @@ impl MobActor {
         // rotation plans its next incarnation over the seated one).
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
         let state = self.dsl_authority.state();
-        if mode == SeatPlanMode::Seat && state.identity_to_runtime.contains_key(&dsl_identity) {
+        let seated_now = state.identity_to_runtime.contains_key(&dsl_identity);
+        if mode == SeatPlanMode::Seat && seated_now {
             let current_generation = state
                 .identity_runtime_generations
                 .get(&dsl_identity)
@@ -276,19 +275,19 @@ impl MobActor {
         let runtime_mode = spec.runtime_mode.unwrap_or(profile.runtime_mode);
         let generation = self.mint_spawn_generation(&agent_identity)?;
 
-        // R13: a fresh member that owes a kickoff (an AutonomousHost
-        // member's one kickoff turn, or the initial message a fresh spawn
-        // runs as its first turn) is embodied through the ordinary spawn
-        // path, as a 0.9.6 spawn is: it would be woken at once for the
-        // kickoff anyway. Its session is the seat's name-based one.
-        // A rotation re-seats Dormant WITHOUT a kickoff: 0.9.6 started and then
-        // interrupted that kickoff, and the reset member starts on its next
-        // delivery.
-        if mode == SeatPlanMode::Seat
-            && launch == DormantSeatLaunch::Fresh
+        // A fresh member that owes a kickoff (an AutonomousHost member's one
+        // kickoff turn, or the initial message a fresh spawn runs as its
+        // first turn) is embodied through the ordinary spawn path, as a 0.9.6
+        // spawn is: it would be woken at once for the kickoff anyway. Its
+        // session is the seat's name-based one. The rotation of a seated
+        // member re-seats it Dormant and records the kickoff it owes in the
+        // same step, which wakes the next incarnation once and runs exactly
+        // once; the rotation of an identity that is not seated is a seat. A
+        // resume owes none.
+        let kickoff_owed = launch == DormantSeatLaunch::Fresh
             && (runtime_mode == crate::MobRuntimeMode::AutonomousHost
-                || spec.initial_message.is_some())
-        {
+                || spec.initial_message.is_some());
+        if kickoff_owed && (mode == SeatPlanMode::Seat || !seated_now) {
             spec.fresh_session_id = Some(fresh_seat_session_id(
                 &self.definition.id,
                 self.incarnation.incarnation(),
@@ -360,6 +359,9 @@ impl MobActor {
             authorize_input,
             authorized,
             observations,
+            kickoff_owed,
+            kickoff_prompt: kickoff_owed.then(|| spec.initial_message.clone()).flatten(),
+            kickoff_objective_id: spec.objective_id.unwrap_or_default(),
         })))
     }
 
@@ -543,7 +545,7 @@ impl MobActor {
             }
         }
 
-        // F9: each identity's boot verdict, from one runtime obligation scan
+        // Each identity's boot verdict, from one runtime obligation scan
         // over the chunk's seated state. Exactly the Wake verdicts wake,
         // cause Boot, once the chunk is committed.
         if !plan.is_empty() {
@@ -743,6 +745,9 @@ impl MobActor {
             member_peer_endpoint: endpoint.map(mob_dsl::MemberPeerEndpoint::from),
             // An archived session was answered at preparation, typed.
             session_archived: false,
+            // A spec that owes a kickoff is embodied at the plan; the machine
+            // refuses a seat that owes one.
+            kickoff_owed: candidate.kickoff_owed,
         };
         let transitions =
             match authority.apply_batch([candidate.authorize_input.clone(), begin, seat]) {
@@ -891,19 +896,22 @@ impl MobActor {
         .await;
     }
 
-    /// Record the rotation on the retirement it admitted (F6): the next
-    /// session and endpoint (`BeginMemberRotation`) and the next
+    /// Record the rotation on the retirement it admits, onto `authority`:
+    /// the next session and endpoint (`BeginMemberRotation`) and the next
     /// incarnation's profile authority (`AuthorizeSpawnProfile`, consumed by
-    /// the terminal step), in one step right after the retirement's durable
-    /// start. A re-drive of the same rotation keeps the intent it recorded.
-    pub(super) fn begin_member_rotation(
-        &mut self,
+    /// the terminal step). The retirement's admission applies it in the same
+    /// prepared step as its `Retire`, before the retirement's durable start,
+    /// so a refused rotation journals nothing. A re-drive of the same
+    /// rotation keeps the intent it recorded. Returns the effects to realize,
+    /// or `None` when the intent and the authority are already recorded.
+    pub(super) fn apply_member_rotation_begin(
+        authority: &mut mob_dsl::MobMachinePreparedAuthority,
         entry: &RosterEntry,
         rotation: &MemberRotation,
-    ) -> Result<(), MobError> {
+    ) -> Result<Option<Vec<mob_dsl::MobMachineEffect>>, MobError> {
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         let next_session = mob_dsl::SessionId::from_domain(&rotation.candidate.session_id);
-        let state = self.dsl_authority.state();
+        let state = authority.state();
         let mut inputs = Vec::with_capacity(2);
         match state.member_rotation_session_ids.get(&dsl_identity) {
             Some(recorded) if recorded == &next_session => {}
@@ -933,9 +941,8 @@ impl MobActor {
             inputs.push(rotation.candidate.authorize_input.clone());
         }
         if inputs.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
-        let mut authority = self.dsl_authority.prepare_authority();
         let transitions =
             authority
                 .apply_batch(inputs)
@@ -953,10 +960,27 @@ impl MobActor {
                 "begin_member_rotation",
             )?;
         }
-        let effects = transitions
-            .into_iter()
-            .flat_map(mob_dsl::MobMachineTransition::into_effects)
-            .collect();
+        Ok(Some(
+            transitions
+                .into_iter()
+                .flat_map(mob_dsl::MobMachineTransition::into_effects)
+                .collect(),
+        ))
+    }
+
+    /// [`Self::apply_member_rotation_begin`] on its own, for a rotation
+    /// whose retirement already started durably (a re-drive), committed in
+    /// one step.
+    pub(super) fn begin_member_rotation(
+        &mut self,
+        entry: &RosterEntry,
+        rotation: &MemberRotation,
+    ) -> Result<(), MobError> {
+        let mut authority = self.dsl_authority.prepare_authority();
+        let Some(effects) = Self::apply_member_rotation_begin(&mut authority, entry, rotation)?
+        else {
+            return Ok(());
+        };
         self.commit_prepared_dsl_input(PreparedDslInput {
             authority,
             effects,
@@ -964,7 +988,57 @@ impl MobActor {
         })
     }
 
-    /// The rotation's archive terminal (F6): the current incarnation retired
+    /// The next sessions of the rotations a destroy's admission abandoned
+    /// (`RotationSessionsAbandoned`): sessions no member will own.
+    pub(super) fn abandoned_rotation_sessions(
+        effects: &[mob_dsl::MobMachineEffect],
+    ) -> Vec<(AgentIdentity, SessionId)> {
+        effects
+            .iter()
+            .filter_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::RotationSessionsAbandoned { rotations } => {
+                    Some(rotations)
+                }
+                _ => None,
+            })
+            .flat_map(|rotations| rotations.iter())
+            .filter_map(|(identity, session)| match SessionId::parse(&session.0) {
+                Ok(session_id) => Some((AgentIdentity::from(identity.0.as_str()), session_id)),
+                Err(error) => {
+                    tracing::warn!(
+                        agent_identity = %identity.0,
+                        session = %session.0,
+                        %error,
+                        "an abandoned rotation names an invalid session id"
+                    );
+                    None
+                }
+            })
+            .collect()
+    }
+
+    /// Archive the empty sessions of rotations a destroy abandoned. Each
+    /// holds no member and no runtime: a failure is logged and leaves an
+    /// empty session behind; the destroy goes on.
+    pub(super) async fn archive_abandoned_rotation_sessions(
+        &mut self,
+        abandoned: Vec<(AgentIdentity, SessionId)>,
+    ) {
+        for (identity, session_id) in abandoned {
+            match self.session_service.archive(&session_id).await {
+                Ok(()) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {}
+                Err(error) => tracing::warn!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %identity,
+                    %session_id,
+                    %error,
+                    "could not archive the session of a rotation the destroy abandoned"
+                ),
+            }
+        }
+    }
+
+    /// The rotation's archive terminal: the current incarnation retired
     /// and the next one seated Dormant on the recorded session and endpoint,
     /// in one transition. Its `MemberRetired` and `MemberSpawned` rows go to
     /// the journal in one `append_batch` before the commit, so the identity is
@@ -1012,6 +1086,10 @@ impl MobActor {
             next_generation: mob_dsl::Generation::from_domain(next_generation),
             runtime_mode: mob_dsl::SpawnPolicyRuntimeMode::from(candidate.runtime_mode),
             external_addressable: candidate.authorized.external_addressable,
+            // The kickoff the spec owes, recorded pending on the next
+            // incarnation in the same step.
+            kickoff_owed: candidate.kickoff_owed,
+            kickoff_objective_id: candidate.kickoff_objective_id.to_string(),
         };
         let mut authority = self.dsl_authority.prepare_authority();
         let mut transitions = authority.apply_batch([rotation_input]).map_err(|error| {
@@ -1043,9 +1121,38 @@ impl MobActor {
             Some(next_session),
             "commit_member_rotation",
         )?;
-        // F9: the next incarnation's boot verdict, in the same step. Its
-        // session is new and empty, so it holds no runtime work. A stopped
-        // mob plans it at its lift.
+        // The owed kickoff's row, journaled after the re-seat in the same
+        // batch: replay records it pending on the next incarnation.
+        let kickoff_row = if candidate.kickoff_owed {
+            let recorded = committed.effects().iter().any(|effect| {
+                matches!(
+                    effect,
+                    mob_dsl::MobMachineEffect::PersistKickoffUpdate {
+                        member_id,
+                        phase: mob_dsl::KickoffPhase::Pending,
+                    } if member_id == &dsl_identity
+                )
+            });
+            if !recorded {
+                return Err(MobError::Internal(format!(
+                    "the rotation of '{identity}' owes a kickoff its terminal step did not record"
+                )));
+            }
+            Some(crate::roster::MobMemberKickoffSnapshot {
+                objective_id: Some(required_machine_kickoff_objective_id(
+                    authority.state(),
+                    identity,
+                )?),
+                phase: crate::roster::MobMemberKickoffPhase::Pending,
+                error: None,
+                updated_at: SystemTime::now(),
+            })
+        } else {
+            None
+        };
+        // The next incarnation's boot verdict, in the same step. Its session
+        // is new and empty, so it holds no runtime work; a kickoff it owes
+        // makes the verdict Wake. A stopped mob plans it at its lift.
         if authority.state().lifecycle_phase == mob_dsl::MobPhase::Running {
             let plan = super::super::boot_plan::boot_materialization_input(
                 &dsl_identity,
@@ -1068,12 +1175,24 @@ impl MobActor {
         let phase_changed = transitions
             .iter()
             .any(|transition| transition.from_phase != transition.to_phase);
+        let effects: Vec<mob_dsl::MobMachineEffect> = transitions
+            .into_iter()
+            .flat_map(mob_dsl::MobMachineTransition::into_effects)
+            .collect();
+        let kickoff_notices = effects
+            .iter()
+            .filter_map(|effect| match effect {
+                mob_dsl::MobMachineEffect::EmitKickoffLifecycleNotice { member_id, intent }
+                    if member_id == &dsl_identity =>
+                {
+                    Some(Self::kickoff_notice_intent(*intent))
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
         let prepared = PreparedDslInput {
             authority,
-            effects: transitions
-                .into_iter()
-                .flat_map(mob_dsl::MobMachineTransition::into_effects)
-                .collect(),
+            effects,
             phase_changed,
         };
         let creation = self.seat_creation_record(candidate).await;
@@ -1087,14 +1206,15 @@ impl MobActor {
         .with_bridge_member_ref(Some(MemberRef::Session {
             session_id: candidate.session_id.clone(),
         }))
-        .with_member_peer_endpoint(rotation.endpoint.clone());
+        .with_member_peer_endpoint(rotation.endpoint.clone())
+        .with_kickoff_prompt(candidate.kickoff_prompt.clone());
         spawned.creation = creation;
         spawned.runtime_mode = candidate.runtime_mode;
         spawned.labels = candidate.labels.clone();
         spawned.continuity_intent = candidate.continuity_intent.clone();
         spawned.effective_profile_override = candidate.effective_profile_override.clone();
         spawned.effective_model_override = candidate.effective_model_override.clone();
-        let batch = vec![
+        let mut batch = vec![
             NewMobEvent {
                 mob_id: self.definition.id.clone(),
                 timestamp: None,
@@ -1110,6 +1230,16 @@ impl MobActor {
                 kind: MobEventKind::MemberSpawned(spawned),
             },
         ];
+        if let Some(kickoff) = kickoff_row {
+            batch.push(NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MemberKickoffUpdated {
+                    member: identity.clone(),
+                    kickoff,
+                },
+            });
+        }
         let events = Arc::clone(&self.events);
         let stored = self
             .commit_prepared_dsl_input_after(prepared, move || async move {
@@ -1120,9 +1250,23 @@ impl MobActor {
             .write()
             .await
             .insert(Self::retire_event_key(identity, entry.generation));
-        let mut roster = self.roster.write().await;
-        for event in &stored {
-            roster.apply_event(event);
+        {
+            let mut roster = self.roster.write().await;
+            for event in &stored {
+                roster.apply_event(event);
+            }
+        }
+        // The owed kickoff's notices, effects of the now-durable step; a
+        // failure is presentation-only, as for every kickoff notice.
+        for intent in kickoff_notices {
+            if let Err(error) = self.notify_kickoff_event(identity, intent).await {
+                tracing::warn!(
+                    agent_identity = %identity,
+                    %error,
+                    intent,
+                    "failed to emit the rotated member's kickoff notice"
+                );
+            }
         }
         Ok(())
     }

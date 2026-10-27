@@ -1366,7 +1366,7 @@ pub(super) enum MobCommand {
         reason: super::stop_report::HostRunStartHoldReason,
         reply_tx: oneshot::Sender<Result<(), crate::MobError>>,
     },
-    /// Plan one chunk of a dormant seat (design section 10): each spec's
+    /// Plan one chunk of a dormant seat: each spec's
     /// typed answer, the spawn of a fresh spec that owes a kickoff, or what
     /// its seat needs. Reads nothing durable beyond profile resolution.
     PlanDormantSeats {

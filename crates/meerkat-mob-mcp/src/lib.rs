@@ -19036,16 +19036,6 @@ mod tests {
                 .expect("construct runtime authority")
                 .with_persistent_storage_root(Some(runtime_root)),
         );
-        let restored_bridge_session = restored_state
-            .mob_resolve_bridge_session_id(&mob_id, &identity)
-            .await
-            .expect("resolve restored bridge session")
-            .expect("restored bridge session exists");
-        assert_ne!(
-            restored_bridge_session, respawned_bridge_session,
-            "the explicitly nonpersistent session fixture must rotate its bridge session after a cold restart"
-        );
-
         assert_eq!(
             restored_state
                 .mob_status(&mob_id)
@@ -19074,7 +19064,7 @@ mod tests {
         let meerkat::TargetBinding::Identity(restored_binding) = &restored_schedule.target else {
             panic!("restored schedule must keep identity target");
         };
-        let host = MobMcpScheduleHost::new(restored_state);
+        let host = MobMcpScheduleHost::new(restored_state.clone());
         let probe = host
             .probe_identity_target(restored_binding)
             .await
@@ -19116,6 +19106,17 @@ mod tests {
             .last_start_turn()
             .await
             .expect("scheduled delivery should start a turn");
+        // The member stayed dormant through the restart; the delivery woke it,
+        // and its wake recreated the explicitly nonpersistent session.
+        let restored_bridge_session = restored_state
+            .mob_resolve_bridge_session_id(&mob_id, &identity)
+            .await
+            .expect("resolve restored bridge session")
+            .expect("restored bridge session exists");
+        assert_ne!(
+            restored_bridge_session, respawned_bridge_session,
+            "the explicitly nonpersistent session fixture must rotate its bridge session after a cold restart"
+        );
         assert_eq!(
             delivered_session, restored_bridge_session,
             "scheduled prompt must target the restored current materialized session"

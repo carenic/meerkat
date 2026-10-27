@@ -151,6 +151,59 @@ pub struct PersistedOpsSnapshot {
     pub cursors: meerkat_core::EpochCursorSnapshot,
 }
 
+impl PersistedOpsSnapshot {
+    /// Whether the runtime this snapshot recovers into holds work only a live
+    /// runtime does: a completion past every completion-consumer cursor that
+    /// the generated wake classifier marks wake-worthy (the recovered runtime
+    /// injects it as a continuation), or an operation the generated recovery
+    /// classifier retains with no terminal outcome (a running detached job
+    /// wait). A classification the generated authority refuses counts as
+    /// work.
+    ///
+    /// The cursors are the ones the snapshot captured. A snapshot persists on
+    /// terminal transitions and when a completion is delivered (the injected
+    /// or agent-applied cursor advances), so a delivered completion reads as
+    /// delivered here; one whose cursor write failed reads as owed, exactly
+    /// as the recovered runtime reads it.
+    pub(crate) fn holds_recovery_work(&self) -> bool {
+        let delivered_through = self
+            .cursors
+            .agent_applied_cursor
+            .max(self.cursors.runtime_observed_seq)
+            .max(self.cursors.runtime_last_injected_seq);
+        let completion_owed =
+            self.authority_state
+                .completion_feed_entries
+                .iter()
+                .any(|(operation_id, entry)| {
+                    entry.seq > delivered_through
+                        && !matches!(
+                            ShellState::operation_completion_wake_class(operation_id, entry.kind),
+                            Ok(OperationCompletionWakeClass::Ignore)
+                        )
+                });
+        completion_owed
+            || self
+                .authority_state
+                .operations
+                .iter()
+                .any(|(operation_id, operation)| {
+                    operation.terminal_outcome.is_none()
+                        && !matches!(
+                            ShellState::recovered_operation_record_disposition(
+                                operation_id,
+                                operation.status,
+                                operation.kind,
+                                false,
+                                false,
+                                operation.completion_sequence.is_some(),
+                            ),
+                            Ok(RecoveredOperationRecordDisposition::Discard)
+                        )
+                })
+    }
+}
+
 /// Store-owned facts about public completion rows actually evicted from the
 /// bounded feed projection.
 #[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
@@ -3570,6 +3623,7 @@ impl OpsLifecycleRegistry for RuntimeOpsLifecycleRegistry {
     ) -> Result<CompletionSeq, OpsLifecycleError> {
         let mut state = self.write_state()?;
         state.ensure_owner_active()?;
+        let previous = state.completion_cursor(consumer);
         let input = match consumer {
             CompletionCursorConsumer::AgentApplied => {
                 mm_dsl::MeerkatMachineInput::AdvanceAgentCompletionCursor { cursor }
@@ -3610,6 +3664,27 @@ impl OpsLifecycleRegistry for RuntimeOpsLifecycleRegistry {
             })?;
         if let Some(projection) = projection {
             projection.project_authorized_completion_cursor(consumer, advanced);
+        }
+        // A completion delivered to its owner (injected as a continuation, or
+        // applied by the agent) is recorded durably with the snapshot, so a
+        // restart does not read it as owed recovery work and wake the owner
+        // for it. The cursor moves only after the delivery itself is durable,
+        // so a crash before this write re-presents the completion, never
+        // loses it. A failed write leaves the stored cursor behind, which at
+        // worst wakes the owner at its next start: it does not fail the
+        // advance.
+        if advanced > previous
+            && matches!(
+                consumer,
+                CompletionCursorConsumer::RuntimeInjected | CompletionCursorConsumer::AgentApplied
+            )
+            && let Err(error) = state.maybe_persist()
+        {
+            tracing::warn!(
+                ?consumer,
+                %error,
+                "the advanced completion cursor was not persisted; the next start reads the completion as owed"
+            );
         }
         Ok(advanced)
     }

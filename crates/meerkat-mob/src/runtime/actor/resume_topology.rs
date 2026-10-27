@@ -3808,6 +3808,7 @@ mod tests {
                 session_id: fixture.a_session.clone(),
                 refusal_code: "unavailable".to_string(),
                 reason: "runtime refused the binding".to_string(),
+                attempt: None,
             },
         )
         .expect("record the restore failure");
@@ -4036,6 +4037,7 @@ mod tests {
                 session_id: fixture.a_session.clone(),
                 refusal_code: "unavailable".to_string(),
                 reason: "runtime refused the binding".to_string(),
+                attempt: None,
             },
         )
         .expect("record the restore failure");

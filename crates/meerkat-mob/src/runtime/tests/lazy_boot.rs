@@ -1,8 +1,7 @@
-//! Boot-side rows of member residency (design section 13): the lazy start
-//! (R20, R21, R25), reads that never wake (R26, R47), the verified pass
-//! (R48, R48n), wiring with dormant members (R28, H-D, and external peers),
-//! retiring and destroying dormant members (R27), seats (R13, R64, R94,
-//! R115) and rotation (R62). They run on the combined candidate: the
+//! Boot-side rows of member residency: the lazy start, reads that never
+//! wake, the verified pass, wiring with dormant members (external peers
+//! included), retiring and destroying dormant members, seats, rotation and
+//! the kickoff a rotation owes. They run on the combined candidate: the
 //! machine, the wake path and the boot path together.
 
 use super::*;
@@ -44,7 +43,18 @@ impl CrashedMob {
     /// Spawn `members` workers (the first two wired when `wire`), then crash
     /// (or, when `stop`, stop first) and restart the session service.
     async fn new(label: &str, members: usize, wire: bool, stop: bool) -> Self {
-        let definition = with_unique_mob_id(sample_definition(), label);
+        Self::with_definition(sample_definition(), label, members, wire, stop).await
+    }
+
+    /// [`Self::new`] over `definition`.
+    async fn with_definition(
+        definition: MobDefinition,
+        label: &str,
+        members: usize,
+        wire: bool,
+        stop: bool,
+    ) -> Self {
+        let definition = with_unique_mob_id(definition, label);
         let service = Arc::new(MockSessionService::new());
         let _adapter = service.enable_runtime_adapter();
         let storage = MobStorage::in_memory();
@@ -120,7 +130,7 @@ impl CrashedMob {
     }
 }
 
-/// R20: a crash-path start under the default policy materializes no member
+/// A crash-path start under the default policy materializes no member
 /// that holds no work, reads every member Dormant, and its plan was based on
 /// an observed store. One host delivery to one member then materializes
 /// exactly that member, on its own session.
@@ -169,7 +179,7 @@ async fn r20_a_crash_path_start_materializes_no_member_and_one_delivery_wakes_on
     }
 }
 
-/// R21: the lift of a stopped mob plans its members exactly as a crash-path
+/// The lift of a stopped mob plans its members exactly as a crash-path
 /// start does: none that holds no work is materialized.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r21_the_lift_of_a_stopped_mob_materializes_no_member_without_work() {
@@ -191,7 +201,7 @@ async fn r21_the_lift_of_a_stopped_mob_materializes_no_member_without_work() {
     }
 }
 
-/// R25: the Eager policy restores every member at start, as before.
+/// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r25_the_eager_policy_materializes_every_member() {
     let mob = CrashedMob::new("r25-eager-start", 4, false, false).await;
@@ -219,7 +229,7 @@ async fn r25_the_eager_policy_materializes_every_member() {
     }
 }
 
-/// R26 and R47: reads of dormant members do no work. Member lists, member
+/// Reads of dormant members do no work. Member lists, member
 /// status and roster reads leave every member Dormant and build nothing;
 /// a dormant member's status still reports its peer connectivity and its
 /// resolved capabilities, and lists it Active.
@@ -265,7 +275,7 @@ async fn r26_r47_reads_leave_dormant_members_dormant_and_report_them_whole() {
     }
 }
 
-/// R48: under the verified policy a dormant member whose durable session is
+/// Under the verified policy a dormant member whose durable session is
 /// gone reads Broken at ready, with nothing materialized for it; every other
 /// member stays Dormant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -294,7 +304,7 @@ async fn r48_the_verified_policy_records_an_unrecoverable_member_broken_without_
     }
 }
 
-/// R48n: under the default policy the same member reads Dormant at ready,
+/// Under the default policy the same member reads Dormant at ready,
 /// and the start read nothing of it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r48n_the_default_policy_leaves_an_unrecoverable_member_dormant_until_touched() {
@@ -310,7 +320,7 @@ async fn r48n_the_default_policy_leaves_an_unrecoverable_member_dormant_until_to
     assert!(!handle.restore_diagnostics.read().await.contains_key(&lost));
 }
 
-/// R28, R100 and H-D: wiring and unwiring two dormant members commits the
+/// Wiring and unwiring two dormant members commits the
 /// edge and its event without waking either, and a wired pair restarted
 /// lazily keeps its edge with both members Dormant.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -339,7 +349,7 @@ async fn r28_wiring_dormant_members_wakes_neither() {
     }
 }
 
-/// R28 for external peers: wiring and unwiring a dormant member's external
+/// For external peers: wiring and unwiring a dormant member's external
 /// peers commit the machine edges and their events without waking it (the
 /// verdict owes a member that is not materialized no trust row), and its
 /// wake installs the row of the edge the machine still holds, not the row
@@ -444,7 +454,7 @@ async fn retired_rows(events: &Arc<dyn MobEventStore>, identity: &AgentIdentity)
         .count()
 }
 
-/// R27: after a restart, a dormant member is retired without waking it.
+/// After a restart, a dormant member is retired without waking it.
 /// MobMachine retires it archive-only: no runtime retire is routed to the
 /// session no runtime holds, its durable session is archived, nothing is
 /// materialized, and its wired peer stays dormant.
@@ -494,7 +504,7 @@ async fn r27_a_dormant_member_is_retired_after_a_restart_without_waking() {
     assert_eq!(retired_rows(&mob.events, &retiring).await, 1);
 }
 
-/// R27: after a restart, a mob whose members are all dormant is destroyed
+/// After a restart, a mob whose members are all dormant is destroyed
 /// without waking any of them: every member's durable session is archived
 /// and nothing is materialized.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -518,7 +528,7 @@ async fn r27_a_mob_of_dormant_members_is_destroyed_after_a_restart_without_wakin
     );
 }
 
-/// R27: a retirement that started before a crash and could not archive is
+/// A retirement that started before a crash and could not archive is
 /// recovered archive-only by the restart: its member is not materialized,
 /// no runtime retire is routed to its session, and the start's re-drive
 /// archives the session and journals the retirement once.
@@ -624,12 +634,15 @@ async fn journal_kinds(events: &Arc<dyn MobEventStore>) -> Vec<String> {
             MobEventKind::MemberRetired { agent_identity, .. } => {
                 format!("MemberRetired({agent_identity})")
             }
+            MobEventKind::MemberKickoffUpdated { member, kickoff } => {
+                format!("MemberKickoffUpdated({member}, {:?})", kickoff.phase)
+            }
             other => format!("{:?}", std::mem::discriminant(other)),
         })
         .collect()
 }
 
-/// R115 (F8, R5): a seat batch in which one identity's peer id is already
+/// A seat batch in which one identity's peer id is already
 /// held seats the others in one commit and refuses that identity alone.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r115_a_seat_batch_refuses_only_the_identity_whose_peer_id_is_held() {
@@ -741,7 +754,7 @@ async fn a_seat_without_a_comms_identity_source_is_refused_and_writes_nothing() 
     assert_eq!(journal_kinds(&events).await, before);
 }
 
-/// R6: an archived session is never bound: its seat is answered typed and
+/// An archived session is never bound: its seat is answered typed and
 /// writes nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seat_on_an_archived_session_is_answered_typed() {
@@ -774,7 +787,7 @@ async fn a_seat_on_an_archived_session_is_answered_typed() {
     assert_eq!(journal_kinds(&events).await, before);
 }
 
-/// R13: a fresh spec that owes a kickoff is not seated: it
+/// A fresh spec that owes a kickoff is not seated: it
 /// is spawned, live, on the seat's name-based session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r13_a_fresh_autonomous_spec_is_embodied_on_its_name_based_session() {
@@ -803,7 +816,7 @@ async fn r13_a_fresh_autonomous_spec_is_embodied_on_its_name_based_session() {
     );
 }
 
-/// R64: a fresh turn-driven spec with no initial message is seated, its
+/// A fresh turn-driven spec with no initial message is seated, its
 /// empty session created once through the fresh-spawn create path with no
 /// runtime registration, under its name-based id. On network comms it is
 /// seated owed its endpoint, which its boot wake registers.
@@ -842,7 +855,7 @@ async fn r64_a_fresh_seat_creates_its_empty_session_once_under_its_name_based_id
     );
 }
 
-/// R94 (G12): a seat whose journal append failed after its empty session was
+/// A seat whose journal append failed after its empty session was
 /// created is retried onto the same session, created once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn r94_a_seat_retried_after_a_failed_journal_reuses_its_fresh_session() {
@@ -899,7 +912,7 @@ async fn r94_a_seat_retried_after_a_failed_journal_reuses_its_fresh_session() {
     );
 }
 
-/// R62 (F6): a rotation retires the member's incarnation and seats the next
+/// A rotation retires the member's incarnation and seats the next
 /// one on a new name-based session in one journal batch: MemberRetired is
 /// followed at once by the next MemberSpawned, and the old session is
 /// archived.
@@ -950,7 +963,7 @@ async fn r62_a_rotation_reseats_the_member_on_a_new_session_in_one_batch() {
     assert_eq!(member.generation, crate::ids::Generation::new(1));
 }
 
-/// R96 (R15): 10,000 dormant members restart with zero materializations and
+/// 10,000 dormant members restart with zero materializations and
 /// every member Dormant, within the coarse bound. Deterministic counters are
 /// the assertion; the wall clock is a smoke bound. Run explicitly, in the
 /// release profile.
@@ -1027,7 +1040,7 @@ async fn r96_ten_thousand_dormant_members_restart_without_materializing_any() {
     );
 }
 
-/// R114 (F6): a crash after a rotation's retirement durably started and
+/// A crash after a rotation's retirement durably started and
 /// before its terminal batch. The restart finds the incarnation Retiring
 /// with no rotation intent; the host passes the identity as host-pending (so
 /// the plain retirement cannot complete it) and calls `rotate_member` again,
@@ -1128,8 +1141,10 @@ async fn r114_a_rotation_interrupted_after_its_retirement_started_completes_on_r
     );
 }
 
-/// X6: a member whose comms runtime is missing at start fails alone; the mob
-/// starts Running and every other member is live.
+/// A member whose comms runtime is missing at start fails alone; the mob
+/// starts Running and every other member is live. The failed member's
+/// outcome is its own, typed: Broken with the readiness failure as its
+/// error, not live.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn x6_a_member_whose_comms_runtime_is_missing_at_start_fails_alone() {
     let mob = CrashedMob::new("x6-missing-comms", 3, false, false).await;
@@ -1148,4 +1163,566 @@ async fn x6_a_member_whose_comms_runtime_is_missing_at_start_fails_alone() {
             "{identity}"
         );
     }
+    let failed = worker(1);
+    assert_ne!(
+        phase_of(&handle, &failed),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    let outcome = handle
+        .member_status(&failed)
+        .await
+        .expect("read the failed member's status");
+    assert_eq!(
+        outcome.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{outcome:?}"
+    );
+    assert!(outcome.error.is_some(), "its failure is typed: {outcome:?}");
+}
+
+/// Wait until `predicate` holds, within [`LAZY_STEP`].
+async fn wait_for<F, Fut>(what: &str, mut predicate: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + LAZY_STEP;
+    loop {
+        if predicate().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+fn autonomous(identity: &AgentIdentity, initial_message: Option<&str>) -> SpawnMemberSpec {
+    let mut spec = SpawnMemberSpec::new("worker", identity.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+    if let Some(message) = initial_message {
+        spec = spec.with_initial_message(message);
+    }
+    spec
+}
+
+/// How many turns `service` ran on `session` with exactly `prompt`.
+async fn turns_with(service: &MockSessionService, session: &SessionId, prompt: &str) -> usize {
+    service
+        .recorded_start_turn_prompts()
+        .await
+        .into_iter()
+        .filter(|(ran_on, ran)| ran_on == session && ran == prompt)
+        .count()
+}
+
+/// A mob over stored member keys whose one member (by default an autonomous
+/// one, which ran its first life's kickoff) crashed and restarted under the
+/// default policy: the member is seated Dormant, nothing materialized.
+struct DormantMemberMob {
+    keys: tempfile::TempDir,
+    handle: MobHandle,
+    events: Arc<dyn MobEventStore>,
+    runtime_metadata: Arc<dyn MobRuntimeMetadataStore>,
+    /// The restarted service.
+    service: Arc<MockSessionService>,
+    identity: AgentIdentity,
+    /// The first life's session.
+    session: SessionId,
+}
+
+impl DormantMemberMob {
+    async fn new(label: &str) -> Self {
+        Self::with_spec(label, autonomous(&worker(0), Some("first life"))).await
+    }
+
+    /// [`Self::new`] with the member spawned from `spec`; an autonomous
+    /// member runs its first life's kickoff before the crash.
+    async fn with_spec(label: &str, spec: SpawnMemberSpec) -> Self {
+        let keys = tempfile::tempdir().expect("a comms identity root");
+        let definition = with_unique_mob_id(sample_definition(), label);
+        let service = Arc::new(MockSessionService::new());
+        let _adapter = service.enable_runtime_adapter();
+        service.set_keep_alive_turns_complete_immediately(true);
+        let storage = MobStorage::in_memory();
+        let events = storage.events.clone();
+        let runtime_metadata = storage.runtime_metadata.clone();
+        let handle = MobBuilder::new(definition, storage)
+            .with_session_service(service.clone())
+            .with_member_comms_identity_root(keys.path())
+            .create()
+            .await
+            .expect("create the mob");
+        let identity = spec.identity.clone();
+        let autonomous = spec.runtime_mode == Some(crate::MobRuntimeMode::AutonomousHost);
+        handle.spawn_spec(spec).await.expect("spawn the member");
+        if autonomous {
+            handle
+                .wait_for_members_kickoff_complete(std::slice::from_ref(&identity), Some(LAZY_STEP))
+                .await
+                .expect("the first life's kickoff resolves");
+        }
+        let session = handle
+            .resolve_bridge_session_id(&identity)
+            .await
+            .expect("a session-backed member");
+        let mut mob = Self {
+            keys,
+            handle,
+            events,
+            runtime_metadata,
+            service,
+            identity,
+            session,
+        };
+        mob.restart().await;
+        assert_eq!(
+            phase_of(&mob.handle, &mob.identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "the restart left the member Dormant"
+        );
+        mob
+    }
+
+    /// Crash the mob, restart its session service and resume it under the
+    /// default policy.
+    async fn restart(&mut self) {
+        let handle = self.handle.clone();
+        crash_stop_and_release_routes(handle).await;
+        let restarted = Arc::new(self.service.cold_restart_preserving_durable_state().await);
+        let _ = restarted.enable_runtime_adapter();
+        restarted.set_keep_alive_turns_complete_immediately(true);
+        self.service = restarted;
+        self.handle = tokio::time::timeout(
+            LAZY_STEP,
+            Box::pin(
+                MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                    self.events.clone(),
+                    self.runtime_metadata.clone(),
+                ))
+                .with_session_service(self.service.clone())
+                .with_member_comms_identity_root(self.keys.path())
+                .notify_orchestrator_on_resume(false)
+                .resume(),
+            ),
+        )
+        .await
+        .expect("the restart answers")
+        .expect("the restart succeeds");
+    }
+
+    /// The name-based session of the incarnation at `generation`.
+    fn session_at(&self, generation: u64) -> SessionId {
+        fresh_seat_session_id(
+            self.handle.mob_id(),
+            self.handle.incarnation(),
+            &self.identity,
+            crate::ids::Generation::new(generation),
+        )
+    }
+}
+
+/// With a model override: a dormant member's capabilities are those of
+/// the model its wake binds, its incarnation's model override over its
+/// profile, resolved through the model catalog as a live member's are; the
+/// read wakes nothing. Once the member is live, a resolved live projection
+/// equals the dormant one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r47_a_dormant_members_capabilities_follow_its_model_override() {
+    const OVERRIDE: &str = "claude-opus-4-8";
+    let mut spec = turn_driven(&worker(0));
+    spec.model_override = Some(OVERRIDE.to_string());
+    let mob = DormantMemberMob::with_spec("r47-override-capabilities", spec).await;
+    let provider =
+        meerkat_models::infer_provider(OVERRIDE).expect("the override is a catalog model");
+    let expected = meerkat_runtime::SessionLlmCapabilitySurface::from_model_profile(
+        &meerkat_models::canonical()
+            .profile_for(provider, OVERRIDE)
+            .expect("the override's catalog profile"),
+    )
+    .to_wire_resolved();
+    let dormant = mob
+        .handle
+        .member_status(&mob.identity)
+        .await
+        .expect("the dormant member's status")
+        .resolved_capabilities;
+    assert_eq!(dormant.as_ref(), Some(&expected));
+    assert!(mob.service.recorded_create_requests().await.is_empty());
+    assert_eq!(
+        phase_of(&mob.handle, &mob.identity),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+
+    mob.handle
+        .ensure_member_live(&mob.identity)
+        .await
+        .expect("wake the member");
+    let live = mob
+        .handle
+        .member_status(&mob.identity)
+        .await
+        .expect("the live member's status")
+        .resolved_capabilities;
+    if let Some(live) = live {
+        assert_eq!(live, expected, "the live projection equals the dormant one");
+    }
+}
+
+/// A ready wait over dormant autonomous members after a restart returns
+/// at once: a seated Dormant member is ready as a member, and the wait
+/// materializes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b3_a_ready_wait_over_dormant_autonomous_members_returns_at_once() {
+    let mob = DormantMemberMob::new("b3-dormant-ready-wait").await;
+    let ready = tokio::time::timeout(
+        Duration::from_secs(5),
+        mob.handle.wait_for_members_ready(
+            std::slice::from_ref(&mob.identity),
+            Some(Duration::from_secs(30)),
+        ),
+    )
+    .await
+    .expect("the wait returns at once")
+    .expect("the dormant member is ready");
+    assert_eq!(ready.len(), 1);
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        mob.handle.wait_for_ready(Some(Duration::from_secs(30))),
+    )
+    .await
+    .expect("the mob-wide wait returns at once")
+    .expect("every member is ready");
+    assert!(
+        mob.service.recorded_create_requests().await.is_empty(),
+        "the waits materialized nothing"
+    );
+    assert_eq!(mob.service.active_session_count().await, 0);
+    assert_eq!(
+        phase_of(&mob.handle, &mob.identity),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+}
+
+/// The rotation of a dormant autonomous member re-seats it Dormant and
+/// records the kickoff its spec owes in the same journal batch; the rotation
+/// itself runs no turn. The owed kickoff wakes the next incarnation once and
+/// runs exactly once, on its new session, with the spec's initial message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r62_a_rotated_dormant_member_runs_its_owed_kickoff_once_on_its_new_session() {
+    let mob = DormantMemberMob::new("r62-rotation-kickoff").await;
+    let identity = mob.identity.clone();
+    let new = tokio::time::timeout(
+        LAZY_STEP,
+        mob.handle
+            .rotate_member(autonomous(&identity, Some("second life"))),
+    )
+    .await
+    .expect("the rotation answers")
+    .expect("the rotation succeeds");
+    assert_eq!(new, mob.session_at(1));
+    let kinds = journal_kinds(&mob.events).await;
+    let retired = kinds
+        .iter()
+        .position(|kind| kind == &format!("MemberRetired({identity})"))
+        .expect("the retirement is journaled");
+    assert_eq!(
+        kinds.get(retired + 1..retired + 3),
+        Some(
+            &[
+                format!("MemberSpawned({identity})"),
+                format!("MemberKickoffUpdated({identity}, Pending)"),
+            ][..]
+        ),
+        "the re-seat and its owed kickoff are journaled with the retirement: {kinds:?}"
+    );
+    wait_for("the owed kickoff to run on the new session", || async {
+        turns_with(&mob.service, &new, "second life").await > 0
+    })
+    .await;
+    let resolved = mob
+        .handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&identity), Some(LAZY_STEP))
+        .await
+        .expect("the owed kickoff resolves");
+    assert_eq!(
+        resolved[0].1.kickoff.as_ref().map(|kickoff| kickoff.phase),
+        Some(crate::roster::MobMemberKickoffPhase::Started)
+    );
+    assert_eq!(turns_with(&mob.service, &new, "second life").await, 1);
+    assert!(
+        !mob.service
+            .recorded_start_turn_prompts()
+            .await
+            .iter()
+            .any(|(session, _)| session == &mob.session),
+        "the rotation ran no turn on the retired life's session"
+    );
+    assert_eq!(
+        phase_of(&mob.handle, &identity),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    let member = mob
+        .handle
+        .get_member(&identity)
+        .await
+        .expect("read the roster")
+        .expect("still a member");
+    assert_eq!(member.generation, crate::ids::Generation::new(1));
+}
+
+/// Across a restart: a kickoff a rotation recorded and that did not run
+/// before the process ended (here the next incarnation's wake fails) is owed
+/// at the next start, whose boot verdict wakes the member; it runs exactly
+/// once, with the initial message the rotation's spec named.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r62_an_owed_kickoff_runs_once_with_its_prompt_after_a_restart() {
+    let mut mob = DormantMemberMob::new("r62-owed-kickoff-restart").await;
+    let identity = mob.identity.clone();
+    let next = mob.session_at(1);
+    mob.service.set_missing_comms_runtime(&next).await;
+    let new = tokio::time::timeout(
+        LAZY_STEP,
+        mob.handle
+            .rotate_member(autonomous(&identity, Some("owed across the restart"))),
+    )
+    .await
+    .expect("the rotation answers")
+    .expect("the rotation succeeds");
+    assert_eq!(new, next);
+    wait_for("the failed wake to settle", || async {
+        !matches!(
+            phase_of(&mob.handle, &identity),
+            Some(dsl::MemberMaterializationPhase::Waking)
+        )
+    })
+    .await;
+    let dsl_identity = dsl::AgentIdentity::from_domain(&identity);
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_kickoff_pending
+            .contains(&dsl_identity),
+        "the kickoff stays owed while the member cannot wake"
+    );
+    let before = mob.service.clone();
+    assert_eq!(
+        turns_with(&before, &new, "owed across the restart").await,
+        0
+    );
+
+    mob.restart().await;
+    wait_for("the owed kickoff to run after the restart", || async {
+        turns_with(&mob.service, &new, "owed across the restart").await > 0
+    })
+    .await;
+    mob.handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&identity), Some(LAZY_STEP))
+        .await
+        .expect("the owed kickoff resolves");
+    assert_eq!(
+        turns_with(&mob.service, &new, "owed across the restart").await,
+        1
+    );
+    assert_eq!(
+        turns_with(&before, &new, "owed across the restart").await,
+        0
+    );
+}
+
+/// The rotation of an identity that is not seated: an identity whose
+/// last retirement completed is seated by `rotate_member` as one fresh seat;
+/// a spec that owes a kickoff is spawned live on its name-based session, and
+/// its kickoff runs once there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r63_a_rotation_of_a_retired_identity_spawns_it_and_runs_its_kickoff_once() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, _events) = seat_mob("r63-rotation-retired", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
+    service.set_keep_alive_turns_complete_immediately(true);
+    let identity = worker(0);
+    handle
+        .spawn_spec(turn_driven(&identity))
+        .await
+        .expect("spawn the member");
+    handle
+        .retire(identity.clone())
+        .await
+        .expect("retire the member");
+    let session = tokio::time::timeout(
+        LAZY_STEP,
+        handle.rotate_member(autonomous(&identity, Some("a new life"))),
+    )
+    .await
+    .expect("the rotation answers")
+    .expect("the rotation seats the identity");
+    assert_eq!(
+        session,
+        fresh_seat_session_id(
+            handle.mob_id(),
+            handle.incarnation(),
+            &identity,
+            crate::ids::Generation::new(1),
+        )
+    );
+    handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&identity), Some(LAZY_STEP))
+        .await
+        .expect("the kickoff resolves");
+    assert_eq!(turns_with(&service, &session, "a new life").await, 1);
+}
+
+/// A rotation in a Stopped mob is refused typed before anything of it
+/// starts: the identity stays seated on its session at its generation, and
+/// nothing is retired or archived.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b4_a_rotation_in_a_stopped_mob_is_refused_and_retires_nothing() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, events) = seat_mob("b4-stopped-rotation", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
+    let identity = worker(0);
+    handle
+        .spawn_spec(turn_driven(&identity))
+        .await
+        .expect("spawn the member");
+    let session = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("a session-backed member");
+    handle.stop().await.expect("stop the mob");
+    let error = tokio::time::timeout(LAZY_STEP, handle.rotate_member(turn_driven(&identity)))
+        .await
+        .expect("the rotation answers")
+        .expect_err("a stopped mob rotates nothing");
+    assert!(
+        matches!(error, MobError::InvalidTransition { .. }),
+        "refused typed: {error:?}"
+    );
+    assert_eq!(
+        handle.resolve_bridge_session_id(&identity).await,
+        Some(session.clone())
+    );
+    let member = handle
+        .get_member(&identity)
+        .await
+        .expect("read the roster")
+        .expect("still a member");
+    assert_eq!(member.generation, crate::ids::Generation::INITIAL);
+    assert!(!service.test_is_session_archived(&session).await);
+    let journal = events.replay_all().await.expect("read the journal");
+    assert!(
+        !journal.iter().any(|event| matches!(
+            event.kind,
+            MobEventKind::MemberRetirementStarted { .. } | MobEventKind::MemberRetired { .. }
+        )),
+        "no retirement started"
+    );
+}
+
+/// A kickoff status notice is content, so a
+/// live member's kickoff notices to a wired Dormant peer wake that peer
+/// once and are delivered, never dropped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b5_kickoff_notices_to_a_dormant_peer_wake_it_once() {
+    let mob = CrashedMob::with_definition(
+        sample_definition_with_role_wiring(),
+        "b5-kickoff-notice",
+        1,
+        false,
+        false,
+    )
+    .await;
+    let handle = mob.resume(mob.builder()).await;
+    mob.service.set_keep_alive_turns_complete_immediately(true);
+    let dormant = worker(0);
+    assert_eq!(
+        phase_of(&handle, &dormant),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+    // A new autonomous worker is wired to the dormant one by the role rule
+    // before its kickoff starts, so its kickoff notices go to the peer.
+    let live = AgentIdentity::from("b5-live");
+    handle
+        .spawn_spec(autonomous(&live, None))
+        .await
+        .expect("spawn the live member");
+    handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&live), Some(LAZY_STEP))
+        .await
+        .expect("the live member's kickoff resolves");
+    wait_for("the notices to wake the dormant peer", || async {
+        phase_of(&handle, &dormant) == Some(dsl::MemberMaterializationPhase::Live)
+    })
+    .await;
+    let dormant_session = mob.session(0);
+    let builds = mob
+        .materialized()
+        .await
+        .into_iter()
+        .filter(|session| session == &dormant_session)
+        .count();
+    assert_eq!(builds, 1, "the peer was woken once");
+}
+
+/// Retiring a member while its wake is still provisioning is
+/// archive-only, and the archive races that provision. The retirement
+/// completes, the wake's attempt closes with it, and the provision the wake
+/// was making is rolled back: no session of the member is left live, the
+/// session is archived, and no retirement of the member is left stuck.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn s19_retiring_a_waking_member_leaves_no_session_live_and_nothing_stuck() {
+    let mob = CrashedMob::new("s19-retire-waking", 1, false, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    let member = worker(0);
+    let session = mob.session(0);
+    // The wake's provision of the member's session is slow.
+    mob.service.set_create_session_delay_ms(1_500);
+    let waking = {
+        let handle = handle.clone();
+        let member = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&member).await })
+    };
+    wait_for("the member to be waking", || async {
+        phase_of(&handle, &member) == Some(dsl::MemberMaterializationPhase::Waking)
+    })
+    .await;
+    tokio::time::timeout(LAZY_STEP, handle.retire(member.clone()))
+        .await
+        .expect("the retirement answers")
+        .expect("retiring a waking member succeeds");
+    // The wake's caller gets an answer; whether it is a refusal or a
+    // success that the retirement then ended is not this row's subject.
+    let _ = tokio::time::timeout(LAZY_STEP, waking)
+        .await
+        .expect("the wake's caller is answered");
+    assert!(
+        handle
+            .get_member(&member)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the member left"
+    );
+    wait_for("the member's session to be archived", || async {
+        mob.service.test_is_session_archived(&session).await
+    })
+    .await;
+    wait_for("no session of the member to be left live", || async {
+        mob.service.active_session_count().await == 0
+    })
+    .await;
+    assert_eq!(phase_of(&handle, &member), None);
+    let state = handle.machine_state_watch_rx.borrow().clone();
+    assert!(
+        state.runtime_retire_pending_sessions.is_empty(),
+        "no retirement is left pending: {:?}",
+        state.runtime_retire_pending_sessions
+    );
 }

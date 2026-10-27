@@ -1397,6 +1397,66 @@ pub(super) fn member_endpoint_defect(
     }
 }
 
+/// The first registration of a member's endpoint at a start: a member that
+/// owes its endpoint (a seat on network comms whose first wake did not record
+/// it) registers the live one here. It is journaled, as a wake journals it,
+/// so every later start restores it from the journal, whatever wiring the
+/// member has by then. A journal refusal falls back to the spawned
+/// incarnation's endpoint recovery, which also admits a wired member. The
+/// error names why neither took the endpoint: the caller breaks this member
+/// alone.
+async fn record_first_seeded_member_endpoint(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    roster: &mut Roster,
+    tool_handle: &MobHandle,
+    mob_id: &MobId,
+    entry: &RosterEntry,
+    spec: &TrustedPeerDescriptor,
+) -> Result<(), String> {
+    let journaled = match entry.member_ref.bridge_session_id() {
+        Some(bridge_session_id) => append_recovered_session_binding(
+            authority,
+            &tool_handle.events,
+            mob_id,
+            entry,
+            bridge_session_id,
+            Some(spec.clone()),
+            "resume_record_first_member_peer_endpoint",
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        None => Err("the member is not session-backed".to_string()),
+    };
+    let journal_error = match journaled {
+        Ok(event) => {
+            roster.apply(&event);
+            tool_handle.roster.write().await.apply_event(&event);
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    apply_seeded_mob_signal(
+        authority,
+        crate::machines::mob_machine::MobMachineSignal::RecoverSpawnedMemberPeerEndpoint {
+            agent_identity: crate::machines::mob_machine::AgentIdentity::from_domain(
+                &entry.agent_identity,
+            ),
+            agent_runtime_id: crate::machines::mob_machine::AgentRuntimeId::from_domain(
+                &entry.agent_runtime_id,
+            ),
+            fence_token: crate::machines::mob_machine::FenceToken::from_domain(entry.fence_token),
+            generation: crate::machines::mob_machine::Generation::from_domain(entry.generation),
+            peer_endpoint: crate::machines::mob_machine::MemberPeerEndpoint::from(spec),
+        },
+        "resume_register_spawned_member_peer_endpoint",
+    )
+    .map_err(|spawned_error| {
+        format!(
+            "its first endpoint could not be recorded ({journal_error}) nor registered on its spawned incarnation ({spawned_error})"
+        )
+    })
+}
+
 /// Cold-boot twin of explicit Resume's per-member endpoint isolation: record
 /// only this member Broken (typed MobMachine restore failure plus the handle
 /// diagnostic), clear its projection, and let the rest of the mob boot.
@@ -2358,7 +2418,7 @@ pub(super) fn open_member_wake_attempt(
         })
 }
 
-/// Resolve a restored member's open wake attempt as bound (F11 step one):
+/// Resolve a restored member's open wake attempt as bound (the first step):
 /// the member stays Waking, and its routed runtime binding is requested.
 /// `ResolveMemberRevivalSucceeded` (Waking -> Live) follows once the member's
 /// readiness and topology settled.
@@ -7676,6 +7736,12 @@ impl MobBuilder {
     /// retryable until the host's seat step for it
     /// ([`MobHandle::seat_dormant_members`], [`MobHandle::rotate_member`])
     /// clears the mark, durably, in the same step.
+    ///
+    /// A host whose rotation a crash interrupted passes the identity here:
+    /// the start then holds the interrupted retirement open (it does not end
+    /// it as a plain retirement) until the host calls
+    /// [`MobHandle::rotate_member`] again, which finishes the rotation on the
+    /// same session.
     pub fn with_host_pending_members(
         mut self,
         members: impl IntoIterator<Item = AgentIdentity>,
@@ -10046,8 +10112,15 @@ impl MobBuilder {
                         .write()
                         .await
                         .apply_event(&recovered_event);
-                } else {
-                    register_seeded_member_peer(
+                } else if dsl_authority
+                    .state()
+                    .member_peer_endpoints
+                    .contains_key(&dsl_identity)
+                {
+                    // The durable endpoint equals the live one (checked
+                    // above): this incarnation re-admits it. A refusal
+                    // breaks this member alone.
+                    if let Err(error) = register_seeded_member_peer(
                         dsl_authority,
                         &entry.agent_identity,
                         &entry.agent_runtime_id,
@@ -10055,7 +10128,36 @@ impl MobBuilder {
                         entry.fence_token,
                         &spec,
                         "resume_register_member_peer",
-                    )?;
+                    ) {
+                        record_seeded_member_endpoint_broken(
+                            dsl_authority,
+                            roster,
+                            &tool_handle.restore_diagnostics,
+                            entry,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                } else if let Err(detail) = record_first_seeded_member_endpoint(
+                    dsl_authority,
+                    roster,
+                    tool_handle,
+                    &definition.id,
+                    entry,
+                    &spec,
+                )
+                .await
+                {
+                    record_seeded_member_endpoint_broken(
+                        dsl_authority,
+                        roster,
+                        &tool_handle.restore_diagnostics,
+                        entry,
+                        &detail,
+                    )
+                    .await?;
+                    continue;
                 }
             } else if let MemberRef::BackendPeer {
                 peer_id,
@@ -10108,15 +10210,23 @@ impl MobBuilder {
         .await?;
         // The boot set settled (each member is bound or Broken) and every
         // legacy member's endpoint is recovered: seal the plan. From here on
-        // every Dormant or Waking member has a durable endpoint, so every one
-        // is peer-wakeable; the seal rebuilds the wake routes.
+        // every Dormant or Waking member has a durable endpoint or owes one,
+        // so every one is peer-wakeable; the seal rebuilds the wake routes.
+        // A refused seal fails no start: the mob runs with the plan unsealed,
+        // and the actor rebuilds every wake route from machine state when it
+        // starts, as it does after every seal.
         let mut boot_plan = boot_plan;
-        boot_plan
-            .residency_effects
-            .extend(super::boot_plan::seal_boot_materialization_plan(
-                dsl_authority,
-                "resume_seal_boot_materialization_plan",
-            )?);
+        match super::boot_plan::seal_boot_materialization_plan(
+            dsl_authority,
+            "resume_seal_boot_materialization_plan",
+        ) {
+            Ok(effects) => boot_plan.residency_effects.extend(effects),
+            Err(error) => tracing::warn!(
+                mob_id = %definition.id,
+                %error,
+                "MobMachine refused to seal the boot materialization plan; the mob starts with it unsealed"
+            ),
+        }
         let mut deferred_orchestrator_resume_notifications = Vec::new();
         if notify_orchestrator_on_resume && let Some(orchestrator) = &definition.orchestrator {
             let orchestrator_entries = dsl_authority

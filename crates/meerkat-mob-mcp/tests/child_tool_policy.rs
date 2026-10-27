@@ -1157,9 +1157,9 @@ async fn a_restored_host_mob_member_keeps_its_durable_policy() {
 }
 
 /// A persistent child mob whose member mounts the agent mob tools comes back
-/// after a cold restart. Restore rebuilds the member, and the member's build
-/// runs the generated mob-tool factory inside that restore, so the factory
-/// must not wait on the restore (it did, and the restore never finished).
+/// after a cold restart, and the member wakes. The member's build runs the
+/// generated mob-tool factory, so the factory must not wait on the restore
+/// (it did, and the restore never finished).
 #[tokio::test(flavor = "multi_thread")]
 async fn a_child_member_with_mob_tools_restores_after_a_cold_restart() {
     let (mut fixture, dispatched) = fixture(|state| state);
@@ -1217,6 +1217,21 @@ async fn a_child_member_with_mob_tools_restores_after_a_cold_restart() {
         listed.iter().any(|(id, _)| *id == child_id),
         "the child mob is restored: {listed:?}"
     );
+    // The member holds no work, so the restart leaves it dormant: its build,
+    // which runs the generated mob-tool factory, happens at its wake, which
+    // must not wait on the restore either.
+    let child = fixture
+        .state
+        .handle_for(&child_id)
+        .await
+        .expect("child mob handle");
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        child.ensure_member_live(&AgentIdentity::from("child-worker")),
+    )
+    .await
+    .expect("waking a child member with mob tools does not wait on the restore")
+    .expect("the child member wakes");
     fixture.teardown().await;
 }
 
@@ -1325,7 +1340,7 @@ async fn an_orchestrator_resume_notification_reaches_its_listing_follow_up_after
 // Member residency of members an agent created, across a cold restart: they
 // come back Dormant, a peer message between them wakes its recipient, and the
 // agent's own `mob_retire_member` and `mob_destroy` act on Dormant members
-// without waking them (R27).
+// without waking them.
 // ---------------------------------------------------------------------------
 
 const SENDER: &str = "agent-sender";
@@ -1449,7 +1464,7 @@ async fn members_an_agent_created_come_back_dormant_and_a_peer_message_wakes_one
     fixture.teardown().await;
 }
 
-/// R27 through the agent tools: after a cold restart, the creating member's
+/// Through the agent tools: after a cold restart, the creating member's
 /// `mob_retire_member` retires a Dormant member it spawned, leaving the
 /// member's wired peer Dormant, and its `mob_destroy` destroys the child mob
 /// with that Dormant member still in it.

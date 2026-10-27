@@ -1504,12 +1504,15 @@ async fn reconstructed_stopped_resume_preparation_keeps_query_phase_responsive()
     }
     handle.stop().await.expect("stop original mob");
     crash_stop_and_release_routes(handle).await;
+    // The row holds the members' attachment preparation at the lift, so the
+    // lift must restore every member.
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events,
         runtime_metadata,
     ))
     .with_session_service(service.clone())
     .notify_orchestrator_on_resume(false)
+    .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
     .resume()
     .await
     .expect("reconstruct stopped mob");
@@ -1573,9 +1576,12 @@ async fn reconstructed_isolation_mob_with_definition(
     );
     mob.handle.stop().await.expect("stop original");
     crash_stop_and_release_routes(mob.handle).await;
+    // Every user holds or observes member construction at the lift, so the
+    // lift must restore every member.
     mob.handle = MobBuilder::for_resume(storage)
         .with_session_service(mob.service.clone())
         .notify_orchestrator_on_resume(false)
+        .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("reconstruct stopped actor");
@@ -1606,10 +1612,13 @@ async fn reconstructed_resume_preserves_the_exact_host_compaction_curator() {
     mob.handle.stop().await.expect("stop original");
     crash_stop_and_release_routes(mob.handle).await;
     let curator: Arc<dyn meerkat_core::CompactionCurator> = Arc::new(TestCompactionCurator);
+    // The row counts the member construction the lift performs, so the lift
+    // must restore the member.
     mob.handle = MobBuilder::for_resume(storage)
         .with_session_service(mob.service.clone())
         .with_spawn_member_customizer(Arc::new(CuratorCustomizer(Arc::clone(&curator))))
         .notify_orchestrator_on_resume(false)
+        .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("reconstruct stopped actor");

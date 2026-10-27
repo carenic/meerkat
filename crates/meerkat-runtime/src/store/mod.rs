@@ -10031,9 +10031,12 @@ pub trait RuntimeStore: Send + Sync {
     /// A runtime holds recovery work when it has nonterminal input rows,
     /// pending terminal owners, a provisional tail (an open run cursor), a
     /// machine lifecycle record that names a current run or does not decode,
-    /// or input rows with no lifecycle record. A runtime whose session
-    /// catalog entry is archived holds none. The host store adapter's open
-    /// loads exactly the bodies of such runtimes, by the same predicate.
+    /// input rows with no lifecycle record, or an ops lifecycle snapshot
+    /// that owes work (a background operation completion its session was not
+    /// woken for, or a detached job wait still running). A runtime whose
+    /// session catalog entry is archived holds none. The host store
+    /// adapter's open loads exactly the bodies of such runtimes, by the same
+    /// predicate.
     ///
     /// A mob boot reads this to decide which members it materializes: a
     /// member whose runtime appears here is materialized, and one with no
