@@ -552,7 +552,7 @@ fi
 # archive (under an admitted destroy no rotation or host carry-out holds it)
 # and no rotation under an admitted destroy, with the I5 ASSUME over the wake
 # refusal helper. It runs with TLC coverage and requires every listed arm to
-# fire and a floor of distinct states per run, and requires its twenty-four
+# fire and a floor of distinct states per run, and requires its twenty-five
 # witnesses reached. Its --mutants mode (run by hand, outside the shard's
 # budget) refuses thirty-eight seeded defects, one per residency invariant and
 # property.

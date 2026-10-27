@@ -568,6 +568,15 @@ macro_rules! mob_catalog_machine_dsl {
             // retiring member is ever woken). Their retirement routes no
             // runtime retire; the session archive alone terminates them.
             runtime_retire_archive_only: Set<AgentRuntimeId>,
+            // Owed trust repairs: a wiring edge whose trust realization failed
+            // (at a wake's topology step or at a repair) while its members
+            // close Live regardless. A successful realization of the edge
+            // clears it, and so do the edge going and either end leaving
+            // (retired or unseated). The owner retries each with backoff
+            // (OwedEdgeRepairsRecorded).
+            owed_edge_repairs: Set<WiringEdge>,
+            // The same for an external peer edge of a local member.
+            owed_external_edge_repairs: Set<ExternalPeerEdge>,
         }
 
         init(Running) {
@@ -867,6 +876,8 @@ macro_rules! mob_catalog_machine_dsl {
             member_rotation_session_ids = EmptyMap,
             member_rotation_peer_endpoints = EmptyMap,
             runtime_retire_archive_only = EmptySet,
+            owed_edge_repairs = EmptySet,
+            owed_external_edge_repairs = EmptySet,
         }
 
         terminal [Destroyed]
@@ -1925,6 +1936,12 @@ macro_rules! mob_catalog_machine_dsl {
             // seated (G1): the route's fields; the identity is resolved
             // through identity_to_runtime. Total, stale-tolerant (F5).
             ReleaseMemberMaterialization { agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>, cause: Enum<MemberMaterializationLossCause> },
+            // The outcome of realizing one edge's trust (a wake's topology
+            // step, a respawn's topology restore, an owed repair): a realized
+            // edge owes no repair; an unrealized one is owed while it is wired
+            // between seated members that are not retiring.
+            ResolveWiringEdgeRealization { edge: WiringEdge, realized: bool },
+            ResolveExternalEdgeRealization { edge: ExternalPeerEdge, realized: bool },
         }
 
         effect MobMachineEffect {
@@ -2314,6 +2331,9 @@ macro_rules! mob_catalog_machine_dsl {
             // attempt (several members at once): the owner arms its retry
             // timer for every owed Dormant member.
             OwedMemberWakesRecorded,
+            // An edge's trust repair is owed: the owner arms its repair timer
+            // for every owed edge.
+            OwedEdgeRepairsRecorded,
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -3249,6 +3269,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition MemberReleaseClassified => local seam SurfaceResultAlignment,
         disposition RuntimeBindingRefusalStale => local seam SurfaceResultAlignment,
         disposition OwedMemberWakesRecorded => local seam OwnerRealizationOnly,
+        disposition OwedEdgeRepairsRecorded => local seam OwnerRealizationOnly,
 
         // =====================================================================
         // Invariants
@@ -4172,6 +4193,19 @@ macro_rules! mob_catalog_machine_dsl {
         invariant archive_only_retirement_is_retiring {
             for_all(rid in self.runtime_retire_archive_only,
                 self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring))
+        }
+
+        // An owed edge repair is a wired edge between seated members, and an
+        // owed external repair is a wired external edge of a seated member:
+        // the edge going, or an end being unseated, clears it.
+        invariant owed_edge_repairs_join_seated_members {
+            for_all(edge in self.owed_edge_repairs,
+                self.wiring_edges.contains(edge)
+                && self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge))
+                && self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)))
+            && for_all(edge in self.owed_external_edge_repairs,
+                self.external_peer_edges.contains(edge)
+                && self.identity_to_runtime.contains_key(mob_machine_external_peer_edge_local(edge)))
         }
 
         // R124: the destroy beats every member lifecycle. A destroyed mob holds
@@ -8990,6 +9024,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.abandoned_respawn_topology.insert(agent_identity, generation);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
             }
@@ -9169,6 +9205,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.remove(agent_identity);
                     self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                     self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                    self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                    self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
@@ -9274,6 +9312,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.remove(agent_identity);
                     self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                     self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                    self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                    self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
@@ -12252,6 +12292,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.remove(agent_identity);
                     self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                     self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                    self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                    self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
@@ -12350,6 +12392,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
             }
@@ -12419,6 +12463,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -12522,6 +12570,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
             }
@@ -12603,6 +12653,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
             }
@@ -12664,6 +12716,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -12761,6 +12817,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 self.topology_epoch += 1;
             }
@@ -12844,6 +12902,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.remove(agent_identity);
                     self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                     self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                    self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                    self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
@@ -12941,6 +13001,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.pending_respawn_topology.remove(agent_identity);
                     self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                     self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                    self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                    self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                     self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                     self.topology_epoch += 1;
                 }
@@ -13113,6 +13175,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13185,6 +13251,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13251,6 +13321,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13316,6 +13390,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13397,6 +13475,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13482,6 +13564,10 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                // The member leaves: its owed edge repairs go (the kept
+                // graph is re-realized by a successor or dropped by the destroy).
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13974,6 +14060,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology = EmptySet;
                 self.abandoned_respawn_topology = EmptyMap;
                 self.external_peer_edges = EmptySet;
+                self.owed_edge_repairs = EmptySet;
+                self.owed_external_edge_repairs = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -14449,6 +14537,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology = EmptySet;
                 self.abandoned_respawn_topology = EmptyMap;
                 self.external_peer_edges = EmptySet;
+                self.owed_edge_repairs = EmptySet;
+                self.owed_external_edge_repairs = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.topology_epoch += 1;
             }
@@ -14683,6 +14773,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "edge_recovered" { self.wiring_edges.contains(edge) == true }
             update {
                 self.wiring_edges.remove(edge);
+                self.owed_edge_repairs.remove(edge);
                 self.topology_epoch += 1;
             }
             to Running
@@ -14712,6 +14803,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             update {
                 self.wiring_edges.remove(edge);
+                self.owed_edge_repairs.remove(edge);
                 if self.identity_to_runtime.contains_key(a_identity) == false {
                     self.pending_respawn_topology.remove(a_identity);
                 }
@@ -14770,6 +14862,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "edge_currently_wired" { self.wiring_edges.contains(edge) == true }
             update {
                 self.wiring_edges.remove(edge);
+                self.owed_edge_repairs.remove(edge);
                 self.topology_epoch += 1;
             }
             to Running
@@ -14797,6 +14890,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "member_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring) }
             update {
                 self.wiring_edges.remove(edge);
+                self.owed_edge_repairs.remove(edge);
                 self.topology_epoch += 1;
             }
             to Running
@@ -15336,6 +15430,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "external_peer_recovered" { self.external_peer_edges_by_key.contains_key(key) == true }
             update {
                 self.external_peer_edges.remove(self.external_peer_edges_by_key.get_cloned(key).get("value"));
+                self.owed_external_edge_repairs.remove(self.external_peer_edges_by_key.get_cloned(key).get("value"));
                 self.external_peer_edges_by_key.remove(key);
                 self.topology_epoch += 1;
             }
@@ -15360,6 +15455,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "local_member_not_dormant" { self.member_materialization.get_cloned(mob_machine_external_peer_edge_local(edge)) != Some(MemberMaterializationPhase::Dormant) }
             update {
                 self.external_peer_edges.remove(edge);
+                self.owed_external_edge_repairs.remove(edge);
                 self.external_peer_edges_by_key.remove(key);
                 self.topology_epoch += 1;
             }
@@ -15387,6 +15483,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "local_member_dormant" { self.member_materialization.get_cloned(mob_machine_external_peer_edge_local(edge)) == Some(MemberMaterializationPhase::Dormant) }
             update {
                 self.external_peer_edges.remove(edge);
+                self.owed_external_edge_repairs.remove(edge);
                 self.external_peer_edges_by_key.remove(key);
                 self.topology_epoch += 1;
             }
@@ -15420,6 +15517,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "retiring_runtime_registered" { self.runtime_retire_archive_only.contains(agent_runtime_id) == false }
             update {
                 self.external_peer_edges.remove(edge);
+                self.owed_external_edge_repairs.remove(edge);
                 self.external_peer_edges_by_key.remove(key);
                 self.topology_epoch += 1;
             }
@@ -15483,6 +15581,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "retiring_peer_id_retained" { self.member_peer_ids.get_cloned(agent_identity) == Some(mob_machine_member_peer_endpoint_peer_id(self.member_peer_endpoints.get_cloned(agent_identity).get("value"))) }
             update {
                 self.external_peer_edges.remove(edge);
+                self.owed_external_edge_repairs.remove(edge);
                 self.external_peer_edges_by_key.remove(key);
                 self.topology_epoch += 1;
             }
@@ -21335,6 +21434,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_respawn_topology = EmptySet;
                 self.abandoned_respawn_topology = EmptyMap;
                 self.external_peer_edges = EmptySet;
+                self.owed_edge_repairs = EmptySet;
+                self.owed_external_edge_repairs = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -25221,6 +25322,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.abandoned_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 // The next incarnation, seated Dormant on the recorded NEW
                 // session and endpoint in the same step: no non-member window.
@@ -25389,6 +25492,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.abandoned_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 // The next incarnation, seated Dormant on the recorded NEW
                 // session and endpoint in the same step: no non-member window.
@@ -25951,6 +26056,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.abandoned_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 // The next incarnation, seated Dormant on the recorded NEW
                 // session and endpoint in the same step: no non-member window.
@@ -26130,6 +26237,8 @@ macro_rules! mob_catalog_machine_dsl {
                 self.abandoned_respawn_topology.remove(agent_identity);
                 self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
                 self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
+                self.owed_external_edge_repairs = mob_machine_external_peer_edges_without_identity(self.owed_external_edge_repairs, agent_identity);
                 self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
                 // The next incarnation, seated Dormant on the recorded NEW
                 // session and endpoint in the same step: no non-member window.
@@ -26546,6 +26655,95 @@ macro_rules! mob_catalog_machine_dsl {
                 cause: MemberWakeCause::PlacedPeerWired,
                 attempt: self.member_wake_attempt_sequence
             }
+        }
+
+        // Edge trust repairs. Each realization outcome of one edge's trust
+        // (a wake's topology step, a respawn's topology restore, an owed
+        // repair) is applied once: a realized edge owes no repair; an
+        // unrealized edge is owed a repair while it is wired between seated
+        // members that are not retiring, and the owner retries it with
+        // backoff; anything else is a no-op. A typed answer in every
+        // lifecycle phase, so a late outcome never fails.
+        transition ResolveWiringEdgeRealizationRealized {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveWiringEdgeRealization { edge, realized }
+            guard "realized" { realized == true }
+            update {
+                self.owed_edge_repairs.remove(edge);
+            }
+            to Running
+        }
+
+        transition ResolveWiringEdgeRealizationOwed {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveWiringEdgeRealization { edge, realized }
+            guard "unrealized" { realized == false }
+            guard "edge_wired" { self.wiring_edges.contains(edge) == true }
+            guard "ends_seated" {
+                self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
+                && self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == true
+            }
+            guard "ends_not_retiring" {
+                self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value")) != Some(MobMemberState::Retiring)
+                && self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value")) != Some(MobMemberState::Retiring)
+            }
+            update {
+                self.owed_edge_repairs.insert(edge);
+            }
+            to Running
+            emit OwedEdgeRepairsRecorded
+        }
+
+        transition ResolveWiringEdgeRealizationStale {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveWiringEdgeRealization { edge, realized }
+            guard "unrealized" { realized == false }
+            guard "edge_not_repairable" {
+                self.wiring_edges.contains(edge) == false
+                || self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == false
+                || self.identity_to_runtime.contains_key(mob_machine_wiring_edge_b(edge)) == false
+                || self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value")) == Some(MobMemberState::Retiring)
+                || self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value")) == Some(MobMemberState::Retiring)
+            }
+            update {}
+            to Running
+        }
+
+        transition ResolveExternalEdgeRealizationRealized {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveExternalEdgeRealization { edge, realized }
+            guard "realized" { realized == true }
+            update {
+                self.owed_external_edge_repairs.remove(edge);
+            }
+            to Running
+        }
+
+        transition ResolveExternalEdgeRealizationOwed {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveExternalEdgeRealization { edge, realized }
+            guard "unrealized" { realized == false }
+            guard "edge_wired" { self.external_peer_edges.contains(edge) == true }
+            guard "local_seated" { self.identity_to_runtime.contains_key(mob_machine_external_peer_edge_local(edge)) == true }
+            guard "local_not_retiring" { self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_external_peer_edge_local(edge)).get("value")) != Some(MobMemberState::Retiring) }
+            update {
+                self.owed_external_edge_repairs.insert(edge);
+            }
+            to Running
+            emit OwedEdgeRepairsRecorded
+        }
+
+        transition ResolveExternalEdgeRealizationStale {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveExternalEdgeRealization { edge, realized }
+            guard "unrealized" { realized == false }
+            guard "edge_not_repairable" {
+                self.external_peer_edges.contains(edge) == false
+                || self.identity_to_runtime.contains_key(mob_machine_external_peer_edge_local(edge)) == false
+                || self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_external_peer_edge_local(edge)).get("value")) == Some(MobMemberState::Retiring)
+            }
+            update {}
+            to Running
         }
     }
         }
