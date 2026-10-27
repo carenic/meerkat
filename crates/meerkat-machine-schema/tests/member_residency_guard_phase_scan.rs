@@ -38,6 +38,16 @@ const RESIDENCY_ARM_PREFIXES: &[&str] = &[
     "ClassifyExplicitResumeMemberLive",
     "SettleExplicitResumeMember",
     "ResolveRecreatedMemberSessionSucceeded",
+    "ClassifyMemberRelease",
+    "RetireRunningReleasingArchiveOnly",
+    "RetireRunningPreservingBindingArchiveOnly",
+    "RetireStoppedReleasingArchiveOnly",
+    "RetireStoppedPreservingBindingArchiveOnly",
+    "RetireMemberArchiveOnly",
+    "AdmitDestroyMemberRetireArchiveOnly",
+    "WireExternalPeerDormant",
+    "WireExternalPeerAlreadyWiredDormant",
+    "UnwireExternalPeerDormant",
 ];
 
 /// Families that must each name at least one arm, so the scan is not vacuous.
@@ -54,15 +64,38 @@ const REQUIRED_ARM_FAMILIES: &[&str] = &[
     "SeedMemberResidency",
     "ResolveMemberHostPreparation",
     "ResolveMemberRevival",
+    "ClassifyMemberRelease",
+    "RetireMemberArchiveOnly",
+    "AdmitDestroyMemberRetireArchiveOnly",
+    "WireExternalPeerDormant",
+    "UnwireExternalPeerDormant",
 ];
+
+/// Transition-name prefixes of the `MeerkatMachine` arms that serve member
+/// residency (the empty-resume verdict and the composition's residency
+/// claim). Each must name at least one arm.
+const MEERKAT_RESIDENCY_ARM_PREFIXES: &[&str] =
+    &["ResolveEmptyResumeRetirement", "ClaimCompositionResidency"];
 
 /// Helper-name prefixes of the residency helpers: they take member facts
 /// only, never the lifecycle phase.
-const RESIDENCY_HELPER_PREFIXES: &[&str] = &["member_wake", "member_boot", "peer_notice"];
+const RESIDENCY_HELPER_PREFIXES: &[&str] = &[
+    "member_wake",
+    "member_boot",
+    "peer_notice",
+    "member_release",
+    "member_registration",
+];
+
+fn dsl_source(file: &str) -> String {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("src/catalog/dsl")
+        .join(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+}
 
 fn mob_machine_dsl_source() -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/catalog/dsl/mob_machine.rs");
-    std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
+    dsl_source("mob_machine.rs")
 }
 
 /// The source with every `//` line comment blanked (string literals kept), so
@@ -245,20 +278,16 @@ fn is_residency_arm(name: &str) -> bool {
         .any(|prefix| name.starts_with(prefix))
 }
 
-#[test]
-fn residency_arm_guards_never_mix_the_lifecycle_phase() {
-    let source = without_line_comments(&mob_machine_dsl_source());
-    let transitions = scanned_transitions(&source);
-    assert!(
-        transitions.len() > 500,
-        "the DSL scan found only {} transitions",
-        transitions.len()
-    );
-
+/// Every guard of the arms `select` picks that reads the lifecycle phase
+/// beyond the plain source predicate.
+fn phase_mixing_guards(
+    transitions: &[ScannedTransition],
+    select: impl Fn(&str) -> bool,
+) -> Vec<String> {
     let mut violations = Vec::new();
     for transition in transitions
         .iter()
-        .filter(|transition| is_residency_arm(&transition.name))
+        .filter(|transition| select(&transition.name))
     {
         for (guard_name, guard_body) in &transition.guards {
             if !guard_body.contains("lifecycle_phase") {
@@ -281,6 +310,20 @@ fn residency_arm_guards_never_mix_the_lifecycle_phase() {
             }
         }
     }
+    violations
+}
+
+#[test]
+fn residency_arm_guards_never_mix_the_lifecycle_phase() {
+    let source = without_line_comments(&mob_machine_dsl_source());
+    let transitions = scanned_transitions(&source);
+    assert!(
+        transitions.len() > 500,
+        "the DSL scan found only {} transitions",
+        transitions.len()
+    );
+
+    let violations = phase_mixing_guards(&transitions, is_residency_arm);
     assert!(
         violations.is_empty(),
         "member-residency arms must split per lifecycle phase instead of reading it in a guard \
@@ -300,6 +343,45 @@ fn residency_arm_guards_never_mix_the_lifecycle_phase() {
     assert!(
         missing.is_empty(),
         "expected member-residency arm families are missing from the DSL: {missing:?}"
+    );
+}
+
+/// The `MeerkatMachine` arms that serve member residency follow the same rule:
+/// the empty-resume verdict and the composition's claim are one arm per
+/// lifecycle phase, with no phase read in a guard.
+#[test]
+fn meerkat_residency_arm_guards_never_mix_the_lifecycle_phase() {
+    let source = without_line_comments(&dsl_source("meerkat_machine.rs"));
+    let transitions = scanned_transitions(&source);
+    assert!(
+        transitions.len() > 300,
+        "the MeerkatMachine DSL scan found only {} transitions",
+        transitions.len()
+    );
+    let is_meerkat_residency_arm = |name: &str| {
+        MEERKAT_RESIDENCY_ARM_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    };
+    let violations = phase_mixing_guards(&transitions, is_meerkat_residency_arm);
+    assert!(
+        violations.is_empty(),
+        "MeerkatMachine residency arms must split per lifecycle phase instead of reading it in a \
+         guard or a guard call (schema lowering strips those):\n{}",
+        violations.join("\n")
+    );
+    let missing: Vec<&str> = MEERKAT_RESIDENCY_ARM_PREFIXES
+        .iter()
+        .copied()
+        .filter(|family| {
+            !transitions
+                .iter()
+                .any(|transition| transition.name.starts_with(family))
+        })
+        .collect();
+    assert!(
+        missing.is_empty(),
+        "expected MeerkatMachine residency arm families are missing from the DSL: {missing:?}"
     );
 }
 

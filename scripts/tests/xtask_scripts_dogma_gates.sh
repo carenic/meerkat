@@ -568,6 +568,7 @@ printf '%s\n' \
   'echo "Error: Invariant archive_only_retirement_is_retiring is violated."' \
   'echo "Error: Invariant destroyed_mob_holds_no_member_lifecycle is violated."' \
   'echo "Error: Invariant AuditWakeClosesLiveUnlessEndpointOwed is violated."' \
+  'echo "Error: Invariant AuditReleaseVerdictMatchesArm is violated."' \
   'echo "Error: Action property AuditPlanLeavesSealable is violated."' \
   'echo "Error: Action property NotAuditWitnessSessionOwnedRetires is violated."' \
   'echo "Error: Action property NotAuditWitnessCompositionKeepsServing is violated."' \

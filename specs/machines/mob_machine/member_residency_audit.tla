@@ -77,7 +77,9 @@
 \*     shape), AuditSucceededLeavesEndpoint (a local wake never closes Live
 \*     without an endpoint while it owes EndpointPending),
 \*     AuditWakeClosesLiveUnlessEndpointOwed (a bound wake owing no endpoint
-\*     cause can always close Live) and AuditReleaseEpochFence (a release
+\*     cause can always close Live), AuditReleaseVerdictMatchesArm (the
+\*     release verdict is Release exactly when the Released arm would honour
+\*     the member's own registration) and AuditReleaseEpochFence (a release
 \*     whose epoch is not the member's recorded one never demotes it);
 \*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (R124: a
@@ -90,8 +92,9 @@
 \*     runtime binding).
 \* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
-\* member. A second ASSUME pins the release verdict helper: Release exactly for
-\* a seated, local, Live member, WakeInFlight exactly for a Waking one.
+\* member. A second ASSUME pins the release verdict helper: Release or
+\* NotYetReleasable exactly for a seated, local, Live member, WakeInFlight
+\* exactly for a Waking one.
 \*
 \* Not covered: I3 (a Dormant member is local) needs a placed member, which
 \* only the placement arms create; the placed revival arm likewise. The machine
@@ -851,6 +854,30 @@ AuditWakeClosesLiveUnlessEndpointOwed ==
               /\ member_boot_obligation_owed[id] = "EndpointPending"))
             => ENABLED ResolveMemberRevivalSucceededRunningLocal(id, member_wake_attempts[id])
 
+\* The release verdict and the Released arm cannot drift: member 1's verdict is
+\* Release exactly when the Released arm would honour the release of its own
+\* registration (its runtime, fence and recorded epoch).
+AuditReleaseVerdictMatchesArm ==
+    (/\ phase = "Running"
+     /\ Id1 \in DOMAIN identity_to_runtime
+     /\ Id1 \in DOMAIN identity_runtime_fence_tokens) =>
+        LET placed1 == Id1 \in DOMAIN member_placement
+            verdict ==
+                member_release_verdict(
+                    TRUE, placed1, Phase1,
+                    member_registration_releasable(
+                        Phase1, placed1, boot_plan_sealed,
+                        Id1 \in DOMAIN member_peer_endpoints,
+                        Id1 \in DOMAIN member_materialization_epoch))
+            released ==
+                /\ Id1 \in DOMAIN member_materialization_epoch
+                /\ ENABLED ReleaseMemberMaterializationReleasedRunning(
+                       Some(identity_to_runtime[Id1]),
+                       Some(identity_runtime_fence_tokens[Id1]),
+                       member_materialization_epoch[Id1],
+                       "RegistrationReleased")
+        IN (verdict = "Release") <=> released
+
 \* The boot plan never leaves a member that blocks the seal: after its plan a
 \* member has a durable endpoint or owes EndpointPending.
 AuditPlanLeavesSealable ==
@@ -921,13 +948,13 @@ ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, or
                             host_pending, input_class, sender_waking, observed_missing, residency)
             # Some("NotAMember")
 
-\* The release verdict: Release exactly for a seated, local, Live member, and
-\* WakeInFlight exactly for a seated, local, Waking one.
-ASSUME \A seated, placed \in BOOLEAN,
+\* The release verdict: Release or NotYetReleasable exactly for a seated,
+\* local, Live member, and WakeInFlight exactly for a seated, local, Waking one.
+ASSUME \A seated, placed, releasable \in BOOLEAN,
           residency \in {None, Some("Dormant"), Some("Waking"), Some("Live")} :
-    /\ (member_release_verdict(seated, placed, residency) = "Release")
+    /\ (member_release_verdict(seated, placed, residency, releasable) \in {"Release", "NotYetReleasable"})
            <=> (seated /\ ~placed /\ residency = Some("Live"))
-    /\ (member_release_verdict(seated, placed, residency) = "WakeInFlight")
+    /\ (member_release_verdict(seated, placed, residency, releasable) = "WakeInFlight")
            <=> (seated /\ ~placed /\ residency = Some("Waking"))
 
 (***************************************************************************)
