@@ -27,7 +27,8 @@
 #   Stopped, a host-pending seed, and the mob's destroy;
 # - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
 # - resume (AuditResumeSpec): one identity through an explicit resume;
-# - edge (AuditEdgeSpec): two identities and one wiring edge (I8);
+# - edge (AuditEdgeSpec): two identities and one wiring edge (I8) and its
+#   trust realization outcomes (an owed edge repair);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
 #   through the dormant seat, the embodied spawn commit, the release and the
 #   rotation;
@@ -258,6 +259,9 @@ edge_covered_actions=(
   RecoverRosterWiringRunning
   WireMembersRunning
   ObserveMemberRetirementArchivedLivePreservingTopology
+  ResolveWiringEdgeRealizationRealizedRunning
+  ResolveWiringEdgeRealizationOwedRunning
+  ResolveWiringEdgeRealizationStaleRunning
 )
 
 seat_covered_actions=(
@@ -571,7 +575,7 @@ for witness in \
   "retire:Action property:RotatedStopped" \
   "resume:Action property:ResumeJoins" "resume:Action property:ResumeReservesLive" \
   "resume:Action property:ResumeFinishedLive" \
-  "edge:Invariant:HeldEdge" \
+  "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
   "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
   "wake2:Action property:CrossNotice" "wake2:Action property:RetireBesideWaking"; do
