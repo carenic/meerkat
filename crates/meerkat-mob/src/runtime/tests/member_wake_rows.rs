@@ -1109,3 +1109,120 @@ async fn a_wake_asks_the_customizer_again_with_its_current_answer() {
     );
     fixture.finish().await;
 }
+
+/// An external wire or unwire whose trust row belongs to a member that is
+/// being woken waits for the wake, then lands on the woken member's runtime
+/// (the command is parked while the member's wake attempt is open).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_external_wire_during_a_wake_waits_for_it_and_installs_on_the_woken_member() {
+    let fixture = WakeFixture::new("wake-external-wire").await;
+    let member = fixture.spawn("ext-wire-member").await;
+    let external_name = format!("external-peer-{}", Uuid::new_v4().simple());
+    let external =
+        test_trusted_peer_descriptor(&external_name, &format!("inproc://{external_name}"));
+    let trusts_external = |peers: &[meerkat_core::comms::PeerDirectoryEntry]| {
+        peers
+            .iter()
+            .any(|peer| peer.name.as_str() == external_name.as_str())
+    };
+
+    // A wire while the member's wake is held.
+    fixture.release(&member).await;
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+    let wire = {
+        let handle = fixture.handle.clone();
+        let local = member.clone();
+        let target = PeerTarget::External(external.clone());
+        tokio::spawn(async move { handle.wire(local, target).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !wire.is_finished(),
+        "the wire waits for the member's wake while it is held"
+    );
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task joins")
+        .expect("the member wakes");
+    tokio::time::timeout(WAIT, wire)
+        .await
+        .expect("the wire answers after the wake")
+        .expect("the wire task joins")
+        .expect("the external wire lands");
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
+    assert!(
+        trusts_external(&fixture.comms(&member).await.peers().await),
+        "the woken member's runtime trusts the external peer"
+    );
+    let wired_events = fixture
+        .handle
+        .poll_events(0, 100_000)
+        .await
+        .expect("read the journal")
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                crate::event::MobEventKind::ExternalPeerWired { local, spec }
+                    if local == &member && spec.name == external.name
+            )
+        })
+        .count();
+    assert_eq!(wired_events, 1, "the journal holds one ExternalPeerWired");
+
+    // The mirror: an unwire while the member's wake is held.
+    fixture.release(&member).await;
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+    let unwire = {
+        let handle = fixture.handle.clone();
+        let local = member.clone();
+        let target = PeerTarget::External(external.clone());
+        tokio::spawn(async move { handle.unwire(local, target).await })
+    };
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !unwire.is_finished(),
+        "the unwire waits for the member's wake while it is held"
+    );
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task joins")
+        .expect("the member wakes");
+    tokio::time::timeout(WAIT, unwire)
+        .await
+        .expect("the unwire answers after the wake")
+        .expect("the unwire task joins")
+        .expect("the external unwire lands");
+    assert!(
+        !trusts_external(&fixture.comms(&member).await.peers().await),
+        "the woken member's runtime no longer trusts the external peer"
+    );
+    fixture.finish().await;
+}

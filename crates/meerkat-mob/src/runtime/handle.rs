@@ -2832,6 +2832,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::MemberRestoreFailed { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::MemberRestoreFailed
         }
+        // A refused member wake (a resume spawn of a seated member that is
+        // not materialized): the member's session could not be served now.
+        MobError::MemberWakeRefused { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::SessionError
+        }
         // Never a spawn outcome today (a spawn on a stopped actor gets
         // ActorCommandChannelClosed, and a spawn acts on no deferred member);
         // were either one, it classifies as its cause.
