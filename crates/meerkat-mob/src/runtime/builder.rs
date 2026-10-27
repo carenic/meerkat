@@ -7879,7 +7879,8 @@ impl MobBuilder {
     }
 
     /// Restore up to `concurrency` members at once when [`Self::resume`]
-    /// restores a running mob's members. Default 16; `0` counts as `1`.
+    /// restores a running mob's members. Default 16; `0` counts as `1`, and a
+    /// value above tokio's `Semaphore::MAX_PERMITS` counts as that maximum.
     ///
     /// Restoring a member reads its session and provisions it, round trips to
     /// the session store that, one member at a time, make a resume grow with
@@ -7926,7 +7927,9 @@ impl MobBuilder {
     /// its `OnDemandVerified` pass reads up to that many verdicts at once.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
-        self.resume_restore_concurrency = concurrency.max(1);
+        // The bound sizes semaphores, and a semaphore panics above its
+        // maximum: a larger value (`usize::MAX` for "no limit") counts as it.
+        self.resume_restore_concurrency = concurrency.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         self
     }
 

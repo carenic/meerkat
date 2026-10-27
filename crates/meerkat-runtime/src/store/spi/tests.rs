@@ -2383,6 +2383,7 @@ async fn obligated_runtimes(store: &SpiRuntimeStore, count: usize) -> Vec<Logica
 #[tokio::test(start_paused = true)]
 async fn an_open_loads_the_runtimes_with_recovery_work_up_to_the_bound_at_once() {
     let bound = super::runtime::BOOT_LOAD_CONCURRENCY;
+    assert_eq!(bound, 16, "the bound the docs and the CHANGELOG state");
     for count in [5, 2 * bound + 3] {
         let host = Arc::new(TestHost::new());
         let opened = open(&host).await;
@@ -2408,13 +2409,14 @@ async fn an_open_loads_the_runtimes_with_recovery_work_up_to_the_bound_at_once()
 // A failed body load fails the open with the host's error, and the open
 // installs nothing: no runtime scope of the realm it leaves counts as
 // loaded, and it commits nothing. Once the host reads again, the next open
-// loads and serves every runtime as it was. The failing runtime is the first
-// in key order and its read answers last, after the other loads finished.
+// loads and serves every runtime as it was. The failing runtime is the last
+// in key order and its read answers last, after the other loads finished, so
+// an open that installed each runtime as its read completed, in key order or
+// not, would have installed the other two.
 //
-// The row holds on the base too: the serial open failed at the first runtime
-// before it read any other. It keeps that contract for the concurrent open,
-// which has read the others by the time the load fails, and installs none of
-// them.
+// RED on the base (e294b75f29, with the row and its test host hooks applied):
+// the serial open imported the first two runtimes and marked their scopes
+// loaded before it failed at the third.
 #[tokio::test(start_paused = true)]
 async fn a_failed_recovery_load_fails_the_open_and_installs_nothing() {
     let host = Arc::new(TestHost::new());
@@ -2427,7 +2429,7 @@ async fn a_failed_recovery_load_fails_the_open_and_installs_nothing() {
     drop(opened);
     host.expire_lease();
     host.faults.lock().unwrap().failing_session_reads =
-        Some((runtime_scope_prefix(&runtimes[0]), BOOT_READ_DELAY));
+        Some((runtime_scope_prefix(&runtimes[2]), BOOT_READ_DELAY));
     let commits = host.commit_count();
     let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
         .await

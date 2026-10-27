@@ -127,7 +127,9 @@ them.
   route for peer ingress and reopen it without rebuilding the runtime.
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
-  `1` restores one member at a time, as before; `0` counts as `1`.
+  `1` restores one member at a time, as before; `0` counts as `1`, and a
+  value above tokio's `Semaphore::MAX_PERMITS` (such as `usize::MAX`) counts
+  as that maximum.
 - `meerkat-mob`: member wakes. A seated member that is not materialized in its
   process (dormant) is materialized on its first delivery, through MobMachine's
   wake verdict, and the delivery then proceeds as to a live member: a host
