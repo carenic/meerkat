@@ -1942,8 +1942,11 @@ impl MobMcpState {
     /// was then dropped) owns the observer until its blocking work returns,
     /// also once the caller awaiting it was cancelled, so the drain refuses
     /// while one runs and the files are never removed under its connection.
-    /// An opener that attaches after the drain and other processes stay
-    /// outside it, so it never states that deleting the storage was safe.
+    /// Outside it stay an opener that attaches after the drain, other
+    /// processes, and the work that opens the database by path without a
+    /// store: the identity runtime write fence a member runtime's writes go
+    /// through, and `MobStorage::read_member_binding_history`. So it never
+    /// states that deleting the storage was safe.
     #[cfg(not(target_arch = "wasm32"))]
     async fn settle_owed_storage_cleanup(
         mobs: &RwLock<BTreeMap<MobId, ManagedMob>>,
@@ -5434,8 +5437,11 @@ impl MobMcpState {
     /// cleanup and answers the canonical report, also while another mob is
     /// managed under the id, which the retry never destroys; another caller
     /// is refused. This settles the observer and the files only: openers
-    /// that attach later and other processes stay outside it, so it is no
-    /// statement that deleting the storage was safe.
+    /// that attach later, other processes, and the work that opens the
+    /// database by path without a store (the identity runtime write fence a
+    /// member runtime's writes go through, and
+    /// `MobStorage::read_member_binding_history`) stay outside it, so it is
+    /// no statement that deleting the storage was safe.
     pub async fn mob_destroy(
         &self,
         mob_id: &MobId,

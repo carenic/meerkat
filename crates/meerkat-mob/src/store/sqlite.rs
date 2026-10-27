@@ -3528,11 +3528,13 @@ impl SqliteMobEventCatchUp {
 /// process are inside it through ownership: a store operation owns the
 /// observer until its blocking work has returned with its connection closed,
 /// also once the future awaiting it was cancelled, so a drain that was not
-/// refused leaves none of them running on the database. Other processes,
-/// readers that open the file by path without a store (such as
-/// `MobStorage::read_member_binding_history`), and openers that attach a new
-/// observer later stay outside it, so on its own it is never a statement
-/// that the database or its directory may be deleted.
+/// refused leaves none of them running on the database. Outside it stay
+/// other processes, openers that attach a new observer later, and the work
+/// that opens the file by path without a store: the identity runtime write
+/// fence a member runtime's writes go through
+/// (`MobIdentityStore::prepare_runtime_write_fence`) and
+/// `MobStorage::read_member_binding_history`. So on its own it is never a
+/// statement that the database or its directory may be deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum SqliteMobObserverDrain {
@@ -3664,8 +3666,9 @@ impl SqliteMobStores {
     /// The result is scoped to that observer and the store operations that
     /// own it; see [`SqliteMobObserverDrain`]. It never states on its own
     /// that the database or its directory may be deleted: other processes,
-    /// readers that open the file without a store and later openers are
-    /// outside it. When `path` no longer resolves and is not itself the
+    /// later openers, and the work that opens the file without a store (the
+    /// identity runtime write fence, `MobStorage::read_member_binding_history`)
+    /// are outside it. When `path` no longer resolves and is not itself the
     /// registered key, it refuses with
     /// [`SqliteMobObserverDrainRefused::UnresolvedPath`] instead of reading
     /// the miss as a missing observer.
