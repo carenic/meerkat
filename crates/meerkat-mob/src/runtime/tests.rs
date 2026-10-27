@@ -88671,6 +88671,8 @@ fn summarize_mob_runtime_error(error: &MobError) -> String {
             "bounded_helper_retirement_failed".to_string()
         }
         MobError::MemberRestoreFailed { .. } => "member_restore_failed".to_string(),
+        MobError::MemberWakeRefused { refusal, .. } => format!("member_wake_refused:{refusal}"),
+        MobError::MemberAuthBindingConflict { .. } => "member_auth_binding_conflict".to_string(),
         MobError::MemberStartupRecoveryFailed { .. } => {
             "member_startup_recovery_failed".to_string()
         }
