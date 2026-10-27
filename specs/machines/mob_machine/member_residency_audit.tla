@@ -53,8 +53,14 @@
 \*   AuditLifecycleNeverWakes (AP3, action property): a Lifecycle wake input
 \*     never opens an attempt, and a peer notice classification never changes
 \*     residency;
+\*   AuditWakeNeverSkipsWaking (action property): a WakeMember input never
+\*     moves a Dormant member straight to Live;
 \*   AuditWakeExactlyOne (invariant): for every wake input exactly one
 \*     WakeMember arm is enabled (the arms are total and disjoint).
+\* In the seat run also:
+\*   AuditSeatLeavesDormant (action property): a dormant seat leaves its
+\*     identity Dormant, with its endpoint or owed EndpointPending, and
+\*     requests no runtime binding.
 \* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
 \* member.
@@ -91,6 +97,7 @@ AuditResumeAttempt == "resumeattemptid_1"
 AuditEpochs == {None, Some("runtimeepochid_1")}
 AuditAttempts == 1..AuditMaxAttempts
 AuditInputClasses == {"Content", "Lifecycle"}
+AuditWakeCauses == {"Boot", "HostDelivery", "PeerDelivery", "Operator"}
 
 \* Member 1's inproc and network endpoints share its peer id; member 2 and the
 \* rotated incarnation have their own.
@@ -113,16 +120,19 @@ AuditResumeBinding ==
 (***************************************************************************)
 
 \* Every WakeMember arm, in every lifecycle phase.
-WakeArm(id, om, ic, sw) ==
-    \/ WakeMemberAuthorizedRunning(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberJoinedRunning(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberAlreadyLiveRunning(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberRefusedRunning(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberRefusedStopped(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberRefusedCompleted(id, "PeerDelivery", om, ic, sw)
-    \/ WakeMemberRefusedDestroyed(id, "PeerDelivery", om, ic, sw)
+WakeArm(id, cause, om, ic, sw) ==
+    \/ WakeMemberAuthorizedRunning(id, cause, om, ic, sw)
+    \/ WakeMemberJoinedRunning(id, cause, om, ic, sw)
+    \/ WakeMemberAlreadyLiveRunning(id, cause, om, ic, sw)
+    \/ WakeMemberRefusedRunning(id, cause, om, ic, sw)
+    \/ WakeMemberRefusedStopped(id, cause, om, ic, sw)
+    \/ WakeMemberRefusedCompleted(id, cause, om, ic, sw)
+    \/ WakeMemberRefusedDestroyed(id, cause, om, ic, sw)
 
-AuditWake(id) == \E om \in BOOLEAN, ic \in AuditInputClasses, sw \in BOOLEAN : WakeArm(id, om, ic, sw)
+\* Every cause, observed miss, input class and sender phase.
+AuditWake(id) ==
+    \E cause \in AuditWakeCauses, om \in BOOLEAN, ic \in AuditInputClasses, sw \in BOOLEAN :
+        WakeArm(id, cause, om, ic, sw)
 
 \* The attempt-fenced resolutions of a Running mob for one incarnation.
 AuditResolve(id, rid, fence, g, sessions) ==
@@ -225,6 +235,10 @@ WBindCurrent == RecoverMemberSessionBindingAlreadyCurrentRunning(Id1, Rid1, Sess
 WEndpoint == \E e \in {E1Inproc, E1Tcp} : RecoverMemberPeerEndpointFreshRunning(Id1, Rid1, Sess1, e)
 WRegisterPeer == \E e \in {E1Inproc, E1Tcp} : RegisterMemberPeerRunning(Id1, Rid1, 0, 1, e)
 WRecoverRetired == \E p \in BOOLEAN, started \in BOOLEAN : RecoverRosterMemberRetiredRunning(Id1, Rid1, 0, p, started)
+\* The replayed restore failures (Broken setters, R2).
+WRestoreFailure ==
+    \/ RecoverMemberRestoreFailureRunning(Id1, AuditReason)
+    \/ RecoverMemberRestoreHostRefusedRunning(Id1, AuditCode, AuditReason)
 WReady == \E ep \in AuditEpochs : ObserveRuntimeReady(Rid1, 1, ep)
 WRelease == \E rid \in {Some(Rid1), None}, fence \in {Some(1), None}, ep \in AuditEpochs : ReleaseArm(rid, fence, ep)
 WRetire ==
@@ -242,7 +256,7 @@ WArchive ==
     \/ ObserveMemberRetirementArchivedRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, FALSE)
 
 \* The recovery and seat arms of the wake run (AP1).
-WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WRecoverRetired
+WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WRecoverRetired \/ WRestoreFailure
 
 AuditWakeNext ==
     \/ WRecover
@@ -251,6 +265,7 @@ AuditWakeNext ==
     \/ WEndpoint
     \/ WRegisterPeer
     \/ WRecoverRetired
+    \/ WRestoreFailure
     \/ AuditSeed({{}, {Id1}})
     \/ AuditHostPrepared(Id1)
     \/ AuditPlan(Id1)
@@ -444,6 +459,20 @@ AuditSeatNext ==
 
 AuditSeatSpec == Init /\ [][AuditSeatNext]_vars
 
+\* A dormant seat leaves its identity Dormant, with its endpoint or owed
+\* EndpointPending, and requests no runtime binding.
+AuditSeatLeavesDormant ==
+    [][\A id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None} :
+         CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
+                                  SIncarnation(id).session, ep, FALSE)
+           => /\ id \in DOMAIN member_materialization'
+              /\ member_materialization'[id] = "Dormant"
+              /\ \/ id \in DOMAIN member_peer_endpoints'
+                 \/ /\ id \in DOMAIN member_boot_obligation_owed'
+                    /\ member_boot_obligation_owed'[id] = "EndpointPending"
+              /\ SIncarnation(id).rid \notin member_startup_binding_requested'
+      ]_vars
+
 (***************************************************************************)
 (* Constraint and view.                                                    *)
 (***************************************************************************)
@@ -462,6 +491,10 @@ AuditView == [vars EXCEPT ![AuditStepIndex] = 0, ![AuditEpochIndex] = 0]
 PhaseKept ==
     \A id \in DOMAIN member_materialization \cap DOMAIN member_materialization' :
         member_materialization'[id] = member_materialization[id]
+
+\* Member 1's residency phase as an option, before and after a step.
+Phase1 == IF Id1 \in DOMAIN member_materialization THEN Some(member_materialization[Id1]) ELSE None
+Phase1Next == IF Id1 \in DOMAIN member_materialization' THEN Some(member_materialization'[Id1]) ELSE None
 
 AuditRecoverKeepsPhase == [][WRecoverArms => PhaseKept]_vars
 AuditResumeRecoverKeepsPhase == [][RRecoverArms => PhaseKept]_vars
@@ -487,26 +520,34 @@ AuditWakingClosable ==
 \* AP3: a Lifecycle wake input never opens an attempt, and a peer notice
 \* classification never changes residency.
 AuditLifecycleNeverWakes ==
-    [][/\ (\E om \in BOOLEAN, sw \in BOOLEAN : WakeArm(Id1, om, "Lifecycle", sw))
+    [][/\ (\E cause \in AuditWakeCauses, om \in BOOLEAN, sw \in BOOLEAN : WakeArm(Id1, cause, om, "Lifecycle", sw))
            => member_wake_attempts' = member_wake_attempts
        /\ AuditNotice(Id1)
            => /\ member_wake_attempts' = member_wake_attempts
               /\ member_materialization' = member_materialization
       ]_vars
 
-AuditWakeVerdicts(id, om, ic, sw) ==
-    <<ENABLED WakeMemberAuthorizedRunning(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberJoinedRunning(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberAlreadyLiveRunning(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberRefusedRunning(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberRefusedStopped(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberRefusedCompleted(id, "PeerDelivery", om, ic, sw),
-      ENABLED WakeMemberRefusedDestroyed(id, "PeerDelivery", om, ic, sw)>>
+\* A WakeMember input never moves a Dormant member straight to Live: it is
+\* Waking (an attempt) or stays Dormant (refused).
+AuditWakeNeverSkipsWaking ==
+    [][(\E cause \in AuditWakeCauses, om \in BOOLEAN, ic \in AuditInputClasses, sw \in BOOLEAN :
+           WakeArm(Id1, cause, om, ic, sw))
+           => (Phase1 = Some("Dormant") => Phase1Next \in {Some("Dormant"), Some("Waking")})
+      ]_vars
 
-\* WakeMember is total and its arms never overlap.
+AuditWakeVerdicts(id, cause, om, ic, sw) ==
+    <<ENABLED WakeMemberAuthorizedRunning(id, cause, om, ic, sw),
+      ENABLED WakeMemberJoinedRunning(id, cause, om, ic, sw),
+      ENABLED WakeMemberAlreadyLiveRunning(id, cause, om, ic, sw),
+      ENABLED WakeMemberRefusedRunning(id, cause, om, ic, sw),
+      ENABLED WakeMemberRefusedStopped(id, cause, om, ic, sw),
+      ENABLED WakeMemberRefusedCompleted(id, cause, om, ic, sw),
+      ENABLED WakeMemberRefusedDestroyed(id, cause, om, ic, sw)>>
+
+\* WakeMember is total and its arms never overlap, for every input.
 AuditWakeExactlyOne ==
-    \A om \in BOOLEAN, ic \in AuditInputClasses, sw \in BOOLEAN :
-        Cardinality({i \in 1..7 : AuditWakeVerdicts(Id1, om, ic, sw)[i]}) = 1
+    \A cause \in AuditWakeCauses, om \in BOOLEAN, ic \in AuditInputClasses, sw \in BOOLEAN :
+        Cardinality({i \in 1..7 : AuditWakeVerdicts(Id1, cause, om, ic, sw)[i]}) = 1
 
 \* I5: over the wake refusal helper's whole input domain, a present,
 \* session-bound member with a phase is never refused as not a member.
@@ -524,9 +565,6 @@ ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, or
 (* negation: a state goal as an invariant, a step goal as an action        *)
 (* property.                                                               *)
 (***************************************************************************)
-
-Phase1 == IF Id1 \in DOMAIN member_materialization THEN Some(member_materialization[Id1]) ELSE None
-Phase1Next == IF Id1 \in DOMAIN member_materialization' THEN Some(member_materialization'[Id1]) ELSE None
 
 \* Wake run: a sealed plan leaves the member Dormant.
 AuditWitnessSealedDormant == boot_plan_sealed /\ Phase1 = Some("Dormant")

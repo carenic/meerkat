@@ -197,7 +197,6 @@ SessionIngressDetachFailed* session ingress detach failure for a mob destroy; no
 RequestPending* session ingress detach request for a mob destroy; no audit drives it
 MemberTerminalized* member terminal notice bookkeeping; no audit drives it
 ResolveAutonomous* autonomous member shutdown action classification; no audit drives it
-RecoverMemberRestore* restore failure replay (Broken); no audit drives it
 ClassifyExplicitResumeMemberOutcome* explicit resume outcome classification; member_residency_audit's resume run settles from the wake attempt's outcome instead
 BeginExplicitResumeReadinessStopped explicit resume readiness while Stopped; the resume run drives the Running arms
 SettleExplicitResumeReadinessStopped explicit resume readiness while Stopped; the resume run drives the Running arms

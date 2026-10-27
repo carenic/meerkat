@@ -66,6 +66,8 @@ wake_covered_actions=(
   RecoverMemberPeerEndpointFreshRunning
   RegisterMemberPeerRunning
   RecoverRosterMemberRetiredRunning
+  RecoverMemberRestoreFailureRunning
+  RecoverMemberRestoreHostRefusedRunning
   SeedMemberResidencyRunning
   SeedMemberResidencyStopped
   SeedMemberResidencyCompleted
@@ -277,7 +279,8 @@ write_cfg() {
       run_properties="
   AuditRecoverKeepsPhase
   AuditAttemptEndsClosed
-  AuditLifecycleNeverWakes"
+  AuditLifecycleNeverWakes
+  AuditWakeNeverSkipsWaking"
       run_invariants="
   AuditWakingClosable
   AuditWakeExactlyOne"
@@ -302,7 +305,8 @@ write_cfg() {
       spec="AuditSeatSpec"
       run_properties="
   AuditSeatRecoverKeepsPhase
-  AuditAttemptEndsClosed"
+  AuditAttemptEndsClosed
+  AuditSeatLeavesDormant"
       run_invariants="
   AuditWakingClosable"
       ;;
@@ -513,6 +517,17 @@ def rewrite_frame(arm, updates):
         return body.replace("    /\\ " + frame, explicit + "\n    /\\ UNCHANGED << " + kept + " >>")
     _replace_body(arm, edit)
 
+def replace_in_update(arm, var, old, new):
+    """Replace the one occurrence of `old` in the arm's update of `var`."""
+    def edit(body):
+        lines = body.split("\n")
+        hits = [i for i, line in enumerate(lines) if line.startswith("    /\\ " + var + "' = ")]
+        assert len(hits) == 1, f"expected one update of {var} in {arm}, found {len(hits)}"
+        assert lines[hits[0]].count(old) == 1, f"expected one {old!r} in the {var} update of {arm}"
+        lines[hits[0]] = lines[hits[0]].replace(old, new)
+        return "\n".join(lines)
+    _replace_body(arm, edit)
+
 def replace_in_operator(operator, old, new):
     """Replace the one occurrence of `old` in a one-line operator definition."""
     global text
@@ -595,13 +610,24 @@ PY
     'keep_var("WakeMemberAuthorizedRunning", "member_wake_attempt_sequence")' "$@"
   # I14: a wake that closes Live keeps its attempt.
   mutate wake live_keeps_attempt \
-    "Error: Invariant wake_bookkeeping_follows_phase is violated" \
+    "Error: Invariant attempt_and_epoch_follow_the_phase is violated" \
     'keep_var("ResolveMemberRevivalSucceededRunningLocal", "member_wake_attempts")' "$@"
   # A Stop that leaves its Waking members waking.
   mutate wake stop_keeps_wakes \
     "Error: Invariant only_a_running_mob_wakes is violated" \
     'for var in ("member_materialization", "member_wake_attempts", "member_wake_bound", "member_materialization_epoch", "member_startup_binding_requested", "member_startup_runtime_ready", "member_startup_ready"):
     keep_var("StopRunning", var)' "$@"
+  # The WakeMember action property: an authorized wake moves Dormant straight
+  # to Live (with no attempt and no owed obligation left, so only the
+  # property can refuse it).
+  mutate wake wake_skips_waking \
+    "Error: Action property AuditWakeNeverSkipsWaking is violated" \
+    'replace_in_update("WakeMemberAuthorizedRunning", "member_materialization", "\"Waking\"", "\"Live\"")
+keep_var("WakeMemberAuthorizedRunning", "member_wake_attempts")
+keep_var("WakeMemberAuthorizedRunning", "member_wake_attempt_sequence")
+rewrite_frame("WakeMemberAuthorizedRunning", {
+    "member_boot_obligation_owed": "MapRemove(member_boot_obligation_owed, agent_identity)",
+})' "$@"
   # AP1: a recovery arm that writes Dormant over a Live member (with its epoch
   # and startup ladder cleared and, after the seal, its endpoint present, so
   # only the property can refuse it).
@@ -648,6 +674,10 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \
     'drop_guard("BeginMemberRotationRunning", "= Some(\"Retiring\"))")' "$@"
+  # I7 and the seat property: a dormant seat that requests a runtime binding.
+  mutate seat seat_requests_binding \
+    "Error: (Invariant dormant_member_requests_no_runtime_binding|Action property AuditSeatLeavesDormant) is violated" \
+    'replace_in_update("CommitDormantSeatRunning", "member_startup_binding_requested", "member_startup_binding_requested \\ {agent_runtime_id}", "member_startup_binding_requested \\cup {agent_runtime_id}")' "$@"
   # R5: a dormant seat without its peer-id guard takes another member's peer id.
   mutate seat seat_duplicate_peer_id \
     "Error: Invariant (member_peer_id_ownership_is_global_across_generations|live_member_peer_ids_are_unique) is violated" \

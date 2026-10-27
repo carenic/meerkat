@@ -4046,7 +4046,7 @@ macro_rules! mob_catalog_machine_dsl {
         // binding marks exist only for Waking members, an epoch only for a
         // member with a phase, a boot obligation only for a Dormant or Waking
         // member. Every phase removal clears them all.
-        invariant wake_bookkeeping_follows_phase {
+        invariant attempt_and_epoch_follow_the_phase {
             for_all(id in self.member_wake_attempts.keys(),
                 self.member_materialization.get_cloned(id) == Some(MemberMaterializationPhase::Waking))
             && for_all(id in self.member_wake_bound,
@@ -21117,6 +21117,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Waking);
                 self.member_wake_attempts.insert(agent_identity, self.member_wake_attempt_sequence);
                 self.member_wake_bound.remove(agent_identity);
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder.
+                self.member_materialization_epoch.remove(agent_identity);
+                self.member_startup_binding_requested.remove(binding.agent_runtime_id);
+                self.member_startup_runtime_ready.remove(binding.agent_runtime_id);
+                self.member_startup_ready.remove(binding.agent_runtime_id);
             }
             to Running
         }
@@ -23757,6 +23763,13 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Waking);
                 self.member_wake_attempts.insert(agent_identity, self.member_wake_attempt_sequence);
                 self.member_wake_bound.remove(agent_identity);
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder (a late bind
+                // observed while Dormant never carries into the wake).
+                self.member_materialization_epoch.remove(agent_identity);
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
             }
             to Running
             emit MemberWakeClassified {
@@ -23937,6 +23950,13 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Waking);
                 self.member_wake_attempts.insert(agent_identity, self.member_wake_attempt_sequence);
                 self.member_wake_bound.remove(agent_identity);
+                // A Dormant member has no live registration: the wake starts
+                // with no epoch and no startup binding ladder (a late bind
+                // observed while Dormant never carries into the wake).
+                self.member_materialization_epoch.remove(agent_identity);
+                self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
+                self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
+                self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
                 // The obligation stays owed until the wake reaches Live: a
                 // retryable wake keeps it, so the owner's timer wakes the
                 // member again. A member with no durable endpoint is owed
