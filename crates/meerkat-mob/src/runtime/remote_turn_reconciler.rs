@@ -1095,10 +1095,11 @@ fn machine_only_wake_can_skip_event_poll(
 /// material: only after a proven-quiescent scan, with no remote-turn custody,
 /// while no member is placed on a host. MobMachine records a remote turn only
 /// for a placed member (`RecordRemoteTurnObligation`'s `target_placed`
-/// guard), so such a mob mints no private row. A placement or a custody mint
-/// is a machine input the watch publishes before any row it leads to, and the
-/// first scan after a start never skips (it is not preceded by a quiescent
-/// one).
+/// guard), so such a mob mints no private row. A placement is published
+/// before any private row it allows. A remote-turn row is written while its
+/// member is placed and before its custody mint, whose publish wakes the next
+/// scan with custody not quiet. The first scan after a start never skips (it
+/// is not preceded by a quiescent one).
 fn unplaced_mob_scan_can_skip_material(
     previous_scan_quiescent: bool,
     machine_custody_quiet: bool,

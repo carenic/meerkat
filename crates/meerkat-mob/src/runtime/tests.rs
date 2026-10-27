@@ -13292,16 +13292,26 @@ async fn wait_for_run_listings(run_store: &RecordingRunStore, at_least: u64) -> 
     }
 }
 
-// A local-only mob's remote-turn reconciler lists no runs for the events
-// after its first, quiescent scan: no member is placed on a host, so the
-// events carry no remote-turn work and the scan skips the private rows.
-// Before, each event burst listed (and re-validated) every run.
+// A local mob's remote-turn reconciler lists no runs for the events after its
+// first, quiescent scan, a local member's spawn included: no member is placed
+// on a host (a local member is not), so the events carry no remote-turn work
+// and the scan skips the private rows. Before, each event burst listed (and
+// re-validated) every run.
 #[tokio::test]
 async fn a_local_mobs_remote_turn_scan_lists_no_runs_per_event_burst() {
     let run_store = Arc::new(RecordingRunStore::new());
     let (handle, _service) =
         create_test_mob_with_run_store(sample_definition(), run_store.clone()).await;
     let after_first_scan = wait_for_run_listings(&run_store, 1).await;
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("local-worker"),
+            None,
+        )
+        .await
+        .expect("spawn a local member");
+    tokio::time::sleep(Duration::from_millis(300)).await;
     for _ in 0..3 {
         append_quiet_event(&handle).await;
         // Past the reconciler's 100 ms debounce: each event is a burst.

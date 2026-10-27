@@ -5878,7 +5878,8 @@ pub(crate) trait MobIdentityMemberStore: Send + Sync {
 /// [`crate::MemberBindingHistory`] fold.
 #[derive(Debug)]
 pub(crate) struct MemberBindingJournalRead {
-    /// Every journal event, in cursor order.
+    /// The journal events read (all of them, or those from the read's cursor
+    /// on), in cursor order.
     pub(crate) events: Vec<MobEvent>,
     /// How each identity intent row (Present or Absent) of the read mob
     /// reads: [`intent_row_management`] of its stored observation.

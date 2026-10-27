@@ -1194,9 +1194,10 @@ impl MobHandle {
     ///
     /// The handle and its clones keep the fold between reads, so a read
     /// reads only the journal events appended since the previous one (with
-    /// the intent rows, in one store transaction) and its cost does not grow
-    /// with the journal. A journal that no longer holds the last folded
-    /// event (a destroy cleared it) is read whole again.
+    /// the intent rows, in one store transaction), never the whole journal:
+    /// it costs those events plus the size of the history it answers (its
+    /// members and sessions). A journal that no longer holds the last
+    /// folded event (a destroy cleared it) is read whole again.
     ///
     /// A pure store read: it records nothing, never enters the actor queue
     /// (a busy actor cannot delay it) and never consults the live machine

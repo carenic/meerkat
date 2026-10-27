@@ -519,13 +519,14 @@ them.
   `identity_management`, which read it) no longer reads the mob's whole
   event journal each time. A handle and its clones keep the fold between
   reads: a read reads only the events appended since the previous one,
-  together with the identity intent rows in one store transaction, so its
-  cost no longer grows with the mob's history. Before, every read decoded
-  every stored event on a SQLite store and copied the whole journal on the
-  in-memory and host stores (on a host store while holding the mob's write
-  lock), so a host that reads the history on every page load or message got
-  slower as the journal grew. A journal that a destroy cleared is read whole
-  again.
+  together with the identity intent rows in one store transaction, so it no
+  longer reads or decodes the whole journal: it costs the events appended
+  since the previous read plus the size of the history it answers (its
+  members and sessions). Before, every read decoded every stored event on a
+  SQLite store and copied the whole journal on the in-memory and host stores
+  (on a host store while holding the locks the mob's writes wait for), so a
+  host that reads the history on every page load or message got slower as
+  the journal grew. A journal that a destroy cleared is read whole again.
 - `meerkat-mob`: a mob with no member placed on a host no longer reads every
   flow run it ever started on each burst of mob events. The remote-turn
   reconciler that every mob runs listed every run and replayed each run's

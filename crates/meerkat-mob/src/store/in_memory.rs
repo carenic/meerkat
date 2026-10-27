@@ -6011,7 +6011,11 @@ mod tests {
             };
             store
                 .append(NewMobEvent {
-                    mob_id: MobId::from(if index % 2 == 0 { "mob" } else { "other-mob" }),
+                    mob_id: MobId::from(if index.is_multiple_of(2) {
+                        "mob"
+                    } else {
+                        "other-mob"
+                    }),
                     timestamp: Some(timestamp),
                     kind: MobEventKind::MobCompleted,
                 })
