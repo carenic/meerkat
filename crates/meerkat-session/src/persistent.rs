@@ -22163,6 +22163,67 @@ mod tests {
         }
     }
 
+    /// A cold attach of a session another owner holds in this process (a
+    /// mob holding its member dormant) asks that owner to wake it and
+    /// settles nothing itself once it is woken. The owner's own settle of
+    /// the session never asks it.
+    #[tokio::test]
+    async fn a_cold_attach_of_an_owned_session_asks_its_owner_first() {
+        use meerkat_core::session_owner_wake::{
+            SessionOwnerWakeFuture, SessionOwnerWakeOutcome, SessionOwnerWakeRegistry,
+            SessionOwnerWaker,
+        };
+
+        struct CountingOwner {
+            asked: AtomicUsize,
+        }
+
+        impl SessionOwnerWaker for CountingOwner {
+            fn wake_session_owner(&self, _session_id: &SessionId) -> SessionOwnerWakeFuture {
+                self.asked.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(SessionOwnerWakeOutcome::Ready) })
+            }
+        }
+
+        let service = PersistentSessionService::new(
+            DummyBuilder,
+            4,
+            Arc::new(MemoryStore::new()),
+            Arc::new(InMemoryRuntimeStore::new()),
+            memory_blob_store(),
+        );
+        let session_id = SessionId::new();
+        let owner = Arc::new(CountingOwner {
+            asked: AtomicUsize::new(0),
+        });
+        let owner_entry: Arc<dyn SessionOwnerWaker> = owner.clone();
+        let registry = SessionOwnerWakeRegistry::global();
+        registry.publish(session_id.clone(), Arc::downgrade(&owner_entry));
+
+        let claim = service
+            .grant_session_hosting(&session_id)
+            .expect("the service's hosting claim");
+        let settlement = service
+            .prepare_cold_attach_reporting(&session_id, claim)
+            .await
+            .expect("the owner woke the session");
+        assert!(matches!(settlement, ColdAttachSettlement::Settled));
+        assert_eq!(owner.asked.load(Ordering::SeqCst), 1);
+
+        let claim = service
+            .grant_session_hosting(&session_id)
+            .expect("the service's hosting claim");
+        let _ = service
+            .prepare_cold_attach_reporting_as_owner(&session_id, claim)
+            .await;
+        assert_eq!(
+            owner.asked.load(Ordering::SeqCst),
+            1,
+            "the owner's own settle never asks the owner"
+        );
+        assert!(registry.retract(&session_id, &Arc::downgrade(&owner_entry)));
+    }
+
     #[tokio::test]
     async fn runtime_backed_exact_boundary_cancel_requires_machine_authority() {
         let service = PersistentSessionService::new(
