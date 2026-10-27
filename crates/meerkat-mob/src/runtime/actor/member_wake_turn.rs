@@ -936,9 +936,6 @@ impl MobActor {
 
     /// Report a woken member's build to the host's preparer (off the actor).
     async fn report_member_built_after_wake(&mut self, identity: &AgentIdentity) {
-        let Some(preparer) = self.member_residency.build_preparer.clone() else {
-            return;
-        };
         let Some(session_id) = self
             .roster
             .read()
@@ -948,13 +945,26 @@ impl MobActor {
         else {
             return;
         };
+        self.report_member_built_to_host(identity, session_id);
+    }
+
+    /// Report a member Core built live on `session_id` (a wake's, or a
+    /// spawn's once its activation committed) to the host's preparer, off
+    /// the actor. Nothing happens without a preparer.
+    pub(in crate::runtime) fn report_member_built_to_host(
+        &mut self,
+        identity: &AgentIdentity,
+        session_id: SessionId,
+    ) {
+        let Some(preparer) = self.member_residency.build_preparer.clone() else {
+            return;
+        };
         let session_service = Arc::clone(&self.session_service);
-        let identity = identity.clone();
         self.actor_io_tasks
             .spawn(super::super::member_build_preparer::report_member_built(
                 Some(preparer),
                 session_service,
-                identity,
+                identity.clone(),
                 session_id,
             ));
     }

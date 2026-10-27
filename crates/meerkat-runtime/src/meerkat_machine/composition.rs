@@ -477,6 +477,12 @@ impl ConsumerSurface for MeerkatConsumerSurface {
                 // the epoch".
                 runtime_epoch_id: None,
                 session_id: mm_dsl::SessionId::from(sid.to_string()),
+                // The route binds Composition as a literal, which is not
+                // projected: every routed placement is the composition's own
+                // (a mob member's binding request), so the composition owns
+                // the registration's residency and an empty resume keeps it
+                // serving.
+                residency_owner: mm_dsl::SessionResidencyOwner::Composition,
             }
         } else if variant == seam_facts::inputs::ingest() {
             // Route binding `work_request_reaches_meerkat` delivers
@@ -1113,6 +1119,7 @@ mod tests {
                     generation: Some(mm_dsl::Generation(0)),
                     runtime_epoch_id: Some(mm_dsl::RuntimeEpochId("stale-epoch".into())),
                     session_id: mm_dsl::SessionId(session_id.to_string()),
+                    residency_owner: mm_dsl::SessionResidencyOwner::Composition,
                 },
             )
             .await
@@ -2003,7 +2010,24 @@ mod tests {
             .commit_session_dsl_transition(&id, staged, "test delayed retirement dispatch")
             .await
             .expect("dispatch captured old endpoint");
-        assert_eq!(old_surface.log.lock().await.len(), 2);
+        // The old endpoint saw its own binding, its registration's release
+        // (the final unregister publishes it to the owning composition) and
+        // the delayed retirement captured for it, in that order.
+        let old_signals: Vec<String> = old_surface
+            .log
+            .lock()
+            .await
+            .iter()
+            .map(|(variant, _)| variant.as_str().to_string())
+            .collect();
+        assert_eq!(
+            old_signals,
+            [
+                "ObserveRuntimeReady",
+                "ReleaseMemberMaterialization",
+                "ObserveRuntimeRetired"
+            ]
+        );
         assert_eq!(
             new_surface.log.lock().await.len(),
             1,
@@ -2092,6 +2116,7 @@ mod tests {
                     generation: Some(mm_dsl::Generation(0)),
                     runtime_epoch_id: None,
                     session_id: mm_dsl::SessionId(session_id.to_string()),
+                    residency_owner: mm_dsl::SessionResidencyOwner::Composition,
                 },
             )
             .await
@@ -2755,6 +2780,7 @@ mod tests {
                     // typed rejection).
                     runtime_epoch_id: Some(mm_dsl::RuntimeEpochId::from_domain(&epoch_before)),
                     session_id: mm_dsl::SessionId(session_id.to_string()),
+                    residency_owner: mm_dsl::SessionResidencyOwner::Composition,
                 },
                 "OwnerlessAttachedRegressionBinding",
             )
@@ -3065,6 +3091,7 @@ mod tests {
                     generation: Some(mm_dsl::Generation(0)),
                     runtime_epoch_id: None,
                     session_id: mm_dsl::SessionId(session_id.to_string()),
+                    residency_owner: mm_dsl::SessionResidencyOwner::Composition,
                 },
             )
             .await

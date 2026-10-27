@@ -13034,6 +13034,14 @@ impl meerkat_core::service::SessionServiceHistoryExt for RunMobSessionService {
 #[async_trait::async_trait]
 #[cfg(feature = "mob")]
 impl meerkat_mob::MobSessionService for RunMobSessionService {
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, meerkat_core::service::SessionError> {
+        meerkat_mob::MobSessionService::recorded_auth_binding(self.inner.as_ref(), auth_binding)
+            .await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &meerkat_core::SessionId,
@@ -16979,6 +16987,14 @@ impl meerkat_core::service::SessionServiceHistoryExt for MobCliSessionService {
 #[async_trait::async_trait]
 #[cfg(all(feature = "mob", feature = "session-store"))]
 impl meerkat_mob::MobSessionService for MobCliSessionService {
+    async fn recorded_auth_binding(
+        &self,
+        auth_binding: &meerkat_core::AuthBindingRef,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, meerkat_core::service::SessionError> {
+        meerkat_mob::MobSessionService::recorded_auth_binding(self.inner.as_ref(), auth_binding)
+            .await
+    }
+
     async fn subscribe_session_activity(
         &self,
         session_id: &meerkat_core::SessionId,

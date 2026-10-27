@@ -766,6 +766,7 @@ mod tests {
                     generation: Some(dsl::Generation(0)),
                     runtime_epoch_id: None,
                     session_id: dsl::SessionId("routed-session".into()),
+                    residency_owner: dsl::SessionResidencyOwner::Composition,
                 },
             ),
             (

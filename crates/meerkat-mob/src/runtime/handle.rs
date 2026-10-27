@@ -2768,6 +2768,11 @@ fn spawn_many_failure_observation(error: &MobError) -> mob_dsl::MobSpawnManyFail
         MobError::SessionUnavailableForResume { .. } => {
             mob_dsl::MobSpawnManyFailureObservationKind::SessionError
         }
+        // The resumed session's live actor runs another auth binding: the
+        // SESSION could not serve this resume - session-class failure.
+        MobError::MemberAuthBindingConflict { .. } => {
+            mob_dsl::MobSpawnManyFailureObservationKind::SessionError
+        }
         // Process-incarnation provisioning terminals are not a public
         // spawn-many failure family. Keep the exhaustive classifier
         // fail-closed rather than laundering callback-transport state into a

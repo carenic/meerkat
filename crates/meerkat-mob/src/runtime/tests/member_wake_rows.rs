@@ -65,6 +65,24 @@ impl ScriptedClient {
             .expect("started channel open");
     }
 
+    /// The tools, in request order, of the first recorded model request
+    /// that mentions `token`.
+    fn tools_of_request_mentioning(&self, token: &str) -> Vec<String> {
+        self.requests
+            .lock()
+            .expect("recorded requests")
+            .iter()
+            .find(|request| format!("{:?}", request.messages).contains(token))
+            .map(|request| {
+                request
+                    .tools
+                    .iter()
+                    .map(|tool| tool.name.as_str().to_string())
+                    .collect()
+            })
+            .expect("a model request mentions the token")
+    }
+
     /// How many recorded model requests mention `token` anywhere.
     fn requests_mentioning(&self, token: &str) -> usize {
         self.requests
@@ -252,10 +270,16 @@ impl MemberBuildPreparer for RecordingPreparer {
 }
 
 /// A customizer whose resume answer is versioned: every resume records the
-/// version it customized the member with.
+/// version it customized the member with. With overlay tools set, every
+/// answer carries them as the member's external tools, each answer in
+/// another order, as a host may return them.
 struct VersionedCustomizer {
     version: AtomicU64,
     resumes: Mutex<Vec<(AgentIdentity, SessionId, u64)>>,
+    overlay_tools: Mutex<Vec<&'static str>>,
+    overlay_answers: AtomicU64,
+    /// The auth binding every answer names, when set.
+    auth_binding: Mutex<Option<meerkat_core::AuthBindingRef>>,
 }
 
 impl VersionedCustomizer {
@@ -263,7 +287,18 @@ impl VersionedCustomizer {
         Self {
             version: AtomicU64::new(1),
             resumes: Mutex::new(Vec::new()),
+            overlay_tools: Mutex::new(Vec::new()),
+            overlay_answers: AtomicU64::new(0),
+            auth_binding: Mutex::new(None),
         }
+    }
+
+    fn set_auth_binding(&self, binding: meerkat_core::AuthBindingRef) {
+        *self.auth_binding.lock().expect("auth binding") = Some(binding);
+    }
+
+    fn set_overlay_tools(&self, names: &[&'static str]) {
+        *self.overlay_tools.lock().expect("overlay tools") = names.to_vec();
     }
 
     fn set_version(&self, version: u64) {
@@ -279,8 +314,18 @@ impl SpawnMemberCustomizer for VersionedCustomizer {
     fn customize_spawn(
         &self,
         _ctx: &SpawnCustomizationContext,
-        _spec: &mut SpawnMemberSpec,
+        spec: &mut SpawnMemberSpec,
     ) -> Result<(), MobError> {
+        if let Some(binding) = self.auth_binding.lock().expect("auth binding").clone() {
+            spec.auth_binding = Some(binding);
+        }
+        let mut names = self.overlay_tools.lock().expect("overlay tools").clone();
+        if !names.is_empty() {
+            let answer = self.overlay_answers.fetch_add(1, Ordering::SeqCst);
+            let shift = usize::try_from(answer).unwrap_or(0) % names.len();
+            names.rotate_left(shift);
+            spec.external_tools = Some(Arc::new(FixedOverlayTools(names)));
+        }
         Ok(())
     }
 
@@ -326,6 +371,11 @@ struct WakeFixture {
 
 impl WakeFixture {
     async fn new(label: &str) -> Self {
+        Self::new_with_config(label, |_| {}).await
+    }
+
+    /// [`Self::new`], with `configure` applied to the factory's config.
+    async fn new_with_config(label: &str, configure: impl FnOnce(&mut meerkat::Config)) -> Self {
         let root = tempfile::Builder::new()
             .prefix("meerkat-member-wake-")
             .tempdir()
@@ -344,6 +394,7 @@ impl WakeFixture {
         let mut config = meerkat::Config::default();
         config.agent.model = "gpt-5.5".to_string();
         config.compaction.auto_compact_threshold = 1_000_000;
+        configure(&mut config);
         let client = ScriptedClient::new();
         let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
         builder.default_llm_client = Some(Arc::new(client.clone()));
@@ -945,6 +996,19 @@ async fn a_wake_prepares_the_member_build_once_and_reports_it_built() {
         0,
         "a spawn is no wake: the preparer is asked for wakes and restores"
     );
+    // A spawn is a build all the same: each is reported once its activation
+    // committed, with the tools its member sees.
+    fixture.preparer.wait_built(2).await;
+    let spawned = fixture.preparer.built();
+    assert_eq!(spawned.len(), 2, "one build report per spawn: {spawned:?}");
+    for identity in [&peer, &member] {
+        assert!(
+            spawned.iter().any(
+                |report| &report.agent_identity == identity && !report.visible_tools.is_empty()
+            ),
+            "the spawn of {identity} is reported with its visible tools: {spawned:?}"
+        );
+    }
     fixture.release(&member).await;
     let session = fixture.session(&member).await;
 
@@ -963,11 +1027,11 @@ async fn a_wake_prepares_the_member_build_once_and_reports_it_built() {
         }],
         "one preparation, with the member, its session and its wired peers"
     );
-    fixture.preparer.wait_built(1).await;
+    fixture.preparer.wait_built(3).await;
     let built = fixture.preparer.built();
-    assert_eq!(built.len(), 1, "one build report per build");
-    assert_eq!(built[0].agent_identity, member);
-    assert_eq!(built[0].session_id, session);
+    assert_eq!(built.len(), 3, "one build report per build");
+    assert_eq!(built[2].agent_identity, member);
+    assert_eq!(built[2].session_id, session);
     fixture.finish().await;
 }
 
@@ -1223,6 +1287,267 @@ async fn an_external_wire_during_a_wake_waits_for_it_and_installs_on_the_woken_m
     assert!(
         !trusts_external(&fixture.comms(&member).await.peers().await),
         "the woken member's runtime no longer trusts the external peer"
+    );
+    fixture.finish().await;
+}
+
+/// A background completion on an idle member is an empty resume: the wake
+/// finds no pending boundary. A mob member's registration is
+/// composition-owned, so MeerkatMachine keeps it serving
+/// (`ResolveEmptyResumeRetirement` answers `KeepServing`). Nothing is
+/// unregistered or released, the member's other background operation keeps
+/// running, and a peer message reaches the same materialization, with no wake
+/// and no rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_background_completion_on_an_idle_member_keeps_it_loaded() {
+    use meerkat_core::ops_lifecycle::{
+        CompletionCursorConsumer, OperationId, OperationKind, OperationResult, OperationSpec,
+        OperationStatus, OpsLifecycleRegistry as _, OpsOwnerAdmission,
+    };
+
+    let fixture = WakeFixture::new("wake-keep-serving").await;
+    let sender = fixture.spawn("keep-sender").await;
+    let member = fixture.spawn("keep-member").await;
+    fixture.wire(&sender, &member).await;
+    // The member is idle on a finished turn: nothing is pending.
+    fixture
+        .host_turn(&member, &token("keep-warm"), HandlingMode::Queue)
+        .await;
+
+    let session = fixture.session(&member).await;
+    let machine = MobSessionService::acquire_runtime_adapter(&*fixture.service, None)
+        .expect("the service's runtime")
+        .expect("a runtime-backed service");
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the live member is registered");
+    let registry = machine
+        .ops_lifecycle_registry(&session)
+        .await
+        .expect("the member's operation registry");
+    let background = |name: &str| OperationSpec {
+        id: OperationId::new(),
+        kind: OperationKind::BackgroundToolOp,
+        owner_session_id: session.clone(),
+        display_name: name.to_string(),
+        source_label: "member-wake-rows".to_string(),
+        operation_source: None,
+        child_session_id: None,
+        expect_peer_channel: false,
+    };
+    let finished = background("finished-job");
+    let running = background("still-running-job");
+    let finished_id = finished.id.clone();
+    let running_id = running.id.clone();
+    for spec in [finished, running] {
+        let id = spec.id.clone();
+        registry
+            .register_operation(spec)
+            .expect("register a background operation");
+        registry
+            .provisioning_succeeded(&id)
+            .expect("the background operation runs");
+    }
+    let injected_cursor = || {
+        registry
+            .completion_cursor(CompletionCursorConsumer::RuntimeInjected)
+            .expect("the runtime's injected cursor")
+            .unwrap_or(0)
+    };
+    let injected_before = injected_cursor();
+    let builds_before = fixture.preparer.prepared_count();
+
+    registry
+        .complete_operation(
+            &finished_id,
+            OperationResult {
+                id: finished_id.clone(),
+                content: "done".to_string(),
+                is_error: false,
+                duration_ms: 1,
+                tokens_used: 0,
+            },
+        )
+        .expect("the first background operation completes");
+
+    // The runtime injects the completion wake and applies it: an empty
+    // resume of the idle session.
+    tokio::time::timeout(WAIT, async {
+        loop {
+            if injected_cursor() > injected_before
+                && !machine.session_has_active_inputs(&session).await
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the completion wake is injected and its empty resume applied");
+
+    // A retiring registration would release the member to Dormant: give a
+    // teardown the time it takes, and see the member stay Live.
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let mut machine_state = fixture.handle.machine_state_watch_rx.clone();
+    let left_live = tokio::time::timeout(
+        STEP,
+        machine_state.wait_for(|current| {
+            current.member_materialization.get(&key).cloned()
+                != Some(mob_dsl::MemberMaterializationPhase::Live)
+        }),
+    )
+    .await
+    .is_ok();
+    assert!(
+        !left_live,
+        "the member stays Live after the empty resume; it is {:?}",
+        fixture.residency(&member)
+    );
+    let after = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the member's registration is still current");
+    assert_eq!(
+        after.epoch_id(),
+        registration.epoch_id(),
+        "the same registration keeps serving: nothing was unregistered"
+    );
+    assert_eq!(
+        registry
+            .snapshot(&running_id)
+            .expect("read the second operation")
+            .map(|operation| operation.status),
+        Some(OperationStatus::Running),
+        "the member's other background operation keeps running"
+    );
+    assert_eq!(registry.owner_admission(), Ok(OpsOwnerAdmission::Open));
+
+    let body = token("keep");
+    tokio::time::timeout(
+        WAIT,
+        fixture.handle.send_peer_message(
+            sender.clone(),
+            member.clone(),
+            body.as_str(),
+            HandlingMode::Queue,
+        ),
+    )
+    .await
+    .expect("the send answers")
+    .expect("the loaded member takes the message");
+    assert_eq!(fixture.delivered_count(&member, &body).await, 1);
+    assert_eq!(
+        fixture.preparer.prepared_count(),
+        builds_before,
+        "nothing woke or rebuilt the member"
+    );
+    assert_eq!(
+        machine
+            .current_session_registration_witness(&session)
+            .await
+            .map(|current| current.epoch_id().clone()),
+        Some(registration.epoch_id().clone()),
+        "the message ran on the registration the completion left serving"
+    );
+    fixture.finish().await;
+}
+
+/// A customizer may return a member's external tools in any order, and a
+/// wake asks it again. The member lists them in name order, so the woken
+/// member's first request carries the tools array it sent before.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_lists_the_customizers_tools_in_the_order_it_listed_them_before() {
+    let fixture = WakeFixture::new("wake-tool-order").await;
+    fixture
+        .customizer
+        .set_overlay_tools(&["zeta_overlay", "alpha_overlay", "mid_overlay"]);
+    let member = fixture.spawn("tool-order-member").await;
+
+    let before_body = token("tool-order-before");
+    fixture
+        .host_turn(&member, &before_body, HandlingMode::Queue)
+        .await;
+    let before = fixture.client.tools_of_request_mentioning(&before_body);
+    let overlay_before: Vec<&str> = before
+        .iter()
+        .map(String::as_str)
+        .filter(|name| name.ends_with("_overlay"))
+        .collect();
+    assert_eq!(
+        overlay_before,
+        ["alpha_overlay", "mid_overlay", "zeta_overlay"],
+        "the customizer's tools are listed in name order: {before:?}"
+    );
+
+    fixture.release(&member).await;
+    let after_body = token("tool-order-after");
+    fixture
+        .host_turn(&member, &after_body, HandlingMode::Queue)
+        .await;
+    assert!(
+        fixture.customizer.overlay_answers.load(Ordering::SeqCst) >= 2,
+        "the wake asked the customizer again, which answered in another order"
+    );
+    assert_eq!(
+        fixture.client.tools_of_request_mentioning(&after_body),
+        before,
+        "the woken member's first request carries the tools array it sent before"
+    );
+    fixture.finish().await;
+}
+
+/// A member rebuilt on another auth binding (here a wake whose customizer
+/// now names one) has that binding persisted as its session's recorded
+/// binding before it serves: a read right after the wake, before any turn,
+/// sees the new binding, so a follow-up attach or ensure that checks the
+/// recorded binding never sees the old one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebuilt_members_binding_is_recorded_before_it_serves() {
+    let fixture = WakeFixture::new_with_config("wake-binding-recorded", |config| {
+        config.realm.insert(
+            "global".to_string(),
+            meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", "test-key")]),
+        );
+    })
+    .await;
+    let member = fixture.spawn("binding-member").await;
+    let session = fixture.session(&member).await;
+    let recorded = |metadata: Option<meerkat_core::PersistedSessionMetadataView>| {
+        metadata
+            .and_then(|view| view.session_metadata)
+            .and_then(|metadata| metadata.auth_binding)
+    };
+    let binding = meerkat_core::AuthBindingRef {
+        realm: meerkat_core::RealmId::global(),
+        binding: meerkat_core::BindingId::parse("default_openai").expect("binding id"),
+        profile: None,
+        origin: meerkat_core::BindingOrigin::Configured,
+    };
+    assert_ne!(
+        recorded(
+            MobSessionService::load_persisted_session_metadata(&*fixture.service, &session)
+                .await
+                .expect("read the recorded metadata")
+        ),
+        Some(binding.clone()),
+        "precondition: the member was not built on the binding its wake names"
+    );
+    fixture.customizer.set_auth_binding(binding.clone());
+    fixture.release(&member).await;
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("the released member wakes on the new binding");
+
+    assert_eq!(
+        recorded(
+            MobSessionService::load_persisted_session_metadata(&*fixture.service, &session)
+                .await
+                .expect("read the recorded metadata")
+        ),
+        Some(binding),
+        "the woken member's binding is recorded before it runs any turn"
     );
     fixture.finish().await;
 }

@@ -3042,6 +3042,15 @@ impl MobActor {
                 );
             }
         }
+        // The host's preparer learns every member Core builds live here, as
+        // it learns a woken one: a fresh spawn (an embodied seat included), a
+        // held create once it is activated, a respawn. A placed member is
+        // built by its host, not here.
+        if state.remote.is_none()
+            && let Some(session_id) = state.member_ref.bridge_session_id().cloned()
+        {
+            self.report_member_built_to_host(&agent_identity, session_id);
+        }
         tracing::debug!(
             agent_identity = %agent_identity,
             "MobActor spawn activation done"

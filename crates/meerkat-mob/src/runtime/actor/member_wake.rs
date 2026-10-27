@@ -1329,6 +1329,33 @@ impl MobActor {
                     %error,
                     "MobMachine refused wake feedback; the attempt is treated as stale"
                 );
+                // A feedback the machine has no arm for (a false
+                // precondition) never leaves its attempt open: it is closed
+                // NotCurrent, so the member is Dormant and its next delivery
+                // wakes it again. Should that close be refused too, the
+                // attempt's bound still closes it.
+                if self.member_wake_attempt_is_open(identity, attempt) {
+                    self.member_wakes.resolving.insert(attempt);
+                    let closed = self.apply_dsl_signal_collect_transition(
+                        mob_dsl::MobMachineSignal::AbandonMemberWake {
+                            agent_identity: dsl_identity,
+                            attempt,
+                            kind: mob_dsl::MemberWakeAbandonKind::NotCurrent,
+                            reason: format!("{context} was refused: {error}"),
+                        },
+                        "member_wake_refused_feedback_closed",
+                    );
+                    self.member_wakes.resolving.remove(&attempt);
+                    if let Err(close_error) = closed {
+                        tracing::error!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %identity,
+                            attempt,
+                            %close_error,
+                            "a refused wake feedback's attempt could not be closed; its bound closes it"
+                        );
+                    }
+                }
                 mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt
             }
         }

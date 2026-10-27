@@ -5814,11 +5814,12 @@ impl RuntimeLoopAuthorityBinding {
             .await
     }
 
-    /// Same as [`Self::begin_durable_unregister_for_teardown`], but declines
-    /// to stage `BeginUnregisterSession` when admitted input is still queued
-    /// under the session mutation gate. Only the no-pending terminal path may
-    /// use this: a failed run that requires teardown must still fail closed.
-    async fn begin_durable_unregister_for_teardown_unless_queued(
+    /// Same as [`Self::begin_durable_unregister_for_teardown`], but stages
+    /// `BeginUnregisterSession` only on MeerkatMachine's empty-resume verdict
+    /// `Retire`, asked under the session mutation gate. Only the no-pending
+    /// terminal path may use this: a failed run that requires teardown must
+    /// still fail closed.
+    async fn begin_durable_unregister_for_empty_resume(
         &self,
         driver: &crate::meerkat_machine::SharedDriver,
     ) -> Result<RuntimeLoopTeardownUnregisterAdmission, crate::traits::RuntimeDriverError> {
@@ -5829,7 +5830,7 @@ impl RuntimeLoopAuthorityBinding {
                     state: crate::runtime_state::RuntimeState::Destroyed,
                 })?;
         machine
-            .begin_unregister_from_runtime_loop_teardown_unless_queued(&self.session_id, driver)
+            .begin_unregister_from_runtime_loop_empty_resume(&self.session_id, driver)
             .await
     }
 }
@@ -8590,11 +8591,6 @@ async fn process_queue(
 
                 // Lock again to update driver state
                 let d = driver.lock().await;
-                // Observed under the driver lock, before the terminal is
-                // classified: whether any admitted input outside this batch
-                // is still queued. A no-pending terminal may only retire the
-                // registration when nothing else is waiting on it.
-                let other_work_queued = d.has_queued_input_outside(&input_ids);
                 match result {
                     Ok(output) => {
                         drop(d);
@@ -8724,22 +8720,25 @@ async fn process_queue(
                             .chain(join_resolution.retained.iter().cloned())
                             .collect();
                         // A resume against a session that has no pending
-                        // boundary is a successful terminal observation, but
-                        // the executor must not remain attached afterward
-                        // when no other input is admitted. Commit and resolve
-                        // this batch first, then exit so the loop guard
-                        // publishes the exact executor to the machine-owned
-                        // unregister saga. When other admitted input is still
-                        // queued (for example a `turn/start` prompt admitted
-                        // behind a detached-op completion wake), the
-                        // registration stays serving: the materialized actor
-                        // remains attached and the queued input is applied by
-                        // the next batch instead of resolving
-                        // `RuntimeTerminated`.
-                        let teardown_after_commit = matches!(
+                        // boundary (an empty resume, for example an idle
+                        // detached-op completion wake) is a successful
+                        // terminal observation. Commit and resolve this batch
+                        // first; then MeerkatMachine decides whether the
+                        // registration retires (`ResolveEmptyResumeRetirement`,
+                        // asked under the session mutation gate). `Retire` (a
+                        // session-owned registration with nothing queued)
+                        // exits so the loop guard publishes the exact
+                        // executor to the machine-owned unregister saga.
+                        // `KeepServing` keeps the materialized actor attached:
+                        // admitted input queued behind the wake (for example a
+                        // `turn/start` prompt) is applied by the next batch
+                        // instead of resolving `RuntimeTerminated`, and a
+                        // composition-owned registration (a mob member) stays
+                        // loaded, its other operations still running.
+                        let empty_resume_after_commit = matches!(
                             terminal.as_ref(),
                             Some(CoreApplyTerminal::NoPendingBoundary)
-                        ) && !other_work_queued;
+                        );
                         // Keep one cheap clone of the sealed carrier for
                         // post-commit publication. WholeBlob clones share the
                         // lazy byte cell; HeadCanonical clones only an Arc to
@@ -9112,26 +9111,27 @@ async fn process_queue(
                             }
                             continue;
                         }
-                        if teardown_after_commit {
+                        if empty_resume_after_commit {
                             let prior_disposition = std::mem::replace(
                                 &mut handoff.disposition,
                                 RuntimeLoopTeardownDisposition::UnregisterRequired,
                             );
                             match authority_binding
-                                .begin_durable_unregister_for_teardown_unless_queued(driver)
+                                .begin_durable_unregister_for_empty_resume(driver)
                                 .await
                             {
                                 Ok(RuntimeLoopTeardownUnregisterAdmission::Began) => {}
-                                Ok(RuntimeLoopTeardownUnregisterAdmission::QueuedWorkPresent) => {
-                                    // Input was admitted between the queue
-                                    // observation above and the mutation gate.
-                                    // Nothing has been staged, so keep serving
-                                    // and let the next batch apply it.
+                                Ok(RuntimeLoopTeardownUnregisterAdmission::KeepServing) => {
+                                    // The machine kept the registration
+                                    // serving: input is queued, or the
+                                    // composition owns its residency. Nothing
+                                    // has been staged, so keep serving and let
+                                    // the next batch apply any queued input.
                                     handoff.disposition = prior_disposition;
                                     tracing::debug!(
                                         session_id = %authority_binding.session_id,
                                         %run_id,
-                                        "no-pending runtime apply found newly admitted input; keeping the registration serving"
+                                        "empty resume kept the registration serving"
                                     );
                                     continue;
                                 }

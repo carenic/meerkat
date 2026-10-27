@@ -121,7 +121,7 @@ impl ScriptedOwner {
 impl InprocPeerWaker for ScriptedOwner {
     fn wake(&self, request: PeerWakeRequest) -> PeerWakeFuture {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        self.requests.lock().push(request.clone());
+        self.requests.lock().push(request);
         let answer = match &self.on_wake {
             OnWake::Materialize {
                 registry,

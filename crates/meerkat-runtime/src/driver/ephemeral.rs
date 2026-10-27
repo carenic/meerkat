@@ -1333,6 +1333,7 @@ impl EphemeralRuntimeDriver {
                     generation: active_runtime_generation,
                     runtime_epoch_id: active_runtime_epoch_id,
                     session_id,
+                    residency_owner: crate::meerkat_machine::dsl::SessionResidencyOwner::Session,
                 },
             )
             .map_err(|err| {
