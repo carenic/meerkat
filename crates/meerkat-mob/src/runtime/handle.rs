@@ -7969,6 +7969,7 @@ impl MobHandle {
                         let elapsed = Instant::now().saturating_duration_since(stalled.observed_at);
                         tracing::warn!(
                             agent_identity = ?stalled.member_id,
+                            members_owed = ?stalled.members_owed,
                             stage = stalled.stage.as_str(),
                             elapsed_ms = elapsed.as_millis(),
                             "explicit resume lifecycle progress stalled"

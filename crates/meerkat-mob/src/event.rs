@@ -949,8 +949,9 @@ pub enum MobEventKind {
         step_id: StepId,
         reason: String,
     },
-    /// An orchestrator resume notification that a cold resume handed to the
-    /// actor's lifecycle owner did not deliver.
+    /// An orchestrator resume notification that a resume (a cold resume, or
+    /// the lift of a stopped mob) handed to the actor's lifecycle owner did
+    /// not deliver.
     ///
     /// Diagnostic only: the mob keeps running and its phase is unchanged.
     /// `member_id` and `session_id` name the exact notification target the
