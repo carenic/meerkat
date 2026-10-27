@@ -4331,7 +4331,7 @@ export type WireOpenAiPromptCacheMode = "implicit" | "explicit";
 
 export type WireOpenAiPromptCacheRetention = "in_memory" | "24h";
 
-export type WireOpenAiPromptCacheTtl = "30m";
+export type WireOpenAiPromptCacheTtl = "30m" | "12h";
 
 export type WireOpenAiReasoningContext = "auto" | "current_turn" | "all_turns";
 

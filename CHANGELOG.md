@@ -35,11 +35,63 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`, `meerkat-contracts`: the OpenAI prompt-cache TTL
+  vocabulary gains the 12-hour lifetime, appended last:
+  `OpenAiPromptCacheTtl::TwelveHours` (`meerkat_core::model_profile::capabilities`,
+  wire `"12h"`) and `WireOpenAiPromptCacheTtl::TwelveHours`
+  (`meerkat_contracts::wire::runtime`, wire `"12h"`). The provider cache
+  lifetime recorded on authored cache-breakpoint evidence gains
+  `ProviderCacheTtl::TwelveHours` (wire `twelve_hours`), appended last.
+  The three enums are exhaustive, so a downstream exhaustive match needs an
+  arm.
+
+- Python and TypeScript SDKs (not measured by the gate): the fork-cache
+  evidence lifetime `ForkAuthoredCacheBreakpoint.ttl` is now
+  `ForkCacheTtl | ForkCacheTtlUnknown`. A lifetime the SDK does not know
+  reads as `{"unknown": <value>}` instead of failing the fork result with
+  `INVALID_RESPONSE`; code that treats `ttl` as a `ForkCacheTtl` string must
+  handle the unknown form. A missing, empty or non-string `ttl` still fails
+  closed.
+
 ### Added
 
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
   `1` restores one member at a time, as before; `0` counts as `1`.
+
+- `meerkat-models`, `meerkat-openai`, `meerkat-core`, `meerkat`, SDKs:
+  OpenAI's 12-hour prompt-cache lifetime. Every GPT-5.6 and GPT-6 catalog
+  row (`gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`,
+  `gpt-6-astra`, `gpt-6-sol`, `gpt-6.1-sol`, `gpt-6-luna`) now accepts
+  `prompt_cache_options.ttl = "12h"` beside `"30m"`, and its `params_schema`
+  lists both. Set it in a profile, an agent's or session's
+  `provider_params`, or a turn override:
+  `{"provider_tag": {"provider": "open_ai", "prompt_cache_options": {"ttl": "12h"}}}`.
+  The request then carries `prompt_cache_options.ttl = "12h"`; Meerkat's
+  breakpoints carry no lifetime of their own, so it applies to every
+  breakpoint, and the authored cache-breakpoint evidence records
+  `twelve_hours` (`ProviderCacheBreakpointClaim::ttl()` reads it). Choose
+  it for a long-lived agent with a stable prefix that responds every few
+  hours. Every cache write of a `12h` request costs 2.5x the uncached input
+  rate, the conversation tail included, against 1.25x for `30m`; cache
+  reads cost the same. The default stays `30m`; `12h` is only an explicit
+  choice. Rows without GPT-5.6-and-later prompt caching (`gpt-5.5`,
+  `gpt-5.5-pro` and earlier) refuse a TTL when the agent is built
+  (`BuildAgentError::Config`, like `prompt_cache_retention`) on the public
+  OpenAI API, the only backend that sends it; the ChatGPT backend, Azure
+  OpenAI and Copilot drop the prompt-cache fields, so their agents build as
+  before. The request lowering keeps the same check, a typed
+  `InvalidRequest` before anything is sent, for a per-turn override. The
+  Python, TypeScript and Web SDK vocabularies (`WireOpenAiPromptCacheTtl`,
+  `OpenAiPromptCacheTtl`, and the fork-cache evidence `ForkCacheTtl`, now
+  with `ForkCacheTtlUnknown`) carry the new values. The
+  `prompt_cache_options.ttl` description in the schemas and the REST API now
+  reads "`30m` (default) or `12h` on GPT-5.6 and later". The adaptive
+  mobpack `LayerDecision` schema stays pinned to its released form: it keeps
+  the released description and does not list `12h`, and a decision that
+  carries `12h` anyway is parsed and judged by the member's build.
 
 ### Changed
 
@@ -89,6 +141,27 @@ them.
   required review settled as `ReviewUnavailable { UnsupportedEntry }`
   before any reviewer or consent, and a read-only member was refused every
   tool behind them.
+
+### Upgrade notes
+
+- Upgrade the Python and TypeScript SDKs with the server before selecting
+  `prompt_cache_options.ttl = "12h"` for a session you fork. Once such a
+  session runs in `explicit` mode (the GPT-5.6 default), its cache-breakpoint
+  evidence names `twelve_hours`, and the SDKs of 0.9.6 and earlier read that
+  field from a closed list: they refuse the whole fork result as
+  `INVALID_RESPONSE`. The SDKs of this release read a lifetime they do not
+  know as `{"unknown": <value>}`.
+- Rolling back to 0.9.6 after selecting `12h` (opt-in): 0.9.6 does not know
+  the value. A session whose stored `provider_params` carry `ttl = "12h"`
+  panics the first time 0.9.6 decodes its metadata (resuming it, or
+  building its view) with
+  ``generated session-metadata authority rejected durable restore: unknown variant `12h`, expected `30m` ``,
+  logged first at error level as `generated authority rejected durable
+  restore`. A profile or mob definition that carries it fails its parse with
+  ``unknown variant `12h`, expected `30m` ``. Cache-breakpoint evidence that
+  names `twelve_hours` is not fatal there: a fork reports cache inheritance
+  unavailable (`authored_evidence_invalid`) and the next turn drops the row
+  as `evidence_unusable`. Remove the setting before rolling back.
 
 ## [0.9.6] - 2026-10-27
 
