@@ -19070,6 +19070,22 @@ impl MobActor {
                 reason: "registration reload requires a session-backed member".to_string(),
             }
         })?;
+        // A seat that built nothing has no session to reload: its session is
+        // created at the member's first wake, through the spawn provision
+        // path, never by a reload of durable truth it does not have. Not a
+        // busy refusal: a retry of the reload answers the same until a wake
+        // created the session.
+        if super::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            agent_identity,
+        ) {
+            return Err(MobError::UnsupportedForMode {
+                mode: entry.runtime_mode,
+                reason: "the member's session is created at its first wake; it has no session \
+                         to reload yet"
+                    .to_string(),
+            });
+        }
         let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
         Ok(PreparedMemberRegistrationReload {
             entry,

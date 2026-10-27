@@ -638,18 +638,10 @@ impl MobActor {
                     %error,
                     "a member wake's plan was refused in its turn"
                 );
-                self.roll_back_member_wake_provision(&run, plan_rollback);
-                if self.member_wake_attempt_is_open(&run.identity, run.attempt) {
-                    self.abandon_member_wake(
-                        &run,
-                        mob_dsl::MemberWakeAbandonKind::NotCurrent,
-                        None,
-                    )
-                    .await;
-                } else {
-                    self.finish_closed_member_wake(&run.identity, run.attempt)
-                        .await;
-                }
+                // Rolled back before the attempt ends (NotCurrent while it
+                // is open): a seat session the plan created and did not
+                // journal born is kept for the next wake.
+                self.roll_back_member_wake(run, plan_rollback);
                 return;
             }
         }
@@ -1185,7 +1177,10 @@ impl MobActor {
     }
 
     /// Roll back the provision a wake made (off the actor), then finish the
-    /// attempt by the state the rollback leaves.
+    /// attempt by the state the rollback leaves: NotCurrent (Dormant) while
+    /// it is still open. A seat session the wake created and has not
+    /// journaled born is kept rather than archived
+    /// ([`Self::wake_keeps_unborn_seat_session`]).
     fn roll_back_member_wake(&mut self, run: WakeRun, rollback: Option<WakeRollback>) {
         let Some(rollback) = rollback else {
             let identity = run.identity.clone();
@@ -1195,11 +1190,37 @@ impl MobActor {
             self.member_wakes.closed_answer_later(identity, attempt);
             return;
         };
-        let provision = rollback.pending(&run.identity, Arc::clone(&self.provisioner));
         let fence = match self.member_wake_fence_or_absent(&run.identity) {
             Some(fence) => fence,
             None => MemberFence::ExpectedAbsent(run.identity.clone()),
         };
+        if self.wake_keeps_unborn_seat_session(&run.identity) {
+            let provisioner = Arc::clone(&self.member_wakes.provisioner);
+            let mob_id = self.definition.id.clone();
+            let identity = run.identity.clone();
+            self.dispatch_member_wake_step(
+                run,
+                fence,
+                None,
+                "member_wake_keep_seat_session",
+                async move {
+                    match release_kept_seat_session(&provisioner, &rollback.member_ref).await {
+                        Ok(()) => WakeStep::RolledBack { settled: true },
+                        Err(error) => {
+                            tracing::error!(
+                                mob_id = %mob_id,
+                                agent_identity = %identity,
+                                %error,
+                                "a kept seat session's live materialization could not be released"
+                            );
+                            WakeStep::RolledBack { settled: false }
+                        }
+                    }
+                },
+            );
+            return;
+        }
+        let provision = rollback.pending(&run.identity, Arc::clone(&self.provisioner));
         self.dispatch_member_wake_step(run, fence, None, "member_wake_rollback", async move {
             match provision.rollback_retaining_custody().await {
                 Ok(()) => WakeStep::RolledBack { settled: true },
@@ -1232,6 +1253,28 @@ impl MobActor {
         });
     }
 
+    /// Whether a wake that ends retryable keeps the session it created
+    /// instead of archiving it: the member's seat session is still unborn
+    /// (the create happened, its born row was not journaled), the member is
+    /// still seated and not retiring, and the service keeps durable sessions.
+    /// Only the session's live materialization is released then; the next
+    /// wake adopts the session, as it adopts one a crash left created, and
+    /// never creates it again. A wake that ends Broken rolls its provision
+    /// back as before, and so does one of a member that is leaving.
+    fn wake_keeps_unborn_seat_session(&self, identity: &AgentIdentity) -> bool {
+        let state = self.dsl_authority.state();
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        self.session_service.supports_persistent_sessions()
+            && super::super::boot_plan::domain_member_seat_session_unborn(state, identity)
+            && state
+                .identity_to_runtime
+                .get(&dsl_identity)
+                .is_some_and(|runtime_id| {
+                    state.member_state_markers.get(runtime_id)
+                        != Some(&mob_dsl::MobMemberState::Retiring)
+                })
+    }
+
     /// The exact fence of `identity`'s current incarnation, if it is seated.
     fn member_wake_fence_or_absent(&self, identity: &AgentIdentity) -> Option<MemberFence> {
         self.roster
@@ -1240,6 +1283,37 @@ impl MobActor {
             .and_then(|roster| roster.get(identity).cloned())
             .map(|entry| MemberFence::exact(&entry))
     }
+}
+
+/// Release the live materialization of a seat session a retryable wake
+/// keeps: its exact runtime attachment is retired and its live actor
+/// discarded, as before a resume of it, and the run-start hold its build
+/// preparation staged is removed (the next wake prepares the build again).
+/// The session itself stays, for the next wake to adopt.
+async fn release_kept_seat_session(
+    provisioner: &super::super::provisioner::MultiBackendProvisioner,
+    member_ref: &MemberRef,
+) -> Result<(), MobError> {
+    let session_id = member_ref.bridge_session_id().ok_or_else(|| {
+        MobError::Internal("a kept seat session's provision names no session".to_string())
+    })?;
+    provisioner
+        .retire_exact_attachment_for_explicit_resume(session_id)
+        .await?;
+    if let Err(error) = provisioner
+        .unstage_member_registration_run_start_hold(
+            member_ref,
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            %error,
+            "a kept seat session's staged run-start hold could not be removed"
+        );
+    }
+    Ok(())
 }
 
 /// Step B: plan the member's restore off the actor.

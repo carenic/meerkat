@@ -15761,7 +15761,10 @@ impl MobHandle {
     /// too: its pending unregister is completed and the same session is
     /// re-attached (`Reattached`). `NotDegraded` is a success no-op and is
     /// reported only for a registration with a committed attachment. Placed
-    /// members are reloaded by their member host and are rejected typed.
+    /// members are reloaded by their member host and are rejected typed. A
+    /// member whose seat built nothing has no session to reload: its session
+    /// is created at its first wake, and until then the reload is refused
+    /// with [`MobError::UnsupportedForMode`] saying so; a delivery wakes it.
     /// While the mob is Stopped the reload discards the degraded registration
     /// and publishes its successor, which the Stop's staged `MobStop` holds,
     /// and answers `Discarded`: the successor's revival waits for Running,
