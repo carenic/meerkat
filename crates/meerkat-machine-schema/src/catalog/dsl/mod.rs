@@ -4158,6 +4158,7 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     "WakeInFlight",
                     "HostOwned",
                     "NotAMember",
+                    "NotYetReleasable",
                 ],
             ),
             NamedTypeBinding::string("RuntimeEpochId"),

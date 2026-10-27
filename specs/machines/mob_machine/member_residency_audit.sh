@@ -40,14 +40,16 @@
 # classification never changes residency), that exactly one WakeMember arm
 # answers every input shape, that a local wake never closes Live without an
 # endpoint while it owes EndpointPending and can always close Live when it
-# owes no endpoint cause, and that a release of another epoch never demotes.
-# The seed run checks that the boot plan never leaves a member that blocks the
-# seal. The retire run checks that no runtime retire is routed for a member
-# with no registration (R27), that a settled retirement can always archive and
-# under an admitted destroy nothing holds it (R124), and that no rotation
-# begins or commits under an admitted destroy (R124). TLC evaluates the
-# module's I5 ASSUME (a present, bound member with a phase is never refused as
-# not a member) and its release verdict ASSUME at the start of every run.
+# owes no endpoint cause, that the release verdict is Release exactly when the
+# Released arm would honour the member's own registration, and that a release
+# of another epoch never demotes. The seed run checks that the boot plan never
+# leaves a member that blocks the seal. The retire run checks that no runtime
+# retire is routed for a member with no registration (R27), that a settled
+# retirement can always archive and under an admitted destroy nothing holds it
+# (R124), and that no rotation begins or commits under an admitted destroy
+# (R124). TLC evaluates the module's I5 ASSUME (a present, bound member with a
+# phase is never refused as not a member) and its release verdict ASSUME at
+# the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -355,7 +357,8 @@ write_cfg() {
       run_invariants="
   AuditWakingClosable
   AuditWakeExactlyOne
-  AuditWakeClosesLiveUnlessEndpointOwed"
+  AuditWakeClosesLiveUnlessEndpointOwed
+  AuditReleaseVerdictMatchesArm"
       ;;
     retire)
       spec="AuditRetireSpec"
@@ -854,6 +857,11 @@ for fold in folds:
   mutate wake release_verdict_misses_waking \
     "Assumption .* is false" \
     'replace_in_operator("member_release_verdict", "(residency = Some(\"Waking\"))", "FALSE")' "$@"
+  # The release verdict drifts from the Released arm: it answers Release for
+  # a Live member whose registration release would be Stale.
+  mutate wake release_verdict_ignores_registration \
+    "Error: Invariant AuditReleaseVerdictMatchesArm is violated" \
+    'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "TRUE")' "$@"
   # The boot plan leaves an endpoint-less member Dormant owing nothing, so
   # the seal would refuse the whole start.
   mutate seed stay_dormant_owes_nothing \

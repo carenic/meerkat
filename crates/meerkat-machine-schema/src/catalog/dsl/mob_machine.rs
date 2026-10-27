@@ -2993,15 +2993,36 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
+        // The member facts a registration release needs, shared by the
+        // Released arm and the release verdict so the two cannot drift: a
+        // Live local member whose registration's epoch is recorded (the
+        // routed binding landed) and which, after the seal, has a durable
+        // endpoint.
+        helper member_registration_releasable(
+            residency: Option<Enum<MemberMaterializationPhase>>,
+            placed: bool,
+            sealed: bool,
+            has_endpoint: bool,
+            epoch_recorded: bool
+        ) -> bool {
+            residency == Some(MemberMaterializationPhase::Live)
+                && placed == false
+                && (sealed == false || has_endpoint == true)
+                && epoch_recorded == true
+        }
+
         // The release verdict for one member. An identity that is not seated
         // is not a member; a placed member's member host owns its
-        // materialization; a local Live member releases its registration; a
-        // Waking member has a wake in flight; anything else (Dormant, or no
-        // phase: Broken, retiring, unbound) has nothing materialized.
+        // materialization; a local Live member releases its registration
+        // when the Released arm would honour that release, and is not yet
+        // releasable otherwise; a Waking member has a wake in flight;
+        // anything else (Dormant, or no phase: Broken, retiring, unbound)
+        // has nothing materialized.
         helper member_release_verdict(
             seated: bool,
             placed: bool,
-            residency: Option<Enum<MemberMaterializationPhase>>
+            residency: Option<Enum<MemberMaterializationPhase>>,
+            releasable: bool
         ) -> Enum<MemberReleaseVerdict> {
             if seated == false {
                 MemberReleaseVerdict::NotAMember
@@ -3009,14 +3030,17 @@ macro_rules! mob_catalog_machine_dsl {
             if placed == true {
                 MemberReleaseVerdict::HostOwned
             } else {
-            if residency == Some(MemberMaterializationPhase::Live) {
+            if residency == Some(MemberMaterializationPhase::Live) && releasable == true {
                 MemberReleaseVerdict::Release
+            } else {
+            if residency == Some(MemberMaterializationPhase::Live) {
+                MemberReleaseVerdict::NotYetReleasable
             } else {
             if residency == Some(MemberMaterializationPhase::Waking) {
                 MemberReleaseVerdict::WakeInFlight
             } else {
                 MemberReleaseVerdict::NothingMaterialized
-            }}}}
+            }}}}}
         }
 
         disposition DefinitionEpochAdvanced => local seam SurfaceResultAlignment,
@@ -21089,6 +21113,15 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.lifecycle_phase == Phase::Stopped
                 || self.lifecycle_phase == Phase::Completed
             }
+            // R124: a rotation in flight at a destroy is abandoned at the
+            // destroy's admission, whose RotationSessionsAbandoned names each
+            // rotation's next session for the shell to archive (no rotation
+            // begins after it). The destroy that drops the intents therefore
+            // follows the admission whenever one exists.
+            guard "rotations_abandoned_at_admission" {
+                self.member_rotation_session_ids == EmptyMap
+                || self.destroy_admitted == true
+            }
             guard "session_ingress_detaches_closed" { self.pending_session_ingress_detach_runtime_ids == EmptySet }
             guard "placed_completion_quiesce_started" { self.placed_completion_lifecycle_quiescing == true }
             guard "placed_completion_destroy_intent" { self.placed_completion_lifecycle_intent == Some(PlacedCompletionLifecycleIntentKind::Destroy) }
@@ -25431,14 +25464,15 @@ macro_rules! mob_catalog_machine_dsl {
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::StaleAttempt }
         }
 
-        // G1/F5: a runtime registration was released while its member stays
-        // seated (the composition route from MeerkatMachine's
-        // RuntimeRegistrationReleased, or the mob-owned discard seam). Only
-        // the exact registration of a Live, local member (with a durable
-        // endpoint once the boot plan is sealed, N3) is released: Live -> Dormant, its epoch and binding
-        // ladder cleared (R12). Anything else (an older epoch after a newer
-        // wake, a Waking member, a wake's own claim rollback, a non-member)
-        // is a normal, accepted Stale no-op that never demotes a wake.
+        // G1/F5: a runtime registration was released while its member stays seated
+        // (the composition route from MeerkatMachine's RuntimeRegistrationReleased,
+        // or the mob-owned discard seam). Only the exact registration of a Live,
+        // local member (with a durable endpoint once the boot plan is sealed, N3) is
+        // released: Live -> Dormant, its epoch and binding ladder cleared (R12). The
+        // member facts come from member_registration_releasable, which the release
+        // verdict shares. Anything else (an older epoch after a newer wake, a Waking
+        // member, a wake's own claim rollback, a non-member) is a normal, accepted
+        // Stale no-op that never demotes a wake.
         transition ReleaseMemberMaterializationReleased {
             per_phase [Running, Stopped, Completed]
             on signal ReleaseMemberMaterialization { agent_runtime_id, fence_token, runtime_epoch_id, cause }
@@ -25446,19 +25480,25 @@ macro_rules! mob_catalog_machine_dsl {
                 exists(member_id in self.identity_to_runtime.keys(),
                     self.identity_to_runtime.get_cloned(member_id) == agent_runtime_id
                     && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
-                    && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
-                    && self.member_placement.contains_key(member_id) == false
-                    && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
-                    && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id))
+                    && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id)
+                    && member_registration_releasable(
+                        self.member_materialization.get_cloned(member_id),
+                        self.member_placement.contains_key(member_id),
+                        self.boot_plan_sealed,
+                        self.member_peer_endpoints.contains_key(member_id),
+                        self.member_materialization_epoch.contains_key(member_id)))
             }
             update {
                 for member_id in self.identity_to_runtime.keys() {
                     if self.identity_to_runtime.get_cloned(member_id) == agent_runtime_id
                         && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
-                        && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
-                        && self.member_placement.contains_key(member_id) == false
-                        && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
                         && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id)
+                        && member_registration_releasable(
+                            self.member_materialization.get_cloned(member_id),
+                            self.member_placement.contains_key(member_id),
+                            self.boot_plan_sealed,
+                            self.member_peer_endpoints.contains_key(member_id),
+                            self.member_materialization_epoch.contains_key(member_id))
                     {
                         self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
                         self.member_materialization_epoch.remove(member_id);
@@ -25479,10 +25519,13 @@ macro_rules! mob_catalog_machine_dsl {
                 !exists(member_id in self.identity_to_runtime.keys(),
                     self.identity_to_runtime.get_cloned(member_id) == agent_runtime_id
                     && self.identity_runtime_fence_tokens.get_copied(member_id) == fence_token
-                    && self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Live)
-                    && self.member_placement.contains_key(member_id) == false
-                    && (self.boot_plan_sealed == false || self.member_peer_endpoints.contains_key(member_id) == true)
-                    && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id))
+                    && self.member_materialization_epoch.get_cloned(member_id) == Some(runtime_epoch_id)
+                    && member_registration_releasable(
+                        self.member_materialization.get_cloned(member_id),
+                        self.member_placement.contains_key(member_id),
+                        self.boot_plan_sealed,
+                        self.member_peer_endpoints.contains_key(member_id),
+                        self.member_materialization_epoch.contains_key(member_id)))
             }
             update {}
             to Running
@@ -25597,7 +25640,13 @@ macro_rules! mob_catalog_machine_dsl {
                 verdict: member_release_verdict(
                     self.identity_to_runtime.contains_key(agent_identity),
                     self.member_placement.contains_key(agent_identity),
-                    self.member_materialization.get_cloned(agent_identity))
+                    self.member_materialization.get_cloned(agent_identity),
+                    member_registration_releasable(
+                        self.member_materialization.get_cloned(agent_identity),
+                        self.member_placement.contains_key(agent_identity),
+                        self.boot_plan_sealed,
+                        self.member_peer_endpoints.contains_key(agent_identity),
+                        self.member_materialization_epoch.contains_key(agent_identity)))
             }
         }
 
@@ -28405,6 +28454,10 @@ pub enum MemberReleaseVerdict {
     HostOwned,
     /// The identity is not seated.
     NotAMember,
+    /// A Live member whose registration release would not be honoured yet:
+    /// its registration's epoch is not recorded (the routed binding has not
+    /// landed), or after the seal it has no durable endpoint.
+    NotYetReleasable,
 }
 
 /// A runtime registration epoch, as the composition route carries it.

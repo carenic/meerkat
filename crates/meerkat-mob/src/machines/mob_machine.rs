@@ -10601,9 +10601,12 @@ mod tests {
         assert!(authority.state().boot_plan_sealed);
     }
 
-    /// The release verdict answers from the member's phase: a local Live member
-    /// releases, a Waking one has a wake in flight, a Dormant one has nothing
-    /// materialized, and an identity that is not seated is not a member.
+    /// The release verdict answers from the member's phase and from the facts
+    /// the Released arm checks: a local Live member releases once its
+    /// registration's epoch is recorded (before that it is not yet
+    /// releasable), a Waking one has a wake in flight, a Dormant one has
+    /// nothing materialized, and an identity that is not seated is not a
+    /// member.
     #[test]
     fn the_release_verdict_answers_from_the_member_phase() {
         let verdict = |authority: &mut MobMachineAuthority, identity: &AgentIdentity| {
@@ -10630,6 +10633,18 @@ mod tests {
         let runtime_id = AgentRuntimeId::from("release-verdict:0");
         let mut live = MobMachineAuthority::new();
         seed_live_member(&mut live, &identity, &runtime_id);
+        assert_eq!(
+            verdict(&mut live, &identity),
+            MemberReleaseVerdict::NotYetReleasable,
+            "before the routed binding lands, the release would be Stale"
+        );
+        let fence_token = live_fence(&live, &runtime_id);
+        live.apply_signal(MobMachineSignal::ObserveRuntimeReady {
+            agent_runtime_id: runtime_id.clone(),
+            fence_token,
+            runtime_epoch_id: Some(RuntimeEpochId("release-verdict-epoch".to_string())),
+        })
+        .expect("the routed binding records the registration's epoch");
         assert_eq!(verdict(&mut live, &identity), MemberReleaseVerdict::Release);
         assert_eq!(
             verdict(&mut live, &AgentIdentity::from("never-seated")),
@@ -10651,6 +10666,70 @@ mod tests {
             verdict(&mut dormant, &identity),
             MemberReleaseVerdict::WakeInFlight
         );
+    }
+
+    /// A forced destroy that drops in-flight rotation intents follows the
+    /// destroy's admission, whose RotationSessionsAbandoned names each
+    /// rotation's next session for the shell to archive.
+    #[test]
+    fn the_forced_destroy_follows_the_admission_that_abandons_rotation_sessions() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "forced-destroy-rotation", 37);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "forced-destroy-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the rotation's retirement starts");
+        let next_session = SessionId::from("forced-destroy-rotation-next");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: next_session.clone(),
+                peer_endpoint: None,
+                session_archived: false,
+            },
+        )
+        .expect("the rotation records its intent");
+        close_ingress_detach(&mut authority, &member);
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        assert!(
+            MobMachineMutator::apply(&mut authority, MobMachineInput::Destroy).is_err(),
+            "a forced destroy never drops a rotation intent its admission did not abandon"
+        );
+        let admitted = authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+        assert!(admitted.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::RotationSessionsAbandoned { rotations }
+                if rotations.get(&member.identity) == Some(&next_session)
+        )));
+        MobMachineMutator::apply(&mut authority, MobMachineInput::Destroy)
+            .expect("the admitted forced destroy completes");
+        assert!(authority.state().member_rotation_session_ids.is_empty());
     }
 
     /// A rotation whose spec owes a kickoff re-seats the next incarnation with
