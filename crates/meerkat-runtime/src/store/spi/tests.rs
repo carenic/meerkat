@@ -2563,3 +2563,135 @@ async fn a_settling_runtime_keeps_its_window_under_the_rebase_bound() {
         "the owed work is still owed"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The open's loads of the runtimes recovery must act on: up to
+// BOOT_LOAD_CONCURRENCY runtimes at once, and nothing installed when one
+// fails.
+// ---------------------------------------------------------------------------
+
+/// How long a session row read takes in these rows, on the paused clock.
+const BOOT_READ_DELAY: Duration = Duration::from_millis(50);
+
+/// `count` runtimes, each holding an unsettled input, so the open loads every
+/// one of their bodies. Their keys sort in creation order.
+async fn obligated_runtimes(store: &SpiRuntimeStore, count: usize) -> Vec<LogicalRuntimeId> {
+    let mut runtimes = Vec::with_capacity(count);
+    for index in 0..count {
+        let runtime = LogicalRuntimeId::new(format!("obligated-{index:03}"));
+        store
+            .persist_input_state(
+                &runtime,
+                &persistable(StoredInputState::new_accepted(InputId::new())),
+            )
+            .await
+            .expect("an unsettled input");
+        runtimes.push(runtime);
+    }
+    runtimes
+}
+
+// Unrun until the candidate's validation.
+//
+// The open loads the runtimes recovery must act on concurrently, up to
+// `BOOT_LOAD_CONCURRENCY` at once. Every session row read waits the same
+// delay on the paused clock, and the host counts the reads waiting at once:
+// an open of K such runtimes peaks at min(K, bound) reads in flight, never
+// more, and loads every one of them. The row counts the peak; it does not
+// time the open (ceil(K / bound) delays, where a serial open took K).
+//
+// RED on the base (e294b75f29, with the row and its test host hooks applied):
+// the open loaded the runtimes one at a time, so the peak is 1 for every K.
+#[tokio::test(start_paused = true)]
+async fn an_open_loads_the_runtimes_with_recovery_work_up_to_the_bound_at_once() {
+    let bound = super::runtime::BOOT_LOAD_CONCURRENCY;
+    assert_eq!(bound, 16, "the bound the docs and the CHANGELOG state");
+    for count in [5, 2 * bound + 3] {
+        let host = Arc::new(TestHost::new());
+        let opened = open(&host).await;
+        let runtimes = obligated_runtimes(&opened.1, count).await;
+        host.faults.lock().unwrap().session_read_delay = Some(BOOT_READ_DELAY);
+        let (_realm, store) = reopen(&host, opened).await;
+        assert_eq!(
+            host.session_read_peak(),
+            count.min(bound),
+            "an open of {count} runtimes with work reads min({count}, {bound}) of them at once"
+        );
+        for runtime in &runtimes {
+            assert!(
+                store.runtime_loaded_for_test(&runtime.0).await,
+                "{runtime:?} holds work and loads at open"
+            );
+        }
+    }
+}
+
+// Unrun until the candidate's validation.
+//
+// A failed body load fails the open with the host's error, and the open
+// installs nothing: no runtime scope of the realm it leaves counts as
+// loaded, and it commits nothing. Once the host reads again, the next open
+// loads and serves every runtime as it was. The failing runtime is the last
+// in key order and its read answers last, after the other loads finished, so
+// an open that installed each runtime as its read completed, in key order or
+// not, would have installed the other two.
+//
+// RED on the base (e294b75f29, with the row and its test host hooks applied):
+// the serial open imported the first two runtimes and marked their scopes
+// loaded before it failed at the third.
+#[tokio::test(start_paused = true)]
+async fn a_failed_recovery_load_fails_the_open_and_installs_nothing() {
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let runtimes = obligated_runtimes(&opened.1, 3).await;
+    let mut images = Vec::with_capacity(runtimes.len());
+    for runtime in &runtimes {
+        images.push(opened.1.export_runtime_for_test(&runtime.0).await);
+    }
+    drop(opened);
+    host.expire_lease();
+    host.faults.lock().unwrap().failing_session_reads =
+        Some((runtime_scope_prefix(&runtimes[2]), BOOT_READ_DELAY));
+    let commits = host.commit_count();
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .expect("the realm opens");
+    let failed = SpiRuntimeStore::open(Arc::clone(&realm)).await;
+    assert!(
+        matches!(
+            failed,
+            Err(SpiError::Host(
+                meerkat_core::host_store::HostStoreError::Unavailable(_)
+            ))
+        ),
+        "the failed load fails the open with the host's error: {failed:?}"
+    );
+    for runtime in &runtimes {
+        let cell = realm.cell(&ScopeId::new(super::RUNTIME_FAMILY, runtime.0.clone()));
+        assert!(
+            !cell.lock().await.is_loaded(),
+            "the failed open installed nothing, {runtime:?} included"
+        );
+    }
+    assert_eq!(
+        host.commit_count(),
+        commits,
+        "the failed open committed nothing"
+    );
+
+    host.faults.lock().unwrap().failing_session_reads = None;
+    drop((failed, realm));
+    host.expire_lease();
+    let (_realm, store) = open(&host).await;
+    for (runtime, image) in runtimes.iter().zip(&images) {
+        assert!(
+            store.runtime_loaded_for_test(&runtime.0).await,
+            "{runtime:?} loads at the next open"
+        );
+        assert_eq!(
+            &store.export_runtime_for_test(&runtime.0).await,
+            image,
+            "the next open serves {runtime:?} as it was"
+        );
+    }
+}

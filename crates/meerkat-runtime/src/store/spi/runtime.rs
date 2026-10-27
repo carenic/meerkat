@@ -37,13 +37,14 @@
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex as StdMutex};
 
+use futures::{StreamExt as _, TryStreamExt as _};
 use meerkat_core::host_store::ScopeKind;
 use meerkat_core::lifecycle::{InputId, RunBoundaryReceipt, RunId};
 use tokio::sync::RwLock;
 
 use super::SpiError;
 use super::realm::{
-    ArmedScopes, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm,
+    ArmedScopes, ScopeCell, ScopeDelta, ScopeFamily, ScopeGuard, ScopeId, ScopeState, SpiRealm,
 };
 use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
@@ -110,6 +111,15 @@ pub(crate) const MOB_HOST_REVOCATION_FAMILY: ScopeFamily = ScopeFamily {
 
 /// The single entry of a record scope.
 const RECORD_ENTRY: &str = "v";
+
+/// How many runtimes [`SpiRuntimeStore::open`] reads from the host at once:
+/// the head entries each runtime keeps as chunks, and the body of each
+/// runtime recovery must act on. It is 16, the default restore concurrency
+/// of a mob resume (meerkat-mob's `MobBuilder::with_resume_restore_concurrency`):
+/// the open runs before any mob is built, so it has a bound of its own. One
+/// runtime's reads stay in order: its rows 16 per `read_rows` call, then its
+/// chunks one after another.
+pub(crate) const BOOT_LOAD_CONCURRENCY: usize = 16;
 
 fn runtime_id_scope(runtime_id: &LogicalRuntimeId) -> ScopeId {
     ScopeId::new(RUNTIME_FAMILY, runtime_id.0.clone())
@@ -308,10 +318,58 @@ fn find<'a>(guards: &'a mut [ScopeGuard], id: &ScopeId) -> Result<&'a mut ScopeS
         .ok_or_else(|| SpiError::Misuse(format!("{id} is not locked")))
 }
 
+/// What the open read of one runtime, nothing of it installed yet: its
+/// locked scope, its pinned entries, and its body when recovery must act on
+/// it.
+struct RuntimeAtBoot {
+    /// The runtime's place in the claim (key order), the order the open
+    /// installs the runtimes in.
+    index: usize,
+    state: ScopeGuard,
+    pinned: BTreeMap<String, Arc<Vec<u8>>>,
+    /// The body, loaded when recovery must act on the runtime.
+    body: Option<BTreeMap<String, Arc<Vec<u8>>>>,
+    /// Without a body: whether the head predates the ops fold
+    /// ([`head_predates_ops_fold`]).
+    unfolded: bool,
+}
+
+/// Read one runtime for the open: lock its scope, read its pinned entries
+/// (a chunked one from the host), and load its body when recovery must act
+/// on it. Nothing goes to memory and the scope is not marked loaded, so a
+/// read that fails or is dropped leaves the scope as the listing left it.
+/// The scope stays locked across the host reads, as every call's does; no
+/// read here waits for another lock while it holds it.
+async fn read_runtime_at_boot(
+    realm: &SpiRealm,
+    index: usize,
+    cell: Arc<ScopeCell>,
+) -> Result<RuntimeAtBoot, SpiError> {
+    let mut state = cell.lock_owned().await;
+    let pinned = realm.pinned_values(&state).await?;
+    let (body, unfolded) = if needs_body_at_boot(&pinned)? {
+        (Some(realm.load_body(&mut state).await?), false)
+    } else {
+        (None, head_predates_ops_fold(&pinned)?)
+    };
+    Ok(RuntimeAtBoot {
+        index,
+        state,
+        pinned,
+        body,
+        unfolded,
+    })
+}
+
 impl SpiRuntimeStore {
     /// Open the runtime store over a realm: claim its families, import every
     /// realm record and every runtime's pinned entries, and load the bodies
     /// recovery must act on. Every other body loads on first use.
+    ///
+    /// The runtimes are read from the host up to 16 at once (their head
+    /// entries kept as chunks, and the bodies recovery must act on); one
+    /// runtime's reads stay in order. Nothing is installed until every read
+    /// succeeded, so a failed read fails the open with no runtime installed.
     ///
     /// # Errors
     /// Host failures and data that does not decode.
@@ -352,22 +410,42 @@ impl SpiRuntimeStore {
             }
         }
         let mut unfolded_heads = HashSet::new();
-        for cell in realm.claim(RUNTIME_FAMILY)? {
-            let mut state = cell.lock().await;
+        // The runtimes are read up to BOOT_LOAD_CONCURRENCY at once, each
+        // holding only its own scope's lock. Nothing is installed until every
+        // read succeeded: the first failure fails the open, with no runtime
+        // in memory and no scope marked loaded. The runtimes are then
+        // installed one by one in key order, as a serial open installed them.
+        let reader: &SpiRealm = &realm;
+        let reads = realm
+            .claim(RUNTIME_FAMILY)?
+            .into_iter()
+            .enumerate()
+            .map(move |(index, cell)| read_runtime_at_boot(reader, index, cell));
+        let mut runtimes: Vec<RuntimeAtBoot> = futures::stream::iter(reads)
+            .buffer_unordered(BOOT_LOAD_CONCURRENCY)
+            .try_collect()
+            .await?;
+        runtimes.sort_unstable_by_key(|runtime| runtime.index);
+        for RuntimeAtBoot {
+            mut state,
+            pinned,
+            body,
+            unfolded,
+            ..
+        } in runtimes
+        {
             let scope = TouchScope::Runtime(state.id().key.clone());
-            let pinned = realm.pinned_values(&state).await?;
             memory
                 .journal_import(&scope, &pinned)
                 .await
                 .map_err(memory_error)?;
-            if needs_body_at_boot(&pinned)? {
-                let body = realm.load_body(&mut state).await?;
+            if let Some(body) = body {
                 memory
                     .journal_import(&scope, &body)
                     .await
                     .map_err(memory_error)?;
                 state.mark_loaded();
-            } else if head_predates_ops_fold(&pinned)? {
+            } else if unfolded {
                 unfolded_heads.insert(state.id().key.clone());
             }
         }

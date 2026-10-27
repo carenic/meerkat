@@ -26032,16 +26032,22 @@ macro_rules! mob_catalog_machine_dsl {
 
         // A member already Waking (a boot-plan, peer or host wake in
         // flight) is not rebuilt: the explicit resume Joins its open attempt
-        // and settles from its outcome.
+        // and settles from its outcome. Its readiness is its own wake's, never
+        // this resume's, so a join may follow a readiness the resume already
+        // settled: the lift of a stopped mob runs its readiness before the
+        // durable Resume, and its member plan opens the wakes it joins only
+        // after it. A join comes before the topology stage, which needs every
+        // joined member settled, and never while a readiness is in flight.
         transition AuthorizeExplicitResumeMemberJoinRunning {
             on input AuthorizeExplicitResumeMember { attempt, agent_identity, binding }
             guard { self.lifecycle_phase == Phase::Running }
             guard "exact_resume_attempt" { self.explicit_resume_attempt == Some(attempt) }
             guard "resume_not_cancelled" { self.explicit_resume_cancel_requested == false }
             guard "preparation_settled" { self.explicit_resume_preparation_pending == false }
-            guard "readiness_not_started" {
-                self.explicit_resume_readiness_pending == false
-                && self.explicit_resume_readiness_settled == false
+            guard "readiness_not_pending" { self.explicit_resume_readiness_pending == false }
+            guard "topology_not_started" {
+                self.explicit_resume_topology_pending == false
+                && self.explicit_resume_topology_settled == false
             }
             guard "member_work_not_pending" { self.explicit_resume_member_work.contains_key(agent_identity) == false }
             guard "current_definition" { self.definition_epoch == binding.definition_epoch }

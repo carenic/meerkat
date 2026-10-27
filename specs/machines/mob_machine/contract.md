@@ -16390,7 +16390,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `exact_resume_attempt`
   - `resume_not_cancelled`
   - `preparation_settled`
-  - `readiness_not_started`
+  - `readiness_not_pending`
+  - `topology_not_started`
   - `member_work_not_pending`
   - `current_definition`
   - `current_runtime`

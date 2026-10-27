@@ -1013,7 +1013,8 @@ pub(super) enum MobCommand {
         stage: super::actor::UnprovenResumeCustodyStage,
     },
     /// A member the clean-stop lift's plan materializes closed its wake
-    /// attempt (`joined`: it went Live); the lift settles its resume work.
+    /// attempt (`joined`: it went Live); the lift dispatches the next members
+    /// of its plan and settles the member's resume work.
     ResumeLifecycleBootMemberSettled {
         member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
         joined: bool,

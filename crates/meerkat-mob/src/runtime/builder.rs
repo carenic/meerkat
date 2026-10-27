@@ -7879,7 +7879,8 @@ impl MobBuilder {
     }
 
     /// Restore up to `concurrency` members at once when [`Self::resume`]
-    /// restores a running mob's members. Default 16; `0` counts as `1`.
+    /// restores a running mob's members. Default 16; `0` counts as `1`, and a
+    /// value above tokio's `Semaphore::MAX_PERMITS` counts as that maximum.
     ///
     /// Restoring a member reads its session and provisions it, round trips to
     /// the session store that, one member at a time, make a resume grow with
@@ -7916,9 +7917,19 @@ impl MobBuilder {
     /// A resume dropped before it returns drops the restores in flight with
     /// it: up to `concurrency` members are left provisioned, or part way
     /// through their provision, without their release.
+    ///
+    /// The same bound holds for a lift of the mob once stopped
+    /// ([`MobHandle::resume`]): it starts the wakes of the dormant members
+    /// its plan materializes up to `concurrency` at once, the next one as an
+    /// earlier one finishes (a member it has not reached stays dormant, and a
+    /// delivery to it wakes it at once); it observes the live and durable
+    /// sessions of the members it rebuilds up to `concurrency` at once; and
+    /// its `OnDemandVerified` pass reads up to that many verdicts at once.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
-        self.resume_restore_concurrency = concurrency.max(1);
+        // The bound sizes semaphores, and a semaphore panics above its
+        // maximum: a larger value (`usize::MAX` for "no limit") counts as it.
+        self.resume_restore_concurrency = concurrency.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
         self
     }
 
@@ -8286,6 +8297,7 @@ impl MobBuilder {
                 callback_claim_verifier,
                 provenance,
                 // A created mob restores no members; a later lift of it
+                // wakes its plan, observes the members it rebuilds and
                 // verifies at this concurrency.
                 #[cfg(feature = "runtime-adapter")]
                 resume_restore_concurrency,
@@ -8649,7 +8661,8 @@ impl MobBuilder {
             member_residency,
         } = self;
         // The verified pass reads at the restore concurrency on both start
-        // paths: this resume, and a later lift of the mob.
+        // paths: this resume, and a later lift of the mob, which also wakes
+        // its plan and observes the members it rebuilds at that bound.
         #[cfg(feature = "runtime-adapter")]
         let member_residency = super::boot_plan::MemberResidencyConfig {
             verify_concurrency: resume_restore_concurrency,
@@ -11091,6 +11104,7 @@ impl MobBuilder {
                 lifecycle_observations,
                 inline_step_watchdog: super::actor::ActorInlineStepWatchdog::new(),
                 pending_resume_lifecycle: None,
+                explicit_resume_boot_dispatch: None,
                 pending_resume_controls: std::collections::VecDeque::new(),
                 retained_resume_cleanup: Vec::new(),
                 unproven_resume_cleanup: Vec::new(),

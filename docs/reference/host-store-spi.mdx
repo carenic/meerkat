@@ -377,6 +377,12 @@ reads:
 
 No other row is read at open.
 
+Core reads up to 16 runtimes at once: their head entries kept as chunks, and
+the rows of those with recovery work. One runtime's reads run in order, its
+rows and then its chunks. An open of K runtimes with recovery work therefore
+waits about ceil(K / 16) times as long as the reads of one runtime, not K
+times. If any of those reads fails, the open fails and serves nothing.
+
 **When a mob's storage is opened** (its resume after a restart), Core reads
 the mob's own scopes whole: its event log, identity, flow runs and statuses.
 The lift of a mob stopped in the same process finds them in memory and reads
@@ -392,7 +398,11 @@ the members the host requires. Under the default restore policy
 session scope gets no `load_head` and no `read_rows`.
 `MemberRestorePolicy::OnDemandVerified` reads every dormant member's session
 rows once at every start, and `MemberRestorePolicy::Eager` wakes every
-member.
+member. A start wakes its members at most the mob's restore concurrency at a
+time (`MobBuilder::with_resume_restore_concurrency`, 16 by default), and its
+verified reads run at most that many at a time too. A member the lift of a
+stopped mob has not reached yet stays dormant until it does, or until a
+delivery wakes it first.
 
 **Later, on first use.** A dormant member's session is read when its first
 delivery wakes it. Any session not read yet is read the first time a call

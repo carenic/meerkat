@@ -5373,6 +5373,110 @@ fn take_explicit_resume_member_binding_hold_for_test(
         .remove(&(mob_id.clone(), member.clone()))
 }
 
+/// Test probe of the member observations of one mob's lifts: it counts the
+/// observations running and the most that ran at once, and holds each one at
+/// its start (once it holds its permit) until the row lets it go.
+#[cfg(test)]
+pub(super) struct ExplicitResumeObservationProbe {
+    /// Observations that reached their start so far.
+    arrived: tokio::sync::watch::Sender<usize>,
+    /// Observations started and not ended.
+    running: std::sync::atomic::AtomicUsize,
+    /// The most observations that ran at once.
+    max_running: std::sync::atomic::AtomicUsize,
+    /// One permit for each observation the row lets go on.
+    released: tokio::sync::Semaphore,
+}
+
+#[cfg(test)]
+static EXPLICIT_RESUME_OBSERVATION_PROBES: std::sync::Mutex<
+    BTreeMap<MobId, Arc<ExplicitResumeObservationProbe>>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Test seam: hold every member observation of `mob_id`'s lifts at its start
+/// from now on, counted, until the row releases it
+/// ([`ExplicitResumeObservationProbe::release`]).
+#[cfg(test)]
+pub(super) fn probe_explicit_resume_observations_for_test(
+    mob_id: &MobId,
+) -> Arc<ExplicitResumeObservationProbe> {
+    let probe = Arc::new(ExplicitResumeObservationProbe {
+        arrived: tokio::sync::watch::Sender::new(0),
+        running: std::sync::atomic::AtomicUsize::new(0),
+        max_running: std::sync::atomic::AtomicUsize::new(0),
+        released: tokio::sync::Semaphore::new(0),
+    });
+    EXPLICIT_RESUME_OBSERVATION_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id.clone(), Arc::clone(&probe));
+    probe
+}
+
+/// An observation of `mob_id`'s lift starts: counted running by the mob's
+/// probe, if one is installed, and held until the row releases it. Running
+/// until the answer is dropped.
+#[cfg(test)]
+async fn enter_explicit_resume_observation_probe(
+    mob_id: &MobId,
+) -> Option<ProbedExplicitResumeObservation> {
+    let probe = EXPLICIT_RESUME_OBSERVATION_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(mob_id)
+        .cloned()?;
+    let running = probe
+        .running
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        + 1;
+    probe
+        .max_running
+        .fetch_max(running, std::sync::atomic::Ordering::SeqCst);
+    probe.arrived.send_modify(|arrived| *arrived += 1);
+    if let Ok(permit) = probe.released.acquire().await {
+        permit.forget();
+    }
+    Some(ProbedExplicitResumeObservation(probe))
+}
+
+/// One observation the probe counts as running until it is dropped.
+#[cfg(test)]
+struct ProbedExplicitResumeObservation(Arc<ExplicitResumeObservationProbe>);
+
+#[cfg(test)]
+impl Drop for ProbedExplicitResumeObservation {
+    fn drop(&mut self) {
+        self.0
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl ExplicitResumeObservationProbe {
+    /// Let `count` more held observations go on (an observation that starts
+    /// later takes a released permit and is not held).
+    pub(super) fn release(&self, count: usize) {
+        self.released.add_permits(count);
+    }
+
+    /// Observations that reached their start so far.
+    pub(super) fn arrived(&self) -> usize {
+        *self.arrived.borrow()
+    }
+
+    /// The most observations that ran at once.
+    pub(super) fn max_running(&self) -> usize {
+        self.max_running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Wait until `count` observations reached their start.
+    pub(super) async fn wait_for_arrivals(&self, count: usize) {
+        let mut arrived = self.arrived.subscribe();
+        let _ = arrived.wait_for(|arrived| *arrived >= count).await;
+    }
+}
+
 /// How many times a startup restore took each member's stopped registration
 /// over, per mob.
 #[cfg(test)]
@@ -9104,6 +9208,9 @@ pub(super) struct MobActor {
     /// Explicit Resume whose per-member readiness fan-out is running detached;
     /// the loop keeps draining commands until the outcomes re-enter.
     pub(super) pending_resume_lifecycle: Option<PendingResumeLifecycle>,
+    /// The lift's member plan while it still has members to reach: they are
+    /// dispatched at most the restore concurrency at a time (`boot_lift`).
+    pub(super) explicit_resume_boot_dispatch: Option<boot_lift::ExplicitResumeBootDispatch>,
     pub(super) pending_resume_controls: VecDeque<RoutedMobCommand>,
     pub(super) retained_resume_cleanup: Vec<RetainedExplicitResumeCleanup>,
     pub(super) unproven_resume_cleanup: Vec<UnprovenExplicitResumeCleanup>,
@@ -21872,6 +21979,13 @@ impl MobActor {
         super::fork_build::order_fork_sources_first(&mut rebuild, &self.definition.id, |rebuild| {
             &rebuild.entry
         });
+        // Each rebuilt member's observation reads its live and durable
+        // session (on a host store, its stored rows when they are not in
+        // memory yet): at most the start's restore concurrency of them run at
+        // once (`MobBuilder::with_resume_restore_concurrency`).
+        let observation_permits = Arc::new(tokio::sync::Semaphore::new(
+            self.member_residency.verify_concurrency.max(1),
+        ));
         let mut first_infrastructure_error = None;
         for rebuild in rebuild {
             let ExplicitResumeMemberRebuild {
@@ -22034,21 +22148,24 @@ impl MobActor {
                 .get(&dsl_identity)
                 .copied();
             let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
-            self.spawn_explicit_resume_member_observation(Arc::new(ExplicitResumeMemberWork {
-                rebuild: ExplicitResumeMemberRebuild {
-                    entry,
-                    restore_spec,
-                    member_ref,
-                    bridge_session_id,
-                    requires_materialization,
-                    superseded_session_id,
-                    recovered_peer_endpoint,
-                },
-                attempt,
-                binding,
-                wake_attempt,
-                drain_required,
-            }));
+            self.spawn_explicit_resume_member_observation(
+                Arc::new(ExplicitResumeMemberWork {
+                    rebuild: ExplicitResumeMemberRebuild {
+                        entry,
+                        restore_spec,
+                        member_ref,
+                        bridge_session_id,
+                        requires_materialization,
+                        superseded_session_id,
+                        recovered_peer_endpoint,
+                    },
+                    attempt,
+                    binding,
+                    wake_attempt,
+                    drain_required,
+                }),
+                Arc::clone(&observation_permits),
+            );
         }
         if let Some(error) = first_infrastructure_error {
             return Err(error);
@@ -22056,13 +22173,27 @@ impl MobActor {
         Ok(())
     }
 
-    fn spawn_explicit_resume_member_observation(&mut self, work: Arc<ExplicitResumeMemberWork>) {
+    /// Observe one rebuilt member's live and durable session off the actor,
+    /// once it holds one of the lift's `permits`, and hand the observation to
+    /// the actor. The permit is released when the observation ends, before
+    /// the hand-off; a deadline the observation sets starts once it holds the
+    /// permit.
+    fn spawn_explicit_resume_member_observation(
+        &mut self,
+        work: Arc<ExplicitResumeMemberWork>,
+        permits: Arc<tokio::sync::Semaphore>,
+    ) {
         let service = Arc::clone(&self.session_service);
         let provisioner = Arc::clone(&self.provisioner);
         let definition = Arc::clone(&self.definition);
         let profiles = self.realm_profile_store.clone();
         let command_tx = self.command_tx.clone();
         self.actor_io_tasks.spawn(async move {
+            // The lift never closes its permits; were they closed, the
+            // observation would run unbounded rather than not at all.
+            let permit = permits.acquire_owned().await.ok();
+            #[cfg(test)]
+            let probed = enter_explicit_resume_observation_probe(&definition.id).await;
             let observation = async {
                 let session_id = &work.rebuild.bridge_session_id;
                 match service.has_live_session(session_id).await {
@@ -22152,6 +22283,9 @@ impl MobActor {
                 Ok(ExplicitResumeLiveObservation::DurablePresent { profile })
             }
             .await;
+            #[cfg(test)]
+            drop(probed);
+            drop(permit);
             if command_tx
                 .send(RoutedMobCommand::internal(
                     MobCommand::ResumeLifecycleMemberObserved { work, observation },
@@ -22728,6 +22862,8 @@ impl MobActor {
         &mut self,
         result: Result<(), MobError>,
     ) -> Result<(), MobError> {
+        // The lift's plan dispatches nothing after its attempt ends.
+        self.explicit_resume_boot_dispatch = None;
         if result.is_err() {
             self.apply_explicit_resume_input(
                 |attempt| mob_dsl::MobMachineInput::CancelExplicitResume { attempt },
@@ -23190,8 +23326,10 @@ impl MobActor {
         // The members this lift materializes, planned now that the mob is
         // Running again: one `PlanBootMaterialization` per Dormant member,
         // with this start's policy and host inputs and a fresh obligation
-        // scan. Each planned member is woken through the one cold recipe;
-        // the resume joins its wake and settles it once the wake closes.
+        // scan, applied while fewer than the restore concurrency of the
+        // plan's wakes are open (the rest as they close, `boot_lift`). Each
+        // planned member is woken through the one cold recipe; the resume
+        // joins its wake and settles it once the wake closes.
         let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set().await {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),

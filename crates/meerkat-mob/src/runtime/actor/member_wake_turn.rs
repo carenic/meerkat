@@ -232,6 +232,196 @@ struct WakeRestoreInput {
     member_bound_sessions: HashSet<SessionId>,
 }
 
+/// Test probe of one mob's member wake restores (step B): the members whose
+/// restore started, in order, the most restores that ran at once, and holds
+/// on chosen restores (a member's first, second, ... restore since the probe
+/// was installed) that wait at their start until the row releases them, or
+/// end them there, before they read anything.
+#[cfg(test)]
+pub(in crate::runtime) struct MemberWakeRestoreProbe {
+    /// The members whose restore started, in order.
+    started: tokio::sync::watch::Sender<Vec<AgentIdentity>>,
+    /// Restores started and not ended.
+    running: std::sync::atomic::AtomicUsize,
+    /// The most restores that ran at once.
+    max_running: std::sync::atomic::AtomicUsize,
+    /// The holds armed, by member and the restore of it they hold (1 for the
+    /// member's first restore).
+    held: std::sync::Mutex<BTreeMap<(AgentIdentity, usize), Arc<MemberWakeRestoreHold>>>,
+}
+
+/// One held restore: it waits at its start until the gate closes, and ends
+/// there when the row aborted it.
+#[cfg(test)]
+struct MemberWakeRestoreHold {
+    /// Never given a permit: releasing or aborting the hold closes it.
+    gate: tokio::sync::Semaphore,
+    aborted: std::sync::atomic::AtomicBool,
+}
+
+#[cfg(test)]
+fn armed_member_wake_restore_hold() -> Arc<MemberWakeRestoreHold> {
+    Arc::new(MemberWakeRestoreHold {
+        gate: tokio::sync::Semaphore::new(0),
+        aborted: std::sync::atomic::AtomicBool::new(false),
+    })
+}
+
+#[cfg(test)]
+static MEMBER_WAKE_RESTORE_PROBES: std::sync::Mutex<BTreeMap<MobId, Arc<MemberWakeRestoreProbe>>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Test seam: watch the member wake restores of `mob_id` from now on, and
+/// hold the first restore of each member in `held` at its start until the
+/// row releases it ([`MemberWakeRestoreProbe::release`]).
+#[cfg(test)]
+pub(in crate::runtime) fn probe_member_wake_restores_for_test(
+    mob_id: &MobId,
+    held: impl IntoIterator<Item = AgentIdentity>,
+) -> Arc<MemberWakeRestoreProbe> {
+    let probe = Arc::new(MemberWakeRestoreProbe {
+        started: tokio::sync::watch::Sender::new(Vec::new()),
+        running: std::sync::atomic::AtomicUsize::new(0),
+        max_running: std::sync::atomic::AtomicUsize::new(0),
+        held: std::sync::Mutex::new(
+            held.into_iter()
+                .map(|identity| ((identity, 1), armed_member_wake_restore_hold()))
+                .collect(),
+        ),
+    });
+    MEMBER_WAKE_RESTORE_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id.clone(), Arc::clone(&probe));
+    probe
+}
+
+/// A restore of `identity` in `mob_id` starts: recorded by the mob's probe,
+/// if one is installed, and held while its hold is armed. Counted running
+/// until the answer is dropped.
+#[cfg(test)]
+async fn enter_member_wake_restore_probe(
+    mob_id: &MobId,
+    identity: AgentIdentity,
+) -> Option<ProbedMemberWakeRestore> {
+    let probe = MEMBER_WAKE_RESTORE_PROBES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(mob_id)
+        .cloned()?;
+    Some(probe.enter(identity).await)
+}
+
+/// One restore the probe counts as running until it is dropped.
+#[cfg(test)]
+struct ProbedMemberWakeRestore {
+    probe: Arc<MemberWakeRestoreProbe>,
+    /// The row ended this restore at its start: it reads nothing.
+    aborted: bool,
+}
+
+#[cfg(test)]
+impl Drop for ProbedMemberWakeRestore {
+    fn drop(&mut self) {
+        self.probe
+            .running
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+impl MemberWakeRestoreProbe {
+    /// A restore of `identity` starts: recorded and counted running, then
+    /// held while its hold is armed.
+    async fn enter(self: Arc<Self>, identity: AgentIdentity) -> ProbedMemberWakeRestore {
+        let running = self
+            .running
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            + 1;
+        self.max_running
+            .fetch_max(running, std::sync::atomic::Ordering::SeqCst);
+        let mut restore = 0;
+        self.started.send_modify(|started| {
+            restore = started.iter().filter(|member| **member == identity).count() + 1;
+            started.push(identity.clone());
+        });
+        let hold = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&(identity, restore))
+            .cloned();
+        let aborted = match hold {
+            Some(hold) => {
+                let _closed = hold.gate.acquire().await;
+                hold.aborted.load(std::sync::atomic::Ordering::SeqCst)
+            }
+            None => false,
+        };
+        ProbedMemberWakeRestore {
+            probe: self,
+            aborted,
+        }
+    }
+
+    /// Hold `identity`'s restore number `restore` (1 for its first) at its
+    /// start until the row releases or aborts it.
+    pub(in crate::runtime) fn hold(&self, identity: &AgentIdentity, restore: usize) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry((identity.clone(), restore))
+            .or_insert_with(armed_member_wake_restore_hold);
+    }
+
+    /// Let every held restore of `identity` go on; no later restore of it is
+    /// held.
+    pub(in crate::runtime) fn release(&self, identity: &AgentIdentity) {
+        self.held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .retain(|(member, _), hold| {
+                if member == identity {
+                    hold.gate.close();
+                    false
+                } else {
+                    true
+                }
+            });
+    }
+
+    /// End `identity`'s held restore number `restore` at its start, before it
+    /// reads anything: its wake fails as a restore that read nothing.
+    pub(in crate::runtime) fn abort(&self, identity: &AgentIdentity, restore: usize) {
+        let hold = self
+            .held
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&(identity.clone(), restore));
+        if let Some(hold) = hold {
+            hold.aborted
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            hold.gate.close();
+        }
+    }
+
+    /// The members whose restore started so far, in order.
+    pub(in crate::runtime) fn started(&self) -> Vec<AgentIdentity> {
+        self.started.borrow().clone()
+    }
+
+    /// Wait until `count` restores started.
+    pub(in crate::runtime) async fn wait_for_started(&self, count: usize) {
+        let mut started = self.started.subscribe();
+        let _ = started.wait_for(|started| started.len() >= count).await;
+    }
+
+    /// The most restores that ran at once.
+    pub(in crate::runtime) fn max_running(&self) -> usize {
+        self.max_running.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
 impl MobActor {
     /// Start every materialization MobMachine handed off since the last loop
     /// boundary.
@@ -358,12 +548,24 @@ impl MobActor {
             durable_endpoint,
             member_bound_sessions,
         };
+        #[cfg(test)]
+        let (probe_mob, probe_member) = (self.definition.id.clone(), identity.clone());
         self.dispatch_member_wake_step(
             run,
             MemberFence::exact(&entry),
             None,
             "member_wake_restore",
-            async move { WakeStep::Planned(Box::new(plan_member_wake(input).await)) },
+            async move {
+                #[cfg(test)]
+                let probed = enter_member_wake_restore_probe(&probe_mob, probe_member).await;
+                #[cfg(test)]
+                if probed.as_ref().is_some_and(|restore| restore.aborted) {
+                    return WakeStep::Planned(Box::new(Err(MobError::Internal(
+                        "the test probe ended this member wake restore at its start".to_string(),
+                    ))));
+                }
+                WakeStep::Planned(Box::new(plan_member_wake(input).await))
+            },
         );
     }
 
