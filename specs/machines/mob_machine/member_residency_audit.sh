@@ -881,11 +881,13 @@ for fold in folds:
     "Error: Action property AuditBindingRefusalFenced is violated" \
     'drop_guard("ResolveRuntimeBindingRefusalRunning", "member_wake_attempts")
 add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (agent_identity \\in DOMAIN member_wake_attempts) THEN Some(member_wake_attempts[agent_identity]) ELSE None) = attempt))")' "$@"
-  # The release verdict drifts from the Released arm: it answers Release for
-  # a Live member whose registration release would be Stale.
+  # The release verdict drifts from the Released arm on the registration
+  # facts: it answers Release for a Live, unpinned member whose registration
+  # release would be Stale. It keeps the pin, so the release ASSUMEs (which
+  # TLC evaluates before any invariant) still hold and the property refuses it.
   mutate wake release_verdict_ignores_registration \
     "Error: Invariant AuditReleaseVerdictMatchesArm is violated" \
-    'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "TRUE")' "$@"
+    'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "((releasable = TRUE) \\/ (wired_to_placed = FALSE))")' "$@"
   # The release predicate without its placed-peer pin: a member wired to a
   # placed member is released (no run places a member; the ASSUME over the
   # helper's whole domain refuses it).
