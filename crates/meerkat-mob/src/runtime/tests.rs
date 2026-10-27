@@ -77921,6 +77921,110 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
     assert_eq!(snapshot.status, crate::runtime::MobMemberStatus::Active);
 }
 
+/// Task #37 through `MobHandle::ensure_member_live`: the spawn published the
+/// member's runtime executor, and the discard drops the live session actor
+/// while that executor stays attached. An attached executor over a session no
+/// actor serves is not a served member, so the wake that saw the miss takes
+/// MobMachine's drift arm and rebuilds the live session; it never answers ready
+/// over a session a turn would not find. The next turn runs on the rebuilt
+/// session, and the revival leaves no wake attempt open. The #37 row covers the
+/// same gap through the delivery lane.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_discarded_live_session_with_an_attached_executor_is_revived_by_the_next_wake() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob(definition).await;
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("w-1");
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn worker");
+    let session = receipt
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    assert!(
+        adapter
+            .session_has_executor(&session)
+            .await
+            .expect("executor read"),
+        "the spawn published the member's runtime executor"
+    );
+
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard live session");
+    assert!(
+        !service
+            .has_live_session(&session)
+            .await
+            .expect("has_live_session"),
+        "the discard removes the live session actor"
+    );
+    assert!(
+        adapter
+            .session_has_executor(&session)
+            .await
+            .expect("executor read"),
+        "the discard leaves the runtime executor attached"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        handle.ensure_member_live(&identity),
+    )
+    .await
+    .expect("the wake answers")
+    .expect("the wake revives the member");
+    assert!(
+        service
+            .has_live_session(&session)
+            .await
+            .expect("has_live_session"),
+        "the drift arm rebuilt the live session under the unchanged binding"
+    );
+
+    handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn(ContentInput::from("after the revival".to_string()))
+        .await
+        .expect("the turn runs on the rebuilt session");
+    let turn_prompts = service.start_turn_prompts.read().await.clone();
+    assert!(
+        turn_prompts
+            .iter()
+            .any(|(session_id, prompt)| session_id == &session
+                && prompt.contains("after the revival")),
+        "the turn ran on the rebuilt session: {turn_prompts:?}"
+    );
+    let machine_state = handle
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state");
+    let machine_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&identity);
+    assert!(
+        !machine_state
+            .member_wake_attempts
+            .contains_key(&machine_identity),
+        "the revival resolved its wake attempt"
+    );
+    let snapshot = handle
+        .member_status(&identity)
+        .await
+        .expect("member status");
+    assert_eq!(snapshot.status, crate::runtime::MobMemberStatus::Active);
+}
+
 /// Delivery-time MissingLive regression: the member and its durable session
 /// snapshot remain Active, but a completed runtime stop left the registered
 /// session with no executor. Delivery-time binding preparation readmits that
