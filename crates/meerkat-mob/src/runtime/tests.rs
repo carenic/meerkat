@@ -9,6 +9,8 @@ mod historical_metadata;
 mod host_human_input;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lazy_boot;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod lift_binding_rows;
 mod member_creation;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_creation_upcall;

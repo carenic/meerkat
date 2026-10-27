@@ -6780,6 +6780,10 @@ impl ResumedMemberView {
 ///   restore and [`MobHandle::resume`]):
 ///   [`customize_resume`](Self::customize_resume), with what the session
 ///   holds. Its default asks `customize_spawn` with `SpawnSource::Resume`.
+///   [`MobHandle::resume`] of a mob stopped in this process asks it too for
+///   each member whose live actor the stop kept: the actor is kept only when
+///   it runs the auth binding the answer names, and otherwise the member is
+///   rebuilt on that binding.
 ///
 /// # Which spawns never ask it
 ///

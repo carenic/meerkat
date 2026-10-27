@@ -134,6 +134,16 @@ them.
   its member, once: the runtime's next commit records its facts in full, and
   a release before 0.9.7 still reads them.
 
+- Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
+  (`MobHandle::resume`) keeps a member's live actor only when it runs the auth
+  binding the member's resume request names (the spawn member customizer's
+  answer, which the lift now asks for such a member too). Otherwise the
+  member's runtime attachment is retired and the member is rebuilt on that
+  binding, on its own session. A backend with no runtime attachment to retire
+  refuses the member instead: it is recorded broken with
+  `MobError::MemberAuthBindingConflict`, and its live actor is retired. Before,
+  the lift kept every live actor on whatever binding it ran.
+
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
   time. A member counts against the bound from the start of its restore until

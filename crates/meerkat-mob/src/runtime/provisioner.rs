@@ -2100,6 +2100,23 @@ pub trait MobProvisioner: Send + Sync {
         deadline: Instant,
         admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError>;
+    /// Retire this provisioner's own live exact attachment of `session_id`
+    /// at the explicit mob-resume seam, because the member's live actor runs
+    /// another auth binding than its resume spec names: a live actor is never
+    /// reused on another binding. The attachment is retired as
+    /// [`Self::prepare_member_session_for_explicit_resume`] retires one it
+    /// does not own (same exact witness fence, attachment-local queued work
+    /// never adopted), and the caller rebuilds the member on its spec.
+    /// Returns `true` when the caller must rebuild, `false` when nothing was
+    /// retired (no runtime adapter participates). Default: `false`.
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        let _ = (session_id, deadline);
+        Ok(false)
+    }
     async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
         let _ = member_ref;
         Ok(())
@@ -2436,6 +2453,17 @@ pub struct SessionBackend {
 #[derive(Clone)]
 struct ExplicitResumeAttachmentRetirement {
     completion: Arc<Mutex<oneshot::Receiver<Result<bool, MobError>>>>,
+}
+
+/// What the explicit-resume retirement does with this provisioner's own
+/// exact attachment when its actor is live: keep it (it is the complete
+/// active incarnation), or retire it too (its actor runs another auth
+/// binding than the member's resume spec names).
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnLiveAttachment {
+    Keep,
+    Retire,
 }
 
 /// Exact physical capabilities retained across retryable cold-recovery
@@ -5740,7 +5768,10 @@ impl SessionBackend {
                 let task_session_id = session_id.clone();
                 tokio::spawn(async move {
                     let result = backend
-                        .retire_exact_attachment_for_explicit_resume_owned(&task_session_id)
+                        .retire_exact_attachment_for_explicit_resume_owned(
+                            &task_session_id,
+                            OwnLiveAttachment::Keep,
+                        )
                         .await;
                     let _ = result_tx.send(result);
                 });
@@ -5790,6 +5821,47 @@ impl SessionBackend {
         }
         drop(retirements);
         result
+    }
+
+    /// Retire this provisioner's own live exact attachment of `session_id`
+    /// for a rebuild on another auth binding (see
+    /// [`MobProvisioner::retire_live_member_session_for_explicit_resume`]).
+    /// The retirement runs to its end in its own task, as the takeover of an
+    /// attachment this provisioner does not own does: a caller past
+    /// `deadline` is answered pending, and its retry finds the attachment
+    /// retired.
+    async fn retire_live_attachment_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        let pending = || MobError::LifecycleOperationPending {
+            intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(pending());
+        }
+        let backend = self.clone();
+        let task_session_id = session_id.clone();
+        let retirement = tokio::spawn(async move {
+            backend
+                .retire_exact_attachment_for_explicit_resume_owned(
+                    &task_session_id,
+                    OwnLiveAttachment::Retire,
+                )
+                .await
+        });
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(pending)?;
+        tokio::time::timeout(remaining, retirement)
+            .await
+            .map_err(|_| pending())?
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "the explicit-resume retirement of '{session_id}' ended without a result: {error}"
+                ))
+            })?
     }
 
     /// Release the member's session binding at the end of a resumed-provision
@@ -5855,6 +5927,7 @@ impl SessionBackend {
     async fn retire_exact_attachment_for_explicit_resume_owned(
         &self,
         session_id: &SessionId,
+        own_live: OwnLiveAttachment,
     ) -> Result<bool, MobError> {
         let Some(adapter) = self.runtime_adapter.as_ref() else {
             // Runtime-less session services retain their existing live actor;
@@ -5886,7 +5959,7 @@ impl SessionBackend {
                         .session_service
                         .live_session_actor_registered(session_id)
                         .await?;
-                if exact_actor_live {
+                if exact_actor_live && own_live == OwnLiveAttachment::Keep {
                     return Ok(false);
                 }
             }
@@ -15801,6 +15874,15 @@ impl MobProvisioner for SessionBackend {
             .await
     }
 
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        self.retire_live_attachment_for_explicit_resume(session_id, deadline)
+            .await
+    }
+
     async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
         let bridge_session_id = Self::require_session(member_ref, "ensure runtime session for")?;
         self.runtime_session_state(&bridge_session_id)
@@ -20303,6 +20385,16 @@ impl MobProvisioner for MultiBackendProvisioner {
     ) -> Result<bool, MobError> {
         self.session
             .retire_exact_attachment_for_explicit_resume(session_id, deadline, admission)
+            .await
+    }
+
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        self.session
+            .retire_live_attachment_for_explicit_resume(session_id, deadline)
             .await
     }
 
