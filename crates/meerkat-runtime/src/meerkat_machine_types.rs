@@ -1336,6 +1336,12 @@ meerkat_machine_runtime_internal_inputs!(
     FailureRecoveryLifecycle => [
         AuthorizeOperatorDurableTailRepair,
     ],
+    // The empty-resume verdict: whether a resume batch that ended with no
+    // pending boundary retires the registration.
+    SessionUnregisterDrainLifecycle => [
+        ResolveEmptyResumeRetirement,
+        ClaimCompositionResidency,
+    ],
 );
 
 macro_rules! meerkat_machine_fieldless_runtime_internal_inputs {

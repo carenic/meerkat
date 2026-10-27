@@ -87552,7 +87552,7 @@ fn mob_runtime_parity_field_value(
         )),
         // Residency bookkeeping the parity snapshot does not project yet:
         // the parity probes never read it.
-        "member_wake_bound" | "member_host_preparation_pending" => {
+        "member_wake_bound" | "member_host_preparation_pending" | "runtime_retire_archive_only" => {
             Some(MobRuntimeParityExprValue::Set(BTreeSet::new()))
         }
         "member_materialization_epoch"

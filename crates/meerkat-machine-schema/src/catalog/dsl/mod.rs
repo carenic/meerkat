@@ -1910,6 +1910,11 @@ pub fn meerkat_machine_schema_metadata() -> MachineSchemaMetadata {
             ),
             NamedTypeBinding::string_enum("InputLane", &["Queue", "Steer"]),
             NamedTypeBinding::string_enum("RunStartHoldReason", &["MobStop", "ToolsNotPublished"]),
+            NamedTypeBinding::string_enum("SessionResidencyOwner", &["Session", "Composition"]),
+            NamedTypeBinding::string_enum(
+                "EmptyResumeRetirementVerdict",
+                &["Retire", "KeepServing"],
+            ),
             NamedTypeBinding::string_enum(
                 "InputPhase",
                 &[
@@ -3374,6 +3379,11 @@ runtime_internal_inputs!(
         // The operator's held-tail repair, driven by recovery's
         // resolve-held-tail primitive on its own fresh authority.
         AuthorizeOperatorDurableTailRepair,
+        // The runtime loop's empty-resume verdict (a composition-owned
+        // registration keeps serving), and the composition's boot re-claim
+        // of a recovered registration it placed.
+        ResolveEmptyResumeRetirement,
+        ClaimCompositionResidency,
     ]
 );
 

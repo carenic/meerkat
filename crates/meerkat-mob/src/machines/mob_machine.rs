@@ -9965,4 +9965,601 @@ mod tests {
             }
         }
     }
+
+    // -----------------------------------------------------------------
+    // Archive-only retirement (R27), destroy beats rotation (R124),
+    // Dormant external wiring (R125), the endpoint at a wake's close and
+    // the seat's kickoff refusal (R13).
+    // -----------------------------------------------------------------
+
+    struct SeatedMember {
+        identity: AgentIdentity,
+        runtime_id: AgentRuntimeId,
+        session_id: SessionId,
+        fence_token: FenceToken,
+    }
+
+    fn seat_live_member_with_endpoint(
+        authority: &mut MobMachineAuthority,
+        name: &str,
+        key_byte: u8,
+    ) -> SeatedMember {
+        let identity = AgentIdentity(name.to_string());
+        let runtime_id = AgentRuntimeId(format!("{name}:0"));
+        let session_id = seed_live_member(authority, &identity, &runtime_id);
+        register_test_member_peer(authority, &identity, name, [key_byte; 32]);
+        let fence_token = live_fence(authority, &runtime_id);
+        SeatedMember {
+            identity,
+            runtime_id,
+            session_id,
+            fence_token,
+        }
+    }
+
+    /// A seated member as replay leaves it after a restart: Dormant, with its
+    /// endpoint, and with no registration in this process.
+    fn dormant_member_authority(name: &str) -> (MobMachineAuthority, SeatedMember) {
+        let mut seeded = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut seeded, name, 31);
+        let authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            seeded.state().clone(),
+            &member.identity,
+            &member.runtime_id,
+        ))
+        .expect("a replay-shaped Dormant member recovers");
+        (authority, member)
+    }
+
+    fn routes_runtime_retire(transition: &MobMachineTransition) -> bool {
+        transition
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, MobMachineEffect::RequestRuntimeRetire { .. }))
+    }
+
+    fn retire_input(member: &SeatedMember, releasing: Option<SessionId>) -> MobMachineInput {
+        MobMachineInput::Retire {
+            mob_id: MobId::from("archive-only-mob"),
+            agent_runtime_id: member.runtime_id.clone(),
+            agent_identity: member.identity.clone(),
+            generation: Generation(0),
+            releasing,
+            session_id: Some(member.session_id.clone()),
+        }
+    }
+
+    fn retry_runtime_retire(member: &SeatedMember) -> MobMachineInput {
+        MobMachineInput::RetryRuntimeRetire {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+        }
+    }
+
+    fn close_ingress_detach(authority: &mut MobMachineAuthority, member: &SeatedMember) {
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::SessionIngressDetachedForMobDestroy {
+                mob_id: MobId::from("archive-only-mob"),
+                agent_runtime_id: member.runtime_id.clone(),
+            },
+        )
+        .expect("the retiring member's session ingress detach closes");
+    }
+
+    fn archived_signal(member: &SeatedMember) -> MobMachineSignal {
+        MobMachineSignal::ObserveMemberRetirementArchived {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+            fence_token: member.fence_token,
+            generation: Generation(0),
+            session_id: Some(member.session_id.clone()),
+            disposal: MemberSessionDisposal::Archived,
+            preserve_machine_topology: false,
+        }
+    }
+
+    fn wake_input(identity: &AgentIdentity) -> MobMachineInput {
+        MobMachineInput::WakeMember {
+            agent_identity: identity.clone(),
+            cause: MemberWakeCause::Operator,
+            observed_missing: false,
+            input_class: PeerInputClass::Content,
+            sender_waking: false,
+        }
+    }
+
+    /// R27: a Dormant member holds no runtime registration, so its retirement
+    /// routes no runtime retire. It is archive-only: the retry refuses to route
+    /// one, and the session archive alone terminates the member.
+    #[test]
+    fn a_dormant_member_retires_archive_only() {
+        let (mut authority, member) = dormant_member_authority("dormant-retire");
+        let retire = MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("a Dormant member's retirement is admitted");
+        assert!(
+            !routes_runtime_retire(&retire),
+            "a Dormant member has no registration to retire"
+        );
+        assert!(
+            authority
+                .state()
+                .runtime_retire_archive_only
+                .contains(&member.runtime_id)
+        );
+        assert!(
+            !authority
+                .state()
+                .member_materialization
+                .contains_key(&member.identity)
+        );
+        assert!(
+            MobMachineMutator::apply(&mut authority, retry_runtime_retire(&member)).is_err(),
+            "an archive-only retirement never routes a runtime retire"
+        );
+        close_ingress_detach(&mut authority, &member);
+        authority
+            .apply_signal(archived_signal(&member))
+            .expect("the session archive terminates the archive-only retirement");
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&member.identity)
+        );
+        assert!(authority.state().runtime_retire_archive_only.is_empty());
+    }
+
+    /// R27 with F3: a Waking member's retirement closes its open attempt in
+    /// the same step and is archive-only; the in-flight attempt's late
+    /// feedback is a typed StaleAttempt no-op.
+    #[test]
+    fn a_waking_member_retires_archive_only_and_closes_its_attempt() {
+        let (mut authority, member) = dormant_member_authority("waking-retire");
+        MobMachineMutator::apply(&mut authority, wake_input(&member.identity))
+            .expect("the Dormant member wakes");
+        let attempt = *authority
+            .state()
+            .member_wake_attempts
+            .get(&member.identity)
+            .expect("the wake opened an attempt");
+        let retire = MobMachineMutator::apply(&mut authority, retire_input(&member, None))
+            .expect("a Waking member's retirement is admitted");
+        assert!(!routes_runtime_retire(&retire));
+        assert!(
+            !authority
+                .state()
+                .member_wake_attempts
+                .contains_key(&member.identity),
+            "the retirement start closes the open attempt"
+        );
+        assert!(
+            authority
+                .state()
+                .runtime_retire_archive_only
+                .contains(&member.runtime_id)
+        );
+        let late = authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("late wake feedback is a total machine verdict");
+        assert!(late.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::MemberWakeFeedbackResolved {
+                verdict: MemberWakeFeedbackVerdict::StaleAttempt,
+                ..
+            }
+        )));
+    }
+
+    /// R27 control: a Live member holds its registration, so its retirement
+    /// still routes the runtime retire and is not archive-only.
+    #[test]
+    fn a_live_member_retirement_still_routes_its_runtime_retire() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "live-retire", 32);
+        let retire = MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("a Live member's retirement is admitted");
+        assert!(routes_runtime_retire(&retire));
+        assert!(authority.state().runtime_retire_archive_only.is_empty());
+    }
+
+    /// R27: the mob's destroy retires a Dormant member archive-only and
+    /// archives it with no runtime retire.
+    #[test]
+    fn the_destroy_retires_a_dormant_member_archive_only() {
+        let (mut authority, member) = dormant_member_authority("dormant-destroy");
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+        let admitted = authority
+            .apply_signal(MobMachineSignal::AdmitDestroyMemberRetire {
+                mob_id: MobId::from("archive-only-mob"),
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: Some(member.session_id.clone()),
+            })
+            .expect("the destroy admits the Dormant member's retirement");
+        assert!(!routes_runtime_retire(&admitted));
+        assert!(
+            authority
+                .state()
+                .runtime_retire_archive_only
+                .contains(&member.runtime_id)
+        );
+        assert!(
+            MobMachineMutator::apply(&mut authority, retry_runtime_retire(&member)).is_err(),
+            "the destroy's route retry refuses an archive-only retirement"
+        );
+        close_ingress_detach(&mut authority, &member);
+        authority
+            .apply_signal(MobMachineSignal::ObserveDestroyMemberRetirementArchived {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: Some(member.session_id.clone()),
+                disposal: MemberSessionDisposal::Archived,
+            })
+            .expect("the destroy archives the member");
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&member.identity)
+        );
+        assert!(authority.state().runtime_retire_archive_only.is_empty());
+    }
+
+    /// R27: no retiring member is woken after a restart, so a replayed
+    /// retirement start is archive-only and its re-drive routes nothing.
+    #[test]
+    fn a_recovered_retirement_start_is_archive_only() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "recovered-retire", 33);
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMemberRetirementStarted {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                generation: Generation(0),
+                releasing: Some(member.session_id.clone()),
+                session_id: Some(member.session_id.clone()),
+                retiring_peer_endpoint: None,
+                preserve_machine_topology: false,
+            })
+            .expect("replay restores the retirement start");
+        assert!(
+            authority
+                .state()
+                .runtime_retire_archive_only
+                .contains(&member.runtime_id)
+        );
+        assert!(MobMachineMutator::apply(&mut authority, retry_runtime_retire(&member)).is_err());
+    }
+
+    /// R124: the destroy beats an in-flight rotation and a pending host
+    /// carry-out. Once the destroy is admitted the rotation's terminal is
+    /// refused, and the plain archive terminal archives the rotating,
+    /// host-pending identity and drops its intent with no wait. DestroyMob
+    /// leaves no pending host preparation behind.
+    #[test]
+    fn the_destroy_beats_an_in_flight_rotation_and_a_host_carry_out() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "rotating-member", 34);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::SeedMemberResidency {
+                policy: MemberRestorePolicyKind::OnDemand,
+                composition_authority: CompositionAuthorityKind::Authoritative,
+                host_pending: std::collections::BTreeSet::from([member.identity.clone()]),
+            },
+        )
+        .expect("the host marks the identity's preparation pending");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the rotation's retirement starts");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: SessionId::from("rotating-member-next"),
+                peer_endpoint: None,
+                session_archived: false,
+            },
+        )
+        .expect("the rotation records its intent");
+        close_ingress_detach(&mut authority, &member);
+        assert!(
+            authority.apply_signal(archived_signal(&member)).is_err(),
+            "before the destroy, the rotating identity's terminal is the rotation's"
+        );
+
+        let commit = MobMachineInput::CommitMemberRotation {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+            fence_token: member.fence_token,
+            generation: Generation(0),
+            session_id: Some(member.session_id.clone()),
+            disposal: MemberSessionDisposal::Archived,
+            next_agent_runtime_id: AgentRuntimeId::from("rotating-member:1"),
+            next_fence_token: FenceToken(8),
+            next_generation: Generation(1),
+            runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+            external_addressable: false,
+            kickoff_owed: false,
+        };
+        let mut undestroyed = MobMachineAuthority::recover_from_state(authority.state().clone())
+            .expect("the in-flight rotation recovers");
+        MobMachineMutator::apply(&mut undestroyed, commit.clone())
+            .expect("without a destroy, the rotation's terminal re-seats the identity");
+
+        begin_completion_lifecycle_quiesce(
+            &mut authority,
+            PlacedCompletionLifecycleIntentKind::Destroy,
+        );
+        authority
+            .apply_signal(MobMachineSignal::AdmitDestroyCleanup)
+            .expect("the mob admits its destroy");
+        assert!(
+            MobMachineMutator::apply(&mut authority, commit).is_err(),
+            "the destroy refuses the rotation's re-seat"
+        );
+        authority
+            .apply_signal(archived_signal(&member))
+            .expect("the destroy archives the rotating, host-pending identity with no wait");
+        assert!(
+            !authority
+                .state()
+                .member_rotation_session_ids
+                .contains_key(&member.identity)
+        );
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&member.identity)
+        );
+        authority
+            .apply_signal(MobMachineSignal::DestroyMob {
+                session_id: SessionId::from("rotation-destroy-session"),
+            })
+            .expect("the destroy completes");
+        assert!(authority.state().member_host_preparation_pending.is_empty());
+        assert!(authority.state().member_rotation_session_ids.is_empty());
+    }
+
+    /// R125: a Dormant member holds no comms runtime, so its external edge
+    /// commits, re-commits and is removed with no trust obligation (its wake
+    /// realizes the trust). A Live member keeps the obligation.
+    #[test]
+    fn a_dormant_member_external_wiring_owes_no_trust_work() {
+        let trust_effects = |transition: &MobMachineTransition| {
+            transition
+                .effects()
+                .iter()
+                .filter(|effect| {
+                    matches!(
+                        effect,
+                        MobMachineEffect::ExternalPeerTrustWiringRequested { .. }
+                            | MobMachineEffect::ExternalPeerTrustRepairRequested { .. }
+                            | MobMachineEffect::ExternalPeerTrustUnwiringRequested { .. }
+                    )
+                })
+                .count()
+        };
+        let (mut authority, _member) = dormant_member_authority("dormant-wired");
+        let edge = external_peer_edge_for_test("dormant-wired", "outside-peer");
+        let key = ExternalPeerKey::new(edge.local.clone(), edge.endpoint.name.clone());
+        let wired = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::WireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+        )
+        .expect("a Dormant member's external edge commits");
+        assert_eq!(trust_effects(&wired), 0);
+        assert!(authority.state().external_peer_edges.contains(&edge));
+        let again = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::WireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+        )
+        .expect("an idempotent re-wire");
+        assert_eq!(trust_effects(&again), 0);
+        let unwired = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::UnwireExternalPeer {
+                key,
+                edge: edge.clone(),
+            },
+        )
+        .expect("a Dormant member's external edge is removed");
+        assert_eq!(trust_effects(&unwired), 0);
+        assert!(!authority.state().external_peer_edges.contains(&edge));
+
+        let mut live_authority = MobMachineAuthority::new();
+        seat_live_member_with_endpoint(&mut live_authority, "live-wired", 35);
+        let live_edge = external_peer_edge_for_test("live-wired", "outside-peer");
+        let live_key =
+            ExternalPeerKey::new(live_edge.local.clone(), live_edge.endpoint.name.clone());
+        let live_wired = MobMachineMutator::apply(
+            &mut live_authority,
+            MobMachineInput::WireExternalPeer {
+                key: live_key,
+                edge: live_edge,
+            },
+        )
+        .expect("a Live member's external edge commits");
+        assert_eq!(trust_effects(&live_wired), 1);
+    }
+
+    /// A local wake closes Live only with a registered endpoint, so a Live
+    /// member is always reachable and its registration release is honoured.
+    #[test]
+    fn a_local_wake_closes_live_only_with_a_registered_endpoint() {
+        let identity = AgentIdentity::from("endpointless-wake");
+        let runtime_id = AgentRuntimeId::from("endpointless-wake:0");
+        let mut seeded = MobMachineAuthority::new();
+        seed_live_member(&mut seeded, &identity, &runtime_id);
+        let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            seeded.state().clone(),
+            &identity,
+            &runtime_id,
+        ))
+        .expect("a replay-shaped Dormant member recovers");
+        MobMachineMutator::apply(&mut authority, wake_input(&identity))
+            .expect("the Dormant member wakes");
+        let attempt = *authority
+            .state()
+            .member_wake_attempts
+            .get(&identity)
+            .expect("the wake opened an attempt");
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: identity.clone(),
+                attempt,
+            })
+            .expect("the wake's Bound step applies");
+        let succeeded = MobMachineSignal::ResolveMemberRevivalSucceeded {
+            agent_identity: identity.clone(),
+            attempt,
+        };
+        assert!(
+            authority.apply_signal(succeeded.clone()).is_err(),
+            "a wake without a registered endpoint does not close Live"
+        );
+        assert_eq!(
+            authority.state().member_materialization.get(&identity),
+            Some(&MemberMaterializationPhase::Waking)
+        );
+        register_test_member_peer(&mut authority, &identity, "endpointless-wake", [36; 32]);
+        authority
+            .apply_signal(succeeded)
+            .expect("with its endpoint registered the wake closes Live");
+        assert_eq!(
+            authority.state().member_materialization.get(&identity),
+            Some(&MemberMaterializationPhase::Live)
+        );
+    }
+
+    /// R13: a seat owes no kickoff. A spec that owes one spawns
+    /// embodied, so the machine refuses a seat that would owe one.
+    #[test]
+    fn a_seat_that_owes_a_kickoff_is_refused() {
+        let identity = AgentIdentity::from("kickoff-seat");
+        let runtime_id = AgentRuntimeId::from("kickoff-seat:0");
+        let session_id = SessionId::from("kickoff-seat-session");
+        let profile_material_digest = "kickoff-seat-profile-digest".to_string();
+        let mut authority = MobMachineAuthority::new();
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: profile_material_digest.clone(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: true,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the seat's profile is authorized");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginSpawnExec {
+                agent_identity: identity.clone(),
+                agent_runtime_id: runtime_id.clone(),
+                fence_token: FenceToken(7),
+                generation: Generation(0),
+                profile_material_digest,
+                external_addressable: true,
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                bridge_session_id: Some(session_id.clone()),
+                replacing: None,
+                placement: None,
+                workgraph_required: false,
+                rust_bundles_present: false,
+                per_spawn_external_tools_present: false,
+                mob_default_external_tools_present: false,
+                default_llm_client_override_present: false,
+                host_surface_mcp_allowlist_present: false,
+                inherited_tool_filter_present: false,
+                shell_env_present: false,
+                mcp_stdio_env_present: false,
+                mcp_http_headers_present: false,
+                memory_required: false,
+                mcp_required: false,
+                resume_session_id: None,
+                placed_spawn_id: None,
+                placed_provision_operation_id: None,
+                placed_operation_owner_session_id: None,
+                effective_profile_override_present: false,
+                effective_model_override_present: false,
+            },
+        )
+        .expect("the seat opens the spawn ladder");
+        let seat = |kickoff_owed| MobMachineInput::CommitDormantSeat {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id.clone(),
+            fence_token: FenceToken(7),
+            generation: Generation(0),
+            external_addressable: true,
+            runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+            bridge_session_id: session_id.clone(),
+            member_peer_endpoint: None,
+            session_archived: false,
+            kickoff_owed,
+        };
+        assert!(
+            MobMachineMutator::apply(&mut authority, seat(true)).is_err(),
+            "a seat that owes a kickoff is refused"
+        );
+        MobMachineMutator::apply(&mut authority, seat(false))
+            .expect("a seat that owes no kickoff commits");
+        assert_eq!(
+            authority.state().member_materialization.get(&identity),
+            Some(&MemberMaterializationPhase::Dormant)
+        );
+    }
 }

@@ -20,7 +20,8 @@
 //!   member's live session (`discard_live_session*`) only inside the one
 //!   mob-owned seam that applies `ReleaseMemberMaterialization`
 //!   (`discard_member_session_with_release`), or inside the session-service
-//!   adapters that define that API.
+//!   adapter file that defines that API (keyed by its path: a fn's name never
+//!   exempts it).
 //!
 //! Sites are keyed by file path suffix and enclosing fn name, never by line.
 //! A `Pending` allowance is a known site that must move behind the machine;
@@ -52,6 +53,11 @@ const LIVE_SESSION_OBSERVATIONS: &[&str] = &["live_session_actor_registered", "h
 
 /// Prefix of every session-service API that discards a live session.
 const DISCARD_PREFIX: &str = "discard_live_session";
+
+/// The session-service adapter file: it defines and forwards the discard API
+/// and rolls back its own create-time materialization, so its discards are
+/// the API itself, never a residency decision.
+const SESSION_SERVICE_ADAPTER_PATH: &str = "crates/meerkat-mob/src/runtime/session_service.rs";
 
 /// The crate whose shell must read residency from `MobMachine`.
 const MOB_SOURCE_PREFIX: &str = "crates/meerkat-mob/src/";
@@ -100,20 +106,8 @@ const fn pending(
 }
 
 /// Every registered `PeerNotFound` construction site, each with its design
-/// row (R91). The comms stream renames the inproc resolution; both the
-/// current fns and the new ones are listed until the merge, and an entry that
-/// matches nothing only warns.
+/// row (R91). An entry that matches nothing only warns.
 pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
-    settled(
-        "crates/meerkat-comms/src/inproc.rs",
-        "send_to_pubkey_any_namespace_with_id_wait",
-        "pre-wake-route name, remove at the comms merge. R91: inproc registry miss in any namespace; reached only after a wake-route miss or for a non-member",
-    ),
-    settled(
-        "crates/meerkat-comms/src/inproc.rs",
-        "send_to_pubkey_in_namespace_with_id_wait",
-        "pre-wake-route name, remove at the comms merge. R91: inproc registry miss in the sender's namespace; reached only after a wake-route miss or for a non-member",
-    ),
     settled(
         "crates/meerkat-comms/src/inproc.rs",
         "send_resolving_wake",
@@ -123,11 +117,6 @@ pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
         "crates/meerkat-comms/src/inproc.rs",
         "await_wake",
         "R91: a stale wake route whose owner denies membership (the NotAMember wake denial)",
-    ),
-    settled(
-        "crates/meerkat-comms/src/inproc.rs",
-        "peer_not_found",
-        "constructor helper: every call of it is a site that needs its own entry",
     ),
     settled(
         "crates/meerkat-comms/src/router.rs",
@@ -162,9 +151,9 @@ pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
 ];
 
 /// Fns that construct `PeerNotFound` on behalf of their callers: a call of
-/// one is itself a construction site and needs its own entry above.
-pub(crate) const PEER_NOT_FOUND_CONSTRUCTOR_HELPERS: &[(&str, &str)] =
-    &[("crates/meerkat-comms/src/inproc.rs", "peer_not_found")];
+/// one is itself a construction site and needs its own entry above. The
+/// inproc resolution constructs it inline since the wake-route merge.
+pub(crate) const PEER_NOT_FOUND_CONSTRUCTOR_HELPERS: &[(&str, &str)] = &[];
 
 /// The tool-boundary text of a not-found peer. Comms source that writes it
 /// constructs the not-found outcome without the enum.
@@ -257,8 +246,13 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
     ),
     settled(
         "crates/meerkat-mob/src/runtime/handle.rs",
-        "ensure_member_live",
-        "the drift observation: the probe only feeds observed_missing to WakeMember(Operator), whose verdict decides",
+        "wake_member",
+        "the drift observation: the probe only feeds observed_missing to WakeMember (Operator or HostDelivery), whose verdict decides",
+    ),
+    settled(
+        "crates/meerkat-mob/src/runtime/actor/member_wake_turn.rs",
+        "plan_member_wake",
+        "the wake path's own live observation (as begin_member_live_revival): inside the authorized attempt, a session actor or successor still live in this process is kept, never built twice",
     ),
     pending(
         "crates/meerkat-mob/src/runtime/actor.rs",
@@ -299,6 +293,11 @@ pub(crate) const MOB_MEMBER_SESSION_DISCARDS: &[SiteAllowance] = &[
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "reload_degraded_runtime_registration",
         "durability reload keeps the registration: the reload's drift classification (ClassifyMemberLiveMaterialization, a counted fault path) moves the Live member to Waking under its own attempt",
+    ),
+    settled(
+        "crates/meerkat-mob/src/runtime/provisioner.rs",
+        "create_dormant_member_session",
+        "fresh-seat create (R14, D2): the empty session's agent is built standalone, with no runtime registration, and discarded at once; it never was a member materialization (the identity is not seated yet, or a rotation seats it on this session later), so a release has nothing to release; the seat or rotation commit seats it Dormant",
     ),
 ];
 
@@ -392,10 +391,12 @@ impl<'a> MaterializationAuthorityGates<'a> {
             let enclosing = site.enclosing_fn.as_str();
             let symbol = format!("{enclosing}::{}", site.callee);
             if matches!(site.kind, SiteKind::MemberSessionDiscard)
-                && (enclosing == RELEASE_SEAM_FN || enclosing.starts_with(DISCARD_PREFIX))
+                && (enclosing == RELEASE_SEAM_FN
+                    || relative.ends_with(SESSION_SERVICE_ADAPTER_PATH))
             {
-                // The release seam itself, or a session-service adapter that
-                // defines the discard API.
+                // The release seam itself, or the session-service adapter
+                // file that defines the discard API (by path: a fn named like
+                // the API elsewhere is no adapter).
                 continue;
             }
             let allowance = list.iter().find(|allowance| {
@@ -897,10 +898,44 @@ mod tests {
             source,
         );
         let errors = errors(&findings);
-        assert_eq!(errors.len(), 1, "{findings:?}");
-        assert_eq!(errors[0].key.rule, DISCARD_RULE);
-        assert_eq!(errors[0].key.symbol, "reload::discard_live_session");
+        // A fn named like the discard API outside the adapter file is no
+        // adapter: only the release seam and the adapter file are exempt.
+        let symbols: BTreeSet<String> = errors
+            .iter()
+            .map(|finding| finding.key.symbol.clone())
+            .collect();
+        assert_eq!(
+            symbols,
+            BTreeSet::from([
+                "reload::discard_live_session".to_string(),
+                "discard_live_session_after_runtime_stop_terminalized::discard_live_session"
+                    .to_string(),
+            ]),
+            "{findings:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .all(|finding| finding.key.rule == DISCARD_RULE)
+        );
         assert_eq!(warnings(&findings).len(), 1, "{findings:?}");
+    }
+
+    #[test]
+    fn the_session_service_adapter_file_defines_the_discard_api() {
+        let source = r"
+            impl MobSessionService for Adapter {
+                async fn discard_live_session_after_runtime_stop_terminalized(&self, id: &SessionId) {
+                    let _ = self.discard_live_session(id).await;
+                }
+                async fn create_session_with_actor_witness_under_runtime_turn_boundary(&self, id: &SessionId) {
+                    let _ = self.discard_live_session_actor(id).await;
+                }
+            }
+        ";
+        let mut gates = fixture_gates();
+        let findings = findings_for(&mut gates, SESSION_SERVICE_ADAPTER_PATH, source);
+        assert!(errors(&findings).is_empty(), "{findings:?}");
     }
 
     #[test]

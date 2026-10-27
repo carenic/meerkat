@@ -79,15 +79,15 @@ covered_actions=(
   ObserveMemberProgressUnchangedOpenDegradedRunning
   ObserveMemberProgressUnchangedOpenWedgedRunning
   ObserveMemberProgressStaleRunning
-  RetireRunningReleasing
-  RetireRunningPreservingBinding
+  RetireRunningReleasingArchiveOnly
+  RetireRunningPreservingBindingArchiveOnly
   RetireRunningNoBinding
-  RetireStoppedReleasing
-  RetireStoppedPreservingBinding
+  RetireStoppedReleasingArchiveOnly
+  RetireStoppedPreservingBindingArchiveOnly
   RetireStoppedNoBinding
   RetireAbsentRunning
   RetireAbsentStopped
-  RetireMember
+  RetireMemberArchiveOnly
   RetireMemberPeerOnly
   SessionIngressDetachedForMobDestroyRunning
   SessionIngressDetachedForMobDestroyStopped
@@ -449,7 +449,7 @@ text = text[: block.start()] + "\n".join(lines) + text[block.end():]
 open(path, "w").write(text)
 PY
 
-  mutate lifecycle stale_incarnation_old_guard "Error: Invariant pending_respawn_topology_has_no_current_runtime is violated" "$@" <<'PY'
+  mutate lifecycle stale_incarnation_old_guard "Error: Invariant (pending_respawn_topology_has_no_current_runtime|local_session_bound_member_is_live_or_wakeable) is violated" "$@" <<'PY'
 import os, re
 path = os.environ["MODEL"]
 text = open(path).read()

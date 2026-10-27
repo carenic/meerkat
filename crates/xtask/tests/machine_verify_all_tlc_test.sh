@@ -424,6 +424,30 @@ if run_part audits-a; then
   TLC_WORKERS="${tlc_workers}" "${mob_operator_grant_audit}" "${MOB_OPERATOR_GRANT_AUDIT_MAX_STEPS:-5}" --mutants
 fi
 
+# The empty-resume retirement verdict (a recovered registration whose resume
+# found nothing to run retires only when it is Session-owned with nothing
+# queued; a Composition-owned one, a mob member, keeps serving) reads the
+# registration's residency owner, which no ci-sweep step sets. A hand-written
+# audit over the same generated model drives one session and one runtime
+# binding through the registration, the placement with either owner, the
+# composition's claim and the verdict with and without queued input in Idle
+# and Attached, under every generated invariant plus: exactly one verdict
+# answers each observation, Retire fires only for a Session-owned
+# registration with nothing queued, and a Composition placement claims the
+# registration while a Session placement never downgrades it. It requires
+# four witnesses reached (a Session-owned retire, a Composition-owned keep,
+# a queued keep and the claim) and refuses two seeded defects (--mutants).
+# 4 steps reach every witness.
+empty_resume_residency_audit="${workspace_root}/specs/machines/meerkat_machine/empty_resume_residency_audit.sh"
+if [[ ! -x "${empty_resume_residency_audit}" ]]; then
+  echo "error: empty-resume residency audit runner is missing from workspace runfiles: ${empty_resume_residency_audit}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running bounded empty-resume residency TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${empty_resume_residency_audit}" "${EMPTY_RESUME_RESIDENCY_AUDIT_MAX_STEPS:-6}" --mutants
+fi
+
 # The member generation high-water (resume recovers each identity's highest
 # generation from the whole log, every reset epoch included, then seals the
 # window; minting reads it) is empty in the MobMachine ci sweep, whose
@@ -502,26 +526,33 @@ fi
 # MobMachine member residency (Dormant, Waking, Live) is empty in the ci
 # sweep, whose AgentIdentityValues are {}, so the residency invariants
 # (I1-I14) hold there only vacuously. A hand-written audit over the same
-# generated model checks four runs over their whole reachable space, under a
-# cap of two minted wake attempts and the member lifecycle audit's VIEW
-# (model_step_count and topology_epoch left out, checked first): one
-# identity through the build seed, the boot plan and seal, every WakeMember
-# arm, every attempt-fenced resolution and its stale twin in every phase, the
-# runtime-ready observation, every release shape, the drift and terminal
-# classifications, the peer notice classification and the mob's lifecycle
-# arms; one identity through an explicit resume; two identities and one
-# wiring edge (I8); and two identities from the spawn ladder's Opened phase
-# through the dormant seat (R5), the embodied spawn, the release (R12) and
-# the rotation. Under every generated invariant plus AP1 (no recovery or
-# seat arm overwrites a phase), AP2 (an open attempt is never replaced and
-# ends only Live, Dormant or without a phase, and every Waking member has an
-# enabled closing arm), AP3 (a Lifecycle input never wakes) and WakeMember
-# totality, with the I5 ASSUME over the wake refusal helper. It runs with TLC
-# coverage and requires every listed arm to fire and a floor of distinct
-# states, and requires its seventeen witnesses reached. Its --mutants mode
-# (by hand and in the release validation, outside the shard's budget)
-# refuses twenty-four seeded defects, one per residency invariant and
-# property.
+# generated model checks eight small runs over their whole reachable space,
+# each under a cap of minted wake attempts and the member lifecycle audit's
+# VIEW (model_step_count and topology_epoch left out, checked first): one
+# identity through the build seed, the boot plan, the seal and the host
+# carry-out; one identity through every WakeMember arm, every attempt-fenced
+# resolution and its stale twin in Running and Stopped, the runtime-ready
+# observation, every release shape, the drift and terminal classifications,
+# the peer notice classification and the mob's stop and resume; one identity
+# woken, released, retired (routed or archive-only), rotated and destroyed;
+# one identity in the Completed and Destroyed phases; one identity through
+# an explicit resume; two identities and one wiring edge (I8); two
+# identities from the spawn ladder's Opened phase through the dormant seat
+# (R5), the embodied spawn, the release (R12) and the rotation; and two
+# identities woken beside each other. Under every generated invariant plus
+# AP1 (no recovery or seat arm overwrites a phase), AP2 (an open attempt is
+# never replaced and ends only Live, Dormant or without a phase, and every
+# Waking member has an enabled closing arm of every kind), AP3 (a Lifecycle
+# input never wakes), WakeMember totality, a local wake that closes Live
+# only with a registered endpoint, the release epoch fence, no runtime
+# retire routed for a member with no registration, a settled retirement
+# that can always archive (under an admitted destroy no rotation or host
+# carry-out holds it) and no rotation under an admitted destroy, with the I5
+# ASSUME over the wake refusal helper. It runs with TLC coverage and
+# requires every listed arm to fire and a floor of distinct states per run,
+# and requires its twenty-three witnesses reached. Its --mutants mode (run
+# by hand, outside the shard's budget) refuses thirty-one seeded defects,
+# one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
   echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2
@@ -661,7 +692,10 @@ run_machine_verify() {
 # 90 (131), live-context causal-tail batch with --mutants 74 (110),
 # generation high-water with --mutants 38 (55): about 635 s (930 s), plus
 # the member residency audit without its mutants, which joined audits-c as
-# the lightest shard and is not measured on hosted runners yet.
+# the lightest shard and is not measured on hosted runners yet. The
+# empty-resume residency audit with --mutants (seven small TLC runs over the
+# meerkat_machine model) joined audits-b and is not measured on hosted
+# runners yet either.
 # With the durable-tail recovery ownership and materialization-rollback keep
 # audits both in audits-b, that shard ran 1143 s on the pull request, past
 # the 1080 s execution budget, and hit the 20-minute job timeout on the

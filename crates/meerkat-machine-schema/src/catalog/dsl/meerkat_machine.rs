@@ -2868,6 +2868,27 @@ pub enum RecoveredInputRecoveryDisposition {
     Discard,
 }
 
+/// Who holds a session's runtime registration resident. The composition's
+/// routed placement (a mob member's binding request) marks it
+/// `Composition`; every other placement is `Session`. The mark is sticky
+/// for the registration's life (a standalone placement never downgrades it)
+/// and is reset when the registration ends or a new session binds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum SessionResidencyOwner {
+    #[default]
+    Session,
+    Composition,
+}
+
+/// The verdict for an empty resume (a resume batch that ended with no
+/// pending boundary): the registration retires, or keeps serving.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum EmptyResumeRetirementVerdict {
+    #[default]
+    Retire,
+    KeepServing,
+}
+
 /// What an unregister does with inputs still queued behind the session's
 /// running turn when it stops the runtime. `BeginUnregisterSession` records
 /// it with the unregister; `ClassifyStopInputDisposition` reads it.
@@ -3749,6 +3770,13 @@ macro_rules! meerkat_catalog_machine_dsl {
             active_fence_token: Option<FenceToken>,
             active_runtime_generation: Option<Generation>,
             active_runtime_epoch_id: Option<RuntimeEpochId>,
+            // Who holds this registration resident (SessionResidencyOwner):
+            // set Composition by the composition's routed placement and kept
+            // for the registration's life (a recycle or a revival of the same
+            // session keeps it); reset when the registration ends or a new
+            // session binds. Only a Session-owned registration retires on an
+            // empty resume.
+            residency_owner: Enum<SessionResidencyOwner>,
             current_run_id: Option<RunId>,
             pre_run_phase: Option<Enum<PreRunPhase>>,
             runtime_stop_deferred: bool,
@@ -4675,6 +4703,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             active_fence_token = None,
             active_runtime_generation = None,
             active_runtime_epoch_id = None,
+            residency_owner = SessionResidencyOwner::Session,
             current_run_id = None,
             pre_run_phase = None,
             runtime_stop_deferred = false,
@@ -5320,6 +5349,9 @@ macro_rules! meerkat_catalog_machine_dsl {
                 generation: Option<Generation>,
                 runtime_epoch_id: Option<RuntimeEpochId>,
                 session_id: SessionId,
+                // Composition for the composition's routed placement (the
+                // route binds it); Session for every standalone placement.
+                residency_owner: Enum<SessionResidencyOwner>,
             },
             SetPeerIngressContext { keep_alive: bool },
             ResolvePeerIngressReceive {
@@ -7254,6 +7286,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 prior_commit: Enum<DurableRecoveryPriorCommit>,
                 input_evidence: Enum<DurableRecoveryInputEvidence>,
             },
+            // An empty resume (the resume batch ended with no pending
+            // boundary) asks whether the registration retires: only a
+            // Session-owned registration with nothing queued does.
+            ResolveEmptyResumeRetirement { queued_input_present: bool },
+            // The composition re-claims residency of a recovered registration
+            // it placed: the boot rebind of its signal dispatcher applies no
+            // placement, so it claims the exact recovered binding directly.
+            ClaimCompositionResidency {
+                session_id: SessionId,
+                agent_runtime_id: AgentRuntimeId,
+                fence_token: FenceToken,
+                generation: Option<Generation>,
+            },
         }
 
         surface_only [
@@ -8616,11 +8661,16 @@ macro_rules! meerkat_catalog_machine_dsl {
             // A graceful requeue stop left the in-flight run resumable.
             RunSuspendedForStop { run_id: RunId },
             // A session's runtime registration was released (G1): every
-            // unregister, the idle-executor teardown included, publishes the
+            // unregister (a Session-owned registration's empty-resume teardown
+            // included; a Composition-owned one keeps serving) publishes the
             // released registration's exact runtime id, fence and epoch. The
             // composition routes it to the owning mob, which demotes exactly
             // that live materialization to Dormant (a stale release is a no-op).
             RuntimeRegistrationReleased { agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId> },
+            // The empty-resume verdict: Retire (the standalone teardown runs)
+            // or KeepServing (the registration stays; a mob member, once
+            // loaded, stays loaded).
+            EmptyResumeRetirementResolved { verdict: Enum<EmptyResumeRetirementVerdict> },
         }
 
         // =====================================================================
@@ -8631,6 +8681,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RuntimeRetired => routed [MobMachine] seam NoOwnerRealization,
         disposition RuntimeDestroyed => routed [MobMachine] seam NoOwnerRealization,
         disposition RuntimeRegistrationReleased => routed [MobMachine] seam NoOwnerRealization,
+        disposition EmptyResumeRetirementResolved => local seam SurfaceResultAlignment,
         disposition TurnRunStarted => local seam NoOwnerRealization,
         disposition TurnBoundaryApplied => local seam NoOwnerRealization,
         disposition LiveBoundaryContextReceiptResolved => local seam NoOwnerRealization,
@@ -11598,6 +11649,7 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "new_session_binding" { self.session_id != Some(session_id) }
             update {
                 self.session_id = Some(session_id);
+                self.residency_owner = SessionResidencyOwner::Session;
                 // The entry epoch is born here, with the registration that
                 // owns it. Placement (`PrepareBindings`) only asserts it.
                 self.active_runtime_epoch_id = runtime_epoch_id;
@@ -11819,6 +11871,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_media_fault_reopens_by_session = EmptyMap;
                 self.session_id = Some(session_id);
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = runtime_epoch_id;
@@ -12492,6 +12545,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_media_fault_reopens_by_session = EmptyMap;
                 self.session_id = None;
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = None;
@@ -12653,6 +12707,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_media_fault_reopens_by_session = EmptyMap;
                 self.session_id = None;
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = None;
@@ -12814,6 +12869,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.input_live_boundary_join_phase = EmptyMap;
                 self.session_id = None;
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = None;
@@ -12973,6 +13029,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_media_fault_reopens_by_session = EmptyMap;
                 self.session_id = None;
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = None;
@@ -13132,6 +13189,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.live_media_fault_reopens_by_session = EmptyMap;
                 self.session_id = None;
                 self.active_runtime_id = None;
+                self.residency_owner = SessionResidencyOwner::Session;
                 self.active_fence_token = None;
                 self.active_runtime_generation = None;
                 self.active_runtime_epoch_id = None;
@@ -14678,7 +14736,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         // unregister.
         transition PrepareBindingsIdempotent {
             per_phase [Initializing, Idle, Attached, Running, Retired]
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
             guard "runtime_binding_exact" { self.active_runtime_id == Some(agent_runtime_id) }
@@ -14686,12 +14744,19 @@ macro_rules! meerkat_catalog_machine_dsl {
             guard "generation_binding_exact" { self.active_runtime_generation == generation }
             guard "epoch_binding_exact" { self.active_runtime_epoch_id == runtime_epoch_id }
             guard "typed_binding_identity_present" { generation != None || runtime_epoch_id != None }
-            update {}
+            update {
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
+            }
             to Idle
         }
         // Initializing → Initializing (emits RuntimeBound for new binding)
         transition PrepareBindingsInitializing {
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard { self.lifecycle_phase == Phase::Initializing }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
@@ -14709,13 +14774,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
             }
             to Initializing
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Idle → Attached
         transition PrepareBindingsIdle {
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard { self.lifecycle_phase == Phase::Idle }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
@@ -14733,13 +14804,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
             }
             to Attached
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Attached → Attached
         transition PrepareBindingsAttached {
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard { self.lifecycle_phase == Phase::Attached }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
@@ -14757,13 +14834,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
             }
             to Attached
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Running → Running
         transition PrepareBindingsRunning {
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard { self.lifecycle_phase == Phase::Running }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
@@ -14781,13 +14864,19 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
             }
             to Running
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Retired → Retired
         transition PrepareBindingsRetired {
-            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id }
+            on input PrepareBindings { agent_runtime_id, fence_token, generation, runtime_epoch_id, session_id, residency_owner }
             guard { self.lifecycle_phase == Phase::Retired }
             guard "not_draining" { self.registration_phase != RegistrationPhase::Draining }
             guard "session_matches_current" { self.session_id == Some(session_id) }
@@ -14805,9 +14894,59 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_id = Some(agent_runtime_id);
                 self.active_fence_token = Some(fence_token);
                 self.active_runtime_generation = generation;
+                // A composition placement claims the registration's residency
+                // (sticky until the binding goes); a standalone one never
+                // downgrades it.
+                if residency_owner == SessionResidencyOwner::Composition {
+                    self.residency_owner = SessionResidencyOwner::Composition;
+                }
             }
             to Retired
             emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
+        }
+
+        // The empty-resume verdict. A Session-owned registration with nothing
+        // queued retires (the standalone recovery teardown). A
+        // Composition-owned one keeps serving: the composition owns a mob
+        // member's residency, so it stays loaded until its owner releases it.
+        // Queued input always keeps the registration serving.
+        transition ResolveEmptyResumeRetirementRetire {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveEmptyResumeRetirement { queued_input_present }
+            guard "nothing_queued" { queued_input_present == false }
+            guard "session_owned" { self.residency_owner == SessionResidencyOwner::Session }
+            update {}
+            to Idle
+            emit EmptyResumeRetirementResolved { verdict: EmptyResumeRetirementVerdict::Retire }
+        }
+
+        transition ResolveEmptyResumeRetirementKeepServing {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ResolveEmptyResumeRetirement { queued_input_present }
+            guard "queued_or_composition_owned" {
+                queued_input_present == true
+                || self.residency_owner == SessionResidencyOwner::Composition
+            }
+            update {}
+            to Idle
+            emit EmptyResumeRetirementResolved { verdict: EmptyResumeRetirementVerdict::KeepServing }
+        }
+
+        // The composition re-claims residency of a registration it placed when
+        // it rebinds its signal dispatcher at boot (that recovery applies no
+        // placement). Only the exact recovered binding is claimed; a claim
+        // over an already Composition-owned registration changes nothing.
+        transition ClaimCompositionResidency {
+            per_phase [Idle, Attached, Running, Retired, Stopped]
+            on input ClaimCompositionResidency { session_id, agent_runtime_id, fence_token, generation }
+            guard "session_matches_current" { self.session_id == Some(session_id) }
+            guard "runtime_binding_matches_observation" { self.active_runtime_id == Some(agent_runtime_id) }
+            guard "fence_binding_matches_observation" { self.active_fence_token == Some(fence_token) }
+            guard "generation_binding_matches_observation" { self.active_runtime_generation == generation }
+            update {
+                self.residency_owner = SessionResidencyOwner::Composition;
+            }
+            to Idle
         }
 
         // 8. SetPeerIngressContext: per-phase self-loop, guard session_registered
