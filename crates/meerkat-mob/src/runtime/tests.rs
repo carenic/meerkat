@@ -77447,6 +77447,121 @@ async fn test_discarded_live_session_revived_by_machine_authorized_dispatch() {
     assert_eq!(snapshot.status, crate::runtime::MobMemberStatus::Active);
 }
 
+/// Task #37 with the member's runtime executor attached, as the real session
+/// services attach one for every live session: the discard drops the live
+/// session actor and leaves the executor attached. An attached executor over a
+/// session no actor serves is not a served member, so the next wake that saw
+/// the miss takes MobMachine's drift arm and rebuilds the live session. It
+/// never answers ready and leaves a turn to find no session.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn test_discarded_live_session_with_an_attached_executor_is_revived_by_the_next_wake() {
+    struct IdleExecutor;
+
+    #[async_trait::async_trait]
+    impl meerkat_core::lifecycle::core_executor::CoreExecutor for IdleExecutor {
+        async fn cancel_after_boundary(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+
+        async fn apply(
+            &mut self,
+            run_id: meerkat_core::RunId,
+            primitive: meerkat_core::lifecycle::run_primitive::RunPrimitive,
+        ) -> Result<
+            meerkat_core::lifecycle::core_executor::CoreApplyOutput,
+            meerkat_core::lifecycle::core_executor::CoreExecutorError,
+        > {
+            Ok(
+                meerkat_core::lifecycle::core_executor::CoreApplyOutput::with_untyped_snapshot(
+                    meerkat_core::lifecycle::run_receipt::RunBoundaryReceiptDraft {
+                        run_id,
+                        boundary:
+                            meerkat_core::lifecycle::run_primitive::RunApplyBoundary::RunStart,
+                        contributing_input_ids: primitive.contributing_input_ids().to_vec(),
+                        conversation_digest: None,
+                        message_count: 0,
+                    },
+                    None,
+                    None,
+                ),
+            )
+        }
+
+        async fn stop_runtime_executor(
+            &mut self,
+            _reason: String,
+        ) -> Result<(), meerkat_core::lifecycle::core_executor::CoreExecutorError> {
+            Ok(())
+        }
+    }
+
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .unwrap()
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let (handle, service) = create_test_mob(definition).await;
+    let identity = AgentIdentity::from("w-1");
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn worker");
+    let session = receipt
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    let adapter = service.enable_runtime_adapter();
+    adapter
+        .ensure_session_with_executor(session.clone(), Box::new(IdleExecutor))
+        .await
+        .expect("attach the member's runtime executor");
+
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard live session");
+    assert!(
+        !service
+            .has_live_session(&session)
+            .await
+            .expect("has_live_session"),
+        "the discard removes the live session actor"
+    );
+    assert!(
+        adapter
+            .session_has_executor(&session)
+            .await
+            .expect("executor read"),
+        "the discard leaves the runtime executor attached"
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        handle.ensure_member_live(&identity),
+    )
+    .await
+    .expect("the wake answers")
+    .expect("the wake revives the member");
+    assert!(
+        service
+            .has_live_session(&session)
+            .await
+            .expect("has_live_session"),
+        "the drift arm rebuilt the live session under the unchanged binding"
+    );
+    let snapshot = handle
+        .member_status(&identity)
+        .await
+        .expect("member status");
+    assert_eq!(snapshot.status, crate::runtime::MobMemberStatus::Active);
+}
+
 /// Delivery-time MissingLive regression: the member and its durable session
 /// snapshot remain Active, but a completed runtime stop left the registered
 /// session with no executor. Delivery-time binding preparation readmits that

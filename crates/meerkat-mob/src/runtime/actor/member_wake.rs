@@ -1010,8 +1010,8 @@ impl MobActor {
         // The miss was observed before this command ran (off the actor, or
         // by a sender's route lookup), so it may be stale: a concurrent wake
         // may have served the member since. Observe again here, and a member
-        // whose runtime registration serves it with an executor is ready,
-        // not drifted.
+        // whose runtime registration serves it with an executor and whose
+        // session has a live actor is ready, not drifted.
         if self.member_materialization_served(identity).await {
             return MemberWakeAdmission::Ready;
         }
@@ -1087,8 +1087,11 @@ impl MobActor {
     }
 
     /// Whether `identity`'s session is served in this process right now: its
-    /// runtime registration has an executor attached. The fresh observation
-    /// the drift path takes on the actor before it trusts an earlier miss.
+    /// runtime registration has an executor attached and the session has a
+    /// live actor. The fresh observation the drift path takes on the actor
+    /// before it trusts an earlier miss. The executor alone is not enough: a
+    /// discarded session actor leaves its runtime executor attached, and a
+    /// turn applied there finds no session.
     async fn member_materialization_served(&self, identity: &AgentIdentity) -> bool {
         #[cfg(feature = "runtime-adapter")]
         {
@@ -1108,6 +1111,11 @@ impl MobActor {
                 .session_has_executor(&session_id)
                 .await
                 .unwrap_or(false)
+                && self
+                    .session_service
+                    .live_session_actor_registered(&session_id)
+                    .await
+                    .unwrap_or(false)
         }
         #[cfg(not(feature = "runtime-adapter"))]
         {
