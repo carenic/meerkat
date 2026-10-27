@@ -496,7 +496,7 @@ impl WakeFixture {
             .borrow()
             .member_materialization
             .get(&mob_dsl::AgentIdentity::from_domain(identity))
-            .cloned()
+            .copied()
     }
 
     async fn wait_residency(
@@ -508,7 +508,7 @@ impl WakeFixture {
         let mut state = self.handle.machine_state_watch_rx.clone();
         let reached = tokio::time::timeout(
             WAIT,
-            state.wait_for(|state| state.member_materialization.get(&key).cloned() == expected),
+            state.wait_for(|state| state.member_materialization.get(&key).copied() == expected),
         )
         .await;
         assert!(
@@ -1531,7 +1531,7 @@ async fn a_background_completion_on_an_idle_member_keeps_it_loaded() {
     let left_live = tokio::time::timeout(
         STEP,
         machine_state.wait_for(|current| {
-            current.member_materialization.get(&key).cloned()
+            current.member_materialization.get(&key).copied()
                 != Some(mob_dsl::MemberMaterializationPhase::Live)
         }),
     )
