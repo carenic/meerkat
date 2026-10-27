@@ -5,6 +5,8 @@ mod before_activation;
 mod existing_live_delegation;
 mod historical_metadata;
 mod host_human_input;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod lazy_boot;
 mod member_creation;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_creation_upcall;
@@ -12201,12 +12203,12 @@ async fn seed_operator_execution_residency(handle: &MobHandle, member_session_id
             runtime_mode: dsl::SpawnPolicyRuntimeMode::TurnDriven,
             bridge_session_id: Some(dsl::SessionId::from(member_session_id)),
             replacing: None,
-            member_peer_endpoint: Some(dsl::MemberPeerEndpoint {
-                name: dsl::PeerName::from("member-a"),
-                peer_id: dsl::PeerId::from("peer-member-a"),
-                address: dsl::PeerAddress::from("tcp://member-a"),
-                signing_key: dsl::PeerSigningKey([3; 32]),
-            }),
+            member_peer_endpoint: Some(dsl::MemberPeerEndpoint::new(
+                dsl::PeerName::from("member-a"),
+                dsl::PeerId::from("peer-member-a"),
+                dsl::PeerAddress::from("tcp://member-a"),
+                dsl::PeerSigningKey([3; 32]),
+            )),
             spec_digest_echo: Some(spec_digest),
             ack_engine_version: Some("operator-race-host".to_string()),
             placed_spawn_id: Some(spawn_id),

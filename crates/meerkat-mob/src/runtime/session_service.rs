@@ -519,18 +519,12 @@ impl SessionResumeVerdict {
                         "archived refusal runtime state disagrees with atomic durable authority",
                     ));
                 }
-                let state = runtime_state.map_or_else(
-                    || "<no runtime record>".to_string(),
-                    |state| state.to_string(),
-                );
                 Ok(Self::Rejected(SessionResumeRejection {
                     session_id: session_id.clone(),
                     lifecycle,
                     authority: Box::new(authority),
                     kind: ResumeRejectionKind::ArchivedNotRevivable,
-                    detail: format!(
-                        "durable session '{session_id}' is archived and not revivable from runtime state {state}; the transcript is intact and preserved"
-                    ),
+                    detail: archived_not_revivable_detail(session_id, runtime_state),
                     runtime_state,
                     terminality: if runtime_state == Some(meerkat_runtime::RuntimeState::Destroyed)
                     {
@@ -557,9 +551,7 @@ impl SessionResumeVerdict {
                         runtime_state: authority.runtime_state(),
                         authority: Box::new(authority),
                         kind: ResumeRejectionKind::ContradictoryDurableAuthority,
-                        detail: format!(
-                            "session '{session_id}' has durable authority or lifecycle rows but no materializable body"
-                        ),
+                        detail: bodiless_durable_authority_detail(session_id),
                         terminality: ResumeVerdictTerminality::StableParkable,
                     }))
                 } else {
@@ -689,6 +681,70 @@ impl SessionResumeVerdict {
             runtime_state,
             terminality: ResumeVerdictTerminality::TransientRetryable,
         })
+    }
+}
+
+/// The refusal detail of an archived session that cannot be revived from
+/// `runtime_state`: shared by the materializing verdict and the read-only one.
+fn archived_not_revivable_detail(
+    session_id: &SessionId,
+    runtime_state: Option<meerkat_runtime::RuntimeState>,
+) -> String {
+    let state = runtime_state.map_or_else(
+        || "<no runtime record>".to_string(),
+        |state| state.to_string(),
+    );
+    format!(
+        "durable session '{session_id}' is archived and not revivable from runtime state {state}; the transcript is intact and preserved"
+    )
+}
+
+/// The refusal detail of a session whose durable authority or lifecycle rows
+/// exist with no materializable body: shared by the materializing verdict
+/// and the read-only one.
+fn bodiless_durable_authority_detail(session_id: &SessionId) -> String {
+    format!(
+        "session '{session_id}' has durable authority or lifecycle rows but no materializable body"
+    )
+}
+
+/// What a read-only observation of a session's durable resume authority says
+/// a cold resume of the session would meet. It loads no body, settles no
+/// durable tail and takes no hosting claim, so what only a materialization
+/// can find (an unprovable committed boundary, a session another runtime
+/// owner hosts) is not visible here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ObservedResumeVerdict {
+    /// Active, or archived and revivable: a resume materializes it.
+    Resumable,
+    /// No durable session: a resume searches for a persisted successor.
+    Absent,
+    /// The typed refusal a resume records, with its detail.
+    Refused(String),
+}
+
+/// Classify one read-only resume observation (see [`ObservedResumeVerdict`])
+/// exactly as the materializing verdict classifies the same lifecycle.
+pub(crate) fn observed_resume_verdict(
+    session_id: &SessionId,
+    authority: &SessionResumeAuthority,
+) -> ObservedResumeVerdict {
+    match authority.lifecycle() {
+        SessionResumeLifecycle::Active { .. }
+        | SessionResumeLifecycle::Archived {
+            revivable: true, ..
+        } => ObservedResumeVerdict::Resumable,
+        SessionResumeLifecycle::Archived {
+            revivable: false,
+            runtime_state,
+            ..
+        } => {
+            ObservedResumeVerdict::Refused(archived_not_revivable_detail(session_id, runtime_state))
+        }
+        SessionResumeLifecycle::ContradictoryDurableAuthority { .. } => {
+            ObservedResumeVerdict::Refused(bodiless_durable_authority_detail(session_id))
+        }
+        SessionResumeLifecycle::NoCurrentDurableAuthority => ObservedResumeVerdict::Absent,
     }
 }
 

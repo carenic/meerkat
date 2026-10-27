@@ -84,7 +84,11 @@ impl MobCommand {
             // acquisition; both halves already require SendCommand.
             | Self::SpawnAttachedForkedParticipant { .. }
             // Releasing a host's run-start hold lets the member start runs.
-            | Self::ReleaseMemberRunStarts { .. } => Some(ControlScope::SendCommand),
+            | Self::ReleaseMemberRunStarts { .. }
+            // A dormant seat creates members (and spawns the fresh ones that
+            // owe a kickoff): the authority class of a spawn.
+            | Self::PlanDormantSeats { .. }
+            | Self::CommitDormantSeats { .. } => Some(ControlScope::SendCommand),
 
             #[cfg(feature = "openai-live")]
             Self::StartLiveBridgeOperation { .. }
@@ -142,6 +146,9 @@ impl MobCommand {
             | Self::Complete { .. }
             | Self::Destroy { .. }
             | Self::Reset { .. }
+            // A rotation retires the member's current life to seat its next.
+            | Self::PlanMemberRotation { .. }
+            | Self::StartMemberRotation { .. }
             | Self::AdoptMemberIdentityDeclaration { .. }
             | Self::ApplyMemberToolDeclaration { .. }
             | Self::ResolveIdentityConvergenceBlock { .. } => Some(ControlScope::Retire),
@@ -220,6 +227,7 @@ impl MobCommand {
             | Self::ResumeLifecycleMemberSettled { .. }
             | Self::ResumeLifecycleMemberCleanupHeld { .. }
             | Self::ResumeLifecycleMemberUnproven { .. }
+            | Self::ResumeLifecycleBootMemberSettled { .. }
             | Self::ResumeLifecycleRollbackStep { .. }
             | Self::ResumeLifecycleRollbackFinalized { .. }
             | Self::ResumePostCommitMemberCompleted { .. }
@@ -354,6 +362,8 @@ impl MobCommand {
                     | Self::ResumeLifecycle { .. }
                     | Self::Reset { .. }
                     | Self::ReloadMemberRegistration { .. }
+                    | Self::PlanMemberRotation { .. }
+                    | Self::StartMemberRotation { .. }
             ),
             Some(
                 ControlScope::List
@@ -452,6 +462,18 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::ReleaseMemberRunStarts { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::PlanDormantSeats { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::PlanMemberRotation { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::StartMemberRotation { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CommitDormantSeats { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             // Settling closes the waiter set; the actor's in-flight map prunes
@@ -711,6 +733,7 @@ impl MobCommand {
             | Self::ResumeLifecycleMemberSettled { .. }
             | Self::ResumeLifecycleMemberCleanupHeld { .. }
             | Self::ResumeLifecycleMemberUnproven { .. }
+            | Self::ResumeLifecycleBootMemberSettled { .. }
             | Self::ResumeLifecycleRollbackStep { .. }
             | Self::ResumeLifecycleRollbackFinalized { .. }
             | Self::ResumePostCommitMemberCompleted { .. }

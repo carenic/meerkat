@@ -24,10 +24,13 @@ use serde::{Deserialize, Serialize};
 use super::journal::{Group, TouchScope, Touches, receipt_sub};
 use super::{
     CompactionOutboxEntry, InMemoryRuntimeStore, Inner, OpsLifecycleState, ReceiptKey,
-    StoredWholeBlobProvisionalTail,
+    StoredWholeBlobProvisionalTail, boot_facts,
 };
 use crate::input_state::StoredInputState;
 use crate::ops_lifecycle::PersistedOpsSnapshot;
+use crate::store::recovery_obligation::{
+    BootFactsV1, catalog_entry_is_archived, lifecycle_has_current_run,
+};
 use crate::store::spi::codec;
 use crate::store::{
     CommittedRecoveryBoundary, ContinuationAdmission, ContinuationKeyBinding,
@@ -175,22 +178,8 @@ struct AdmissionWire {
     input_id: InputId,
 }
 
-/// Facts a boot reads from a runtime's head to decide whether recovery must
-/// act on it, refreshed by every commit of the runtime.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct BootFactsV1 {
-    pub(crate) v: u32,
-    /// The runtime has nonterminal inputs.
-    pub(crate) nonterminal: bool,
-    /// The runtime has pending terminal owners.
-    pub(crate) pending_owners: bool,
-    /// The runtime has a provisional tail (an open run cursor).
-    pub(crate) tail: bool,
-    /// The runtime has input rows.
-    pub(crate) inputs: bool,
-}
-
+// The boot facts' wire form: the entry pinned in every runtime head under
+// `BOOT_FACTS_KEY`.
 impl BootFactsV1 {
     pub(crate) fn decode(bytes: &[u8]) -> Result<Self, RuntimeStoreError> {
         let facts: Self = from_json(bytes, "boot facts")?;
@@ -198,6 +187,11 @@ impl BootFactsV1 {
         Ok(facts)
     }
 }
+
+const _: () = assert!(
+    BootFactsV1::VERSION == WIRE_V1,
+    "the boot facts every writer stamps are the version this reader requires"
+);
 
 /// The entry key of the boot facts, pinned in every runtime head.
 pub(crate) const BOOT_FACTS_KEY: &str = "boot";
@@ -590,25 +584,6 @@ fn admission_value(
         session_id: session_id.clone(),
         input_id: input_id.clone(),
     })
-}
-
-fn boot_facts(inner: &Inner, rt: &str) -> BootFactsV1 {
-    BootFactsV1 {
-        v: WIRE_V1,
-        nonterminal: inner
-            .recovery_nonterminal_inputs
-            .get(rt)
-            .is_some_and(|ids| !ids.is_empty()),
-        pending_owners: inner
-            .pending_terminal_owners
-            .get(rt)
-            .is_some_and(|owners| !owners.is_empty()),
-        tail: inner.whole_blob_provisional_tails.contains_key(rt),
-        inputs: inner
-            .input_states
-            .get(rt)
-            .is_some_and(|states| !states.is_empty()),
-    }
 }
 
 /// Whether the runtime holds anything at all (an empty runtime's scope is
@@ -1028,28 +1003,12 @@ impl InMemoryRuntimeStore {
     /// its body may leave memory.
     pub(crate) async fn journal_archived_idle(&self, rt: &str) -> bool {
         let inner = self.inner.lock().await;
-        let archived = inner
-            .session_catalog
-            .get(rt)
-            .and_then(RuntimeSessionCatalogEntry::lifecycle_terminal)
-            .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived);
+        let archived = catalog_entry_is_archived(inner.session_catalog.get(rt));
         let facts = boot_facts(&inner, rt);
         archived
             && !facts.nonterminal
             && !facts.pending_owners
             && !facts.tail
             && !lifecycle_has_current_run(inner.runtime_lifecycle.get(rt).map(Vec::as_slice))
-    }
-}
-
-/// Whether a lifecycle record names a current run. A record that does not
-/// decode counts as one: recovery must look at it.
-pub(crate) fn lifecycle_has_current_run(bytes: Option<&[u8]>) -> bool {
-    match bytes.map(crate::store::classify_machine_lifecycle_record) {
-        None => false,
-        Some(crate::store::MachineLifecycleObservation::Decoded { record, .. }) => {
-            record.run().current_run_id().is_some()
-        }
-        Some(_) => true,
     }
 }

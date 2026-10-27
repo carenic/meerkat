@@ -16,6 +16,7 @@ use tokio::sync::Mutex;
 #[cfg(target_arch = "wasm32")]
 use tokio_with_wasm::alias::sync::Mutex;
 
+use super::recovery_obligation::{BootFactsV1, runtime_has_recovery_obligation};
 use super::{
     AuthOAuthFlowSnapshotUpdate, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
     ContinuationAdmission, ContinuationAdmissionEntry, ContinuationAdmissionOutcome,
@@ -250,6 +251,54 @@ fn sync_runtime_session_catalog_lifecycle(
     if let Some(entry) = inner.session_catalog.get_mut(runtime_id) {
         entry.set_runtime_state(Some(runtime_state));
     }
+}
+
+/// The boot facts of runtime `rt` as `inner` holds them. The host store
+/// adapter pins exactly these in the runtime's head.
+fn boot_facts(inner: &Inner, rt: &str) -> BootFactsV1 {
+    BootFactsV1 {
+        v: BootFactsV1::VERSION,
+        nonterminal: inner
+            .recovery_nonterminal_inputs
+            .get(rt)
+            .is_some_and(|ids| !ids.is_empty()),
+        pending_owners: inner
+            .pending_terminal_owners
+            .get(rt)
+            .is_some_and(|owners| !owners.is_empty()),
+        tail: inner.whole_blob_provisional_tails.contains_key(rt),
+        inputs: inner
+            .input_states
+            .get(rt)
+            .is_some_and(|states| !states.is_empty()),
+    }
+}
+
+/// Every runtime `inner` holds whose facts carry recovery work
+/// ([`runtime_has_recovery_obligation`]), in runtime id order. A runtime
+/// carries work only through the maps read here, so their keys are the
+/// candidates.
+fn runtimes_with_recovery_work(inner: &Inner) -> Vec<LogicalRuntimeId> {
+    let candidates: BTreeSet<&str> = inner
+        .input_states
+        .keys()
+        .chain(inner.pending_terminal_owners.keys())
+        .chain(inner.recovery_nonterminal_inputs.keys())
+        .chain(inner.whole_blob_provisional_tails.keys())
+        .chain(inner.runtime_lifecycle.keys())
+        .map(String::as_str)
+        .collect();
+    candidates
+        .into_iter()
+        .filter(|rt| {
+            runtime_has_recovery_obligation(
+                &boot_facts(inner, rt),
+                inner.runtime_lifecycle.get(*rt).map(Vec::as_slice),
+                inner.session_catalog.get(*rt),
+            )
+        })
+        .map(LogicalRuntimeId::new)
+        .collect()
 }
 
 fn store_input_state_prechecked(
@@ -3121,6 +3170,14 @@ impl RuntimeStore for InMemoryRuntimeStore {
             .collect())
     }
 
+    /// The facts of every runtime the store holds, read under its one lock.
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+        let inner = self.inner.lock().await;
+        Ok(runtimes_with_recovery_work(&inner))
+    }
+
     async fn list_runtime_delivery_records(
         &self,
         runtime_id: &LogicalRuntimeId,
@@ -4722,6 +4779,14 @@ pub(crate) mod tests {
     async fn pending_terminal_owner_index_satisfies_store_contract() {
         crate::store::assert_pending_terminal_owner_index_contract(&InMemoryRuntimeStore::new())
             .await;
+    }
+
+    #[tokio::test]
+    async fn boot_obligation_scan_memory_store_lists_exactly_the_runtimes_with_recovery_work() {
+        use crate::store::recovery_obligation::scan_contract;
+        let store = InMemoryRuntimeStore::new();
+        let fixture = scan_contract::seed(&store).await;
+        scan_contract::assert_lists_exactly(&store, &fixture).await;
     }
 
     fn make_receipt(run_id: RunId, seq: u64) -> RunBoundaryReceipt {
