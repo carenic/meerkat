@@ -824,6 +824,11 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate edge archive_keeps_edges \
     "Error: Invariant wiring_edges_connect_seated_members is violated" \
     'keep_var("ObserveMemberRetirementArchivedLive", "wiring_edges")' "$@"
+  # A preserved-topology archive that keeps the archived end's owed edge
+  # repair: the repair then names an unseated member.
+  mutate edge preserved_archive_keeps_repair \
+    "Error: Invariant owed_edge_repairs_join_seated_members is violated" \
+    'keep_var("ObserveMemberRetirementArchivedLivePreservingTopology", "owed_edge_repairs")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \
