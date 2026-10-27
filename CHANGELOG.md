@@ -103,8 +103,8 @@ them.
   suspended run, queued inputs, a provisional tail, a pending delivery, a
   background operation completion not yet delivered), a
   member whose endpoint is a network transport or that has no durable
-  endpoint, an orchestrator the resume notifies, and the members the host
-  requires; every other member stays Dormant and is materialized by its
+  endpoint, a member wired to a placed member, an orchestrator the resume
+  notifies, and the members the host requires; every other member stays Dormant and is materialized by its
   first delivery, on its own session. Reads (member lists, status, history,
   console projections) never materialize a member: a Dormant member's
   status reports its peer connectivity from MobMachine's membership and its
@@ -121,11 +121,13 @@ them.
   registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
   restores the previous start.
 
-- `meerkat-runtime`: a background operation completion delivered to its
-  owner (injected as a continuation, or applied by the agent) is recorded
-  durably with the ops lifecycle snapshot. A restart no longer reads it as
-  owed, so the owner is not woken for it and does not run its continuation
-  a second time.
+- `meerkat-runtime`: a background operation completion the runtime injected
+  into its owner as a continuation is recorded durably with the ops
+  lifecycle snapshot. A restart no longer reads it as owed, so the owner is
+  not woken for it and does not run its continuation a second time. A
+  completion the agent applied in a model call is recorded with the next
+  snapshot: until then a restart presents it again (one more wake and one
+  repeated notice, never a lost completion).
 
 - Upgrade note, behaviour-only: the first start after upgrading a host-store
   deployment restores members whose runtime heads predate 0.9.7. Such a
@@ -133,6 +135,10 @@ them.
   owes, so the obligation scan reads it as holding work and the start wakes
   its member, once: the runtime's next commit records its facts in full, and
   a release before 0.9.7 still reads them.
+
+- Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
+  member rotated with `MobHandle::rotate_member`, so a rotated member whose
+  owed kickoff has not run yet does not run it after a rollback to 0.9.6.
 
 - Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
   (`MobHandle::resume`) keeps a member's live actor only when it runs the auth

@@ -22593,8 +22593,8 @@ impl MobActor {
             let _ = reply_tx.send(result);
             return;
         }
-        // Resume is what releases the run starts its Stop held (#1500), and
-        // only now: every member's binding check, and any retirement of an
+        // Resume is what releases the run starts its Stop held, and only
+        // now: every member's binding check, and any retirement of an
         // actor that runs another binding, completed in the preparation. So a
         // run queued while the mob was stopped never starts on an actor the
         // lift does not keep. The member rebuild and readiness below need
@@ -62676,7 +62676,7 @@ impl MobActor {
                     &entry,
                     &self.sender_notice_spec(&entry).await?,
                 )?;
-                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 self.spawn_peer_message_delivery(
                     PeerMessageDeliveryPlan {
                         from: agent_identity.clone(),
@@ -62686,6 +62686,26 @@ impl MobActor {
                     },
                     reply_tx,
                 );
+                // The delivery settles off the actor: a notice that was not
+                // delivered is reported, as a failed send to a live recipient
+                // is.
+                let mob_id = self.definition.id.clone();
+                let from = agent_identity.clone();
+                let to = recipient_entry.agent_identity.clone();
+                tokio::spawn(async move {
+                    let failure = match reply_rx.await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "the delivery ended without an outcome".to_string(),
+                    };
+                    tracing::warn!(
+                        %mob_id,
+                        from = %from,
+                        to = %to,
+                        error = %failure,
+                        "a kickoff notice to a peer that was not materialized was not delivered"
+                    );
+                });
                 continue;
             }
             self.notify_peer_event(
