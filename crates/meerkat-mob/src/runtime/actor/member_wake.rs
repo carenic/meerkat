@@ -1732,13 +1732,46 @@ impl MobActor {
                 }
             }
         };
-        let realized = match self.prepare_member_wire(local, target).await {
+        match self.prepare_member_wire(local, target).await {
             Ok(prepared) => match prepared.into_prepared() {
-                None => Ok(()),
-                Some(prepared) => self.realize_wiring_inline(*prepared).await,
+                None => self.finish_owed_edge_repair(edge, Ok(())),
+                // The realization runs off the actor; its continuation
+                // reports the outcome back (no caller waits on a repair).
+                Some(prepared) => {
+                    let continuation = self.realize_wiring_detached(*prepared);
+                    let worker_edge = edge.clone();
+                    self.dispatch_member_effect(super::member_effect_lane::MemberEffectRequest {
+                        context: "owed_edge_repair",
+                        members: Vec::new(),
+                        effects: Box::pin(async move {
+                            let realized = continuation.settled().await;
+                            Box::new(EdgeRepairCommit {
+                                edge: worker_edge,
+                                realized,
+                            })
+                                as Box<dyn super::member_effect_lane::MemberEffectCommit>
+                        }),
+                        unsettled_commit: Box::new(EdgeRepairCommit {
+                            edge,
+                            realized: Err(MobError::Internal(
+                                "an owed edge repair's realization did not settle".to_string(),
+                            )),
+                        }),
+                    });
+                }
             },
-            Err(error) => Err(error),
-        };
+            Err(error) => self.finish_owed_edge_repair(edge, Err(error)),
+        }
+    }
+
+    /// Report one owed edge repair's outcome to MobMachine: a realized edge
+    /// clears its repair (and its retry state), a failed one stays owed and
+    /// is re-armed through `OwedEdgeRepairsRecorded`.
+    pub(in crate::runtime) fn finish_owed_edge_repair(
+        &mut self,
+        edge: MemberWiringEdge,
+        realized: Result<(), MobError>,
+    ) {
         match &realized {
             Ok(()) => {
                 self.member_wakes.edge_repairs.remove(&edge);
@@ -2119,6 +2152,36 @@ fn edge_end_retiring(state: &mob_dsl::MobMachineState, edge: &MemberWiringEdge) 
     match edge {
         MemberWiringEdge::Member(edge) => retiring(&edge.a) || retiring(&edge.b),
         MemberWiringEdge::External(edge) => retiring(&edge.local),
+    }
+}
+
+/// The outcome of an owed edge repair's detached realization, applied on
+/// the actor.
+struct EdgeRepairCommit {
+    edge: MemberWiringEdge,
+    realized: Result<(), MobError>,
+}
+
+impl super::member_effect_lane::MemberEffectCommit for EdgeRepairCommit {
+    fn commit(
+        self: Box<Self>,
+        actor: &mut MobActor,
+        _settlement: super::member_effect_lane::MemberEffectSettlement,
+    ) -> super::member_effect_lane::MemberEffectCommitFuture<'_> {
+        Box::pin(async move {
+            if actor.durable_uncertainty_fail_stop.is_set() {
+                return super::member_effect_lane::MemberEffectAck::Retained(
+                    super::member_effect_lane::MemberEffectRetention::unresumable(
+                        MobError::Internal(
+                            "an owed edge repair's outcome is held by fail-stop".to_string(),
+                        ),
+                    ),
+                );
+            }
+            let EdgeRepairCommit { edge, realized } = *self;
+            actor.finish_owed_edge_repair(edge, realized);
+            super::member_effect_lane::MemberEffectAck::Settled
+        })
     }
 }
 
