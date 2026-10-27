@@ -7051,6 +7051,11 @@ pub struct SpawnMemberSpec {
     /// arguments; the spawn folds it into `operator_authority_ceiling` after
     /// the customizer, so nothing can widen past it.
     pub(crate) inherited_operator_authority_bound: Option<super::MemberOperatorAuthorityCeiling>,
+    /// The pre-assigned id of a fresh member's new session. Set only by a
+    /// dormant seat that spawns a spec owing a kickoff, so the spawn's
+    /// session is the seat's name-based one and a re-driven seat finds it;
+    /// never taken from caller-supplied arguments.
+    pub(crate) fresh_session_id: Option<SessionId>,
 }
 
 impl std::fmt::Debug for SpawnMemberSpec {
@@ -7169,6 +7174,7 @@ impl SpawnMemberSpec {
             fork_build_inheritance: None,
             operator_authority_ceiling: None,
             inherited_operator_authority_bound: None,
+            fresh_session_id: None,
         }
     }
 
@@ -9314,6 +9320,181 @@ impl MobHandle {
     /// boot report.
     pub fn boot_set_basis(&self) -> super::MobBootSetBasis {
         self.boot_set_basis.get()
+    }
+
+    /// Seat members Dormant: each becomes a member, wireable and reachable,
+    /// without being materialized. Its first delivery wakes it (or MobMachine
+    /// does at once, for a member whose session holds runtime work, a network
+    /// endpoint or a member the host requires live).
+    ///
+    /// Each spec is a spawn spec: `Fresh` seats the identity on a new empty
+    /// session under a name-based id (a seat re-driven after a crash finds
+    /// the session its earlier attempt created), `Resume` binds the session
+    /// it names, which is never archived. A fresh spec that owes a kickoff
+    /// (an `AutonomousHost` member, or one with an initial message) is not
+    /// seated: it is spawned through the ordinary spawn path and answered
+    /// [`super::DormantSeatOutcome::Embodied`]. A fork is refused. Seating
+    /// needs the members' comms transport
+    /// ([`super::MobBuilder::with_member_comms_identity_root`] or
+    /// [`super::MobBuilder::with_network_member_comms`]) and a running mob.
+    ///
+    /// Outcomes come back in input order, one per spec: a spec the machine or
+    /// its session refuses is answered alone and nothing of it is written.
+    /// Specs are committed in chunks of at most 256, one journal batch each;
+    /// only a store failure fails the call, and the chunks committed before
+    /// it stay seated, so re-sending the same specs answers those
+    /// [`super::DormantSeatOutcome::AlreadySeated`]. Seating an identity
+    /// clears its host-pending mark
+    /// ([`super::MobBuilder::with_host_pending_members`]) in the same step.
+    pub async fn seat_dormant_members(
+        &self,
+        specs: Vec<SpawnMemberSpec>,
+    ) -> Result<Vec<super::DormantSeatOutcome>, MobError> {
+        let agent_lane = matches!(
+            self.command_authority_kind(),
+            crate::control_policy::CommandAuthorityKind::AgentLane
+        );
+        let mut outcomes = Vec::with_capacity(specs.len());
+        let mut specs = specs.into_iter();
+        loop {
+            let mut chunk = specs
+                .by_ref()
+                .take(super::dormant_seat::DORMANT_SEAT_CHUNK)
+                .collect::<Vec<_>>();
+            if chunk.is_empty() {
+                break;
+            }
+            if agent_lane {
+                for spec in &mut chunk {
+                    spec.mark_agent_creation();
+                }
+            }
+            outcomes.extend(Box::pin(self.seat_dormant_chunk(chunk)).await?);
+        }
+        Ok(outcomes)
+    }
+
+    /// One chunk of [`Self::seat_dormant_members`]: plan on the actor,
+    /// prepare here (sessions and endpoints, off the actor), commit on the
+    /// actor in one step.
+    async fn seat_dormant_chunk(
+        &self,
+        specs: Vec<SpawnMemberSpec>,
+    ) -> Result<Vec<super::DormantSeatOutcome>, MobError> {
+        use super::dormant_seat::{DormantSeatCommitEntry, DormantSeatPlanEntry};
+        use futures::StreamExt as _;
+
+        let super::dormant_seat::DormantSeatPlan {
+            entries,
+            endpoint_source,
+            provisioner,
+        } = self
+            .send_actor_command(|reply_tx| MobCommand::PlanDormantSeats { specs, reply_tx })
+            .await??;
+        let mut outcomes = Vec::with_capacity(entries.len());
+        outcomes.resize_with(entries.len(), || None);
+        let mut to_prepare = Vec::new();
+        let mut to_commit = Vec::new();
+        for (index, entry) in entries.into_iter().enumerate() {
+            match entry {
+                DormantSeatPlanEntry::Done(outcome) => outcomes[index] = Some(outcome),
+                DormantSeatPlanEntry::AlreadySeated {
+                    agent_identity,
+                    session_id,
+                } => to_commit.push((
+                    index,
+                    DormantSeatCommitEntry::AlreadySeated {
+                        agent_identity,
+                        session_id,
+                    },
+                )),
+                // R13: spawned exactly as a spawn is, under this handle's
+                // authority, one at a time as the host's own embodiment was.
+                DormantSeatPlanEntry::Embody(spec) => {
+                    let agent_identity = spec.identity.clone();
+                    match Box::pin(self.spawn_spec_internal(*spec)).await {
+                        Ok(member_ref) => match member_ref.bridge_session_id() {
+                            Some(session_id) => to_commit.push((
+                                index,
+                                DormantSeatCommitEntry::Embodied {
+                                    agent_identity,
+                                    session_id: session_id.clone(),
+                                },
+                            )),
+                            None => {
+                                outcomes[index] = Some(super::DormantSeatOutcome::Refused {
+                                    error: MobError::Internal(format!(
+                                        "the spawn of '{agent_identity}' bound no session"
+                                    )),
+                                    agent_identity,
+                                });
+                            }
+                        },
+                        Err(error) => {
+                            outcomes[index] = Some(super::DormantSeatOutcome::Refused {
+                                agent_identity,
+                                error,
+                            });
+                        }
+                    }
+                }
+                DormantSeatPlanEntry::Seat(candidate) => to_prepare.push((index, candidate)),
+            }
+        }
+        let session_service = self.session_service.as_ref();
+        let mob_id = &self.definition.id;
+        let prepared = futures::stream::iter(to_prepare)
+            .map(|(index, candidate)| {
+                let provisioner = provisioner.as_ref();
+                let endpoint_source = endpoint_source.as_ref();
+                async move {
+                    (
+                        index,
+                        super::dormant_seat::prepare_dormant_seat(
+                            session_service,
+                            provisioner,
+                            endpoint_source,
+                            mob_id,
+                            candidate,
+                        )
+                        .await,
+                    )
+                }
+            })
+            .buffered(super::dormant_seat::DORMANT_SEAT_PREPARE_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        for (index, prepared) in prepared {
+            match prepared {
+                Ok(entry) => to_commit.push((index, entry)),
+                Err(outcome) => outcomes[index] = Some(*outcome),
+            }
+        }
+        if !to_commit.is_empty() {
+            to_commit.sort_by_key(|(index, _)| *index);
+            let (indices, entries): (Vec<_>, Vec<_>) = to_commit.into_iter().unzip();
+            let committed = self
+                .send_actor_command(|reply_tx| MobCommand::CommitDormantSeats { entries, reply_tx })
+                .await??;
+            if committed.len() != indices.len() {
+                return Err(MobError::Internal(format!(
+                    "a seat chunk committed {} outcomes for {} entries",
+                    committed.len(),
+                    indices.len()
+                )));
+            }
+            for (index, outcome) in indices.into_iter().zip(committed) {
+                outcomes[index] = Some(outcome);
+            }
+        }
+        outcomes
+            .into_iter()
+            .map(|outcome| {
+                outcome.ok_or_else(|| {
+                    MobError::Internal("a seat spec was left without an outcome".into())
+                })
+            })
+            .collect()
     }
 
     /// The materialization phase MobMachine holds for `identity` in this

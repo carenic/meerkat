@@ -168,6 +168,10 @@ pub(crate) struct MemberResidencyConfig {
     /// How many read-only verdicts the `OnDemandVerified` pass reads at once:
     /// the builder's restore concurrency, for the clean-stop lift too.
     pub(crate) verify_concurrency: usize,
+    /// Where a dormant seat takes its member's endpoint from; `None` until
+    /// the host names its members' comms transport, and every seat is
+    /// refused typed meanwhile.
+    pub(crate) seat_endpoints: Option<super::dormant_seat::MemberSeatEndpointSource>,
     /// The host's per-member build preparation (its tools published before
     /// the member's first run).
     #[cfg(feature = "runtime-adapter")]
@@ -187,6 +191,7 @@ impl Default for MemberResidencyConfig {
                 max: DEFAULT_OWED_WAKE_RETRY_MAX,
             },
             verify_concurrency: DEFAULT_VERIFY_CONCURRENCY,
+            seat_endpoints: None,
             #[cfg(feature = "runtime-adapter")]
             build_preparer: None,
         }
@@ -203,7 +208,8 @@ impl std::fmt::Debug for MemberResidencyConfig {
             .field("host_pending", &self.host_pending)
             .field("wake_timeout", &self.wake_timeout)
             .field("owed_wake_retry", &self.owed_wake_retry)
-            .field("verify_concurrency", &self.verify_concurrency);
+            .field("verify_concurrency", &self.verify_concurrency)
+            .field("seat_endpoints", &self.seat_endpoints);
         #[cfg(feature = "runtime-adapter")]
         debug.field("build_preparer", &self.build_preparer.is_some());
         debug.finish()

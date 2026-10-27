@@ -214,6 +214,8 @@ mod bridge_request_claim_test_support;
 pub use boot_plan::{
     MemberRestorePolicy, MobBootSetBasis, MobBootSetUnobservedCause, MobCompositionAuthority,
 };
+mod dormant_seat;
+pub use dormant_seat::DormantSeatOutcome;
 mod builder;
 pub mod composition;
 pub mod conditions;

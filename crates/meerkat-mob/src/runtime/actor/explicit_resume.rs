@@ -640,6 +640,37 @@ impl MobActor {
                 }
             }
         }
+        // Settle requires the member's wake attempt closed. A resume that
+        // ends without resolving the attempt it opened (its work was
+        // classified stale, or its own resolution was refused) abandons it
+        // first: the member is Dormant again, and its next delivery wakes it.
+        // No provision of such an attempt was committed.
+        let still_open = work.wake_attempt.filter(|attempt| {
+            self.dsl_authority
+                .state()
+                .member_wake_attempts
+                .get(&identity)
+                == Some(attempt)
+        });
+        if let Some(attempt) = still_open
+            && let Err(error) = self.apply_dsl_signal(
+                mob_dsl::MobMachineSignal::AbandonMemberWake {
+                    agent_identity: identity.clone(),
+                    attempt,
+                    kind: mob_dsl::MemberWakeAbandonKind::Unsettled,
+                    reason: format!(
+                        "the explicit resume of bridge session '{}' ended before its member settled",
+                        work.rebuild.bridge_session_id
+                    ),
+                },
+                "abandon_unsettled_explicit_resume_member_wake",
+            )
+        {
+            tracing::warn!(
+                %error,
+                "an explicit resume member's open wake attempt could not be abandoned before its settlement"
+            );
+        }
         if let Err(error) = self.apply_dsl_input(
             mob_dsl::MobMachineInput::SettleExplicitResumeMember {
                 attempt: work.attempt.clone(),

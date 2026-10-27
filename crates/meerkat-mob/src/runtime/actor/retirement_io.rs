@@ -6148,8 +6148,16 @@ impl MobActor {
             }
             SpawnRollbackObservation::Compensated(result) => {
                 match result {
+                    // PeerNotFound means "not a member": every seated member
+                    // has a live or a wake route. A compensating notice whose
+                    // recipient is a seated member that is not live (dormant
+                    // in a stopped mob, broken, retiring) has nothing to
+                    // undo: its wake rebuilds its trust from machine state.
                     Ok(())
-                    | Err(MobError::CommsError(meerkat_core::comms::SendError::PeerNotFound(_))) => {
+                    | Err(MobError::CommsError(
+                        meerkat_core::comms::SendError::PeerNotFound(_)
+                        | meerkat_core::comms::SendError::PeerWakeRefused { .. },
+                    )) => {
                         rollback.notices.pop();
                         self.compensate_spawn_rollback(continuation).await;
                     }

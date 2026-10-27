@@ -1336,6 +1336,20 @@ pub(super) enum MobCommand {
         reason: super::stop_report::HostRunStartHoldReason,
         reply_tx: oneshot::Sender<Result<(), crate::MobError>>,
     },
+    /// Plan one chunk of a dormant seat (design section 10): each spec's
+    /// typed answer, the spawn of a fresh spec that owes a kickoff, or what
+    /// its seat needs. Reads nothing durable beyond profile resolution.
+    PlanDormantSeats {
+        specs: Vec<super::handle::SpawnMemberSpec>,
+        reply_tx: oneshot::Sender<Result<super::dormant_seat::DormantSeatPlan, crate::MobError>>,
+    },
+    /// Commit one prepared chunk of a dormant seat in one actor step.
+    CommitDormantSeats {
+        entries: Vec<super::dormant_seat::DormantSeatCommitEntry>,
+        reply_tx: oneshot::Sender<
+            Result<Vec<super::dormant_seat::DormantSeatOutcome>, crate::MobError>,
+        >,
+    },
     /// An off-actor member-status observation returning to the actor, with
     /// every caller that joined it.
     ProjectMemberStatusObserved {
@@ -2071,6 +2085,8 @@ impl MobCommand {
             Self::ProjectMemberList { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ProjectMemberStatus { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ReleaseMemberRunStarts { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::PlanDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::CommitDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityIntent { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityConvergenceStatus { .. } => ShutdownAnswerClass::CallerRequest,
             Self::AdoptMemberIdentityDeclaration { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2287,6 +2303,8 @@ impl MobCommand {
             Self::ProjectMemberList { .. } => "ProjectMemberList",
             Self::ProjectMemberStatus { .. } => "ProjectMemberStatus",
             Self::ReleaseMemberRunStarts { .. } => "ReleaseMemberRunStarts",
+            Self::PlanDormantSeats { .. } => "PlanDormantSeats",
+            Self::CommitDormantSeats { .. } => "CommitDormantSeats",
             Self::ProjectMemberStatusObserved { .. } => "ProjectMemberStatusObserved",
             Self::GetIdentityIntent { .. } => "GetIdentityIntent",
             Self::GetIdentityConvergenceStatus { .. } => "GetIdentityConvergenceStatus",

@@ -84,7 +84,11 @@ impl MobCommand {
             // acquisition; both halves already require SendCommand.
             | Self::SpawnAttachedForkedParticipant { .. }
             // Releasing a host's run-start hold lets the member start runs.
-            | Self::ReleaseMemberRunStarts { .. } => Some(ControlScope::SendCommand),
+            | Self::ReleaseMemberRunStarts { .. }
+            // A dormant seat creates members (and spawns the fresh ones that
+            // owe a kickoff): the authority class of a spawn.
+            | Self::PlanDormantSeats { .. }
+            | Self::CommitDormantSeats { .. } => Some(ControlScope::SendCommand),
 
             #[cfg(feature = "openai-live")]
             Self::StartLiveBridgeOperation { .. }
@@ -434,6 +438,12 @@ impl MobCommand {
                 let _ = reply_tx.send(Err(error));
             }
             Self::ReleaseMemberRunStarts { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::PlanDormantSeats { reply_tx, .. } => {
+                let _ = reply_tx.send(Err(error));
+            }
+            Self::CommitDormantSeats { reply_tx, .. } => {
                 let _ = reply_tx.send(Err(error));
             }
             // Settling closes the waiter set; the actor's in-flight map prunes

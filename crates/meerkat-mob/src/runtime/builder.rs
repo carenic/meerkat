@@ -7684,6 +7684,39 @@ impl MobBuilder {
         self
     }
 
+    /// The root of the members' session-scoped comms identities, for
+    /// members on inproc comms (the default transport): pass the root the
+    /// session service's agent factory uses,
+    /// `meerkat::canonical_session_comms_identity_root(user_config_root)`. A
+    /// dormant seat ([`MobHandle::seat_dormant_members`],
+    /// [`MobHandle::rotate_member`]) reads a member's key there, one local
+    /// read with no session load, and records the inproc endpoint the
+    /// member's woken runtime reports. Without this or
+    /// [`Self::with_network_member_comms`], every seat is refused typed and
+    /// nothing is written.
+    pub fn with_member_comms_identity_root(
+        mut self,
+        identity_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.member_residency.seat_endpoints = Some(
+            super::dormant_seat::MemberSeatEndpointSource::SessionScopedInproc {
+                identity_root: identity_root.into(),
+            },
+        );
+        self
+    }
+
+    /// The members run on network comms (Tcp or Uds), whose key belongs to
+    /// the realm rather than to a member's session. A dormant seat then
+    /// records no endpoint: the member is seated with its endpoint owed, and
+    /// its boot wake registers the endpoint (a network member is in the boot
+    /// set anyway).
+    pub fn with_network_member_comms(mut self) -> Self {
+        self.member_residency.seat_endpoints =
+            Some(super::dormant_seat::MemberSeatEndpointSource::Network);
+        self
+    }
+
     /// Whether this composition of the mob may act on the mob's shared store
     /// (default [`super::MobCompositionAuthority::Authoritative`]). A
     /// non-authoritative composition reads only: it materializes no member

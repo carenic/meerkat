@@ -88,7 +88,7 @@ impl MobActor {
             }
         }
         #[cfg(feature = "runtime-adapter")]
-        self.verify_explicit_resume_dormant_members(&verify).await?;
+        self.verify_dormant_member_set(&verify).await?;
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = verify;
         let state = self.dsl_authority.state();
@@ -128,13 +128,14 @@ impl MobActor {
             .collect()
     }
 
-    /// `on_demand_verified` on the lift: one read-only durable verdict for
-    /// each member the lift's plan leaves Dormant, before the lift answers.
-    /// A member whose durable session cannot be resumed is recorded Broken
-    /// through the machine, with nothing materialized; the others stay
-    /// Dormant. The realm is listed once and scanned at most once.
+    /// `on_demand_verified` after a plan on the live authority (the lift's,
+    /// or a seat's): one read-only durable verdict for each member the plan
+    /// leaves Dormant, before the caller is answered. A member whose durable
+    /// session cannot be resumed is recorded Broken through the machine,
+    /// with nothing materialized; the others stay Dormant. The realm is
+    /// listed once and scanned at most once.
     #[cfg(feature = "runtime-adapter")]
-    async fn verify_explicit_resume_dormant_members(
+    pub(super) async fn verify_dormant_member_set(
         &mut self,
         verify: &BTreeSet<AgentIdentity>,
     ) -> Result<(), MobError> {
@@ -159,7 +160,7 @@ impl MobActor {
                         SessionId::parse(&session.0)
                             .map_err(|error| {
                                 MobError::Internal(format!(
-                                    "the lift's verified pass found an invalid session binding '{}' for '{}': {error}",
+                                    "the verified pass found an invalid session binding '{}' for '{}': {error}",
                                     session.0, entry.agent_identity
                                 ))
                             })

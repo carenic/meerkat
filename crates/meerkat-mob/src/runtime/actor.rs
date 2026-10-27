@@ -12,6 +12,7 @@ use super::transaction::LifecycleRollback;
 use super::*;
 
 pub(super) mod boot_lift;
+mod dormant_seat;
 mod dormant_wiring;
 pub(super) mod explicit_resume;
 #[cfg(feature = "openai-live")]
@@ -30117,6 +30118,14 @@ impl MobActor {
                     }
                     let _ = reply_tx.send(result);
                 }
+                MobCommand::PlanDormantSeats { specs, reply_tx } => {
+                    let plan = Box::pin(self.plan_dormant_seats(specs)).await;
+                    let _ = reply_tx.send(Ok(plan));
+                }
+                MobCommand::CommitDormantSeats { entries, reply_tx } => {
+                    let result = Box::pin(self.commit_dormant_seats(entries)).await;
+                    let _ = reply_tx.send(result);
+                }
                 MobCommand::ProjectMemberStatusObserved {
                     agent_identity,
                     expected_target,
@@ -34174,6 +34183,7 @@ impl MobActor {
             operator_authority_ceiling: _,
             // Folded into the ceiling above.
             inherited_operator_authority_bound: _,
+            fresh_session_id,
         } = spec;
         let agent_identity = AgentIdentity::from(identity.as_str());
         self.inline_step_watchdog
@@ -34897,6 +34907,14 @@ impl MobActor {
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
             let mut req = req;
+            // A dormant seat that spawns a spec owing a kickoff names the
+            // spawn's new session: the seat's name-based one, so a re-driven
+            // seat finds the member it spawned.
+            if let Some(session_id) = fresh_session_id {
+                req.build
+                    .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
+                    .mint_session_with_id(session_id);
+            }
             if prompt_context_source.is_some() || fork_seed.is_some() {
                 // A fork child's create request always carries a build; a
                 // seed with nowhere to go is an error, never a silent drop.
@@ -36415,6 +36433,8 @@ impl MobActor {
             operator_authority_ceiling,
             // Folded into the ceiling before the placed lane.
             inherited_operator_authority_bound: _,
+            // Set only by a dormant seat, whose spawns are local.
+            fresh_session_id: _,
         } = spec;
         let Some(host) = placement else {
             fail!(MobError::Internal(
@@ -38012,6 +38032,8 @@ impl MobActor {
             // Nor a ceiling: customizers never run on a policy auto-spawn.
             operator_authority_ceiling: _,
             inherited_operator_authority_bound: _,
+            // Set only by a dormant seat, whose spawns are local.
+            fresh_session_id: _,
         } = member_spec;
 
         if agent_identity.is_system_reserved() {
