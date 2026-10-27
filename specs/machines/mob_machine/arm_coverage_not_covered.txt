@@ -135,6 +135,7 @@ UnwireExternal* external peer wiring; trust wiring and peer overlay obligations 
 RecoverExternal* external peer wiring replay; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
 SetExternal* external member rebind capability; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
 WireMembersWithTrust* trust-carrying member wiring; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
+WireMembersPlacedPeerWake* a wiring edge that wakes a Dormant member it joins to a placed member; placed members (member hosts) are outside the audits: no audit binds a host or places a member
 WireMembersAlreadyWired idempotent re-wire of an edge member_residency_audit's edge run already wired
 UnwireMembers* member unwiring; member_residency_audit's edge run keeps its one edge
 RecoverRosterWiringAlreadyRecovered idempotent wiring replay; member_residency_audit's edge run drives the fresh replay

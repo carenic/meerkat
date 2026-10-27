@@ -97,13 +97,18 @@
 \*     runtime binding).
 \* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
-\* member. A second ASSUME pins the release verdict helper: Release or
-\* NotYetReleasable exactly for a seated, local, Live member, WakeInFlight
-\* exactly for a Waking one.
+\* member. A second ASSUME pins the release verdict helper: Release,
+\* PinnedByPlacedPeer or NotYetReleasable exactly for a seated, local, Live
+\* member (PinnedByPlacedPeer exactly for one wired to a placed member that is
+\* not releasable), WakeInFlight exactly for a Waking one. A third pins the
+\* shared release predicate: a member wired to a placed member is never
+\* releasable.
 \*
 \* Not covered: I3 (a Dormant member is local) needs a placed member, which
-\* only the placement arms create; the placed revival arm likewise. The machine
-\* debug invariants and the meerkat-mob placed tests pin them.
+\* only the placement arms create; the placed revival arm, the placed-peer
+\* pin on a release and the wiring arms that wake a Dormant member wired to
+\* a placed one likewise. The machine debug invariants and the meerkat-mob
+\* placed tests pin them.
 \*
 \* The TLC configs are DERIVED from the generated ci.cfg on every run by
 \* member_residency_audit.sh.
@@ -874,6 +879,16 @@ AuditWakeClosesLiveUnlessEndpointOwed ==
               /\ member_boot_obligation_owed[id] = "EndpointPending"))
             => ENABLED ResolveMemberRevivalSucceededRunningLocal(id, member_wake_attempts[id])
 
+\* Member 1 has a wiring edge to a placed identity, in either direction (no
+\* audit places a member, so no run reaches it; the release ASSUME below
+\* covers the helpers over every pin).
+Pinned1 ==
+    \E edge \in wiring_edges :
+        \/ /\ mob_machine_wiring_edge_a(edge) = Id1
+           /\ mob_machine_wiring_edge_b(edge) \in DOMAIN member_placement
+        \/ /\ mob_machine_wiring_edge_b(edge) = Id1
+           /\ mob_machine_wiring_edge_a(edge) \in DOMAIN member_placement
+
 \* The release verdict and the Released arm cannot drift: member 1's verdict is
 \* Release exactly when the Released arm would honour the release of its own
 \* registration (its runtime, fence and recorded epoch).
@@ -888,7 +903,9 @@ AuditReleaseVerdictMatchesArm ==
                     member_registration_releasable(
                         Phase1, placed1, boot_plan_sealed,
                         Id1 \in DOMAIN member_peer_endpoints,
-                        Id1 \in DOMAIN member_materialization_epoch))
+                        Id1 \in DOMAIN member_materialization_epoch,
+                        Pinned1),
+                    Pinned1)
             released ==
                 /\ Id1 \in DOMAIN member_materialization_epoch
                 /\ ENABLED ReleaseMemberMaterializationReleasedRunning(
@@ -981,14 +998,25 @@ ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, or
                             host_pending, input_class, sender_waking, observed_missing, residency)
             # Some("NotAMember")
 
-\* The release verdict: Release or NotYetReleasable exactly for a seated,
-\* local, Live member, and WakeInFlight exactly for a seated, local, Waking one.
-ASSUME \A seated, placed, releasable \in BOOLEAN,
+\* The release verdict: Release, PinnedByPlacedPeer or NotYetReleasable
+\* exactly for a seated, local, Live member (PinnedByPlacedPeer exactly for
+\* one wired to a placed member and not releasable), and WakeInFlight exactly
+\* for a seated, local, Waking one.
+ASSUME \A seated, placed, releasable, pinned \in BOOLEAN,
           residency \in {None, Some("Dormant"), Some("Waking"), Some("Live")} :
-    /\ (member_release_verdict(seated, placed, residency, releasable) \in {"Release", "NotYetReleasable"})
+    /\ (member_release_verdict(seated, placed, residency, releasable, pinned)
+            \in {"Release", "PinnedByPlacedPeer", "NotYetReleasable"})
            <=> (seated /\ ~placed /\ residency = Some("Live"))
-    /\ (member_release_verdict(seated, placed, residency, releasable) = "WakeInFlight")
+    /\ (member_release_verdict(seated, placed, residency, releasable, pinned) = "PinnedByPlacedPeer")
+           <=> (seated /\ ~placed /\ residency = Some("Live") /\ pinned /\ ~releasable)
+    /\ (member_release_verdict(seated, placed, residency, releasable, pinned) = "WakeInFlight")
            <=> (seated /\ ~placed /\ residency = Some("Waking"))
+
+\* A member wired to a placed member is never releasable: its placed peer,
+\* in another process, could not wake it again.
+ASSUME \A placed, sealed, has_endpoint, epoch_recorded \in BOOLEAN,
+          residency \in {None, Some("Dormant"), Some("Waking"), Some("Live")} :
+    ~member_registration_releasable(residency, placed, sealed, has_endpoint, epoch_recorded, TRUE)
 
 (***************************************************************************)
 (* Reachability goals, each checked as an expected violation of its       *)
