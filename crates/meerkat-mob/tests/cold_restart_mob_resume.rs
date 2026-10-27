@@ -12142,8 +12142,8 @@ async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continu
             panic!("the lift waited at its operation binding of w-1 for w-1's held run");
         }
         Ok(Err(error)) => panic!("the lift failed: {error}"),
-        Err(_) => panic!(
-            "the lift neither reached ready nor reported a stall while w-1's resumed run was held"
+        Err(elapsed) => panic!(
+            "the lift neither reached ready nor reported a stall while w-1's resumed run was held: {elapsed}"
         ),
     }
     client_2.wait_until_held("long-resumed-run").await;
