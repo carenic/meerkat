@@ -2185,3 +2185,42 @@ async fn a_transient_edge_failure_at_a_wake_is_repaired_and_the_member_keeps_ser
     assert_eq!(fixture.delivered_count(&peer, &peer_body).await, 1);
     fixture.finish().await;
 }
+
+/// A member woken among Dormant neighbours realizes its own side of each
+/// edge to them (each Dormant end realizes its side at its own wake), so
+/// every edge is reported realized: the member owes no edge repair, no
+/// repair timer is armed (only an owed repair arms one), and the neighbours
+/// stay Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_waking_among_dormant_neighbours_owes_no_edge_repairs() {
+    let fixture = WakeFixture::new("wake-dormant-neighbours").await;
+    let member = fixture.spawn("dormant-neighbours-member").await;
+    let first = fixture.spawn("dormant-neighbour-one").await;
+    let second = fixture.spawn("dormant-neighbour-two").await;
+    fixture.wire(&member, &first).await;
+    fixture.wire(&member, &second).await;
+    fixture.release(&first).await;
+    fixture.release(&second).await;
+    fixture.release(&member).await;
+
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("the member wakes among dormant neighbours");
+    {
+        let state = fixture.handle.machine_state_watch_rx.borrow();
+        assert!(
+            state.owed_edge_repairs.is_empty() && state.owed_external_edge_repairs.is_empty(),
+            "an edge to a dormant neighbour is realized on the live side, never owed: {:?}",
+            state.owed_edge_repairs
+        );
+    }
+    for neighbour in [&first, &second] {
+        assert_eq!(
+            fixture.residency(neighbour),
+            Some(mob_dsl::MemberMaterializationPhase::Dormant),
+            "the member's wake leaves its neighbours dormant"
+        );
+    }
+    fixture.finish().await;
+}
