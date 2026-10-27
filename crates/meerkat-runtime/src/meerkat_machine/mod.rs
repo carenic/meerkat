@@ -1216,6 +1216,10 @@ pub use scoped_retained_resume::{
     RetainedControllerOwner, RetainedInvocationOwner, ScopedRetainedResume,
 };
 mod agent_mandate;
+mod boot_obligations;
+pub use boot_obligations::{
+    RuntimeBootObligations, RuntimeRecoveryWork, RuntimeRecoveryWorkUnobserved,
+};
 pub mod composition;
 mod dispatch_control;
 mod dispatch_drain;

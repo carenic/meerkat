@@ -15224,6 +15224,12 @@ async fn persistent_destroy_durable_commit_observes_canonical_destroy_truth() {
             self.inner.supports_compaction_projection_outbox()
         }
 
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, crate::store::RuntimeStoreError> {
+            self.inner.list_runtimes_with_recovery_work().await
+        }
+
         async fn observe_machine_lifecycle(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -35903,6 +35909,12 @@ impl RuntimeStore for RuntimeCommitAtomicityStore {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         declared.or_else(|| RuntimeStore::commit_outcome_deadline(self.inner.as_ref()))
+    }
+
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, crate::store::RuntimeStoreError> {
+        self.inner.list_runtimes_with_recovery_work().await
     }
 
     async fn commit_prepared_session_boundary(

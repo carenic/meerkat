@@ -19,6 +19,9 @@ mod inner {
     use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
     use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
     use crate::runtime_state::RuntimeState;
+    use crate::store::recovery_obligation::{
+        BootFactsV1, catalog_entry_is_archived, runtime_holds_recovery_work,
+    };
     use crate::store::{
         AuthOAuthFlowSnapshotUpdate, CommittedRecoveryBoundary, CommittedWholeBlobProvisionalTail,
         CommittedWholeBlobSnapshot, ContinuationAdmission, ContinuationAdmissionEntry,
@@ -11178,6 +11181,147 @@ ORDER BY runtime_id";
         Ok(())
     }
 
+    /// Every runtime whose rows hold recovery work, in runtime id order, read
+    /// by one statement over the existing tables and decided by the
+    /// predicate the host store adapter's open also asks
+    /// (`runtime_has_recovery_obligation`, in its two halves).
+    ///
+    /// The candidates are the runtimes with a lifecycle row, an input-set
+    /// revision, a pending terminal owner, a provisional tail or an ops
+    /// lifecycle snapshot: a runtime holds work only through these. Every
+    /// runtime with input rows has an input-set revision: the triggers write
+    /// it with the runtime's first input row and nothing deletes it, so this
+    /// enumerates the runtimes with inputs without reading their rows. Each
+    /// candidate's boot facts come from indexed existence probes, the
+    /// nonterminal one through the predicate of the recovery index. Only what
+    /// the answer needs is decoded: the lifecycle record when the facts name
+    /// no work, the ops lifecycle snapshot when neither does, and the catalog
+    /// entry only for a runtime that holds work.
+    fn list_runtimes_with_recovery_work_in(
+        conn: &Connection,
+    ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+        let query = format!(
+            r"
+            WITH candidates(runtime_id) AS (
+                SELECT runtime_id FROM runtime_states
+                UNION
+                SELECT runtime_id FROM runtime_input_set_revisions
+                UNION
+                SELECT runtime_id FROM runtime_pending_terminal_owners
+                UNION
+                SELECT runtime_id FROM runtime_whole_blob_provisional_tails
+                UNION
+                SELECT runtime_id FROM runtime_head_canonical_provisional_tails
+                UNION
+                SELECT runtime_id FROM runtime_ops_lifecycle
+            )
+            SELECT
+                candidates.runtime_id,
+                EXISTS (
+                    SELECT 1 FROM runtime_input_states
+                    WHERE runtime_input_states.runtime_id = candidates.runtime_id
+                      AND {RECOVERY_NONTERMINAL_INPUT_PREDICATE_SQL}
+                ),
+                EXISTS (
+                    SELECT 1 FROM runtime_pending_terminal_owners AS owners
+                    WHERE owners.runtime_id = candidates.runtime_id
+                ),
+                EXISTS (
+                    SELECT 1 FROM runtime_whole_blob_provisional_tails AS tails
+                    WHERE tails.runtime_id = candidates.runtime_id
+                )
+                OR EXISTS (
+                    SELECT 1 FROM runtime_head_canonical_provisional_tails AS tails
+                    WHERE tails.runtime_id = candidates.runtime_id
+                ),
+                EXISTS (
+                    SELECT 1 FROM runtime_input_states AS inputs
+                    WHERE inputs.runtime_id = candidates.runtime_id
+                ),
+                lifecycle.runtime_state_json,
+                catalog.entry_json,
+                ops.state_json
+            FROM candidates
+            LEFT JOIN runtime_states AS lifecycle
+                ON lifecycle.runtime_id = candidates.runtime_id
+            LEFT JOIN runtime_session_catalog AS catalog
+                ON catalog.runtime_id = candidates.runtime_id
+            LEFT JOIN runtime_ops_lifecycle AS ops
+                ON ops.runtime_id = candidates.runtime_id
+            ORDER BY candidates.runtime_id
+            "
+        );
+        let mut statement = conn
+            .prepare(&query)
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    BootFactsV1 {
+                        v: BootFactsV1::VERSION,
+                        nonterminal: row.get(1)?,
+                        pending_owners: row.get(2)?,
+                        tail: row.get(3)?,
+                        inputs: row.get(4)?,
+                    },
+                    row.get::<_, Option<JsonColumnBytes>>(5)?
+                        .map(JsonColumnBytes::into_bytes),
+                    row.get::<_, Option<JsonColumnBytes>>(6)?
+                        .map(JsonColumnBytes::into_bytes),
+                    row.get::<_, Option<JsonColumnBytes>>(7)?
+                        .map(JsonColumnBytes::into_bytes),
+                ))
+            })
+            .map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+        let mut runtimes = Vec::new();
+        for row in rows {
+            let (runtime_id, facts, lifecycle, catalog, ops) =
+                row.map_err(|error| RuntimeStoreError::ReadFailed(error.to_string()))?;
+            // The ops lifecycle snapshot's work is part of the nonterminal
+            // fact, as the memory store folds it; it is decoded only when no
+            // other fact names work.
+            let holds_work = runtime_holds_recovery_work(&facts, lifecycle.as_deref())
+                || ops
+                    .as_deref()
+                    .is_some_and(|encoded| ops_snapshot_holds_recovery_work(&runtime_id, encoded));
+            if !holds_work {
+                continue;
+            }
+            let catalog = catalog
+                .map(|encoded| {
+                    serde_json::from_slice::<crate::store::RuntimeSessionCatalogEntry>(&encoded)
+                })
+                .transpose()
+                .map_err(|error| {
+                    RuntimeStoreError::ReadFailed(format!(
+                        "runtime {runtime_id} catalog entry: {error}"
+                    ))
+                })?;
+            if !catalog_entry_is_archived(catalog.as_ref()) {
+                runtimes.push(LogicalRuntimeId(runtime_id));
+            }
+        }
+        Ok(runtimes)
+    }
+
+    /// Whether a stored ops lifecycle snapshot holds recovery work
+    /// (`PersistedOpsSnapshot::holds_recovery_work`). A snapshot that does
+    /// not decode counts as work: recovery must look at it.
+    fn ops_snapshot_holds_recovery_work(runtime_id: &str, encoded: &[u8]) -> bool {
+        match serde_json::from_slice::<crate::ops_lifecycle::PersistedOpsSnapshot>(encoded) {
+            Ok(snapshot) => snapshot.holds_recovery_work(),
+            Err(error) => {
+                tracing::warn!(
+                    runtime_id,
+                    %error,
+                    "the recovery scan read an undecodable ops lifecycle snapshot as recovery work"
+                );
+                true
+            }
+        }
+    }
+
     enum SqliteRecoveryInputMutation {
         Upsert {
             replacement: StoredInputState,
@@ -16616,6 +16760,20 @@ ORDER BY runtime_id";
             Ok(records)
         }
 
+        /// One statement over the runtime tables on its own connection,
+        /// which loads no session body.
+        async fn list_runtimes_with_recovery_work(
+            &self,
+        ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+            let path = self.path.clone();
+            spawn_blocking_holding_claim(move || {
+                let conn = open_runtime_connection(&path)?;
+                list_runtimes_with_recovery_work_in(&conn)
+            })
+            .await
+            .map_err(|error| RuntimeStoreError::Internal(format!("Task join failed: {error}")))?
+        }
+
         async fn list_runtime_delivery_records(
             &self,
             runtime_id: &LogicalRuntimeId,
@@ -20955,6 +21113,22 @@ ORDER BY runtime_id";
             let tempdir = tempfile::TempDir::new().unwrap();
             let store = SqliteRuntimeStore::new(tempdir.path().join("runtime.sqlite3")).unwrap();
             crate::store::assert_pending_terminal_owner_index_contract(&store).await;
+        }
+
+        /// The scan reads the durable rows: a reopened store answers the
+        /// same.
+        #[tokio::test]
+        async fn boot_obligation_scan_sqlite_store_lists_exactly_the_runtimes_with_recovery_work() {
+            use crate::store::recovery_obligation::scan_contract;
+
+            let tempdir = tempfile::TempDir::new().unwrap();
+            let path = tempdir.path().join("runtime.sqlite3");
+            let store = SqliteRuntimeStore::new(path.clone()).unwrap();
+            let fixture = scan_contract::seed(&store).await;
+            scan_contract::assert_lists_exactly(&store, &fixture).await;
+            drop(store);
+            let reopened = SqliteRuntimeStore::new(path).unwrap();
+            scan_contract::assert_lists_exactly(&reopened, &fixture).await;
         }
 
         #[tokio::test]

@@ -12,6 +12,7 @@ pub use execution_custody::{
 };
 
 pub mod memory;
+pub(crate) mod recovery_obligation;
 pub mod spi;
 #[cfg(feature = "sqlite-store")]
 pub mod sqlite;
@@ -10024,6 +10025,36 @@ pub trait RuntimeStore: Send + Sync {
         ))
     }
 
+    /// Every runtime whose durable state holds recovery work, in one
+    /// store-wide read that loads no runtime body. Each runtime appears once.
+    ///
+    /// A runtime holds recovery work when it has nonterminal input rows,
+    /// pending terminal owners, a provisional tail (an open run cursor), a
+    /// machine lifecycle record that names a current run or does not decode,
+    /// input rows with no lifecycle record, or an ops lifecycle snapshot
+    /// that owes work (a background operation completion its session was not
+    /// woken for, or a detached job wait still running). A runtime whose
+    /// session catalog entry is archived holds none. The host store
+    /// adapter's open loads exactly the bodies of such runtimes, by the same
+    /// predicate.
+    ///
+    /// A mob boot reads this to decide which members it materializes: a
+    /// member whose runtime appears here is materialized, and one with no
+    /// other reason to start stays dormant until something wakes it. An
+    /// implementation must therefore never omit a runtime that holds work;
+    /// listing one that holds none only materializes its member early. The
+    /// default answers [`RuntimeStoreError::Unsupported`]: a boot over such a
+    /// store cannot tell which members hold work and materializes all of
+    /// them. A decorator forwards this method to the store it wraps; left to
+    /// the default, every boot through it materializes every member.
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+        Err(RuntimeStoreError::Unsupported(
+            "list_runtimes_with_recovery_work".into(),
+        ))
+    }
+
     /// The store's durable delivery generation (#1813): incremented in the
     /// same transaction as every delivery-authority commit, so another
     /// process that sees the store change learns, from one read, whether a
@@ -11414,6 +11445,36 @@ mod runtime_store_write_fence_tests {
         assert_eq!(
             inner.load_session_snapshot(&runtime_id).await.unwrap(),
             None
+        );
+    }
+
+    /// A store that does not implement the obligation scan answers
+    /// `Unsupported`: the provided default, which a decorator that does not
+    /// forward the scan keeps even when the store it wraps answers it.
+    #[tokio::test]
+    async fn boot_obligation_scan_default_answers_unsupported() {
+        let inner = InMemoryRuntimeStore::new();
+        let runtime_id = LogicalRuntimeId::new("boot-obligation-default");
+        inner
+            .persist_input_state(
+                &runtime_id,
+                &InputStatePersistenceRecord::from_machine_snapshot(
+                    StoredInputState::new_accepted(InputId::new()),
+                )
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            inner.list_runtimes_with_recovery_work().await.unwrap(),
+            vec![runtime_id],
+            "the wrapped store answers the scan"
+        );
+        let store = DefaultFenceDecorator { inner };
+        let scanned = store.list_runtimes_with_recovery_work().await;
+        assert!(
+            matches!(scanned, Err(RuntimeStoreError::Unsupported(_))),
+            "{scanned:?}"
         );
     }
 }

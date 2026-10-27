@@ -196,6 +196,9 @@ pub(in crate::runtime) struct LocalEndpointObservation {
     member_ref: MemberRef,
     comms_name: String,
     context: &'static str,
+    /// The durable endpoint of a member MobMachine holds Waking: when its
+    /// comms runtime does not exist yet, it resolves `LocalDormant` from it.
+    unmaterialized_spec: Option<TrustedPeerDescriptor>,
 }
 
 impl LocalEndpointObservation {
@@ -211,6 +214,7 @@ impl LocalEndpointObservation {
             member_ref,
             comms_name,
             context,
+            unmaterialized_spec,
         } = self;
         if let Some(comms) = provisioner.comms_runtime(&member_ref).await {
             let public_key = comms.public_key().ok_or_else(|| {
@@ -249,10 +253,15 @@ impl LocalEndpointObservation {
                 let spec = MobActor::peer_only_spec_for_binding(&binding, context)?;
                 Ok(WiringEndpoint::PeerOnly { spec, binding })
             }
-            MemberRef::Session { .. } => Err(MobError::WiringError(format!(
-                "{context} requires comms runtime for '{}'",
-                entry.agent_identity
-            ))),
+            MemberRef::Session { .. } => match unmaterialized_spec {
+                // Waking, comms runtime not built yet: its wake's topology
+                // step realizes the edge from machine state.
+                Some(spec) => Ok(WiringEndpoint::LocalDormant { entry, spec }),
+                None => Err(MobError::WiringError(format!(
+                    "{context} requires comms runtime for '{}'",
+                    entry.agent_identity
+                ))),
+            },
         }
     }
 }
@@ -1164,6 +1173,22 @@ impl MobActor {
                 },
             )));
         }
+        // A Dormant member is resolved here, from its durable endpoint: no
+        // comms runtime of it is looked up, and nothing wakes it.
+        let state = self.dsl_authority.state();
+        if crate::runtime::boot_plan::domain_member_is_dormant(state, &entry.agent_identity) {
+            return Ok(WiringEndpointObservation::Resolved(Box::new(
+                self.local_dormant_wiring_endpoint(entry, context)?,
+            )));
+        }
+        let unmaterialized_spec = if crate::runtime::boot_plan::domain_member_is_unmaterialized(
+            state,
+            &entry.agent_identity,
+        ) {
+            self.machine_member_peer_spec_for(&entry.agent_identity, context)?
+        } else {
+            None
+        };
         Ok(WiringEndpointObservation::Observe(Box::new(
             LocalEndpointObservation {
                 provisioner: Arc::clone(&self.provisioner),
@@ -1171,6 +1196,7 @@ impl MobActor {
                 member_ref,
                 comms_name,
                 context,
+                unmaterialized_spec,
             },
         )))
     }

@@ -981,6 +981,12 @@ pub(super) enum MobCommand {
         failure: super::provisioner::ProvisionAttemptFailure,
         stage: super::actor::UnprovenResumeCustodyStage,
     },
+    /// A member the clean-stop lift's plan materializes closed its wake
+    /// attempt (`joined`: it went Live); the lift settles its resume work.
+    ResumeLifecycleBootMemberSettled {
+        member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
+        joined: bool,
+    },
     ResumeLifecycleRollbackStep {
         attempt: mob_dsl::ResumeAttemptId,
     },
@@ -1371,6 +1377,32 @@ pub(super) enum MobCommand {
         agent_identity: crate::ids::AgentIdentity,
         reason: super::stop_report::HostRunStartHoldReason,
         reply_tx: oneshot::Sender<Result<(), crate::MobError>>,
+    },
+    /// Plan one chunk of a dormant seat: each spec's
+    /// typed answer, the spawn of a fresh spec that owes a kickoff, or what
+    /// its seat needs. Reads nothing durable beyond profile resolution.
+    PlanDormantSeats {
+        specs: Vec<super::handle::SpawnMemberSpec>,
+        reply_tx: oneshot::Sender<Result<super::dormant_seat::DormantSeatPlan, crate::MobError>>,
+    },
+    /// Plan a rotation (`rotate_member`): the next incarnation's seat.
+    PlanMemberRotation {
+        spec: Box<super::handle::SpawnMemberSpec>,
+        reply_tx: oneshot::Sender<Result<super::dormant_seat::MemberRotationPlan, crate::MobError>>,
+    },
+    /// Start a prepared rotation of a seated member: its retirement, which
+    /// seats the next incarnation in its terminal step.
+    StartMemberRotation {
+        candidate: Box<super::dormant_seat::DormantSeatCandidate>,
+        endpoint: Option<meerkat_core::comms::TrustedPeerDescriptor>,
+        reply_tx: oneshot::Sender<Result<SessionId, crate::MobError>>,
+    },
+    /// Commit one prepared chunk of a dormant seat in one actor step.
+    CommitDormantSeats {
+        entries: Vec<super::dormant_seat::DormantSeatCommitEntry>,
+        reply_tx: oneshot::Sender<
+            Result<Vec<super::dormant_seat::DormantSeatOutcome>, crate::MobError>,
+        >,
     },
     /// An off-actor member-status observation returning to the actor, with
     /// every caller that joined it.
@@ -1996,6 +2028,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberCleanupHeld { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberUnproven { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleBootMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackStep { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackFinalized { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumePostCommitMemberCompleted { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2113,6 +2146,10 @@ impl MobCommand {
             Self::ProjectMemberList { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ProjectMemberStatus { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ReleaseMemberRunStarts { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::PlanDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::PlanMemberRotation { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::StartMemberRotation { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::CommitDormantSeats { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityIntent { .. } => ShutdownAnswerClass::CallerRequest,
             Self::GetIdentityConvergenceStatus { .. } => ShutdownAnswerClass::CallerRequest,
             Self::AdoptMemberIdentityDeclaration { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2237,6 +2274,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberSettled { .. } => "ResumeLifecycleMemberSettled",
             Self::ResumeLifecycleMemberCleanupHeld { .. } => "ResumeLifecycleMemberCleanupHeld",
             Self::ResumeLifecycleMemberUnproven { .. } => "ResumeLifecycleMemberUnproven",
+            Self::ResumeLifecycleBootMemberSettled { .. } => "ResumeLifecycleBootMemberSettled",
             Self::ResumeLifecycleRollbackStep { .. } => "ResumeLifecycleRollbackStep",
             Self::ResumeLifecycleRollbackFinalized { .. } => "ResumeLifecycleRollbackFinalized",
             Self::ResumePostCommitMemberCompleted { .. } => "ResumePostCommitMemberCompleted",
@@ -2335,6 +2373,10 @@ impl MobCommand {
             Self::ProjectMemberList { .. } => "ProjectMemberList",
             Self::ProjectMemberStatus { .. } => "ProjectMemberStatus",
             Self::ReleaseMemberRunStarts { .. } => "ReleaseMemberRunStarts",
+            Self::PlanDormantSeats { .. } => "PlanDormantSeats",
+            Self::PlanMemberRotation { .. } => "PlanMemberRotation",
+            Self::StartMemberRotation { .. } => "StartMemberRotation",
+            Self::CommitDormantSeats { .. } => "CommitDormantSeats",
             Self::ProjectMemberStatusObserved { .. } => "ProjectMemberStatusObserved",
             Self::GetIdentityIntent { .. } => "GetIdentityIntent",
             Self::GetIdentityConvergenceStatus { .. } => "GetIdentityConvergenceStatus",

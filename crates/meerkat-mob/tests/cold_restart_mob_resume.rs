@@ -648,10 +648,13 @@ async fn run_cold_restart_scenario(reuse_runtime_store: bool, lead_mode: MobRunt
         "restoration must start from an unregistered runtime, not a warm binding"
     );
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    // The scenario reads the restore's runtime bindings and Broken verdicts
+    // right after the resume, so the start materializes every member.
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
         .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
+        .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("mob resume after cold restart");
@@ -1873,10 +1876,13 @@ async fn mob_cold_restart_resume_surviving_member_respawn_scenario() {
 
     let (service_2, _store_2) = persistent_service(&paths, runtime_store_1);
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    // The scenario reads the lead's live comms runtime right after the
+    // resume, so the start materializes every member.
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
         .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
+        .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("resume after cold restart");
@@ -1999,10 +2005,14 @@ async fn mob_cold_restart_partial_resume_lost_member_scenario() {
 
     let (service_2, _store_2) = persistent_service(&paths, runtime_store_1);
     let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    // The scenario reads the restore's Broken verdict and the lead's live
+    // comms runtime right after the resume, so the start materializes every
+    // member.
     let handle_2 = MobBuilder::for_resume(storage_2)
         .with_session_service(service_2.clone())
         .with_default_llm_client(openai_test_client())
         .notify_orchestrator_on_resume(false)
+        .with_member_restore_policy(meerkat_mob::MemberRestorePolicy::Eager)
         .resume()
         .await
         .expect("partial resume after cold restart");
@@ -2296,6 +2306,15 @@ impl PowerCutRuntimeStore {
 impl meerkat_runtime::RuntimeStore for PowerCutRuntimeStore {
     fn session_authority_ops(&self) -> &dyn meerkat_runtime::store::RuntimeSessionAuthorityOps {
         self.inner.session_authority_ops()
+    }
+
+    // A mob boot over this store plans its members from the wrapped store's
+    // obligation scan, as over the store itself.
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<meerkat_runtime::LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError>
+    {
+        meerkat_runtime::RuntimeStore::list_runtimes_with_recovery_work(&self.inner).await
     }
 
     fn hosting_capability(&self) -> meerkat_runtime::HostingCapability {

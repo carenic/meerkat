@@ -11,6 +11,10 @@ use super::terminalization::{FlowFailureCause, TerminalizationOutcome, Terminali
 use super::transaction::LifecycleRollback;
 use super::*;
 
+pub(super) mod boot_lift;
+mod dormant_kickoff;
+mod dormant_seat;
+mod dormant_wiring;
 pub(super) mod explicit_resume;
 #[cfg(feature = "openai-live")]
 pub(super) mod live_durable_source_loads;
@@ -37,6 +41,7 @@ pub(in crate::runtime) use shutdown_teardown::teardown_session;
 pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
+mod startup_readiness;
 pub(super) mod wiring_io;
 
 use super::uncertain_durability::UncertainDurabilityFailStop;
@@ -5621,14 +5626,26 @@ pub(super) enum WiringEndpoint {
         host: mob_dsl::HostId,
         spec: TrustedPeerDescriptor,
     },
+    /// A seated local member that is not materialized in this process
+    /// (Dormant, or Waking before its comms runtime exists). Its peer
+    /// material is MobMachine's durable endpoint (`member_peer_endpoints`):
+    /// a live peer's trust toward it is installed from that endpoint. It has
+    /// no comms runtime, so nothing is installed or removed on its own side
+    /// and it sends no notice: its wake's topology step realizes its trust
+    /// from machine state. No wiring verb wakes it.
+    LocalDormant {
+        entry: Box<RosterEntry>,
+        spec: TrustedPeerDescriptor,
+    },
 }
 
 impl WiringEndpoint {
     fn spec(&self) -> &TrustedPeerDescriptor {
         match self {
-            Self::Local { spec, .. } | Self::PeerOnly { spec, .. } | Self::Placed { spec, .. } => {
-                spec
-            }
+            Self::Local { spec, .. }
+            | Self::PeerOnly { spec, .. }
+            | Self::Placed { spec, .. }
+            | Self::LocalDormant { spec, .. } => spec,
         }
     }
 }
@@ -5651,20 +5668,29 @@ enum BatchWiringEndpoint {
         spec: TrustedPeerDescriptor,
         removal_key: String,
     },
+    /// A seated local member that is not materialized: its durable endpoint
+    /// feeds a live counterpart's trust row, and nothing is installed on its
+    /// own side (its wake's topology step realizes its trust).
+    NotMaterialized {
+        spec: TrustedPeerDescriptor,
+        removal_key: String,
+    },
 }
 
 impl BatchWiringEndpoint {
     fn spec(&self) -> &TrustedPeerDescriptor {
         match self {
             Self::Local(local) => &local.spec,
-            Self::Placed { spec, .. } => spec,
+            Self::Placed { spec, .. } | Self::NotMaterialized { spec, .. } => spec,
         }
     }
 
     fn removal_key(&self) -> &str {
         match self {
             Self::Local(local) => &local.removal_key,
-            Self::Placed { removal_key, .. } => removal_key,
+            Self::Placed { removal_key, .. } | Self::NotMaterialized { removal_key, .. } => {
+                removal_key
+            }
         }
     }
 }
@@ -8447,6 +8473,13 @@ pub(super) struct ExplicitResumeMemberWork {
     rebuild: ExplicitResumeMemberRebuild,
     attempt: mob_dsl::ResumeAttemptId,
     binding: mob_dsl::ResumeMemberBinding,
+    /// The wake attempt `AuthorizeExplicitResumeMember` opened (or joined)
+    /// for the member: every resolution of this rebuild is fenced by it.
+    wake_attempt: Option<u64>,
+    /// Whether the rebuilt member requires its comms drain
+    /// ([`member_requires_comms_drain`]), read from the machine when the
+    /// work was planned, as every other readiness path reads it.
+    drain_required: bool,
 }
 
 pub(super) enum ExplicitResumeLiveObservation {
@@ -8683,6 +8716,18 @@ pub(super) struct MobActor {
     /// Whether an explicit stopped -> running resume should enqueue the
     /// informational orchestrator turn after the durable transition commits.
     pub(super) notify_orchestrator_on_resume: bool,
+    /// The host's member-residency inputs, the ones the start that built
+    /// this actor planned with: the clean-stop lift plans with the same.
+    pub(super) member_residency: super::boot_plan::MemberResidencyConfig,
+    /// Whether the latest member plan could not observe recovery work,
+    /// shared with the handles ([`super::MobHandle::boot_set_basis`]).
+    pub(super) boot_set_basis: super::boot_plan::MobBootSetBasisCell,
+    /// Members held Waking for a readiness pass, each with its open attempt:
+    /// the crash-path boot set (members this start's plan materialized,
+    /// bound in the builder's restore turn), and the members an explicit
+    /// resume rebuilt (bound in the rebuild's commit). The pass that runs
+    /// their readiness settles each Live (or Broken) and takes them.
+    pub(super) startup_boot_attempts: BTreeMap<AgentIdentity, u64>,
     /// Flow-run EXECUTION-HANDLE registries — NOT semantic authority (#210).
     ///
     /// `run_tasks` (JoinHandles), `run_cancel_tokens` (CancellationTokens +
@@ -12355,6 +12400,20 @@ impl MobActor {
             .is_some()
     }
 
+    /// Whether MobMachine retires `agent_runtime_id` archive-only: the member
+    /// was not materialized in this process when its retirement started, or
+    /// its retirement was recovered at a start. No runtime of this process
+    /// holds its session, so its retirement routes no runtime retire, removes
+    /// no trust row of its own, and archives its durable session with no
+    /// owner operation binding required. Retiring members only; the
+    /// retirement's terminal clears it.
+    pub(super) fn runtime_retire_archive_only(&self, agent_runtime_id: &AgentRuntimeId) -> bool {
+        self.dsl_authority
+            .state()
+            .runtime_retire_archive_only
+            .contains(&mob_dsl::AgentRuntimeId::from_domain(agent_runtime_id))
+    }
+
     /// The typed host refusal `agent_identity` is Broken with, read from
     /// MobMachine's recorded restore-failure code, so asking again answers
     /// the same refusal without asking the host.
@@ -12538,6 +12597,11 @@ impl MobActor {
         // #1105: a control that would move or retire a member whose wiring
         // effects this actor still owns must wait for that exact ledger.
         if self.wiring_io_control_is_pending(command) {
+            return true;
+        }
+        // An external-peer wire or unwire whose verdict owes a member being
+        // woken a trust row change waits for that wake.
+        if self.external_wiring_awaits_wake(command) {
             return true;
         }
         // Same rule for any other owned detached member effect on the shared
@@ -13786,6 +13850,17 @@ impl MobActor {
         session_id: &mob_dsl::SessionId,
         context: &str,
     ) -> Result<(), MobError> {
+        // MobMachine retires an archive-only runtime with no runtime retire
+        // (it refuses RetryRuntimeRetire for it): nothing is routed.
+        if self
+            .dsl_authority
+            .state()
+            .runtime_retire_archive_only
+            .contains(agent_runtime_id)
+        {
+            self.discard_queued_runtime_retire_for(agent_runtime_id);
+            return Ok(());
+        }
         if self
             .dsl_authority
             .state()
@@ -15827,6 +15902,7 @@ impl MobActor {
             incarnation: self.incarnation.incarnation(),
             registered_tool_bundles: Arc::new(self.tool_bundles.keys().cloned().collect()),
             realm_profile_store: self.realm_profile_store.clone(),
+            boot_set_basis: self.boot_set_basis.clone(),
         }
     }
 
@@ -21276,7 +21352,7 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation started"
             );
-            let requires_materialization = self
+            let mut requires_materialization = self
                 .provisioner
                 .prepare_member_session_for_explicit_resume(
                     &session_id,
@@ -21298,28 +21374,31 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation completed"
             );
-            if !requires_materialization {
+            // A fork-derived member's request is its own durable records, not
+            // customized, like its first build (see `fork_build`), and names
+            // no auth binding of its own.
+            let customized = entry.fork_source.is_none() && self.spawn_member_customizer.is_some();
+            if !requires_materialization && !customized {
                 continue;
             }
 
             // The cold explicit-resume request is customized before either
             // exact-session admission or successor search. This makes a
             // one-shot resume_from_role declaration part of the actual
-            // recovery request instead of an after-the-fact build tweak.
-            // A fork-derived member's request is its own durable records, not
-            // customized, like its first build (see `fork_build`).
+            // recovery request instead of an after-the-fact build tweak. A
+            // member whose live actor the preparation kept is customized too:
+            // the actor is kept only on the auth binding its request names.
             // What the bound session holds, read once, for the customizer's
             // resume view (an ordinary member only).
-            let restore_view =
-                if entry.fork_source.is_none() && self.spawn_member_customizer.is_some() {
-                    super::fork_build::load_resumed_member_view(
-                        self.session_service.as_ref(),
-                        &session_id,
-                    )
-                    .await?
-                } else {
-                    super::handle::ResumedMemberView::new(session_id.clone(), None)
-                };
+            let restore_view = if customized {
+                super::fork_build::load_resumed_member_view(
+                    self.session_service.as_ref(),
+                    &session_id,
+                )
+                .await?
+            } else {
+                super::handle::ResumedMemberView::new(session_id.clone(), None)
+            };
             let mut restore_spec = super::fork_build::rebuild_resume_spec(
                 &self.definition.id,
                 self.spawn_member_customizer.as_ref(),
@@ -21355,6 +21434,46 @@ impl ExplicitResumePreparationContext {
                 )));
             }
             let resume_from_role = resume_from_role.clone();
+            if !requires_materialization {
+                // A live actor is kept only when it runs the binding the
+                // member's request names (the one check every live-actor
+                // reuse runs). On a conflict its exact attachment is retired
+                // and the member is rebuilt on its request; when nothing
+                // could be retired, its live observation refuses the member,
+                // typed.
+                let Some(requested) = restore_spec.auth_binding.as_ref() else {
+                    continue;
+                };
+                match super::live_actor_binding::verify_live_actor_auth_binding(
+                    self.session_service.as_ref(),
+                    &entry.agent_identity,
+                    &session_id,
+                    requested,
+                )
+                .await
+                {
+                    Ok(()) => continue,
+                    Err(conflict @ MobError::MemberAuthBindingConflict { .. }) => {
+                        let retired = self
+                            .provisioner
+                            .retire_live_member_session_for_explicit_resume(
+                                &session_id,
+                                Instant::now()
+                                    + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                            )
+                            .await?;
+                        tracing::info!(
+                            agent_identity = %entry.agent_identity,
+                            %session_id,
+                            %conflict,
+                            retired,
+                            "explicit resume rebuilds a member whose live actor runs another auth binding"
+                        );
+                        requires_materialization = true;
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
 
             // Post-preparation work reports progress at every durable read so
             // the explicit-resume watchdog observes an advancing resume rather
@@ -21575,6 +21694,13 @@ impl MobActor {
                 if machine.member_placement.contains_key(&identity) {
                     return None;
                 }
+                // A member that is not materialized in this process is not a
+                // candidate: there is no attachment of it to prepare. The
+                // lift's member plan decides, after the durable Resume, which
+                // Dormant members it materializes (see `boot_lift`).
+                if super::boot_plan::member_is_dormant(machine, &identity) {
+                    return None;
+                }
                 let binding = machine.member_session_bindings.get(&identity)?;
                 Some(
                     SessionId::parse(&binding.0)
@@ -21761,7 +21887,7 @@ impl MobActor {
             if let Err(error) = self.apply_dsl_input(
                 mob_dsl::MobMachineInput::AuthorizeExplicitResumeMember {
                     attempt: attempt.clone(),
-                    agent_identity: dsl_identity,
+                    agent_identity: dsl_identity.clone(),
                     binding: binding.clone(),
                 },
                 "authorize_explicit_resume_member",
@@ -21769,6 +21895,17 @@ impl MobActor {
                 first_infrastructure_error.get_or_insert(error);
                 continue;
             }
+            // The reservation left the member Waking under one wake attempt
+            // (its own, or the in-flight wake it joined): a peer or host wake
+            // meanwhile joins the same attempt, so the session is
+            // materialized once.
+            let wake_attempt = self
+                .dsl_authority
+                .state()
+                .member_wake_attempts
+                .get(&dsl_identity)
+                .copied();
+            let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
             self.spawn_explicit_resume_member_observation(Arc::new(ExplicitResumeMemberWork {
                 rebuild: ExplicitResumeMemberRebuild {
                     entry,
@@ -21781,6 +21918,8 @@ impl MobActor {
                 },
                 attempt,
                 binding,
+                wake_attempt,
+                drain_required,
             }));
         }
         if let Some(error) = first_infrastructure_error {
@@ -21791,6 +21930,7 @@ impl MobActor {
 
     fn spawn_explicit_resume_member_observation(&mut self, work: Arc<ExplicitResumeMemberWork>) {
         let service = Arc::clone(&self.session_service);
+        let provisioner = Arc::clone(&self.provisioner);
         let definition = Arc::clone(&self.definition);
         let profiles = self.realm_profile_store.clone();
         let command_tx = self.command_tx.clone();
@@ -21798,7 +21938,55 @@ impl MobActor {
             let observation = async {
                 let session_id = &work.rebuild.bridge_session_id;
                 match service.has_live_session(session_id).await {
-                    Ok(true) => return Ok(ExplicitResumeLiveObservation::AlreadyLive),
+                    Ok(true) => {
+                        // A live actor is kept only when it runs the binding
+                        // the member's request names (the one check every
+                        // live-actor reuse runs). On a conflict its exact
+                        // attachment is retired and the member is observed
+                        // as its durable session, so it is rebuilt on its
+                        // request. When nothing could be retired, the member
+                        // is refused, typed, and its live actor retired, so
+                        // no surface reaches the old binding.
+                        let Some(requested) = work.rebuild.restore_spec.auth_binding.as_ref()
+                        else {
+                            return Ok(ExplicitResumeLiveObservation::AlreadyLive);
+                        };
+                        let checked = super::live_actor_binding::verify_live_actor_auth_binding(
+                            service.as_ref(),
+                            &work.rebuild.entry.agent_identity,
+                            session_id,
+                            requested,
+                        )
+                        .await;
+                        let conflict = match checked {
+                            Ok(()) => return Ok(ExplicitResumeLiveObservation::AlreadyLive),
+                            Err(conflict @ MobError::MemberAuthBindingConflict { .. }) => conflict,
+                            Err(error) => return Err(error),
+                        };
+                        let retired = provisioner
+                            .retire_live_member_session_for_explicit_resume(
+                                session_id,
+                                Instant::now()
+                                    + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                            )
+                            .await?;
+                        if !retired {
+                            if let Err(error) =
+                                super::live_actor_binding::retire_conflicting_live_actor(
+                                    service.as_ref(),
+                                    session_id,
+                                )
+                                .await
+                            {
+                                tracing::error!(
+                                    %session_id,
+                                    %error,
+                                    "a refused member's live actor on another auth binding could not be retired"
+                                );
+                            }
+                            return Err(conflict);
+                        }
+                    }
                     Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {}
                     Err(error) => return Err(MobError::SessionError(error)),
                 }
@@ -21846,44 +22034,6 @@ impl MobActor {
                 tracing::warn!("resume member observation settled after the actor stopped");
             }
         });
-    }
-
-    /// Ensure all autonomous roster members have their runtime ready.
-    ///
-    /// Called on mob startup and resume. Does NOT fire synthetic kickoff turns —
-    /// the keep-alive runtime infrastructure is sufficient. On resume, the
-    /// member's session already has its conversation history. Once a recovered
-    /// local autonomous member's drain and injector have both been observed,
-    /// publish that exact runtime/fence through MobMachine's existing startup
-    /// readiness transition. Durable membership alone is not readiness.
-    /// Actor-startup form of the member readiness fan-out (`prepare_actor_run`,
-    /// before the command loop exists): every member's bounded readiness step
-    /// runs concurrently and the outcomes are applied here, so the whole pass
-    /// is bounded by one `RESUME_MEMBER_READINESS_BOUND` rather than by member
-    /// count. This form awaits inline; commands sent during it queue in the
-    /// channel until `run` starts draining. Explicit Resume uses the split
-    /// form (`spawn_resume_readiness_fanout` + `resume_lifecycle_readiness_resolved`)
-    /// whose outcomes re-enter as a command so the loop keeps draining (#1102).
-    async fn ensure_autonomous_runtimes_from_roster(
-        &mut self,
-        allow_stopped_resume_reopen: bool,
-        progress: Option<&super::state::LifecycleProgressSignal>,
-    ) -> Result<(), MobError> {
-        let Some(targets) = self
-            .collect_member_readiness_targets(allow_stopped_resume_reopen)
-            .await?
-        else {
-            return Ok(());
-        };
-        #[cfg(feature = "runtime-adapter")]
-        let targets = self
-            .break_members_whose_runtime_ended_outside_the_mob(targets)
-            .await;
-        let expected = member_readiness_expectations(&targets);
-        let readiness = self.spawn_member_readiness_tasks(targets, progress.cloned());
-        let outcomes =
-            collect_member_readiness_outcomes(readiness, expected, &self.definition.id).await;
-        self.apply_member_readiness_outcomes(outcomes).await
     }
 
     /// The startup readiness targets without the members whose session
@@ -22028,6 +22178,13 @@ impl MobActor {
                         &mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                     )
                     && !self.recovered_after_start(&entry.agent_identity)
+                    // Live members only: a Dormant member has no runtime to
+                    // make ready, and a Waking member's readiness is run by
+                    // the attempt that materializes it.
+                    && !super::boot_plan::domain_member_is_unmaterialized(
+                        lifecycle,
+                        &entry.agent_identity,
+                    )
             })
             .map(|entry| MemberReadinessTarget {
                 entry: entry.clone(),
@@ -22453,6 +22610,15 @@ impl MobActor {
             |attempt| mob_dsl::MobMachineInput::FinishExplicitResume { attempt },
             "finish_explicit_resume",
         )?;
+        if result.is_ok() {
+            // The lift's boot set settled: seal its member plan. From here on
+            // every Dormant or Waking member has a durable endpoint, so every
+            // one is peer-wakeable; the seal rebuilds the wake routes.
+            self.apply_dsl_input(
+                mob_dsl::MobMachineInput::SealBootMaterializationPlan {},
+                "seal_explicit_resume_boot_materialization_plan",
+            )?;
+        }
         result
     }
 
@@ -22508,16 +22674,9 @@ impl MobActor {
         // Re-enable checkpointer gates a host may have cancelled. The mob
         // itself leaves them armed while it is Stopped.
         self.provisioner.rearm_all_checkpointers().await;
-        // Resume is what releases the run starts its Stop held (#1500). The
-        // member rebuild below needs each member's runtime to make progress,
-        // so the release comes first.
-        if let Err(error) = self.release_all_member_run_starts().await {
-            tracing::warn!(
-                mob_id = %self.definition.id,
-                error = %error,
-                "resume could not release every member's run-start hold"
-            );
-        }
+        // The run starts its Stop held stay held through the preparation:
+        // they are released once every member's attachment and binding
+        // check settled (`resume_lifecycle_preparation_resolved`).
 
         let candidates = match self.explicit_resume_candidates().await {
             Ok(candidates) => candidates,
@@ -22630,6 +22789,20 @@ impl MobActor {
             let _ = reply_tx.send(result);
             return;
         }
+        // Resume is what releases the run starts its Stop held, and only
+        // now: every member's binding check, and any retirement of an
+        // actor that runs another binding, completed in the preparation. So a
+        // run queued while the mob was stopped never starts on an actor the
+        // lift does not keep. The member rebuild and readiness below need
+        // each member's runtime to make progress, so the release comes before
+        // them.
+        if let Err(error) = self.release_all_member_run_starts().await {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                error = %error,
+                "resume could not release every member's run-start hold"
+            );
+        }
         if !rebuild.is_empty() {
             // A reconstructed handle cannot become ready until its foreign
             // attachments have been retired and the durable Resume transition
@@ -22702,6 +22875,7 @@ impl MobActor {
             "begin_explicit_resume_readiness",
         );
         if let Err(error) = begun {
+            let _ = self.settle_held_member_readiness(Vec::new()).await;
             let result = self.finish_explicit_resume_attempt(Err(error));
             self.hold_member_run_starts_while_stopped().await;
             let _ = pending.reply_tx.send(result);
@@ -22718,6 +22892,7 @@ impl MobActor {
         let ticket = match ticket {
             Ok(ticket) => ticket,
             Err(error) => {
+                let _ = self.settle_held_member_readiness(Vec::new()).await;
                 let settled = self.apply_explicit_resume_input(
                     |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeReadiness { attempt },
                     "settle_undispatched_resume_readiness",
@@ -22767,6 +22942,10 @@ impl MobActor {
             progress,
             reply_tx,
         } = pending;
+        // The members this resume rebuilt are held Waking: their readiness
+        // settles each Live, or Broken with its failure (the member's own
+        // outcome), before anything else of the resume continues.
+        let (outcomes, held_failure) = self.settle_held_member_readiness(outcomes).await;
         if let Err(error) = self.apply_explicit_resume_input(
             |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeReadiness { attempt },
             "settle_explicit_resume_readiness",
@@ -22837,7 +23016,9 @@ impl MobActor {
                     }));
                     return;
                 }
-                let post_commit_error = post_commit_error.or(readiness_result.err());
+                let post_commit_error = post_commit_error
+                    .or(readiness_result.err())
+                    .or(held_failure);
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -22878,27 +23059,40 @@ impl MobActor {
             return;
         }
 
-        if rebuilt_attachment {
+        // The members this lift materializes, planned now that the mob is
+        // Running again: one `PlanBootMaterialization` per Dormant member,
+        // with this start's policy and host inputs and a fresh obligation
+        // scan. Each planned member is woken through the one cold recipe;
+        // the resume joins its wake and settles it once the wake closes.
+        let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set().await {
+            Ok(members) => (members, None),
+            Err(error) => (Vec::new(), Some(error)),
+        };
+        if rebuilt_attachment || !boot_members.is_empty() {
             self.pending_resume_lifecycle = Some(PendingResumeLifecycle {
                 ticket: ResumeStepTicket::default(),
                 phase: ResumeLifecyclePhase::RebuildingMembers {
-                    post_commit_error: None,
+                    post_commit_error: plan_error,
                 },
                 admission,
                 progress: progress.clone(),
                 reply_tx,
             });
-            if let Err(error) = self
-                .rebuild_explicit_resume_member_sessions(rebuild, &progress)
-                .await
+            if rebuilt_attachment
+                && let Err(error) = self
+                    .rebuild_explicit_resume_member_sessions(rebuild, &progress)
+                    .await
             {
+                self.retain_explicit_resume_error(error);
+            }
+            if let Err(error) = self.join_explicit_resume_boot_members(boot_members) {
                 self.retain_explicit_resume_error(error);
             }
             self.continue_explicit_resume_after_rebuild().await;
             return;
         }
 
-        self.begin_resume_lifecycle_post_commit(admission, progress, None, reply_tx)
+        self.begin_resume_lifecycle_post_commit(admission, progress, plan_error, reply_tx)
             .await;
     }
 
@@ -23316,7 +23510,7 @@ impl MobActor {
     }
 
     async fn emit_prepared_kickoff_notices(
-        &self,
+        &mut self,
         agent_identity: &AgentIdentity,
         effects: &[mob_dsl::MobMachineEffect],
     ) {
@@ -24456,8 +24650,9 @@ impl MobActor {
             ))));
         }
         // The mob runs again: release the run starts its Stop held (#1500),
-        // so input admitted before the stop runs now. The release at resume
-        // begin did the same; this covers members materialized by the resume.
+        // so input admitted before the stop runs now. The release after the
+        // resume's preparation did the same; this covers members materialized
+        // by the resume.
         // A member that cannot be released yet (a peer-only member not bound
         // again yet) is logged per member; the committed resume stands.
         if let Err(error) = self.release_all_member_run_starts().await {
@@ -28387,6 +28582,9 @@ impl MobActor {
                 } => {
                     Box::pin(self.explicit_resume_member_unproven(work, failure, stage)).await;
                 }
+                MobCommand::ResumeLifecycleBootMemberSettled { member, joined } => {
+                    Box::pin(self.explicit_resume_boot_member_settled(member, joined)).await;
+                }
                 MobCommand::ResumeLifecycleRollbackStep { attempt } => {
                     Box::pin(self.drive_explicit_resume_rollback(attempt)).await;
                 }
@@ -30365,6 +30563,25 @@ impl MobActor {
                     }
                     let _ = reply_tx.send(result);
                 }
+                MobCommand::PlanDormantSeats { specs, reply_tx } => {
+                    let plan = Box::pin(self.plan_dormant_seats(specs)).await;
+                    let _ = reply_tx.send(Ok(plan));
+                }
+                MobCommand::PlanMemberRotation { spec, reply_tx } => {
+                    let plan = Box::pin(self.plan_member_rotation(*spec)).await;
+                    let _ = reply_tx.send(plan);
+                }
+                MobCommand::StartMemberRotation {
+                    candidate,
+                    endpoint,
+                    reply_tx,
+                } => {
+                    Box::pin(self.start_member_rotation(candidate, endpoint, reply_tx)).await;
+                }
+                MobCommand::CommitDormantSeats { entries, reply_tx } => {
+                    let result = Box::pin(self.commit_dormant_seats(entries)).await;
+                    let _ = reply_tx.send(result);
+                }
                 MobCommand::ProjectMemberStatusObserved {
                     agent_identity,
                     expected_target,
@@ -31447,6 +31664,11 @@ impl MobActor {
         if self.durable_uncertainty_fail_stop.is_set() {
             return ActorLoopWakeSelection::Continue;
         }
+        // The kickoffs members owe and can run now: each member that owes one
+        // and is live (woken after a rotation, a restart or a lift) starts it
+        // once.
+        #[cfg(feature = "runtime-adapter")]
+        boxed_arm_future(|| self.start_owed_kickoffs()).await;
 
         enum RegularActorWake {
             Routed(Option<RoutedMobCommand>),
@@ -31718,10 +31940,9 @@ impl MobActor {
         if matches!(self.state(), MobState::Running) {
             #[cfg(test)]
             run_startup_readiness_test_gate(&self.definition.id).await;
-            if let Err(error) = self
-                .ensure_autonomous_runtimes_from_roster(false, None)
-                .await
-            {
+            // Member readiness failures are member-scoped here: only a
+            // failure that is not one member's stops the start.
+            if let Err(error) = self.ensure_startup_member_readiness().await {
                 tracing::error!(
                     mob_id = %self.definition.id,
                     error = %error,
@@ -33093,6 +33314,15 @@ impl MobActor {
             let Some(cleanup_session) = cleanup_session else {
                 continue;
             };
+            // A Dormant member of a stopped or completed mob is not
+            // materialized in this process and owes no delivery: its session
+            // is not read and nothing is registered for it here. A member
+            // that holds work is planned at the lift, and its wake registers
+            // it. A retiring member keeps its cleanup delivery.
+            if !retiring && super::boot_plan::domain_member_is_dormant(state, &entry.agent_identity)
+            {
+                continue;
+            }
             let Some(session) = entry.bridge_session_id() else {
                 return Err(MobError::Internal(
                     "local cleanup authority has no session projection".into(),
@@ -33572,6 +33802,15 @@ impl MobActor {
                 );
                 entry
             };
+            // A Dormant member has no session actor in this process: the
+            // provision of its wake binds its owner context, so its session
+            // is not read here.
+            if super::boot_plan::domain_member_is_dormant(
+                self.dsl_authority.state(),
+                &entry.agent_identity,
+            ) {
+                continue;
+            }
             // A member whose host refused its registration at this boot keeps
             // no registration and no owner context until a host-approved
             // materialization: the refusal removed the registration it was
@@ -34517,6 +34756,7 @@ impl MobActor {
             operator_authority_ceiling: _,
             // Folded into the ceiling above.
             inherited_operator_authority_bound: _,
+            fresh_session_id,
         } = spec;
         let agent_identity = AgentIdentity::from(identity.as_str());
         self.inline_step_watchdog
@@ -35262,6 +35502,14 @@ impl MobActor {
             let selected_runtime_mode =
                 normalize_runtime_mode_for_binding(selected_runtime_mode, &selected_binding);
             let mut req = req;
+            // A dormant seat that spawns a spec owing a kickoff names the
+            // spawn's new session: the seat's name-based one, so a re-driven
+            // seat finds the member it spawned.
+            if let Some(session_id) = fresh_session_id {
+                req.build
+                    .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
+                    .mint_session_with_id(session_id);
+            }
             if prompt_context_source.is_some() || fork_seed.is_some() {
                 // A fork child's create request always carries a build; a
                 // seed with nowhere to go is an error, never a silent drop.
@@ -36780,6 +37028,8 @@ impl MobActor {
             operator_authority_ceiling,
             // Folded into the ceiling before the placed lane.
             inherited_operator_authority_bound: _,
+            // Set only by a dormant seat, whose spawns are local.
+            fresh_session_id: _,
         } = spec;
         let Some(host) = placement else {
             fail!(MobError::Internal(
@@ -38377,6 +38627,8 @@ impl MobActor {
             // Nor a ceiling: customizers never run on a policy auto-spawn.
             operator_authority_ceiling: _,
             inherited_operator_authority_bound: _,
+            // Set only by a dormant seat, whose spawns are local.
+            fresh_session_id: _,
         } = member_spec;
 
         if agent_identity.is_system_reserved() {
@@ -44612,6 +44864,79 @@ impl MobActor {
                 // Both endpoints remote: every trust lane rides the
                 // route-install obligations re-driven below.
             }
+            // A member that is not materialized has no trust of its own to
+            // repair: its wake's topology step installs it from machine
+            // state. A live counterpart reinstalls its trust toward the
+            // durable endpoint; a placed one rides the obligations below.
+            (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::LocalDormant { .. })
+            | (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::Placed { .. })
+            | (WiringEndpoint::Placed { .. }, WiringEndpoint::LocalDormant { .. }) => {}
+            (
+                WiringEndpoint::Local {
+                    comms: live_comms, ..
+                },
+                WiringEndpoint::LocalDormant {
+                    spec: dormant_spec, ..
+                },
+            ) => {
+                let dormant_key = Self::trusted_peer_removal_key(dormant_spec);
+                handoff.require_peer_id_for(peer_member_identity, &dormant_key)?;
+                self.apply_trusted_peer_add_report(
+                    live_comms.as_ref(),
+                    dormant_spec.clone(),
+                    handoff.repair_authority_for(
+                        peer_member_identity,
+                        &dormant_key,
+                        &self.dsl_authority,
+                    )?,
+                )
+                .await
+                .map_err(MobError::from)?;
+            }
+            (
+                WiringEndpoint::LocalDormant {
+                    spec: dormant_spec, ..
+                },
+                WiringEndpoint::Local {
+                    comms: live_comms, ..
+                },
+            ) => {
+                let dormant_key = Self::trusted_peer_removal_key(dormant_spec);
+                handoff.require_peer_id_for(local, &dormant_key)?;
+                self.apply_trusted_peer_add_report(
+                    live_comms.as_ref(),
+                    dormant_spec.clone(),
+                    handoff.repair_authority_for(local, &dormant_key, &self.dsl_authority)?,
+                )
+                .await
+                .map_err(MobError::from)?;
+            }
+            (
+                WiringEndpoint::PeerOnly {
+                    spec: peer_only_spec,
+                    binding: peer_only_binding,
+                },
+                WiringEndpoint::LocalDormant {
+                    spec: dormant_spec, ..
+                },
+            )
+            | (
+                WiringEndpoint::LocalDormant {
+                    spec: dormant_spec, ..
+                },
+                WiringEndpoint::PeerOnly {
+                    spec: peer_only_spec,
+                    binding: peer_only_binding,
+                },
+            ) => {
+                self.wire_peer_only_recipient(
+                    peer_only_spec,
+                    Some(peer_only_binding),
+                    dormant_spec,
+                    std::time::Duration::from_secs(10),
+                )
+                .await?;
+            }
             (WiringEndpoint::Placed { .. }, WiringEndpoint::PeerOnly { .. })
             | (WiringEndpoint::PeerOnly { .. }, WiringEndpoint::Placed { .. }) => {
                 return Err(MobError::WiringError(format!(
@@ -44891,6 +45216,19 @@ impl MobActor {
                 )
                 .await
                 .map(|()| wiring_io::WiringPreparation::Settled);
+        }
+        if matches!(local_endpoint, WiringEndpoint::LocalDormant { .. })
+            || matches!(peer_endpoint, WiringEndpoint::LocalDormant { .. })
+        {
+            return Box::pin(self.wire_new_edge_with_dormant_endpoint(
+                &edge,
+                &local,
+                &peer_member_identity,
+                &local_endpoint,
+                &peer_endpoint,
+            ))
+            .await
+            .map(|()| wiring_io::WiringPreparation::Settled);
         }
         if let (
             WiringEndpoint::PeerOnly {
@@ -45210,17 +45548,17 @@ impl MobActor {
                     "wire requires local session comms runtime for '{local}'"
                 )));
             }
-            WiringEndpoint::Placed { .. } => {
+            WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. } => {
                 return Err(MobError::Internal(format!(
-                    "wire placed lane for '{local}' bypassed its dedicated handler"
+                    "wire lane for '{local}' bypassed its dedicated handler"
                 )));
             }
         };
         let (peer_comms, peer_spec) = match peer_endpoint {
             WiringEndpoint::Local { comms, spec, .. } => (comms, spec),
-            WiringEndpoint::Placed { .. } => {
+            WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. } => {
                 return Err(MobError::Internal(format!(
-                    "wire placed lane for '{peer_identity}' bypassed its dedicated handler"
+                    "wire lane for '{peer_identity}' bypassed its dedicated handler"
                 )));
             }
             WiringEndpoint::PeerOnly { .. } => {
@@ -45360,12 +45698,24 @@ impl MobActor {
                 WiringEndpoint::Local { comms, .. },
             ) => Some((Arc::clone(comms), identity.clone(), spec.clone())),
             (WiringEndpoint::Placed { .. }, WiringEndpoint::Placed { .. }) => None,
+            // A local member that is not materialized installs no trust now:
+            // its wake's topology step trusts the placed member from machine
+            // state; the placed side rides the obligations recorded below.
+            // The wire itself wakes it: a placed member cannot use its
+            // in-process wake route, so MobMachine's wire opens the member's
+            // wake (cause PlacedPeerWired), and the apply below realizes that
+            // materialization with the transition's other residency effects.
+            (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::Placed { .. })
+            | (WiringEndpoint::Placed { .. }, WiringEndpoint::LocalDormant { .. }) => None,
             (WiringEndpoint::PeerOnly { .. }, _) | (_, WiringEndpoint::PeerOnly { .. }) => {
                 return Err(MobError::WiringError(format!(
                     "wire between a placed member and a legacy external (peer-only) member is unsupported ('{local}' <-> '{peer_member_identity}')"
                 )));
             }
-            (WiringEndpoint::Local { .. }, WiringEndpoint::Local { .. }) => {
+            (
+                WiringEndpoint::Local { .. } | WiringEndpoint::LocalDormant { .. },
+                WiringEndpoint::Local { .. } | WiringEndpoint::LocalDormant { .. },
+            ) => {
                 return Err(MobError::Internal(
                     "wire_new_edge_with_placement invoked without a placed endpoint".into(),
                 ));
@@ -45517,12 +45867,19 @@ impl MobActor {
                 WiringEndpoint::Local { comms, .. },
             ) => Some((Arc::clone(comms), identity.clone(), spec.clone())),
             (WiringEndpoint::Placed { .. }, WiringEndpoint::Placed { .. }) => None,
+            // A local member that is not materialized holds no trust row to
+            // remove: only the placed side's lane (obligations) is unwired.
+            (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::Placed { .. })
+            | (WiringEndpoint::Placed { .. }, WiringEndpoint::LocalDormant { .. }) => None,
             (WiringEndpoint::PeerOnly { .. }, _) | (_, WiringEndpoint::PeerOnly { .. }) => {
                 return Err(MobError::WiringError(format!(
                     "unwire between a placed member and a legacy external (peer-only) member is unsupported ('{local}' <-> '{peer_member_identity}')"
                 )));
             }
-            (WiringEndpoint::Local { .. }, WiringEndpoint::Local { .. }) => {
+            (
+                WiringEndpoint::Local { .. } | WiringEndpoint::LocalDormant { .. },
+                WiringEndpoint::Local { .. } | WiringEndpoint::LocalDormant { .. },
+            ) => {
                 return Err(MobError::Internal(
                     "unwire_edge_with_placement invoked without a placed endpoint".into(),
                 ));
@@ -45950,6 +46307,16 @@ impl MobActor {
                     let removal_key = Self::trusted_peer_removal_key(&spec);
                     endpoints.insert(identity, BatchWiringEndpoint::Placed { spec, removal_key });
                 }
+                // A member that is not materialized rides the batch from its
+                // durable endpoint, with no wake: a live counterpart trusts
+                // it now, its own side is realized by its wake.
+                WiringEndpoint::LocalDormant { spec, .. } => {
+                    let removal_key = Self::trusted_peer_removal_key(&spec);
+                    endpoints.insert(
+                        identity,
+                        BatchWiringEndpoint::NotMaterialized { spec, removal_key },
+                    );
+                }
                 // V3 legacy-external members were never batch-wireable
                 // (descriptor exchange and rollback are per-peer
                 // semantics); this reject names that class only — placed
@@ -46328,7 +46695,11 @@ impl MobActor {
                     fence_token: expected.fence_token,
                 })
             }
-            WiringEndpoint::Local { .. } | WiringEndpoint::PeerOnly { .. } => None,
+            // A recipient that is not materialized is addressed by its durable
+            // endpoint: the send reaches its wake route, which wakes it.
+            WiringEndpoint::Local { .. }
+            | WiringEndpoint::PeerOnly { .. }
+            | WiringEndpoint::LocalDormant { .. } => None,
         };
         let recipient_spec = recipient_endpoint.spec().clone();
         let route =
@@ -47126,6 +47497,20 @@ impl MobActor {
                 .await
                 .map(|()| wiring_io::WiringPreparation::Settled);
         }
+        if matches!(local_endpoint, WiringEndpoint::LocalDormant { .. })
+            || matches!(peer_endpoint, WiringEndpoint::LocalDormant { .. })
+        {
+            return Box::pin(self.unwire_edge_with_dormant_endpoint(
+                &edge,
+                &local,
+                &peer_member_identity,
+                &local_endpoint,
+                &peer_endpoint,
+                dsl_has_edge,
+            ))
+            .await
+            .map(|()| wiring_io::WiringPreparation::Settled);
+        }
         let (local_comms, local_spec) = match local_endpoint {
             WiringEndpoint::Local { comms, spec, .. } => (comms, spec),
             WiringEndpoint::PeerOnly { .. } => {
@@ -47133,17 +47518,17 @@ impl MobActor {
                     "unwire requires local session comms runtime for '{local}'"
                 )));
             }
-            WiringEndpoint::Placed { .. } => {
+            WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. } => {
                 return Err(MobError::Internal(format!(
-                    "unwire placed lane for '{local}' bypassed its dedicated handler"
+                    "unwire lane for '{local}' bypassed its dedicated handler"
                 )));
             }
         };
         let (peer_comms, peer_spec) = match peer_endpoint {
             WiringEndpoint::Local { comms, spec, .. } => (comms, spec),
-            WiringEndpoint::Placed { .. } => {
+            WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. } => {
                 return Err(MobError::Internal(format!(
-                    "unwire placed lane for '{peer_identity}' bypassed its dedicated handler"
+                    "unwire lane for '{peer_identity}' bypassed its dedicated handler"
                 )));
             }
             WiringEndpoint::PeerOnly { .. } => {
@@ -47816,6 +48201,23 @@ impl MobActor {
             )
         };
 
+        // MobMachine's verdict says what the local member's runtime is owed:
+        // a member that is not materialized is owed no trust row now (its
+        // wake installs the row from the machine edge), so the edge and its
+        // event are committed alone.
+        let prepared = self.prepare_dsl_input_transition(
+            mob_dsl::MobMachineInput::WireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+            "wire_external_peer",
+        )?;
+        if !Self::external_peer_trust_row_owed(prepared.transition.effects(), &edge) {
+            Box::pin(self.commit_external_wire_without_trust_row(prepared, local, spec)).await?;
+            return Ok(wiring_io::WiringPreparation::Settled);
+        }
+        drop(prepared);
+
         // Resolve the local session's comms runtime for trust install.
         let comms = self.provisioner_comms(&member_ref).await.ok_or_else(|| {
             MobError::WiringError(format!(
@@ -47992,6 +48394,25 @@ impl MobActor {
         let edge = authority_edge
             .unwrap_or_else(|| Self::external_peer_edge(&local_identity, &prior_spec));
         let key = Self::external_peer_key_for_edge(&edge);
+        // MobMachine's verdict says whether the local member holds a row to
+        // remove: one that is not materialized holds none, and its wake
+        // installs only the edges the machine still holds.
+        let prepared = self.prepare_dsl_input_transition(
+            mob_dsl::MobMachineInput::UnwireExternalPeer {
+                key: key.clone(),
+                edge: edge.clone(),
+            },
+            "unwire_external_peer",
+        )?;
+        if !Self::external_peer_trust_removal_owed(prepared.transition.effects(), &edge) {
+            return Box::pin(self.commit_external_unwire_without_trust_row(
+                prepared,
+                local_identity,
+                peer_name,
+            ))
+            .await;
+        }
+        drop(prepared);
         let comms = self.provisioner_comms(&member_ref).await.ok_or_else(|| {
             MobError::WiringError(format!(
                 "unwire requires comms runtime for '{local}' (external peer unwire)"
@@ -49456,11 +49877,14 @@ impl MobActor {
         // A retiring placed member's external rows live on its host and die
         // with the exact ReleaseMember (its member-member rows likewise):
         // there is no local comms runtime to clean, so the observed-absent
-        // machine cleanup applies.
+        // machine cleanup applies. An archive-only retirement's member holds
+        // no row of its own in this process either (MobMachine refuses its
+        // trust-bearing cleanup).
         let comms = if super::member_runtime_is_host_owned(
             self.dsl_authority.state(),
             &entry.agent_identity,
-        ) {
+        ) || self.runtime_retire_archive_only(&entry.agent_runtime_id)
+        {
             None
         } else {
             self.provisioner_comms(&entry.member_ref).await
@@ -49615,7 +50039,9 @@ impl MobActor {
                     Some(observed) => observed.supervisor_comms.clone(),
                     None => self.supervisor_bridge.runtime_core().await,
                 }),
-                Ok(WiringEndpoint::Placed { .. }) => None,
+                // A retiring member that is not materialized holds no trust
+                // row of its own.
+                Ok(WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. }) => None,
                 Err(error) => {
                     tracing::debug!(
                         mob_id = %self.definition.id,
@@ -49646,8 +50072,12 @@ impl MobActor {
                 ),
                 // A retiring PLACED member's own runtime is remote: peers'
                 // local rows are cleaned with its machine-recorded spec; its
-                // own rows die with the host-side release.
-                Ok(WiringEndpoint::Placed { spec, .. }) => (spec, None),
+                // own rows die with the host-side release. A retiring member
+                // that is not materialized holds no rows of its own: peers'
+                // rows are cleaned with its durable endpoint.
+                Ok(
+                    WiringEndpoint::Placed { spec, .. } | WiringEndpoint::LocalDormant { spec, .. },
+                ) => (spec, None),
                 Err(error) => {
                     let retained_spec = match self.machine_member_peer_spec_for(
                         &retiring_identity,
@@ -49747,7 +50177,8 @@ impl MobActor {
                 Ok(
                     WiringEndpoint::Local { spec, .. }
                     | WiringEndpoint::PeerOnly { spec, .. }
-                    | WiringEndpoint::Placed { spec, .. },
+                    | WiringEndpoint::Placed { spec, .. }
+                    | WiringEndpoint::LocalDormant { spec, .. },
                 ) => spec,
                 Err(error) => {
                     let retained_spec = match self.machine_member_peer_spec_for(
@@ -50237,6 +50668,15 @@ impl MobActor {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        // Destroy admits every roster member into Retiring before disposal
+        // starts. A peer-lifecycle send from one destroy-admitted member to
+        // another waits for that recipient's comms drain to hand off the
+        // volatile notice, but teardown is the sole remaining authority and
+        // the drain may already be quiescent. The notice carries no cleanup
+        // authority: MobMachine owns topology and the exact trust removals
+        // below own the physical rows. Skip only that redundant notice while
+        // preserving every generated trust mutation and wiring cleanup.
+        let emit_peer_lifecycle_notice = !self.destroy_cleanup_active;
         let mut local_jobs = Vec::new();
         let mut local_peer_specs = Vec::new();
         let mut peer_only_jobs = Vec::new();
@@ -50254,6 +50694,24 @@ impl MobActor {
                 );
                 continue;
             };
+            // MobMachine's notice verdict decides whether this peer
+            // gets the retirement notice (a member that is not materialized,
+            // on either side, is Suppressed). The trust cleanup below does
+            // not depend on it.
+            let deliver_notice = emit_peer_lifecycle_notice
+                && match self.lifecycle_notice_delivers(&peer_identity, &ctx.agent_identity) {
+                    Ok(deliver) => deliver,
+                    Err(error) => {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %ctx.agent_identity,
+                            peer_id = %peer_identity,
+                            %error,
+                            "dispose_notify_peers: lifecycle notice verdict failed; continuing with critical trust cleanup"
+                        );
+                        false
+                    }
+                };
             let endpoint = match self
                 .resolve_wiring_endpoint(&peer_entry, "dispose_notify_peers")
                 .await
@@ -50323,10 +50781,11 @@ impl MobActor {
                         comms,
                         authority,
                         historical_authorities,
+                        deliver_notice,
                     ));
                 }
                 WiringEndpoint::PeerOnly { spec, binding } => {
-                    peer_only_jobs.push((peer_identity, spec, binding));
+                    peer_only_jobs.push((peer_identity, spec, binding, deliver_notice));
                 }
                 WiringEndpoint::Placed { .. } => {
                     // A placed peer's runtime is remote: its trust row for
@@ -50339,17 +50798,30 @@ impl MobActor {
                         "dispose_notify_peers skipping placed peer (remote runtime)"
                     );
                 }
+                // A peer that is not materialized holds no trust row for the
+                // retiring member, and MobMachine suppresses its notice: its
+                // wake's topology step reads the machine, which no longer
+                // wires it. A peer-only retiring member's own trust toward
+                // the peer's durable endpoint is removed below, as for a
+                // peer whose comms runtime is gone.
+                WiringEndpoint::LocalDormant { spec, .. } => {
+                    if deliver_notice {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %ctx.agent_identity,
+                            peer_id = %peer_identity,
+                            error = %Self::unmaterialized_notice_drift(
+                                &peer_identity,
+                                &ctx.agent_identity,
+                                "Deliver",
+                            ),
+                            "dispose_notify_peers: lifecycle notice not sent; continuing with critical trust cleanup"
+                        );
+                    }
+                    local_peer_specs.push((peer_identity, spec));
+                }
             }
         }
-        // Destroy admits every roster member into Retiring before disposal
-        // starts. A peer-lifecycle send from one destroy-admitted member to
-        // another waits for that recipient's comms drain to hand off the
-        // volatile notice, but teardown is the sole remaining authority and
-        // the drain may already be quiescent. The notice carries no cleanup
-        // authority: MobMachine owns topology and the exact trust removals
-        // below own the physical rows. Skip only that redundant notice while
-        // preserving every generated trust mutation and wiring cleanup.
-        let emit_peer_lifecycle_notice = !self.destroy_cleanup_active;
         let retiring_key = Self::trusted_peer_removal_key(retiring_spec);
         let retiring_comms = ctx.retiring_comms.clone();
         let retiring_spec_for_jobs = retiring_spec.clone();
@@ -50367,6 +50839,7 @@ impl MobActor {
                 recipient_comms,
                 authority,
                 historical_authorities,
+                deliver_notice,
             ) in local_jobs
             {
                 let retiring_key = retiring_key.clone();
@@ -50377,7 +50850,7 @@ impl MobActor {
                 let owner_token = owner_token.clone();
                 let mob_id = mob_id.clone();
                 local_tasks.push(async move {
-                if emit_peer_lifecycle_notice
+                if deliver_notice
                     && let Some(retiring_comms) = retiring_comms.as_ref()
                 {
                     if let Err(error) = Self::notify_peer_retired_bounded(
@@ -50413,7 +50886,7 @@ impl MobActor {
                             "dispose_notify_peers: lifecycle notice sent"
                         );
                     }
-                } else if emit_peer_lifecycle_notice {
+                } else if deliver_notice {
                     if retiring_member_is_placed {
                         tracing::warn!(
                             mob_id = %mob_id,
@@ -50429,6 +50902,13 @@ impl MobActor {
                             "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                         );
                     }
+                } else if emit_peer_lifecycle_notice {
+                    tracing::debug!(
+                        mob_id = %mob_id,
+                        agent_identity = %retired_id,
+                        peer_id = %peer_identity,
+                        "dispose_notify_peers: MobMachine suppressed the lifecycle notice"
+                    );
                 } else {
                     tracing::debug!(
                         mob_id = %mob_id,
@@ -50539,9 +51019,8 @@ impl MobActor {
                 }
             }
         }
-        for (peer_identity, recipient_spec, recipient_binding) in peer_only_jobs {
-            if emit_peer_lifecycle_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref()
-            {
+        for (peer_identity, recipient_spec, recipient_binding, deliver_notice) in peer_only_jobs {
+            if deliver_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref() {
                 if let Err(error) = Self::notify_peer_retired_bounded(
                     &recipient_spec,
                     &ctx.agent_identity,
@@ -50575,7 +51054,7 @@ impl MobActor {
                         "dispose_notify_peers: lifecycle notice sent"
                     );
                 }
-            } else if emit_peer_lifecycle_notice {
+            } else if deliver_notice {
                 if super::member_runtime_is_host_owned(
                     self.dsl_authority.state(),
                     &ctx.agent_identity,
@@ -50594,6 +51073,13 @@ impl MobActor {
                         "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                     );
                 }
+            } else if emit_peer_lifecycle_notice {
+                tracing::debug!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %ctx.agent_identity,
+                    peer_id = %peer_identity,
+                    "dispose_notify_peers: MobMachine suppressed the lifecycle notice"
+                );
             } else {
                 tracing::debug!(
                     mob_id = %self.definition.id,
@@ -51134,9 +51620,14 @@ impl MobActor {
             member_ref = ?ctx.entry.member_ref,
             "MobActor::dispose_archive_session retiring member via provisioner"
         );
-        let disposal_result = if ctx.registration_refused {
+        // A host-refused member, and one MobMachine retires archive-only (no
+        // runtime of this process holds its session), may hold no owner
+        // operation binding here.
+        let archive_only = ctx.registration_refused
+            || self.runtime_retire_archive_only(&ctx.entry.agent_runtime_id);
+        let disposal_result = if archive_only {
             self.provisioner
-                .retire_refused_member(
+                .retire_member_archive_only(
                     &ctx.entry.member_ref,
                     &ctx.entry.agent_identity,
                     ctx.retirement_deadline,
@@ -51948,6 +52439,7 @@ impl MobActor {
                 mob_dsl::MobLifecycleJournalKind::Destroying,
                 "record_destroying_event",
             )?;
+            let abandoned = Self::abandoned_rotation_sessions(prepared.transition.effects());
             let events = self.events.clone();
             let mob_id = self.definition.id.clone();
             self.commit_prepared_dsl_transition_after(prepared, move || async move {
@@ -51962,6 +52454,7 @@ impl MobActor {
                 Ok(())
             })
             .await?;
+            self.archive_abandoned_rotation_sessions(abandoned).await;
         } else if !self.destroy_admitted() {
             let prepared = self.prepare_dsl_signal_transition(
                 mob_dsl::MobMachineSignal::AdmitDestroyCleanup,
@@ -51972,7 +52465,9 @@ impl MobActor {
                 mob_dsl::MobLifecycleJournalKind::Destroying,
                 "record_destroying_event",
             )?;
+            let abandoned = Self::abandoned_rotation_sessions(prepared.transition.effects());
             self.commit_prepared_dsl_transition(prepared)?;
+            self.archive_abandoned_rotation_sessions(abandoned).await;
         }
         let _ = self.phase_watch_tx.send(self.state());
         Ok(())
@@ -62202,6 +62697,15 @@ impl MobActor {
             });
         }
 
+        // A Dormant member is wired from its durable endpoint: no comms
+        // runtime of it is looked up (there is none), and nothing wakes it.
+        if super::boot_plan::domain_member_is_dormant(
+            self.dsl_authority.state(),
+            &entry.agent_identity,
+        ) {
+            return self.local_dormant_wiring_endpoint(entry, context);
+        }
+
         if let Some(comms) = self.provisioner_comms(&member_ref).await {
             let public_key = comms.public_key().ok_or_else(|| {
                 MobError::WiringError(format!(
@@ -62232,11 +62736,42 @@ impl MobActor {
                 let spec = Self::peer_only_spec_for_binding(&binding, context)?;
                 Ok(WiringEndpoint::PeerOnly { spec, binding })
             }
+            // A Waking member whose comms runtime does not exist yet: its
+            // wake's topology step realizes the edge from machine state.
+            MemberRef::Session { .. }
+                if super::boot_plan::domain_member_is_unmaterialized(
+                    self.dsl_authority.state(),
+                    &entry.agent_identity,
+                ) =>
+            {
+                self.local_dormant_wiring_endpoint(entry, context)
+            }
             MemberRef::Session { .. } => Err(MobError::WiringError(format!(
                 "{context} requires comms runtime for '{}'",
                 entry.agent_identity
             ))),
         }
+    }
+
+    /// The wiring endpoint of a seated local member that is not materialized
+    /// in this process: its machine-recorded durable endpoint.
+    pub(super) fn local_dormant_wiring_endpoint(
+        &self,
+        entry: &RosterEntry,
+        context: &'static str,
+    ) -> Result<WiringEndpoint, MobError> {
+        let spec = self
+            .machine_member_peer_spec_for(&entry.agent_identity, context)?
+            .ok_or_else(|| {
+                MobError::WiringError(format!(
+                    "{context}: member '{}' is not materialized and has no machine-recorded peer endpoint",
+                    entry.agent_identity
+                ))
+            })?;
+        Ok(WiringEndpoint::LocalDormant {
+            entry: Box::new(entry.clone()),
+            spec,
+        })
     }
 
     /// Retirement-only endpoint resolution. An exact confirmed revoke means
@@ -62268,6 +62803,23 @@ impl MobActor {
                     comms,
                     spec,
                     comms_name,
+                });
+            }
+            // A retiring local member with no comms runtime in this process
+            // (it was never woken, or its materialization is gone) has no
+            // trust row of its own to clean: its retained machine endpoint
+            // names the rows its live peers hold toward it.
+            if self
+                .confirmed_revoked_placed_host(&entry.agent_identity)
+                .is_none()
+                && let Some(spec) = self.machine_member_peer_spec_for(
+                    &entry.agent_identity,
+                    "dormant retirement endpoint",
+                )?
+            {
+                return Ok(WiringEndpoint::LocalDormant {
+                    entry: Box::new(entry.clone()),
+                    spec,
                 });
             }
         }
@@ -62338,7 +62890,8 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. }
             | WiringEndpoint::PeerOnly { spec, .. }
-            | WiringEndpoint::Placed { spec, .. } => spec,
+            | WiringEndpoint::Placed { spec, .. }
+            | WiringEndpoint::LocalDormant { spec, .. } => spec,
         };
         let peer_route =
             PeerRoute::with_display_name(recipient_spec.peer_id, recipient_spec.name.clone());
@@ -62379,7 +62932,8 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. }
             | WiringEndpoint::PeerOnly { spec, .. }
-            | WiringEndpoint::Placed { spec, .. } => spec,
+            | WiringEndpoint::Placed { spec, .. }
+            | WiringEndpoint::LocalDormant { spec, .. } => spec,
         };
         self.notify_peer_event_with_spec(
             intent,
@@ -62504,7 +63058,7 @@ impl MobActor {
     }
 
     async fn notify_kickoff_event(
-        &self,
+        &mut self,
         agent_identity: &AgentIdentity,
         intent: &'static str,
     ) -> Result<(), MobError> {
@@ -62560,11 +63114,24 @@ impl MobActor {
             let Some(recipient_entry) = recipient_entry else {
                 continue;
             };
-            let recipient_spec = match self
+            // A kickoff status notice is content in MobMachine's verdict: it
+            // is delivered like a message, so a recipient that is not
+            // materialized is woken by its delivery, never skipped.
+            if !self.peer_notice_delivers(
+                &recipient_entry.agent_identity,
+                agent_identity,
+                mob_dsl::PeerInputClass::Content,
+            )? {
+                continue;
+            }
+            let (recipient_spec, recipient_unmaterialized) = match self
                 .resolve_wiring_endpoint(&recipient_entry, "notify_kickoff_event")
                 .await?
             {
-                WiringEndpoint::Local { spec, .. } | WiringEndpoint::PeerOnly { spec, .. } => spec,
+                WiringEndpoint::Local { spec, .. } | WiringEndpoint::PeerOnly { spec, .. } => {
+                    (spec, false)
+                }
+                WiringEndpoint::LocalDormant { spec, .. } => (spec, true),
                 WiringEndpoint::Placed { .. } => {
                     return Err(MobError::WiringError(format!(
                         "kickoff lifecycle notice to placed member '{}' has no remote-recipient realization",
@@ -62572,6 +63139,49 @@ impl MobActor {
                     )));
                 }
             };
+            if recipient_unmaterialized {
+                // The send waits for the recipient's wake, which this actor
+                // runs: it leaves the actor on the peer delivery lane, sent
+                // to the recipient's durable endpoint (its wake route).
+                let command = Self::peer_event_command(
+                    intent,
+                    &recipient_spec,
+                    agent_identity,
+                    &entry,
+                    &self.sender_notice_spec(&entry).await?,
+                )?;
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                self.spawn_peer_message_delivery(
+                    PeerMessageDeliveryPlan {
+                        from: agent_identity.clone(),
+                        to: recipient_entry.agent_identity.clone(),
+                        sender_comms: Arc::clone(&sender_comms),
+                        command,
+                    },
+                    reply_tx,
+                );
+                // The delivery settles off the actor: a notice that was not
+                // delivered is reported, as a failed send to a live recipient
+                // is.
+                let mob_id = self.definition.id.clone();
+                let from = agent_identity.clone();
+                let to = recipient_entry.agent_identity.clone();
+                tokio::spawn(async move {
+                    let failure = match reply_rx.await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "the delivery ended without an outcome".to_string(),
+                    };
+                    tracing::warn!(
+                        %mob_id,
+                        from = %from,
+                        to = %to,
+                        error = %failure,
+                        "a kickoff notice to a peer that was not materialized was not delivered"
+                    );
+                });
+                continue;
+            }
             self.notify_peer_event(
                 intent,
                 &recipient_spec,
@@ -62582,6 +63192,25 @@ impl MobActor {
             .await?;
         }
         Ok(())
+    }
+
+    /// The peer spec a notice from `entry` names its sender by, resolved as
+    /// [`Self::notify_peer_event`] resolves it.
+    async fn sender_notice_spec(
+        &self,
+        entry: &RosterEntry,
+    ) -> Result<TrustedPeerDescriptor, MobError> {
+        Ok(
+            match self
+                .resolve_wiring_endpoint(entry, "notify_peer_event")
+                .await?
+            {
+                WiringEndpoint::Local { spec, .. }
+                | WiringEndpoint::PeerOnly { spec, .. }
+                | WiringEndpoint::Placed { spec, .. }
+                | WiringEndpoint::LocalDormant { spec, .. } => spec,
+            },
+        )
     }
 
     /// Notify a peer that another peer was retired from the mob.

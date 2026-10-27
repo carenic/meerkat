@@ -16843,7 +16843,8 @@ mod tests {
         files.remove(0)
     }
 
-    /// A child mob whose owner is committed restores and activates its members.
+    /// A child mob whose owner is committed restores and activates its members:
+    /// each member is rebuilt on demand, at its first touch.
     #[tokio::test]
     async fn restored_child_mob_with_a_committed_owner_activates() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -16856,14 +16857,22 @@ mod tests {
         );
         let activations_before = svc.session_activation_count();
         let restored = restored_state(&svc, root.path());
+        let worker = AgentIdentity::from("worker-1");
         let status = restored
-            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .mob_member_status(&mob_id, &worker)
             .await
             .expect("restore member status");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the activated child mob")
+            .ensure_member_live(&worker)
+            .await
+            .expect("the member's first touch rebuilds it");
         assert!(
             svc.session_activation_count() > activations_before,
-            "control: an activating restore rebuilds the member session"
+            "control: an activated child mob's member session is rebuilt"
         );
     }
 
@@ -18075,6 +18084,8 @@ mod tests {
 
     /// #1701: restoring a child mob asks the host customizer for each member's
     /// rebuild through `customize_resume`, with the member's bound session.
+    /// The rebuild is on demand: a status read leaves the member Dormant and
+    /// asks nothing, and the member's first touch rebuilds it.
     #[tokio::test]
     async fn restored_child_mob_members_are_customized_with_their_resume_view() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -18088,31 +18099,53 @@ mod tests {
                 .with_persistent_storage_root(Some(root.path().to_path_buf()))
                 .with_child_spawn_member_customizer(host.clone()),
         );
+        let worker = AgentIdentity::from("worker-1");
         let status = restored
-            .mob_member_status(&mob_id, &AgentIdentity::from("worker-1"))
+            .mob_member_status(&mob_id, &worker)
             .await
             .expect("restore member status");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        let rebuilt = |calls: &[(
+            MobId,
+            meerkat_mob::SpawnSource,
+            AgentIdentity,
+            Option<SessionId>,
+        )]| {
+            calls.iter().any(|(mob, source, member, view)| {
+                mob == &mob_id
+                    && *source == meerkat_mob::SpawnSource::Resume
+                    && member == &worker
+                    && view.as_ref() == Some(&session)
+            })
+        };
+        assert!(
+            !rebuilt(&host.calls()),
+            "a status read rebuilds no member: {:?}",
+            host.calls()
+        );
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the child mob is restored")
+            .ensure_member_live(&worker)
+            .await
+            .expect("the member's first touch rebuilds it");
         let calls = host.calls();
         assert!(
-            calls
-                .iter()
-                .any(|(mob, source, member, view)| mob == &mob_id
-                    && *source == meerkat_mob::SpawnSource::Resume
-                    && member.as_str() == "worker-1"
-                    && view.as_ref() == Some(&session)),
-            "the restore asks the host customizer with the worker's session: {calls:?}"
+            rebuilt(&calls),
+            "the rebuild asks the host customizer with the worker's session: {calls:?}"
         );
     }
 
     /// #1701 restore ordering, under the joint child-policy decision: a
     /// restored mob is classified as a child mob before any member is
-    /// restored, so its members' rebuilds run under the child policy. A
+    /// rebuilt, so its members' rebuilds run under the child policy. A
     /// managed host without a child policy still restores everything: the
     /// child mob comes up, and its members are not brought back unconstrained.
-    /// Each carries a typed restore failure saying why and naming the fixes,
-    /// and calls into it return that refusal. (Recovery once the refusal
-    /// lifts is proved in meerkat-mob:
+    /// A member is rebuilt on demand, so the refusal comes at its first touch:
+    /// the member then carries a typed restore failure saying why and naming
+    /// the fixes, and calls into it return that refusal. (Recovery once the
+    /// refusal lifts is proved in meerkat-mob:
     /// `refused_restore_is_per_member_and_recovers_once_admitted`.)
     #[tokio::test]
     async fn unconfigured_child_policy_refuses_restored_child_members_not_the_restore() {
@@ -18187,24 +18220,32 @@ mod tests {
             meerkat_mob::MobMemberStatus::Active,
             "the host mob's member restores"
         );
-        let refusal = unconfigured
+        let child_handle = unconfigured
             .handle_for(&child)
             .await
-            .expect("the child mob is restored")
+            .expect("the child mob is restored");
+        // The member is rebuilt at its first touch, under the child policy.
+        let touched = child_handle
+            .ensure_member_live(&worker)
+            .await
+            .expect_err("the child member's rebuild is refused");
+        let refusal = child_handle
             .member(&worker)
             .await
             .err()
             .expect("the child member is refused");
-        let MobError::MemberRestoreFailed { reason, .. } = &refusal else {
-            panic!("a typed restore failure, got {refusal:?}");
-        };
-        for needle in [
-            "no child application tool policy is configured",
-            "MobMcpState::with_child_application_tool_policy(binding)",
-            "child_application_tool_policy",
-            "ApplicationToolPolicyBinding::Unmanaged",
-        ] {
-            assert!(reason.contains(needle), "{needle} missing from: {reason}");
+        for error in [&touched, &refusal] {
+            let MobError::MemberRestoreFailed { reason, .. } = error else {
+                panic!("a typed restore failure, got {error:?}");
+            };
+            for needle in [
+                "no child application tool policy is configured",
+                "MobMcpState::with_child_application_tool_policy(binding)",
+                "child_application_tool_policy",
+                "ApplicationToolPolicyBinding::Unmanaged",
+            ] {
+                assert!(reason.contains(needle), "{needle} missing from: {reason}");
+            }
         }
     }
 
@@ -18311,7 +18352,9 @@ mod tests {
     /// #1701 control: the managed host without a child policy that refuses a
     /// restored child mob's members (above) restores a host-created mob's
     /// members as before: it is never classified as a child mob, so the child
-    /// policy does not govern its members' rebuilds.
+    /// policy does not govern its members' rebuilds. The rebuild is on
+    /// demand: the member's first touch builds it once more, with the binding
+    /// it was seated with.
     #[tokio::test]
     async fn host_mob_restore_is_untouched_by_the_child_policy() {
         let svc = Arc::new(MockSessionSvc::new());
@@ -18330,14 +18373,29 @@ mod tests {
             .await
             .expect("the host mob restores");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
+        let seated = svc.build_policies_for(&session);
+        restored
+            .handle_for(&mob_id)
+            .await
+            .expect("the host mob is restored")
+            .ensure_member_live(&worker)
+            .await
+            .expect("the member's first touch rebuilds it");
         let rebuilt_on = restored
             .mob_resolve_bridge_session_id(&mob_id, &worker)
             .await
             .expect("resolve bridge session")
             .expect("the restored member has a session");
+        assert_eq!(rebuilt_on, session, "the member resumes its own session");
+        let rebuilt = svc.build_policies_for(&rebuilt_on);
         assert_eq!(
-            svc.build_policies_for(&rebuilt_on).last(),
-            svc.build_policies_for(&session).last(),
+            rebuilt.len(),
+            seated.len() + 1,
+            "the first touch built the member once"
+        );
+        assert_eq!(
+            rebuilt.last(),
+            seated.last(),
             "the restored member is built with the binding it was seated with"
         );
     }
@@ -18497,16 +18555,6 @@ mod tests {
                 .expect("construct runtime authority")
                 .with_persistent_storage_root(Some(runtime_root)),
         );
-        let restored_bridge_session = restored_state
-            .mob_resolve_bridge_session_id(&mob_id, &identity)
-            .await
-            .expect("resolve restored bridge session")
-            .expect("restored bridge session exists");
-        assert_ne!(
-            restored_bridge_session, respawned_bridge_session,
-            "the explicitly nonpersistent session fixture must rotate its bridge session after a cold restart"
-        );
-
         assert_eq!(
             restored_state
                 .mob_status(&mob_id)
@@ -18535,7 +18583,7 @@ mod tests {
         let meerkat::TargetBinding::Identity(restored_binding) = &restored_schedule.target else {
             panic!("restored schedule must keep identity target");
         };
-        let host = MobMcpScheduleHost::new(restored_state);
+        let host = MobMcpScheduleHost::new(restored_state.clone());
         let probe = host
             .probe_identity_target(restored_binding)
             .await
@@ -18577,6 +18625,17 @@ mod tests {
             .last_start_turn()
             .await
             .expect("scheduled delivery should start a turn");
+        // The member stayed dormant through the restart; the delivery woke it,
+        // and its wake recreated the explicitly nonpersistent session.
+        let restored_bridge_session = restored_state
+            .mob_resolve_bridge_session_id(&mob_id, &identity)
+            .await
+            .expect("resolve restored bridge session")
+            .expect("restored bridge session exists");
+        assert_ne!(
+            restored_bridge_session, respawned_bridge_session,
+            "the explicitly nonpersistent session fixture must rotate its bridge session after a cold restart"
+        );
         assert_eq!(
             delivered_session, restored_bridge_session,
             "scheduled prompt must target the restored current materialized session"

@@ -39,6 +39,9 @@ impl MobActor {
             return;
         };
         if self.dsl_authority.state().explicit_resume_cancel_requested {
+            // The rebuilt members are settled as every other member is: the
+            // lifecycle control that superseded the resume takes them over.
+            let _ = self.settle_held_member_readiness(Vec::new()).await;
             let result =
                 self.finish_explicit_resume_attempt(Err(MobError::LifecycleOperationPending {
                     intent: "explicit_resume superseded by lifecycle control".to_string(),
@@ -50,6 +53,7 @@ impl MobActor {
             .awaiting_stage(crate::runtime::state::LifecycleProgressStage::PostRebuildReadiness);
         match self.collect_member_readiness_targets(false).await {
             Err(error) => {
+                let _ = self.settle_held_member_readiness(Vec::new()).await;
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -59,6 +63,7 @@ impl MobActor {
                 .await;
             }
             Ok(None) => {
+                let _ = self.settle_held_member_readiness(Vec::new()).await;
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -67,7 +72,10 @@ impl MobActor {
                 )
                 .await;
             }
-            Ok(Some(targets)) => {
+            Ok(Some(mut targets)) => {
+                // The rebuilt members are held Waking: the Live-only target
+                // set leaves them out, and their readiness settles them.
+                targets.extend(self.held_member_readiness_targets().await);
                 self.spawn_resume_readiness_fanout(
                     targets,
                     Some(progress.clone()),
@@ -528,23 +536,49 @@ impl MobActor {
             self.publish_machine_state_projection();
         }
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
-        if self
-            .dsl_authority
-            .state()
-            .member_revival_pending
-            .contains(&identity)
-        {
-            self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
-                    agent_identity: identity,
-                },
-                "resolve_explicit_resume_member_revival",
-            )?;
+        if let Some(attempt) = work.wake_attempt {
+            self.resolve_explicit_resume_member_bound(&identity, attempt)?;
+            // Held Waking until the resume's readiness settles it Live.
+            self.startup_boot_attempts
+                .insert(entry.agent_identity.clone(), attempt);
         }
         self.restore_diagnostics
             .write()
             .await
             .remove(&entry.agent_identity);
+        Ok(())
+    }
+
+    /// Resolve the wake attempt the rebuild of `identity` holds bound: the
+    /// member's runtime binding is requested, and the member stays Waking.
+    /// The explicit resume's readiness then settles it Live (Live means
+    /// ready), or Broken with its readiness failure; its topology runs after
+    /// that, as for every member the resume finds live. A stale attempt (the
+    /// member's wake was abandoned or superseded meanwhile) is the machine's
+    /// no-op, and the rebuild is refused, so its provision is rolled back
+    /// rather than committed.
+    fn resolve_explicit_resume_member_bound(
+        &mut self,
+        identity: &mob_dsl::AgentIdentity,
+        attempt: u64,
+    ) -> Result<(), MobError> {
+        let transition = self.apply_dsl_signal_collect_transition(
+            mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: identity.clone(),
+                attempt,
+            },
+            "resolve_explicit_resume_member_bound",
+        )?;
+        if !crate::runtime::boot_plan::wake_feedback_applied(
+            transition.effects(),
+            identity,
+            attempt,
+        ) {
+            return Err(MobError::Internal(format!(
+                "the wake attempt {attempt} of '{}' was superseded before its explicit resume settled",
+                identity.0
+            )));
+        }
         Ok(())
     }
 
@@ -559,37 +593,87 @@ impl MobActor {
                 self.classify_explicit_resume_work(&work),
                 Ok(mob_dsl::ResumeMemberOutcomeDisposition::Current)
             ) {
-                if self
-                    .dsl_authority
-                    .state()
-                    .member_revival_pending
-                    .contains(&identity)
-                {
+                // Only the rebuild's own, still open wake attempt resolves the
+                // member Broken; a stale attempt is the machine's no-op.
+                let open_attempt = work.wake_attempt.filter(|attempt| {
+                    self.dsl_authority
+                        .state()
+                        .member_wake_attempts
+                        .get(&identity)
+                        == Some(attempt)
+                });
+                if let Some(attempt) = open_attempt {
                     let (signal, reason) = Self::member_revival_failure_signal(
                         identity.clone(),
+                        attempt,
                         &work.rebuild.bridge_session_id,
                         &error,
                     );
-                    if let Err(error) =
-                        self.apply_dsl_signal(signal, "resolve_failed_explicit_resume_member")
-                    {
-                        self.retain_explicit_resume_error(error);
-                    } else {
-                        self.record_member_restore_failure(
-                            &work.rebuild.entry.agent_identity,
-                            crate::runtime::handle::RestoreFailureDiagnostic {
-                                bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
-                                reason,
-                                hold: None,
-                                registration_refusal: None,
-                            },
+                    let resolved = self
+                        .apply_dsl_signal_collect_transition(
+                            signal,
+                            "resolve_failed_explicit_resume_member",
                         )
-                        .await;
+                        .map(|transition| {
+                            crate::runtime::boot_plan::wake_feedback_applied(
+                                transition.effects(),
+                                &identity,
+                                attempt,
+                            )
+                        });
+                    match resolved {
+                        Err(error) => self.retain_explicit_resume_error(error),
+                        Ok(true) => {
+                            self.record_member_restore_failure(
+                                &work.rebuild.entry.agent_identity,
+                                crate::runtime::handle::RestoreFailureDiagnostic {
+                                    bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
+                                    reason,
+                                    hold: None,
+                                    registration_refusal: None,
+                                },
+                            )
+                            .await;
+                        }
+                        // The attempt closed meanwhile: the machine kept the
+                        // member's state, and nothing is recorded here.
+                        Ok(false) => {}
                     }
                 } else {
                     self.retain_explicit_resume_error(error);
                 }
             }
+        }
+        // Settle requires the member's wake attempt closed. A resume that
+        // ends without resolving the attempt it opened (its work was
+        // classified stale, or its own resolution was refused) abandons it
+        // first: the member is Dormant again, and its next delivery wakes it.
+        // No provision of such an attempt was committed.
+        let still_open = work.wake_attempt.filter(|attempt| {
+            self.dsl_authority
+                .state()
+                .member_wake_attempts
+                .get(&identity)
+                == Some(attempt)
+        });
+        if let Some(attempt) = still_open
+            && let Err(error) = self.apply_dsl_signal(
+                mob_dsl::MobMachineSignal::AbandonMemberWake {
+                    agent_identity: identity.clone(),
+                    attempt,
+                    kind: mob_dsl::MemberWakeAbandonKind::Unsettled,
+                    reason: format!(
+                        "the explicit resume of bridge session '{}' ended before its member settled",
+                        work.rebuild.bridge_session_id
+                    ),
+                },
+                "abandon_unsettled_explicit_resume_member_wake",
+            )
+        {
+            tracing::warn!(
+                %error,
+                "an explicit resume member's open wake attempt could not be abandoned before its settlement"
+            );
         }
         if let Err(error) = self.apply_dsl_input(
             mob_dsl::MobMachineInput::SettleExplicitResumeMember {
@@ -891,8 +975,15 @@ async fn provision_explicit_resume_member(
         };
     };
     let finalized = async {
+        // One rule for every readiness path: an autonomous or wired member
+        // requires its drain; an unwired turn-driven one binds it only when
+        // its runtime has comms.
         readiness
-            .ensure_mob_comms_drain(&work.rebuild.entry.agent_identity, &work.rebuild.member_ref)
+            .ensure_member_comms_drain(
+                &work.rebuild.entry.agent_identity,
+                &work.rebuild.member_ref,
+                work.drain_required,
+            )
             .await?;
         if work.rebuild.superseded_session_id.is_none()
             || work.rebuild.recovered_peer_endpoint.is_some()

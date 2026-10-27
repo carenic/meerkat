@@ -39,7 +39,8 @@
 //! names the runtime and stays resident until the runtime is archived.
 //! Resident memory is therefore bounded by the bodies of the runtimes
 //! opened since the process started and not archived since, plus every
-//! runtime's pinned head entries.
+//! runtime's pinned head entries. The store's obligation scan asks the same
+//! predicate as the boot and answers from memory, with no host read.
 //!
 //! # Limits of this adapter
 //!

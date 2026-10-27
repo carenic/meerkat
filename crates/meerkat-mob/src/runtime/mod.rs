@@ -206,10 +206,16 @@ mod reconcile_cadence_tests {
 pub(crate) mod actor;
 mod actor_turn_executor;
 mod admission_close;
+mod boot_plan;
 pub mod bridge;
 pub mod bridge_protocol;
 #[cfg(test)]
 mod bridge_request_claim_test_support;
+pub use boot_plan::{
+    MemberRestorePolicy, MobBootSetBasis, MobBootSetUnobservedCause, MobCompositionAuthority,
+};
+mod dormant_seat;
+pub use dormant_seat::DormantSeatOutcome;
 mod builder;
 pub mod composition;
 pub mod conditions;

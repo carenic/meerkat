@@ -162,7 +162,119 @@ them.
   `MobSessionService::recorded_auth_binding` (default `Ok(None)`) forwards it
   for the session services.
 
+- `meerkat-mob`: member residency. A seated member is Dormant (a member, not
+  materialized), Waking or Live, and MobMachine decides every change of it.
+  - `MobBuilder::with_member_restore_policy(MemberRestorePolicy)`:
+    `OnDemand` (the default) materializes at start only the members that
+    must run (see Changed), `OnDemandVerified` also reads each member it
+    leaves Dormant once, read-only, and records one whose durable session
+    cannot be resumed as Broken, and `Eager` materializes every member, as
+    before.
+  - `MobBuilder::with_host_required_members` (members the host needs live at
+    start), `MobBuilder::with_host_pending_members` (members whose host
+    preparation is still pending: never materialized, and every wake of one
+    is refused retryable until the host's seat step clears it), and
+    `MobBuilder::with_composition_authority(MobCompositionAuthority)` (a
+    `NonAuthoritative` composition materializes and seats nothing).
+  - `MobBuilder::with_member_wake_timeout` and
+    `MobBuilder::with_member_wake_retry_backoff` bound a member's wake and
+    the retry of a member whose start-up work is still owed after a
+    retryable refusal.
+  - `MobHandle::boot_set_basis` with `MobBootSetBasis` and
+    `MobBootSetUnobservedCause`: whether the latest start could tell which
+    members hold durable work; a start that could not materialized every
+    member, and the cause names the read the store could not make, or is
+    `ScanFailed` for a read that failed (a failed read does not fail the
+    start).
+  - `MobHandle::seat_dormant_members(specs)` with `DormantSeatOutcome`:
+    seats members Dormant without materializing them, at most 256 per
+    journal batch, one typed outcome per spec. A fresh spec gets a new
+    empty session under a name-based id, created through the fresh-spawn
+    create path; a resume spec binds its session (never an archived one); a
+    fresh spec that owes a kickoff is spawned instead, as a spawn is.
+    `MobBuilder::with_member_comms_identity_root` (inproc comms) or
+    `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
+    a seat's endpoint comes from.
+  - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
+    reset): its current incarnation is retired and the next one is seated
+    Dormant on a new empty session in the retirement's terminal step, both
+    journal rows in one batch, so the identity is never a non-member. A spec
+    that owes a kickoff (an `AutonomousHost` member, or an initial message)
+    records it on the new incarnation in the same batch: it wakes the new
+    incarnation once and runs exactly once on its new session, also across
+    a restart. The new incarnation keeps no wiring. A rotation is refused
+    typed unless the mob is Running, and a refused rotation retires
+    nothing.
+
+- `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the
+  runtimes whose durable state holds recovery work, from the head summary
+  each runtime already pins (no body load), implemented by the SQLite,
+  memory and host stores; the default answers `Unsupported`, and a store
+  decorator must forward it. `MeerkatMachine::boot_recovery_obligations`
+  with `RuntimeBootObligations`, `RuntimeRecoveryWork` and
+  `RuntimeRecoveryWorkUnobserved` reads it with the pending-delivery scan.
+  `SessionLlmCapabilitySurface::from_model_profile`.
+
 ### Changed
+
+- Behaviour-only (not measured by the gate): `meerkat-mob`:
+  `MobBuilder::resume` and the lift of a stopped mob (`MobHandle::resume`)
+  no longer materialize every member. Under the default `OnDemand` policy a
+  start materializes the members that hold durable work (an open or
+  suspended run, queued inputs, a provisional tail, a pending delivery, a
+  background operation completion not yet delivered), a
+  member whose endpoint is a network transport or that has no durable
+  endpoint, a member wired to a placed member, an orchestrator the resume
+  notifies, and the members the host requires; every other member stays Dormant and is materialized by its
+  first delivery, on its own session. Reads (member lists, status, history,
+  console projections) never materialize a member: a Dormant member's
+  status reports its peer connectivity from MobMachine's membership and its
+  capabilities from the catalog model its wake binds (its profile with its
+  model override). Wiring and unwiring
+  with a Dormant member commit the edge without waking it (except a new edge
+  to a placed member, which wakes it: the placed member, in another process,
+  cannot use its in-process wake route), and lifecycle
+  notices to or from a member that is not materialized are not sent (its
+  wake installs the trust they carry). A kickoff status notice is content,
+  not a lifecycle notice: it wakes a Dormant recipient and is delivered. This holds for an edge to an external
+  peer too; a wire or unwire of one whose member is being woken waits for
+  that wake. Retiring a Dormant member, and destroying a mob with Dormant
+  members, archive their durable sessions without waking them, and so does
+  a retirement that a restart recovered. The start of a stopped mob
+  registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
+  restores the previous start.
+
+- `meerkat-runtime`: a background operation completion the runtime injected
+  into its owner as a continuation is recorded durably with the ops
+  lifecycle snapshot. A restart no longer reads it as owed, so the owner is
+  not woken for it and does not run its continuation a second time. A
+  completion the agent applied in a model call is recorded with the next
+  snapshot: until then a restart presents it again (one more wake and one
+  repeated notice, never a lost completion).
+
+- Upgrade note, behaviour-only: the first start after upgrading a host-store
+  deployment restores members whose runtime heads predate 0.9.7. Such a
+  head may not record a background operation completion its runtime still
+  owes, so the obligation scan reads it as holding work and the start wakes
+  its member, once: the runtime's next commit records its facts in full, and
+  a release before 0.9.7 still reads them.
+
+- Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
+  member rotated with `MobHandle::rotate_member`, so a rotated member whose
+  owed kickoff has not run yet does not run it after a rollback to 0.9.6.
+
+- Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
+  (`MobHandle::resume`) keeps a member's live actor only when it runs the auth
+  binding the member's resume request names (the spawn member customizer's
+  answer, which the lift now asks for such a member too). Otherwise the
+  member's runtime attachment is retired and the member is rebuilt on that
+  binding, on its own session. A backend with no runtime attachment to retire
+  refuses the member instead: it is recorded broken with
+  `MobError::MemberAuthBindingConflict`, and its live actor is retired. The
+  lift releases the run starts the stop held only after every member's check
+  (and any retirement) completed, so a run queued while the mob was stopped
+  never starts on the old binding. Before, the lift released them first and
+  kept every live actor on whatever binding it ran.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a

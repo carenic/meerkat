@@ -1561,6 +1561,16 @@ enum MemberRunCancel {
     Now,
 }
 
+/// A dormant seat's empty session, created durably
+/// ([`MobProvisioner::create_dormant_member_session`]).
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct DormantMemberSessionCreated {
+    /// The public key of the comms identity the session's build used, when
+    /// the build had one.
+    pub(crate) public_key: Option<[u8; 32]>,
+}
+
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MobProvisioner: Send + Sync {
@@ -1576,6 +1586,24 @@ pub trait MobProvisioner: Send + Sync {
         &self,
         req: ProvisionMemberRequest,
     ) -> Result<MemberSpawnReceipt, MobError>;
+
+    /// Create a fresh member's empty durable session without materializing
+    /// the member: a dormant seat's session. `create_session`
+    /// is the create request a fresh spawn sends, already carrying the
+    /// session's pre-assigned id; the session is persisted by the same
+    /// session-service create a fresh spawn's provision runs, with no
+    /// runtime registration, and its live actor is discarded at once.
+    /// Returns the public key of the comms identity the build used. A
+    /// provisioner that cannot create such a session refuses.
+    #[cfg(feature = "runtime-adapter")]
+    async fn create_dormant_member_session(
+        &self,
+        _create_session: meerkat_core::service::CreateSessionRequest,
+    ) -> Result<DormantMemberSessionCreated, MobError> {
+        Err(MobError::Internal(
+            "this provisioner cannot create a dormant member's session".into(),
+        ))
+    }
 
     /// Provision a fresh member and hold it before its publication: its
     /// agent finished under its host's selection and its built surface
@@ -1705,15 +1733,18 @@ pub trait MobProvisioner: Send + Sync {
         deadline: Instant,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError>;
 
-    /// Retire a member whose host refused its registration, as MobMachine
-    /// records it. The refusal left the member no owner operation binding in
-    /// this process, so its retirement projects into one only when one is
+    /// Retire a member whose retirement is archive-only: MobMachine routes
+    /// it no runtime retire (it was not materialized in this process when its
+    /// retirement started, or its retirement was recovered at a start), or
+    /// its host refused its registration, as MobMachine records it. Such a
+    /// member holds no owner operation binding in this process unless one
+    /// was bound since, so its retirement projects into one only when one is
     /// bound, where the fresh archive of any other member fails closed on a
     /// missing binding. `deadline` bounds it as in
     /// [`Self::retire_member_until`]; without one it retires under
     /// [`Self::retire_member`]'s budget. The default retires it as any
     /// member.
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         member_identity: &AgentIdentity,
@@ -2069,6 +2100,23 @@ pub trait MobProvisioner: Send + Sync {
         deadline: Instant,
         admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError>;
+    /// Retire this provisioner's own live exact attachment of `session_id`
+    /// at the explicit mob-resume seam, because the member's live actor runs
+    /// another auth binding than its resume spec names: a live actor is never
+    /// reused on another binding. The attachment is retired as
+    /// [`Self::prepare_member_session_for_explicit_resume`] retires one it
+    /// does not own (same exact witness fence, attachment-local queued work
+    /// never adopted), and the caller rebuilds the member on its spec.
+    /// Returns `true` when the caller must rebuild, `false` when nothing was
+    /// retired (no runtime adapter participates). Default: `false`.
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        let _ = (session_id, deadline);
+        Ok(false)
+    }
     async fn ensure_runtime_session_state(&self, member_ref: &MemberRef) -> Result<(), MobError> {
         let _ = member_ref;
         Ok(())
@@ -2405,6 +2453,17 @@ pub struct SessionBackend {
 #[derive(Clone)]
 struct ExplicitResumeAttachmentRetirement {
     completion: Arc<Mutex<oneshot::Receiver<Result<bool, MobError>>>>,
+}
+
+/// What the explicit-resume retirement does with this provisioner's own
+/// exact attachment when its actor is live: keep it (it is the complete
+/// active incarnation), or retire it too (its actor runs another auth
+/// binding than the member's resume spec names).
+#[cfg(feature = "runtime-adapter")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OwnLiveAttachment {
+    Keep,
+    Retire,
 }
 
 /// Exact physical capabilities retained across retryable cold-recovery
@@ -5709,7 +5768,10 @@ impl SessionBackend {
                 let task_session_id = session_id.clone();
                 tokio::spawn(async move {
                     let result = backend
-                        .retire_exact_attachment_for_explicit_resume_owned(&task_session_id)
+                        .retire_exact_attachment_for_explicit_resume_owned(
+                            &task_session_id,
+                            OwnLiveAttachment::Keep,
+                        )
                         .await;
                     let _ = result_tx.send(result);
                 });
@@ -5759,6 +5821,47 @@ impl SessionBackend {
         }
         drop(retirements);
         result
+    }
+
+    /// Retire this provisioner's own live exact attachment of `session_id`
+    /// for a rebuild on another auth binding (see
+    /// [`MobProvisioner::retire_live_member_session_for_explicit_resume`]).
+    /// The retirement runs to its end in its own task, as the takeover of an
+    /// attachment this provisioner does not own does: a caller past
+    /// `deadline` is answered pending, and its retry finds the attachment
+    /// retired.
+    async fn retire_live_attachment_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        let pending = || MobError::LifecycleOperationPending {
+            intent: format!("explicit_resume_attachment_retirement:{session_id}"),
+        };
+        if Instant::now() >= deadline {
+            return Err(pending());
+        }
+        let backend = self.clone();
+        let task_session_id = session_id.clone();
+        let retirement = tokio::spawn(async move {
+            backend
+                .retire_exact_attachment_for_explicit_resume_owned(
+                    &task_session_id,
+                    OwnLiveAttachment::Retire,
+                )
+                .await
+        });
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(pending)?;
+        tokio::time::timeout(remaining, retirement)
+            .await
+            .map_err(|_| pending())?
+            .map_err(|error| {
+                MobError::Internal(format!(
+                    "the explicit-resume retirement of '{session_id}' ended without a result: {error}"
+                ))
+            })?
     }
 
     /// Release the member's session binding at the end of a resumed-provision
@@ -5824,6 +5927,7 @@ impl SessionBackend {
     async fn retire_exact_attachment_for_explicit_resume_owned(
         &self,
         session_id: &SessionId,
+        own_live: OwnLiveAttachment,
     ) -> Result<bool, MobError> {
         let Some(adapter) = self.runtime_adapter.as_ref() else {
             // Runtime-less session services retain their existing live actor;
@@ -5855,7 +5959,7 @@ impl SessionBackend {
                         .session_service
                         .live_session_actor_registered(session_id)
                         .await?;
-                if exact_actor_live {
+                if exact_actor_live && own_live == OwnLiveAttachment::Keep {
                     return Ok(false);
                 }
             }
@@ -6428,18 +6532,18 @@ impl SessionBackend {
 
     /// Dispose a session-backed member's session under `deadline`, then
     /// project its retirement into its owner operation binding. A member
-    /// whose host refused its registration holds no such binding here (see
-    /// [`MobProvisioner::retire_refused_member`]), so its projection runs
-    /// only when one is bound.
+    /// whose retirement is archive-only may hold no such binding here (see
+    /// [`MobProvisioner::retire_member_archive_only`]), so its projection
+    /// runs only when one is bound.
     async fn retire_session_member_until(
         &self,
         member_ref: &MemberRef,
         deadline: Instant,
-        registration_refused: bool,
+        archive_only: bool,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
         tracing::debug!(
             member_ref = ?member_ref,
-            registration_refused,
+            archive_only,
             "SessionBackend::retire_member start"
         );
         let session_id = Self::require_session(member_ref, "retire")?;
@@ -6456,7 +6560,7 @@ impl SessionBackend {
             disposal,
             MemberSessionDisposalVerdict::ArchivedWithRecoveredOpsRetired
         ) {
-            if registration_refused {
+            if archive_only {
                 self.ops_adapter
                     .mark_member_retired_if_bound(member_ref)
                     .await?;
@@ -14871,6 +14975,59 @@ impl MobProvisioner for SessionBackend {
             .await
     }
 
+    async fn create_dormant_member_session(
+        &self,
+        mut create_session: meerkat_core::service::CreateSessionRequest,
+    ) -> Result<DormantMemberSessionCreated, MobError> {
+        // The WorkGraph grant every member build in this mob receives
+        // (`provision_member_until_created`), so the session's build is a
+        // fresh spawn's build.
+        if let (Some(workgraph), Some(build)) = (
+            self.workgraph_service.as_ref(),
+            create_session.build.as_mut(),
+        ) && build.workgraph_tools.is_none()
+        {
+            build.workgraph_namespace_grant = Some(workgraph.namespace_grant().clone());
+            build.workgraph_tools = Some(Arc::new(meerkat::WorkGraphToolSurface::new(
+                workgraph.clone(),
+            )));
+        }
+        let session_id = create_session
+            .build
+            .as_ref()
+            .and_then(|build| build.resume_session.as_ref())
+            .map(|session| session.id().clone())
+            .ok_or_else(|| {
+                MobError::Internal(
+                    "a dormant member's session is created under its pre-assigned id".into(),
+                )
+            })?;
+        // No runtime registration: the build is the standalone one a
+        // provision without a runtime adapter runs, and nothing is
+        // materialized past this call.
+        let created = self
+            .session_service
+            .create_session(create_session)
+            .await
+            .map_err(MobError::from)?;
+        if created.session_id != session_id {
+            return Err(MobError::Internal(format!(
+                "the session service created session '{}' for the dormant member session '{session_id}'",
+                created.session_id
+            )));
+        }
+        let public_key = self
+            .session_service
+            .comms_runtime(&session_id)
+            .await
+            .and_then(|comms| comms.public_key_bytes());
+        self.session_service
+            .discard_live_session(&session_id)
+            .await
+            .map_err(MobError::from)?;
+        Ok(DormantMemberSessionCreated { public_key })
+    }
+
     async fn provision_member_held(
         &self,
         req: ProvisionMemberRequest,
@@ -15152,7 +15309,7 @@ impl MobProvisioner for SessionBackend {
             .await
     }
 
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         _member_identity: &AgentIdentity,
@@ -15714,6 +15871,15 @@ impl MobProvisioner for SessionBackend {
         admission: Option<super::state::LifecycleAdmissionSignal>,
     ) -> Result<bool, MobError> {
         self.retire_exact_attachment_for_explicit_resume(session_id, deadline, admission)
+            .await
+    }
+
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        self.retire_live_attachment_for_explicit_resume(session_id, deadline)
             .await
     }
 
@@ -18049,6 +18215,15 @@ impl MobProvisioner for MultiBackendProvisioner {
         self.session.provision_member_held(req).await
     }
 
+    async fn create_dormant_member_session(
+        &self,
+        create_session: meerkat_core::service::CreateSessionRequest,
+    ) -> Result<DormantMemberSessionCreated, MobError> {
+        self.session
+            .create_dormant_member_session(create_session)
+            .await
+    }
+
     async fn provision_member(
         &self,
         mut req: ProvisionMemberRequest,
@@ -18858,15 +19033,15 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
     }
 
-    async fn retire_refused_member(
+    async fn retire_member_archive_only(
         &self,
         member_ref: &MemberRef,
         member_identity: &AgentIdentity,
         deadline: Option<Instant>,
     ) -> Result<crate::machines::mob_machine::MemberSessionDisposal, MobError> {
         match member_ref {
-            // A peer-only member has no session here whose registration a
-            // host could refuse.
+            // A peer-only member has no session here: it is retired as any
+            // peer-only member.
             MemberRef::BackendPeer {
                 session_id: None, ..
             } => match deadline {
@@ -18878,7 +19053,7 @@ impl MobProvisioner for MultiBackendProvisioner {
             },
             _ => {
                 self.session
-                    .retire_refused_member(member_ref, member_identity, deadline)
+                    .retire_member_archive_only(member_ref, member_identity, deadline)
                     .await
             }
         }
@@ -20210,6 +20385,16 @@ impl MobProvisioner for MultiBackendProvisioner {
     ) -> Result<bool, MobError> {
         self.session
             .retire_exact_attachment_for_explicit_resume(session_id, deadline, admission)
+            .await
+    }
+
+    async fn retire_live_member_session_for_explicit_resume(
+        &self,
+        session_id: &SessionId,
+        deadline: Instant,
+    ) -> Result<bool, MobError> {
+        self.session
+            .retire_live_attachment_for_explicit_resume(session_id, deadline)
             .await
     }
 

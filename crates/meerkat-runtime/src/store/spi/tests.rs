@@ -1560,3 +1560,172 @@ async fn an_import_lands_as_one_batch_with_its_outbox_row_and_survives_a_reopen(
         "the catalog entry is on the host"
     );
 }
+
+// Unrun until the candidate's validation. The obligation scan answers from
+// memory: before and after a restart it lists exactly the runtimes with
+// recovery work and reads nothing from the host, and after the restart the
+// open has loaded the body of exactly the runtimes it lists.
+#[tokio::test]
+async fn boot_obligation_scan_spi_store_lists_the_runtimes_with_work_without_host_reads() {
+    use crate::store::recovery_obligation::scan_contract;
+
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let fixture = scan_contract::seed(&opened.1).await;
+    let reads = host.read_count();
+    scan_contract::assert_lists_exactly(&opened.1, &fixture).await;
+    assert_eq!(
+        host.read_count(),
+        reads,
+        "the scan reads nothing from the host"
+    );
+
+    let reopened = reopen(&host, opened).await;
+    let reads = host.read_count();
+    scan_contract::assert_lists_exactly(&reopened.1, &fixture).await;
+    assert_eq!(
+        host.read_count(),
+        reads,
+        "after a restart the scan still reads nothing from the host"
+    );
+    for runtime in fixture.runtimes() {
+        assert_eq!(
+            reopened.1.runtime_loaded_for_test(&runtime.0).await,
+            fixture.listed.contains(runtime),
+            "the open loads the body of {runtime:?} exactly when the scan lists it"
+        );
+    }
+}
+
+// Unrun until the candidate's validation. Boot facts without the folded
+// form's rollback-compatibility marker (an earlier writer's compact form, or
+// a JSON normaliser's rewrite, which drops it) may leave the ops lifecycle's
+// work out: the scan lists their runtime as holding work, fail closed,
+// without the open loading its body, until the runtime's next commit pins
+// the folded form.
+#[tokio::test]
+async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the_ops_fold() {
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let quiet = LogicalRuntimeId::new("quiet");
+    opened
+        .1
+        .compare_and_swap_runtime_delivery_authority(
+            &quiet,
+            None,
+            RuntimeDeliveryAuthorityRecord::from_parts(1, br#"{"state":1}"#.to_vec()),
+            None,
+        )
+        .await
+        .expect("delivery cas");
+    assert!(
+        !opened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&quiet),
+        "a folded head with no work is not listed"
+    );
+
+    // The same facts as a JSON normaliser rewrites them: the marker is
+    // gone, as in the compact form an earlier writer pinned.
+    let id = ScopeId::new(super::RUNTIME_FAMILY, quiet.0.clone());
+    let folded = {
+        let cell = opened.0.cell(&id);
+        let state = cell.lock().await;
+        let pinned = opened
+            .0
+            .pinned_values(&state)
+            .await
+            .expect("the pinned head");
+        Arc::clone(pinned.get("boot").expect("the boot facts are pinned"))
+    };
+    assert_eq!(
+        folded.last(),
+        Some(&b'\n'),
+        "this writer pins the folded form"
+    );
+    let normalised =
+        serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&folded).unwrap()).unwrap();
+    commit_one(
+        &opened.0,
+        &id,
+        ScopeDelta::Changes(vec![("boot".into(), Some(Arc::new(normalised)))]),
+    )
+    .await
+    .expect("a head that lost the marker");
+
+    let reopened = reopen(&host, opened).await;
+    assert!(
+        reopened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&quiet),
+        "a head without the marker is listed, fail closed"
+    );
+    assert!(
+        !reopened.1.runtime_loaded_for_test("quiet").await,
+        "the open does not load its body for it"
+    );
+
+    reopened
+        .1
+        .compare_and_swap_runtime_delivery_authority(
+            &quiet,
+            Some(1),
+            RuntimeDeliveryAuthorityRecord::from_parts(2, br#"{"state":2}"#.to_vec()),
+            None,
+        )
+        .await
+        .expect("the runtime's next commit");
+    assert!(
+        !reopened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&quiet),
+        "its next commit pins the folded form"
+    );
+    let restarted = reopen(&host, reopened).await;
+    assert!(
+        !restarted
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&quiet),
+        "and the head stays folded across a restart"
+    );
+}
+
+// Unrun until the candidate's validation. The open's body-load decision
+// over a runtime's pinned head and the scan answer the same predicate.
+#[tokio::test]
+async fn boot_obligation_scan_spi_store_agrees_with_the_open_on_each_pinned_head() {
+    use crate::store::recovery_obligation::scan_contract;
+
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let fixture = scan_contract::seed(&opened.1).await;
+    let (realm, store) = reopen(&host, opened).await;
+    let listed: std::collections::HashSet<LogicalRuntimeId> = store
+        .list_runtimes_with_recovery_work()
+        .await
+        .expect("the scan answers")
+        .into_iter()
+        .collect();
+    for runtime in fixture.runtimes() {
+        let cell = realm.cell(&ScopeId::new(super::RUNTIME_FAMILY, runtime.0.clone()));
+        let state = cell.lock().await;
+        let pinned = realm.pinned_values(&state).await.expect("the pinned head");
+        assert_eq!(
+            super::runtime::needs_body_at_boot(&pinned).expect("the pinned head decodes"),
+            listed.contains(runtime),
+            "the open and the scan decide {runtime:?} alike"
+        );
+    }
+}
