@@ -4150,6 +4150,16 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                 "MemberBootObligationCause",
                 &["Obligation", "EndpointPending"],
             ),
+            NamedTypeBinding::string_enum(
+                "MemberReleaseVerdict",
+                &[
+                    "Release",
+                    "NothingMaterialized",
+                    "WakeInFlight",
+                    "HostOwned",
+                    "NotAMember",
+                ],
+            ),
             NamedTypeBinding::string("RuntimeEpochId"),
             NamedTypeBinding::string("ResumeAttemptId"),
             NamedTypeBinding::u64("MobDefinitionEpoch"),
@@ -4786,6 +4796,7 @@ runtime_internal_inputs!(
         ResolveMemberHostPreparation,
         BeginMemberRotation,
         CommitMemberRotation,
+        ClassifyMemberRelease,
     ]
 );
 

@@ -1405,6 +1405,10 @@ const MOB_MACHINE_RUNTIME_INTERNAL_CLASSIFICATIONS:
         input: MobMachineCatalogInput::CommitMemberRotation,
         reason: MobMachineRuntimeInternalReason::MemberResidencyAuthority,
     },
+    MobMachineRuntimeInternalClassificationRecord {
+        input: MobMachineCatalogInput::ClassifyMemberRelease,
+        reason: MobMachineRuntimeInternalReason::MemberResidencyAuthority,
+    },
 ];
 
 #[doc(hidden)]

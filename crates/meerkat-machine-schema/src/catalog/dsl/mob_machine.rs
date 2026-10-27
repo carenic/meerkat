@@ -1800,7 +1800,11 @@ macro_rules! mob_catalog_machine_dsl {
             // seats the next one Dormant in one transition (no non-member
             // window). Its two journal rows are appended in one batch before
             // the commit.
-            CommitMemberRotation { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: Enum<MemberSessionDisposal>, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: Enum<SpawnPolicyRuntimeMode>, external_addressable: bool, kickoff_owed: bool },
+            CommitMemberRotation { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: Enum<MemberSessionDisposal>, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: Enum<SpawnPolicyRuntimeMode>, external_addressable: bool, kickoff_owed: bool, kickoff_objective_id: String },
+            // The release verdict for one member: the shell's release_member
+            // answers through it, never from a shell phase read. A pure
+            // verdict in every lifecycle phase.
+            ClassifyMemberRelease { agent_identity: AgentIdentity },
         }
 
         surface_only [
@@ -2299,6 +2303,7 @@ macro_rules! mob_catalog_machine_dsl {
             RebuildWakeRoutes,
             PeerNoticeClassified { recipient: AgentIdentity, sender: AgentIdentity, notice_class: Enum<PeerInputClass>, disposition: Enum<PeerNoticeDisposition> },
             MemberMaterializationReleased { agent_runtime_id: Option<AgentRuntimeId>, cause: Enum<MemberMaterializationLossCause>, outcome: Enum<MemberMaterializationReleaseOutcome> },
+            MemberReleaseClassified { agent_identity: AgentIdentity, verdict: Enum<MemberReleaseVerdict> },
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -2988,6 +2993,32 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
+        // The release verdict for one member. An identity that is not seated
+        // is not a member; a placed member's member host owns its
+        // materialization; a local Live member releases its registration; a
+        // Waking member has a wake in flight; anything else (Dormant, or no
+        // phase: Broken, retiring, unbound) has nothing materialized.
+        helper member_release_verdict(
+            seated: bool,
+            placed: bool,
+            residency: Option<Enum<MemberMaterializationPhase>>
+        ) -> Enum<MemberReleaseVerdict> {
+            if seated == false {
+                MemberReleaseVerdict::NotAMember
+            } else {
+            if placed == true {
+                MemberReleaseVerdict::HostOwned
+            } else {
+            if residency == Some(MemberMaterializationPhase::Live) {
+                MemberReleaseVerdict::Release
+            } else {
+            if residency == Some(MemberMaterializationPhase::Waking) {
+                MemberReleaseVerdict::WakeInFlight
+            } else {
+                MemberReleaseVerdict::NothingMaterialized
+            }}}}
+        }
+
         disposition DefinitionEpochAdvanced => local seam SurfaceResultAlignment,
         disposition RequestRuntimeBinding => routed [MeerkatMachine] seam NoOwnerRealization,
         disposition SpawnProfileAuthorized => local seam NoOwnerRealization,
@@ -3171,6 +3202,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition RebuildWakeRoutes => local seam OwnerRealizationOnly,
         disposition PeerNoticeClassified => local seam SurfaceResultAlignment,
         disposition MemberMaterializationReleased => local seam SurfaceResultAlignment,
+        disposition MemberReleaseClassified => local seam SurfaceResultAlignment,
 
         // =====================================================================
         // Invariants
@@ -13618,11 +13650,14 @@ macro_rules! mob_catalog_machine_dsl {
             guard "attempt_open" { self.member_wake_attempts.get_copied(agent_identity) == Some(attempt) }
             guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
             guard "binding_requested" { self.member_wake_bound.contains(agent_identity) == true }
-            // A woken member closes Live only with its endpoint registered
-            // (an EndpointPending member registers it during the wake, before
-            // this step), so every Live member is reachable and its
-            // registration release is honoured.
-            guard "endpoint_registered" { self.member_peer_endpoints.contains_key(agent_identity) == true }
+            // A member owed EndpointPending closes Live only once its endpoint
+            // is registered (it registers it during the wake, before this
+            // step), so a member with comms is reachable when Live. A member
+            // that owes no endpoint closes Live without one.
+            guard "owed_endpoint_registered" {
+                self.member_peer_endpoints.contains_key(agent_identity) == true
+                || self.member_boot_obligation_owed.get_cloned(agent_identity) != Some(MemberBootObligationCause::EndpointPending)
+            }
             update {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Live);
                 self.member_wake_attempts.remove(agent_identity);
@@ -24612,7 +24647,16 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::StayDormant
             }
-            update {}
+            update {
+                // A member left Dormant with no durable endpoint (a candidate
+                // composition, a pending host preparation or a lifecycle
+                // cleanup holds it) is owed EndpointPending, the seal's typed
+                // exception (I6): the seal never refuses it, and its first
+                // wake registers the endpoint.
+                if self.member_peer_endpoints.contains_key(agent_identity) == false {
+                    self.member_boot_obligation_owed.insert(agent_identity, MemberBootObligationCause::EndpointPending);
+                }
+            }
             to Running
             emit BootMaterializationPlanned {
                 agent_identity: agent_identity,
@@ -24875,12 +24919,12 @@ macro_rules! mob_catalog_machine_dsl {
         // already observed.
         transition CommitMemberRotationLive {
             per_phase [Running, Stopped]
-            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed }
+            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13: a seat owes no kickoff; a spec that owes one spawns
-            // embodied. The caller states whether the spec owes one.
-            guard "seat_owes_no_kickoff" { kickoff_owed == false }
+            // R13: the re-seat owes no kickoff here; a rotation whose spec owes
+            // one takes the Kickoff twin below. The caller states which.
+            guard "rotation_owes_no_kickoff" { kickoff_owed == false }
             // R124: the destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
@@ -25043,12 +25087,12 @@ macro_rules! mob_catalog_machine_dsl {
 
         transition CommitMemberRotationRetired {
             per_phase [Running, Stopped]
-            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed }
+            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13: a seat owes no kickoff; a spec that owes one spawns
-            // embodied. The caller states whether the spec owes one.
-            guard "seat_owes_no_kickoff" { kickoff_owed == false }
+            // R13: the re-seat owes no kickoff here; a rotation whose spec owes
+            // one takes the Kickoff twin below. The caller states which.
+            guard "rotation_owes_no_kickoff" { kickoff_owed == false }
             // R124: the destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
@@ -25537,6 +25581,385 @@ macro_rules! mob_catalog_machine_dsl {
             guard "member_waking" { self.member_materialization.get_cloned(agent_identity) == Some(MemberMaterializationPhase::Waking) }
             update { self.explicit_resume_member_work.insert(agent_identity, binding); }
             to Running
+        }
+
+        // The release verdict for one member (the shell's release_member
+        // answers through it, never from a shell phase read). A pure verdict
+        // in every lifecycle phase; the Live -> Dormant demotion itself stays
+        // the registration release route, fenced by the epoch.
+        transition ClassifyMemberRelease {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on input ClassifyMemberRelease { agent_identity }
+            update {}
+            to Running
+            emit MemberReleaseClassified {
+                agent_identity: agent_identity,
+                verdict: member_release_verdict(
+                    self.identity_to_runtime.contains_key(agent_identity),
+                    self.member_placement.contains_key(agent_identity),
+                    self.member_materialization.get_cloned(agent_identity))
+            }
+        }
+
+        // The rotation terminal of a spec that owes a kickoff (R13, R62): as
+        // its kickoff-free twin, and the next incarnation is seated with the
+        // kickoff recorded pending.
+        transition CommitMemberRotationLiveKickoff {
+            per_phase [Running, Stopped]
+            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
+            guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
+            guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
+            // R13 / R62: a rotation whose spec owes a kickoff re-seats the
+            // next incarnation with the kickoff recorded pending, so it is
+            // never lost across the rotation (a fresh seat still refuses one).
+            guard "rotation_owes_kickoff" { kickoff_owed == true }
+            // R124: the destroy beats the rotation. Once it is admitted the
+            // identity's retirement ends through the destroy, which drops the
+            // intent; no rotation begins or re-seats a member under it.
+            guard "destroy_not_admitted" { self.destroy_admitted == false }
+            guard "session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
+            guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "placed_carrier_absent" { self.current_placed_spawn_ids.contains_key(agent_identity) == false }
+            guard "member_not_placed" { self.member_placement.contains_key(agent_identity) == false }
+            guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) }
+            guard "fence_token_matches" { self.runtime_fence_tokens.get_copied(agent_runtime_id) == Some(fence_token) }
+            guard "generation_matches" { self.identity_runtime_generations.get_copied(agent_identity) == Some(generation) }
+            guard "member_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring) }
+            guard "retirement_session_matches" { self.runtime_retire_pending_sessions.get_cloned(agent_runtime_id) == session_id }
+            guard "session_present" { session_id != None }
+            guard "session_binding_matches_or_cleared" {
+                self.member_session_bindings.get_cloned(agent_identity) == None
+                || self.member_session_bindings.get_cloned(agent_identity) == session_id
+            }
+            guard "kickoff_quiesced" {
+                !self.member_kickoff_pending.contains(agent_identity)
+                && !self.member_kickoff_starting.contains(agent_identity)
+                && !self.member_kickoff_callback_pending.contains(agent_identity)
+                && mob_machine_placed_kickoff_custody_absent_for_identity(
+                    self.pending_placed_kickoff_outcomes,
+                    self.resolved_placed_kickoff_outcomes,
+                    agent_identity)
+            }
+            // The next incarnation's seat guards (R5, and the spawn mint).
+            guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
+            guard "next_runtime_fresh" {
+                self.live_runtime_ids.contains(next_agent_runtime_id) == false
+                && next_agent_runtime_id != agent_runtime_id
+            }
+            guard "spawn_profile_name_authorized" { self.spawn_profile_authority_profile_names.contains_key(agent_identity) == true }
+            guard "spawn_profile_addressability_authorized" { self.spawn_profile_authority_external_addressable.get_cloned(agent_identity) == Some(external_addressable) }
+            guard "peer_id_available_for_identity" {
+                self.member_rotation_peer_endpoints.contains_key(agent_identity) == false
+                || mob_machine_member_peer_id_available_for_identity(
+                    self.member_peer_endpoints,
+                    self.member_prior_peer_endpoints,
+                    agent_identity,
+                    self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"))
+            }
+            guard "member_peer_id_is_not_host" {
+                self.member_rotation_peer_endpoints.contains_key(agent_identity) == false
+                || for_all(host in self.mob_hosts,
+                    mob_machine_host_id_matches_peer_id(
+                        host,
+                        mob_machine_member_peer_endpoint_peer_id(self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"))
+                    ) == false)
+            }
+            update {
+                // The retiring incarnation's archive, as the plain terminal.
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.member_state_markers.remove(agent_runtime_id);
+                self.runtime_retire_archive_only.remove(agent_runtime_id);
+                self.remote_runtime_retired_ids.remove(agent_runtime_id);
+                self.remote_supervisor_revoked_ids.remove(agent_runtime_id);
+                self.runtime_retire_refusal_codes.remove(agent_runtime_id);
+                self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
+                self.runtime_retire_pending_sessions.remove(agent_runtime_id);
+                self.spawn_exec_phase.remove(agent_identity);
+                self.member_prior_peer_endpoints.remove(agent_identity);
+                self.member_restore_failures.remove(agent_identity);
+                self.member_restore_failure_codes.remove(agent_identity);
+                self.member_placement.remove(agent_identity);
+                self.member_materialization_failures.remove(agent_identity);
+                self.pending_respawn_topology.remove(agent_identity);
+                self.abandoned_respawn_topology.remove(agent_identity);
+                self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
+                self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
+                // The next incarnation, seated Dormant on the recorded NEW
+                // session and endpoint in the same step: no non-member window.
+                self.live_runtime_ids.insert(next_agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(next_agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(next_agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
+                self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                self.identity_runtime_generations.insert(agent_identity, next_generation);
+                self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
+                self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
+                self.member_runtime_modes.insert(agent_identity, runtime_mode);
+                self.member_startup_binding_requested.remove(next_agent_runtime_id);
+                self.member_startup_runtime_ready.remove(next_agent_runtime_id);
+                self.member_startup_ready.remove(next_agent_runtime_id);
+                self.member_session_bindings.insert(agent_identity, self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
+                // The recorded endpoint, or (network comms) none until the
+                // next incarnation's first wake registers it.
+                if self.member_rotation_peer_endpoints.contains_key(agent_identity) == true {
+                    self.member_peer_ids.insert(agent_identity, mob_machine_member_peer_endpoint_peer_id(self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value")));
+                    self.member_peer_endpoints.insert(agent_identity, self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"));
+                    self.member_boot_obligation_owed.remove(agent_identity);
+                } else {
+                    self.member_peer_ids.remove(agent_identity);
+                    self.member_peer_endpoints.remove(agent_identity);
+                    self.member_boot_obligation_owed.insert(agent_identity, MemberBootObligationCause::EndpointPending);
+                }
+                self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Dormant);
+                self.member_wake_attempts.remove(agent_identity);
+                self.member_wake_bound.remove(agent_identity);
+                self.member_materialization_epoch.remove(agent_identity);
+                self.member_host_preparation_pending.remove(agent_identity);
+                // The owed kickoff, recorded pending on the next incarnation
+                // in the same step (KickoffClear + KickoffMarkPending): its
+                // boot verdict wakes it, and the kickoff runs once on the new
+                // session.
+                self.member_kickoff_pending.insert(agent_identity);
+                self.member_kickoff_starting.remove(agent_identity);
+                self.member_kickoff_callback_pending.remove(agent_identity);
+                self.member_kickoff_started.remove(agent_identity);
+                self.member_kickoff_failed.remove(agent_identity);
+                self.member_kickoff_cancelled.remove(agent_identity);
+                self.member_kickoff_error.remove(agent_identity);
+                self.member_kickoff_input_ids.remove(agent_identity);
+                self.retained_placed_kickoff_obligations.remove(agent_identity);
+                self.member_placed_kickoff_outcome_kinds.remove(agent_identity);
+                self.member_placed_kickoff_outcome_errors.remove(agent_identity);
+                self.member_placed_kickoff_closure_kinds.remove(agent_identity);
+                self.member_kickoff_objective_ids.insert(agent_identity, kickoff_objective_id);
+                if !self.objective_owner_ids.contains_key(kickoff_objective_id) {
+                    self.objective_owner_ids.insert(kickoff_objective_id, agent_identity);
+                }
+                self.spawn_profile_authority_profile_names.remove(agent_identity);
+                self.spawn_profile_authority_models.remove(agent_identity);
+                self.spawn_profile_authority_material_digests.remove(agent_identity);
+                self.spawn_profile_authority_tool_config_digests.remove(agent_identity);
+                self.spawn_profile_authority_skills_digests.remove(agent_identity);
+                self.spawn_profile_authority_provider_params_digests.remove(agent_identity);
+                self.spawn_profile_authority_output_schema_digests.remove(agent_identity);
+                self.spawn_profile_authority_resolved_spec_digests.remove(agent_identity);
+                self.spawn_profile_authority_external_addressable.remove(agent_identity);
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
+                self.member_rotation_session_ids.remove(agent_identity);
+                self.member_rotation_peer_endpoints.remove(agent_identity);
+                self.topology_epoch += 1;
+            }
+            to Running
+            emit AppendLifecycleJournal { kind: MobLifecycleJournalKind::MemberRetired, agent_identity: Some(agent_identity), agent_runtime_id: Some(agent_runtime_id), fence_token: None, generation: Some(generation), session_id: session_id }
+            emit AppendLifecycleJournal {
+                kind: MobLifecycleJournalKind::MemberSpawned,
+                agent_identity: Some(agent_identity),
+                agent_runtime_id: Some(next_agent_runtime_id),
+                fence_token: Some(next_fence_token),
+                generation: Some(next_generation),
+                session_id: self.member_session_bindings.get_cloned(agent_identity)
+            }
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: session_id, new_session_id: self.member_session_bindings.get_cloned(agent_identity) }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
+            emit PublishWakeRoute { agent_identity: agent_identity }
+            emit PersistKickoffUpdate { member_id: agent_identity, phase: KickoffPhase::Pending }
+            emit EmitKickoffLifecycleNotice { member_id: agent_identity, intent: KickoffIntent::Pending }
+        }
+
+        transition CommitMemberRotationRetiredKickoff {
+            per_phase [Running, Stopped]
+            on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
+            guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
+            guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
+            // R13 / R62: a rotation whose spec owes a kickoff re-seats the
+            // next incarnation with the kickoff recorded pending, so it is
+            // never lost across the rotation (a fresh seat still refuses one).
+            guard "rotation_owes_kickoff" { kickoff_owed == true }
+            // R124: the destroy beats the rotation. Once it is admitted the
+            // identity's retirement ends through the destroy, which drops the
+            // intent; no rotation begins or re-seats a member under it.
+            guard "destroy_not_admitted" { self.destroy_admitted == false }
+            guard "session_ingress_detach_closed" { self.pending_session_ingress_detach_runtime_ids.contains(agent_runtime_id) == false }
+            guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "placed_carrier_absent" { self.current_placed_spawn_ids.contains_key(agent_identity) == false }
+            guard "member_not_placed" { self.member_placement.contains_key(agent_identity) == false }
+            guard "runtime_not_live" { self.live_runtime_ids.contains(agent_runtime_id) == false }
+            guard "fence_token_matches_history" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token) }
+            guard "generation_matches" { self.identity_runtime_generations.get_copied(agent_identity) == Some(generation) }
+            guard "member_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring) }
+            guard "retirement_session_matches" { self.runtime_retire_pending_sessions.get_cloned(agent_runtime_id) == session_id }
+            guard "session_present" { session_id != None }
+            guard "session_binding_matches_or_cleared" {
+                self.member_session_bindings.get_cloned(agent_identity) == None
+                || self.member_session_bindings.get_cloned(agent_identity) == session_id
+            }
+            guard "kickoff_quiesced" {
+                !self.member_kickoff_pending.contains(agent_identity)
+                && !self.member_kickoff_starting.contains(agent_identity)
+                && !self.member_kickoff_callback_pending.contains(agent_identity)
+                && mob_machine_placed_kickoff_custody_absent_for_identity(
+                    self.pending_placed_kickoff_outcomes,
+                    self.resolved_placed_kickoff_outcomes,
+                    agent_identity)
+            }
+            // The next incarnation's seat guards (R5, and the spawn mint).
+            guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
+            guard "next_runtime_fresh" {
+                self.live_runtime_ids.contains(next_agent_runtime_id) == false
+                && next_agent_runtime_id != agent_runtime_id
+            }
+            guard "spawn_profile_name_authorized" { self.spawn_profile_authority_profile_names.contains_key(agent_identity) == true }
+            guard "spawn_profile_addressability_authorized" { self.spawn_profile_authority_external_addressable.get_cloned(agent_identity) == Some(external_addressable) }
+            guard "peer_id_available_for_identity" {
+                self.member_rotation_peer_endpoints.contains_key(agent_identity) == false
+                || mob_machine_member_peer_id_available_for_identity(
+                    self.member_peer_endpoints,
+                    self.member_prior_peer_endpoints,
+                    agent_identity,
+                    self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"))
+            }
+            guard "member_peer_id_is_not_host" {
+                self.member_rotation_peer_endpoints.contains_key(agent_identity) == false
+                || for_all(host in self.mob_hosts,
+                    mob_machine_host_id_matches_peer_id(
+                        host,
+                        mob_machine_member_peer_endpoint_peer_id(self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"))
+                    ) == false)
+            }
+            update {
+                // The retiring incarnation's archive, as the plain terminal.
+                self.live_runtime_ids.remove(agent_runtime_id);
+                self.externally_addressable_runtime_ids.remove(agent_runtime_id);
+                self.runtime_fence_tokens.remove(agent_runtime_id);
+                self.member_startup_binding_requested.remove(agent_runtime_id);
+                self.member_startup_runtime_ready.remove(agent_runtime_id);
+                self.member_startup_ready.remove(agent_runtime_id);
+                self.member_state_markers.remove(agent_runtime_id);
+                self.runtime_retire_archive_only.remove(agent_runtime_id);
+                self.remote_runtime_retired_ids.remove(agent_runtime_id);
+                self.remote_supervisor_revoked_ids.remove(agent_runtime_id);
+                self.runtime_retire_refusal_codes.remove(agent_runtime_id);
+                self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
+                self.runtime_retire_pending_sessions.remove(agent_runtime_id);
+                self.spawn_exec_phase.remove(agent_identity);
+                self.member_prior_peer_endpoints.remove(agent_identity);
+                self.member_restore_failures.remove(agent_identity);
+                self.member_restore_failure_codes.remove(agent_identity);
+                self.member_placement.remove(agent_identity);
+                self.member_materialization_failures.remove(agent_identity);
+                self.pending_respawn_topology.remove(agent_identity);
+                self.abandoned_respawn_topology.remove(agent_identity);
+                self.wiring_edges = mob_machine_wiring_edges_without_identity(self.wiring_edges, agent_identity);
+                self.external_peer_edges = mob_machine_external_peer_edges_without_identity(self.external_peer_edges, agent_identity);
+                self.external_peer_edges_by_key = mob_machine_external_peer_edges_by_key_without_identity(self.external_peer_edges_by_key, agent_identity);
+                // The next incarnation, seated Dormant on the recorded NEW
+                // session and endpoint in the same step: no non-member window.
+                self.live_runtime_ids.insert(next_agent_runtime_id);
+                if external_addressable {
+                    self.externally_addressable_runtime_ids.insert(next_agent_runtime_id);
+                } else {
+                    self.externally_addressable_runtime_ids.remove(next_agent_runtime_id);
+                }
+                self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
+                self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                self.identity_runtime_generations.insert(agent_identity, next_generation);
+                self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
+                self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
+                self.member_runtime_modes.insert(agent_identity, runtime_mode);
+                self.member_startup_binding_requested.remove(next_agent_runtime_id);
+                self.member_startup_runtime_ready.remove(next_agent_runtime_id);
+                self.member_startup_ready.remove(next_agent_runtime_id);
+                self.member_session_bindings.insert(agent_identity, self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
+                // The recorded endpoint, or (network comms) none until the
+                // next incarnation's first wake registers it.
+                if self.member_rotation_peer_endpoints.contains_key(agent_identity) == true {
+                    self.member_peer_ids.insert(agent_identity, mob_machine_member_peer_endpoint_peer_id(self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value")));
+                    self.member_peer_endpoints.insert(agent_identity, self.member_rotation_peer_endpoints.get_cloned(agent_identity).get("value"));
+                    self.member_boot_obligation_owed.remove(agent_identity);
+                } else {
+                    self.member_peer_ids.remove(agent_identity);
+                    self.member_peer_endpoints.remove(agent_identity);
+                    self.member_boot_obligation_owed.insert(agent_identity, MemberBootObligationCause::EndpointPending);
+                }
+                self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Dormant);
+                self.member_wake_attempts.remove(agent_identity);
+                self.member_wake_bound.remove(agent_identity);
+                self.member_materialization_epoch.remove(agent_identity);
+                self.member_host_preparation_pending.remove(agent_identity);
+                // The owed kickoff, recorded pending on the next incarnation
+                // in the same step (KickoffClear + KickoffMarkPending): its
+                // boot verdict wakes it, and the kickoff runs once on the new
+                // session.
+                self.member_kickoff_pending.insert(agent_identity);
+                self.member_kickoff_starting.remove(agent_identity);
+                self.member_kickoff_callback_pending.remove(agent_identity);
+                self.member_kickoff_started.remove(agent_identity);
+                self.member_kickoff_failed.remove(agent_identity);
+                self.member_kickoff_cancelled.remove(agent_identity);
+                self.member_kickoff_error.remove(agent_identity);
+                self.member_kickoff_input_ids.remove(agent_identity);
+                self.retained_placed_kickoff_obligations.remove(agent_identity);
+                self.member_placed_kickoff_outcome_kinds.remove(agent_identity);
+                self.member_placed_kickoff_outcome_errors.remove(agent_identity);
+                self.member_placed_kickoff_closure_kinds.remove(agent_identity);
+                self.member_kickoff_objective_ids.insert(agent_identity, kickoff_objective_id);
+                if !self.objective_owner_ids.contains_key(kickoff_objective_id) {
+                    self.objective_owner_ids.insert(kickoff_objective_id, agent_identity);
+                }
+                self.spawn_profile_authority_profile_names.remove(agent_identity);
+                self.spawn_profile_authority_models.remove(agent_identity);
+                self.spawn_profile_authority_material_digests.remove(agent_identity);
+                self.spawn_profile_authority_tool_config_digests.remove(agent_identity);
+                self.spawn_profile_authority_skills_digests.remove(agent_identity);
+                self.spawn_profile_authority_provider_params_digests.remove(agent_identity);
+                self.spawn_profile_authority_output_schema_digests.remove(agent_identity);
+                self.spawn_profile_authority_resolved_spec_digests.remove(agent_identity);
+                self.spawn_profile_authority_external_addressable.remove(agent_identity);
+                self.member_run_open.remove(agent_identity);
+                self.member_in_flight_work.remove(agent_identity);
+                self.member_progress_tokens.remove(agent_identity);
+                self.member_last_observed_at_ms.remove(agent_identity);
+                self.member_last_progress_at_ms.remove(agent_identity);
+                self.member_last_progress_event.remove(agent_identity);
+                self.member_health_class.remove(agent_identity);
+                self.member_rotation_session_ids.remove(agent_identity);
+                self.member_rotation_peer_endpoints.remove(agent_identity);
+                self.topology_epoch += 1;
+            }
+            to Running
+            emit AppendLifecycleJournal { kind: MobLifecycleJournalKind::MemberRetired, agent_identity: Some(agent_identity), agent_runtime_id: Some(agent_runtime_id), fence_token: None, generation: Some(generation), session_id: session_id }
+            emit AppendLifecycleJournal {
+                kind: MobLifecycleJournalKind::MemberSpawned,
+                agent_identity: Some(agent_identity),
+                agent_runtime_id: Some(next_agent_runtime_id),
+                fence_token: Some(next_fence_token),
+                generation: Some(next_generation),
+                session_id: self.member_session_bindings.get_cloned(agent_identity)
+            }
+            emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: session_id, new_session_id: self.member_session_bindings.get_cloned(agent_identity) }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Retired }
+            emit EmitMemberLifecycleNotice { kind: MemberLifecycleKind::Spawned }
+            emit PublishWakeRoute { agent_identity: agent_identity }
+            emit PersistKickoffUpdate { member_id: agent_identity, phase: KickoffPhase::Pending }
+            emit EmitKickoffLifecycleNotice { member_id: agent_identity, intent: KickoffIntent::Pending }
         }
     }
         }
@@ -27965,6 +28388,23 @@ pub enum MemberBootObligationCause {
     #[default]
     Obligation,
     EndpointPending,
+}
+
+/// The machine's release verdict for one member: the shell's release path
+/// answers through it, never from a shell phase read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum MemberReleaseVerdict {
+    /// A local, seated, Live member: its registration is released.
+    #[default]
+    Release,
+    /// Dormant, or no phase (Broken, retiring, unbound): nothing to release.
+    NothingMaterialized,
+    /// Waking: a wake is in flight.
+    WakeInFlight,
+    /// A placed member: its member host owns its materialization.
+    HostOwned,
+    /// The identity is not seated.
+    NotAMember,
 }
 
 /// A runtime registration epoch, as the composition route carries it.

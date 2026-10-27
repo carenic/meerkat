@@ -533,26 +533,27 @@ fi
 # carry-out; one identity through every WakeMember arm, every attempt-fenced
 # resolution and its stale twin in Running and Stopped, the runtime-ready
 # observation, every release shape, the drift and terminal classifications,
-# the peer notice classification and the mob's stop and resume; one identity
-# woken, released, retired (routed or archive-only), rotated and destroyed;
-# one identity in the Completed and Destroyed phases; one identity through
-# an explicit resume; two identities and one wiring edge (I8); two
-# identities from the spawn ladder's Opened phase through the dormant seat
-# (R5), the embodied spawn, the release (R12) and the rotation; and two
-# identities woken beside each other. Under every generated invariant plus
-# AP1 (no recovery or seat arm overwrites a phase), AP2 (an open attempt is
-# never replaced and ends only Live, Dormant or without a phase, and every
+# the peer notice classification, the release verdict and the mob's stop and
+# resume; one identity woken, released, retired (routed or archive-only),
+# rotated and destroyed; one identity in the Completed and Destroyed phases;
+# one identity through an explicit resume; two identities and one wiring edge
+# (I8); two identities from the spawn ladder's Opened phase through the
+# dormant seat (R5), the embodied spawn, the release (R12) and the rotation;
+# and two identities woken beside each other. Under every generated invariant
+# plus AP1 (no recovery or seat arm overwrites a phase), AP2 (an open attempt
+# is never replaced and ends only Live, Dormant or without a phase, and every
 # Waking member has an enabled closing arm of every kind), AP3 (a Lifecycle
-# input never wakes), WakeMember totality, a local wake that closes Live
-# only with a registered endpoint, the release epoch fence, no runtime
-# retire routed for a member with no registration, a settled retirement
-# that can always archive (under an admitted destroy no rotation or host
-# carry-out holds it) and no rotation under an admitted destroy, with the I5
-# ASSUME over the wake refusal helper. It runs with TLC coverage and
-# requires every listed arm to fire and a floor of distinct states per run,
-# and requires its twenty-three witnesses reached. Its --mutants mode (run
-# by hand, outside the shard's budget) refuses thirty-one seeded defects,
-# one per residency invariant and property.
+# input never wakes), WakeMember totality, a local wake that owes an endpoint
+# closes Live only with it (and one that owes none always can), a boot plan
+# that never leaves a member blocking the seal, the release verdict helper,
+# the release epoch fence, no runtime retire routed for a member with no
+# registration, a settled retirement that can always archive (under an
+# admitted destroy no rotation or host carry-out holds it) and no rotation
+# under an admitted destroy, with the I5 ASSUME over the wake refusal helper.
+# It runs with TLC coverage and requires every listed arm to fire and a floor
+# of distinct states per run, and requires its twenty-four witnesses reached.
+# Its --mutants mode (run by hand, outside the shard's budget) refuses
+# thirty-four seeded defects, one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
   echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2
