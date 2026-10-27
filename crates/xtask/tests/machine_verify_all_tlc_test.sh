@@ -499,6 +499,23 @@ if run_part audits-b; then
   TLC_WORKERS="${tlc_workers}" "${member_lifecycle_audit}" --mutants
 fi
 
+# The MobMachine arm-coverage gate: every arm of the generated model's Next
+# relation is either in a hand-written audit runner's covered_actions array
+# (each runner checks with TLC coverage that every listed arm fires) or named
+# in specs/machines/mob_machine/arm_coverage_not_covered.txt with the reason
+# no audit drives it. A stale, contradictory or reasonless entry fails it too.
+# It reads model.tla and the runners only and runs no TLC, so it costs
+# seconds in the shard of the member lifecycle audit it reads.
+mob_arm_coverage_gate="${workspace_root}/specs/machines/mob_machine/arm_coverage_gate.sh"
+if [[ ! -x "${mob_arm_coverage_gate}" ]]; then
+  echo "error: MobMachine arm-coverage gate is missing from workspace runfiles: ${mob_arm_coverage_gate}" >&2
+  exit 1
+fi
+if run_part audits-b; then
+  echo "running MobMachine arm coverage gate"
+  "${mob_arm_coverage_gate}"
+fi
+
 # The SessionDocumentMachine durable-tail classification (Completed,
 # Repairable, Ambiguous, by the store's durable head relation, the tail's
 # run-id count, terminal stop reason, dangling tool uses, orphan results and

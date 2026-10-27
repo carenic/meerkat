@@ -24,6 +24,16 @@ pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
     RetireAtScopeVerdictKind, SpawnExecPhase, StepFaultDispositionKind, StepOutputFaultKind,
     SupervisorEscalationFailureCause, TurnTimeoutDisposition, WorkContentAttribution,
 };
+// Member residency (Dormant / Waking / Live): the schema's own types, one
+// definition for both instantiations of the machine.
+pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
+    BootMaterializationKind, CompositionAuthorityKind, MemberBootObligationCause,
+    MemberMaterializationLossCause, MemberMaterializationPhase,
+    MemberMaterializationReleaseOutcome, MemberRecoveryObligationKind, MemberRestorePolicyKind,
+    MemberWakeAbandonCause, MemberWakeAbandonKind, MemberWakeCause, MemberWakeFeedbackVerdict,
+    MemberWakeRefusalKind, MemberWakeRetryableKind, MemberWakeVerdictKind, PeerInputClass,
+    PeerNoticeDisposition, PeerTransportKind, RuntimeEpochId,
+};
 
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
 pub type OpaquePrincipalToken = meerkat_core::service::OpaquePrincipalToken;
@@ -1379,11 +1389,52 @@ impl WiringEdge {
     serde::Serialize,
     serde::Deserialize,
 )]
+#[serde(from = "MemberPeerEndpointWire")]
 pub struct MemberPeerEndpoint {
     pub name: PeerName,
     pub peer_id: PeerId,
     pub address: PeerAddress,
     pub signing_key: PeerSigningKey,
+    /// Derived from `address`: set only by the constructors below and by
+    /// deserialization, never stored, so the persisted shape is unchanged.
+    #[serde(skip_serializing)]
+    pub transport: PeerTransportKind,
+}
+
+/// The stored shape of a member endpoint (no transport field).
+#[derive(serde::Deserialize)]
+struct MemberPeerEndpointWire {
+    name: PeerName,
+    peer_id: PeerId,
+    address: PeerAddress,
+    signing_key: PeerSigningKey,
+}
+
+impl From<MemberPeerEndpointWire> for MemberPeerEndpoint {
+    fn from(wire: MemberPeerEndpointWire) -> Self {
+        Self::new(wire.name, wire.peer_id, wire.address, wire.signing_key)
+    }
+}
+
+impl MemberPeerEndpoint {
+    /// An endpoint whose transport is derived from its address (G3). Build
+    /// endpoints with this or `From<&TrustedPeerDescriptor>`, never with a
+    /// struct literal, so the transport cannot drift from the address.
+    pub fn new(
+        name: PeerName,
+        peer_id: PeerId,
+        address: PeerAddress,
+        signing_key: PeerSigningKey,
+    ) -> Self {
+        let transport = PeerTransportKind::from_address_str(address.0.as_str());
+        Self {
+            name,
+            peer_id,
+            address,
+            signing_key,
+            transport,
+        }
+    }
 }
 
 impl From<&meerkat_core::comms::TrustedPeerDescriptor> for MemberPeerEndpoint {
@@ -1393,6 +1444,7 @@ impl From<&meerkat_core::comms::TrustedPeerDescriptor> for MemberPeerEndpoint {
             peer_id: PeerId(spec.peer_id.to_string()),
             address: PeerAddress(spec.address.to_string()),
             signing_key: PeerSigningKey(spec.pubkey),
+            transport: PeerTransportKind::from_transport(spec.address.transport()),
         }
     }
 }
@@ -2277,7 +2329,7 @@ impl MobMachineState {
                 .identity_runtime_fence_tokens
                 .contains_key(agent_identity)
             && !self.spawn_exec_phase.contains_key(agent_identity)
-            && !self.member_revival_pending.contains(agent_identity)
+            && !self.member_wake_attempts.contains_key(agent_identity)
             && !self
                 .member_materialization_failures
                 .contains_key(agent_identity)
@@ -4283,6 +4335,7 @@ mod tests {
             ),
             address: PeerAddress(format!("inproc://{name}")),
             signing_key: PeerSigningKey(signing_key),
+            transport: PeerTransportKind::Inproc,
         }
     }
 
@@ -6167,6 +6220,7 @@ mod tests {
                     peer_id: PeerId("ascending-peer-id".to_string()),
                     address: PeerAddress("tcp://placed-member.test:4200".to_string()),
                     signing_key: PeerSigningKey([3; 32]),
+                    transport: PeerTransportKind::Tcp,
                 },
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
@@ -6440,6 +6494,7 @@ mod tests {
             peer_id: PeerId(meerkat_core::comms::PeerId::from_ed25519_pubkey(&[9; 32]).to_string()),
             address: PeerAddress("inproc://late-retired-peer".to_string()),
             signing_key: PeerSigningKey([9; 32]),
+            transport: PeerTransportKind::Inproc,
         };
         assert!(
             MobMachineMutator::apply(
@@ -6903,6 +6958,7 @@ mod tests {
                     peer_id: PeerId("scoped-retire-placed-peer".to_string()),
                     address: PeerAddress("tcp://scoped-retire-placed-member.test:4200".to_string()),
                     signing_key: PeerSigningKey([3; 32]),
+                    transport: PeerTransportKind::Tcp,
                 },
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
@@ -7626,6 +7682,7 @@ mod tests {
                     peer_id: PeerId("placed-health-peer".to_string()),
                     address: PeerAddress("tcp://placed-health-member.test:4200".to_string()),
                     signing_key: PeerSigningKey([3; 32]),
+                    transport: PeerTransportKind::Tcp,
                 },
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
@@ -8161,6 +8218,7 @@ mod tests {
                     peer_id: PeerId("placed-ext-peer".to_string()),
                     address: PeerAddress("tcp://placed-ext-member.test:4200".to_string()),
                     signing_key: PeerSigningKey([3; 32]),
+                    transport: PeerTransportKind::Tcp,
                 },
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
@@ -8315,6 +8373,7 @@ mod tests {
             peer_id: PeerId("peer-id".to_string()),
             address: PeerAddress("tcp://placed-member.test:4200".to_string()),
             signing_key: PeerSigningKey([3; 32]),
+            transport: PeerTransportKind::Tcp,
         };
         let recovery_signal = || MobMachineSignal::RecoverCommittedPlacedSpawn {
             spawn_id: spawn_id.clone(),
@@ -8414,6 +8473,7 @@ mod tests {
             peer_id: PeerId("shared-peer-id".to_string()),
             address: PeerAddress("tcp://placed-member.test:4200".to_string()),
             signing_key: PeerSigningKey([3; 32]),
+            transport: PeerTransportKind::Tcp,
         };
         let mut authority = MobMachineAuthority::new();
         authority
@@ -8949,6 +9009,7 @@ mod tests {
                     peer_id: PeerId("placed-kickoff-peer".to_string()),
                     address: PeerAddress("tcp://placed-kickoff-member.test:4200".to_string()),
                     signing_key: PeerSigningKey([3; 32]),
+                    transport: PeerTransportKind::Tcp,
                 },
                 profile_name: "worker".to_string(),
                 runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,

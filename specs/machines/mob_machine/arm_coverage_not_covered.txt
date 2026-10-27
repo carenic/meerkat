@@ -1,0 +1,14 @@
+# MobMachine arms that no hand-written audit drives, each with the reason.
+#
+# Read by arm_coverage_gate.sh, which fails on any arm of the generated
+# model's Next relation that is neither in an audit runner's covered_actions
+# array (checked to fire by that audit's TLC coverage) nor matched here.
+#
+# Format: one entry per line, `<ArmName> <reason>` or `<Prefix>* <reason>`
+# for an arm family. Arm names are the expanded names of model.tla (a
+# per_phase transition expands to one arm per phase, suffixed with the
+# phase). `#` starts a comment. An entry that names no uncovered arm, an exact
+# entry that names a covered arm, a duplicate and an entry without a reason
+# fail the gate. `arm_coverage_gate.sh --list-uncovered` prints the arms that
+# still need an entry or an audit.
+ClassifyFlow* flow-engine verdict classifiers over flow run, step and frame state, outside the member lifecycle; no hand-written audit drives them

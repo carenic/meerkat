@@ -745,6 +745,40 @@ else
   bad "a workflow or action installs TLC outside setup-tlc-ci, or downloads the rolling tlaplus jar"
 fi
 
+# The MobMachine arm-coverage gate reads the generated Next relation, the
+# audit runners' covered_actions arrays and the not-covered list. On a
+# synthetic spec directory it must pass a complete classification and refuse
+# an unlisted arm, a stale entry, an exact entry for a covered arm and an
+# entry without a reason.
+arm_gate_tmp="$(mktemp -d)"
+cp specs/machines/mob_machine/arm_coverage_gate.sh "$arm_gate_tmp/"
+printf '%s\n' \
+  'Next ==' \
+  '    \/ (phase = "Running") /\ \E agent_identity \in AgentIdentityValues : ArmCoveredRunning(agent_identity)' \
+  '    \/ ArmListedRunning' \
+  '    \/ (phase = "Stopped") /\ ArmFamilyOneStopped' \
+  '    \/ ArmFamilyTwoStopped' \
+  '    \/ TerminalStutter' \
+  '' \
+  'Spec == Init /\ [][Next]_vars' \
+  > "$arm_gate_tmp/model.tla"
+printf '%s\n' '#!/usr/bin/env bash' 'covered_actions=(' '  ArmCoveredRunning' '  AuditWrapper' ')' \
+  > "$arm_gate_tmp/probe_audit.sh"
+arm_gate_run() {
+  printf '%s\n' "$@" > "$arm_gate_tmp/arm_coverage_not_covered.txt"
+  bash "$arm_gate_tmp/arm_coverage_gate.sh" >/dev/null 2>&1
+}
+if arm_gate_run '# header' 'ArmListedRunning listed with a reason' 'ArmFamily* a family with a reason' \
+  && ! arm_gate_run 'ArmFamily* a family with a reason' \
+  && ! arm_gate_run 'ArmListedRunning listed' 'ArmFamily* family' 'ArmGone stale entry' \
+  && ! arm_gate_run 'ArmListedRunning listed' 'ArmFamily* family' 'ArmCoveredRunning contradicts the audit' \
+  && ! arm_gate_run 'ArmListedRunning' 'ArmFamily* family'; then
+  ok "MobMachine arm-coverage gate passes a complete classification and refuses unlisted, stale, contradictory and reasonless entries"
+else
+  bad "MobMachine arm-coverage gate accepts an unclassified arm or a bad not-covered entry, or refuses a complete one"
+fi
+rm -rf "$arm_gate_tmp"
+
 echo ""
 echo "gate summary: ${pass} passed, ${fail} failed"
 if [ "$fail" -ne 0 ]; then

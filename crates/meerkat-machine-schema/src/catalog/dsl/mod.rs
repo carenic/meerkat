@@ -3795,6 +3795,9 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                     TypePathStructField::named("peer_id", "PeerId"),
                     TypePathStructField::named("address", "PeerAddress"),
                     TypePathStructField::named("signing_key", "PeerSigningKey"),
+                    // Derived from the parsed address (G3); the boot plan
+                    // wakes a network (Tcp or Uds) member.
+                    TypePathStructField::named("transport", "PeerTransportKind"),
                 ],
             ),
             NamedTypeBinding::type_path_struct(
@@ -4043,6 +4046,101 @@ pub fn mob_machine_schema_metadata() -> MachineSchemaMetadata {
                 "MemberRevivalVerdictKind",
                 &["ReviveAuthorized", "BrokenRecorded"],
             ),
+            // Member residency (Dormant / Waking / Live).
+            NamedTypeBinding::string_enum(
+                "MemberMaterializationPhase",
+                &["Dormant", "Waking", "Live"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeCause",
+                &["Boot", "HostDelivery", "PeerDelivery", "Operator"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeVerdictKind",
+                &["Authorized", "Joined", "AlreadyLive", "Refused"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeRefusalKind",
+                &[
+                    "Broken",
+                    "Retiring",
+                    "NotAMember",
+                    "HostOwned",
+                    "MobNotRunning",
+                    "LifecycleOriginFenced",
+                    "NonAuthoritativeComposition",
+                    "HostPreparationPending",
+                    "ResumeGateUnavailable",
+                    "SuppressedLifecycleNotice",
+                    "SenderWaking",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeRetryableKind",
+                &[
+                    "ResumeGateUnavailable",
+                    "HostingClaimHeld",
+                    "WakeTimedOut",
+                    "BuildPreparationRefused",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeAbandonKind",
+                &[
+                    "NotCurrent",
+                    "ReloadRefused",
+                    "Unsettled",
+                    "ReadinessFailed",
+                    "TopologyFailed",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeAbandonCause",
+                &["MobStopping", "MobCompleting", "MobDestroying"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberWakeFeedbackVerdict",
+                &["Applied", "StaleAttempt"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberMaterializationLossCause",
+                &[
+                    "RegistrationReleased",
+                    "ExecutorRetired",
+                    "ActorDiscarded",
+                    "DurabilityReload",
+                    "ReconfigureRollback",
+                    "ObservedMissing",
+                ],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberMaterializationReleaseOutcome",
+                &["Released", "Stale"],
+            ),
+            NamedTypeBinding::string_enum(
+                "CompositionAuthorityKind",
+                &["Authoritative", "NonAuthoritative"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberRecoveryObligationKind",
+                &["None", "RuntimeWork", "PendingDelivery", "Unobserved"],
+            ),
+            NamedTypeBinding::string_enum(
+                "BootMaterializationKind",
+                &["Wake", "StayDormant", "VerifyThenDormant"],
+            ),
+            NamedTypeBinding::string_enum(
+                "MemberRestorePolicyKind",
+                &["OnDemand", "OnDemandVerified", "Eager"],
+            ),
+            NamedTypeBinding::string_enum("PeerInputClass", &["Content", "Lifecycle"]),
+            NamedTypeBinding::string_enum("PeerNoticeDisposition", &["Deliver", "Suppressed"]),
+            NamedTypeBinding::string_enum("PeerTransportKind", &["Inproc", "Tcp", "Uds"]),
+            NamedTypeBinding::string_enum(
+                "MemberBootObligationCause",
+                &["Obligation", "EndpointPending"],
+            ),
+            NamedTypeBinding::string("RuntimeEpochId"),
             NamedTypeBinding::string("ResumeAttemptId"),
             NamedTypeBinding::u64("MobDefinitionEpoch"),
             NamedTypeBinding::type_path_struct(
