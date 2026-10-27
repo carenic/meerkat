@@ -132,7 +132,7 @@ where
                         } => crate::JobDeliveryApplyError::Authorization(
                             meerkat_core::OperationAuthorizationError::Unavailable,
                         ),
-                        // Another runtime owner hosts the recipient (#1813): its
+                        // Another runtime owner hosts the recipient: its
                         // registration was refused; a skip, never a block.
                         meerkat_runtime::RuntimeDriverError::ServedElsewhere { session_id } => {
                             crate::JobDeliveryApplyError::ServedElsewhere { session_id }

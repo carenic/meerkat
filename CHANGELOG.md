@@ -123,6 +123,13 @@ them.
   `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
   (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
   boot restore records it. Reads never wake.
+- `meerkat-session`: `PersistentSessionService::prepare_cold_attach_as_owner`
+  and `prepare_cold_attach_reporting_as_owner`: the cold attach of a session
+  by its own owner (a mob settling its member's session), which does not ask
+  that owner to wake the session first. `prepare_cold_attach` and
+  `prepare_cold_attach_reporting` now ask the owner of a session another
+  owner holds in the process (a mob holding the member dormant) to wake it
+  before they would attach it themselves.
 - `meerkat-mob`: `MobHandle::release_member(identity)` makes a member dormant:
   it releases the member's materialization in its process while the member is
   quiescent, and keeps it seated at the same session, generation and fence;
