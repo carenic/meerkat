@@ -14575,6 +14575,14 @@ impl ProvisionFinish {
                             .ops_adapter
                             .capture_session_binding_witness(&created_bridge_session_id);
                     }
+                    #[cfg(test)]
+                    if provision_finish_test_hooks::take_failure_after_generated_bind(
+                        &created_bridge_session_id,
+                    ) {
+                        return Err(MobError::Internal(format!(
+                            "injected failure of the provision of '{created_bridge_session_id}' after its generated bind"
+                        )));
+                    }
                 }
                 tracing::debug!(
                     bridge_session_id = %created_bridge_session_id,
@@ -14701,6 +14709,47 @@ impl ProvisionFinish {
             return Err(error);
         }
         finalize_result
+    }
+}
+
+/// Test seam: a member provision that fails right after it bound its
+/// generated operation owner.
+#[cfg(test)]
+pub(crate) mod provision_finish_test_hooks {
+    use std::sync::{Mutex, PoisonError};
+
+    use meerkat_core::types::SessionId;
+
+    static FAILING_AFTER_GENERATED_BIND: Mutex<Vec<SessionId>> = Mutex::new(Vec::new());
+
+    /// The next provision of `session` fails right after its generated bind,
+    /// once.
+    pub(crate) fn fail_after_generated_bind(session: &SessionId) {
+        FAILING_AFTER_GENERATED_BIND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .push(session.clone());
+    }
+
+    /// Whether the failure armed for `session` has not fired yet.
+    pub(crate) fn failure_after_generated_bind_armed(session: &SessionId) -> bool {
+        FAILING_AFTER_GENERATED_BIND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains(session)
+    }
+
+    pub(super) fn take_failure_after_generated_bind(session: &SessionId) -> bool {
+        let mut armed = FAILING_AFTER_GENERATED_BIND
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        match armed.iter().position(|candidate| candidate == session) {
+            Some(index) => {
+                armed.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 }
 
