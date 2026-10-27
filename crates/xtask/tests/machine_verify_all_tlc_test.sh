@@ -535,27 +535,28 @@ fi
 # Running and Stopped, the seat session replay, the runtime-ready observation,
 # every release shape, the drift and terminal classifications, the peer notice
 # classification, the release verdict and the mob's stop and resume; one
-# identity woken, released, retired (routed or archive-only), rotated and
-# destroyed; one identity in the Completed and Destroyed phases; one identity
-# through an explicit resume; two identities and one wiring edge; two
-# identities from the spawn ladder's Opened phase through the dormant seat,
-# the embodied spawn, the release and the rotation; and two identities woken
-# beside each other. Under every generated invariant plus the audit's own
-# properties (no recovery or seat arm overwrites a phase, an open attempt is
-# never replaced and ends only Live, Dormant or without a phase, every Waking
-# member has an enabled closing arm of every kind, a Lifecycle input never
-# wakes), WakeMember totality, a local wake that owes an endpoint closes Live
-# only with it (and one owing no endpoint cause always can), a boot plan that
-# never leaves a member blocking the seal, the release verdict helper and its
-# agreement with the Released arm, the attempt fence on the routed binding
-# refusal, the fresh create only for an unborn seat's session, the release
-# epoch fence, no runtime retire routed for a member with no registration, a
-# settled retirement that can always archive (under an admitted destroy no
-# rotation or host carry-out holds it) and no rotation under an admitted
-# destroy, with the ASSUME over the wake refusal helper. It
+# identity woken, released, retired (routed or archive-only), rotated, seated
+# again on its first seat's session and destroyed; one identity in the
+# Completed and Destroyed phases; one identity through an explicit resume; two
+# identities and one wiring edge; two identities from the spawn ladder's
+# Opened phase through the dormant seat, the embodied spawn, the release and
+# the rotation; and two identities woken beside each other. Under every
+# generated invariant plus the audit's own properties (no recovery or seat arm
+# overwrites a phase, an open attempt is never replaced and ends only Live,
+# Dormant or without a phase, every Waking member has an enabled closing arm of
+# every kind, a Lifecycle input never wakes), WakeMember totality, a local wake
+# that owes an endpoint closes Live only with it (and one owing no endpoint
+# cause always can), a boot plan that never leaves a member blocking the seal,
+# the release verdict helper and its agreement with the Released arm, the
+# attempt fence on the routed binding refusal, the fresh create only for an
+# unborn seat's session, the release epoch fence, no runtime retire routed for
+# a member with no registration, a settled retirement that can always archive
+# (under an admitted destroy no rotation or host carry-out holds it), no
+# rotation under an admitted destroy and a resume seat unborn exactly when no
+# build created its session, with the ASSUME over the wake refusal helper. It
 # runs with TLC coverage and requires every listed arm to fire and a floor of
-# distinct states per run, and requires its twenty-nine witnesses reached. Its
-# --mutants mode (run by hand, outside the shard's budget) refuses forty-two
+# distinct states per run, and requires its thirty witnesses reached. Its
+# --mutants mode (run by hand, outside the shard's budget) refuses forty-five
 # seeded defects, one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then

@@ -586,6 +586,14 @@ macro_rules! mob_catalog_machine_dsl {
             // so does the member leaving or the mob's reset or destroy. A
             // session missing for any other member is never created afresh.
             member_seat_session_unborn: Set<AgentIdentity>,
+            // Sessions a seat or a rotation named for an unborn seat that no
+            // build has created yet (no session-created step followed). The
+            // record outlives the member: a retire before the first wake keeps
+            // it, so a later seat naming that session seats it unborn and its
+            // first wake creates it, where a session that was created and is
+            // gone is lost. The session-created step and the born replay row
+            // drop it, as do the mob's reset and destroy.
+            unborn_seat_sessions: Set<SessionId>,
         }
 
         init(Running) {
@@ -888,6 +896,7 @@ macro_rules! mob_catalog_machine_dsl {
             owed_edge_repairs = EmptySet,
             owed_external_edge_repairs = EmptySet,
             member_seat_session_unborn = EmptySet,
+            unborn_seat_sessions = EmptySet,
         }
 
         terminal [Destroyed]
@@ -1808,7 +1817,7 @@ macro_rules! mob_catalog_machine_dsl {
             // A seat: membership without materialization (import and new
             // roster identities). Walks the spawn admission ladder
             // (BeginSpawnExec + AuthorizeSpawnProfile) and commits Dormant.
-            CommitDormantSeat { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, runtime_mode: Enum<SpawnPolicyRuntimeMode>, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: bool, kickoff_owed: bool, session_unborn: bool },
+            CommitDormantSeat { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, runtime_mode: Enum<SpawnPolicyRuntimeMode>, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: bool, kickoff_owed: bool, session_unborn: bool, fresh_launch: bool },
             // The host carried out an identity's pending preparation on an
             // identity already seated on that session.
             ResolveMemberHostPreparation { agent_identity: AgentIdentity },
@@ -4219,9 +4228,6 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_state_markers.get_cloned(rid) == Some(MobMemberState::Retiring))
         }
 
-        // An owed edge repair is a wired edge between seated members, and an
-        // owed external repair is a wired external edge of a seated member:
-        // the edge going, or an end being unseated, clears it.
         // An unborn seat is a seated member: every unseat clears it.
         invariant seat_session_unborn_is_seated {
             for_all(id in self.member_seat_session_unborn,
@@ -4238,6 +4244,17 @@ macro_rules! mob_catalog_machine_dsl {
                 && self.member_materialization.get_cloned(id) != Some(MemberMaterializationPhase::Live))
         }
 
+        // An unborn seat's bound session is recorded as one no build has
+        // created, so the record survives the member.
+        invariant unborn_seat_session_is_recorded {
+            for_all(id in self.member_seat_session_unborn,
+                self.member_session_bindings.contains_key(id) == false
+                || self.unborn_seat_sessions.contains(self.member_session_bindings.get_cloned(id).get("value")))
+        }
+
+        // An owed edge repair is a wired edge between seated members, and an
+        // owed external repair is a wired external edge of a seated member:
+        // the edge going, or an end being unseated, clears it.
         invariant owed_edge_repairs_join_seated_members {
             for_all(edge in self.owed_edge_repairs,
                 self.wiring_edges.contains(edge)
@@ -14126,6 +14143,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
                 self.member_seat_session_unborn = EmptySet;
+                self.unborn_seat_sessions = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -14604,6 +14622,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
                 self.member_seat_session_unborn = EmptySet;
+                self.unborn_seat_sessions = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.topology_epoch += 1;
             }
@@ -21502,6 +21521,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
                 self.member_seat_session_unborn = EmptySet;
+                self.unborn_seat_sessions = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -25109,7 +25129,7 @@ macro_rules! mob_catalog_machine_dsl {
         // it is seated owed EndpointPending (the seal's typed exception), its boot
         // verdict wakes it, and the wake registers the real endpoint.
         transition CommitDormantSeatRunning {
-            on input CommitDormantSeat { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed, session_unborn }
+            on input CommitDormantSeat { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed, session_unborn, fresh_launch }
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
@@ -25126,6 +25146,14 @@ macro_rules! mob_catalog_machine_dsl {
             guard "spawn_profile_addressability_authorized" { self.spawn_profile_authority_external_addressable.get_cloned(agent_identity) == Some(external_addressable) }
             // Never bind an archived session.
             guard "session_not_archived" { session_archived == false }
+            // A session no build has created is seated unborn whatever the
+            // store shows (the first wake adopts one an interrupted create
+            // left): the record, not the store, tells it from a lost session.
+            guard "never_born_session_seats_unborn" { session_unborn == true || self.unborn_seat_sessions.contains(bridge_session_id) == false }
+            // An unborn seat names the session minted for a fresh launch or one
+            // no build has created. A lost session (created, then gone) is
+            // never seated unborn, so it is never created afresh.
+            guard "unborn_seat_session_is_new_or_never_born" { session_unborn == false || fresh_launch == true || self.unborn_seat_sessions.contains(bridge_session_id) == true }
             // RegisterMemberPeerRunning's peer-registration guards, for a
             // seat that carries its endpoint.
             guard "peer_id_available_for_identity" {
@@ -25168,10 +25196,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_ready.remove(agent_runtime_id);
                 self.member_session_bindings.insert(agent_identity, bridge_session_id);
                 // A fresh launch's seat builds nothing: its session is unborn
-                // until the first wake creates it. A seat over an existing
+                // until the first wake creates it, and so is a seat naming a
+                // session no build has created. A seat over an existing
                 // session (a resume) states it born.
                 if session_unborn == true {
                     self.member_seat_session_unborn.insert(agent_identity);
+                    self.unborn_seat_sessions.insert(bridge_session_id);
                 } else {
                     self.member_seat_session_unborn.remove(agent_identity);
                 }
@@ -25414,6 +25444,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
                 // The next incarnation's session is created by its first wake.
                 self.member_seat_session_unborn.insert(agent_identity);
+                self.unborn_seat_sessions.insert(self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -25586,6 +25617,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
                 // The next incarnation's session is created by its first wake.
                 self.member_seat_session_unborn.insert(agent_identity);
+                self.unborn_seat_sessions.insert(self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -26158,6 +26190,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
                 // The next incarnation's session is created by its first wake.
                 self.member_seat_session_unborn.insert(agent_identity);
+                self.unborn_seat_sessions.insert(self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -26341,6 +26374,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
                 // The next incarnation's session is created by its first wake.
                 self.member_seat_session_unborn.insert(agent_identity);
+                self.unborn_seat_sessions.insert(self.member_rotation_session_ids.get_cloned(agent_identity).get("value"));
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -26864,6 +26898,7 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.member_wake_bound.insert(agent_identity);
                 self.member_seat_session_unborn.remove(agent_identity);
+                self.unborn_seat_sessions.remove(self.member_session_bindings.get_cloned(agent_identity).get("value"));
             }
             to Running
             emit RequestRuntimeBinding {
@@ -26901,6 +26936,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "seat_session_unborn_row" { unborn == true }
             guard "replay_not_sealed" { self.boot_plan_sealed == false }
             guard "identity_runtime_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
             // A seat is local: a placed member's session is its host's.
             guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
             guard "member_not_materialized" {
@@ -26909,6 +26945,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             update {
                 self.member_seat_session_unborn.insert(agent_identity);
+                self.unborn_seat_sessions.insert(self.member_session_bindings.get_cloned(agent_identity).get("value"));
             }
             to Running
         }
@@ -26919,8 +26956,10 @@ macro_rules! mob_catalog_machine_dsl {
             guard "seat_session_born_row" { unborn == false }
             guard "replay_not_sealed" { self.boot_plan_sealed == false }
             guard "identity_runtime_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
             update {
                 self.member_seat_session_unborn.remove(agent_identity);
+                self.unborn_seat_sessions.remove(self.member_session_bindings.get_cloned(agent_identity).get("value"));
             }
             to Running
         }
