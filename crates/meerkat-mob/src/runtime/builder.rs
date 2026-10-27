@@ -13047,7 +13047,7 @@ pub(super) async fn provision_durable_member_restore(
 /// resume request may set them, as a spawn's caller does.
 #[cfg(feature = "runtime-adapter")]
 fn apply_restore_spec_build_inputs(
-    config: &mut build::AgentBuildConfig,
+    config: &mut meerkat::AgentBuildConfig,
     restore_spec: &super::handle::SpawnMemberSpec,
 ) {
     config
