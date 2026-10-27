@@ -4229,7 +4229,9 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // An unborn seat's session is never bound and the member is never
-        // Live: only the fresh create binds it, and that step clears it.
+        // Live: only the session-created step binds it (a fresh create, or
+        // the adoption of the session an interrupted create left), and that
+        // step clears it.
         invariant seat_session_unborn_is_never_bound {
             for_all(id in self.member_seat_session_unborn,
                 self.member_wake_bound.contains(id) == false
