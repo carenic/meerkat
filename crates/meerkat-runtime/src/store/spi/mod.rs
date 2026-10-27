@@ -47,12 +47,14 @@
 //! # Retention
 //!
 //! A row entry that changes is appended again, whole, so a scope's rows
-//! hold superseded values until a checkpoint (a re-base) drops them: once
-//! the rows appended since the last checkpoint pass four times the scope's
-//! live bytes or [`realm::CHECKPOINT_MIN_BYTES`], whichever is larger, its
-//! next commit writes the live image and drops every earlier row in one
-//! batch. Only a loaded scope is re-based: a body that stays on the host
-//! keeps its rows until its next commit.
+//! hold superseded values until a journal checkpoint drops them (the host
+//! store reference calls it a re-base; it is not the run re-base of a
+//! WholeBlob run after a compaction): once the rows appended since the last
+//! checkpoint pass four times the scope's live bytes or
+//! [`realm::CHECKPOINT_MIN_BYTES`], whichever is larger, its next commit
+//! writes the live image and drops every earlier row in one batch. Only a
+//! loaded scope is checkpointed: a body that stays on the host keeps its
+//! rows until its next commit.
 //!
 //! # Limits of this adapter
 //!

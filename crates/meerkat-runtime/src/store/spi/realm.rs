@@ -108,8 +108,9 @@ pub const BATCH_BUDGET: usize = MAX_BATCH_BYTES - 512 * 1024;
 /// Chunk rows written per batch.
 pub const CHUNK_ROWS_PER_BATCH: usize = 7;
 
-/// A checkpoint (a re-base) is written once the rows appended since the last
-/// one pass `max(CHECKPOINT_FACTOR x live bytes, CHECKPOINT_MIN_BYTES)`: the
+/// A checkpoint (the host store reference's re-base) is written once the rows
+/// appended since the last one pass
+/// `max(CHECKPOINT_FACTOR x live bytes, CHECKPOINT_MIN_BYTES)`: the
 /// scope's next commit that carries its full image appends a reset and every
 /// live row entry, and drops every earlier row, in one batch. A scope's
 /// visible rows therefore stay within that threshold plus its last commit's
@@ -124,7 +125,7 @@ pub const CHECKPOINT_FACTOR: u64 = 4;
 /// ops lifecycle snapshot is rewritten on every terminal operation
 /// transition): such a scope keeps at most this many row bytes plus its last
 /// commit's. 4 MiB before 0.9.7; the format is unchanged, and every release
-/// reads a scope re-based at either value.
+/// reads a scope checkpointed at either value.
 pub const CHECKPOINT_MIN_BYTES: u64 = 256 * 1024;
 
 /// Rows read per host call when loading.

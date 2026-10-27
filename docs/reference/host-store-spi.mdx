@@ -345,9 +345,14 @@ one of its tags.
 ## What Core Reads
 
 This section is informative too. A store must answer every operation
-whenever Core calls it; these are the reads Core makes, and apart from a
-mob's own scopes none of them grows with the number of commits a realm has
-seen.
+whenever Core calls it; these are the reads Core makes. None of them reads
+superseded history (see [Retention](#retention)): they follow how many scopes
+the realm holds (archived sessions are never deleted) and its live state.
+Some live state grows with use and is not removed today: a runtime's
+delivery authority, kept in its head, grows with every delivery and, once
+over 32 KiB, is read as a chunk at every open, dormant runtimes included; a
+runtime's boundary receipts and delivery records grow the rows a load of it
+reads; and a mob's event log grows the mob's own scope.
 
 **At open.** After it acquires the fence and before its first commit, Core
 reads:
@@ -370,21 +375,22 @@ reads:
 
 No other row is read at open.
 
-**When a mob starts** (its resume after a restart, or the lift of a stopped
-mob), Core reads:
+**When a mob's storage is opened** (its resume after a restart), Core reads
+the mob's own scopes whole: its event log, identity, flow runs and statuses.
+The lift of a mob stopped in the same process finds them in memory and reads
+none of them.
 
-- **The mob's own scopes**, whole: its event log, identity, flow runs and
-  statuses.
-- **The sessions of the members the start wakes.** A start wakes a member
-  with recovery work, a pending delivery or an owed kickoff, a member on TCP
-  or UDS member comms, one wired to a member placed in another process, an
-  orchestrator the resume notifies, a member without a durable endpoint, and
-  the members the host requires. Under the default restore policy
-  (`MemberRestorePolicy::OnDemand`) every other member stays dormant: its
-  session scope gets no `load_head` and no `read_rows`.
-  `MemberRestorePolicy::OnDemandVerified` reads every dormant member's
-  session rows once at every start, and `MemberRestorePolicy::Eager` wakes
-  every member.
+**When a mob starts** (that resume, or the lift of a stopped mob), Core reads
+the sessions of the members the start wakes. A start wakes a member with
+recovery work, a pending delivery or an owed kickoff, a member on TCP or UDS
+member comms, one wired to a member placed in another process, an
+orchestrator the resume notifies, a member without a durable endpoint, and
+the members the host requires. Under the default restore policy
+(`MemberRestorePolicy::OnDemand`) every other member stays dormant: its
+session scope gets no `load_head` and no `read_rows`.
+`MemberRestorePolicy::OnDemandVerified` reads every dormant member's session
+rows once at every start, and `MemberRestorePolicy::Eager` wakes every
+member.
 
 **Later, on first use.** A dormant member's session is read when its first
 delivery wakes it. Any session not read yet is read the first time a call
