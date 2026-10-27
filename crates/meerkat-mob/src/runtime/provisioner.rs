@@ -14459,9 +14459,9 @@ impl ProvisionFinish {
             held,
         } = self;
         let backend = &backend;
-        // The generated binding this attempt installs (one the session did
-        // not hold before it, answered by the bind itself), released if the
-        // attempt fails before it publishes its receipt.
+        // The generated binding this attempt installs (answered by the bind
+        // itself: none for an exact retry of the binding the session held),
+        // released if the attempt fails before it publishes its receipt.
         let mut installed_generated_binding = None;
         let binding_session_id = created_bridge_session_id.clone();
         let finalize_result = async {
@@ -14603,15 +14603,6 @@ impl ProvisionFinish {
             .ops_adapter
             .prepare_member_provision_operation(&created_bridge_session_id, &peer_name)
             .await?;
-        #[cfg(test)]
-        if provision_finish_test_hooks::take(
-            &created_bridge_session_id,
-            provision_finish_test_hooks::ProvisionFinishFault::AfterOperationClaim,
-        ) {
-            return Err(MobError::Internal(format!(
-                "injected failure of the provision of '{created_bridge_session_id}' after its operation claim"
-            )));
-        }
         let exact_operation_id = prepared_operation.operation_id().clone();
         if let Some(ledger) = backend.settlement_ledger.as_ref() {
             // Retained custody carries the exact ops row a retry must abort.
@@ -14688,12 +14679,13 @@ impl ProvisionFinish {
                 Some(transaction) => transaction.abort().await,
                 None => Ok(()),
             };
-            // A failed attempt leaves no generated binding it installed: it
-            // names the registry of the attempt's own registration, and a
-            // binding left behind would refuse the session's next
-            // registration (the next restore or wake) as a different
-            // incarnation. A replayed Running operation keeps its binding
-            // through the operation rollback, so this is where it goes.
+            // A failed attempt leaves no generated binding it installed. The
+            // operation's own rollback removes it whenever this attempt
+            // registered the operation (a fresh registration holds no live
+            // operation to replay), and keeps it only for a Running operation
+            // a registration that was already in place replays. This release
+            // covers what is left: that case, and a failure between the bind
+            // and the operation claim.
             if let Some(installed) = installed_generated_binding.as_ref()
                 && backend
                     .ops_adapter
@@ -14727,9 +14719,6 @@ pub(crate) mod provision_finish_test_hooks {
     pub(crate) enum ProvisionFinishFault {
         /// Right after it bound its generated operation owner.
         AfterGeneratedBind,
-        /// Right after it claimed its provision operation (prepared, not yet
-        /// committed).
-        AfterOperationClaim,
     }
 
     static FAULTS: Mutex<Vec<(SessionId, ProvisionFinishFault)>> = Mutex::new(Vec::new());
