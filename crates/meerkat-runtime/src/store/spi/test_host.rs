@@ -69,6 +69,8 @@ pub(crate) struct TestHost {
     pub(crate) commit_gate: Mutex<Option<std::sync::Arc<tokio::sync::Notify>>>,
     /// Commits that started, counted before they wait at the gate.
     pub(crate) commits_started: std::sync::atomic::AtomicU64,
+    /// Reads of the host's scopes: head loads, head listings and row reads.
+    reads: std::sync::atomic::AtomicU64,
 }
 
 impl TestHost {
@@ -83,6 +85,7 @@ impl TestHost {
             faults: Mutex::new(Faults::default()),
             commit_gate: Mutex::new(None),
             commits_started: std::sync::atomic::AtomicU64::new(0),
+            reads: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
@@ -96,6 +99,16 @@ impl TestHost {
         self.faults
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn count_read(&self) {
+        self.reads.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// How many reads of the host's scopes (head loads, head listings and
+    /// row reads) the host answered or refused.
+    pub(crate) fn read_count(&self) -> u64 {
+        self.reads.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// End the current holder's lease now (a crashed writer's lease ran
@@ -179,6 +192,7 @@ impl HostStore for TestHost {
     }
 
     async fn load_head(&self, scope: &ScopeRef) -> Result<Option<VersionedHead>, HostStoreError> {
+        self.count_read();
         {
             let mut faults = self.faults();
             if faults.load_head_unavailable > 0 {
@@ -203,6 +217,7 @@ impl HostStore for TestHost {
         after: Option<&ScopeName>,
         limit: usize,
     ) -> Result<HeadPage, HostStoreError> {
+        self.count_read();
         let delay = self.faults().list_delay.take();
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
@@ -241,6 +256,7 @@ impl HostStore for TestHost {
         from: RowIndex,
         limit: usize,
     ) -> Result<Vec<Row>, HostStoreError> {
+        self.count_read();
         let state = self.state();
         let Some(stored) = state
             .scopes

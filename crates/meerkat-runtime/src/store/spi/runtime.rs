@@ -49,7 +49,10 @@ use crate::identifiers::{IdempotencyKey, LogicalRuntimeId};
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
 use crate::ops_lifecycle::PersistedOpsSnapshot;
 use crate::store::memory::journal::{self, TouchScope, Touches};
-use crate::store::memory::journal_image::{self, BOOT_FACTS_KEY, BootFactsV1, ScopeExport};
+use crate::store::memory::journal_image::{BOOT_FACTS_KEY, ScopeExport};
+use crate::store::recovery_obligation::{
+    BootFactsV1, catalog_entry_is_archived, runtime_has_recovery_obligation,
+};
 use crate::store::{
     AuthOAuthFlowSnapshotUpdate, CommittedWholeBlobProvisionalTail, CommittedWholeBlobSnapshot,
     ContinuationAdmission, ContinuationAdmissionOutcome, ContinuationAdmissionTransition,
@@ -176,29 +179,30 @@ fn memory_error(error: RuntimeStoreError) -> SpiError {
     SpiError::Corrupt(error.to_string())
 }
 
-/// Whether a runtime's body loads at boot: recovery must act on it.
-/// An archived runtime never loads at boot.
-fn needs_body_at_boot(pinned: &BTreeMap<String, Arc<Vec<u8>>>) -> Result<bool, SpiError> {
-    if let Some(catalog) = pinned.get("cat") {
-        let entry: RuntimeSessionCatalogEntry = serde_json::from_slice(catalog)
-            .map_err(|error| SpiError::Corrupt(format!("catalog entry: {error}")))?;
-        if entry
-            .lifecycle_terminal()
-            .is_some_and(meerkat_core::SessionLifecycleTerminal::is_archived)
-        {
-            return Ok(false);
-        }
-    }
+/// Whether a runtime's body loads at boot: recovery must act on it
+/// ([`runtime_has_recovery_obligation`] over its pinned entries, the same
+/// predicate the obligation scan asks). An archived runtime never loads at
+/// boot, and its boot facts are not read.
+pub(super) fn needs_body_at_boot(
+    pinned: &BTreeMap<String, Arc<Vec<u8>>>,
+) -> Result<bool, SpiError> {
+    let catalog = pinned
+        .get("cat")
+        .map(|bytes| serde_json::from_slice::<RuntimeSessionCatalogEntry>(bytes))
+        .transpose()
+        .map_err(|error| SpiError::Corrupt(format!("catalog entry: {error}")))?;
     let facts = match pinned.get(BOOT_FACTS_KEY) {
-        Some(bytes) => BootFactsV1::decode(bytes).map_err(memory_error)?,
-        None => BootFactsV1::default(),
+        Some(bytes) if !catalog_entry_is_archived(catalog.as_ref()) => {
+            BootFactsV1::decode(bytes).map_err(memory_error)?
+        }
+        _ => BootFactsV1::default(),
     };
     let lifecycle = pinned.get("lc").map(|bytes| bytes.as_slice());
-    Ok(facts.nonterminal
-        || facts.pending_owners
-        || facts.tail
-        || journal_image::lifecycle_has_current_run(lifecycle)
-        || (facts.inputs && lifecycle.is_none()))
+    Ok(runtime_has_recovery_obligation(
+        &facts,
+        lifecycle,
+        catalog.as_ref(),
+    ))
 }
 
 /// The changes one scope's export makes: every whole group's entries, the
@@ -1070,6 +1074,27 @@ impl RuntimeStore for SpiRuntimeStore {
     ) -> Result<Vec<(LogicalRuntimeId, RuntimeDeliveryAuthorityRecord)>, RuntimeStoreError> {
         self.cross_scope_read(
             <InMemoryRuntimeStore as RuntimeStore>::list_runtime_delivery_authorities(&self.memory),
+        )
+        .await
+    }
+
+    /// Answered from memory, with no host read, as a cross-scope read (no
+    /// commit in flight, refused while a scope is poisoned).
+    ///
+    /// The answer is complete. The open imported every runtime's pinned
+    /// entries, its catalog entry and its lifecycle among them, and loaded
+    /// the body of every runtime the same predicate named. Every later
+    /// change to a runtime is a call that loads its body before memory
+    /// changes. So memory holds the full facts of every runtime that had
+    /// recovery work at the open or changed since. A runtime whose body is
+    /// still on the host had no work at the open and has not changed since,
+    /// and from its pinned entries alone the predicate again answers that
+    /// it has none.
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, RuntimeStoreError> {
+        self.cross_scope_read(
+            <InMemoryRuntimeStore as RuntimeStore>::list_runtimes_with_recovery_work(&self.memory),
         )
         .await
     }

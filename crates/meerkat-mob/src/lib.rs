@@ -356,6 +356,10 @@ pub use runtime::{
     MemberIdentityManagement, ScopeIncarnation, ScopedRecoveryUnresolved, ScopedWorkRecovery,
     ScopedWorkState, WorkAdmissionStage,
 };
+pub use runtime::{
+    DormantSeatOutcome, MemberRestorePolicy, MobBootSetBasis, MobBootSetUnobservedCause,
+    MobCompositionAuthority,
+};
 #[cfg(feature = "runtime-adapter")]
 pub use runtime::{DurableResumeGate, DurableResumeRequest, DurableResumeVerdict};
 pub use runtime::{FlowFrameKernel, FlowFrameMutator};

@@ -6274,6 +6274,9 @@ pub struct MobHandle {
     /// The realm profile store member builds read realm-referenced roles
     /// from.
     pub(super) realm_profile_store: Option<Arc<dyn crate::store::RealmProfileStore>>,
+    /// Whether the latest member plan of this mob's start could not observe
+    /// recovery work; see [`MobHandle::boot_set_basis`].
+    pub(super) boot_set_basis: super::boot_plan::MobBootSetBasisCell,
 }
 
 /// Per-member retained per-spawn tool overlays (`SpawnMemberSpec::external_tools`)
@@ -9300,6 +9303,33 @@ impl MobHandle {
     /// reaches a later one.
     pub fn incarnation(&self) -> meerkat_core::service::MobIncarnationId {
         self.incarnation
+    }
+
+    /// What the member plan of this mob's latest start (its resume, or the
+    /// lift of a stopped mob) was based on.
+    /// [`super::MobBootSetBasis::Unobserved`] means the runtime store could
+    /// not tell which runtimes hold recovery work (its typed cause names the
+    /// read it could not make), so the start materialized every seated member
+    /// instead of only those the plan selects. A host surfaces it on its own
+    /// boot report.
+    pub fn boot_set_basis(&self) -> super::MobBootSetBasis {
+        self.boot_set_basis.get()
+    }
+
+    /// The materialization phase MobMachine holds for `identity` in this
+    /// process, read from the published machine state without an actor round
+    /// trip: test support for rows that prove a read never wakes a member.
+    /// The phase is internal; no public surface reports it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-support"))]
+    pub fn member_materialization_for_test(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<crate::machines::mob_machine::MemberMaterializationPhase> {
+        super::boot_plan::member_materialization_phase(
+            &self.machine_state_watch_rx.borrow(),
+            &crate::machines::mob_machine::AgentIdentity::from_domain(identity),
+        )
     }
 
     /// The witness that this mob's runtime runs at [`Self::incarnation`], for

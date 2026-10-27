@@ -361,6 +361,14 @@ impl RuntimeStore for FaultInjectingRuntimeStore {
         self.inner.session_authority_ops()
     }
 
+    // A mob boot over this store plans its members from the wrapped store's
+    // obligation scan, as over the store itself.
+    async fn list_runtimes_with_recovery_work(
+        &self,
+    ) -> Result<Vec<LogicalRuntimeId>, meerkat_runtime::store::RuntimeStoreError> {
+        self.inner.list_runtimes_with_recovery_work().await
+    }
+
     fn session_persistence_profile(
         &self,
     ) -> meerkat_runtime::store::RuntimeSessionPersistenceProfile {

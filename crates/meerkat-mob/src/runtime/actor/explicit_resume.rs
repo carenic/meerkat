@@ -525,23 +525,56 @@ impl MobActor {
             self.publish_machine_state_projection();
         }
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
-        if self
-            .dsl_authority
-            .state()
-            .member_revival_pending
-            .contains(&identity)
-        {
-            self.apply_dsl_signal(
-                mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
-                    agent_identity: identity,
-                },
-                "resolve_explicit_resume_member_revival",
-            )?;
+        if let Some(attempt) = work.wake_attempt {
+            self.resolve_explicit_resume_member_wake(&identity, attempt)?;
         }
         self.restore_diagnostics
             .write()
             .await
             .remove(&entry.agent_identity);
+        Ok(())
+    }
+
+    /// Resolve the wake attempt the rebuild of `identity` holds: bound (the
+    /// member's runtime binding is requested), then live. The explicit
+    /// resume runs the member's readiness and topology after it settles the
+    /// member. A stale attempt (the member's wake was abandoned or superseded
+    /// meanwhile) is the machine's no-op, and the rebuild is refused, so its
+    /// provision is rolled back rather than committed.
+    fn resolve_explicit_resume_member_wake(
+        &mut self,
+        identity: &mob_dsl::AgentIdentity,
+        attempt: u64,
+    ) -> Result<(), MobError> {
+        let steps = [
+            (
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
+                    agent_identity: identity.clone(),
+                    attempt,
+                },
+                "resolve_explicit_resume_member_bound",
+            ),
+            (
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
+                    agent_identity: identity.clone(),
+                    attempt,
+                },
+                "resolve_explicit_resume_member_ready",
+            ),
+        ];
+        for (signal, context) in steps {
+            let transition = self.apply_dsl_signal_collect_transition(signal, context)?;
+            if !crate::runtime::boot_plan::wake_feedback_applied(
+                transition.effects(),
+                identity,
+                attempt,
+            ) {
+                return Err(MobError::Internal(format!(
+                    "the wake attempt {attempt} of '{}' was superseded before its explicit resume settled",
+                    identity.0
+                )));
+            }
+        }
         Ok(())
     }
 
@@ -556,32 +589,51 @@ impl MobActor {
                 self.classify_explicit_resume_work(&work),
                 Ok(mob_dsl::ResumeMemberOutcomeDisposition::Current)
             ) {
-                if self
-                    .dsl_authority
-                    .state()
-                    .member_revival_pending
-                    .contains(&identity)
-                {
+                // Only the rebuild's own, still open wake attempt resolves the
+                // member Broken; a stale attempt is the machine's no-op.
+                let open_attempt = work.wake_attempt.filter(|attempt| {
+                    self.dsl_authority
+                        .state()
+                        .member_wake_attempts
+                        .get(&identity)
+                        == Some(attempt)
+                });
+                if let Some(attempt) = open_attempt {
                     let (signal, reason) = Self::member_revival_failure_signal(
                         identity.clone(),
+                        attempt,
                         &work.rebuild.bridge_session_id,
                         &error,
                     );
-                    if let Err(error) =
-                        self.apply_dsl_signal(signal, "resolve_failed_explicit_resume_member")
-                    {
-                        self.retain_explicit_resume_error(error);
-                    } else {
-                        self.record_member_restore_failure(
-                            &work.rebuild.entry.agent_identity,
-                            crate::runtime::handle::RestoreFailureDiagnostic {
-                                bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
-                                reason,
-                                hold: None,
-                                registration_refusal: None,
-                            },
+                    let resolved = self
+                        .apply_dsl_signal_collect_transition(
+                            signal,
+                            "resolve_failed_explicit_resume_member",
                         )
-                        .await;
+                        .map(|transition| {
+                            crate::runtime::boot_plan::wake_feedback_applied(
+                                transition.effects(),
+                                &identity,
+                                attempt,
+                            )
+                        });
+                    match resolved {
+                        Err(error) => self.retain_explicit_resume_error(error),
+                        Ok(true) => {
+                            self.record_member_restore_failure(
+                                &work.rebuild.entry.agent_identity,
+                                crate::runtime::handle::RestoreFailureDiagnostic {
+                                    bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
+                                    reason,
+                                    hold: None,
+                                    registration_refusal: None,
+                                },
+                            )
+                            .await;
+                        }
+                        // The attempt closed meanwhile: the machine kept the
+                        // member's state, and nothing is recorded here.
+                        Ok(false) => {}
                     }
                 } else {
                     self.retain_explicit_resume_error(error);

@@ -947,6 +947,12 @@ pub(super) enum MobCommand {
         failure: super::provisioner::ProvisionAttemptFailure,
         stage: super::actor::UnprovenResumeCustodyStage,
     },
+    /// A member the clean-stop lift's plan materializes closed its wake
+    /// attempt (`joined`: it went Live); the lift settles its resume work.
+    ResumeLifecycleBootMemberSettled {
+        member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
+        joined: bool,
+    },
     ResumeLifecycleRollbackStep {
         attempt: mob_dsl::ResumeAttemptId,
     },
@@ -1954,6 +1960,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberCleanupHeld { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberUnproven { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleBootMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackStep { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackFinalized { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumePostCommitMemberCompleted { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2183,6 +2190,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberSettled { .. } => "ResumeLifecycleMemberSettled",
             Self::ResumeLifecycleMemberCleanupHeld { .. } => "ResumeLifecycleMemberCleanupHeld",
             Self::ResumeLifecycleMemberUnproven { .. } => "ResumeLifecycleMemberUnproven",
+            Self::ResumeLifecycleBootMemberSettled { .. } => "ResumeLifecycleBootMemberSettled",
             Self::ResumeLifecycleRollbackStep { .. } => "ResumeLifecycleRollbackStep",
             Self::ResumeLifecycleRollbackFinalized { .. } => "ResumeLifecycleRollbackFinalized",
             Self::ResumePostCommitMemberCompleted { .. } => "ResumePostCommitMemberCompleted",
