@@ -170,15 +170,27 @@ impl EnteredDispatchOperation {
     ///
     /// # Errors
     /// The error speaks only for this step; earlier steps keep their effects.
-    /// `AuthorizationRefused` (no not-dispatched certificate, so `tool_invoked`
-    /// is "unknown" when forwarded): `Denied` when the admitting dispatch
-    /// ended, a source was cancelled, revoked or is no longer retained, the
-    /// run ended, the window expired, or the current decision needs more
-    /// review than was entered; `ReprepareRequired` when the owners need a
-    /// rebuild (a later step may succeed); `MalformedFacts` for a malformed
-    /// `further`. `OperationAuthorizationUnavailable` for contention or
-    /// owners that cannot answer now. A step never answers
-    /// `ReviewUnsatisfied` or `ReviewUnavailable`.
+    /// No `AuthorizationRefused` carries a not-dispatched certificate, so
+    /// `tool_invoked` is "unknown" when it is forwarded:
+    /// - `Denied`: the admitting dispatch ended; a source was cancelled,
+    ///   revoked or is no longer retained; the validity window passed; the
+    ///   current decision needs more review than was entered.
+    /// - `MalformedFacts`: the run's custody no longer matches (an ended run,
+    ///   in the native runtime composition), or the operation's facts no
+    ///   longer bind.
+    /// - `ReprepareRequired`: the owners need a rebuild; a later step may
+    ///   succeed.
+    ///
+    /// A malformed `further` is refused as the work owner decides: the native
+    /// owner answers `OperationAuthorizationUnavailable` for a `further` that
+    /// is not its `FurtherOriginals`. `OperationAuthorizationUnavailable` also
+    /// answers contention (a held review owner or work owner), owners that
+    /// cannot answer now, and a work authorization that does not implement
+    /// the entered step. A step never answers `ReviewUnsatisfied`,
+    /// `ReviewUnavailable` or `OperationObservationUnavailable`. The governed
+    /// helper fence and child issuance built on the witness answer `Denied`
+    /// for every `AuthorizationRefused` here except `ReprepareRequired`, and
+    /// `Unavailable` otherwise.
     pub fn run_if_current_within(
         &self,
         further: &(dyn std::any::Any + Send + Sync),
@@ -215,8 +227,10 @@ impl EnteredDispatchOperation {
     /// an outer `Ok` is no receipt.
     ///
     /// # Errors
-    /// As [`Self::run_if_current_within`]; `MalformedFacts` also for a
-    /// malformed `intent`. Nothing was issued for this step.
+    /// As [`Self::run_if_current_within`]. A malformed `intent` is refused as
+    /// the work owner decides: the native owner answers `Denied` for an
+    /// intent that is not a `ChildGrantIntent`. Nothing was issued for this
+    /// step.
     pub fn issue_child_if_current_within(
         &self,
         further: &(dyn std::any::Any + Send + Sync),

@@ -252,12 +252,15 @@ impl GovernedHelperChildIssuance {
     }
 
     /// The prepared path's conjunct ([`PreparedSetup::originating`]); a
-    /// dispatch is checked by its own work owners instead.
+    /// dispatch, or a step of its entered operation, is checked by its own
+    /// work owners instead.
     #[cfg(test)]
     pub(crate) fn originating(&self) -> Result<ChildGrantValidity, OperationAuthorizationError> {
         match &self.setup {
             Setup::Prepared(prepared) => prepared.originating(),
-            Setup::Dispatch { .. } => Err(OperationAuthorizationError::Unavailable),
+            Setup::Dispatch { .. } | Setup::Entered { .. } => {
+                Err(OperationAuthorizationError::Unavailable)
+            }
         }
     }
 }
