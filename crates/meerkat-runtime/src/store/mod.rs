@@ -9650,7 +9650,11 @@ pub trait RuntimeStore: Send + Sync {
     ///
     /// Backends must read the session authority, catalog projection, and raw
     /// lifecycle row under one snapshot. This method never materializes the
-    /// accumulated Session body.
+    /// accumulated Session body. The host store adapter
+    /// (`spi::SpiRuntimeStore`) keeps the session authority among a
+    /// runtime's rows, so it answers the first such read of a runtime whose
+    /// rows are not resident by loading them from the host (they then stay
+    /// resident).
     async fn load_session_resume_observation(
         &self,
         runtime_id: &LogicalRuntimeId,

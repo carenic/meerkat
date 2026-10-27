@@ -709,10 +709,13 @@ fn bodiless_durable_authority_detail(session_id: &SessionId) -> String {
 }
 
 /// What a read-only observation of a session's durable resume authority says
-/// a cold resume of the session would meet. It loads no body, settles no
-/// durable tail and takes no hosting claim, so what only a materialization
-/// can find (an unprovable committed boundary, a session another runtime
-/// owner hosts) is not visible here.
+/// a cold resume of the session would meet. It decodes no session, settles
+/// no durable tail and takes no hosting claim, so what only a
+/// materialization can find (an unprovable committed boundary, a session
+/// another runtime owner hosts) is not visible here. On a host store the
+/// runtime store answers the observation by loading the session's stored
+/// rows (the authority is one of its row entries); a SQLite store reads the
+/// authority, catalog and lifecycle rows only.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ObservedResumeVerdict {
     /// Active, or archived and revivable: a resume materializes it.
