@@ -8874,6 +8874,7 @@ class MeerkatClient:
             "thirty_minutes",
             "twenty_four_hours",
             "provider_default",
+            "twelve_hours",
         }:
             raise MeerkatError(
                 "INVALID_RESPONSE",

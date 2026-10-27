@@ -35,6 +35,43 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `meerkat-core`, `meerkat-contracts`: the OpenAI prompt-cache TTL
+  vocabulary gains the 12-hour lifetime, appended last:
+  `OpenAiPromptCacheTtl::TwelveHours` (`meerkat_core::model_profile::capabilities`,
+  wire `"12h"`) and `WireOpenAiPromptCacheTtl::TwelveHours`
+  (`meerkat_contracts::wire::runtime`, wire `"12h"`). The provider cache
+  lifetime recorded on authored cache-breakpoint evidence gains
+  `ProviderCacheTtl::TwelveHours` (wire `twelve_hours`), appended last.
+  The three enums are exhaustive, so a downstream exhaustive match needs an
+  arm.
+
+### Added
+
+- `meerkat-models`, `meerkat-openai`, `meerkat-core`, SDKs: OpenAI's 12-hour
+  prompt-cache lifetime. Every GPT-5.6 and GPT-6 catalog row (`gpt-5.6-sol`,
+  `gpt-5.6-terra`, `gpt-5.6-luna`, `gpt-5.6`, `gpt-6-astra`, `gpt-6-sol`,
+  `gpt-6.1-sol`, `gpt-6-luna`) now accepts `prompt_cache_options.ttl = "12h"`
+  beside `"30m"`, and its `params_schema` lists both. Set it in a profile,
+  an agent's or session's `provider_params`, or a turn override:
+  `{"provider_tag": {"provider": "open_ai", "prompt_cache_options": {"ttl": "12h"}}}`.
+  The request then carries `prompt_cache_options.ttl = "12h"`; Meerkat's
+  breakpoints carry no lifetime of their own, so it applies to every
+  breakpoint, and the authored cache-breakpoint evidence records
+  `twelve_hours` (`ProviderCacheBreakpointClaim::ttl()` reads it). Choose
+  it for a long-lived agent with a stable prefix that responds every few
+  hours: a 12-hour cache write costs 2.5x the uncached input rate, against
+  1.25x for `30m`, and cache reads cost the same. The default stays `30m`;
+  `12h` is only an explicit choice. Rows without GPT-5.6-and-later prompt
+  caching (`gpt-5.5`, `gpt-5.5-pro` and earlier) refuse it with a typed
+  `InvalidRequest` before any request is sent. The Python, TypeScript and
+  Web SDK vocabularies (`WireOpenAiPromptCacheTtl`, `OpenAiPromptCacheTtl`,
+  and the fork-cache evidence `ForkCacheTtl`) carry the new values. The
+  adaptive mobpack `LayerDecision` schema stays pinned to its released form
+  and does not list `12h`; a decision that carries it anyway is parsed and
+  judged by the member's build.
+
 ### Fixed
 
 - `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its

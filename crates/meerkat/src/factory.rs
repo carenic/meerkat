@@ -13025,6 +13025,64 @@ mod tests {
         }
     }
 
+    /// Every GPT-5.6-and-later row lists `12h` beside `30m`, and the factory's
+    /// default lifetime stays `30m` on every one: `12h` is only an explicit
+    /// choice (a profile, config or turn override).
+    #[test]
+    fn twelve_hour_prompt_cache_ttl_is_never_a_default() {
+        use meerkat_core::lifecycle::run_primitive::ProviderTag;
+        use meerkat_core::model_profile::capabilities::OpenAiPromptCacheTtl;
+
+        let temp = tempfile::tempdir().unwrap();
+        let factory = AgentFactory::new(temp.path().join("sessions"));
+        let session_id = meerkat_core::SessionId::parse("018f2f0d-7b1d-7a34-8c09-0a1b2c3d4e5f")
+            .expect("fixed session id");
+        for model in [
+            "gpt-6-astra",
+            "gpt-6-sol",
+            "gpt-6.1-sol",
+            "gpt-6-luna",
+            "gpt-5.6-sol",
+            "gpt-5.6-terra",
+            "gpt-5.6-luna",
+            "gpt-5.6",
+        ] {
+            let accepted = meerkat_models::capabilities_for(Provider::OpenAI, model)
+                .and_then(|capabilities| capabilities.openai_responses_params)
+                .map(|params| params.prompt_cache_ttls)
+                .unwrap_or_default();
+            assert!(
+                accepted.contains(&OpenAiPromptCacheTtl::TwelveHours),
+                "{model} lists 12h: {accepted:?}"
+            );
+            let identity = SessionLlmIdentity {
+                model: model.to_string(),
+                provider: Provider::OpenAI,
+                self_hosted_server_id: None,
+                provider_params: None,
+                auth_binding: None,
+            };
+            let policy = factory
+                .request_policy_for_session_llm_identity(
+                    &Config::default(),
+                    &identity,
+                    ToolCategoryOverride::Disable,
+                    &session_id,
+                )
+                .expect("request policy");
+            let Some(ProviderTag::OpenAi(defaults)) = policy.provider_tool_defaults else {
+                panic!("{model} must receive OpenAI request defaults");
+            };
+            assert_eq!(
+                defaults
+                    .prompt_cache_options
+                    .and_then(|options| options.ttl),
+                Some(OpenAiPromptCacheTtl::ThirtyMinutes),
+                "{model}: the default lifetime stays 30m"
+            );
+        }
+    }
+
     #[test]
     fn in_memory_prompt_cache_retention_is_refused_at_build_for_gpt_6() {
         use meerkat_core::lifecycle::run_primitive::{
@@ -13046,7 +13104,7 @@ mod tests {
         };
         assert!(message.contains("'in_memory'"), "{message}");
         assert!(
-            message.contains("prompt_cache_options.ttl ('30m')"),
+            message.contains("prompt_cache_options.ttl ('30m', '12h')"),
             "{message}"
         );
         assert!(!message.contains("24h"), "{message}");

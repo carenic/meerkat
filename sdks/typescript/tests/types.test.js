@@ -6026,7 +6026,7 @@ describe("Member-send handling-mode parse boundary (row 357)", () => {
   });
 });
 
-function forkCacheAvailable() {
+function forkCacheAvailable(ttl = "provider_default") {
   return {
     status: "available",
     fork_point: {
@@ -6044,7 +6044,7 @@ function forkCacheAvailable() {
           encoding: "open_ai_responses_json",
           body_sha256: Array(32).fill(7),
         },
-        ttl: "provider_default",
+        ttl,
       },
     },
   };
@@ -6136,6 +6136,25 @@ describe("Session fork result parse boundary (row 88)", () => {
       messageCount: 3,
       reason: "provider_model_mismatch",
     });
+  });
+
+  it("parses evidence authored under the 12-hour prompt-cache TTL", () => {
+    const forkResult = (ttl) => ({
+      source_session_id: "src-1",
+      session_id: "fork-1",
+      message_count: 4,
+      cache_inheritance: forkCacheAvailable(ttl),
+    });
+    const result = MeerkatClient.parseSessionForkResult(forkResult("twelve_hours"));
+    assert.equal(result.cacheInheritance.status, "available");
+    assert.equal(
+      result.cacheInheritance.forkPoint.authoredCacheBreakpoint.ttl,
+      "twelve_hours",
+    );
+    assert.throws(
+      () => MeerkatClient.parseSessionForkResult(forkResult("twelve_hour")),
+      (error) => error instanceof MeerkatError && error.code === "INVALID_RESPONSE",
+    );
   });
 
   it("throws INVALID_RESPONSE when cache_inheritance is missing", () => {

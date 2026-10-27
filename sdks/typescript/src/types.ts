@@ -583,7 +583,8 @@ export type ForkCacheTtl =
   | "one_hour"
   | "thirty_minutes"
   | "twenty_four_hours"
-  | "provider_default";
+  | "provider_default"
+  | "twelve_hours";
 
 /** Why a durable fork could not inherit provider cache state. */
 export type ForkCacheInheritanceUnavailableReason =

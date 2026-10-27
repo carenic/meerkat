@@ -1113,6 +1113,7 @@ ForkCacheTtl = Literal[
     "thirty_minutes",
     "twenty_four_hours",
     "provider_default",
+    "twelve_hours",
 ]
 ForkCacheInheritanceUnavailableReason = Literal[
     "no_authored_breakpoint_at_boundary",

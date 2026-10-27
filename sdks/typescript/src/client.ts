@@ -8029,6 +8029,7 @@ export class MeerkatClient {
           "thirty_minutes",
           "twenty_four_hours",
           "provider_default",
+          "twelve_hours",
         ],
         context,
       ) as ForkCacheTtl,
