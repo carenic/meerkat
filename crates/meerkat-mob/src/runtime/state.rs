@@ -210,10 +210,14 @@ pub(crate) struct MobDslT2Snapshot {
         std::collections::BTreeSet<crate::machines::mob_machine::AgentRuntimeId>,
     pub remote_supervisor_revoked_ids:
         std::collections::BTreeSet<crate::machines::mob_machine::AgentRuntimeId>,
-    // #37: machine-owned revival obligation for members whose live
-    // materialization is gone while a durable snapshot remains.
-    pub member_revival_pending:
-        std::collections::BTreeSet<crate::machines::mob_machine::AgentIdentity>,
+    // Machine-owned member residency (Dormant, Waking, Live) and each Waking
+    // member's open wake attempt.
+    pub member_materialization: std::collections::BTreeMap<
+        crate::machines::mob_machine::AgentIdentity,
+        crate::machines::mob_machine::MemberMaterializationPhase,
+    >,
+    pub member_wake_attempts:
+        std::collections::BTreeMap<crate::machines::mob_machine::AgentIdentity, u64>,
     pub member_kickoff_objective_ids:
         std::collections::BTreeMap<crate::machines::mob_machine::AgentIdentity, String>,
     pub objective_owner_ids:
@@ -703,7 +707,7 @@ pub(super) enum MobCommand {
     /// unhealthy/missing. The actor feeds the raw observation to the
     /// machine's `ClassifyMemberLiveMaterialization` ladder; there is no
     /// public caller and no reply — the outcome lands in machine state
-    /// (`member_revival_pending`/Broken) and the restore diagnostics.
+    /// (`member_materialization`/Broken) and the restore diagnostics.
     RevivePlacedMember {
         agent_identity: AgentIdentity,
         reason: String,

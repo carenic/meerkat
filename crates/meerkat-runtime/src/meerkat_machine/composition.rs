@@ -1172,6 +1172,88 @@ mod tests {
         assert_eq!(refusal.error_code, "dsl_guard_rejected", "{refusal}");
     }
 
+    /// ABA: a placement stating the entry epoch of an EARLIER registration of
+    /// the same session is refused against the newer registration, and
+    /// nothing binds; the routed placement that states no epoch takes the
+    /// newer entry's epoch and binds. Every routed placement therefore carries
+    /// the current registration's epoch, so the registration release's epoch
+    /// fence compares Some epochs in production.
+    #[tokio::test]
+    async fn routed_placement_stating_an_earlier_registrations_epoch_is_refused() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let surface = MeerkatConsumerSurface::unobserved_for_test(Arc::clone(&machine));
+        let session_id = SessionId::new();
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register session");
+        let first_epoch = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("registered authority exists")
+            .active_runtime_epoch_id
+            .expect("a registration owns an entry epoch");
+        machine
+            .unregister_session(&session_id)
+            .await
+            .expect("unregister the first registration");
+        machine
+            .register_session(session_id.clone())
+            .await
+            .expect("register the session again");
+        let second_epoch = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("registered authority exists")
+            .active_runtime_epoch_id
+            .expect("the newer registration owns an entry epoch");
+        assert_ne!(
+            first_epoch, second_epoch,
+            "each registration mints its own entry epoch"
+        );
+
+        let refusal = machine
+            .apply_routed_meerkat_input(
+                &session_id,
+                mm_dsl::MeerkatMachineInput::PrepareBindings {
+                    agent_runtime_id: mm_dsl::AgentRuntimeId("mob-runtime".into()),
+                    fence_token: mm_dsl::FenceToken(1),
+                    generation: Some(mm_dsl::Generation(0)),
+                    runtime_epoch_id: Some(first_epoch),
+                    session_id: mm_dsl::SessionId(session_id.to_string()),
+                    residency_owner: mm_dsl::SessionResidencyOwner::Composition,
+                },
+            )
+            .await
+            .expect_err("a placement stating an earlier registration's epoch must be refused");
+        assert_eq!(refusal.error_code, "dsl_guard_rejected", "{refusal}");
+        let state = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("authority remains available");
+        assert_eq!(
+            state.active_runtime_id, None,
+            "a refused placement binds nothing"
+        );
+        assert_eq!(state.active_runtime_epoch_id, Some(second_epoch.clone()));
+
+        bind_runtime(&surface, &session_id, "mob-runtime").await;
+        let state = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("authority remains available");
+        assert_eq!(
+            state.active_runtime_id,
+            Some(mm_dsl::AgentRuntimeId("mob-runtime".into())),
+            "the epochless routed placement binds"
+        );
+        assert_eq!(
+            state.active_runtime_epoch_id,
+            Some(second_epoch),
+            "the routed placement asserts the newer registration's epoch"
+        );
+    }
+
     #[tokio::test]
     async fn prepare_bindings_requires_all_three_fields() {
         let machine = Arc::new(MeerkatMachine::ephemeral());

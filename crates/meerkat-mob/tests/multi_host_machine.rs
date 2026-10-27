@@ -67,12 +67,12 @@ fn provision_operation_id(identity_name: &str, generation: u64) -> String {
 }
 
 fn member_endpoint(identity_name: &str, key_byte: u8) -> MemberPeerEndpoint {
-    MemberPeerEndpoint {
-        name: PeerName(identity_name.to_string()),
-        peer_id: PeerId(format!("peer-{identity_name}")),
-        address: PeerAddress(format!("tcp://members/{identity_name}")),
-        signing_key: PeerSigningKey([key_byte; 32]),
-    }
+    MemberPeerEndpoint::new(
+        PeerName(identity_name.to_string()),
+        PeerId(format!("peer-{identity_name}")),
+        PeerAddress(format!("tcp://members/{identity_name}")),
+        PeerSigningKey([key_byte; 32]),
+    )
 }
 
 /// Capability shape for a bind/rebind test host.
@@ -4399,9 +4399,10 @@ fn grant_inputs_maintain_scope_and_expiry_key_parity_at_every_step() {
 // ==========================================================================
 // Leg B - revival re-emits the runtime binding only on the LOCAL lane.
 //
-// The local half (exact tuple re-emitted, and the fail-closed refusal when the
-// tuple cannot be named) lives in `member_revival_rebinding.rs`; the placed
-// half needs the bound-host ladder, so it lives here.
+// The local half (the exact tuple re-emitted by the Bound step, and the typed
+// Stale verdict for feedback without an open attempt) lives in
+// `member_revival_rebinding.rs`; the placed half needs the bound-host ladder,
+// so it lives here.
 // ==========================================================================
 
 #[test]
@@ -4418,6 +4419,28 @@ fn placed_member_revival_leaves_the_runtime_binding_to_its_member_host() {
         SpawnPolicyRuntimeMode::TurnDriven,
     );
 
+    let authorized = authority
+        .apply_signal(MobMachineSignal::ClassifyMemberLiveMaterialization {
+            agent_identity: identity("remote-revive"),
+            observation: MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
+            reason: "live materialization missing at dispatch".to_string(),
+        })
+        .expect("a durable snapshot must authorize one revival attempt for a placed member");
+    let attempt = authorized
+        .effects()
+        .iter()
+        .find_map(|effect| match effect {
+            MobMachineEffect::MemberLiveMaterializationClassified {
+                verdict: MemberRevivalVerdictKind::ReviveAuthorized,
+                attempt,
+                ..
+            } => *attempt,
+            _ => None,
+        })
+        .expect("the placed fixture depends on the machine-owned revival authorization");
+
+    // The open attempt is a placed member's: a local recreation completion
+    // cannot bind its member-host-owned runtime.
     let before = authority.state().clone();
     authority
         .apply_signal(MobMachineSignal::ResolveRecreatedMemberSessionSucceeded {
@@ -4426,31 +4449,16 @@ fn placed_member_revival_leaves_the_runtime_binding_to_its_member_host() {
             fence_token: FenceToken(1),
             generation: Generation(0),
             bridge_session_id: session_id("member-host-session-remote-revive"),
+            attempt,
         })
         .expect_err("local recreation completion cannot bind a member-host-owned runtime");
     assert_eq!(authority.state(), &before);
 
-    let authorized = authority
-        .apply_signal(MobMachineSignal::ClassifyMemberLiveMaterialization {
-            agent_identity: identity("remote-revive"),
-            observation: MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
-            reason: "live materialization missing at dispatch".to_string(),
-        })
-        .expect("a durable snapshot must authorize one revival attempt for a placed member");
-    assert!(
-        authorized.effects().iter().any(|effect| matches!(
-            effect,
-            MobMachineEffect::MemberLiveMaterializationClassified {
-                verdict: MemberRevivalVerdictKind::ReviveAuthorized,
-                ..
-            }
-        )),
-        "the placed fixture depends on the machine-owned revival authorization",
-    );
-
+    // A placed wake has no Bound step: its attempt closes Live directly.
     let resolved = authority
         .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
             agent_identity: identity("remote-revive"),
+            attempt,
         })
         .expect("a placed revival with an active carrier binding must resolve");
     assert!(
@@ -4464,9 +4472,9 @@ fn placed_member_revival_leaves_the_runtime_binding_to_its_member_host() {
     assert!(
         !authority
             .state()
-            .member_revival_pending
-            .contains(&identity("remote-revive")),
-        "a resolved placed revival still clears the machine-owned obligation",
+            .member_wake_attempts
+            .contains_key(&identity("remote-revive")),
+        "a resolved placed revival still closes the machine-owned attempt",
     );
     check_multi_host_invariants(authority.state());
 }

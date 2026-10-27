@@ -3585,14 +3585,14 @@ mod tests {
 
     fn test_peer_endpoint(name: &str) -> mob_dsl::MemberPeerEndpoint {
         let signing_key = [*name.as_bytes().last().unwrap_or(&1_u8); 32];
-        mob_dsl::MemberPeerEndpoint {
-            name: mob_dsl::PeerName(name.to_string()),
-            peer_id: mob_dsl::PeerId(
+        mob_dsl::MemberPeerEndpoint::new(
+            mob_dsl::PeerName(name.to_string()),
+            mob_dsl::PeerId(
                 meerkat_core::comms::PeerId::from_ed25519_pubkey(&signing_key).to_string(),
             ),
-            address: mob_dsl::PeerAddress(format!("inproc://{name}")),
-            signing_key: mob_dsl::PeerSigningKey(signing_key),
-        }
+            mob_dsl::PeerAddress(format!("inproc://{name}")),
+            mob_dsl::PeerSigningKey(signing_key),
+        )
     }
 
     struct WiredMachineFixture {
@@ -4125,12 +4125,12 @@ mod tests {
             let placed = mob_dsl::AgentIdentity::from("placed");
             let host = mob_dsl::HostId("placed-host".to_string());
             let signing_key = [3_u8; 32];
-            let endpoint = mob_dsl::MemberPeerEndpoint {
-                name: mob_dsl::PeerName("fixture-mob/worker/placed".to_string()),
-                peer_id: mob_dsl::PeerId(peer_id),
-                address: mob_dsl::PeerAddress("tcp://placed-member.test:4200".to_string()),
-                signing_key: mob_dsl::PeerSigningKey(signing_key),
-            };
+            let endpoint = mob_dsl::MemberPeerEndpoint::new(
+                mob_dsl::PeerName("fixture-mob/worker/placed".to_string()),
+                mob_dsl::PeerId(peer_id),
+                mob_dsl::PeerAddress("tcp://placed-member.test:4200".to_string()),
+                mob_dsl::PeerSigningKey(signing_key),
+            );
             let mut authority = mob_dsl::MobMachineAuthority::new();
             authority
                 .apply_signal(mob_dsl::MobMachineSignal::RecoverOwnerBridgeSession {

@@ -107,7 +107,9 @@ fn machine_route_is_current_for_replay(
         && machine_cancel_route_is_current_for_recovery(state, obligation)
         // An absent spawn-exec phase is the DSL's Settled state.
         && !state.spawn_exec_phase.contains_key(&identity)
-        && !state.member_revival_pending.contains(&identity)
+        // Placed members are never Dormant: not reviving is no open wake
+        // attempt.
+        && !state.member_wake_attempts.contains_key(&identity)
         && !state.member_materialization_failures.contains_key(&identity)
         && state.identity_to_runtime.get(&identity).is_some_and(|runtime_id| {
             // Placed PeerOnly runtimes intentionally have no local

@@ -14189,12 +14189,12 @@ mod tests {
             record.phase = crate::store::PlacedSpawnCarrierPhase::Committed(
                 crate::store::PlacedSpawnCommitRecord {
                     member_session_id: meerkat_core::SessionId::new(),
-                    member_peer_endpoint: mob_dsl::MemberPeerEndpoint {
-                        name: mob_dsl::PeerName(name),
-                        peer_id: mob_dsl::PeerId(peer_id),
-                        address: mob_dsl::PeerAddress("tcp://127.0.0.1:4711".to_string()),
-                        signing_key: mob_dsl::PeerSigningKey(signing_key),
-                    },
+                    member_peer_endpoint: mob_dsl::MemberPeerEndpoint::new(
+                        mob_dsl::PeerName(name),
+                        mob_dsl::PeerId(peer_id),
+                        mob_dsl::PeerAddress("tcp://127.0.0.1:4711".to_string()),
+                        mob_dsl::PeerSigningKey(signing_key),
+                    ),
                     ack_engine_version: "placed-recovery-test-engine".to_string(),
                     adopted_first_turn_started: false,
                 },
@@ -15552,12 +15552,12 @@ mod tests {
                 host_id: host.clone(),
                 host_binding_generation: 1,
                 member_session_id: mob_dsl::SessionId(member_session_id.to_string()),
-                member_peer_endpoint: mob_dsl::MemberPeerEndpoint {
-                    name: mob_dsl::PeerName(format!("placed-{}", identity.as_str())),
-                    peer_id: mob_dsl::PeerId(peer_id),
-                    address: mob_dsl::PeerAddress(format!("tcp://members/{}", identity.as_str())),
-                    signing_key: mob_dsl::PeerSigningKey(signing_key),
-                },
+                member_peer_endpoint: mob_dsl::MemberPeerEndpoint::new(
+                    mob_dsl::PeerName(format!("placed-{}", identity.as_str())),
+                    mob_dsl::PeerId(peer_id),
+                    mob_dsl::PeerAddress(format!("tcp://members/{}", identity.as_str())),
+                    mob_dsl::PeerSigningKey(signing_key),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: mob_dsl::SpawnPolicyRuntimeMode::TurnDriven,
                 external_addressable: true,
@@ -17954,14 +17954,14 @@ mod member_endpoint_defect_tests {
 
     fn endpoint(seed: u8, address: &str) -> mob_dsl::MemberPeerEndpoint {
         let signing_key = [seed; 32];
-        mob_dsl::MemberPeerEndpoint {
-            name: mob_dsl::PeerName("mob/worker/member".to_string()),
-            peer_id: mob_dsl::PeerId(
+        mob_dsl::MemberPeerEndpoint::new(
+            mob_dsl::PeerName("mob/worker/member".to_string()),
+            mob_dsl::PeerId(
                 meerkat_core::comms::PeerId::from_ed25519_pubkey(&signing_key).to_string(),
             ),
-            address: mob_dsl::PeerAddress(address.to_string()),
-            signing_key: mob_dsl::PeerSigningKey(signing_key),
-        }
+            mob_dsl::PeerAddress(address.to_string()),
+            mob_dsl::PeerSigningKey(signing_key),
+        )
     }
 
     #[test]

@@ -485,6 +485,21 @@ const MEERKAT_TRANSITION_ENUM_LATE_TAIL: &[&str] = &[
     "ResolveRuntimeCompletionResultOutcomeUnknownRunning",
     "ResolveRuntimeCompletionResultOutcomeUnknownRetired",
     "ResolveRuntimeCompletionResultOutcomeUnknownStopped",
+    "ResolveEmptyResumeRetirementRetireIdle",
+    "ResolveEmptyResumeRetirementRetireAttached",
+    "ResolveEmptyResumeRetirementRetireRunning",
+    "ResolveEmptyResumeRetirementRetireRetired",
+    "ResolveEmptyResumeRetirementRetireStopped",
+    "ResolveEmptyResumeRetirementKeepServingIdle",
+    "ResolveEmptyResumeRetirementKeepServingAttached",
+    "ResolveEmptyResumeRetirementKeepServingRunning",
+    "ResolveEmptyResumeRetirementKeepServingRetired",
+    "ResolveEmptyResumeRetirementKeepServingStopped",
+    "ClaimCompositionResidencyIdle",
+    "ClaimCompositionResidencyAttached",
+    "ClaimCompositionResidencyRunning",
+    "ClaimCompositionResidencyRetired",
+    "ClaimCompositionResidencyStopped",
 ];
 
 // Append-only emission tails for the other machines, whose public
