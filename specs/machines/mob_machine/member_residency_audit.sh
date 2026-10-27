@@ -32,22 +32,22 @@
 #   through the dormant seat, the embodied spawn commit, the release and the
 #   rotation;
 # - wake2 (AuditWake2Spec): two identities woken beside each other.
-# Every run checks every generated invariant (I1-I14 among them), AP2 (an
-# open attempt is never replaced and ends only Live, Dormant or without a
-# phase; every Waking member has an enabled closing arm for every kind)
-# and, where the run has recovery or seat arms, AP1 (no such arm overwrites a
-# phase). The wake run also checks AP3 (a Lifecycle input never wakes, a
-# notice classification never changes residency), that exactly one WakeMember
-# arm answers every input shape, that a local wake never closes Live without
-# an endpoint while it owes EndpointPending and can always close Live when it
-# owes none, and that a release of another epoch never demotes. The seed run
-# checks that the boot plan never leaves a member that blocks the seal. The
-# retire run checks that no runtime retire is routed for a member with no
-# registration (R27), that a settled retirement can always archive and under
-# an admitted destroy nothing holds it (R124), and that no rotation begins or
-# commits under an admitted destroy (R124). TLC evaluates the module's I5
-# ASSUME (a present, bound member with a phase is never refused as not a
-# member) and its release verdict ASSUME at the start of every run.
+# Every run checks every generated invariant (I1-I14 among them), AP2 (an open
+# attempt is never replaced and ends only Live, Dormant or without a phase;
+# every Waking member has an enabled closing arm for every kind) and, where
+# the run has recovery or seat arms, AP1 (no such arm overwrites a phase). The
+# wake run also checks AP3 (a Lifecycle input never wakes, a notice
+# classification never changes residency), that exactly one WakeMember arm
+# answers every input shape, that a local wake never closes Live without an
+# endpoint while it owes EndpointPending and can always close Live when it
+# owes no endpoint cause, and that a release of another epoch never demotes.
+# The seed run checks that the boot plan never leaves a member that blocks the
+# seal. The retire run checks that no runtime retire is routed for a member
+# with no registration (R27), that a settled retirement can always archive and
+# under an admitted destroy nothing holds it (R124), and that no rotation
+# begins or commits under an admitted destroy (R124). TLC evaluates the
+# module's I5 ASSUME (a present, bound member with a phase is never refused as
+# not a member) and its release verdict ASSUME at the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -841,8 +841,8 @@ for fold in folds:
     line = found[0].group(0)
     assert len(re.findall(epoch, line)) == 1, f"expected one epoch conjunct in {fold}"
     text = text[:found[0].start()] + re.sub(epoch, "TRUE", line) + text[found[0].end():]' "$@"
-  # A local wake that needs an endpoint whatever it owes: a member that owes
-  # no endpoint is held Waking for one.
+  # A local wake that needs an endpoint whatever it owes: a member owing no
+  # endpoint cause is held Waking for one.
   mutate wake succeeded_needs_endpoint \
     "Error: Invariant AuditWakeClosesLiveUnlessEndpointOwed is violated" \
     'add_guard("ResolveMemberRevivalSucceededRunningLocal", "(agent_identity \\in DOMAIN member_peer_endpoints)")' "$@"

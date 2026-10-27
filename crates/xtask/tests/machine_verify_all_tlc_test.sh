@@ -544,10 +544,10 @@ fi
 # is never replaced and ends only Live, Dormant or without a phase, and every
 # Waking member has an enabled closing arm of every kind), AP3 (a Lifecycle
 # input never wakes), WakeMember totality, a local wake that owes an endpoint
-# closes Live only with it (and one that owes none always can), a boot plan
-# that never leaves a member blocking the seal, the release verdict helper,
-# the release epoch fence, no runtime retire routed for a member with no
-# registration, a settled retirement that can always archive (under an
+# closes Live only with it (and one owing no endpoint cause always can), a
+# boot plan that never leaves a member blocking the seal, the release verdict
+# helper, the release epoch fence, no runtime retire routed for a member with
+# no registration, a settled retirement that can always archive (under an
 # admitted destroy no rotation or host carry-out holds it) and no rotation
 # under an admitted destroy, with the I5 ASSUME over the wake refusal helper.
 # It runs with TLC coverage and requires every listed arm to fire and a floor
