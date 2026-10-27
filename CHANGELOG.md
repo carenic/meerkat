@@ -122,7 +122,11 @@ them.
   cause of one member joins one wake. A refused wake is typed:
   `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
   (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
-  boot restore records it. Reads never wake.
+  boot restore records it. Reads never wake. The first wake of a member whose
+  seat built nothing creates its session under the id the seat named (see
+  `MobHandle::seat_dormant_members`), after the host's build preparation, as
+  any wake prepares it; a registration the host refuses there
+  (`MobError::MemberRegistrationRefused`) is the member's restore failure.
 - `meerkat-session`: `PersistentSessionService::prepare_cold_attach_as_owner`
   and `prepare_cold_attach_reporting_as_owner`: the cold attach of a session
   by its own owner (a mob settling its member's session), which does not ask

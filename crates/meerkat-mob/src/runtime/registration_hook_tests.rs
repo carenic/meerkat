@@ -3085,3 +3085,57 @@ async fn a_rotations_next_incarnation_builds_nothing_until_its_first_wake() {
     .await;
     handle.stop().await.unwrap();
 }
+
+/// A first wake whose host refuses the registration of the seat's session
+/// breaks the member, typed, as a boot restore's refusal does: the host is
+/// asked once, no actor is built and no registration stays current, and
+/// the session stays unborn, so a later wake creates it rather than resuming
+/// a session that was never built.
+#[tokio::test]
+async fn a_refused_registration_at_a_seats_first_wake_breaks_the_member_and_keeps_it_unborn() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, machine, host) = hooked_seat_mob(keys.path()).await;
+    let member = AgentIdentity::from("refused-seat");
+    let mut spec = SpawnMemberSpec::new("worker", member.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let outcomes = handle
+        .seat_dormant_members(vec![spec])
+        .await
+        .expect("the seat batch answers");
+    let session = match &outcomes[0] {
+        crate::runtime::DormantSeatOutcome::Seated { session_id, .. } => session_id.clone(),
+        other => panic!("the fresh spec is seated: {other:?}"),
+    };
+    host.refuse.store(true, Ordering::SeqCst);
+
+    let refused = handle
+        .ensure_member_live(&member)
+        .await
+        .expect_err("the host refused the member's registration");
+
+    RebootedMob::assert_refused(&refused);
+    assert_eq!(host.selections_of(&member), 1, "the host is asked once");
+    assert!(
+        !service.has_live_session(&session).await.unwrap(),
+        "no actor of the refused session is built"
+    );
+    assert!(
+        machine
+            .current_session_registration_witness(&session)
+            .await
+            .is_none(),
+        "no registration of the refused member stays current"
+    );
+    let status = handle.member_status(&member).await.unwrap();
+    assert_eq!(status.status, MobMemberStatus::Broken);
+    assert_eq!(
+        status.registration_refusal,
+        Some(crate::MemberRegistrationHookCall::SelectDestination),
+        "the member's status carries the typed refusal"
+    );
+    assert!(
+        session_unborn(&handle, &member),
+        "a refused create leaves the seat's session unborn"
+    );
+    handle.stop().await.unwrap();
+}

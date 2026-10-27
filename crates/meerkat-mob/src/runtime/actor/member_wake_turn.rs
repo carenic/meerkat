@@ -10,15 +10,19 @@
 //!   continuity intent, and dispatch the restore.
 //! - Step B (off the actor, [`plan_member_wake`]): the cold restore recipe
 //!   (`restore_resumed_member`) plans the member's restore on its own fork,
-//!   writing nothing shared. A missing bound session searches its successor
-//!   here and provisions it on a fork repointed to it. The woken comms
-//!   runtime's endpoint is checked against the durable one.
+//!   writing nothing shared. A bound session the member's seat never created
+//!   is created there, through the spawn provision path, under the seat's
+//!   id; any other missing bound session searches its successor here and
+//!   provisions it on a fork repointed to it. The woken comms runtime's
+//!   endpoint is checked against the durable one.
 //! - Step C (on the actor, [`MobActor::commit_member_wake_plan`]): the
 //!   attempt is still this wake's (attempt and incarnation fences); a
 //!   successor is repointed (journal first); `apply_member_restore_plan`
 //!   applies the plan to the actor's authority, rosters and overlays in the
 //!   member's turn, ending in `ResolveMemberRevivalBound` (the runtime
-//!   binding is requested, the member is still Waking).
+//!   binding is requested, the member is still Waking), or, for a session
+//!   the member's seat never created, `ResolveMemberRevivalSessionCreated`
+//!   after its born row is journaled.
 //! - Readiness (the member's comms drain) and topology (its wiring restored
 //!   over the machine's edges, dormant peers included), then
 //!   `ResolveMemberRevivalSucceeded` (Waking -> Live) and every caller of the

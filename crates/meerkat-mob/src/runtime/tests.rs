@@ -18,6 +18,8 @@ mod member_creation_upcall;
 mod member_wake_rows;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod parallel_resume_restore;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod unborn_seat_wake;
 use crate::definition::{
     BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowSpec,
     FlowStepSpec, LimitsSpec, MobDefinition, OrchestratorConfig, PolicyMode, RoleWiringRule,
