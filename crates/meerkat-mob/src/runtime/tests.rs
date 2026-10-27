@@ -8,6 +8,8 @@ mod existing_live_delegation;
 mod historical_metadata;
 mod host_human_input;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod host_store_boot_reads;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lazy_boot;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lift_binding_rows;
