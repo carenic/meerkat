@@ -87,6 +87,15 @@ them.
   `RuntimeRecoveryWorkUnobserved` reads it with the pending-delivery scan.
   `SessionLlmCapabilitySurface::from_model_profile`.
 
+- `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
+  `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
+  or resumes, the child mobs its agents create included, starts with that
+  member restore policy and restore concurrency
+  (`MobBuilder::with_member_restore_policy`,
+  `MobBuilder::with_resume_restore_concurrency`). A host that builds mobs of
+  its own with a policy passes the same one here, so its child mobs start the
+  way its own mobs do. Without them a mob gets the builder's defaults.
+
 ### Changed
 
 - Behaviour-only (not measured by the gate): `meerkat-mob`:
