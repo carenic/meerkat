@@ -235,6 +235,7 @@ fn binding_requests(
                 fence_token,
                 generation,
                 session_id,
+                ..
             } => Some((
                 agent_identity.clone(),
                 agent_runtime_id.clone(),

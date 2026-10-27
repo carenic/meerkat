@@ -18,7 +18,9 @@
 \*     and Stopped, the runtime-ready observation with and without an epoch,
 \*     three release shapes (the recorded epoch, another epoch, no epoch), the
 \*     drift and terminal classifications, the peer notice classification,
-\*     the replayed restore failures, the release verdict, Stop and Resume.
+\*     the replayed restore failures, the routed binding refusal (current and
+\*     stale), the spawned-endpoint recovery, the release verdict, Stop and
+\*     Resume.
 \*   retire (AuditRetireSpec): one identity woken, released and retired: the
 \*     routed and the archive-only retirement starts (R27), the routed retire
 \*     retry, the runtime retire observation, the session ingress detach, the
@@ -80,7 +82,9 @@
 \*     cause can always close Live), AuditReleaseVerdictMatchesArm (the
 \*     release verdict is Release exactly when the Released arm would honour
 \*     the member's own registration) and AuditReleaseEpochFence (a release
-\*     whose epoch is not the member's recorded one never demotes it);
+\*     whose epoch is not the member's recorded one never demotes it) and
+\*     AuditBindingRefusalFenced (a refused binding request of a wake ends the
+\*     member's attempt only when it belongs to its open attempt);
 \*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (R124: a
 \*     retiring member whose ingress detach closed has an enabled archive
@@ -309,6 +313,16 @@ WRecoverRetired == \E p \in BOOLEAN, started \in BOOLEAN : RecoverRosterMemberRe
 WRestoreFailure ==
     \/ RecoverMemberRestoreFailureRunning(Id1, AuditReason)
     \/ RecoverMemberRestoreHostRefusedRunning(Id1, AuditCode, AuditReason)
+\* The endpoint registration a wired member's wake uses (the spawned-endpoint
+\* recovery arm), beside WEndpoint and WRegisterPeer.
+WSpawnedEndpoint == RecoverSpawnedMemberPeerEndpointFreshRunning(Id1, Rid1, 1, 0, E1Inproc)
+\* The routed refusal of member 1's binding request: the spawn's (no attempt)
+\* or a wake's (its attempt, the open one or a stale one).
+WBindingRefusal ==
+    \E att \in {None} \cup {Some(a) : a \in AuditAttempts} :
+        \/ ResolveRuntimeBindingRefusalRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
+        \/ ResolveRuntimeBindingRefusalStaleRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
+        \/ ResolveRuntimeBindingRefusalStaleStopped(Id1, Rid1, Sess1, AuditCode, AuditReason, att)
 WReady == \E ep \in AuditEpochs : ObserveRuntimeReady(Rid1, 1, ep)
 WReadyEpoch1 == ObserveRuntimeReady(Rid1, 1, Epoch1)
 WRelease == \E ep \in AuditReleaseEpochs : ReleaseArm(Some(Rid1), Some(1), ep)
@@ -354,15 +368,17 @@ AuditSeedSpec == Init /\ [][AuditSeedNext]_vars
 (***************************************************************************)
 
 \* The recovery and seat arms of the wake run (AP1).
-WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WRestoreFailure
+WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WSpawnedEndpoint \/ WRestoreFailure
 
 AuditWakeNext ==
     \/ WRecover
     \/ WBind
     \/ WBindCurrent
     \/ WEndpoint
+    \/ WSpawnedEndpoint
     \/ WRegisterPeer
     \/ WRestoreFailure
+    \/ WBindingRefusal
     \/ AuditPlanDefault(Id1)
     \/ SealBootMaterializationPlan
     \/ AuditWakeShaped(Id1)
@@ -507,6 +523,9 @@ AuditTerminalNext ==
     \/ TNotice
     \/ ClassifyMemberReleaseCompleted(Id1)
     \/ ClassifyMemberReleaseDestroyed(Id1)
+    \/ \E a \in AuditAttempts :
+           \/ ResolveRuntimeBindingRefusalStaleCompleted(Id1, Rid1, Sess1, AuditCode, AuditReason, Some(a))
+           \/ ResolveRuntimeBindingRefusalStaleDestroyed(Id1, Rid1, Sess1, AuditCode, AuditReason, Some(a))
     \/ AuditStaleFeedbackTerminal(Id1, Rid1, 1, 0, Sess1)
     \/ AuditQuiesceComplete
     \/ CompleteRunning
@@ -877,6 +896,15 @@ AuditReleaseVerdictMatchesArm ==
                        member_materialization_epoch[Id1],
                        "RegistrationReleased")
         IN (verdict = "Release") <=> released
+
+\* The attempt fence on the routed binding refusal: the refusal of a wake's
+\* request ends member 1's attempt only when that request belongs to its open
+\* attempt; a late refusal of another attempt changes nothing.
+AuditBindingRefusalFenced ==
+    [][\A a \in AuditAttempts :
+         ResolveRuntimeBindingRefusalRunning(Id1, Rid1, Sess1, AuditCode, AuditReason, Some(a))
+           => (Id1 \in DOMAIN member_wake_attempts /\ member_wake_attempts[Id1] = a)
+      ]_vars
 
 \* The boot plan never leaves a member that blocks the seal: after its plan a
 \* member has a durable endpoint or owes EndpointPending.
