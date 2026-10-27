@@ -143,7 +143,7 @@ OperationPeer* operation peer trust; trust wiring and peer overlay obligations (
 PeerInput* peer input admission bookkeeping; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
 MemberPeer* member peer exposure; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
 RegisterMemberPeerAlreadyCurrentRunning idempotent endpoint registration; member_residency_audit drives the fresh registration
-RecoverSpawned* spawned member endpoint replay; member_residency_audit drives RecoverMemberPeerEndpointFreshRunning instead
+RecoverSpawned* the idempotent spawned member endpoint replay; member_residency_audit's wake run drives the fresh arm
 RecoverMemberPeerEndpointAlreadyCurrentRunning idempotent endpoint replay; member_residency_audit drives the fresh arm
 RecoverMemberPeerEndpointChangedRunning endpoint migration replay; trust wiring and peer overlay obligations (member, supervisor and external peers); no hand-written audit drives them
 SubscribeAgent* event subscriptions and polling over the journal; they change no member residency, no audit drives them
@@ -167,7 +167,7 @@ ResolveSubmit* work submission refusals; no audit drives them
 SubmitWork* work submission; no audit drives it
 CancelAll* work cancellation; no audit drives it
 ForceCancel* forced cancellation; no audit drives it
-ResolveRuntime* runtime binding, ingress and retire refusal feedback from MeerkatMachine; no audit drives it
+ResolveRuntime* runtime ingress and retire refusal feedback from MeerkatMachine; member_residency_audit drives the binding refusal and its stale twins
 ClassifyMemberWait* member wait classification over runtime material; no audit drives it
 ClassifyIdentity* identity reconciliation decisions; no audit drives them
 ConvergeRecovered* recovered roster and respawn topology convergence; no audit drives it
