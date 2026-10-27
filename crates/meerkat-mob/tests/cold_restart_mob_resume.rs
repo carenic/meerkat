@@ -11796,3 +11796,660 @@ async fn a_mob_start_over_a_held_member_tail_still_refuses_typed() {
         "nothing resumed the run"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A compaction inside a member's run, then a stop and a cold start
+// ---------------------------------------------------------------------------
+
+/// The HeadCanonical persistent session service of one process start, with
+/// durable semantic memory (a compaction stages its memory projection and
+/// records its intent in the session) and compaction allowed at every model
+/// boundary.
+#[cfg(feature = "test-support")]
+fn memory_compacting_service(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    client: Arc<HoldingToolLoopClient>,
+) -> (
+    Arc<PersistentSessionService<FactoryAgentBuilder>>,
+    Arc<SqliteSessionStore>,
+) {
+    paths.materialize_project_context();
+    let mut config = Config::default();
+    config.compaction.min_turns_between_compactions = 1;
+    let mut builder = FactoryAgentBuilder::new(factory(paths).memory(true), config);
+    builder.default_llm_client = Some(client);
+    let store = Arc::new(
+        SqliteSessionStore::open(&paths.realm_db_path)
+            .expect("open co-tenant SQLite session store"),
+    );
+    builder.default_session_store = Some(Arc::new(StoreAdapter::new(store.clone())));
+    let store_dyn: Arc<dyn meerkat::SessionStore> = store.clone();
+    let blob_store: Arc<dyn meerkat_core::BlobStore> =
+        Arc::new(meerkat_store::MemoryBlobStore::default());
+    let service = Arc::new(PersistentSessionService::new(
+        builder,
+        32,
+        store_dyn,
+        runtime_store,
+        blob_store,
+    ));
+    (service, store)
+}
+
+/// What the first process start left: member `w-1`'s session, the open run
+/// its provisional tail belongs to, and that run's input.
+#[cfg(feature = "test-support")]
+struct CompactedMemberRun {
+    w1_sid: meerkat_core::types::SessionId,
+    run_id: meerkat_core::RunId,
+    runtime_id: meerkat_runtime::LogicalRuntimeId,
+    /// The compaction projections the run's tail carries.
+    intents: Vec<meerkat_core::CompactionProjectionId>,
+}
+
+/// The first process start: member `w-1`, with durable memory and a
+/// compaction threshold every boundary crosses, answers one ordinary turn,
+/// then runs a tool loop. The loop run's boundaries compact (a compaction
+/// stages its memory projection and the session carries its intent; the
+/// ordinary turn before the run gives its first boundary something to fold),
+/// and its tool rounds' commits carry the rewrite and the intent into the
+/// run's provisional tail; the loop's third model call is held. Nothing has committed the tail, so the compaction outbox holds
+/// no row for the intent. The host then stops the mob, leaving the run
+/// running, and shuts it down with `queued_inputs`.
+#[cfg(feature = "test-support")]
+async fn stop_over_a_member_run_that_compacted(
+    paths: &Paths,
+    runtime_store: Arc<dyn meerkat_runtime::RuntimeStore>,
+    queued_inputs: meerkat_mob::QueuedInputsOnShutdown,
+) -> CompactedMemberRun {
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    match definition.profiles.get_mut(&ProfileName::from("worker")) {
+        Some(ProfileBinding::Inline(profile)) => {
+            profile.auto_compact_threshold = std::num::NonZeroU64::new(1);
+            // A member's build takes its memory capability from the profile,
+            // over the factory's default.
+            profile.tools.memory = true;
+        }
+        other => panic!("the worker profile must be inline: {other:?}"),
+    }
+    let client_1 = Arc::new(HoldingToolLoopClient::new(3));
+    let (service_1, store_1) =
+        memory_compacting_service(paths, runtime_store.clone(), client_1.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(client_1.clone())
+        .create()
+        .await
+        .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("lead", AgentIdentity::from("lead-1")))
+        .await
+        .expect("spawn lead");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from("w-1")))
+        .await
+        .expect("spawn worker");
+    let identity = AgentIdentity::from("w-1");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("w1 session id");
+    let lead_sid = handle_1
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("lead session id");
+    let mut runtime_release_witnesses = Vec::new();
+    for session_id in [&lead_sid, &w1_sid] {
+        let runtime = service_1
+            .comms_runtime(session_id)
+            .await
+            .unwrap_or_else(|| panic!("comms runtime missing for {session_id}"));
+        runtime_release_witnesses.push(Arc::downgrade(&runtime));
+    }
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&w1_sid);
+
+    let member = handle_1.member(&identity).await.expect("member handle");
+    member
+        .send("an ordinary turn first".to_string(), HandlingMode::Queue)
+        .await
+        .expect("the ordinary input is admitted");
+    member
+        .send(
+            format!("{} token-compacted", HoldingToolLoopClient::LOOP_MARKER),
+            HandlingMode::Queue,
+        )
+        .await
+        .expect("the run's input is admitted");
+    tokio::time::timeout(Duration::from_secs(30), client_1.wait_until_holding())
+        .await
+        .expect("the run reaches its held third model request");
+    let run_id = provisional_tail_run(runtime_store.as_ref(), &w1_sid, true)
+        .await
+        .expect("the run's round commits stand as the provisional tail");
+    let physical = store_1
+        .load(&w1_sid)
+        .await
+        .expect("load the physical row")
+        .expect("physical row");
+    let intents = physical
+        .validated_compaction_projection_intents()
+        .expect("the physical row's intents validate")
+        .into_iter()
+        .map(|intent| intent.projection)
+        .collect::<Vec<_>>();
+    assert!(
+        !intents.is_empty(),
+        "the run's round commits carried the compaction's intent into the tail"
+    );
+    assert!(
+        runtime_store
+            .load_pending_compaction_projections(&runtime_id)
+            .await
+            .expect("read the compaction outbox")
+            .is_empty(),
+        "nothing committed the tail, so the outbox holds no row for the intent"
+    );
+
+    handle_1
+        .stop_with_options(meerkat_mob::StopOptions::default().leave_runs_running())
+        .await
+        .expect("the mob stops");
+    handle_1
+        .shutdown_with_report(
+            meerkat_mob::ShutdownOptions::default().with_queued_inputs(queued_inputs),
+        )
+        .await
+        .expect("the mob shuts down");
+    service_1
+        .try_shutdown()
+        .await
+        .expect("shutdown first session service");
+    drop(member);
+    drop(handle_1);
+    drop(service_1);
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while runtime_release_witnesses
+            .iter()
+            .any(|runtime| runtime.upgrade().is_some())
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("every old session runtime is released before the next start");
+    CompactedMemberRun {
+        w1_sid,
+        run_id,
+        runtime_id,
+        intents,
+    }
+}
+
+/// The states of the member's durable compaction memory stages, read from
+/// the memory store's database: `staged` until the intent's commit finalizes
+/// the stage, then `finalized`; an aborted stage is gone.
+#[cfg(feature = "test-support")]
+fn compaction_stage_states(
+    paths: &Paths,
+    session_id: &meerkat_core::types::SessionId,
+) -> Vec<String> {
+    let db = paths
+        .runtime_root
+        .join("factory-store")
+        .join("memory")
+        .join("memory.sqlite3");
+    let connection =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the memory store's database");
+    let mut statement = connection
+        .prepare("SELECT state FROM memory_compaction_stage WHERE session_id = ?1 ORDER BY rowid")
+        .expect("prepare the stage query");
+    statement
+        .query_map([session_id.to_string()], |row| row.get::<_, String>(0))
+        .expect("query the stages")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read the stages")
+}
+
+/// The state of `projection`'s durable memory stage (`staged` or
+/// `finalized`), or `None` once it is gone.
+#[cfg(feature = "test-support")]
+fn compaction_stage_state(
+    paths: &Paths,
+    projection: &meerkat_core::CompactionProjectionId,
+) -> Option<String> {
+    let db = paths
+        .runtime_root
+        .join("factory-store")
+        .join("memory")
+        .join("memory.sqlite3");
+    let connection =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the memory store's database");
+    connection
+        .query_row(
+            "SELECT state FROM memory_compaction_stage WHERE session_id = ?1 AND revision = ?2",
+            [
+                projection.session_id().to_string(),
+                projection.revision().to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+}
+
+/// The states of `projection`'s rows in the runtime's compaction outbox
+/// (`pending`, then `finalized` once its finalization completed).
+#[cfg(feature = "test-support")]
+fn compaction_outbox_states(
+    paths: &Paths,
+    projection: &meerkat_core::CompactionProjectionId,
+) -> Vec<String> {
+    let connection = rusqlite::Connection::open_with_flags(
+        &paths.realm_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the runtime store's database");
+    let mut statement = connection
+        .prepare(
+            "SELECT state FROM runtime_compaction_projection_outbox \
+             WHERE session_id = ?1 AND revision = ?2",
+        )
+        .expect("prepare the outbox query");
+    statement
+        .query_map(
+            [
+                projection.session_id().to_string(),
+                projection.revision().to_string(),
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query the outbox")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("read the outbox")
+}
+
+/// In one read of the memory store's database: how many memory records the
+/// session holds, and how many entries its finalized compaction stages
+/// published. Equal counts mean every finalized stage published its entries
+/// exactly once.
+#[cfg(feature = "test-support")]
+fn published_compaction_entries(
+    paths: &Paths,
+    session_id: &meerkat_core::types::SessionId,
+) -> (i64, i64) {
+    let db = paths
+        .runtime_root
+        .join("factory-store")
+        .join("memory")
+        .join("memory.sqlite3");
+    let connection =
+        rusqlite::Connection::open_with_flags(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .expect("open the memory store's database");
+    connection
+        .query_row(
+            "SELECT \
+               (SELECT COUNT(*) FROM memory_metadata WHERE session_id = ?1), \
+               (SELECT COALESCE(SUM(indexed_entries), 0) FROM memory_compaction_stage \
+                  WHERE session_id = ?1 AND state = 'finalized')",
+            [session_id.to_string()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .expect("count the published compaction entries")
+}
+
+/// The member runtime's persisted lifecycle facts that bear on a
+/// compaction commit (its state, its current run and its runtime binding),
+/// read from the runtime store's database.
+#[cfg(feature = "test-support")]
+fn runtime_binding_facts(
+    paths: &Paths,
+    runtime_id: &meerkat_runtime::LogicalRuntimeId,
+) -> Vec<(String, serde_json::Value)> {
+    const KEYS: &[&str] = &[
+        "state",
+        "current_run_id",
+        "agent_runtime_id",
+        "fence_token",
+        "runtime_generation",
+        "runtime_epoch_id",
+    ];
+    fn collect(value: &serde_json::Value, found: &mut Vec<(String, serde_json::Value)>) {
+        match value {
+            serde_json::Value::Object(map) => {
+                for (key, value) in map {
+                    if KEYS.contains(&key.as_str()) && !value.is_object() {
+                        found.push((key.clone(), value.clone()));
+                    }
+                    collect(value, found);
+                }
+            }
+            serde_json::Value::Array(values) => {
+                for value in values {
+                    collect(value, found);
+                }
+            }
+            _ => {}
+        }
+    }
+    let connection = rusqlite::Connection::open_with_flags(
+        &paths.realm_db_path,
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .expect("open the runtime store's database");
+    let record: Option<Vec<u8>> = connection
+        .query_row(
+            "SELECT runtime_state_json FROM runtime_states WHERE runtime_id = ?1",
+            [runtime_id.to_string()],
+            |row| row.get(0),
+        )
+        .ok();
+    let mut found = Vec::new();
+    match record.map(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes)) {
+        Some(Ok(value)) => collect(&value, &mut found),
+        Some(Err(error)) => found.push(("undecodable".to_string(), error.to_string().into())),
+        None => found.push(("record".to_string(), serde_json::Value::Null)),
+    }
+    found
+}
+
+/// Wait, bounded, until the member's session commits with no compaction
+/// intent left and the outbox holds no pending row: the intent was committed
+/// and finalized once.
+#[cfg(feature = "test-support")]
+async fn wait_for_the_intents_to_finalize(
+    paths: &Paths,
+    service: &PersistentSessionService<FactoryAgentBuilder>,
+    runtime_store: &dyn meerkat_runtime::RuntimeStore,
+    run: &CompactedMemberRun,
+    context: &str,
+) {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let tail = provisional_tail_run(runtime_store, &run.w1_sid, true).await;
+        let pending = runtime_store
+            .load_pending_compaction_projections(&run.runtime_id)
+            .await
+            .expect("read the compaction outbox");
+        let carried = if tail.is_none() {
+            service
+                .load_authoritative_session(&run.w1_sid)
+                .await
+                .ok()
+                .flatten()
+                .map(|session| {
+                    session
+                        .validated_compaction_projection_intents()
+                        .map(|intents| intents.len())
+                        .unwrap_or(usize::MAX)
+                })
+        } else {
+            None
+        };
+        if tail.is_none() && pending.is_empty() && carried == Some(0) {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "[{context}] the compaction intent never finalized: tail {tail:?}, pending {}, \
+             carried {carried:?}, memory stages {:?}, runtime {:?}",
+            pending.len(),
+            compaction_stage_states(paths, &run.w1_sid),
+            runtime_binding_facts(paths, &run.runtime_id)
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// A host's graceful shutdown keeps a member's run whose round commits
+/// carried a compaction's intent into its provisional tail. The next start
+/// restores the member over that run and seeds it from the tail, so the
+/// member's session carries the intent while the outbox holds no row for it
+/// (only a commit of the tail writes one). The start's reconciliation waits
+/// for the tail: the run resumes, its boundary commits the tail and with it
+/// the intent, and the reconciliation after the boundary finalizes it once.
+/// RED before: the start's reconciliation asked the agent first, which
+/// refused because "runtime compaction outbox omits a validated session
+/// projection intent", so the member's revival failed and the run never
+/// resumed, at every start while the tail stood.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_run_kept_after_a_compaction_resumes_and_finalizes_its_intent() {
+    // A refused startup or reconciliation is logged, not returned: show it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_over_a_member_run_that_compacted(
+        &paths,
+        runtime_store.clone(),
+        meerkat_mob::QueuedInputsOnShutdown::RequeueDurable,
+    )
+    .await;
+    assert_eq!(
+        provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true).await,
+        Some(run.run_id.clone()),
+        "the graceful shutdown keeps the run: its tail outlives the process"
+    );
+
+    let client_2 = Arc::new(HoldingToolLoopClient::new(0));
+    let (service_2, _store_2) =
+        memory_compacting_service(&paths, runtime_store.clone(), client_2.clone());
+    let handle = start_again(&paths, service_2.clone(), client_2.clone())
+        .await
+        .unwrap_or_else(|error| panic!("the start restores the member over its open run: {error}"));
+    handle.resume().await.expect("the mob resumes");
+    wait_for_the_intents_to_finalize(
+        &paths,
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &run,
+        "requeue",
+    )
+    .await;
+    assert!(
+        client_2
+            .loop_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            >= 1,
+        "the kept run resumed and asked the model"
+    );
+    // The intent the tail carried finalized exactly once: its one outbox row
+    // and its memory stage are finalized, and the session's memory holds
+    // each finalized stage's entries once.
+    for projection in &run.intents {
+        assert_eq!(
+            compaction_outbox_states(&paths, projection),
+            vec!["finalized".to_string()],
+            "the tail's intent has one outbox row, finalized"
+        );
+        assert_eq!(
+            compaction_stage_state(&paths, projection).as_deref(),
+            Some("finalized"),
+            "the tail's intent's memory stage is finalized"
+        );
+    }
+    let (records, published) = published_compaction_entries(&paths, &run.w1_sid);
+    assert!(published > 0, "the finalized stages published entries");
+    assert_eq!(
+        records, published,
+        "every finalized stage's entries are in the session's memory exactly once"
+    );
+    let _ = handle.shutdown().await;
+}
+
+/// The same run, but the host's shutdown stops it instead of keeping it:
+/// the stop cancels the run, and the run's tail, which carries the
+/// compaction's intent, is committed as an interrupted run, so the outbox
+/// holds the intent. The intent's memory stage must still be there for that
+/// commit, and the next start finalizes the intent once, before the revived
+/// member's runtime is bound. RED before: the cancelled run's agent aborted
+/// its uncommitted compaction and deleted the stage, while the tail it had
+/// already written still carried the intent, so a finalization failed with
+/// "missing durable compaction stage for committed rewrite"; and the start's
+/// reconciliation refused the committed intent because the member had no
+/// runtime binding yet, so the member's startup failed at every start.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_run_stopped_after_a_compaction_still_finalizes_its_intent() {
+    // A refused startup or reconciliation is logged, not returned: show it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_over_a_member_run_that_compacted(
+        &paths,
+        runtime_store.clone(),
+        meerkat_mob::QueuedInputsOnShutdown::Stop,
+    )
+    .await;
+
+    let client_2 = Arc::new(HoldingToolLoopClient::new(0));
+    let (service_2, _store_2) =
+        memory_compacting_service(&paths, runtime_store.clone(), client_2.clone());
+    let handle = start_again(&paths, service_2.clone(), client_2.clone())
+        .await
+        .unwrap_or_else(|error| panic!("the start restores the member: {error}"));
+    handle.resume().await.expect("the mob resumes");
+    wait_for_the_intents_to_finalize(
+        &paths,
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &run,
+        "stop",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
+/// The stopped run of the row above leaves a committed compaction intent the
+/// next start must finalize while the revived member has no runtime
+/// placement yet: the mob binds a member's runtime only after its revival,
+/// which waits for the startup's reconciliation. The reconciliation
+/// finalizes the committed intent under the member's live session and epoch,
+/// the revival succeeds, and the member serves a new input. The committed
+/// rewrite's memory stage is finalized. RED before: the startup refused with
+/// "compaction projection coordinator rejected the handoff: session has no
+/// authoritative runtime binding for compaction commit" at every start, and
+/// the member never served again.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_revived_member_finalizes_a_committed_intent_before_its_binding() {
+    // A refused startup or reconciliation is logged, not returned: show it.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_over_a_member_run_that_compacted(
+        &paths,
+        runtime_store.clone(),
+        meerkat_mob::QueuedInputsOnShutdown::Stop,
+    )
+    .await;
+    // The stop's settlement commits the run's tail, and with it the
+    // compaction's intent; a tail it left would be committed the same way by
+    // the next start's recovery.
+    let pending = runtime_store
+        .load_pending_compaction_projections(&run.runtime_id)
+        .await
+        .expect("read the compaction outbox")
+        .len();
+    let tail = provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true).await;
+    assert!(
+        (pending == 1 && tail.is_none()) || (pending == 0 && tail == Some(run.run_id.clone())),
+        "the stop left the intent committed or in the run's tail: pending {pending}, tail {tail:?}"
+    );
+    assert!(
+        compaction_stage_states(&paths, &run.w1_sid)
+            .iter()
+            .all(|state| state == "staged"),
+        "the stop kept the intent's memory stage"
+    );
+
+    let client_2 = Arc::new(HoldingToolLoopClient::new(0));
+    let (service_2, _store_2) =
+        memory_compacting_service(&paths, runtime_store.clone(), client_2.clone());
+    let handle = start_again(&paths, service_2.clone(), client_2.clone())
+        .await
+        .unwrap_or_else(|error| panic!("the start restores the member: {error}"));
+    handle.resume().await.expect("the mob resumes");
+    handle
+        .member(&AgentIdentity::from("w-1"))
+        .await
+        .expect("member handle")
+        .send("token-after-the-stop".to_string(), HandlingMode::Queue)
+        .await
+        .expect("the member admits a new input");
+    wait_for_the_intents_to_finalize(
+        &paths,
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &run,
+        "revival",
+    )
+    .await;
+    for projection in &run.intents {
+        assert_eq!(
+            compaction_stage_state(&paths, projection).as_deref(),
+            Some("finalized"),
+            "the committed rewrite's memory stage is finalized"
+        );
+    }
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        // The new input's request carries the compaction summary, which the
+        // client answers as a loop request.
+        let served = client_2
+            .loop_requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            + client_2.other_requests()
+            >= 1;
+        // The new input's run ends with its answer committed, and with any
+        // compaction it made finalized, before the host shuts down.
+        let answered = provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true)
+            .await
+            .is_none()
+            && runtime_store
+                .load_pending_compaction_projections(&run.runtime_id)
+                .await
+                .expect("read the compaction outbox")
+                .is_empty()
+            && service_2
+                .load_authoritative_session(&run.w1_sid)
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|session| {
+                    matches!(
+                        session.messages().last(),
+                        Some(meerkat_core::Message::BlockAssistant(_))
+                    ) && session
+                        .validated_compaction_projection_intents()
+                        .is_ok_and(|intents| intents.is_empty())
+                });
+        if served && answered {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the revived member did not serve: served {served}, answered {answered}, runtime {:?}",
+            runtime_binding_facts(&paths, &run.runtime_id)
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+    let _ = handle.shutdown().await;
+}

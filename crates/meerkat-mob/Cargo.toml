@@ -86,8 +86,10 @@ tokio_with_wasm = { workspace = true }
 # whose durable live-session synchronization is gated by the facade's
 # session-store feature. jsonl-store keeps the facade feature view coherent
 # with the direct JsonlStore dev dependency below; neither feature is imposed
-# on production meerkat-mob consumers.
-meerkat = { workspace = true, features = ["jsonl-store", "session-store"] }
+# on production meerkat-mob consumers. memory-store-session lets the
+# cold-restart rows give a member durable semantic memory, so a compaction
+# stages its memory projection and records its intent.
+meerkat = { workspace = true, features = ["jsonl-store", "session-store", "memory-store-session"] }
 
 [dev-dependencies]
 # Cold-restart fixtures need these helpers even in package-scoped test lanes.
