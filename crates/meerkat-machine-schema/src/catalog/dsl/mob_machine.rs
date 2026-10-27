@@ -2310,6 +2310,10 @@ macro_rules! mob_catalog_machine_dsl {
             // refusal changes nothing, and the shell consumes the refused
             // route without recording the member Broken.
             RuntimeBindingRefusalStale { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, attempt: Option<u64> },
+            // A step that may have recorded owed wakes without opening an
+            // attempt (several members at once): the owner arms its retry
+            // timer for every owed Dormant member.
+            OwedMemberWakesRecorded,
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -3244,6 +3248,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition MemberMaterializationReleased => local seam SurfaceResultAlignment,
         disposition MemberReleaseClassified => local seam SurfaceResultAlignment,
         disposition RuntimeBindingRefusalStale => local seam SurfaceResultAlignment,
+        disposition OwedMemberWakesRecorded => local seam OwnerRealizationOnly,
 
         // =====================================================================
         // Invariants
@@ -7761,6 +7766,24 @@ macro_rules! mob_catalog_machine_dsl {
                 self.pending_placed_spawn_provision_operation_ids.insert(agent_identity, placed_provision_operation_id.get("value"));
                 self.pending_placed_spawn_operation_owner_session_ids.insert(agent_identity, placed_operation_owner_session_id.get("value"));
                 self.member_materialization_failures.remove(agent_identity);
+                // A held identity (a respawn's preserved topology) placed now:
+                // every Dormant local member its kept edges join is wired to
+                // a placed member, which cannot wake it through an inproc
+                // route. Each is owed a wake (PlacedPeerWired) that the
+                // owner's retry timer realizes; an owed member keeps its cause.
+                for member_id in self.member_materialization.keys() {
+                    if self.member_materialization.get_cloned(member_id) == Some(MemberMaterializationPhase::Dormant)
+                        && self.member_placement.contains_key(member_id) == false
+                        && self.member_boot_obligation_owed.contains_key(member_id) == false
+                        && mob_machine_wiring_contains_pair(self.wiring_edges, member_id, agent_identity)
+                    {
+                        if self.member_peer_endpoints.contains_key(member_id) == true {
+                            self.member_boot_obligation_owed.insert(member_id, MemberBootObligationCause::PlacedPeerWired);
+                        } else {
+                            self.member_boot_obligation_owed.insert(member_id, MemberBootObligationCause::EndpointPending);
+                        }
+                    }
+                }
             }
             to Running
             emit PersistPendingPlacedSpawn {
@@ -7787,6 +7810,7 @@ macro_rules! mob_catalog_machine_dsl {
                 provision_operation_id: placed_provision_operation_id.get("value"),
                 operation_owner_session_id: placed_operation_owner_session_id.get("value")
             }
+            emit OwedMemberWakesRecorded
         }
 
         // §6.1 materialization failure/retry recorder: the ladder rung stays
@@ -14814,9 +14838,38 @@ macro_rules! mob_catalog_machine_dsl {
             update {
                 self.wiring_edges.insert(edge);
                 self.topology_epoch += 1;
+                // A placed retiring member's restored edge joins its peer to
+                // a placed member again: a Dormant local peer (released while
+                // the edge was gone) is owed a wake (PlacedPeerWired) that the
+                // owner's retry timer realizes; an owed peer keeps its cause.
+                if self.member_placement.contains_key(agent_identity) == true
+                    && mob_machine_wiring_edge_a(edge) != agent_identity
+                    && self.member_materialization.get_cloned(mob_machine_wiring_edge_a(edge)) == Some(MemberMaterializationPhase::Dormant)
+                    && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == false
+                    && self.member_boot_obligation_owed.contains_key(mob_machine_wiring_edge_a(edge)) == false
+                {
+                    if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
+                        self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::PlacedPeerWired);
+                    } else {
+                        self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::EndpointPending);
+                    }
+                }
+                if self.member_placement.contains_key(agent_identity) == true
+                    && mob_machine_wiring_edge_b(edge) != agent_identity
+                    && self.member_materialization.get_cloned(mob_machine_wiring_edge_b(edge)) == Some(MemberMaterializationPhase::Dormant)
+                    && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == false
+                    && self.member_boot_obligation_owed.contains_key(mob_machine_wiring_edge_b(edge)) == false
+                {
+                    if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
+                        self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::PlacedPeerWired);
+                    } else {
+                        self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::EndpointPending);
+                    }
+                }
             }
             to Running
             emit WiringGraphChanged { epoch: self.topology_epoch }
+            emit OwedMemberWakesRecorded
         }
 
         transition WireExternalPeerRunning {
@@ -26246,12 +26299,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
                 self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
-                // Owed until Live, as a boot wake is: a retryable failure
-                // leaves the member Dormant and owed, so the owner wakes it
-                // again. A member with no durable endpoint owes
-                // EndpointPending (I6).
+                // Owed until Live (PlacedPeerWired), as a boot wake is: a
+                // retryable failure leaves the member Dormant and owed, so
+                // the owner wakes it again. A member with no durable endpoint
+                // owes EndpointPending (I6).
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
-                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::Obligation);
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::EndpointPending);
                 }
@@ -26313,12 +26366,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
                 self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
-                // Owed until Live, as a boot wake is: a retryable failure
-                // leaves the member Dormant and owed, so the owner wakes it
-                // again. A member with no durable endpoint owes
-                // EndpointPending (I6).
+                // Owed until Live (PlacedPeerWired), as a boot wake is: a
+                // retryable failure leaves the member Dormant and owed, so
+                // the owner wakes it again. A member with no durable endpoint
+                // owes EndpointPending (I6).
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
-                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::Obligation);
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::EndpointPending);
                 }
@@ -26385,12 +26438,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
                 self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_a(edge)).get("value"));
-                // Owed until Live, as a boot wake is: a retryable failure
-                // leaves the member Dormant and owed, so the owner wakes it
-                // again. A member with no durable endpoint owes
-                // EndpointPending (I6).
+                // Owed until Live (PlacedPeerWired), as a boot wake is: a
+                // retryable failure leaves the member Dormant and owed, so
+                // the owner wakes it again. A member with no durable endpoint
+                // owes EndpointPending (I6).
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
-                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::Obligation);
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::EndpointPending);
                 }
@@ -26465,12 +26518,12 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
                 self.member_startup_ready.remove(self.identity_to_runtime.get_cloned(mob_machine_wiring_edge_b(edge)).get("value"));
-                // Owed until Live, as a boot wake is: a retryable failure
-                // leaves the member Dormant and owed, so the owner wakes it
-                // again. A member with no durable endpoint owes
-                // EndpointPending (I6).
+                // Owed until Live (PlacedPeerWired), as a boot wake is: a
+                // retryable failure leaves the member Dormant and owed, so
+                // the owner wakes it again. A member with no durable endpoint
+                // owes EndpointPending (I6).
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
-                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::Obligation);
+                    self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::EndpointPending);
                 }
@@ -28918,12 +28971,15 @@ impl PeerTransportKind {
 
 /// Why a boot obligation is still owed. `EndpointPending`: the member has no
 /// durable endpoint yet (a legacy journal), the boot plan's one typed
-/// exception to "every Dormant member is peer-wakeable".
+/// exception to "every Dormant member is peer-wakeable". `PlacedPeerWired`: a
+/// wiring edge joins the member to a placed member, which cannot wake it
+/// through an inproc route (the owner wakes it with that cause).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MemberBootObligationCause {
     #[default]
     Obligation,
     EndpointPending,
+    PlacedPeerWired,
 }
 
 /// The machine's release verdict for one member: the shell's release path
