@@ -5597,6 +5597,64 @@ export type AdmissionDropReason = "untrusted_sender" | "classification_rejected"
 
 export type CommsSendRequiredAction = "reconcile";
 
+export type DurableResumeHold = "tail_held_for_recovery" | "recovery_refused" | "evidence_quarantined" | "audited_endpoint_divergence";
+
+export interface PeerWakeRefusalMemberBroken {
+  hold?: DurableResumeHold | null;
+  kind: "member_broken";
+  reason: string;
+}
+
+export interface PeerWakeRefusalMemberRetiring {
+  kind: "member_retiring";
+}
+
+export interface PeerWakeRefusalMobNotRunning {
+  kind: "mob_not_running";
+}
+
+export interface PeerWakeRefusalAdmissionClosed {
+  kind: "admission_closed";
+}
+
+export interface PeerWakeRefusalWakeTimedOut {
+  kind: "wake_timed_out";
+}
+
+export interface PeerWakeRefusalMobUnavailable {
+  kind: "mob_unavailable";
+}
+
+export interface PeerWakeRefusalMaterializationLost {
+  kind: "materialization_lost";
+}
+
+export interface PeerWakeRefusalNonAuthoritativeComposition {
+  kind: "non_authoritative_composition";
+}
+
+export interface PeerWakeRefusalHostPreparationPending {
+  kind: "host_preparation_pending";
+}
+
+export interface PeerWakeRefusalResumeGateUnavailable {
+  kind: "resume_gate_unavailable";
+}
+
+export interface PeerWakeRefusalHostOwned {
+  kind: "host_owned";
+}
+
+export interface PeerWakeRefusalLifecycleOriginFenced {
+  kind: "lifecycle_origin_fenced";
+}
+
+export interface PeerWakeRefusalSenderWaking {
+  kind: "sender_waking";
+}
+
+export type PeerWakeRefusal = PeerWakeRefusalMemberBroken | PeerWakeRefusalMemberRetiring | PeerWakeRefusalMobNotRunning | PeerWakeRefusalAdmissionClosed | PeerWakeRefusalWakeTimedOut | PeerWakeRefusalMobUnavailable | PeerWakeRefusalMaterializationLost | PeerWakeRefusalNonAuthoritativeComposition | PeerWakeRefusalHostPreparationPending | PeerWakeRefusalResumeGateUnavailable | PeerWakeRefusalHostOwned | PeerWakeRefusalLifecycleOriginFenced | PeerWakeRefusalSenderWaking;
+
 export interface CommsSendErrorDataPeerNotFoundOrNotTrusted {
   code: "peer_not_found_or_not_trusted";
   message: string;
@@ -5630,7 +5688,7 @@ export interface CommsSendErrorDataPeerWakeRefused {
   envelope_id: string;
   message: string;
   peer: string;
-  refusal: Record<string, unknown>;
+  refusal: PeerWakeRefusal;
   retryable: boolean;
 }
 
