@@ -6,32 +6,45 @@
 # Derives the TLC configs from the generated ci.cfg next to this script (every
 # generated constant and invariant, unchanged), then adds the audit's model
 # values (two identities, three runtime ids, fence tokens 1..3, generations
-# 0..1, three sessions, the audit's strings), its wake-attempt cap
-# (AuditMaxAttempts = 2, held by AuditStateConstraint) and its VIEW, which
-# leaves out the two counters no guard, other variable's update or invariant
-# of the generated model reads (model_step_count and topology_epoch). The
-# runner first checks that the model still reads neither counter anywhere
-# else, and fails otherwise. It checks four runs over their whole space with
-# TLC coverage (see member_residency_audit.tla):
-# - wake (AuditWakeSpec): one identity through the seed, the boot plan and
-#   seal, every WakeMember arm, every attempt-fenced resolution and its stale
-#   twin in every phase, the runtime-ready observation, every release shape,
-#   the drift and terminal classifications, the peer notice classification,
-#   Stop, Resume, Complete, the destroy admission, DestroyMob, Shutdown, a
-#   retirement start and its archive;
+# 0..1, three sessions, the audit's strings), each run's wake-attempt cap
+# (AuditMaxAttempts, held by AuditStateConstraint) and its VIEW, which leaves
+# out the two counters no guard, other variable's update or invariant of the
+# generated model reads (model_step_count and topology_epoch). The runner
+# first checks that the model still reads neither counter anywhere else, and
+# fails otherwise. It checks eight small runs over their whole space with TLC
+# coverage (see member_residency_audit.tla):
+# - seed (AuditSeedSpec): one identity through every build seed, every boot
+#   verdict, the seal and the host carry-out;
+# - wake (AuditWakeSpec): one identity under the default seed through the boot
+#   plan and seal, every WakeMember arm for six input shapes, every
+#   attempt-fenced resolution, the late feedback in Running and Stopped, the
+#   runtime-ready observation, three release shapes, the drift and terminal
+#   classifications, the peer notice classification, Stop and Resume;
+# - retire (AuditRetireSpec): one identity woken, released and retired, the
+#   routed and archive-only retirement starts, the routed retire retry, the
+#   archives, the replayed starts, a rotation finished in Running and in
+#   Stopped, a host-pending seed, and the mob's destroy;
+# - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
 # - resume (AuditResumeSpec): one identity through an explicit resume;
 # - edge (AuditEdgeSpec): two identities and one wiring edge (I8);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
 #   through the dormant seat, the embodied spawn commit, the release and the
-#   rotation.
-# Every run checks every generated invariant (I1-I14 among them), AP1
-# (no recovery or seat arm overwrites a phase) and AP2 (an open attempt is
-# never replaced and ends only Live, Dormant or without a phase; every
-# Waking member has an enabled closing arm); the wake run also AP3 (a
-# Lifecycle input never wakes, a notice classification never changes
-# residency) and that exactly one WakeMember arm answers every input. TLC
-# evaluates the module's I5 ASSUME (a present, bound member with a phase is
-# never refused as not a member) at the start of every run.
+#   rotation;
+# - wake2 (AuditWake2Spec): two identities woken beside each other.
+# Every run checks every generated invariant (I1-I14 among them), AP2 (an
+# open attempt is never replaced and ends only Live, Dormant or without a
+# phase; every Waking member has an enabled closing arm for every kind)
+# and, where the run has recovery or seat arms, AP1 (no such arm overwrites a
+# phase). The wake run also checks AP3 (a Lifecycle input never wakes, a
+# notice classification never changes residency), that exactly one WakeMember
+# arm answers every input shape, that a local wake closes Live only with an
+# endpoint and that a release of another epoch never demotes. The
+# retire run checks that no runtime retire is routed for a member with no
+# registration (R27), that a settled retirement can always archive and under
+# an admitted destroy nothing holds it (R124), and that no rotation begins or
+# commits under an admitted destroy (R124). TLC evaluates the module's I5
+# ASSUME (a present, bound member with a phase is never refused as not a
+# member) at the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -52,22 +65,21 @@ fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane. The
 # counts below are provisional (1) until the first green run reports them.
+seed_states=1
 wake_states=1
+retire_states=1
+terminal_states=1
 resume_states=1
 edge_states=1
 seat_states=1
+wake2_states=1
 
 # Every arm each run must fire. TLC names an arm after the generated
 # operator, since every audit wrapper here is a plain application.
-wake_covered_actions=(
+seed_covered_actions=(
   RecoverRosterMemberRunning
   RecoverMemberSessionBindingFreshRunning
-  RecoverMemberSessionBindingAlreadyCurrentRunning
   RecoverMemberPeerEndpointFreshRunning
-  RegisterMemberPeerRunning
-  RecoverRosterMemberRetiredRunning
-  RecoverMemberRestoreFailureRunning
-  RecoverMemberRestoreHostRefusedRunning
   SeedMemberResidencyRunning
   SeedMemberResidencyStopped
   SeedMemberResidencyCompleted
@@ -79,12 +91,30 @@ wake_covered_actions=(
   PlanBootMaterializationStayDormant
   SealBootMaterializationPlan
   WakeMemberAuthorizedRunning
+  AbandonMemberWakeDormantRunning
+  BeginPlacedCompletionLifecycleQuiesceFreshStop
+  StopRunning
+  ResumeStopped
+  BeginPlacedCompletionLifecycleQuiesceFresh
+  CompleteRunning
+)
+
+wake_covered_actions=(
+  RecoverRosterMemberRunning
+  RecoverMemberSessionBindingFreshRunning
+  RecoverMemberSessionBindingAlreadyCurrentRunning
+  RecoverMemberPeerEndpointFreshRunning
+  RegisterMemberPeerRunning
+  RecoverMemberRestoreFailureRunning
+  RecoverMemberRestoreHostRefusedRunning
+  PlanBootMaterializationWake
+  PlanBootMaterializationStayDormant
+  SealBootMaterializationPlan
+  WakeMemberAuthorizedRunning
   WakeMemberJoinedRunning
   WakeMemberAlreadyLiveRunning
   WakeMemberRefusedRunning
   WakeMemberRefusedStopped
-  WakeMemberRefusedCompleted
-  WakeMemberRefusedDestroyed
   ResolveMemberRevivalBoundRunning
   ResolveMemberRevivalSucceededRunningLocal
   ResolveMemberRevivalFailedRunning
@@ -95,67 +125,98 @@ wake_covered_actions=(
   ResolveRecreatedMemberSessionSucceededRunningLocal
   ResolveMemberRevivalBoundStaleRunning
   ResolveMemberRevivalBoundStaleStopped
-  ResolveMemberRevivalBoundStaleCompleted
-  ResolveMemberRevivalBoundStaleDestroyed
   ResolveMemberRevivalSucceededStaleRunning
   ResolveMemberRevivalSucceededStaleStopped
-  ResolveMemberRevivalSucceededStaleCompleted
-  ResolveMemberRevivalSucceededStaleDestroyed
   ResolveMemberRevivalFailedStaleRunning
   ResolveMemberRevivalFailedStaleStopped
-  ResolveMemberRevivalFailedStaleCompleted
-  ResolveMemberRevivalFailedStaleDestroyed
   ResolveMemberRevivalHostRefusedStaleRunning
   ResolveMemberRevivalHostRefusedStaleStopped
-  ResolveMemberRevivalHostRefusedStaleCompleted
-  ResolveMemberRevivalHostRefusedStaleDestroyed
   ResolveMemberRevivalRetryableStaleRunning
   ResolveMemberRevivalRetryableStaleStopped
-  ResolveMemberRevivalRetryableStaleCompleted
-  ResolveMemberRevivalRetryableStaleDestroyed
   AbandonMemberWakeStaleRunning
   AbandonMemberWakeStaleStopped
-  AbandonMemberWakeStaleCompleted
-  AbandonMemberWakeStaleDestroyed
   ResolveRecreatedMemberSessionSucceededStaleRunning
   ResolveRecreatedMemberSessionSucceededStaleStopped
-  ResolveRecreatedMemberSessionSucceededStaleCompleted
-  ResolveRecreatedMemberSessionSucceededStaleDestroyed
   ObserveRuntimeReady
   ReleaseMemberMaterializationReleasedRunning
   ReleaseMemberMaterializationReleasedStopped
-  ReleaseMemberMaterializationReleasedCompleted
   ReleaseMemberMaterializationStaleRunning
   ReleaseMemberMaterializationStaleStopped
-  ReleaseMemberMaterializationStaleCompleted
-  ReleaseMemberMaterializationStaleDestroyed
   ClassifyMemberLiveMaterializationRevivable
   ClassifyMemberLiveMaterializationTerminal
   ClassifyMemberLiveMaterializationTerminalDormant
   ClassifyPeerNoticeRunning
   ClassifyPeerNoticeStopped
-  ClassifyPeerNoticeCompleted
-  ClassifyPeerNoticeDestroyed
   BeginPlacedCompletionLifecycleQuiesceFreshStop
   StopRunning
   ResumeStopped
-  BeginPlacedCompletionLifecycleQuiesceFresh
-  CompleteRunning
-  MarkCompleted
-  AdmitDestroyCleanup
-  DestroyMob
-  ShutdownRunning
+)
+
+retire_covered_actions=(
   RetireRunningReleasing
+  RetireRunningReleasingArchiveOnly
   RetireRunningPreservingBinding
+  RetireRunningPreservingBindingArchiveOnly
   RetireStoppedReleasing
-  SessionIngressDetachedForMobDestroyRunning
-  SessionIngressDetachedForMobDestroyStopped
+  RetireStoppedReleasingArchiveOnly
+  RetireStoppedPreservingBinding
+  RetireStoppedPreservingBindingArchiveOnly
+  RetireMember
+  RetireMemberArchiveOnly
+  RetryRuntimeRetireRunning
+  RetryRuntimeRetireStopped
   ObserveRuntimeRetired
   ObserveRuntimeRetiredStopped
+  SessionIngressDetachedForMobDestroyRunning
+  SessionIngressDetachedForMobDestroyStopped
   ObserveMemberRetirementArchivedLive
   ObserveMemberRetirementArchivedRetired
   ObserveMemberRetirementArchivedLiveStopped
   ObserveMemberRetirementArchivedRetiredStopped
+  RecoverRosterMemberRetirementStartedReleasing
+  RecoverRosterMemberRetirementStartedPreservingBinding
+  AuthorizeSpawnProfileRunning
+  BeginMemberRotationRunning
+  CommitMemberRotationLiveRunning
+  CommitMemberRotationRetiredRunning
+  CommitMemberRotationLiveStopped
+  CommitMemberRotationRetiredStopped
+  AdmitDestroyCleanup
+  AdmitDestroyMemberRetireLiveRunning
+  AdmitDestroyMemberRetireArchiveOnlyRunning
+  AdmitDestroyMemberRetireAlreadyRetiringSessionRunning
+  AdmitDestroyMemberRetireAlreadyRetiringReleasedSessionRunning
+  ObserveDestroyMemberRetirementArchivedLiveRunning
+  ObserveDestroyMemberRetirementArchivedRetiredRunning
+  DestroyMob
+)
+
+terminal_covered_actions=(
+  RecoverRosterMemberRetiredRunning
+  WakeMemberRefusedCompleted
+  WakeMemberRefusedDestroyed
+  ResolveMemberRevivalBoundStaleCompleted
+  ResolveMemberRevivalBoundStaleDestroyed
+  ResolveMemberRevivalSucceededStaleCompleted
+  ResolveMemberRevivalSucceededStaleDestroyed
+  ResolveMemberRevivalFailedStaleCompleted
+  ResolveMemberRevivalFailedStaleDestroyed
+  ResolveMemberRevivalHostRefusedStaleCompleted
+  ResolveMemberRevivalHostRefusedStaleDestroyed
+  ResolveMemberRevivalRetryableStaleCompleted
+  ResolveMemberRevivalRetryableStaleDestroyed
+  AbandonMemberWakeStaleCompleted
+  AbandonMemberWakeStaleDestroyed
+  ResolveRecreatedMemberSessionSucceededStaleCompleted
+  ResolveRecreatedMemberSessionSucceededStaleDestroyed
+  ReleaseMemberMaterializationReleasedCompleted
+  ReleaseMemberMaterializationStaleCompleted
+  ReleaseMemberMaterializationStaleDestroyed
+  ClassifyPeerNoticeCompleted
+  ClassifyPeerNoticeDestroyed
+  CompleteRunning
+  MarkCompleted
+  ShutdownRunning
 )
 
 resume_covered_actions=(
@@ -183,13 +244,16 @@ edge_covered_actions=(
 )
 
 seat_covered_actions=(
-  AuthorizeSpawnProfileRunning
   BeginSpawnExecFresh
   CommitDormantSeatRunning
   CommitSpawnMembershipFresh
-  BeginMemberRotationRunning
-  CommitMemberRotationLiveRunning
-  CommitMemberRotationRetiredRunning
+)
+
+wake2_covered_actions=(
+  ClassifyPeerNoticeRunning
+  WakeMemberAuthorizedRunning
+  WakeMemberRefusedRunning
+  RetireRunningPreservingBindingArchiveOnly
 )
 
 spec_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -256,9 +320,95 @@ step_index="${view_positions% *}"
 epoch_index="${view_positions#* }"
 
 # usage: write_cfg <run> <file> <extra invariant lines> <extra property lines>
-# where <run> is wake, resume, edge or seat.
+# where <run> is seed, wake, retire, terminal, resume, edge, seat or wake2.
 write_cfg() {
   local run="$1" cfg="$2" invariants="$3" properties="$4"
+  local spec run_properties run_invariants max_attempts section_end
+  case "${run}" in
+    seed)
+      spec="AuditSeedSpec"
+      max_attempts=1
+      run_properties="
+  AuditSeedRecoverKeepsPhase
+  AuditAttemptEndsClosed"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    wake)
+      spec="AuditWakeSpec"
+      max_attempts=2
+      run_properties="
+  AuditRecoverKeepsPhase
+  AuditAttemptEndsClosed
+  AuditLifecycleNeverWakes
+  AuditWakeNeverSkipsWaking
+  AuditSucceededLeavesEndpoint
+  AuditReleaseEpochFence"
+      run_invariants="
+  AuditWakingClosable
+  AuditWakeExactlyOne"
+      ;;
+    retire)
+      spec="AuditRetireSpec"
+      max_attempts=1
+      run_properties="
+  AuditAttemptEndsClosed
+  AuditRetireRoutesOnlyRegistered
+  AuditDestroyFencesRotation"
+      run_invariants="
+  AuditWakingClosable
+  AuditRetirementArchivable"
+      ;;
+    terminal)
+      spec="AuditTerminalSpec"
+      max_attempts=1
+      run_properties="
+  AuditTerminalRecoverKeepsPhase
+  AuditAttemptEndsClosed"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    resume)
+      spec="AuditResumeSpec"
+      max_attempts=2
+      run_properties="
+  AuditResumeRecoverKeepsPhase
+  AuditAttemptEndsClosed"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    edge)
+      spec="AuditEdgeSpec"
+      max_attempts=2
+      run_properties="
+  AuditEdgeRecoverKeepsPhase
+  AuditAttemptEndsClosed"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    seat)
+      spec="AuditSeatSpec"
+      max_attempts=2
+      run_properties="
+  AuditSeatRecoverKeepsPhase
+  AuditAttemptEndsClosed
+  AuditSeatLeavesDormant"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    wake2)
+      spec="AuditWake2Spec"
+      max_attempts=2
+      run_properties="
+  AuditAttemptEndsClosed"
+      run_invariants="
+  AuditWakingClosable"
+      ;;
+    *)
+      echo "error: unknown audit run '${run}'" >&2
+      exit 1
+      ;;
+  esac
   cp "${ci_cfg}" "${cfg}"
   replace_exact_line "  AgentIdentityValues = {}" '  AgentIdentityValues = {"agentidentity_1", "agentidentity_2"}' "${cfg}"
   replace_exact_line "  AgentRuntimeIdValues = {}" '  AgentRuntimeIdValues = {"agentruntimeid_1", "agentruntimeid_2", "agentruntimeid_3"}' "${cfg}"
@@ -271,54 +421,21 @@ write_cfg() {
   replace_exact_line "CONSTANTS" "CONSTANTS
   AuditStepIndex = ${step_index}
   AuditEpochIndex = ${epoch_index}
-  AuditMaxAttempts = 2" "${cfg}"
-  local spec run_properties run_invariants
-  case "${run}" in
-    wake)
-      spec="AuditWakeSpec"
-      run_properties="
-  AuditRecoverKeepsPhase
-  AuditAttemptEndsClosed
-  AuditLifecycleNeverWakes
-  AuditWakeNeverSkipsWaking"
-      run_invariants="
-  AuditWakingClosable
-  AuditWakeExactlyOne"
-      ;;
-    resume)
-      spec="AuditResumeSpec"
-      run_properties="
-  AuditResumeRecoverKeepsPhase
-  AuditAttemptEndsClosed"
-      run_invariants="
-  AuditWakingClosable"
-      ;;
-    edge)
-      spec="AuditEdgeSpec"
-      run_properties="
-  AuditEdgeRecoverKeepsPhase
-  AuditAttemptEndsClosed"
-      run_invariants="
-  AuditWakingClosable"
-      ;;
-    seat)
-      spec="AuditSeatSpec"
-      run_properties="
-  AuditSeatRecoverKeepsPhase
-  AuditAttemptEndsClosed
-  AuditSeatLeavesDormant"
-      run_invariants="
-  AuditWakingClosable"
-      ;;
-    *)
-      echo "error: unknown audit run '${run}'" >&2
-      exit 1
-      ;;
-  esac
+  AuditMaxAttempts = ${max_attempts}" "${cfg}"
   replace_exact_line "SPECIFICATION Spec" "SPECIFICATION ${spec}" "${cfg}"
   replace_exact_line "INVARIANTS" "PROPERTIES${run_properties}${properties}
-INVARIANTS${run_invariants}${invariants}" "${cfg}"
-  replace_exact_line "CONSTRAINTS" "VIEW AuditView
+INVARIANTS" "${cfg}"
+  # The audit's invariants follow the generated ones: TLC reports the first
+  # invariant a state breaks in the config's order, so a mutant seeded
+  # against a generated invariant is refused by that invariant even where
+  # its state also breaks an audit invariant.
+  section_end="$(awk '/^INVARIANTS$/ { inside = 1; next } inside && /^[A-Z]/ { print; exit }' "${cfg}")"
+  if [[ "${section_end}" != "CONSTRAINTS" ]]; then
+    echo "error: expected the CONSTRAINTS section right after INVARIANTS in ${ci_cfg}, found '${section_end}'" >&2
+    exit 1
+  fi
+  replace_exact_line "CONSTRAINTS" "${run_invariants#$'\n'}${invariants}
+VIEW AuditView
 CONSTRAINTS" "${cfg}"
   replace_exact_line "  CiStateConstraint" "  AuditStateConstraint" "${cfg}"
   printf 'CHECK_DEADLOCK FALSE\n' >> "${cfg}"
@@ -408,24 +525,31 @@ check_space() {
 }
 
 tlc_args=("$@")
+check_space seed "${seed_states}" "${seed_covered_actions[@]}"
 check_space wake "${wake_states}" "${wake_covered_actions[@]}"
+check_space retire "${retire_states}" "${retire_covered_actions[@]}"
+check_space terminal "${terminal_states}" "${terminal_covered_actions[@]}"
 check_space resume "${resume_states}" "${resume_covered_actions[@]}"
 check_space edge "${edge_states}" "${edge_covered_actions[@]}"
 check_space seat "${seat_states}" "${seat_covered_actions[@]}"
+check_space wake2 "${wake2_states}" "${wake2_covered_actions[@]}"
 
 # Each witness is <run>:<kind>:<name>: a state goal's negation joins the
 # invariants, a step goal's negation ([][~step]_vars) joins the properties.
 for witness in \
-  "wake:Invariant:SealedDormant" "wake:Invariant:SealedEndpointPending" \
+  "seed:Invariant:SealedDormant" "seed:Invariant:SealedEndpointPending" \
   "wake:Action property:WokeLive" "wake:Action property:Released" \
   "wake:Action property:StopCloses" "wake:Invariant:StaleInStopped" \
-  "wake:Invariant:Drift" "wake:Action property:RetireCloses" \
-  "wake:Invariant:BrokenWake" \
+  "wake:Invariant:Drift" "wake:Invariant:BrokenWake" \
+  "retire:Action property:RetireCloses" "retire:Action property:ArchiveOnlyArchived" \
+  "retire:Action property:DestroyBeatsRotation" "retire:Action property:DestroyBeatsHostPending" \
+  "retire:Action property:RotatedStopped" \
   "resume:Action property:ResumeJoins" "resume:Action property:ResumeReservesLive" \
   "resume:Action property:ResumeFinishedLive" \
   "edge:Invariant:HeldEdge" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
-  "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn"; do
+  "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
+  "wake2:Action property:CrossNotice" "wake2:Action property:RetireBesideWaking"; do
   run="${witness%%:*}"
   rest="${witness#*:}"
   kind="${rest%%:*}"
@@ -563,7 +687,7 @@ PY
   }
 
   # I1: an unseating replay that keeps the residency phase.
-  mutate wake replay_unseat_keeps_phase \
+  mutate terminal replay_unseat_keeps_phase \
     "Error: Invariant materialization_domain_is_session_bound_membership is violated" \
     'keep_var("RecoverRosterMemberRetiredRunning", "member_materialization")' "$@"
   # I2: the one seating arm binds the member without seating it Dormant.
@@ -575,11 +699,11 @@ PY
     "Error: Invariant broken_member_has_no_phase is violated" \
     'keep_var("ClassifyMemberLiveMaterializationTerminal", "member_materialization")' "$@"
   # I6: the seal without its endpoint guard.
-  mutate wake seal_without_endpoint_guard \
+  mutate seed seal_without_endpoint_guard \
     "Error: Invariant dormant_member_has_durable_endpoint is violated" \
     'drop_guard("SealBootMaterializationPlan", "member_boot_obligation_owed")' "$@"
   # The I6 exception: registering an endpoint keeps EndpointPending owed.
-  mutate wake endpoint_keeps_pending \
+  mutate seed endpoint_keeps_pending \
     "Error: Invariant endpoint_pending_member_has_no_endpoint is violated" \
     'keep_var("RecoverMemberPeerEndpointFreshRunning", "member_boot_obligation_owed")' "$@"
   # I7: an abandoned wake keeps its binding request.
@@ -594,14 +718,15 @@ PY
   mutate wake wake_records_no_attempt \
     "Error: Invariant waking_is_one_attempt is violated" \
     'keep_var("WakeMemberAuthorizedRunning", "member_wake_attempts")' "$@"
-  # I11: a retirement start keeps the member's open wake.
-  mutate wake retire_start_keeps_wake \
+  # I11: a retirement start keeps the member's open wake (a Waking member
+  # retires through the archive-only twin).
+  mutate retire retire_start_keeps_wake \
     "Error: Invariant retiring_incarnation_never_waking is violated" \
     'for var in ("member_materialization", "member_wake_attempts", "member_wake_bound", "member_materialization_epoch", "member_boot_obligation_owed"):
-    keep_var("RetireRunningPreservingBinding", var)' "$@"
+    keep_var("RetireRunningPreservingBindingArchiveOnly", var)' "$@"
   # I12: the build seed turns the composition non-authoritative over an open
   # attempt.
-  mutate wake seed_over_open_attempt \
+  mutate seed seed_over_open_attempt \
     "Error: Invariant candidate_composition_never_wakes is violated" \
     'drop_guard("SeedMemberResidencyRunning", "member_wake_attempts")' "$@"
   # I13: an authorized wake mints no attempt id.
@@ -682,5 +807,53 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate seat seat_duplicate_peer_id \
     "Error: Invariant (member_peer_id_ownership_is_global_across_generations|live_member_peer_ids_are_unique) is violated" \
     'drop_guard("CommitDormantSeatRunning", "mob_machine_member_peer_id_available_for_identity")' "$@"
+  # A local wake closes Live without a registered endpoint.
+  mutate wake succeeded_without_endpoint \
+    "Error: Action property AuditSucceededLeavesEndpoint is violated" \
+    'drop_guard("ResolveMemberRevivalSucceededRunningLocal", "member_peer_endpoints")' "$@"
+  # The epoch fence: a release demotes whatever its epoch. The epoch
+  # conjunct of the Released guard and of both its folds (the demotion and
+  # the epoch clear) becomes TRUE, so the demoted state is a valid one and
+  # only the property can refuse it.
+  mutate wake release_ignores_epoch \
+    "Error: Action property AuditReleaseEpochFence is violated" \
+    'epoch = r"\(\(IF \(member_id \\in DOMAIN (member_materialization_epoch|acc)\) THEN Some\(\(IF member_id \\in DOMAIN \1 THEN \1\[member_id\] ELSE None\)\) ELSE None\) = Some\((outer_)?runtime_epoch_id\)\)"
+def edit(body):
+    found = re.findall(epoch, body)
+    assert len(found) == 1, f"expected one epoch conjunct in the Released guard, found {len(found)}"
+    return re.sub(epoch, "TRUE", body)
+_replace_body("ReleaseMemberMaterializationReleasedRunning", edit)
+folds = re.findall(r"^(ReleaseMemberMaterializationReleasedRunning_ForEach\d+_member_materialization(?:_epoch)?)\(", text, re.M)
+assert len(folds) == 2, f"expected the two folds of the Released arm, found {folds}"
+for fold in folds:
+    found = list(re.finditer(r"^" + re.escape(fold) + r"\(.*$", text, re.M))
+    assert len(found) == 1, f"expected one definition line of {fold}, found {len(found)}"
+    line = found[0].group(0)
+    assert len(re.findall(epoch, line)) == 1, f"expected one epoch conjunct in {fold}"
+    text = text[:found[0].start()] + re.sub(epoch, "TRUE", line) + text[found[0].end():]' "$@"
+  # R27: the routed retirement start without its Dormant guard routes a
+  # runtime retire for a member with no registration.
+  mutate retire archive_only_routes \
+    "Error: Action property AuditRetireRoutesOnlyRegistered is violated" \
+    'drop_guard("RetireRunningReleasing", "# Some(\"Dormant\")")' "$@"
+  # R27: an archive terminal keeps the runtime's archive-only mark.
+  mutate retire archive_keeps_archive_only \
+    "Error: Invariant archive_only_retirement_is_retiring is violated" \
+    'keep_var("ObserveMemberRetirementArchivedLive", "runtime_retire_archive_only")' "$@"
+  # R124: the plain archive terminals wait for the rotation even under an
+  # admitted destroy.
+  mutate retire destroy_waits_on_rotation \
+    "Error: Invariant AuditRetirementArchivable is violated" \
+    'for arm in ("ObserveMemberRetirementArchivedLive", "ObserveMemberRetirementArchivedRetired", "ObserveMemberRetirementArchivedLiveStopped", "ObserveMemberRetirementArchivedRetiredStopped"):
+    drop_guard(arm, "member_rotation_session_ids")
+    add_guard(arm, "((agent_identity \\in DOMAIN member_rotation_session_ids) = FALSE)")' "$@"
+  # R124: the rotation commits under an admitted destroy.
+  mutate retire commit_rotation_after_destroy \
+    "Error: Action property AuditDestroyFencesRotation is violated" \
+    'drop_guard("CommitMemberRotationLiveRunning", "destroy_admitted")' "$@"
+  # R124: the destroy keeps the pending host preparations.
+  mutate retire destroy_keeps_host_pending \
+    "Error: Invariant destroyed_mob_holds_no_member_lifecycle is violated" \
+    'keep_var("DestroyMob", "member_host_preparation_pending")' "$@"
 fi
 echo "member residency audit passed over the whole reachable space of its domains"

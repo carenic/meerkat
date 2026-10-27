@@ -28,11 +28,11 @@
 
 use meerkat_mob::machines::mob_machine::{
     AgentIdentity, AgentRuntimeId, FenceToken, Generation,
-    MemberLiveMaterializationObservationKind, MemberMaterializationPhase, MemberRevivalVerdictKind,
-    MemberWakeFeedbackVerdict, MobMachineAuthority, MobMachineEffect, MobMachineInput,
-    MobMachineMutator, MobMachineSignal, MobMachineState, MobMachineTransition, MobMemberState,
-    MobPhase, PlacedCompletionLifecycleIntentKind, ResumeMemberBinding, SessionId,
-    SpawnPolicyRuntimeMode,
+    MemberLiveMaterializationObservationKind, MemberMaterializationPhase, MemberPeerEndpoint,
+    MemberRevivalVerdictKind, MemberWakeFeedbackVerdict, MobMachineAuthority, MobMachineEffect,
+    MobMachineInput, MobMachineMutator, MobMachineSignal, MobMachineState, MobMachineTransition,
+    MobMemberState, MobPhase, PeerAddress, PeerId, PeerName, PeerSigningKey,
+    PlacedCompletionLifecycleIntentKind, ResumeMemberBinding, SessionId, SpawnPolicyRuntimeMode,
 };
 
 const MEMBER: &str = "worker-1";
@@ -141,6 +141,27 @@ fn apply_local_spawn_ladder(authority: &mut MobMachineAuthority, identity_name: 
     .expect("local CommitSpawnActivation must settle the spawn-exec phase");
 }
 
+/// The member's comms endpoint, registered after its spawn as the actor does.
+/// A local wake closes Live only with a registered endpoint.
+fn register_member_endpoint(authority: &mut MobMachineAuthority, identity_name: &str) {
+    MobMachineMutator::apply(
+        authority,
+        MobMachineInput::RegisterMemberPeer {
+            agent_identity: identity(identity_name),
+            agent_runtime_id: runtime_id(identity_name, GENERATION),
+            generation: Generation(GENERATION),
+            fence_token: FenceToken(FENCE),
+            peer_endpoint: MemberPeerEndpoint::new(
+                PeerName(identity_name.to_string()),
+                PeerId(format!("peer-{identity_name}")),
+                PeerAddress(format!("inproc://{identity_name}")),
+                PeerSigningKey([9; 32]),
+            ),
+        },
+    )
+    .expect("the spawned member registers its endpoint");
+}
+
 /// The drift arm: the machine believed the member Live and a probe observed
 /// its materialization gone with a durable snapshot present. It opens exactly
 /// one wake attempt (Live -> Waking) and returns the attempt id the shell
@@ -231,6 +252,7 @@ fn local_member_revival_reemits_the_exact_runtime_binding_request() {
     let mut authority = MobMachineAuthority::new();
     authorize_spawn_profile(&mut authority, MEMBER);
     apply_local_spawn_ladder(&mut authority, MEMBER);
+    register_member_endpoint(&mut authority, MEMBER);
     let attempt = authorize_revival(&mut authority, MEMBER);
 
     // Step 1 (Bound): the provision registered the runtime; the machine asks

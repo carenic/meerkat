@@ -168,7 +168,6 @@ SubmitWork* work submission; no audit drives it
 CancelAll* work cancellation; no audit drives it
 ForceCancel* forced cancellation; no audit drives it
 ResolveRuntime* runtime binding, ingress and retire refusal feedback from MeerkatMachine; no audit drives it
-RetryRuntime* runtime retire retry; no audit drives it
 ClassifyMemberWait* member wait classification over runtime material; no audit drives it
 ClassifyIdentity* identity reconciliation decisions; no audit drives them
 ConvergeRecovered* recovered roster and respawn topology convergence; no audit drives it
@@ -186,8 +185,8 @@ BeginCleanup* post-stop cleanup custody; no audit drives it
 FinishCleanup* post-stop cleanup custody; no audit drives it
 RecoverCompleted* completed-with-cleanup-custody replay; no audit drives it
 DestroyFromAny the forced destroy from any phase; member_lifecycle_audit and member_residency_audit drive DestroyMob behind its quiesce instead
-AdmitDestroyMemberRetire* member retirement inside the mob's own destroy; no audit retires a member during the destroy
-ObserveDestroy* member archives inside the mob's own destroy; no audit retires a member during the destroy
+AdmitDestroyMemberRetire* member retirement inside the mob's own destroy while Stopped, and for placed, peer-only, runtime-ended or archived members; member_residency_audit's retire run drives the Running arms of a local member
+ObserveDestroy* member archives inside the mob's own destroy while Stopped, and for placed or already-cleared members; member_residency_audit's retire run drives the Running arms of a local member
 AdmitDestroyStorageFinalizing destroy storage finalization; no audit drives it
 AdmitDestroyCleanupStopped destroy admission outside Running; the audits drive AdmitDestroyCleanup
 AdmitDestroyCleanupCompleted destroy admission outside Running; the audits drive AdmitDestroyCleanup
@@ -204,6 +203,3 @@ BeginExplicitResumeCleanup* explicit resume rollback cleanup; the resume run doe
 SettleExplicitResumeCleanup* explicit resume rollback cleanup; the resume run does not cancel
 CancelExplicit* explicit resume cancellation; the resume run does not cancel
 FinishExplicitResumeCancelledStopped explicit resume cancellation; the resume run does not cancel
-BeginMemberRotationStopped the Stopped twin of the rotation intent; member_residency_audit's seat run drives the Running arm, which shares its guards and update
-CommitMemberRotationLiveStopped the Stopped twin of the rotation terminal; member_residency_audit's seat run drives the Running arm, which shares its guards and update
-CommitMemberRotationRetiredStopped the Stopped twin of the rotation terminal; member_residency_audit's seat run drives the Running arm, which shares its guards and update
