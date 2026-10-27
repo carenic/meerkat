@@ -578,6 +578,14 @@ macro_rules! mob_catalog_machine_dsl {
             owed_edge_repairs: Set<WiringEdge>,
             // The same for an external peer edge of a local member.
             owed_external_edge_repairs: Set<ExternalPeerEdge>,
+            // Seats whose session does not exist yet: a fresh launch's seat
+            // and a rotation's next incarnation build nothing, and the first
+            // wake creates the session through the spawn provision path, with
+            // the host's registration (ResolveMemberRevivalSessionCreated).
+            // That step clears it durably (PersistMemberSeatSessionBorn), and
+            // so does the member leaving or the mob's reset or destroy. A
+            // session missing for any other member is never created afresh.
+            member_seat_session_unborn: Set<AgentIdentity>,
         }
 
         init(Running) {
@@ -879,6 +887,7 @@ macro_rules! mob_catalog_machine_dsl {
             runtime_retire_archive_only = EmptySet,
             owed_edge_repairs = EmptySet,
             owed_external_edge_repairs = EmptySet,
+            member_seat_session_unborn = EmptySet,
         }
 
         terminal [Destroyed]
@@ -1799,7 +1808,7 @@ macro_rules! mob_catalog_machine_dsl {
             // A seat: membership without materialization (import and new
             // roster identities). Walks the spawn admission ladder
             // (BeginSpawnExec + AuthorizeSpawnProfile) and commits Dormant.
-            CommitDormantSeat { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, runtime_mode: Enum<SpawnPolicyRuntimeMode>, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: bool, kickoff_owed: bool },
+            CommitDormantSeat { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, runtime_mode: Enum<SpawnPolicyRuntimeMode>, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: bool, kickoff_owed: bool, session_unborn: bool },
             // The host carried out an identity's pending preparation on an
             // identity already seated on that session.
             ResolveMemberHostPreparation { agent_identity: AgentIdentity },
@@ -1943,6 +1952,14 @@ macro_rules! mob_catalog_machine_dsl {
             // between seated members that are not retiring.
             ResolveWiringEdgeRealization { edge: WiringEdge, realized: bool },
             ResolveExternalEdgeRealization { edge: ExternalPeerEdge, realized: bool },
+            // An unborn seat's wake created its session through the spawn
+            // provision path, with the host's registration (or adopted the
+            // session such a create left), and registered the runtime: request
+            // its binding, in place of ResolveMemberRevivalBound.
+            ResolveMemberRevivalSessionCreated { agent_identity: AgentIdentity, attempt: u64 },
+            // Replay of a seat's session from its journal rows: unborn from
+            // the seat's row, born from the row of its session's creation.
+            RecoverMemberSeatSession { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, unborn: bool },
         }
 
         effect MobMachineEffect {
@@ -2335,6 +2352,9 @@ macro_rules! mob_catalog_machine_dsl {
             // An edge's trust repair is owed: the owner arms its repair timer
             // for every owed edge.
             OwedEdgeRepairsRecorded,
+            // An unborn seat's session was created: the owner journals it, so
+            // a replay never creates that session afresh.
+            PersistMemberSeatSessionBorn { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId },
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -2943,7 +2963,8 @@ macro_rules! mob_catalog_machine_dsl {
         // fail closed), an owed kickoff, a network transport (Tcp or Uds), an
         // orchestrator notification, a missing durable endpoint or the host's
         // explicit set. The rest stay Dormant, verified first under
-        // OnDemandVerified.
+        // OnDemandVerified unless the seat's session is unborn (there is no
+        // durable session to verify yet).
         helper member_boot_materialization(
             policy: Enum<MemberRestorePolicyKind>,
             composition_authoritative: bool,
@@ -2954,7 +2975,8 @@ macro_rules! mob_catalog_machine_dsl {
             network_transport: bool,
             orchestrator_notified: bool,
             has_durable_endpoint: bool,
-            host_required: bool
+            host_required: bool,
+            session_unborn: bool
         ) -> Enum<BootMaterializationKind> {
             if composition_authoritative == false {
                 BootMaterializationKind::StayDormant
@@ -2986,7 +3008,7 @@ macro_rules! mob_catalog_machine_dsl {
             if host_required == true {
                 BootMaterializationKind::Wake
             } else {
-            if policy == MemberRestorePolicyKind::OnDemandVerified {
+            if policy == MemberRestorePolicyKind::OnDemandVerified && session_unborn == false {
                 BootMaterializationKind::VerifyThenDormant
             } else {
                 BootMaterializationKind::StayDormant
@@ -3271,6 +3293,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition RuntimeBindingRefusalStale => local seam SurfaceResultAlignment,
         disposition OwedMemberWakesRecorded => local seam OwnerRealizationOnly,
         disposition OwedEdgeRepairsRecorded => local seam OwnerRealizationOnly,
+        disposition PersistMemberSeatSessionBorn => local seam OwnerRealizationOnly,
 
         // =====================================================================
         // Invariants
@@ -4199,6 +4222,20 @@ macro_rules! mob_catalog_machine_dsl {
         // An owed edge repair is a wired edge between seated members, and an
         // owed external repair is a wired external edge of a seated member:
         // the edge going, or an end being unseated, clears it.
+        // An unborn seat is a seated member: every unseat clears it.
+        invariant seat_session_unborn_is_seated {
+            for_all(id in self.member_seat_session_unborn,
+                self.identity_to_runtime.contains_key(id))
+        }
+
+        // An unborn seat's session is never bound and the member is never
+        // Live: only the fresh create binds it, and that step clears it.
+        invariant seat_session_unborn_is_never_bound {
+            for_all(id in self.member_seat_session_unborn,
+                self.member_wake_bound.contains(id) == false
+                && self.member_materialization.get_cloned(id) != Some(MemberMaterializationPhase::Live))
+        }
+
         invariant owed_edge_repairs_join_seated_members {
             for_all(edge in self.owed_edge_repairs,
                 self.wiring_edges.contains(edge)
@@ -8664,6 +8701,8 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.runtime_fence_tokens.insert(agent_runtime_id, fence_token);
                 self.identity_to_runtime.insert(agent_identity, agent_runtime_id);
+                // The reset incarnation's session state comes from its own rows.
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.pending_respawn_topology.remove(agent_identity);
                 self.abandoned_respawn_topology.remove(agent_identity);
                 self.identity_runtime_generations.insert(agent_identity, generation);
@@ -9177,6 +9216,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // side effect again after terminal completion.
                 self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -9284,6 +9324,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.pending_session_ingress_detach_runtime_ids.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -12274,6 +12315,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.member_materialization.remove(agent_identity);
                 self.member_wake_attempts.remove(agent_identity);
                 self.member_wake_bound.remove(agent_identity);
@@ -12376,6 +12418,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -12465,6 +12508,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -12554,6 +12598,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -12636,6 +12681,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -12718,6 +12764,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -12800,6 +12847,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -12880,6 +12928,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
                 self.member_peer_endpoints.remove(agent_identity);
@@ -12978,6 +13027,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 self.spawn_exec_phase.remove(agent_identity);
                 self.member_session_bindings.remove(agent_identity);
                 self.member_peer_ids.remove(agent_identity);
@@ -13177,6 +13227,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13253,6 +13304,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13323,6 +13375,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13392,6 +13445,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13477,6 +13531,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13566,6 +13621,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.runtime_retire_refusal_reasons.remove(agent_runtime_id);
                 self.runtime_retire_pending_sessions.remove(agent_runtime_id);
                 self.identity_to_runtime.remove(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
                 // The member leaves: its owed edge repairs go (the kept
                 // graph is re-realized by a successor or dropped by the destroy).
                 self.owed_edge_repairs = mob_machine_wiring_edges_without_identity(self.owed_edge_repairs, agent_identity);
@@ -13842,6 +13898,9 @@ macro_rules! mob_catalog_machine_dsl {
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "attempt_open" { self.member_wake_attempts.get_copied(agent_identity) == Some(attempt) }
             guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
+            // A never-created session is never restored: an unborn seat binds
+            // only through ResolveMemberRevivalSessionCreated.
+            guard "seat_session_born" { self.member_seat_session_unborn.contains(agent_identity) == false }
             guard "identity_runtime_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "runtime_live" { self.live_runtime_ids.contains(agent_runtime_id) == true }
             guard "member_not_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) != Some(MobMemberState::Retiring) }
@@ -14064,6 +14123,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges = EmptySet;
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
+                self.member_seat_session_unborn = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -14541,6 +14601,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges = EmptySet;
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
+                self.member_seat_session_unborn = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.topology_epoch += 1;
             }
@@ -21438,6 +21499,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.external_peer_edges = EmptySet;
                 self.owed_edge_repairs = EmptySet;
                 self.owed_external_edge_repairs = EmptySet;
+                self.member_seat_session_unborn = EmptySet;
                 self.external_peer_edges_by_key = EmptyMap;
                 self.identity_to_runtime = EmptyMap;
                 self.identity_runtime_generations = EmptyMap;
@@ -24877,7 +24939,8 @@ macro_rules! mob_catalog_machine_dsl {
                             && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
-                    host_required) == BootMaterializationKind::Wake
+                    host_required,
+                    self.member_seat_session_unborn.contains(agent_identity)) == BootMaterializationKind::Wake
             }
             update {
                 self.member_wake_attempt_sequence += 1;
@@ -24935,7 +24998,8 @@ macro_rules! mob_catalog_machine_dsl {
                             && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
-                    host_required) == BootMaterializationKind::VerifyThenDormant
+                    host_required,
+                    self.member_seat_session_unborn.contains(agent_identity)) == BootMaterializationKind::VerifyThenDormant
             }
             update {}
             to Running
@@ -24968,7 +25032,8 @@ macro_rules! mob_catalog_machine_dsl {
                             && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
-                    host_required) == BootMaterializationKind::StayDormant
+                    host_required,
+                    self.member_seat_session_unborn.contains(agent_identity)) == BootMaterializationKind::StayDormant
             }
             update {
                 // A member left Dormant with no durable endpoint (a candidate
@@ -25042,7 +25107,7 @@ macro_rules! mob_catalog_machine_dsl {
         // it is seated owed EndpointPending (the seal's typed exception), its boot
         // verdict wakes it, and the wake registers the real endpoint.
         transition CommitDormantSeatRunning {
-            on input CommitDormantSeat { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed }
+            on input CommitDormantSeat { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed, session_unborn }
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
@@ -25100,6 +25165,14 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_runtime_ready.remove(agent_runtime_id);
                 self.member_startup_ready.remove(agent_runtime_id);
                 self.member_session_bindings.insert(agent_identity, bridge_session_id);
+                // A fresh launch's seat builds nothing: its session is unborn
+                // until the first wake creates it. A seat over an existing
+                // session (a resume) states it born.
+                if session_unborn == true {
+                    self.member_seat_session_unborn.insert(agent_identity);
+                } else {
+                    self.member_seat_session_unborn.remove(agent_identity);
+                }
                 self.member_prior_peer_endpoints.remove(agent_identity);
                 self.member_restore_failures.remove(agent_identity);
                 self.member_restore_failure_codes.remove(agent_identity);
@@ -25337,6 +25410,8 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                // The next incarnation's session is created by its first wake.
+                self.member_seat_session_unborn.insert(agent_identity);
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -25507,6 +25582,8 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                // The next incarnation's session is created by its first wake.
+                self.member_seat_session_unborn.insert(agent_identity);
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -25595,6 +25672,9 @@ macro_rules! mob_catalog_machine_dsl {
             guard "fence_binding_present" { self.identity_runtime_fence_tokens.contains_key(agent_identity) == true }
             guard "generation_binding_present" { self.identity_runtime_generations.contains_key(agent_identity) == true }
             guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            // A never-created session is never restored: an unborn seat binds
+            // only through ResolveMemberRevivalSessionCreated.
+            guard "seat_session_born" { self.member_seat_session_unborn.contains(agent_identity) == false }
             update {
                 if self.member_startup_runtime_ready.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) == false
                     && self.member_startup_ready.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) == false
@@ -25854,6 +25934,9 @@ macro_rules! mob_catalog_machine_dsl {
             guard "member_dormant" { self.member_materialization.get_cloned(agent_identity) == Some(MemberMaterializationPhase::Dormant) }
             guard "no_explicit_resume_work" { self.explicit_resume_member_work.contains_key(agent_identity) == false }
             guard "durable_snapshot_missing" { observation == MemberLiveMaterializationObservationKind::DurableSnapshotMissing }
+            // An unborn seat has no durable session yet: its first wake
+            // creates one, so its absence is no restore failure.
+            guard "seat_session_born" { self.member_seat_session_unborn.contains(agent_identity) == false }
             update {
                 self.member_materialization.remove(agent_identity);
                 self.member_wake_attempts.remove(agent_identity);
@@ -26071,6 +26154,8 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                // The next incarnation's session is created by its first wake.
+                self.member_seat_session_unborn.insert(agent_identity);
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -26252,6 +26337,8 @@ macro_rules! mob_catalog_machine_dsl {
                 }
                 self.runtime_fence_tokens.insert(next_agent_runtime_id, next_fence_token);
                 self.identity_to_runtime.insert(agent_identity, next_agent_runtime_id);
+                // The next incarnation's session is created by its first wake.
+                self.member_seat_session_unborn.insert(agent_identity);
                 self.identity_runtime_generations.insert(agent_identity, next_generation);
                 self.identity_runtime_fence_tokens.insert(agent_identity, next_fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
@@ -26745,6 +26832,94 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(mob_machine_external_peer_edge_local(edge)).get("value")) == Some(MobMemberState::Retiring)
             }
             update {}
+            to Running
+        }
+
+        // An unborn seat's wake created its session through the spawn
+        // provision path, with the host's registration, or adopted the
+        // session such a create left before a crash: the member's session is
+        // born. As the Bound step, it requests the runtime binding and keeps
+        // the attempt open; it also clears the fact and asks the owner to
+        // journal the birth, so a later wake restores that session and never
+        // creates it again.
+        transition ResolveMemberRevivalSessionCreatedRunning {
+            on signal ResolveMemberRevivalSessionCreated { agent_identity, attempt }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "attempt_open" { self.member_wake_attempts.get_copied(agent_identity) == Some(attempt) }
+            guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
+            guard "runtime_binding_present" { self.identity_to_runtime.contains_key(agent_identity) == true }
+            guard "fence_binding_present" { self.identity_runtime_fence_tokens.contains_key(agent_identity) == true }
+            guard "generation_binding_present" { self.identity_runtime_generations.contains_key(agent_identity) == true }
+            guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
+            // Only an unborn seat's session is created afresh: any other
+            // member's missing session takes the successor search, else Broken.
+            guard "seat_session_unborn" { self.member_seat_session_unborn.contains(agent_identity) == true }
+            update {
+                if self.member_startup_runtime_ready.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) == false
+                    && self.member_startup_ready.contains(self.identity_to_runtime.get_cloned(agent_identity).get("value")) == false
+                {
+                    self.member_startup_binding_requested.insert(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
+                }
+                self.member_wake_bound.insert(agent_identity);
+                self.member_seat_session_unborn.remove(agent_identity);
+            }
+            to Running
+            emit RequestRuntimeBinding {
+                agent_identity: agent_identity,
+                agent_runtime_id: self.identity_to_runtime.get_cloned(agent_identity).get("value"),
+                fence_token: self.identity_runtime_fence_tokens.get_copied(agent_identity).get("value"),
+                generation: self.identity_runtime_generations.get_copied(agent_identity),
+                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value"),
+                attempt: Some(attempt)
+            }
+            emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::Applied }
+            emit PersistMemberSeatSessionBorn {
+                agent_identity: agent_identity,
+                agent_runtime_id: self.identity_to_runtime.get_cloned(agent_identity).get("value"),
+                session_id: self.member_session_bindings.get_cloned(agent_identity).get("value")
+            }
+        }
+
+        transition ResolveMemberRevivalSessionCreatedStale {
+            per_phase [Running, Stopped, Completed, Destroyed]
+            on signal ResolveMemberRevivalSessionCreated { agent_identity, attempt }
+            guard "attempt_not_open" { self.member_wake_attempts.get_copied(agent_identity) != Some(attempt) }
+            update {}
+            to Running
+            emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::StaleAttempt }
+        }
+
+        // Replay of a seat's session state: the seat's row marks it unborn,
+        // the row of its session's creation marks it born. Replay only (the
+        // boot plan is not sealed yet), for the identity seated on that
+        // runtime, which replay leaves Dormant.
+        transition RecoverMemberSeatSessionUnbornRunning {
+            on signal RecoverMemberSeatSession { agent_identity, agent_runtime_id, unborn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "seat_session_unborn_row" { unborn == true }
+            guard "replay_not_sealed" { self.boot_plan_sealed == false }
+            guard "identity_runtime_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            // A seat is local: a placed member's session is its host's.
+            guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
+            guard "member_not_materialized" {
+                self.member_materialization.get_cloned(agent_identity) != Some(MemberMaterializationPhase::Live)
+                && self.member_materialization.get_cloned(agent_identity) != Some(MemberMaterializationPhase::Waking)
+            }
+            update {
+                self.member_seat_session_unborn.insert(agent_identity);
+            }
+            to Running
+        }
+
+        transition RecoverMemberSeatSessionBornRunning {
+            on signal RecoverMemberSeatSession { agent_identity, agent_runtime_id, unborn }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "seat_session_born_row" { unborn == false }
+            guard "replay_not_sealed" { self.boot_plan_sealed == false }
+            guard "identity_runtime_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
+            update {
+                self.member_seat_session_unborn.remove(agent_identity);
+            }
             to Running
         }
     }

@@ -547,6 +547,13 @@ const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
             "RetireRunningPreservingBindingArchiveOnly",
             "RetireStoppedReleasingArchiveOnly",
             "RetireStoppedPreservingBindingArchiveOnly",
+            "ResolveMemberRevivalSessionCreatedRunning",
+            "ResolveMemberRevivalSessionCreatedStaleRunning",
+            "ResolveMemberRevivalSessionCreatedStaleStopped",
+            "ResolveMemberRevivalSessionCreatedStaleCompleted",
+            "ResolveMemberRevivalSessionCreatedStaleDestroyed",
+            "RecoverMemberSeatSessionUnbornRunning",
+            "RecoverMemberSeatSessionBornRunning",
         ],
     ),
 ];

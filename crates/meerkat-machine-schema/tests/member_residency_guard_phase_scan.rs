@@ -8,14 +8,15 @@
 //! stronger or weaker than production, and TLC checks the wrong arm.
 //!
 //! The member-residency arms (Dormant, Waking and Live, the wake, release,
-//! seat, rotation, boot-plan and wiring-wake arms, and the existing arms they
-//! rewrote) are written one arm per lifecycle phase instead. This scan reads
-//! the `MobMachine` DSL source and fails when any of those arms has a guard,
-//! or a call inside one, that mentions `lifecycle_phase` beyond the plain
-//! source predicate `guard { self.lifecycle_phase == Phase::X }` (or a
-//! disjunction of such comparisons only), and when a residency helper takes
-//! or reads the lifecycle phase. It also fails when an expected arm family is
-//! missing, so the scan cannot pass vacuously.
+//! seat, seat session replay, rotation, boot-plan and wiring-wake arms, and
+//! the existing arms they rewrote) are written one arm per lifecycle phase
+//! instead. This scan reads the `MobMachine` DSL source and fails when any of
+//! those arms has a guard, or a call inside one, that mentions
+//! `lifecycle_phase` beyond the plain source predicate
+//! `guard { self.lifecycle_phase == Phase::X }` (or a disjunction of such
+//! comparisons only), and when a residency helper takes or reads the
+//! lifecycle phase. It also fails when an expected arm family is missing, so
+//! the scan cannot pass vacuously.
 
 use std::path::Path;
 
@@ -49,6 +50,7 @@ const RESIDENCY_ARM_PREFIXES: &[&str] = &[
     "WireExternalPeerAlreadyWiredDormant",
     "UnwireExternalPeerDormant",
     "WireMembers",
+    "RecoverMemberSeatSession",
 ];
 
 /// Families that must each name at least one arm, so the scan is not vacuous.
@@ -72,6 +74,8 @@ const REQUIRED_ARM_FAMILIES: &[&str] = &[
     "UnwireExternalPeerDormant",
     "WireMembersPlacedPeerWake",
     "WireMembersWithTrustPlacedPeerWake",
+    "ResolveMemberRevivalSessionCreated",
+    "RecoverMemberSeatSession",
 ];
 
 /// Transition-name prefixes of the `MeerkatMachine` arms that serve member

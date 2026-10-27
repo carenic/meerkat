@@ -13,14 +13,16 @@
 # first checks that the model still reads neither counter anywhere else, and
 # fails otherwise. It checks eight small runs over their whole space with TLC
 # coverage (see member_residency_audit.tla):
-# - seed (AuditSeedSpec): one identity through every build seed, every boot
-#   verdict, the seal and the host carry-out;
+# - seed (AuditSeedSpec): one identity, its seat session unborn or born,
+#   through every build seed, every boot verdict, the seal and the host
+#   carry-out;
 # - wake (AuditWakeSpec): one identity under the default seed through the boot
 #   plan and seal, every WakeMember arm for six input shapes, every
-#   attempt-fenced resolution, the late feedback in Running and Stopped, the
-#   runtime-ready observation, three release shapes, the drift and terminal
-#   classifications, the peer notice classification, the release verdict,
-#   Stop and Resume;
+#   attempt-fenced resolution (the fresh create of an unborn seat's session
+#   among them), the late feedback in Running and Stopped, the seat session
+#   replay, the runtime-ready observation, three release shapes, the drift and
+#   terminal classifications, the peer notice classification, the release
+#   verdict, Stop and Resume;
 # - retire (AuditRetireSpec): one identity woken, released and retired, the
 #   routed and archive-only retirement starts, the routed retire retry, the
 #   archives, the replayed starts, a rotation finished in Running and in
@@ -30,8 +32,8 @@
 # - edge (AuditEdgeSpec): two identities and one wiring edge and its
 #   trust realization outcomes (an owed edge repair);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
-#   through the dormant seat, the embodied spawn commit, the release and the
-#   rotation;
+#   through the dormant seat (one over an existing session, one over an
+#   unborn one), the embodied spawn commit, the release and the rotation;
 # - wake2 (AuditWake2Spec): two identities woken beside each other.
 # Every run checks every generated invariant (the residency invariants among
 # them), AuditAttemptEndsClosed and AuditWakingClosable (an open attempt is
@@ -45,15 +47,16 @@
 # close Live when it owes no endpoint cause, that the release verdict is
 # Release exactly when the Released arm would honour the member's own
 # registration, that a refused binding request applies only to the wake it
-# belongs to, and that a release of another epoch never demotes. The seed run
-# checks that the boot plan never leaves a member that blocks the seal. The
-# retire run checks that no runtime retire is routed for a member with no
-# registration, that a settled retirement can always archive and under an
-# admitted destroy nothing holds it, and that no rotation begins or commits
-# under an admitted destroy. TLC evaluates the module's wake refusal ASSUME (a
-# present, bound member with a phase is never refused as not a member) and its
-# release ASSUMEs (the verdict helper, and no member wired to a placed member
-# is releasable) at the start of every run.
+# belongs to, that only an unborn seat's session is created afresh, and that a
+# release of another epoch never demotes. The seed run checks that the boot
+# plan never leaves a member that blocks the seal. The retire run checks that
+# no runtime retire is routed for a member with no registration, that a
+# settled retirement can always archive and under an admitted destroy nothing
+# holds it, and that no rotation begins or commits under an admitted destroy.
+# TLC evaluates the module's wake refusal ASSUME (a present, bound member with
+# a phase is never refused as not a member) and its release ASSUMEs (the
+# verdict helper, and no member wired to a placed member is releasable) at the
+# start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -150,6 +153,11 @@ wake_covered_actions=(
   AbandonMemberWakeStaleStopped
   ResolveRecreatedMemberSessionSucceededStaleRunning
   ResolveRecreatedMemberSessionSucceededStaleStopped
+  ResolveMemberRevivalSessionCreatedRunning
+  ResolveMemberRevivalSessionCreatedStaleRunning
+  ResolveMemberRevivalSessionCreatedStaleStopped
+  RecoverMemberSeatSessionUnbornRunning
+  RecoverMemberSeatSessionBornRunning
   ObserveRuntimeReady
   ReleaseMemberMaterializationReleasedRunning
   ReleaseMemberMaterializationReleasedStopped
@@ -224,6 +232,8 @@ terminal_covered_actions=(
   AbandonMemberWakeStaleDestroyed
   ResolveRecreatedMemberSessionSucceededStaleCompleted
   ResolveRecreatedMemberSessionSucceededStaleDestroyed
+  ResolveMemberRevivalSessionCreatedStaleCompleted
+  ResolveMemberRevivalSessionCreatedStaleDestroyed
   ReleaseMemberMaterializationReleasedCompleted
   ReleaseMemberMaterializationStaleCompleted
   ReleaseMemberMaterializationStaleDestroyed
@@ -367,7 +377,8 @@ write_cfg() {
   AuditWakeNeverSkipsWaking
   AuditSucceededLeavesEndpoint
   AuditReleaseEpochFence
-  AuditBindingRefusalFenced"
+  AuditBindingRefusalFenced
+  AuditFreshCreateOnlyUnborn"
       run_invariants="
   AuditWakingClosable
   AuditWakeExactlyOne
@@ -577,6 +588,8 @@ for witness in \
   "resume:Action property:ResumeJoins" "resume:Action property:ResumeReservesLive" \
   "resume:Action property:ResumeFinishedLive" \
   "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
+  "wake:Action property:UnbornCreated" "retire:Action property:UnbornArchived" \
+  "seat:Invariant:SeatUnborn" "seat:Action property:RotatedUnborn" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
   "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
   "wake2:Action property:CrossNotice" "wake2:Action property:RetireBesideWaking"; do
@@ -830,6 +843,18 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate edge preserved_archive_keeps_repair \
     "Error: Invariant owed_edge_repairs_join_seated_members is violated" \
     'keep_var("ObserveMemberRetirementArchivedLivePreservingTopology", "owed_edge_repairs")' "$@"
+  # An archive that keeps the archived member's unborn seat session fact.
+  mutate retire archive_keeps_unborn \
+    "Error: Invariant seat_session_unborn_is_seated is violated" \
+    'keep_var("ObserveMemberRetirementArchivedLive", "member_seat_session_unborn")' "$@"
+  # A restore that binds an unborn seat, whose session was never created.
+  mutate wake bound_without_born_guard \
+    "Error: Invariant seat_session_unborn_is_never_bound is violated" \
+    'drop_guard("ResolveMemberRevivalBoundRunning", "member_seat_session_unborn")' "$@"
+  # The fresh create for a member whose session was created before.
+  mutate wake fresh_create_without_unborn \
+    "Error: Action property AuditFreshCreateOnlyUnborn is violated" \
+    'drop_guard("ResolveMemberRevivalSessionCreatedRunning", "member_seat_session_unborn")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \

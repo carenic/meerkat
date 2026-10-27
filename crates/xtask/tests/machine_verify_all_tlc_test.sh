@@ -530,9 +530,10 @@ fi
 # of minted wake attempts and the member lifecycle audit's VIEW
 # (model_step_count and topology_epoch left out, checked first): one identity
 # through the build seed, the boot plan, the seal and the host carry-out; one
-# identity through every WakeMember arm, every attempt-fenced resolution and
-# its stale twin in Running and Stopped, the runtime-ready observation, every
-# release shape, the drift and terminal classifications, the peer notice
+# identity through every WakeMember arm, every attempt-fenced resolution (the
+# fresh create of an unborn seat's session among them) and its stale twin in
+# Running and Stopped, the seat session replay, the runtime-ready observation,
+# every release shape, the drift and terminal classifications, the peer notice
 # classification, the release verdict and the mob's stop and resume; one
 # identity woken, released, retired (routed or archive-only), rotated and
 # destroyed; one identity in the Completed and Destroyed phases; one identity
@@ -547,13 +548,14 @@ fi
 # only with it (and one owing no endpoint cause always can), a boot plan that
 # never leaves a member blocking the seal, the release verdict helper and its
 # agreement with the Released arm, the attempt fence on the routed binding
-# refusal, the release epoch fence, no runtime retire routed for a member with
-# no registration, a settled retirement that can always archive (under an
-# admitted destroy no rotation or host carry-out holds it) and no rotation
-# under an admitted destroy, with the ASSUME over the wake refusal helper. It
+# refusal, the fresh create only for an unborn seat's session, the release
+# epoch fence, no runtime retire routed for a member with no registration, a
+# settled retirement that can always archive (under an admitted destroy no
+# rotation or host carry-out holds it) and no rotation under an admitted
+# destroy, with the ASSUME over the wake refusal helper. It
 # runs with TLC coverage and requires every listed arm to fire and a floor of
-# distinct states per run, and requires its twenty-five witnesses reached. Its
-# --mutants mode (run by hand, outside the shard's budget) refuses thirty-nine
+# distinct states per run, and requires its twenty-nine witnesses reached. Its
+# --mutants mode (run by hand, outside the shard's budget) refuses forty-two
 # seeded defects, one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
