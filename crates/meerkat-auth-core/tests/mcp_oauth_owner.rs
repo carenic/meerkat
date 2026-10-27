@@ -21,9 +21,11 @@ use meerkat_auth_core::connector_oauth::{
 use meerkat_auth_core::mcp_oauth::{
     MCP_INTERACTIVE_LOGIN_TIMEOUT, MCP_OAUTH_CALLBACK_PATH, McpOAuthAccountStrategy,
     McpOAuthAttemptCleanup, McpOAuthAuthority, McpOAuthBrowserLaunch, McpOAuthCallback,
-    McpOAuthCeremonyContext, McpOAuthError, McpOAuthListenerCleanup, McpOAuthLoginDisposition,
-    McpOAuthLoginStart, McpOAuthLoopbackBegin, McpOAuthPendingLogin, McpOAuthRegisteredCallback,
-    McpRegisteredRedirectBase, McpServerIdentity, McpStoredCredentialPhase, OAuthStartAdmission,
+    McpOAuthCeremonyContext, McpOAuthClientAuthMethod, McpOAuthClientProfile,
+    McpOAuthClientProfileRefusal, McpOAuthClientSecret, McpOAuthError, McpOAuthListenerCleanup,
+    McpOAuthLoginComplete, McpOAuthLoginDisposition, McpOAuthLoginStart, McpOAuthLoopbackBegin,
+    McpOAuthPendingLogin, McpOAuthRegisteredCallback, McpRegisteredRedirectBase, McpServerIdentity,
+    McpStoredCredentialPhase, OAuthStartAdmission,
 };
 use meerkat_auth_core::oauth_flow::OAuthFlowError;
 use meerkat_core::generated::auth_lease_durable_lifecycle_marker as durable_marker;
@@ -343,6 +345,64 @@ struct TestState {
     stalled: Notify,
     /// Every answer is delayed by this long.
     answer_delay: Mutex<Option<Duration>>,
+    /// The `Authorization` header of each token request, in the order of
+    /// `token_requests`.
+    token_authorizations: Mutex<Vec<Option<String>>>,
+    /// When set, the token endpoint authenticates this confidential client
+    /// and answers `401 invalid_client` to any other request.
+    required_client_auth: Mutex<Option<RequiredClientAuth>>,
+    /// Each token response issues a new refresh token, and a refresh must
+    /// present the newest one issued (single-use refresh tokens).
+    rotate_refresh_tokens: AtomicBool,
+    /// The refresh tokens issued while `rotate_refresh_tokens` is set.
+    issued_refresh_tokens: Mutex<Vec<String>>,
+}
+
+/// The confidential client a token endpoint authenticates.
+#[derive(Clone)]
+struct RequiredClientAuth {
+    method: McpOAuthClientAuthMethod,
+    client_id: String,
+    secret: String,
+}
+
+impl RequiredClientAuth {
+    /// Whether a token request authenticates exactly this client by exactly
+    /// its method (RFC 6749 section 2.3.1).
+    fn authenticates(&self, authorization: Option<&str>, body: &HashMap<String, String>) -> bool {
+        match self.method {
+            McpOAuthClientAuthMethod::ClientSecretBasic => {
+                authorization.and_then(basic_credentials)
+                    == Some((self.client_id.clone(), self.secret.clone()))
+                    && !body.contains_key("client_secret")
+            }
+            McpOAuthClientAuthMethod::ClientSecretPost => {
+                authorization.is_none()
+                    && body.get("client_id") == Some(&self.client_id)
+                    && body.get("client_secret") == Some(&self.secret)
+            }
+            _ => false,
+        }
+    }
+}
+
+/// The client id and secret of a Basic header, decoded as an authorization
+/// server does (RFC 6749 section 2.3.1: each part form-encoded, then joined
+/// by `:`).
+fn basic_credentials(header: &str) -> Option<(String, String)> {
+    use base64::Engine as _;
+    let encoded = header.strip_prefix("Basic ")?;
+    let decoded = String::from_utf8(
+        base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .ok()?,
+    )
+    .ok()?;
+    let (client_id, secret) = decoded.split_once(':')?;
+    Some((
+        urlencoding::decode(client_id).ok()?.into_owned(),
+        urlencoding::decode(secret).ok()?.into_owned(),
+    ))
 }
 
 struct RecordingBrowser {
@@ -710,12 +770,21 @@ const REFRESH_ERROR_BODY_CANARY: &str = "synthetic-refresh-error-body-secret-can
 
 async fn token(
     State(state): State<Arc<TestState>>,
+    headers: HeaderMap,
     Form(body): Form<HashMap<String, String>>,
 ) -> impl IntoResponse {
     state
         .token_requests
         .lock()
         .push(serde_json::to_value(&body).unwrap());
+    let authorization = headers
+        .get("authorization")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    state
+        .token_authorizations
+        .lock()
+        .push(authorization.clone());
     if state.redirect_token.load(Ordering::SeqCst) {
         return Redirect::temporary("/redirected").into_response();
     }
@@ -730,6 +799,22 @@ async fn token(
     {
         state.code_exchange_started.notify_one();
         state.code_exchange_release.notified().await;
+    }
+    let required = state.required_client_auth.lock().clone();
+    if let Some(required) = required
+        && !required.authenticates(authorization.as_deref(), &body)
+    {
+        // A non-conforming server that echoes the presented secret: it must
+        // never reach an error's text.
+        let body = serde_json::json!({
+            "error": "invalid_client",
+            "error_description": body.get("client_secret"),
+        });
+        state.token_error_responses.lock().push(serde_json::json!({
+            "status": StatusCode::UNAUTHORIZED.as_u16(),
+            "body": body,
+        }));
+        return (StatusCode::UNAUTHORIZED, Json(body)).into_response();
     }
     if *state.token_fails.lock() {
         // RFC 6749 §5.2 error response: a JSON body carrying the typed
@@ -770,9 +855,27 @@ async fn token(
         .lock()
         .clone()
         .unwrap_or_else(|| "mcp.read".to_owned());
+    let refresh_token = if state.rotate_refresh_tokens.load(Ordering::SeqCst) {
+        let mut issued = state.issued_refresh_tokens.lock();
+        // A refresh token is single-use: a refresh presents the newest one.
+        if body.get("grant_type").map(String::as_str) == Some("refresh_token")
+            && body.get("refresh_token") != issued.last()
+        {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "error": "invalid_grant" })),
+            )
+                .into_response();
+        }
+        let next = format!("refresh-token-{}", issued.len() + 1);
+        issued.push(next.clone());
+        next
+    } else {
+        "refresh-token".to_owned()
+    };
     Json(serde_json::json!({
         "access_token": "access-token",
-        "refresh_token": "refresh-token",
+        "refresh_token": refresh_token,
         "expires_in": 3600,
         "scope": scope
     }))
@@ -8276,4 +8379,1660 @@ async fn a_failed_start_reports_its_flow_owners_admission() {
         ));
         *flows.failed_start.lock() = None;
     }
+}
+
+// --- Host-registered (fixed) client profiles -----------------------------------
+
+/// The fixed client's registered id and its secrets. The secrets are
+/// canaries: none may appear in an error, `Debug` or `Display` text, a URL or
+/// a stored credential.
+const FIXED_CLIENT_ID: &str = "registered-client-7";
+const FIXED_CLIENT_SECRET: &str = "fixed-client-secret-canary/+=~";
+const ROTATED_CLIENT_SECRET: &str = "rotated-client-secret-canary";
+
+/// The host's own admission of every profile update.
+struct AdmitAll;
+
+impl meerkat_core::AdministrationEntry for AdmitAll {
+    fn enter(
+        &self,
+    ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal> {
+        Ok(meerkat_core::EnteredAdministration::admitted())
+    }
+}
+
+fn admit_all() -> Arc<dyn meerkat_core::AdministrationEntry> {
+    Arc::new(AdmitAll)
+}
+
+/// An entry check that refuses the caller.
+struct RefuseEntry;
+
+impl meerkat_core::AdministrationEntry for RefuseEntry {
+    fn enter(
+        &self,
+    ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal> {
+        Err(meerkat_core::AdministrationEntryRefusal::NotAdministrator)
+    }
+}
+
+/// An authorization server that offers no dynamic client registration and
+/// authenticates the fixed client by `method` at its token endpoint.
+async fn spawn_fixed_client_fixture(method: McpOAuthClientAuthMethod) -> (String, Arc<TestState>) {
+    let (base, state) = spawn_oauth_fixture().await;
+    *state.include_registration_endpoint.lock() = false;
+    require_fixed_client(&state, method, FIXED_CLIENT_SECRET);
+    (base, state)
+}
+
+/// The token endpoint authenticates the fixed client by `method` with
+/// `secret` from now on.
+fn require_fixed_client(state: &TestState, method: McpOAuthClientAuthMethod, secret: &str) {
+    *state.required_client_auth.lock() = Some(RequiredClientAuth {
+        method,
+        client_id: FIXED_CLIENT_ID.to_owned(),
+        secret: secret.to_owned(),
+    });
+}
+
+fn fixed_client_profile(
+    issuer: &str,
+    redirect: &str,
+    method: McpOAuthClientAuthMethod,
+    secret: &str,
+) -> McpOAuthClientProfile {
+    McpOAuthClientProfile::new(
+        issuer,
+        FIXED_CLIENT_ID,
+        redirect,
+        method,
+        McpOAuthClientSecret::new(secret),
+    )
+}
+
+/// Install the fixed client for `target` on the host's registered callback
+/// (its derived registered redirect), returning that redirect.
+async fn install_registered_fixed_client(
+    authority: &McpOAuthAuthority,
+    issuer: &str,
+    target: &McpServerIdentity,
+    method: McpOAuthClientAuthMethod,
+) -> String {
+    let redirect = authority
+        .registered_redirect_uri(target, &registered_base())
+        .unwrap();
+    authority
+        .install_client_profile_entered(
+            target,
+            fixed_client_profile(issuer, &redirect, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("the host installs the fixed client");
+    redirect
+}
+
+/// A login on the host's registered callback, completed from its custody.
+async fn registered_fixed_client_login(
+    authority: &McpOAuthAuthority,
+    target: &McpServerIdentity,
+) -> McpOAuthLoginComplete {
+    let start = authority
+        .login_start_registered(target, &registered_base(), None)
+        .await
+        .expect("the fixed client starts without registration");
+    authority
+        .login_complete_registered(
+            target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        )
+        .await
+        .expect("the fixed client completes from the host's custody")
+}
+
+/// The token request at `index` authenticated the fixed client with
+/// `secret`, by exactly `method` and by no other means.
+fn assert_fixed_client_authenticated(
+    state: &TestState,
+    index: usize,
+    method: McpOAuthClientAuthMethod,
+    secret: &str,
+) {
+    let body = state.token_requests.lock()[index].clone();
+    let authorization = state.token_authorizations.lock()[index].clone();
+    match method {
+        McpOAuthClientAuthMethod::ClientSecretBasic => {
+            assert_eq!(
+                authorization.as_deref().and_then(basic_credentials),
+                Some((FIXED_CLIENT_ID.to_owned(), secret.to_owned())),
+                "token request {index} authenticates by HTTP Basic"
+            );
+            assert!(body.get("client_secret").is_none(), "request {index}");
+            assert!(body.get("client_id").is_none(), "request {index}");
+        }
+        McpOAuthClientAuthMethod::ClientSecretPost => {
+            assert_eq!(authorization, None, "token request {index} sends no Basic");
+            assert_eq!(body["client_id"], FIXED_CLIENT_ID, "request {index}");
+            assert_eq!(body["client_secret"], secret, "request {index}");
+        }
+        other => panic!("unexpected client authentication method {other:?}"),
+    }
+}
+
+/// The stored credential of `target` is due for a refresh.
+async fn expire_stored_credential(
+    authority: &FixtureAuthority,
+    store: &dyn TokenStore,
+    target: &McpServerIdentity,
+) {
+    republish_stored_tokens(authority, store, target, |tokens| {
+        tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+    })
+    .await;
+}
+
+/// The custody key of `target`'s client profile.
+fn client_profile_key(target: &McpServerIdentity) -> TokenKey {
+    let slot = target.auth_binding_ref().unwrap();
+    TokenKey::mcp_oauth_client(slot.realm, slot.binding)
+}
+
+fn client_profile_refusal<T: std::fmt::Debug>(
+    result: Result<T, McpOAuthError>,
+) -> McpOAuthClientProfileRefusal {
+    match result {
+        Err(McpOAuthError::ClientProfile { refusal, .. }) => refusal,
+        other => panic!("expected a client profile refusal, got {other:?}"),
+    }
+}
+
+/// The hosted path: an authorization server without dynamic client
+/// registration and the fixed client on the host's registered callback.
+/// The authorization request names the fixed client and its registered
+/// redirect with PKCE S256, nothing is registered, the code exchange and
+/// every refresh authenticate the client by its method, and each rotated
+/// refresh token is stored and presented by the next refresh.
+async fn registered_fixed_client_logs_in_and_refreshes(method: McpOAuthClientAuthMethod) {
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    state.rotate_refresh_tokens.store(true, Ordering::SeqCst);
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-registered");
+    let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+
+    let start = authority
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .expect("the fixed client starts without registration");
+    assert_eq!(start.disposition, McpOAuthLoginDisposition::Started);
+    assert_eq!(start.redirect_uri, redirect);
+    let query: HashMap<String, String> = reqwest::Url::parse(&start.authorize_url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect();
+    assert_eq!(query["client_id"], FIXED_CLIENT_ID);
+    assert_eq!(query["redirect_uri"], redirect);
+    assert_eq!(query["code_challenge_method"], "S256");
+    assert!(!query["code_challenge"].is_empty());
+    assert!(!query.contains_key("client_secret"));
+    assert!(state.registration_requests.lock().is_empty());
+    assert!(
+        !state
+            .request_paths
+            .lock()
+            .iter()
+            .any(|path| path == "/register"),
+        "nothing is registered"
+    );
+
+    let complete = authority
+        .login_complete_registered(
+            &target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        )
+        .await
+        .expect("the fixed client completes from the host's custody");
+    assert_eq!(complete.account_id.as_deref(), Some("fixture-account-42"));
+    assert!(complete.has_refresh_token);
+    {
+        let requests = state.token_requests.lock();
+        assert_eq!(requests[0]["grant_type"], "authorization_code");
+        assert_eq!(requests[0]["redirect_uri"], redirect.as_str());
+        assert!(
+            requests[0]["code_verifier"]
+                .as_str()
+                .is_some_and(|v| !v.is_empty())
+        );
+    }
+    assert_fixed_client_authenticated(&state, 0, method, FIXED_CLIENT_SECRET);
+
+    // The credential names the fixed client and its method, never the
+    // secret, and needs no registration endpoint.
+    let key = target.token_key().unwrap();
+    let stored = store.load(&key).await.unwrap().unwrap();
+    assert_eq!(stored.metadata["client"]["client_id"], FIXED_CLIENT_ID);
+    assert_eq!(
+        stored.metadata["client"]["token_endpoint_auth_method"],
+        method.as_str()
+    );
+    assert!(stored.metadata["client"].get("client_secret").is_none());
+    assert!(
+        stored.metadata["discovery"]
+            .get("registration_endpoint")
+            .is_none()
+    );
+    assert_eq!(stored.refresh_token.as_deref(), Some("refresh-token-1"));
+    assert!(!stored.metadata.to_string().contains(FIXED_CLIENT_SECRET));
+
+    for (round, presented) in [(1, "refresh-token-1"), (2, "refresh-token-2")] {
+        expire_stored_credential(&authority, store.as_ref(), &target).await;
+        assert_eq!(
+            authority
+                .stored_bearer_token(&target)
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("access-token"),
+            "refresh {round} lands"
+        );
+        {
+            let requests = state.token_requests.lock();
+            assert_eq!(requests[round]["grant_type"], "refresh_token");
+            assert_eq!(
+                requests[round]["refresh_token"], presented,
+                "refresh {round} presents the newest refresh token"
+            );
+        }
+        assert_fixed_client_authenticated(&state, round, method, FIXED_CLIENT_SECRET);
+        let stored = store.load(&key).await.unwrap().unwrap();
+        assert_eq!(
+            stored.refresh_token,
+            Some(format!("refresh-token-{}", round + 1)),
+            "refresh {round} stores the rotated refresh token"
+        );
+        assert_eq!(stored.metadata["client"]["client_id"], FIXED_CLIENT_ID);
+    }
+    assert_eq!(state.token_requests.lock().len(), 3);
+    assert!(state.registration_requests.lock().is_empty());
+}
+
+#[tokio::test]
+async fn registered_fixed_client_authenticates_by_client_secret_post() {
+    registered_fixed_client_logs_in_and_refreshes(McpOAuthClientAuthMethod::ClientSecretPost).await;
+}
+
+#[tokio::test]
+async fn registered_fixed_client_authenticates_by_client_secret_basic() {
+    registered_fixed_client_logs_in_and_refreshes(McpOAuthClientAuthMethod::ClientSecretBasic)
+        .await;
+}
+
+/// Without a profile, the same server refuses exactly as before: dynamic
+/// registration needs the registration endpoint it does not publish, on the
+/// registered callback and the loopback route alike.
+#[tokio::test]
+async fn without_a_profile_a_server_without_registration_refuses_as_before() {
+    let (base, state) =
+        spawn_fixed_client_fixture(McpOAuthClientAuthMethod::ClientSecretPost).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-absent");
+    for refused in [
+        authority
+            .login_start_registered(&target, &registered_base(), None)
+            .await,
+        authority.login_start(&target, SPLIT_REDIRECT, None).await,
+    ] {
+        let Err(McpOAuthError::DiscoveryFailed { reason, .. }) = &refused else {
+            panic!("expected the registration refusal, got {refused:?}");
+        };
+        assert_eq!(
+            reason,
+            "authorization server metadata has no registration_endpoint"
+        );
+    }
+    assert!(authority.pending_attempt(&target).unwrap().is_none());
+    assert!(state.token_requests.lock().is_empty());
+    assert!(state.registration_requests.lock().is_empty());
+    assert!(
+        !state
+            .request_paths
+            .lock()
+            .iter()
+            .any(|path| path == "/authorize")
+    );
+}
+
+/// A profile is bound to its credential slot. It is never used for another
+/// server or for the same server under another credential owner (realm);
+/// its row copied into another slot is refused typed before any request;
+/// and a server whose resource does not name the profile's issuer is
+/// refused typed before any attempt exists.
+#[tokio::test]
+async fn a_fixed_client_is_bound_to_its_server_issuer_and_owner() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let server_a = split_target(&base, "fixed-server-a");
+    let server_b = split_target(&base, "fixed-server-b");
+    install_registered_fixed_client(&authority, &base, &server_a, method).await;
+
+    // Server B has no profile: its login is the dynamic registration this
+    // server does not offer, and A's client is never sent for it.
+    let refused = authority
+        .login_start_registered(&server_b, &registered_base(), None)
+        .await;
+    assert!(
+        matches!(refused, Err(McpOAuthError::DiscoveryFailed { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(authority.client_profile(&server_b).await.unwrap(), None);
+
+    // Server A under another credential owner: the realm's own slot has no
+    // profile.
+    let realm_b = meerkat_core::connection::RealmId::parse("realm-b").unwrap();
+    let other_owner = authority.native.clone().in_realm(realm_b.clone());
+    assert_eq!(other_owner.client_profile(&server_a).await.unwrap(), None);
+    let refused = other_owner
+        .login_start_registered(&server_a, &registered_base(), None)
+        .await;
+    assert!(
+        matches!(refused, Err(McpOAuthError::DiscoveryFailed { .. })),
+        "{refused:?}"
+    );
+
+    // A's profile row copied into B's slot and into the other owner's slot.
+    let row = store
+        .load(&client_profile_key(&server_a))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .save(&client_profile_key(&server_b), &row)
+        .await
+        .unwrap();
+    store
+        .save(
+            &client_profile_key(&server_a.clone().in_realm(realm_b)),
+            &row,
+        )
+        .await
+        .unwrap();
+    let requests_before = state.request_paths.lock().len();
+    for refused in [
+        authority
+            .login_start_registered(&server_b, &registered_base(), None)
+            .await,
+        other_owner
+            .login_start_registered(&server_a, &registered_base(), None)
+            .await,
+    ] {
+        assert_eq!(
+            client_profile_refusal(refused),
+            McpOAuthClientProfileRefusal::BindingMismatch
+        );
+    }
+    assert_eq!(
+        state.request_paths.lock().len(),
+        requests_before,
+        "a misplaced profile sends nothing"
+    );
+
+    // The server's resource names another authorization server than the
+    // profile's issuer.
+    let server_c = split_target(&base, "fixed-server-c");
+    let redirect = authority
+        .registered_redirect_uri(&server_c, &registered_base())
+        .unwrap();
+    authority
+        .install_client_profile_entered(
+            &server_c,
+            fixed_client_profile(
+                "https://issuer.other.example",
+                &redirect,
+                method,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .login_start_registered(&server_c, &registered_base(), None)
+                .await
+        ),
+        McpOAuthClientProfileRefusal::IssuerMismatch
+    );
+    assert!(authority.pending_attempt(&server_c).unwrap().is_none());
+    assert!(state.token_requests.lock().is_empty());
+    assert!(state.registration_requests.lock().is_empty());
+    assert!(
+        !state
+            .request_paths
+            .lock()
+            .iter()
+            .any(|path| path == "/authorize")
+    );
+}
+
+/// The client secret never reaches an error, `Debug` or `Display` text, a
+/// URL or a stored credential's facts, including when the authorization
+/// server echoes it back in a refusal.
+#[tokio::test]
+async fn the_client_secret_never_appears_in_errors_debug_or_display() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-redaction");
+    let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+    let profile = fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET);
+    let mut rendered = vec![format!("{profile:?} {profile:#?}")];
+    let mut errors = vec![
+        // An install over the installed profile.
+        authority
+            .install_client_profile_entered(&target, profile, Some(&registered_base()), admit_all())
+            .await
+            .unwrap_err(),
+        // An invalid profile.
+        authority
+            .install_client_profile_entered(
+                &split_target(&base, "fixed-invalid"),
+                fixed_client_profile(&base, "http://127.0.0.1/", method, FIXED_CLIENT_SECRET),
+                Some(&registered_base()),
+                admit_all(),
+            )
+            .await
+            .unwrap_err(),
+        // A start on another redirect than the profile's.
+        authority
+            .login_start(&target, SPLIT_REDIRECT, None)
+            .await
+            .unwrap_err(),
+    ];
+
+    // A code exchange the server refuses, echoing the presented secret.
+    require_fixed_client(&state, method, "a-secret-the-server-expects");
+    let start = authority
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+    rendered.push(format!("{start:?} {}", start.authorize_url));
+    errors.push(
+        authority
+            .login_complete_registered(
+                &target,
+                registered_callback(&start, &start.state, &handle_of(&start)),
+            )
+            .await
+            .unwrap_err(),
+    );
+    // A refresh the server refuses the same way.
+    require_fixed_client(&state, method, FIXED_CLIENT_SECRET);
+    let complete = registered_fixed_client_login(&authority, &target).await;
+    rendered.push(format!("{complete:?}"));
+    require_fixed_client(&state, method, "a-secret-the-server-expects");
+    expire_stored_credential(&authority, store.as_ref(), &target).await;
+    errors.push(authority.stored_bearer_token(&target).await.unwrap_err());
+    // Positive control: the server echoed the secret both times.
+    let echoed = state
+        .token_error_responses
+        .lock()
+        .iter()
+        .filter(|response| response["body"]["error_description"] == FIXED_CLIENT_SECRET)
+        .count();
+    assert_eq!(echoed, 2);
+
+    for error in &errors {
+        rendered.push(format!("{error} {error:?}"));
+    }
+    rendered.push(format!(
+        "{:?}",
+        authority.client_profile(&target).await.unwrap()
+    ));
+    for key in store.list().await.unwrap() {
+        let row = store.load(&key).await.unwrap().unwrap();
+        rendered.push(format!("{key} {row:?} {}", row.metadata));
+    }
+    let encoded = urlencoding::encode(FIXED_CLIENT_SECRET).into_owned();
+    for text in &rendered {
+        assert!(!text.contains(FIXED_CLIENT_SECRET), "secret leaked: {text}");
+        assert!(!text.contains(&encoded), "encoded secret leaked: {text}");
+    }
+}
+
+/// The profile and its secret are kept in the host's credential store: a
+/// store reopened from the same directory, as by a restarted host, holds
+/// them, and a login through it authenticates the fixed client.
+#[tokio::test]
+async fn fixed_client_custody_survives_a_store_reopen() {
+    use meerkat_auth_core::auth_store::FileTokenStore;
+    let method = McpOAuthClientAuthMethod::ClientSecretBasic;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let temp = tempfile::tempdir().unwrap();
+    let credentials = temp.path().join("credentials");
+    let target = split_target(&base, "fixed-reopen");
+    // Two slots of the client in two realms on the central callback.
+    let central_target = split_target(&base, "fixed-reopen-central");
+    let redirect = {
+        let installing = FixtureAuthority::with_fixture_http(
+            ProviderAuthPersistence::new(
+                Arc::new(FileTokenStore::new(&credentials)),
+                Arc::new(InMemoryCoordinator::new()),
+            ),
+            recording_browser(Arc::clone(&state)),
+            no_redirect_client(),
+            test_auth_lease(),
+        );
+        central_callback_slots(&installing, &base, &central_target).await;
+        install_registered_fixed_client(&installing, &base, &target, method).await
+    };
+
+    let reopened_store: Arc<dyn TokenStore> = Arc::new(FileTokenStore::new(&credentials));
+    let reopened = FixtureAuthority::with_fixture_http(
+        ProviderAuthPersistence::new(
+            Arc::clone(&reopened_store),
+            Arc::new(InMemoryCoordinator::new()),
+        ),
+        recording_browser(Arc::clone(&state)),
+        no_redirect_client(),
+        test_auth_lease(),
+    );
+    let installed = reopened
+        .client_profile(&target)
+        .await
+        .unwrap()
+        .expect("the profile survives the reopen");
+    assert_eq!(installed.client_id, FIXED_CLIENT_ID);
+    assert_eq!(installed.redirect_uri, redirect);
+    assert_eq!(installed.auth_method, method);
+    assert_eq!(installed.issuer, base);
+    assert!(
+        reopened_store
+            .list()
+            .await
+            .unwrap()
+            .iter()
+            .any(TokenKey::is_mcp_oauth_client)
+    );
+    // Each central slot reads back its own profile on the central callback,
+    // secret-free.
+    for realm in ["realm-a", "realm-b"] {
+        let installed = reopened
+            .native
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap())
+            .client_profile(&central_target)
+            .await
+            .unwrap()
+            .expect("the central profile survives the reopen");
+        assert_eq!(installed.redirect_uri, REGISTERED_BASE, "{realm}");
+        assert_eq!(installed.client_id, FIXED_CLIENT_ID, "{realm}");
+        assert!(
+            !format!("{installed:?}").contains(FIXED_CLIENT_SECRET),
+            "{realm}: {installed:?}"
+        );
+    }
+    registered_fixed_client_login(&reopened, &target).await;
+    assert_fixed_client_authenticated(&state, 0, method, FIXED_CLIENT_SECRET);
+    assert!(state.registration_requests.lock().is_empty());
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ProfileChange {
+    Remove,
+    ReplaceClient,
+    RotateUnaccepted,
+}
+
+/// A credential minted under a fixed client refreshes only under that
+/// exact client. With the profile removed, replaced by another client, or
+/// its secret rotated to one the server does not accept, the refresh ends
+/// with the typed reauthorization error: nothing is registered, no refresh
+/// is sent as a public client, and the credential is closed for a new
+/// login.
+#[tokio::test]
+async fn a_removed_replaced_or_unaccepted_profile_ends_the_credential_without_fallback() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let auth_lease = test_auth_lease();
+    let authority = FixtureAuthority::with_test_http(
+        store.clone(),
+        recording_browser(Arc::clone(&state)),
+        no_redirect_client(),
+        auth_lease.clone(),
+    );
+    for change in [
+        ProfileChange::Remove,
+        ProfileChange::ReplaceClient,
+        ProfileChange::RotateUnaccepted,
+    ] {
+        let target = split_target(&base, &format!("fixed-change-{change:?}").to_lowercase());
+        let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+        registered_fixed_client_login(&authority, &target).await;
+        let requests_before = state.token_requests.lock().len();
+        match change {
+            ProfileChange::Remove => authority
+                .remove_client_profile_entered(&target, admit_all())
+                .await
+                .unwrap(),
+            ProfileChange::ReplaceClient => authority
+                .replace_client_profile_entered(
+                    &target,
+                    McpOAuthClientProfile::new(
+                        &base,
+                        "another-client",
+                        &redirect,
+                        method,
+                        McpOAuthClientSecret::new(FIXED_CLIENT_SECRET),
+                    ),
+                    Some(&registered_base()),
+                    admit_all(),
+                )
+                .await
+                .unwrap(),
+            ProfileChange::RotateUnaccepted => authority
+                .replace_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, &redirect, method, ROTATED_CLIENT_SECRET),
+                    Some(&registered_base()),
+                    admit_all(),
+                )
+                .await
+                .unwrap(),
+        }
+        expire_stored_credential(&authority, store.as_ref(), &target).await;
+        let refused = authority.stored_bearer_token(&target).await;
+        assert!(
+            matches!(refused, Err(McpOAuthError::ReauthRequired { .. })),
+            "{change:?}: {refused:?}"
+        );
+        let sent = state.token_requests.lock().len() - requests_before;
+        match change {
+            // Nothing could authenticate the refresh: nothing was sent.
+            ProfileChange::Remove | ProfileChange::ReplaceClient => {
+                assert_eq!(sent, 0, "{change:?}");
+            }
+            // The rotated secret was sent, and the server refused it.
+            ProfileChange::RotateUnaccepted => {
+                assert_eq!(sent, 1, "{change:?}");
+                assert_fixed_client_authenticated(
+                    &state,
+                    requests_before,
+                    method,
+                    ROTATED_CLIENT_SECRET,
+                );
+            }
+        }
+        assert_eq!(
+            auth_lease.snapshot(&target.lease_key().unwrap()).phase,
+            Some(meerkat_core::handles::AuthLeasePhase::ReauthRequired),
+            "{change:?}"
+        );
+        assert!(
+            store
+                .load(&target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "{change:?}: the credential is closed for a new login"
+        );
+        assert_eq!(
+            authority.stored_bearer_token(&target).await.unwrap(),
+            None,
+            "{change:?}: a later use asks for a login and refreshes nothing"
+        );
+    }
+    assert!(state.registration_requests.lock().is_empty());
+    // Every token request carried the client's secret: none was sent as a
+    // public client.
+    for (index, request) in state.token_requests.lock().iter().enumerate() {
+        assert!(
+            request.get("client_secret").is_some(),
+            "token request {index} authenticates the client"
+        );
+    }
+}
+
+/// Rotating the secret keeps the profile's meaning: the credential keeps
+/// refreshing, authenticated with the new secret.
+#[tokio::test]
+async fn a_rotated_secret_authenticates_the_next_refresh() {
+    let method = McpOAuthClientAuthMethod::ClientSecretBasic;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-rotated");
+    let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+    registered_fixed_client_login(&authority, &target).await;
+    authority
+        .replace_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, &redirect, method, ROTATED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    require_fixed_client(&state, method, ROTATED_CLIENT_SECRET);
+    expire_stored_credential(&authority, store.as_ref(), &target).await;
+    assert_eq!(
+        authority
+            .stored_bearer_token(&target)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("access-token")
+    );
+    assert_fixed_client_authenticated(&state, 1, method, ROTATED_CLIENT_SECRET);
+}
+
+/// An attempt started under a profile completes only under it: with the
+/// profile removed or replaced in between, the completion refuses typed
+/// before any request, retires the attempt, and never exchanges the code as
+/// a public client.
+#[tokio::test]
+async fn a_completion_whose_profile_changed_refuses_and_retires_the_attempt() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    for (index, remove) in [true, false].into_iter().enumerate() {
+        let target = split_target(&base, &format!("fixed-changed-{index}"));
+        let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+        let start = authority
+            .login_start_registered(&target, &registered_base(), None)
+            .await
+            .unwrap();
+        if remove {
+            authority
+                .remove_client_profile_entered(&target, admit_all())
+                .await
+                .unwrap();
+        } else {
+            authority
+                .replace_client_profile_entered(
+                    &target,
+                    McpOAuthClientProfile::new(
+                        &base,
+                        "another-client",
+                        &redirect,
+                        method,
+                        McpOAuthClientSecret::new(FIXED_CLIENT_SECRET),
+                    ),
+                    Some(&registered_base()),
+                    admit_all(),
+                )
+                .await
+                .unwrap();
+        }
+        let paths_before = state.request_paths.lock().len();
+        assert_eq!(
+            client_profile_refusal(
+                authority
+                    .login_complete_registered(
+                        &target,
+                        registered_callback(&start, &start.state, &handle_of(&start)),
+                    )
+                    .await
+            ),
+            McpOAuthClientProfileRefusal::Changed
+        );
+        assert_eq!(
+            state.request_paths.lock().len(),
+            paths_before,
+            "nothing was sent"
+        );
+        assert!(
+            authority.pending_attempt(&target).unwrap().is_none(),
+            "the attempt is retired"
+        );
+    }
+    assert!(state.token_requests.lock().is_empty());
+}
+
+/// The loopback route with a fixed client: the host's listener binds
+/// exactly the profile's registered loopback redirect and the login
+/// completes with the client authenticated. A start on any other loopback
+/// redirect, and a loopback login under a profile registered for the
+/// `https` callback, are refused typed before anything is admitted.
+#[tokio::test]
+async fn loopback_fixed_client_binds_its_registered_redirect_and_authenticates() {
+    let method = McpOAuthClientAuthMethod::ClientSecretBasic;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-loopback");
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let redirect = format!("http://127.0.0.1:{port}/mcp/oauth/callback");
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        client_profile_refusal(authority.login_start(&target, SPLIT_REDIRECT, None).await),
+        McpOAuthClientProfileRefusal::RedirectMismatch
+    );
+    assert!(authority.pending_attempt(&target).unwrap().is_none());
+
+    let pending = started_loopback_login(&authority, &target).await;
+    assert_eq!(pending.start().redirect_uri, redirect);
+    let query: HashMap<String, String> = reqwest::Url::parse(&pending.start().authorize_url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect();
+    assert_eq!(query["client_id"], FIXED_CLIENT_ID);
+    assert_eq!(query["redirect_uri"], redirect);
+    assert_eq!(query["code_challenge_method"], "S256");
+    follow_authorize(&pending.start().authorize_url).await;
+    let complete = pending
+        .complete(MCP_INTERACTIVE_LOGIN_TIMEOUT)
+        .await
+        .expect("the loopback login completes");
+    assert_eq!(complete.account_id.as_deref(), Some("fixture-account-42"));
+    assert_eq!(
+        state.token_requests.lock()[0]["redirect_uri"],
+        redirect.as_str()
+    );
+    assert_fixed_client_authenticated(&state, 0, method, FIXED_CLIENT_SECRET);
+    assert!(state.registration_requests.lock().is_empty());
+
+    let registered_only = split_target(&base, "fixed-registered-only");
+    install_registered_fixed_client(&authority, &base, &registered_only, method).await;
+    match authority.begin_loopback_login(&registered_only, None).await {
+        Err(McpOAuthError::ClientProfile {
+            refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+            ..
+        }) => {}
+        Err(other) => panic!("expected a redirect refusal, got {other:?}"),
+        Ok(_) => panic!("a profile registered for the https callback is no loopback client"),
+    }
+    assert!(
+        authority
+            .pending_attempt(&registered_only)
+            .unwrap()
+            .is_none()
+    );
+}
+
+/// A server whose resource metadata names its origin for an endpoint under
+/// a path: the profile accepts exactly the resource it names, and the
+/// resource indicator is that resource; a profile that names none refuses
+/// the mismatch typed. A profile's scopes are requested in place of the
+/// server's.
+#[tokio::test]
+async fn a_profile_accepts_the_resource_and_requests_the_scopes_it_names() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    *state.resource_override.lock() = Some(base.clone());
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-origin-resource");
+    let redirect = install_registered_fixed_client(&authority, &base, &target, method).await;
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .login_start_registered(&target, &registered_base(), None)
+                .await
+        ),
+        McpOAuthClientProfileRefusal::ResourceMismatch
+    );
+    authority
+        .replace_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET)
+                .with_resource(base.clone()),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    registered_fixed_client_login(&authority, &target).await;
+    assert_eq!(state.token_requests.lock()[0]["resource"], base.as_str());
+    assert_fixed_client_authenticated(&state, 0, method, FIXED_CLIENT_SECRET);
+    assert_eq!(
+        authority
+            .stored_bearer_token(&target)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("access-token")
+    );
+
+    let scoped = split_target(&base, "fixed-scopes");
+    let redirect = authority
+        .registered_redirect_uri(&scoped, &registered_base())
+        .unwrap();
+    authority
+        .install_client_profile_entered(
+            &scoped,
+            fixed_client_profile(&base, &redirect, method, FIXED_CLIENT_SECRET)
+                .with_resource(base.clone())
+                .with_scopes(["mcp.write"]),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    let start = authority
+        .login_start_registered(&scoped, &registered_base(), None)
+        .await
+        .unwrap();
+    assert!(
+        authorize_scopes(&start.authorize_url).contains("mcp.write"),
+        "{}",
+        start.authorize_url
+    );
+    authority.login_cancel(&scoped, &start).unwrap();
+}
+
+/// The client id of the profile installed for `target`, if any.
+async fn installed_client_id(
+    authority: &McpOAuthAuthority,
+    target: &McpServerIdentity,
+) -> Option<String> {
+    authority
+        .client_profile(target)
+        .await
+        .unwrap()
+        .map(|installed| installed.client_id)
+}
+
+/// Profile updates are explicit and typed: an install over an installed
+/// profile, a replace of none, an invalid profile, a target without an
+/// account selection and an update the host's entry check refuses are each
+/// refused, and none writes anything.
+#[tokio::test]
+async fn profile_updates_are_refused_typed_and_write_nothing() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-updates");
+    let redirect = authority
+        .registered_redirect_uri(&target, &registered_base())
+        .unwrap();
+    let profile = |client: &str| {
+        McpOAuthClientProfile::new(
+            base.clone(),
+            client,
+            redirect.clone(),
+            method,
+            McpOAuthClientSecret::new(FIXED_CLIENT_SECRET),
+        )
+    };
+
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .replace_client_profile_entered(
+                    &target,
+                    profile("client-a"),
+                    Some(&registered_base()),
+                    admit_all()
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::NotInstalled
+    );
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, "http://127.0.0.1/", method, FIXED_CLIENT_SECRET),
+                    Some(&registered_base()),
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI")
+    );
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    profile("client-a"),
+                    Some(&registered_base()),
+                    Arc::new(RefuseEntry)
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::NotAdmitted(
+            meerkat_core::AdministrationEntryRefusal::NotAdministrator
+        )
+    );
+    assert_eq!(
+        installed_client_id(&authority, &target).await,
+        None,
+        "nothing was written"
+    );
+    // An unselected target never logs in, so it takes no profile.
+    let legacy = McpServerIdentity::from_server_config("fixed-legacy", format!("{base}/mcp"));
+    assert!(matches!(
+        authority
+            .install_client_profile_entered(
+                &legacy,
+                profile("client-a"),
+                Some(&registered_base()),
+                admit_all()
+            )
+            .await,
+        Err(McpOAuthError::AccountSelectionRequired)
+    ));
+
+    authority
+        .install_client_profile_entered(
+            &target,
+            profile("client-a"),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    profile("client-b"),
+                    Some(&registered_base()),
+                    admit_all()
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::AlreadyInstalled
+    );
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .replace_client_profile_entered(
+                    &target,
+                    profile("client-b"),
+                    Some(&registered_base()),
+                    Arc::new(RefuseEntry)
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::NotAdmitted(
+            meerkat_core::AdministrationEntryRefusal::NotAdministrator
+        )
+    );
+    assert_eq!(
+        installed_client_id(&authority, &target).await.as_deref(),
+        Some("client-a")
+    );
+    authority
+        .replace_client_profile_entered(
+            &target,
+            profile("client-b"),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        installed_client_id(&authority, &target).await.as_deref(),
+        Some("client-b")
+    );
+    authority
+        .remove_client_profile_entered(&target, admit_all())
+        .await
+        .unwrap();
+    assert_eq!(installed_client_id(&authority, &target).await, None);
+    // Removing none succeeds.
+    authority
+        .remove_client_profile_entered(&target, admit_all())
+        .await
+        .unwrap();
+}
+
+/// Without a profile nothing changes: a dynamically registered credential
+/// stores no profile, and its token requests are a public client's. A
+/// profile installed later leaves it alone: it keeps refreshing as the
+/// public client it was registered as, and a new login over it needs a
+/// disconnect first.
+#[tokio::test]
+async fn a_dynamically_registered_credential_is_untouched_by_a_later_profile() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "dcr-untouched");
+    let start = authority
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+    authority
+        .login_complete_registered(
+            &target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        )
+        .await
+        .unwrap();
+    let stored = store
+        .load(&target.token_key().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(stored.metadata["client"].get("client_profile").is_none());
+    assert_eq!(
+        stored.metadata["client"]["token_endpoint_auth_method"],
+        "none"
+    );
+    assert!(stored.metadata["discovery"]["registration_endpoint"].is_string());
+    assert_eq!(state.token_authorizations.lock()[0], None);
+    assert!(
+        state.token_requests.lock()[0]
+            .get("client_secret")
+            .is_none()
+    );
+
+    let redirect = authority
+        .registered_redirect_uri(&target, &registered_base())
+        .unwrap();
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(
+                &base,
+                &redirect,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    expire_stored_credential(&authority, store.as_ref(), &target).await;
+    assert_eq!(
+        authority
+            .stored_bearer_token(&target)
+            .await
+            .unwrap()
+            .as_deref(),
+        Some("access-token")
+    );
+    {
+        let requests = state.token_requests.lock();
+        assert_eq!(requests[1]["grant_type"], "refresh_token");
+        assert_eq!(requests[1]["client_id"], "client-123");
+        assert!(requests[1].get("client_secret").is_none());
+    }
+    assert_eq!(state.token_authorizations.lock()[1], None);
+    let refused = authority
+        .login_start_registered(&target, &registered_base(), None)
+        .await;
+    assert!(
+        matches!(refused, Err(McpOAuthError::DisconnectRequired { .. })),
+        "{refused:?}"
+    );
+}
+
+// --- Central callback: one registered redirect for every slot ----------------
+
+fn authorize_query(start: &McpOAuthLoginStart) -> HashMap<String, String> {
+    reqwest::Url::parse(&start.authorize_url)
+        .unwrap()
+        .query_pairs()
+        .into_owned()
+        .collect()
+}
+
+/// Two credential slots of one host-registered client, the same server in two
+/// realms, whose profiles both name the host's registered base itself: the
+/// central callback.
+async fn central_callback_slots(
+    authority: &FixtureAuthority,
+    base: &str,
+    target: &McpServerIdentity,
+) -> [McpOAuthAuthority; 2] {
+    let slots = ["realm-a", "realm-b"].map(|realm| {
+        authority
+            .native
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap())
+    });
+    for slot in &slots {
+        slot.install_client_profile_entered(
+            target,
+            fixed_client_profile(
+                base,
+                REGISTERED_BASE,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("each slot names the central callback");
+    }
+    slots
+}
+
+/// The central callback: two slots of one host-registered client (the same
+/// server in two realms) both name the host's registered base itself. Each
+/// login is admitted on exactly the base, with its own state and custody,
+/// and both complete through that one callback URI into their own slots.
+#[tokio::test]
+async fn two_realm_slots_complete_through_one_central_callback() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-central");
+    let [slot_a, slot_b] = central_callback_slots(&authority, &base, &target).await;
+
+    let mut starts = Vec::new();
+    for slot in [&slot_a, &slot_b] {
+        assert_eq!(
+            slot.registered_login_redirect_uri(&target, &registered_base())
+                .await
+                .unwrap()
+                .as_deref(),
+            Some(REGISTERED_BASE)
+        );
+        let start = slot
+            .login_start_registered(&target, &registered_base(), None)
+            .await
+            .expect("the slot starts on the central callback");
+        assert_eq!(start.disposition, McpOAuthLoginDisposition::Started);
+        assert_eq!(start.redirect_uri, REGISTERED_BASE);
+        let query = authorize_query(&start);
+        assert_eq!(query["redirect_uri"], REGISTERED_BASE);
+        assert_eq!(query["client_id"], FIXED_CLIENT_ID);
+        starts.push(start);
+    }
+    assert_ne!(starts[0].state, starts[1].state);
+    assert_ne!(handle_of(&starts[0]), handle_of(&starts[1]));
+
+    for (slot, start) in [&slot_a, &slot_b].into_iter().zip(&starts) {
+        let callback = registered_callback(start, &start.state, &handle_of(start));
+        assert_eq!(callback.redirect_uri, REGISTERED_BASE);
+        slot.login_complete_registered(&target, callback)
+            .await
+            .expect("each slot completes through the central callback");
+    }
+    for realm in ["realm-a", "realm-b"] {
+        let slot_target = target
+            .clone()
+            .in_realm(meerkat_core::connection::RealmId::parse(realm).unwrap());
+        assert!(
+            store
+                .load(&slot_target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_some(),
+            "{realm}: the credential lands in its own slot"
+        );
+    }
+    assert!(state.registration_requests.lock().is_empty());
+    let requests = state.token_requests.lock();
+    assert_eq!(requests.len(), 2);
+    assert!(
+        requests
+            .iter()
+            .all(|request| request["redirect_uri"] == REGISTERED_BASE),
+        "each code exchange names the central callback"
+    );
+}
+
+/// On the central callback the host routes each callback by its state to
+/// the ceremony it retained. A callback delivered to another slot, with its
+/// own custody or the other slot's, is refused: nothing is exchanged and no
+/// attempt is consumed, so each slot still completes with its own callback.
+#[tokio::test]
+async fn a_central_callback_routed_to_another_slot_is_refused_and_consumes_nothing() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let store = Arc::new(EphemeralTokenStore::new());
+    let authority = split_authority(&state, store.clone());
+    let target = split_target(&base, "fixed-misrouted");
+    let [slot_a, slot_b] = central_callback_slots(&authority, &base, &target).await;
+    let start_a = slot_a
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+    let start_b = slot_b
+        .login_start_registered(&target, &registered_base(), None)
+        .await
+        .unwrap();
+
+    for (slot, misrouted) in [
+        // A's callback and custody, delivered to B's slot.
+        (
+            &slot_b,
+            registered_callback(&start_a, &start_a.state, &handle_of(&start_a)),
+        ),
+        // A's state with B's custody.
+        (
+            &slot_b,
+            registered_callback(&start_b, &start_a.state, &handle_of(&start_b)),
+        ),
+        // B's callback and custody, delivered to A's slot.
+        (
+            &slot_a,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_b)),
+        ),
+    ] {
+        let refused = slot.login_complete_registered(&target, misrouted).await;
+        assert!(
+            matches!(refused, Err(McpOAuthError::Flow(OAuthFlowError::Missing))),
+            "{refused:?}"
+        );
+    }
+    // B's own state with A's custody: refused at the custody check, which
+    // leaves B's attempt pending as well.
+    let refused = slot_b
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_a)),
+        )
+        .await;
+    assert!(is_custody_refusal(&refused), "{refused:?}");
+    assert!(
+        state.token_requests.lock().is_empty(),
+        "nothing was exchanged"
+    );
+    for slot in [&slot_a, &slot_b] {
+        assert!(
+            slot.pending_attempt(&target).unwrap().is_some(),
+            "the slot's attempt is still pending"
+        );
+    }
+
+    slot_a
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_a, &start_a.state, &handle_of(&start_a)),
+        )
+        .await
+        .expect("A's attempt was not consumed");
+    slot_b
+        .login_complete_registered(
+            &target,
+            registered_callback(&start_b, &start_b.state, &handle_of(&start_b)),
+        )
+        .await
+        .expect("B's attempt was not consumed");
+    assert_eq!(state.token_requests.lock().len(), 2);
+}
+
+/// A profile's registered redirect is one of the host's own for its slot:
+/// the base itself or the slot's derived redirect, byte for byte. Any other
+/// (another path or host, the base with a slash added, another slot's
+/// redirect) is refused at install and at replace and writes nothing, and a
+/// host that serves no base takes no registered redirect.
+#[tokio::test]
+async fn a_profile_redirect_other_than_the_base_or_its_slot_redirect_is_refused() {
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let target = split_target(&base, "fixed-redirects");
+    let derived = authority
+        .registered_redirect_uri(&target, &registered_base())
+        .unwrap();
+    let other_slot = authority
+        .registered_redirect_uri(
+            &split_target(&base, "fixed-redirects-other"),
+            &registered_base(),
+        )
+        .unwrap();
+    let slashed = format!("{REGISTERED_BASE}/");
+    let refused_redirects = [
+        "https://host.example/mcp/oauth/other",
+        "https://other.example/mcp/oauth/callback",
+        slashed.as_str(),
+        other_slot.as_str(),
+    ];
+    for redirect in refused_redirects {
+        assert_eq!(
+            client_profile_refusal(
+                authority
+                    .install_client_profile_entered(
+                        &target,
+                        fixed_client_profile(&base, redirect, method, FIXED_CLIENT_SECRET),
+                        Some(&registered_base()),
+                        admit_all(),
+                    )
+                    .await
+            ),
+            McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, REGISTERED_BASE, method, FIXED_CLIENT_SECRET),
+                    None,
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a host that serves no base has no registered redirect"
+    );
+    assert_eq!(
+        authority.client_profile(&target).await.unwrap(),
+        None,
+        "nothing was written"
+    );
+
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, REGISTERED_BASE, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("the base itself is the slot's");
+    authority
+        .replace_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, &derived, method, FIXED_CLIENT_SECRET),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .expect("the slot's derived redirect is the slot's");
+    for redirect in refused_redirects {
+        assert_eq!(
+            client_profile_refusal(
+                authority
+                    .replace_client_profile_entered(
+                        &target,
+                        fixed_client_profile(&base, redirect, method, FIXED_CLIENT_SECRET),
+                        Some(&registered_base()),
+                        admit_all(),
+                    )
+                    .await
+            ),
+            McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+            "{redirect}"
+        );
+    }
+    assert_eq!(
+        authority
+            .client_profile(&target)
+            .await
+            .unwrap()
+            .map(|installed| installed.redirect_uri),
+        Some(derived)
+    );
+}
+
+/// A slot without a profile is unchanged: its registered login uses its own
+/// derived redirect (the base followed by its binding slug), registered
+/// dynamically for exactly that redirect, while another slot's profile
+/// names the base itself.
+#[tokio::test]
+async fn a_dynamic_slot_keeps_its_derived_redirect_beside_a_central_profile() {
+    let (base, state) = spawn_oauth_fixture().await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let central = split_target(&base, "central-profile");
+    let dynamic = split_target(&base, "dynamic-slot");
+    authority
+        .install_client_profile_entered(
+            &central,
+            fixed_client_profile(
+                &base,
+                REGISTERED_BASE,
+                McpOAuthClientAuthMethod::ClientSecretPost,
+                FIXED_CLIENT_SECRET,
+            ),
+            Some(&registered_base()),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&central, &registered_base())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(REGISTERED_BASE)
+    );
+
+    let derived = authority
+        .registered_redirect_uri(&dynamic, &registered_base())
+        .unwrap();
+    assert_eq!(
+        derived
+            .strip_prefix(&format!("{REGISTERED_BASE}/"))
+            .map(|segment| !segment.is_empty() && !segment.contains('/')),
+        Some(true),
+        "the base followed by one path segment: {derived}"
+    );
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&dynamic, &registered_base())
+            .await
+            .unwrap()
+            .as_deref(),
+        Some(derived.as_str())
+    );
+    let start = authority
+        .login_start_registered(&dynamic, &registered_base(), None)
+        .await
+        .expect("a dynamic slot starts on its derived redirect");
+    assert_eq!(start.redirect_uri, derived);
+    let registration = state.registration_requests.lock()[0].clone();
+    assert_eq!(registration["redirect_uris"], serde_json::json!([derived]));
+}
+
+/// The central callback is the host's configured base byte for byte. A base
+/// with a path and no trailing slash is admitted, sent in the authorization
+/// request and the code exchange, and completed exactly as configured, never
+/// with a slash added; a base configured with a trailing slash keeps it, and
+/// the form without it is not the base.
+#[tokio::test]
+async fn a_central_callback_is_the_configured_base_byte_for_byte() {
+    const CENTRAL: &str = "https://host.example/services/mcp/callback";
+    let method = McpOAuthClientAuthMethod::ClientSecretPost;
+    let (base, state) = spawn_fixed_client_fixture(method).await;
+    let authority = split_authority(&state, Arc::new(EphemeralTokenStore::new()));
+    let central = McpRegisteredRedirectBase::parse(CENTRAL).unwrap();
+    assert_eq!(central.as_str(), CENTRAL);
+    let target = split_target(&base, "fixed-exact");
+    let slashed = format!("{CENTRAL}/");
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &target,
+                    fixed_client_profile(&base, &slashed, method, FIXED_CLIENT_SECRET),
+                    Some(&central),
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a slash added is not the base"
+    );
+    authority
+        .install_client_profile_entered(
+            &target,
+            fixed_client_profile(&base, CENTRAL, method, FIXED_CLIENT_SECRET),
+            Some(&central),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&target, &central)
+            .await
+            .unwrap()
+            .as_deref()
+            .map(str::as_bytes),
+        Some(CENTRAL.as_bytes())
+    );
+    let start = authority
+        .login_start_registered(&target, &central, None)
+        .await
+        .unwrap();
+    assert_eq!(start.redirect_uri.as_bytes(), CENTRAL.as_bytes());
+    assert_eq!(authorize_query(&start)["redirect_uri"], CENTRAL);
+    authority
+        .login_complete_registered(
+            &target,
+            registered_callback(&start, &start.state, &handle_of(&start)),
+        )
+        .await
+        .expect("the login completes on exactly the configured base");
+    assert_eq!(state.token_requests.lock()[0]["redirect_uri"], CENTRAL);
+
+    // A base configured with a trailing slash: the slash is part of it.
+    let slashed_base = McpRegisteredRedirectBase::parse(&slashed).unwrap();
+    let other = split_target(&base, "fixed-exact-slashed");
+    assert_eq!(
+        client_profile_refusal(
+            authority
+                .install_client_profile_entered(
+                    &other,
+                    fixed_client_profile(&base, CENTRAL, method, FIXED_CLIENT_SECRET),
+                    Some(&slashed_base),
+                    admit_all(),
+                )
+                .await
+        ),
+        McpOAuthClientProfileRefusal::Invalid("redirect URI"),
+        "a slash removed is not the base"
+    );
+    authority
+        .install_client_profile_entered(
+            &other,
+            fixed_client_profile(&base, &slashed, method, FIXED_CLIENT_SECRET),
+            Some(&slashed_base),
+            admit_all(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        authority
+            .registered_login_redirect_uri(&other, &slashed_base)
+            .await
+            .unwrap(),
+        Some(slashed)
+    );
 }

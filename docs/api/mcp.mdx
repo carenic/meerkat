@@ -457,8 +457,10 @@ ask its user.
   Agents, MCP server definitions and mob profiles cannot set it. Each
   server's exact redirect is the base followed by one path segment, its
   credential binding, so every server, realm and account selection has its
-  own redirect. `auth/login/start` with `redirect_uri` set to the base (or
-  to that server's derived redirect) starts on it and adds two fields:
+  own redirect (a slot whose pre-registered client names the base itself
+  uses the base: see the central callback below). `auth/login/start` with
+  `redirect_uri` set to the base (or to that server's derived redirect)
+  starts on it and adds two fields:
 
   ```json
   {"authorize_url": "https://idp.example/authorize?...",
@@ -507,6 +509,107 @@ ask its user.
   and logout; a credential whose client was registered for the other
   redirect kind needs a logout first. The window is the same 300 s. REST and
   `rkat mcp login` serve loopback logins only.
+- **Pre-registered clients (no dynamic registration).** An authorization
+  server that offers no dynamic client registration signs in only clients
+  registered with it ahead of time. A native host installs such a client for
+  one configured server with `HostAuthService::mcp_install_client_profile`
+  (`mcp_replace_client_profile`, `mcp_remove_client_profile`, and their
+  `_entered` forms; `mcp_client_profile` reads it back without the secret).
+  An `McpOAuthClientProfile` names the authorization server's issuer, the
+  client id, the client's exact registered redirect and its token endpoint
+  authentication, `client_secret_basic` or `client_secret_post`, with the
+  client secret. The redirect is the host's registered base itself (the
+  central callback, below), the server's own registered `https` callback
+  (the base followed by the slot's binding segment), or an `http` loopback
+  redirect on `127.0.0.1` or `localhost` with an explicit port. A registered
+  `https` redirect that is neither this host's base nor the slot's own
+  derived redirect, byte for byte, is refused at install and replace
+  (`configuration_invalid`). `HostAuthService::mcp_registered_redirect_uri`
+  answers the exact URI a slot logs in on (its profile's, or its derived
+  redirect without a profile): register that URI with the authorization
+  server.
+  Two optional fields cover servers whose metadata does not fit the
+  defaults: `with_scopes` requests (and requires) the scopes the client is
+  registered for in place of the ones the server names (`offline_access` is
+  never required), and `with_resource` accepts the resource identifier the
+  server's protected resource metadata names when it is not the configured
+  URL (only its origin or a path above it).
+
+  Central callback: a host that serves many slots of one pre-registered
+  client (several users, realms or account selections) registers one
+  callback URI for all of them. Each slot's profile names the host's
+  registered base itself, and every login of those slots is admitted on
+  exactly that URI, byte for byte: a base such as
+  `https://host.example/services/mcp/callback` stays exactly that, with no
+  slash added or removed. The slots' attempts are told apart only by their
+  `state` and `host_attempt_handle`, so the host must route each callback
+  by its `state` to the ceremony it retained when it started the login (the
+  target and its `host_attempt_handle`) and complete it for exactly that
+  target; it never takes the realm or account from the callback, the
+  browser or a model. A callback presented for another slot is refused
+  without consuming or retiring any attempt: a `state` that is not an
+  attempt of that slot (`attempt_missing`) and a handle that is not that
+  attempt's custody (`invalid_target`, detail `remote_custody_required`)
+  alike, so a misrouted or injected callback cannot cancel a user's login.
+  Only a callback that passes both checks and then fails (its redirect,
+  issuer or code exchange) retires its attempt. A slot without a profile
+  keeps its derived redirect.
+
+  The profile belongs to one credential slot: the server as configured (name
+  and URL), the realm the host serves and the account selection. It is never
+  used for another server, realm or selection, and a profile stored for
+  another slot is refused (`configuration_invalid`), never ignored. With a
+  profile installed, a login of that server registers nothing and needs no
+  registration endpoint. The server's protected resource metadata must name
+  the profile's issuer (and its resource), or the start is refused
+  (`configuration_invalid`) before any attempt exists. Under an `https`
+  issuer, the token endpoint its metadata names, where the secret is sent,
+  must use `https` as well, loopback included, or discovery refuses it
+  (`upstream_failure`) and nothing is sent there; only an `http` loopback
+  issuer, a local authorization server, keeps loopback endpoints. A refresh
+  checks its stored token endpoint the same way and never sends the secret
+  to one that does not fit: the credential is closed for a new login
+  (`reauth_required`). The authorization request carries the profile's
+  client id and redirect, with PKCE S256. A start on any other redirect is
+  refused (`invalid_target`); a loopback login through
+  `mcp_begin_loopback_login` binds exactly the profile's port and path. The
+  code exchange and every refresh authenticate the client by the profile's
+  method, and a refresh token the server rotates is stored and presented by
+  the next refresh. Without a profile nothing changes: dynamic registration
+  as before.
+
+  The attempt and the credential are bound to the profile's facts, not to
+  its secret. Replacing the profile with the same facts and a new secret
+  keeps existing credentials refreshing with the new secret (and the next
+  code exchange uses it); a secret the server rejects ends the credential.
+  Removing the profile or replacing it with other facts ends what was bound
+  to it: a pending attempt's completion is refused (`attempt_mismatch`) and
+  the attempt retired, and a credential's next refresh is refused as
+  `reauth_required` and the credential removed, so the user logs in again.
+  Removal is not a revocation: the current access token stays usable until
+  it expires, and `mcp_status` reports the credential `Authorized` until the
+  refresh that ends it. To stop its use at once, call
+  `HostAuthService::mcp_logout`, which removes the credential from the host
+  (it revokes nothing at the authorization server). Ending the credential on
+  a refresh the server rejects holds for standard OAuth error responses (for
+  example `invalid_client` for a secret the server no longer accepts): a
+  server that reports errors with HTTP 200 keeps the credential, every use
+  retries the refresh and fails with a typed error, and `mcp_status` can keep
+  reporting `Authorized`, as with Core's other OAuth refreshes. Nothing is
+  ever refreshed as a public client or through dynamic registration instead.
+  A credential minted before the profile was installed keeps refreshing as
+  the client it was registered as; a new login over it needs a logout first.
+
+  Host obligations: install a profile only from the host's own
+  administration, never from agent input, a tool, an MCP server definition
+  or a mob profile, and use the `_entered` forms so the host re-checks its
+  authenticated administrator at the update's entry. The secret lives only in
+  the host's credential store, beside the server's credentials; it is never
+  written to configuration and never appears in errors, events, logs or
+  `Debug` output. Keep the profile in step with the client's registration at
+  the authorization server: its exact redirect, its authentication method and
+  its secret. Profiles are a Rust host API: no RPC, REST or SDK method
+  installs one.
 - **Bounded network stages.** No stalled authorization server holds a login,
   its host or the credential. Each network stage of a login or refresh
   (protected resource metadata, authorization-server metadata, account

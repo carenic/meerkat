@@ -3,7 +3,9 @@
 //! The MCP config owns only server intent. This module owns OAuth discovery,
 //! dynamic client registration, the PKCE browser flow (through a loopback
 //! redirect, or a host-registered `https` callback completed from the host's
-//! custody), token persistence, and refresh for MCP resources.
+//! custody), token persistence, and refresh for MCP resources. A host may
+//! install a pre-registered confidential client for a server instead of
+//! dynamic registration ([`McpOAuthClientProfile`]).
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -18,9 +20,10 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::auth_oauth::{
-    LoopbackClosed, LoopbackHandle, OAuthEndpoints, OAuthTokenRequestFormat, OAuthTokenResult,
-    PkceChallenge, PkcePair, bind_loopback_callback, exchange_authorization_code_with_state,
-    exchange_refresh_token, oauth_refresh_observation,
+    LoopbackClosed, LoopbackHandle, OAuthClientAuthentication, OAuthEndpoints,
+    OAuthTokenRequestFormat, OAuthTokenResult, PkceChallenge, PkcePair, bind_loopback_callback,
+    bind_loopback_callback_with_redirect, exchange_authorization_code_with_client_auth,
+    exchange_refresh_token, exchange_refresh_token_with_client_auth, oauth_refresh_observation,
 };
 use crate::auth_store::{
     CredentialMutationError, PersistedAuthMode, PersistedTokens, ProviderAuthPersistence,
@@ -46,6 +49,14 @@ use meerkat_core::generated::auth_lease_durable_lifecycle_marker as durable_mark
 use meerkat_core::handles::{
     AUTH_LEASE_TTL_REFRESH_WINDOW_SECS, AuthLeaseRestoreSnapshot, AuthLeaseSnapshot,
     CredentialUseDisposition, CredentialUseIntent, GeneratedAuthLeaseHandle, LeaseKey,
+};
+
+mod client_profile;
+
+use client_profile::{BoundClientProfile, load_client_profile};
+pub use client_profile::{
+    McpOAuthClientAuthMethod, McpOAuthClientProfile, McpOAuthClientProfileRefusal,
+    McpOAuthClientSecret, McpOAuthInstalledClientProfile,
 };
 
 const MCP_TOKEN_REALM: &str = "mcp-oauth";
@@ -1466,6 +1477,8 @@ struct ReadyAttempt<'a> {
     client: StoredMcpOAuthClient,
     offline_access: bool,
     identity: OAuthBrowserFlowIdentity,
+    /// The attempt's exact redirect.
+    redirect_uri: String,
 }
 
 impl std::fmt::Debug for McpOAuthLoginStart {
@@ -1514,7 +1527,11 @@ impl std::fmt::Debug for McpOAuthCallback {
 /// segment, the target's credential binding slug
 /// ([`McpOAuthAuthority::registered_redirect_uri`]). So every server, realm
 /// and account selection has its own exact redirect, and a callback compares
-/// byte for byte: no normalization, prefix or pattern matching.
+/// byte for byte: no normalization, prefix or pattern matching. A slot with
+/// a host-registered client profile may instead name the base itself, one
+/// central callback shared by every such slot of the client
+/// ([`McpOAuthAuthority::registered_login_redirect_uri`]); its attempts are
+/// told apart by their state and custody, never by the redirect.
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct McpRegisteredRedirectBase(String);
 
@@ -1595,6 +1612,24 @@ enum RedirectMode {
     /// The target's registered `https` redirect: the host's own callback,
     /// completed only from the host's retained custody.
     Registered,
+}
+
+/// The redirect a start asks for: the loopback redirect the host bound, or
+/// the host's registered base, under which the slot's exact redirect is
+/// resolved ([`registered_login_redirect`]).
+#[derive(Clone, Copy)]
+enum AttemptRedirect<'a> {
+    Loopback(&'a str),
+    Registered(&'a McpRegisteredRedirectBase),
+}
+
+impl AttemptRedirect<'_> {
+    fn mode(self) -> RedirectMode {
+        match self {
+            Self::Loopback(_) => RedirectMode::Loopback,
+            Self::Registered(_) => RedirectMode::Registered,
+        }
+    }
 }
 
 /// What a completion proves about the attempt it completes.
@@ -1710,11 +1745,34 @@ struct AuthorizationServerEndpoints {
     authorization_metadata_url: String,
     authorization_endpoint: String,
     token_endpoint: String,
-    registration_endpoint: String,
+    /// `None` for a host-registered client, which needs and uses none.
+    registration_endpoint: Option<String>,
     /// The server advertises `offline_access` in its `scopes_supported`.
     offline_access: bool,
     /// The server says its authorization responses carry `iss` (RFC 9207).
     iss_parameter_supported: bool,
+}
+
+/// How the client of an attempt was registered with its authorization
+/// server.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientRegistration {
+    /// Dynamic client registration: the server's metadata must name its
+    /// registration endpoint.
+    Dynamic,
+    /// A host-registered client profile: no registration endpoint is
+    /// needed, read or used.
+    HostRegistered,
+}
+
+impl ClientRegistration {
+    fn of(profile: Option<&BoundClientProfile>) -> Self {
+        if profile.is_some() {
+            Self::HostRegistered
+        } else {
+            Self::Dynamic
+        }
+    }
 }
 
 /// What the use path would do with an MCP target's stored credential, as a
@@ -1904,6 +1962,19 @@ pub enum McpOAuthError {
         "MCP OAuth login for '{server_name}': whether the credential landed is unknown until the credential commit settles"
     )]
     CommitUnsettled { server_name: String },
+    /// The host-registered client profile of the target's credential slot
+    /// refused the operation ([`McpOAuthClientProfileRefusal`]): an invalid
+    /// or conflicting profile update, a login whose redirect, issuer or
+    /// resource is not the profile's, a stored profile that belongs to
+    /// another slot, or a completion whose profile was removed or replaced.
+    /// Nothing was sent with another client: no dynamic registration and no
+    /// public-client request stands in for the profile. Never carries the
+    /// client secret.
+    #[error("MCP OAuth client profile for '{server_name}' refused the operation: {refusal}")]
+    ClientProfile {
+        server_name: String,
+        refusal: McpOAuthClientProfileRefusal,
+    },
 }
 
 impl McpOAuthError {
@@ -1926,6 +1997,7 @@ impl McpOAuthError {
             | Self::CredentialSlot { .. }
             | Self::AttemptRetired { .. }
             | Self::EgressRefused { .. }
+            | Self::ClientProfile { .. }
             | Self::TokenKey { .. } => true,
             // Flow-owner persistence and lifecycle failures are not refusals.
             Self::Flow(error) => error.is_refusal(),
@@ -2392,8 +2464,7 @@ impl McpOAuthAuthority {
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
         self.admit_attempt(
             target,
-            redirect_uri,
-            RedirectMode::Loopback,
+            AttemptRedirect::Loopback(redirect_uri),
             www_authenticate,
         )
         .await
@@ -2402,7 +2473,9 @@ impl McpOAuthAuthority {
     /// The exact registered redirect of `target` under `base`: the base
     /// followed by the target's credential binding slug, for the target as
     /// this authority serves it (its realm and account selection included).
-    /// Local and secret-free; it admits nothing.
+    /// Local and secret-free; it admits nothing. A slot with a client profile
+    /// logs in on the profile's redirect, which may be the base itself
+    /// ([`Self::registered_login_redirect_uri`]).
     pub fn registered_redirect_uri(
         &self,
         target: &McpServerIdentity,
@@ -2416,14 +2489,42 @@ impl McpOAuthAuthority {
         Ok(redirect)
     }
 
+    /// The exact registered redirect a registered-callback login of `target`
+    /// uses under `base` ([`Self::login_start_registered`]): the redirect of
+    /// the slot's client profile when one is installed, which is either the
+    /// base itself (one central callback for every slot of the client) or
+    /// the slot's derived redirect; without a profile, the derived redirect
+    /// ([`Self::registered_redirect_uri`]). `None` when the slot's profile is
+    /// a loopback client, which has no registered redirect; a profile naming
+    /// any other redirect is refused
+    /// ([`McpOAuthClientProfileRefusal::RedirectMismatch`]). The URI to
+    /// register with the authorization server; an unattended read of the
+    /// credential store that admits nothing.
+    pub async fn registered_login_redirect_uri(
+        &self,
+        target: &McpServerIdentity,
+        base: &McpRegisteredRedirectBase,
+    ) -> Result<Option<String>, McpOAuthError> {
+        let target = self.scoped(target)?;
+        let profile = load_client_profile(
+            self.token_store().as_ref(),
+            &target,
+            TokenStoreAccess::Unattended,
+        )
+        .await?;
+        registered_login_redirect(&target, base, profile.as_ref())
+    }
+
     /// [`Self::login_start`] for a host whose users' browsers cannot reach
     /// its loopback address: the attempt redirects to the target's registered
-    /// `https` callback under `base` ([`Self::registered_redirect_uri`]), the
-    /// host's own endpoint. Everything else is the same admission: realm,
-    /// account selection, discovery, preflight, client registration (as a
-    /// `web` public PKCE client registering exactly that redirect), PKCE and
-    /// one-time state through the AuthMachine-owned flow owner, the same
-    /// window and the same start-or-join.
+    /// `https` callback under `base` ([`Self::registered_login_redirect_uri`]:
+    /// a slot with a client profile uses exactly the profile's redirect, the
+    /// base itself or the slot's derived one), the host's own endpoint.
+    /// Everything else is the same admission: realm, account selection,
+    /// discovery, preflight, client registration (as a `web` public PKCE
+    /// client registering exactly that redirect), PKCE and one-time state
+    /// through the AuthMachine-owned flow owner, the same window and the same
+    /// start-or-join.
     ///
     /// A started attempt returns [`McpOAuthLoginStart::host_attempt_handle`]:
     /// a host-only secret its completion
@@ -2455,16 +2556,8 @@ impl McpOAuthAuthority {
         base: &McpRegisteredRedirectBase,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
-        let redirect = self
-            .registered_redirect_uri(target, base)
-            .map_err(McpOAuthStartFailure::not_admitted)?;
-        self.admit_attempt(
-            target,
-            &redirect,
-            RedirectMode::Registered,
-            www_authenticate,
-        )
-        .await
+        self.admit_attempt(target, AttemptRedirect::Registered(base), www_authenticate)
+            .await
     }
 
     /// Admit one attempt, or join the one pending. Every step before the
@@ -2473,12 +2566,11 @@ impl McpOAuthAuthority {
     async fn admit_attempt(
         &self,
         target: &McpServerIdentity,
-        redirect_uri: &str,
-        mode: RedirectMode,
+        redirect: AttemptRedirect<'_>,
         www_authenticate: Option<&str>,
     ) -> Result<McpOAuthLoginStart, McpOAuthStartFailure> {
         let ready = match self
-            .prepare_attempt(target, redirect_uri, mode, www_authenticate)
+            .prepare_attempt(target, redirect, www_authenticate)
             .await
         {
             Ok(PreparedAttempt::Joined(joined)) => return Ok(joined),
@@ -2495,13 +2587,14 @@ impl McpOAuthAuthority {
             client,
             offline_access,
             identity,
+            redirect_uri,
         } = ready;
         let pkce = PkcePair::generate_s256();
         let state = authority
             .start_with_admission(
                 credential_identity,
                 identity.clone(),
-                redirect_uri.to_owned(),
+                redirect_uri.clone(),
                 pkce.verifier.secret().to_owned(),
             )
             .map_err(|failure| McpOAuthStartFailure {
@@ -2514,13 +2607,13 @@ impl McpOAuthAuthority {
         let expires_at = std::time::Instant::now() + MCP_INTERACTIVE_LOGIN_TIMEOUT;
         let authorize_url = authorize_endpoints(&discovery, &client, offline_access)
             .authorize_url_with_pkce(&pkce.challenge, &state);
-        let host_attempt_handle = (mode == RedirectMode::Registered)
-            .then(|| mcp_remote_attempt_handle(&binding, &state, redirect_uri));
+        let host_attempt_handle = (redirect.mode() == RedirectMode::Registered)
+            .then(|| mcp_remote_attempt_handle(&binding, &state, &redirect_uri));
         Ok(McpOAuthLoginStart {
             target,
             authorize_url,
             state,
-            redirect_uri: redirect_uri.to_owned(),
+            redirect_uri,
             disposition: McpOAuthLoginDisposition::Started,
             host_attempt_handle,
             identity,
@@ -2534,8 +2627,7 @@ impl McpOAuthAuthority {
     async fn prepare_attempt(
         &self,
         target: &McpServerIdentity,
-        redirect_uri: &str,
-        mode: RedirectMode,
+        redirect: AttemptRedirect<'_>,
         www_authenticate: Option<&str>,
     ) -> Result<PreparedAttempt<'_>, McpOAuthError> {
         let target = &self.scoped(target)?;
@@ -2545,12 +2637,42 @@ impl McpOAuthAuthority {
             .as_ref()
             .ok_or(ConnectorOAuthRefusal::VerificationUnavailable)?;
         self.require_bound_strategy(target, strategy.as_ref())?;
-        match mode {
-            RedirectMode::Loopback => require_loopback_redirect(redirect_uri)?,
-            // Only a redirect derived from a host's registered base gets here.
-            RedirectMode::Registered => {
-                McpRegisteredRedirectBase::parse(redirect_uri)?;
+        let mode = redirect.mode();
+        if let AttemptRedirect::Loopback(redirect_uri) = redirect {
+            require_loopback_redirect(redirect_uri)?;
+        }
+        // The slot's host-registered client, when one is installed: the
+        // attempt is its client's, on exactly its registered redirect, and
+        // nothing is registered dynamically beside it.
+        let profile = load_client_profile(
+            self.token_store().as_ref(),
+            target,
+            TokenStoreAccess::Interactive,
+        )
+        .await?;
+        // The attempt's exact redirect: the loopback redirect the host bound,
+        // or the slot's registered redirect under the host's base (the
+        // profile's, when one is installed).
+        let redirect_uri = match redirect {
+            AttemptRedirect::Loopback(redirect_uri) => redirect_uri.to_owned(),
+            AttemptRedirect::Registered(base) => {
+                let redirect_uri = registered_login_redirect(target, base, profile.as_ref())?
+                    .ok_or_else(|| McpOAuthError::ClientProfile {
+                        server_name: target.server_name().to_owned(),
+                        refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+                    })?;
+                McpRegisteredRedirectBase::parse(&redirect_uri)?;
+                redirect_uri
             }
+        };
+        let redirect_uri = redirect_uri.as_str();
+        if let Some(profile) = &profile
+            && profile.redirect_uri() != redirect_uri
+        {
+            return Err(McpOAuthError::ClientProfile {
+                server_name: target.server_name().to_owned(),
+                refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+            });
         }
         let binding = target.auth_binding_ref()?;
         let credential_identity: meerkat_core::AuthCredentialIdentity = binding.clone().into();
@@ -2574,11 +2696,11 @@ impl McpOAuthAuthority {
             if !joinable {
                 return Err(McpOAuthError::Flow(OAuthFlowError::RedirectUriMismatch));
             }
-            // `None`: the pending attempt no longer matches the server, or
-            // its preflight is not retained; it was retired, so admit a
-            // fresh one.
+            // `None`: the pending attempt no longer matches the server, its
+            // client profile or its preflight is not retained; it was
+            // retired, so admit a fresh one.
             if let Some(joined) = self
-                .join_pending_attempt(target, &state, record, start_deadline)
+                .join_pending_attempt(target, &state, record, start_deadline, profile.as_ref())
                 .await?
             {
                 return Ok(PreparedAttempt::Joined(joined));
@@ -2590,7 +2712,7 @@ impl McpOAuthAuthority {
         let occupant = self.slot_occupant(target).await?;
         let selection = attempt_selection(target, occupant.as_ref())?;
         let (mut discovery, requested) = self
-            .discover(target, www_authenticate, start_deadline)
+            .discover(target, www_authenticate, start_deadline, profile.as_ref())
             .await?;
         // Before client registration and before the human is asked to
         // consent: an issuer the strategy cannot verify is refused here.
@@ -2609,13 +2731,15 @@ impl McpOAuthAuthority {
             )
             .await?;
         }
-        let client = match &occupant {
+        let client = match (&occupant, &profile) {
             // Reconnect with the admitted client: a fresh registration would
             // change the credential's context. A loopback redirect may use
             // any port (RFC 8252 section 7.3); a registered `https` one is
             // registered exactly, so a client registered for another redirect
-            // cannot serve this attempt.
-            Some(occupant) => {
+            // cannot serve this attempt. A credential minted under a client
+            // profile reconnects only under that same profile, and a
+            // dynamically registered one only without a profile.
+            (Some(occupant), profile) => {
                 let client_redirect = &occupant.metadata.client.redirect_uri;
                 let redirect_fits = match mode {
                     RedirectMode::Loopback => !is_https_redirect(client_redirect),
@@ -2625,17 +2749,24 @@ impl McpOAuthAuthority {
                     != discovery.authorization_server
                     || occupant.metadata.discovery.resource != discovery.resource
                     || !redirect_fits
+                    || occupant.metadata.client.client_profile.as_deref()
+                        != profile.as_ref().map(BoundClientProfile::binding)
                 {
                     return Err(McpOAuthError::DisconnectRequired {
                         server_name: target.server_name().to_owned(),
                     });
                 }
-                StoredMcpOAuthClient {
-                    redirect_uri: redirect_uri.to_owned(),
-                    ..occupant.metadata.client.clone()
+                match profile {
+                    Some(profile) => profile.stored_client(),
+                    None => StoredMcpOAuthClient {
+                        redirect_uri: redirect_uri.to_owned(),
+                        ..occupant.metadata.client.clone()
+                    },
                 }
             }
-            None => {
+            // The host-registered client: nothing is registered.
+            (None, Some(profile)) => profile.stored_client(),
+            (None, None) => {
                 self.bounded_stage(
                     target,
                     McpOAuthNetworkStage::ClientRegistration,
@@ -2659,6 +2790,13 @@ impl McpOAuthAuthority {
                 strategy.descriptor(target, &context)?,
                 &requested.resource_scopes,
             )?
+        };
+        // The attempt is bound to the client profile it starts under: its
+        // completion uses exactly that profile, and the credential's context
+        // names it.
+        let descriptor = match &profile {
+            Some(profile) => bind_client_profile(descriptor, profile.binding())?,
+            None => descriptor,
         };
         let facts = descriptor.parameters();
         if facts.expected_account != selection {
@@ -2691,6 +2829,7 @@ impl McpOAuthAuthority {
             client,
             offline_access: requested.offline_access,
             identity: descriptor.into(),
+            redirect_uri: redirect_uri.to_owned(),
         }))
     }
 
@@ -2732,16 +2871,29 @@ impl McpOAuthAuthority {
     /// Re-project the attempt already pending for `target` from its admitted
     /// descriptor. Only the recorded issuer's authorization-server metadata
     /// is fetched (no client registration, no account preflight). An
-    /// attempt that no longer matches the target, or whose preflight this
-    /// process does not retain, is retired and `None` returned.
+    /// attempt that no longer matches the target, that was admitted under
+    /// another client than the slot's `profile` now (or under one with no
+    /// profile installed now), or whose preflight this process does not
+    /// retain, is retired and `None` returned.
     async fn join_pending_attempt(
         &self,
         target: &McpServerIdentity,
         state: &str,
         record: crate::oauth_flow::OAuthFlowRecord,
         start_deadline: tokio::time::Instant,
+        profile: Option<&BoundClientProfile>,
     ) -> Result<Option<McpOAuthLoginStart>, McpOAuthError> {
-        if !pending_attempt_matches(target, &record) || !preflight_receipt_retained(state) {
+        let same_client = match &record.provider {
+            OAuthBrowserFlowIdentity::Connector { connector } => {
+                attempt_client_profile(connector.parameters())
+                    == profile.map(BoundClientProfile::binding)
+            }
+            OAuthBrowserFlowIdentity::Provider(_) => false,
+        };
+        if !same_client
+            || !pending_attempt_matches(target, &record)
+            || !preflight_receipt_retained(state)
+        {
             // A failed retirement is propagated: no fresh attempt is admitted
             // beside one the flow owner still holds.
             if let Some((authority, _)) = self.interactive.as_ref() {
@@ -2765,16 +2917,28 @@ impl McpOAuthAuthority {
                 target,
                 McpOAuthNetworkStage::AuthorizationServerMetadata,
                 start_deadline,
-                self.discover_authorization_server(target, &facts.issuer),
+                self.discover_authorization_server(
+                    target,
+                    &facts.issuer,
+                    ClientRegistration::of(profile),
+                ),
             )
             .await?;
-        let offline_access = endpoints.offline_access;
+        // As the start computed it.
+        let offline_access = endpoints.offline_access
+            || profile
+                .and_then(BoundClientProfile::scopes)
+                .is_some_and(|scopes| scopes.contains(OFFLINE_ACCESS_SCOPE));
         let discovery = completion_discovery(target, facts, endpoints)?;
-        let client = StoredMcpOAuthClient {
-            client_id: facts.client.clone(),
-            client_secret: None,
-            token_endpoint_auth_method: "none".to_owned(),
-            redirect_uri: record.redirect_uri.clone(),
+        let client = match profile {
+            Some(profile) => profile.stored_client(),
+            None => StoredMcpOAuthClient {
+                client_id: facts.client.clone(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_owned(),
+                redirect_uri: record.redirect_uri.clone(),
+                client_profile: None,
+            },
         };
         let challenge = PkceChallenge::s256_for_verifier(&record.pkce_verifier);
         // The admitted descriptor carries the resource scopes; the joined
@@ -2797,6 +2961,11 @@ impl McpOAuthAuthority {
     /// Host loopback login: bind the callback listener, then admit (or join)
     /// the attempt. A joined attempt is bound to another host's listener, so
     /// this binding is retired and the joined projection returned instead.
+    ///
+    /// With a host-registered client profile installed for the target, the
+    /// listener binds exactly the profile's registered loopback redirect (its
+    /// host, port and path), and a profile registered for an `https` callback
+    /// is refused ([`McpOAuthClientProfileRefusal::RedirectMismatch`]).
     pub async fn begin_loopback_login(
         &self,
         target: &McpServerIdentity,
@@ -2806,12 +2975,28 @@ impl McpOAuthAuthority {
         // Everything fallible that needs no admission runs before it.
         let credential_identity: meerkat_core::AuthCredentialIdentity =
             target.auth_binding_ref()?.into();
-        let binding = bind_loopback_callback(MCP_OAUTH_CALLBACK_PATH)
-            .await
-            .map_err(|_| McpOAuthError::Callback {
-                server_name: target.server_name().to_owned(),
-                reason: "loopback callback listener could not be bound".into(),
-            })?;
+        let profile = load_client_profile(
+            self.token_store().as_ref(),
+            target,
+            TokenStoreAccess::Interactive,
+        )
+        .await?;
+        let bound = match profile.as_ref().map(BoundClientProfile::loopback_bind) {
+            None => bind_loopback_callback(MCP_OAUTH_CALLBACK_PATH).await,
+            Some(Some((host, port, path))) => {
+                bind_loopback_callback_with_redirect(path, host, &[port]).await
+            }
+            Some(None) => {
+                return Err(McpOAuthError::ClientProfile {
+                    server_name: target.server_name().to_owned(),
+                    refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+                });
+            }
+        };
+        let binding = bound.map_err(|_| McpOAuthError::Callback {
+            server_name: target.server_name().to_owned(),
+            reason: "loopback callback listener could not be bound".into(),
+        })?;
         let start = match self
             .login_start(target, &binding.redirect_url, www_authenticate)
             .await
@@ -3044,6 +3229,42 @@ impl McpOAuthAuthority {
         // The admitted descriptor is the authority: the strategy's facts plus
         // the resource scopes selected when the attempt started.
         let descriptor: &ConnectorOAuthDescriptor = connector;
+        // An attempt admitted under a host-registered client completes only
+        // under that exact profile, read now: one removed or replaced since
+        // the start ends the attempt here, before anything is sent, and the
+        // code is never exchanged as a public client.
+        let profile = match attempt_client_profile(facts) {
+            None => None,
+            Some(bound) => {
+                let installed = retire
+                    .unless_retired(
+                        target,
+                        load_client_profile(
+                            self.token_store().as_ref(),
+                            target,
+                            TokenStoreAccess::Interactive,
+                        ),
+                    )
+                    .await?;
+                match installed {
+                    Some(profile)
+                        if profile.binding() == bound
+                            && profile.client_id() == facts.client
+                            && profile.issuer() == facts.issuer
+                            && profile.redirect_uri() == record.redirect_uri
+                            && profile.expected_resource() == facts.resource =>
+                    {
+                        Some(profile)
+                    }
+                    _ => {
+                        return Err(McpOAuthError::ClientProfile {
+                            server_name: target.server_name().to_owned(),
+                            refusal: McpOAuthClientProfileRefusal::Changed,
+                        });
+                    }
+                }
+            }
+        };
         let endpoints = retire
             .unless_retired(
                 target,
@@ -3051,7 +3272,11 @@ impl McpOAuthAuthority {
                     target,
                     McpOAuthNetworkStage::AuthorizationServerMetadata,
                     completion_deadline,
-                    self.discover_authorization_server(target, &facts.issuer),
+                    self.discover_authorization_server(
+                        target,
+                        &facts.issuer,
+                        ClientRegistration::of(profile.as_ref()),
+                    ),
                 ),
             )
             .await?;
@@ -3070,20 +3295,31 @@ impl McpOAuthAuthority {
             }
         }
         let discovery = completion_discovery(target, facts, endpoints)?;
-        let client = StoredMcpOAuthClient {
-            client_id: facts.client.clone(),
-            client_secret: None,
-            token_endpoint_auth_method: "none".to_owned(),
-            redirect_uri: record.redirect_uri.clone(),
+        let client = match &profile {
+            Some(profile) => profile.stored_client(),
+            None => StoredMcpOAuthClient {
+                client_id: facts.client.clone(),
+                client_secret: None,
+                token_endpoint_auth_method: "none".to_owned(),
+                redirect_uri: record.redirect_uri.clone(),
+                client_profile: None,
+            },
         };
         let endpoints = mcp_oauth_endpoints(&discovery, &client);
+        // A host-registered client authenticates by its profile's method; a
+        // dynamically registered one is a public client.
+        let client_auth = profile
+            .as_ref()
+            .map_or(OAuthClientAuthentication::Public, |profile| {
+                profile.client_authentication()
+            });
         let exchange = async {
-            exchange_authorization_code_with_state(
+            exchange_authorization_code_with_client_auth(
                 self.http_for(target, &endpoints.token_url)?,
                 &endpoints,
                 &code,
                 &record.pkce_verifier,
-                None,
+                client_auth,
                 Some(&state),
             )
             .await
@@ -3628,6 +3864,71 @@ impl McpOAuthAuthority {
             });
         };
         let metadata = &admitted.metadata;
+        // A credential minted under a host-registered client refreshes only
+        // as that exact client, authenticated by its profile's method. With
+        // the profile removed or replaced, or its row unusable for this slot,
+        // the refresh cannot authenticate: the credential is closed as
+        // needing a new login, and is never refreshed as a public client or
+        // through dynamic registration. A profile the store did not answer
+        // for closes the refresh transiently and keeps the credential.
+        let profile = match metadata.client.client_profile.as_deref() {
+            None => None,
+            Some(bound) => match load_client_profile(
+                self.token_store().as_ref(),
+                target,
+                TokenStoreAccess::Unattended,
+            )
+            .await
+            {
+                Ok(Some(profile))
+                    if profile.binding() == bound
+                        && profile.client_id() == metadata.client.client_id
+                        && profile.issuer() == metadata.discovery.authorization_server =>
+                {
+                    Some(profile)
+                }
+                Ok(_) | Err(McpOAuthError::ClientProfile { .. }) => {
+                    let observation =
+                        meerkat_core::RefreshFailureObservation::local_credential_unusable();
+                    let disposition = self
+                        .close_refresh_failure(key, &lease_key, &observation)
+                        .await?;
+                    return Err(RefreshError::Classified {
+                        message: "the client profile the stored MCP OAuth credential was minted under is not installed; log in again".to_string(),
+                        observation,
+                        disposition,
+                    });
+                }
+                Err(error) => {
+                    let observation = meerkat_core::RefreshFailureObservation::transient();
+                    self.close_refresh_failure(key, &lease_key, &observation)
+                        .await?;
+                    return Err(refresh_error_from_mcp(error));
+                }
+            },
+        };
+        // The client secret goes only to a token endpoint that fits the
+        // profile's issuer ([`require_client_secret_endpoint`]). A stored
+        // endpoint that does not is never sent the secret: the credential is
+        // closed as needing a new login, whose discovery refuses it.
+        if let Some(profile) = &profile
+            && require_client_secret_endpoint(
+                target,
+                profile.issuer(),
+                &metadata.discovery.token_endpoint,
+            )
+            .is_err()
+        {
+            let observation = meerkat_core::RefreshFailureObservation::local_credential_unusable();
+            let disposition = self
+                .close_refresh_failure(key, &lease_key, &observation)
+                .await?;
+            return Err(RefreshError::Classified {
+                message: "the stored MCP OAuth token endpoint does not use https under the client's https issuer; log in again".to_string(),
+                observation,
+                disposition,
+            });
+        }
         let endpoints = OAuthEndpoints {
             client_id: metadata.client.client_id.clone(),
             authorize_url: metadata.discovery.authorization_endpoint.clone(),
@@ -3646,15 +3947,28 @@ impl McpOAuthAuthority {
         // Bounded like a login stage: a token endpoint that never answers
         // ends as a request timeout (a transient failure), so this refresh
         // never holds the credential's exclusive mutation without bound.
-        let exchange = tokio::time::timeout(
-            self.bounds.stage,
-            exchange_refresh_token(
-                http,
-                &endpoints,
-                &refresh_token,
-                metadata.client.client_secret.as_deref(),
-            ),
-        )
+        let exchange = tokio::time::timeout(self.bounds.stage, async {
+            match &profile {
+                Some(profile) => {
+                    exchange_refresh_token_with_client_auth(
+                        http,
+                        &endpoints,
+                        &refresh_token,
+                        profile.client_authentication(),
+                    )
+                    .await
+                }
+                None => {
+                    exchange_refresh_token(
+                        http,
+                        &endpoints,
+                        &refresh_token,
+                        metadata.client.client_secret.as_deref(),
+                    )
+                    .await
+                }
+            }
+        })
         .await
         .unwrap_or(Err(crate::auth_oauth::OAuthError::Timeout));
         let _guard = meerkat_core::acquire_auth_login_lifecycle_guard(&lease_key).await;
@@ -3913,6 +4227,13 @@ impl McpOAuthAuthority {
                 },
             )
             .map_err(|_| unobserved("MCP OAuth account strategy refused the stored context"))?;
+        // A credential minted under a host-registered client was bound to
+        // that profile, as its admitted descriptor was.
+        let descriptor = match metadata.client.client_profile.as_deref() {
+            Some(profile) => bind_client_profile(descriptor, profile)
+                .map_err(|_| unobserved("MCP OAuth account strategy refused the stored context"))?,
+            None => descriptor,
+        };
         if let Some(binding) = &metadata.account_binding
             && (binding.stable_context != descriptor.stable_context()
                 || binding.strategy_id != descriptor.parameters().strategy_id)
@@ -4054,12 +4375,17 @@ impl McpOAuthAuthority {
 
     /// Discover the protected resource's authorization server and its
     /// endpoints: the resource metadata stage, then the authorization-server
-    /// metadata stage, each bounded, and both by `start_deadline`.
+    /// metadata stage, each bounded, and both by `start_deadline`. With a
+    /// host-registered client `profile`, the resource metadata must name the
+    /// profile's resource and list its issuer, whose metadata needs no
+    /// registration endpoint, and the profile's scopes, when it names them,
+    /// are the resource's.
     async fn discover(
         &self,
         target: &McpServerIdentity,
         www_authenticate: Option<&str>,
         start_deadline: tokio::time::Instant,
+        profile: Option<&BoundClientProfile>,
     ) -> Result<(StoredMcpOAuthDiscovery, RequestedScopes), McpOAuthError> {
         require_https_or_loopback(target, target.server_url(), "MCP protected resource")?;
         let (resource_metadata_url, resource) = self
@@ -4070,35 +4396,84 @@ impl McpOAuthAuthority {
                 self.fetch_protected_resource_metadata(target, www_authenticate),
             )
             .await?;
-        if resource.resource != target.server_url() {
-            return Err(McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: format!(
-                    "protected resource metadata resource '{}' does not match MCP server '{}'",
-                    resource.resource,
-                    target.server_url()
-                ),
-            });
-        }
-        let auth_server = resource
-            .authorization_servers
-            .first()
-            .cloned()
-            .ok_or_else(|| McpOAuthError::DiscoveryFailed {
-                server_name: target.server_name().to_string(),
-                reason: "protected resource metadata has no authorization_servers".to_string(),
-            })?;
+        let client_profile_refusal = |refusal| McpOAuthError::ClientProfile {
+            server_name: target.server_name().to_owned(),
+            refusal,
+        };
+        let auth_server = match profile {
+            None => {
+                if resource.resource != target.server_url() {
+                    return Err(McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: format!(
+                            "protected resource metadata resource '{}' does not match MCP server '{}'",
+                            resource.resource,
+                            target.server_url()
+                        ),
+                    });
+                }
+                resource
+                    .authorization_servers
+                    .first()
+                    .cloned()
+                    .ok_or_else(|| McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: "protected resource metadata has no authorization_servers"
+                            .to_string(),
+                    })?
+            }
+            // The profile's client is registered with its issuer only: the
+            // resource must name it among its authorization servers.
+            Some(profile) => {
+                if resource.resource != profile.expected_resource() {
+                    return Err(client_profile_refusal(
+                        McpOAuthClientProfileRefusal::ResourceMismatch,
+                    ));
+                }
+                if !resource
+                    .authorization_servers
+                    .iter()
+                    .any(|server| server == profile.issuer())
+                {
+                    return Err(client_profile_refusal(
+                        McpOAuthClientProfileRefusal::IssuerMismatch,
+                    ));
+                }
+                profile.issuer().to_owned()
+            }
+        };
         let endpoints = self
             .bounded_stage(
                 target,
                 McpOAuthNetworkStage::AuthorizationServerMetadata,
                 start_deadline,
-                self.discover_authorization_server(target, &auth_server),
+                self.discover_authorization_server(
+                    target,
+                    &auth_server,
+                    ClientRegistration::of(profile),
+                ),
             )
             .await?;
+        // A profile's scopes are requested and required in place of the ones
+        // the server names; `offline_access` is never required, and is
+        // requested when the profile names it or the server advertises it.
+        let (resource_scopes, offline_access) = match profile.and_then(BoundClientProfile::scopes) {
+            Some(scopes) => (
+                scopes
+                    .iter()
+                    .filter(|scope| *scope != OFFLINE_ACCESS_SCOPE)
+                    .cloned()
+                    .collect(),
+                endpoints.offline_access || scopes.contains(OFFLINE_ACCESS_SCOPE),
+            ),
+            None => (
+                select_resource_scopes(www_authenticate, &resource.scopes_supported),
+                endpoints.offline_access,
+            ),
+        };
         let requested = RequestedScopes {
-            resource_scopes: select_resource_scopes(www_authenticate, &resource.scopes_supported),
-            offline_access: endpoints.offline_access,
+            resource_scopes,
+            offline_access,
         };
         Ok((
             StoredMcpOAuthDiscovery {
@@ -4170,11 +4545,14 @@ impl McpOAuthAuthority {
     /// RFC 8414, then OpenID Connect discovery when the RFC 8414 document is
     /// absent (see [`authorization_server_metadata_urls`]). The first document
     /// found must have the exact issuer, PKCE S256, and https (or loopback)
-    /// endpoints. Redirects are refused.
+    /// endpoints, and, for a dynamically registered client, a registration
+    /// endpoint. A host-registered client's token endpoint must also fit its
+    /// issuer ([`require_client_secret_endpoint`]). Redirects are refused.
     async fn discover_authorization_server(
         &self,
         target: &McpServerIdentity,
         auth_server: &str,
+        registration: ClientRegistration,
     ) -> Result<AuthorizationServerEndpoints, McpOAuthError> {
         let auth_server = auth_server.to_owned();
         require_https_or_loopback(target, &auth_server, "authorization server issuer")?;
@@ -4247,14 +4625,20 @@ impl McpOAuthAuthority {
                 reason: "authorization server does not advertise PKCE S256".into(),
             });
         }
-        let registration_endpoint =
-            auth.registration_endpoint
-                .clone()
-                .ok_or_else(|| McpOAuthError::DiscoveryFailed {
-                    server_name: target.server_name().to_string(),
-                    reason: "authorization server metadata has no registration_endpoint"
-                        .to_string(),
-                })?;
+        // A host-registered client neither needs nor reads the registration
+        // endpoint; dynamic registration requires one.
+        let registration_endpoint = match registration {
+            ClientRegistration::HostRegistered => None,
+            ClientRegistration::Dynamic => {
+                Some(auth.registration_endpoint.clone().ok_or_else(|| {
+                    McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason: "authorization server metadata has no registration_endpoint"
+                            .to_string(),
+                    }
+                })?)
+            }
+        };
         let authorization_endpoint =
             absolutize_url(&authorization_metadata_url, &auth.authorization_endpoint).map_err(
                 |reason| McpOAuthError::DiscoveryFailed {
@@ -4267,16 +4651,25 @@ impl McpOAuthAuthority {
                 server_name: target.server_name().to_string(),
                 reason,
             })?;
-        let registration_endpoint =
-            absolutize_url(&authorization_metadata_url, &registration_endpoint).map_err(
-                |reason| McpOAuthError::DiscoveryFailed {
-                    server_name: target.server_name().to_string(),
-                    reason,
-                },
-            )?;
+        let registration_endpoint = registration_endpoint
+            .map(|registration_endpoint| {
+                absolutize_url(&authorization_metadata_url, &registration_endpoint).map_err(
+                    |reason| McpOAuthError::DiscoveryFailed {
+                        server_name: target.server_name().to_string(),
+                        reason,
+                    },
+                )
+            })
+            .transpose()?;
         require_https_or_loopback(target, &authorization_endpoint, "authorization endpoint")?;
         require_https_or_loopback(target, &token_endpoint, "token endpoint")?;
-        require_https_or_loopback(target, &registration_endpoint, "registration endpoint")?;
+        // A host-registered client sends its secret to the token endpoint.
+        if registration == ClientRegistration::HostRegistered {
+            require_client_secret_endpoint(target, &auth_server, &token_endpoint)?;
+        }
+        if let Some(registration_endpoint) = &registration_endpoint {
+            require_https_or_loopback(target, registration_endpoint, "registration endpoint")?;
+        }
         let offline_access = auth
             .scopes_supported
             .iter()
@@ -4352,9 +4745,18 @@ impl McpOAuthAuthority {
             "response_types": ["code"],
             "token_endpoint_auth_method": "none",
         });
+        // Dynamic registration's discovery always requires the endpoint.
+        let registration_endpoint =
+            discovery.registration_endpoint.as_deref().ok_or_else(|| {
+                McpOAuthError::DiscoveryFailed {
+                    server_name: target.server_name().to_string(),
+                    reason: "authorization server metadata has no registration_endpoint"
+                        .to_string(),
+                }
+            })?;
         let wire: DynamicClientRegistrationResponse = self
-            .http_for(target, &discovery.registration_endpoint)?
-            .post(&discovery.registration_endpoint)
+            .http_for(target, registration_endpoint)?
+            .post(registration_endpoint)
             .json(&body)
             .send()
             .await
@@ -4418,6 +4820,7 @@ impl McpOAuthAuthority {
             client_secret: None,
             token_endpoint_auth_method,
             redirect_uri: redirect_uri.to_string(),
+            client_profile: None,
         })
     }
 }
@@ -4757,6 +5160,43 @@ fn valid_registered_redirect(redirect_uri: &str) -> bool {
     })
 }
 
+/// Whether `redirect` is one of `target`'s registered redirects under
+/// `base`, byte for byte: the slot's own derived redirect, or the base
+/// itself, the central callback a host-registered client may name for every
+/// slot it serves.
+fn registered_redirect_fits(
+    target: &McpServerIdentity,
+    base: &McpRegisteredRedirectBase,
+    redirect: &str,
+) -> bool {
+    redirect == base.as_str() || redirect == base.redirect_for(&target.binding_slug())
+}
+
+/// The redirect a registered-callback attempt of `target` uses under `base`:
+/// exactly the redirect of the slot's client `profile` when one is
+/// installed, which must be one of the slot's registered redirects
+/// ([`registered_redirect_fits`]); without a profile, the slot's derived
+/// redirect, as before. `None` for a profile on a loopback redirect, which
+/// has no registered redirect.
+fn registered_login_redirect(
+    target: &McpServerIdentity,
+    base: &McpRegisteredRedirectBase,
+    profile: Option<&BoundClientProfile>,
+) -> Result<Option<String>, McpOAuthError> {
+    match profile {
+        None => Ok(Some(base.redirect_for(&target.binding_slug()))),
+        // A loopback client has no registered redirect.
+        Some(profile) if !is_https_redirect(profile.redirect_uri()) => Ok(None),
+        Some(profile) if registered_redirect_fits(target, base, profile.redirect_uri()) => {
+            Ok(Some(profile.redirect_uri().to_owned()))
+        }
+        Some(_) => Err(McpOAuthError::ClientProfile {
+            server_name: target.server_name().to_owned(),
+            refusal: McpOAuthClientProfileRefusal::RedirectMismatch,
+        }),
+    }
+}
+
 /// The host-only handle of an attempt admitted on a registered redirect: an
 /// HMAC over the slot's binding, the state and the admitted redirect under a
 /// key that never leaves this process. It proves the host that started the
@@ -4873,6 +5313,31 @@ fn require_resource_scopes(
     Ok(parameters.try_into()?)
 }
 
+/// `descriptor` bound to the host-registered client profile whose meaning is
+/// `binding`: the attempt's completion then uses exactly that profile, and
+/// its stable context (and so the credential's) names it. Every other fact
+/// is unchanged.
+fn bind_client_profile(
+    descriptor: ConnectorOAuthDescriptor,
+    binding: &str,
+) -> Result<ConnectorOAuthDescriptor, McpOAuthError> {
+    let mut parameters = crate::connector_oauth::ConnectorOAuthParameters::from(descriptor);
+    parameters.client_auth_profile = Some(binding.to_owned());
+    Ok(parameters.try_into()?)
+}
+
+/// The meaning of the host-registered client profile an admitted attempt is
+/// bound to, if it is bound to one ([`bind_client_profile`]). A value of
+/// another form is not an MCP client profile and binds nothing.
+fn attempt_client_profile(
+    facts: &crate::connector_oauth::ConnectorOAuthParameters,
+) -> Option<&str> {
+    facts
+        .client_auth_profile
+        .as_deref()
+        .filter(|binding| client_profile::is_client_profile_binding(binding))
+}
+
 /// Whether `admitted` is `strategy` plus resource scopes: the descriptor
 /// [`require_resource_scopes`] admitted for this strategy. Completion cannot
 /// re-derive the resource scopes (it fetches no resource metadata), so the
@@ -4912,7 +5377,10 @@ fn authorize_endpoints(
 
 /// Whether a pending connector attempt belongs to `target`: its descriptor
 /// names the target's resource and an account selection of the target's
-/// mode.
+/// mode. An attempt bound to a host-registered client profile may name the
+/// resource its profile accepts instead: the server URL's origin or a path
+/// above it (the profile's own resource is checked at its admission and at
+/// its completion).
 fn pending_attempt_matches(
     target: &McpServerIdentity,
     record: &crate::oauth_flow::OAuthFlowRecord,
@@ -4921,7 +5389,10 @@ fn pending_attempt_matches(
         return false;
     };
     let facts = connector.parameters();
-    if facts.resource != target.server_url() {
+    let resource_fits = facts.resource == target.server_url()
+        || (attempt_client_profile(facts).is_some()
+            && client_profile::resource_covers_server(&facts.resource, target.server_url()));
+    if !resource_fits {
         return false;
     }
     let unverified = facts.expected_account.is_unverified()
@@ -5325,6 +5796,31 @@ pub(crate) fn is_loopback_url(url: &reqwest::Url) -> bool {
     )
 }
 
+/// Refuse a token endpoint a host-registered client's secret would be sent
+/// to unless it fits the client's `issuer`. Under an `https` issuer the
+/// endpoint must use `https` as well, with no loopback exception: a plaintext
+/// loopback endpoint would hand the secret to whatever local process holds
+/// the port. Only a plain `http` loopback issuer, a local authorization
+/// server, keeps loopback endpoints ([`require_https_or_loopback`]).
+fn require_client_secret_endpoint(
+    target: &McpServerIdentity,
+    issuer: &str,
+    token_endpoint: &str,
+) -> Result<(), McpOAuthError> {
+    require_https_or_loopback(target, token_endpoint, "token endpoint")?;
+    let https_endpoint =
+        reqwest::Url::parse(token_endpoint).is_ok_and(|url| url.scheme() == "https");
+    let local_issuer = reqwest::Url::parse(issuer)
+        .is_ok_and(|url| url.scheme() == "http" && is_loopback_url(&url));
+    if https_endpoint || local_issuer {
+        return Ok(());
+    }
+    Err(McpOAuthError::DiscoveryFailed {
+        server_name: target.server_name().to_string(),
+        reason: "token endpoint must use https under an https issuer".to_string(),
+    })
+}
+
 #[derive(Debug, Deserialize)]
 struct ProtectedResourceMetadata {
     resource: String,
@@ -5363,7 +5859,10 @@ struct StoredMcpOAuthDiscovery {
     authorization_metadata_url: String,
     authorization_endpoint: String,
     token_endpoint: String,
-    registration_endpoint: String,
+    /// Absent for a credential of a host-registered client: no dynamic
+    /// registration was needed or used for it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    registration_endpoint: Option<String>,
     scopes: Vec<String>,
 }
 
@@ -5375,6 +5874,11 @@ struct StoredMcpOAuthClient {
     client_secret: Option<String>,
     token_endpoint_auth_method: String,
     redirect_uri: String,
+    /// The canonical meaning of the host-registered client profile the
+    /// credential was minted under; absent for a dynamically registered
+    /// client. Its refresh authenticates only as that exact profile.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_profile: Option<String>,
 }
 
 impl std::fmt::Debug for StoredMcpOAuthClient {
@@ -5390,6 +5894,7 @@ impl std::fmt::Debug for StoredMcpOAuthClient {
                 &self.token_endpoint_auth_method,
             )
             .field("redirect_uri", &self.redirect_uri)
+            .field("client_profile", &self.client_profile)
             .finish()
     }
 }
@@ -5442,6 +5947,7 @@ mod tests {
             client_secret: Some(SECRET.into()),
             token_endpoint_auth_method: "client_secret_post".into(),
             redirect_uri: "http://127.0.0.1:1/callback".into(),
+            client_profile: None,
         };
         let rendered = format!("{client:?} {client:#?}");
         assert!(!rendered.contains(SECRET), "secret leaked: {rendered}");
@@ -5811,7 +6317,7 @@ mod tests {
             authorization_metadata_url: format!("{base}/.well-known/oauth-authorization-server"),
             authorization_endpoint: format!("{base}/authorize"),
             token_endpoint: format!("{base}/token"),
-            registration_endpoint: format!("{base}/register"),
+            registration_endpoint: Some(format!("{base}/register")),
             scopes: vec!["mcp.read".to_string()],
         };
         let client = StoredMcpOAuthClient {
@@ -5819,6 +6325,7 @@ mod tests {
             client_secret: None,
             token_endpoint_auth_method: "none".to_string(),
             redirect_uri: format!("{base}/mcp/oauth/callback"),
+            client_profile: None,
         };
         let result = OAuthTokenResult {
             access_token: "access-token".to_string(),
@@ -6952,6 +7459,150 @@ mod tests {
         assert_eq!(state.token_requests.lock().len(), 1);
     }
 
+    /// Under an https issuer a host-registered client's secret goes only to
+    /// an https token endpoint. Metadata naming a plaintext loopback token
+    /// endpoint is refused at discovery, typed; a credential minted under
+    /// the profile whose stored token endpoint is such an endpoint is closed
+    /// at its refresh as needing a new login, and nothing reaches that
+    /// endpoint. A plain http loopback issuer keeps loopback endpoints, and a
+    /// dynamically registered (public) client keeps them as before.
+    #[cfg(feature = "workspace-tests")]
+    #[tokio::test]
+    async fn an_https_issuer_never_sends_the_client_secret_to_a_plaintext_endpoint() {
+        struct AdmitAll;
+        impl meerkat_core::AdministrationEntry for AdmitAll {
+            fn enter(
+                &self,
+            ) -> Result<meerkat_core::EnteredAdministration, meerkat_core::AdministrationEntryRefusal>
+            {
+                Ok(meerkat_core::EnteredAdministration::admitted())
+            }
+        }
+        const ISSUER: &str = "https://as.example.test";
+        let (base, state) = spawn_oauth_fixture().await;
+        let port = reqwest::Url::parse(&base).unwrap().port().unwrap();
+        // The fixture's token endpoint, as plaintext loopback.
+        let plaintext = format!("http://localhost:{port}/token");
+        let target = McpServerIdentity::from_server_config("fixed-https", format!("{base}/mcp"))
+            .with_expected_account("subject-1")
+            .unwrap();
+
+        // Discovery: the token endpoint the issuer's metadata names.
+        for (issuer, endpoint) in [
+            (ISSUER, plaintext.as_str()),
+            (ISSUER, "http://127.0.0.1:8443/token"),
+            ("https://localhost:8443", "http://localhost:8443/token"),
+            ("http://127.0.0.1:8443", "http://as.example.test/token"),
+        ] {
+            let refused = require_client_secret_endpoint(&target, issuer, endpoint);
+            assert!(
+                matches!(
+                    &refused,
+                    Err(McpOAuthError::DiscoveryFailed { reason, .. }) if reason.contains("must use https")
+                ),
+                "{issuer} {endpoint}: {refused:?}"
+            );
+        }
+        for (issuer, endpoint) in [
+            (ISSUER, "https://as.example.test/token"),
+            ("http://127.0.0.1:8443", "http://127.0.0.1:8443/token"),
+            ("http://localhost:8443", "https://as.example.test/token"),
+        ] {
+            require_client_secret_endpoint(&target, issuer, endpoint)
+                .unwrap_or_else(|error| panic!("{issuer} {endpoint}: {error:?}"));
+        }
+        require_https_or_loopback(&target, &plaintext, "token endpoint")
+            .expect("a public client sends no secret: loopback stays allowed");
+
+        // Refresh: the stored token endpoint of a credential minted under the
+        // profile.
+        let store = Arc::new(EphemeralTokenStore::new());
+        let authority = ce_refresh_authority(store.clone(), test_auth_lease());
+        authority
+            .install_client_profile_entered(
+                &target,
+                McpOAuthClientProfile::new(
+                    ISSUER,
+                    "registered-client",
+                    "http://127.0.0.1:3118/callback",
+                    McpOAuthClientAuthMethod::ClientSecretPost,
+                    McpOAuthClientSecret::new("client-secret-canary"),
+                ),
+                None,
+                Arc::new(AdmitAll),
+            )
+            .await
+            .unwrap();
+        let profile = load_client_profile(store.as_ref(), &target, TokenStoreAccess::Unattended)
+            .await
+            .unwrap()
+            .expect("the profile is installed");
+        let discovery = StoredMcpOAuthDiscovery {
+            resource: target.server_url().to_string(),
+            resource_metadata_url: format!("{base}/.well-known/oauth-protected-resource/mcp"),
+            authorization_server: ISSUER.to_string(),
+            authorization_metadata_url: format!("{ISSUER}/.well-known/oauth-authorization-server"),
+            authorization_endpoint: format!("{ISSUER}/authorize"),
+            token_endpoint: plaintext,
+            registration_endpoint: None,
+            scopes: vec!["mcp.read".to_string()],
+        };
+        let result = OAuthTokenResult {
+            access_token: "access-token".to_string(),
+            refresh_token: Some("refresh-token".to_string()),
+            id_token: None,
+            expires_in_secs: Some(3600),
+            scope: Some("mcp.read".to_string()),
+        };
+        let mut tokens = persisted_tokens_from_result_with_binding(
+            &result,
+            &discovery,
+            &profile.stored_client(),
+            &target,
+            None,
+            Utc::now(),
+        )
+        .unwrap();
+        tokens.account_id = Some("subject-1".to_string());
+        crate::save_tokens_and_publish_lifecycle(
+            authority.provider_auth_persistence.clone(),
+            authority.auth_lease.clone(),
+            target.auth_binding_ref().unwrap().into(),
+            tokens,
+        )
+        .await
+        .unwrap();
+        republish_stored_tokens(&authority, store.as_ref(), &target, |tokens| {
+            tokens.expires_at = Some(Utc::now() - chrono::Duration::seconds(1));
+        })
+        .await;
+
+        let refused = authority.stored_bearer_token(&target).await;
+        assert!(
+            matches!(refused, Err(McpOAuthError::ReauthRequired { .. })),
+            "{refused:?}"
+        );
+        assert!(
+            state.token_requests.lock().is_empty(),
+            "nothing reached the plaintext token endpoint"
+        );
+        assert_eq!(
+            authority
+                .auth_lease
+                .snapshot(&target.lease_key().unwrap())
+                .phase,
+            Some(meerkat_core::handles::AuthLeasePhase::ReauthRequired)
+        );
+        assert!(
+            store
+                .load(&target.token_key().unwrap())
+                .await
+                .unwrap()
+                .is_none(),
+            "the credential is closed for a new login"
+        );
+    }
+
     /// Discovery is admitted URL by URL: a protected resource outside the
     /// profile is refused typed before any well-known request is sent.
     #[cfg(feature = "workspace-tests")]
@@ -6984,6 +7635,7 @@ mod tests {
                 &target,
                 None,
                 tokio::time::Instant::now() + MCP_OAUTH_START_BOUND,
+                None,
             )
             .await;
         assert!(

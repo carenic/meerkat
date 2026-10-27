@@ -1619,12 +1619,13 @@ pub async fn handle_auth_login_start(
                 Err(response) => return response,
             };
             // The registered path, when this host serves a registered
-            // redirect base and the request names it or this target's
-            // derived redirect, byte for byte. Any other redirect takes the
+            // redirect base and the request names it or the redirect this
+            // target's registered login uses (its derived redirect, or its
+            // client profile's), byte for byte. Any other redirect takes the
             // loopback admission, which refuses a non-loopback one as before.
-            let registered = match service.mcp_registered_redirect_uri(&target) {
-                Ok(Some(derived)) => {
-                    parsed.redirect_uri == derived
+            let registered = match service.mcp_registered_redirect_uri(&target).await {
+                Ok(Some(registered_redirect)) => {
+                    parsed.redirect_uri == registered_redirect
                         || service
                             .mcp_registered_redirect_base()
                             .is_some_and(|base| base.as_str() == parsed.redirect_uri)

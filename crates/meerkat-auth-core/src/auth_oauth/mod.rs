@@ -33,7 +33,9 @@ pub use device_code::{
 pub use pkce::{PkceChallenge, PkcePair};
 #[cfg(feature = "oauth")]
 pub use token_exchange::{
-    exchange_authorization_code, exchange_authorization_code_with_state, exchange_refresh_token,
+    OAuthClientAuthentication, exchange_authorization_code,
+    exchange_authorization_code_with_client_auth, exchange_authorization_code_with_state,
+    exchange_refresh_token, exchange_refresh_token_with_client_auth,
 };
 
 use meerkat_core::auth::{RefreshError, RefreshFailureObservation};

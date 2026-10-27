@@ -142,6 +142,7 @@ impl TokenStore for FileTokenStore {
                 if let Some(key) = TokenKey::connector_client_secret_from_stem(&realm, stem)
                     .or_else(|| TokenKey::mcp_attachment_identity_key_from_stem(&realm, stem))
                     .or_else(|| TokenKey::mcp_service_secret_from_stem(&realm, stem))
+                    .or_else(|| TokenKey::mcp_oauth_client_from_stem(&realm, stem))
                 {
                     out.push(key);
                     continue;
@@ -327,6 +328,41 @@ mod tests {
         let listed = store.list().await.unwrap();
         assert!(listed.contains(&secret_key));
         assert!(listed.contains(&legacy));
+    }
+
+    #[tokio::test]
+    async fn mcp_oauth_client_round_trips_and_lists_beside_its_slot_credential() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileTokenStore::new(dir.path());
+        let realm = RealmId::parse("mcp-oauth").unwrap();
+        let binding = BindingId::parse("remote-AbC123dEf456GhI7").unwrap();
+        let client_key = TokenKey::mcp_oauth_client(realm.clone(), binding.clone());
+        let credential_key = TokenKey::new(realm, binding);
+        store
+            .save(&client_key, &token("client-secret"))
+            .await
+            .unwrap();
+        store.save(&credential_key, &token("access")).await.unwrap();
+        assert_eq!(
+            store
+                .load(&client_key)
+                .await
+                .unwrap()
+                .and_then(|tokens| tokens.primary_secret),
+            Some("client-secret".to_string())
+        );
+        assert_eq!(
+            store
+                .load(&credential_key)
+                .await
+                .unwrap()
+                .and_then(|tokens| tokens.primary_secret),
+            Some("access".to_string())
+        );
+        let listed = store.list().await.unwrap();
+        assert!(listed.contains(&client_key));
+        assert!(listed.contains(&credential_key));
+        assert_eq!(listed.len(), 2);
     }
 
     // RCT-17: an inherited binding (owner = the defining realm, stamped by the
