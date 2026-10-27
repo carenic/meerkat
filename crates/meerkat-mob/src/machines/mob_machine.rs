@@ -29,10 +29,11 @@ pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
 pub use meerkat_machine_schema::catalog::dsl::mob_machine::{
     BootMaterializationKind, CompositionAuthorityKind, MemberBootObligationCause,
     MemberMaterializationLossCause, MemberMaterializationPhase,
-    MemberMaterializationReleaseOutcome, MemberRecoveryObligationKind, MemberRestorePolicyKind,
-    MemberWakeAbandonCause, MemberWakeAbandonKind, MemberWakeCause, MemberWakeFeedbackVerdict,
-    MemberWakeRefusalKind, MemberWakeRetryableKind, MemberWakeVerdictKind, PeerInputClass,
-    PeerNoticeDisposition, PeerTransportKind, RuntimeEpochId,
+    MemberMaterializationReleaseOutcome, MemberRecoveryObligationKind, MemberReleaseVerdict,
+    MemberRestorePolicyKind, MemberWakeAbandonCause, MemberWakeAbandonKind, MemberWakeCause,
+    MemberWakeFeedbackVerdict, MemberWakeRefusalKind, MemberWakeRetryableKind,
+    MemberWakeVerdictKind, PeerInputClass, PeerNoticeDisposition, PeerTransportKind,
+    RuntimeEpochId,
 };
 
 pub type MobToolCallerProvenance = meerkat_core::service::MobToolCallerProvenance;
@@ -10322,6 +10323,7 @@ mod tests {
             runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
             external_addressable: false,
             kickoff_owed: false,
+            kickoff_objective_id: String::new(),
         };
         let mut undestroyed = MobMachineAuthority::recover_from_state(authority.state().clone())
             .expect("the in-flight rotation recovers");
@@ -10431,10 +10433,11 @@ mod tests {
         assert_eq!(trust_effects(&live_wired), 1);
     }
 
-    /// A local wake closes Live only with a registered endpoint, so a Live
-    /// member is always reachable and its registration release is honoured.
+    /// A wake owed an endpoint (EndpointPending: a member with comms whose
+    /// endpoint arrives with its first wake) closes Live only once the endpoint
+    /// is registered, so a member with comms is reachable when Live.
     #[test]
-    fn a_local_wake_closes_live_only_with_a_registered_endpoint() {
+    fn a_wake_owed_an_endpoint_closes_live_only_once_it_is_registered() {
         let identity = AgentIdentity::from("endpointless-wake");
         let runtime_id = AgentRuntimeId::from("endpointless-wake:0");
         let mut seeded = MobMachineAuthority::new();
@@ -10445,13 +10448,25 @@ mod tests {
             &runtime_id,
         ))
         .expect("a replay-shaped Dormant member recovers");
-        MobMachineMutator::apply(&mut authority, wake_input(&identity))
-            .expect("the Dormant member wakes");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::PlanBootMaterialization {
+                agent_identity: identity.clone(),
+                obligation: MemberRecoveryObligationKind::None,
+                host_required: false,
+                orchestrator_notified: false,
+            },
+        )
+        .expect("the boot plan wakes a member with no durable endpoint");
+        assert_eq!(
+            authority.state().member_boot_obligation_owed.get(&identity),
+            Some(&MemberBootObligationCause::EndpointPending)
+        );
         let attempt = *authority
             .state()
             .member_wake_attempts
             .get(&identity)
-            .expect("the wake opened an attempt");
+            .expect("the boot wake opened an attempt");
         authority
             .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
                 agent_identity: identity.clone(),
@@ -10464,7 +10479,7 @@ mod tests {
         };
         assert!(
             authority.apply_signal(succeeded.clone()).is_err(),
-            "a wake without a registered endpoint does not close Live"
+            "a wake owed an endpoint does not close Live without it"
         );
         assert_eq!(
             authority.state().member_materialization.get(&identity),
@@ -10478,6 +10493,247 @@ mod tests {
             authority.state().member_materialization.get(&identity),
             Some(&MemberMaterializationPhase::Live)
         );
+    }
+
+    /// A member that owes no endpoint (it carries no EndpointPending, so it
+    /// has no comms endpoint to register) wakes and closes Live without one.
+    #[test]
+    fn a_wake_that_owes_no_endpoint_closes_live_without_one() {
+        let identity = AgentIdentity::from("comms-less-wake");
+        let runtime_id = AgentRuntimeId::from("comms-less-wake:0");
+        let mut seeded = MobMachineAuthority::new();
+        seed_live_member(&mut seeded, &identity, &runtime_id);
+        let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            seeded.state().clone(),
+            &identity,
+            &runtime_id,
+        ))
+        .expect("a replay-shaped Dormant member recovers");
+        MobMachineMutator::apply(&mut authority, wake_input(&identity))
+            .expect("the Dormant member wakes");
+        assert!(
+            !authority
+                .state()
+                .member_boot_obligation_owed
+                .contains_key(&identity),
+            "an operator wake owes no endpoint"
+        );
+        let attempt = *authority
+            .state()
+            .member_wake_attempts
+            .get(&identity)
+            .expect("the wake opened an attempt");
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: identity.clone(),
+                attempt,
+            })
+            .expect("the wake's Bound step applies");
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
+                agent_identity: identity.clone(),
+                attempt,
+            })
+            .expect("a wake that owes no endpoint closes Live without one");
+        assert_eq!(
+            authority.state().member_materialization.get(&identity),
+            Some(&MemberMaterializationPhase::Live)
+        );
+        assert!(
+            !authority
+                .state()
+                .member_peer_endpoints
+                .contains_key(&identity)
+        );
+    }
+
+    /// The boot plan owes EndpointPending to a member it leaves Dormant with no
+    /// durable endpoint (here a pending host preparation holds it), so the seal
+    /// admits the member instead of refusing the whole start.
+    #[test]
+    fn the_seal_admits_a_member_left_dormant_without_an_endpoint() {
+        let identity = AgentIdentity::from("host-pending-member");
+        let runtime_id = AgentRuntimeId::from("host-pending-member:0");
+        let mut seeded = MobMachineAuthority::new();
+        seed_live_member(&mut seeded, &identity, &runtime_id);
+        let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            seeded.state().clone(),
+            &identity,
+            &runtime_id,
+        ))
+        .expect("a replay-shaped Dormant member recovers");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::SeedMemberResidency {
+                policy: MemberRestorePolicyKind::OnDemand,
+                composition_authority: CompositionAuthorityKind::Authoritative,
+                host_pending: std::collections::BTreeSet::from([identity.clone()]),
+            },
+        )
+        .expect("the host marks the identity's preparation pending");
+        let planned = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::PlanBootMaterialization {
+                agent_identity: identity.clone(),
+                obligation: MemberRecoveryObligationKind::None,
+                host_required: false,
+                orchestrator_notified: false,
+            },
+        )
+        .expect("the boot plan answers for a host-pending member");
+        assert!(planned.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::BootMaterializationPlanned {
+                verdict: BootMaterializationKind::StayDormant,
+                ..
+            }
+        )));
+        assert_eq!(
+            authority.state().member_materialization.get(&identity),
+            Some(&MemberMaterializationPhase::Dormant)
+        );
+        assert_eq!(
+            authority.state().member_boot_obligation_owed.get(&identity),
+            Some(&MemberBootObligationCause::EndpointPending)
+        );
+        MobMachineMutator::apply(&mut authority, MobMachineInput::SealBootMaterializationPlan)
+            .expect("the seal admits a member left Dormant without an endpoint");
+        assert!(authority.state().boot_plan_sealed);
+    }
+
+    /// The release verdict answers from the member's phase: a local Live member
+    /// releases, a Waking one has a wake in flight, a Dormant one has nothing
+    /// materialized, and an identity that is not seated is not a member.
+    #[test]
+    fn the_release_verdict_answers_from_the_member_phase() {
+        let verdict = |authority: &mut MobMachineAuthority, identity: &AgentIdentity| {
+            let transition = MobMachineMutator::apply(
+                authority,
+                MobMachineInput::ClassifyMemberRelease {
+                    agent_identity: identity.clone(),
+                },
+            )
+            .expect("the release verdict answers in every phase");
+            transition
+                .effects()
+                .iter()
+                .find_map(|effect| match effect {
+                    MobMachineEffect::MemberReleaseClassified {
+                        agent_identity,
+                        verdict,
+                    } if agent_identity == identity => Some(*verdict),
+                    _ => None,
+                })
+                .expect("the verdict is emitted")
+        };
+        let identity = AgentIdentity::from("release-verdict");
+        let runtime_id = AgentRuntimeId::from("release-verdict:0");
+        let mut live = MobMachineAuthority::new();
+        seed_live_member(&mut live, &identity, &runtime_id);
+        assert_eq!(verdict(&mut live, &identity), MemberReleaseVerdict::Release);
+        assert_eq!(
+            verdict(&mut live, &AgentIdentity::from("never-seated")),
+            MemberReleaseVerdict::NotAMember
+        );
+        let mut dormant = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            live.state().clone(),
+            &identity,
+            &runtime_id,
+        ))
+        .expect("a replay-shaped Dormant member recovers");
+        assert_eq!(
+            verdict(&mut dormant, &identity),
+            MemberReleaseVerdict::NothingMaterialized
+        );
+        MobMachineMutator::apply(&mut dormant, wake_input(&identity))
+            .expect("the Dormant member wakes");
+        assert_eq!(
+            verdict(&mut dormant, &identity),
+            MemberReleaseVerdict::WakeInFlight
+        );
+    }
+
+    /// A rotation whose spec owes a kickoff re-seats the next incarnation with
+    /// the kickoff recorded pending, so the kickoff is not lost across the
+    /// rotation (a fresh seat still refuses one).
+    #[test]
+    fn a_rotation_that_owes_a_kickoff_records_it_pending() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "kickoff-rotation", 35);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "kickoff-rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the rotation's retirement starts");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: SessionId::from("kickoff-rotation-next"),
+                peer_endpoint: None,
+                session_archived: false,
+            },
+        )
+        .expect("the rotation records its intent");
+        close_ingress_detach(&mut authority, &member);
+        let committed = MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::CommitMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: Some(member.session_id.clone()),
+                disposal: MemberSessionDisposal::Archived,
+                next_agent_runtime_id: AgentRuntimeId::from("kickoff-rotation:1"),
+                next_fence_token: FenceToken(8),
+                next_generation: Generation(1),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: false,
+                kickoff_owed: true,
+                kickoff_objective_id: "rotation-objective".to_string(),
+            },
+        )
+        .expect("a rotation that owes a kickoff re-seats with the kickoff pending");
+        let state = authority.state();
+        assert_eq!(
+            state.member_materialization.get(&member.identity),
+            Some(&MemberMaterializationPhase::Dormant)
+        );
+        assert!(state.member_kickoff_pending.contains(&member.identity));
+        assert_eq!(
+            state
+                .member_kickoff_objective_ids
+                .get(&member.identity)
+                .map(String::as_str),
+            Some("rotation-objective")
+        );
+        assert!(committed.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::PersistKickoffUpdate {
+                member_id,
+                phase: KickoffPhase::Pending,
+            } if member_id == &member.identity
+        )));
     }
 
     /// R13: a seat owes no kickoff. A spec that owes one spawns

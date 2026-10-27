@@ -18,7 +18,7 @@
 \*     and Stopped, the runtime-ready observation with and without an epoch,
 \*     three release shapes (the recorded epoch, another epoch, no epoch), the
 \*     drift and terminal classifications, the peer notice classification,
-\*     the replayed restore failures, Stop and Resume.
+\*     the replayed restore failures, the release verdict, Stop and Resume.
 \*   retire (AuditRetireSpec): one identity woken, released and retired: the
 \*     routed and the archive-only retirement starts (R27), the routed retire
 \*     retry, the runtime retire observation, the session ingress detach, the
@@ -28,8 +28,9 @@
 \*     and archive arms and DestroyMob (R124).
 \*   terminal (AuditTerminalSpec): one identity in the Completed and
 \*     Destroyed phases: Complete, MarkCompleted, the destroy, Shutdown, the
-\*     late feedback, the release, the wake refusal and the notice
-\*     classification there, and the replayed Retired record.
+\*     late feedback, the release, the wake refusal, the notice
+\*     classification and the release verdict there, and the replayed Retired
+\*     record.
 \*   resume (AuditResumeSpec): one identity through an explicit resume: Stop,
 \*     the resume's preparation and Resume, the three member reservation arms
 \*     (Dormant, Live, Join), the live classification, the settle arms
@@ -69,10 +70,14 @@
 \* Per run also:
 \*   AP1 (action property): no recovery or seat arm overwrites an existing
 \*     residency phase (seed, wake, resume, edge, seat, terminal);
+\*   seed: AuditPlanLeavesSealable (after its boot plan a member has a durable
+\*     endpoint or owes EndpointPending, so the seal never refuses it);
 \*   wake: AuditLifecycleNeverWakes (AP3), AuditWakeNeverSkipsWaking,
 \*     AuditWakeExactlyOne (exactly one WakeMember arm answers every input
-\*     shape), AuditSucceededLeavesEndpoint (a local wake closes Live only
-\*     with a registered endpoint) and AuditReleaseEpochFence (a release
+\*     shape), AuditSucceededLeavesEndpoint (a local wake never closes Live
+\*     without an endpoint while it owes EndpointPending),
+\*     AuditWakeClosesLiveUnlessEndpointOwed (a bound wake that owes no
+\*     endpoint can always close Live) and AuditReleaseEpochFence (a release
 \*     whose epoch is not the member's recorded one never demotes it);
 \*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
 \*     for a member with no registration), AuditRetirementArchivable (R124: a
@@ -85,7 +90,8 @@
 \*     runtime binding).
 \* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
-\* member.
+\* member. A second ASSUME pins the release verdict helper: Release exactly for
+\* a seated, local, Live member, WakeInFlight exactly for a Waking one.
 \*
 \* Not covered: I3 (a Dormant member is local) needs a placed member, which
 \* only the placement arms create; the placed revival arm likewise. The machine
@@ -116,6 +122,7 @@ AuditReason == "reason_1"
 AuditCode == "code_1"
 AuditDisposal == "Archived"
 AuditResumeAttempt == "resumeattemptid_1"
+AuditObjective == "objective_1"
 Epoch1 == Some("runtimeepochid_1")
 Epoch2 == Some("runtimeepochid_2")
 AuditEpochs == {None, Epoch1}
@@ -274,6 +281,11 @@ AuditNotice(id) ==
         \/ ClassifyPeerNoticeRunning(id, id, ic)
         \/ ClassifyPeerNoticeStopped(id, id, ic)
 
+\* The release verdict for one member in the Running and Stopped phases.
+AuditReleaseVerdict(id) ==
+    \/ ClassifyMemberReleaseRunning(id)
+    \/ ClassifyMemberReleaseStopped(id)
+
 AuditClassify(id) ==
     \E obs \in {"DurableSnapshotPresent", "DurableSnapshotMissing"} :
         \/ ClassifyMemberLiveMaterializationRevivable(id, obs, AuditReason)
@@ -358,6 +370,7 @@ AuditWakeNext ==
     \/ WRelease
     \/ AuditClassify(Id1)
     \/ AuditNotice(Id1)
+    \/ AuditReleaseVerdict(Id1)
     \/ AuditQuiesceStop
     \/ StopRunning
     \/ ResumeStopped
@@ -417,10 +430,10 @@ RAuthorize ==
     AuthorizeSpawnProfileRunning(Id1, AuditProfile, AuditModel, AuditDigest, AuditDigest, AuditDigest, None, None, FALSE, None)
 RBeginRotation == BeginMemberRotationRunning(Id1, Rid1, 1, 0, Sess3, None, FALSE)
 RCommitRotation ==
-    \/ CommitMemberRotationLiveRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
-    \/ CommitMemberRotationRetiredRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
-    \/ CommitMemberRotationLiveStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
-    \/ CommitMemberRotationRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
+    \/ CommitMemberRotationLiveRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
+    \/ CommitMemberRotationRetiredRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
+    \/ CommitMemberRotationLiveStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
+    \/ CommitMemberRotationRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
 RotationArms == RBeginRotation \/ RCommitRotation
 
 \* The host marks member 1's preparation pending at build (a rotation lost in
@@ -490,6 +503,8 @@ AuditTerminalNext ==
     \/ WReadyEpoch1
     \/ TRelease
     \/ TNotice
+    \/ ClassifyMemberReleaseCompleted(Id1)
+    \/ ClassifyMemberReleaseDestroyed(Id1)
     \/ AuditStaleFeedbackTerminal(Id1, Rid1, 1, 0, Sess1)
     \/ AuditQuiesceComplete
     \/ CompleteRunning
@@ -647,8 +662,8 @@ SBeginRotation ==
 SRuntimeRetired == ObserveRuntimeRetired(Rid1, 1)
 SDetach == SessionIngressDetachedForMobDestroyRunning(AuditMob, Rid1)
 SCommitRotation ==
-    \/ CommitMemberRotationLiveRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
-    \/ CommitMemberRotationRetiredRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
+    \/ CommitMemberRotationLiveRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
+    \/ CommitMemberRotationRetiredRunning(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
 
 SRecoverArms == SSeat \/ SCommitRotation
 
@@ -814,10 +829,36 @@ AuditWakeExactlyOne ==
     \A s \in AuditWakeShapes :
         Cardinality({i \in 1..7 : AuditWakeVerdicts(Id1, s)[i]}) = 1
 
-\* A local wake closes Live only with a registered endpoint.
+\* Member 1 owes EndpointPending (before a step).
+Owed1EndpointPending ==
+    /\ Id1 \in DOMAIN member_boot_obligation_owed
+    /\ member_boot_obligation_owed[Id1] = "EndpointPending"
+
+\* A local wake never closes Live without an endpoint while its member owes
+\* EndpointPending, so a member with comms is reachable when Live.
 AuditSucceededLeavesEndpoint ==
     [][(\E a \in AuditAttempts : ResolveMemberRevivalSucceededRunningLocal(Id1, a))
-           => Id1 \in DOMAIN member_peer_endpoints'
+           => (Id1 \in DOMAIN member_peer_endpoints' \/ ~Owed1EndpointPending)
+      ]_vars
+
+\* A bound local wake of a member that owes no endpoint can always close Live:
+\* a member with no comms endpoint is never held Waking for one.
+AuditWakeClosesLiveUnlessEndpointOwed ==
+    \A id \in DOMAIN member_wake_attempts :
+        (/\ phase = "Running"
+         /\ id \in member_wake_bound
+         /\ id \notin DOMAIN member_placement
+         /\ ~(/\ id \in DOMAIN member_boot_obligation_owed
+              /\ member_boot_obligation_owed[id] = "EndpointPending"))
+            => ENABLED ResolveMemberRevivalSucceededRunningLocal(id, member_wake_attempts[id])
+
+\* The boot plan never leaves a member that blocks the seal: after its plan a
+\* member has a durable endpoint or owes EndpointPending.
+AuditPlanLeavesSealable ==
+    [][AuditPlan(Id1)
+           => \/ Id1 \in DOMAIN member_peer_endpoints'
+              \/ /\ Id1 \in DOMAIN member_boot_obligation_owed'
+                 /\ member_boot_obligation_owed'[Id1] = "EndpointPending"
       ]_vars
 
 \* A release whose epoch is not member 1's recorded epoch leaves its phase
@@ -881,6 +922,15 @@ ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, or
                             host_pending, input_class, sender_waking, observed_missing, residency)
             # Some("NotAMember")
 
+\* The release verdict: Release exactly for a seated, local, Live member, and
+\* WakeInFlight exactly for a seated, local, Waking one.
+ASSUME \A seated, placed \in BOOLEAN,
+          residency \in {None, Some("Dormant"), Some("Waking"), Some("Live")} :
+    /\ (member_release_verdict(seated, placed, residency) = "Release")
+           <=> (seated /\ ~placed /\ residency = Some("Live"))
+    /\ (member_release_verdict(seated, placed, residency) = "WakeInFlight")
+           <=> (seated /\ ~placed /\ residency = Some("Waking"))
+
 (***************************************************************************)
 (* Reachability goals, each checked as an expected violation of its       *)
 (* negation: a state goal as an invariant, a step goal as an action        *)
@@ -912,6 +962,11 @@ AuditWitnessStaleInStopped ==
 AuditWitnessDrift == member_materialization_drift_count > 0
 \* Wake run: a wake verdict records Broken.
 AuditWitnessBrokenWake == Id1 \in DOMAIN member_restore_failures /\ Id1 \in DOMAIN identity_to_runtime
+\* Wake run: a member that owes no endpoint wakes and closes Live without one.
+AuditWitnessCommsLessWokeLiveStep ==
+    /\ Phase1 = Some("Waking")
+    /\ Phase1Next = Some("Live")
+    /\ Id1 \notin DOMAIN member_peer_endpoints'
 
 \* Retire run: a retirement start closes an open attempt (archive-only).
 AuditWitnessRetireClosesStep ==
@@ -936,8 +991,8 @@ AuditWitnessDestroyBeatsHostPendingStep ==
     /\ PlainArchives
 \* Retire run: a Stop that landed mid-rotation lets the terminal finish it.
 AuditWitnessRotatedStoppedStep ==
-    \/ CommitMemberRotationLiveStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
-    \/ CommitMemberRotationRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE)
+    \/ CommitMemberRotationLiveStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
+    \/ CommitMemberRotationRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, Rid3, 3, 1, AuditMode, FALSE, FALSE, AuditObjective)
 
 \* Resume run: an explicit resume joins a wake already in flight.
 AuditWitnessResumeJoinsStep == AuthorizeExplicitResumeMemberJoinRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
@@ -993,6 +1048,7 @@ NotAuditWitnessStopCloses == [][~AuditWitnessStopClosesStep]_vars
 NotAuditWitnessStaleInStopped == ~AuditWitnessStaleInStopped
 NotAuditWitnessDrift == ~AuditWitnessDrift
 NotAuditWitnessBrokenWake == ~AuditWitnessBrokenWake
+NotAuditWitnessCommsLessWokeLive == [][~AuditWitnessCommsLessWokeLiveStep]_vars
 NotAuditWitnessRetireCloses == [][~AuditWitnessRetireClosesStep]_vars
 NotAuditWitnessArchiveOnlyArchived == [][~AuditWitnessArchiveOnlyArchivedStep]_vars
 NotAuditWitnessDestroyBeatsRotation == [][~AuditWitnessDestroyBeatsRotationStep]_vars

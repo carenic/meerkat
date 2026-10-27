@@ -19,7 +19,8 @@
 #   plan and seal, every WakeMember arm for six input shapes, every
 #   attempt-fenced resolution, the late feedback in Running and Stopped, the
 #   runtime-ready observation, three release shapes, the drift and terminal
-#   classifications, the peer notice classification, Stop and Resume;
+#   classifications, the peer notice classification, the release verdict,
+#   Stop and Resume;
 # - retire (AuditRetireSpec): one identity woken, released and retired, the
 #   routed and archive-only retirement starts, the routed retire retry, the
 #   archives, the replayed starts, a rotation finished in Running and in
@@ -37,14 +38,16 @@
 # and, where the run has recovery or seat arms, AP1 (no such arm overwrites a
 # phase). The wake run also checks AP3 (a Lifecycle input never wakes, a
 # notice classification never changes residency), that exactly one WakeMember
-# arm answers every input shape, that a local wake closes Live only with an
-# endpoint and that a release of another epoch never demotes. The
+# arm answers every input shape, that a local wake never closes Live without
+# an endpoint while it owes EndpointPending and can always close Live when it
+# owes none, and that a release of another epoch never demotes. The seed run
+# checks that the boot plan never leaves a member that blocks the seal. The
 # retire run checks that no runtime retire is routed for a member with no
 # registration (R27), that a settled retirement can always archive and under
 # an admitted destroy nothing holds it (R124), and that no rotation begins or
 # commits under an admitted destroy (R124). TLC evaluates the module's I5
 # ASSUME (a present, bound member with a phase is never refused as not a
-# member) at the start of every run.
+# member) and its release verdict ASSUME at the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -147,6 +150,8 @@ wake_covered_actions=(
   ClassifyMemberLiveMaterializationTerminalDormant
   ClassifyPeerNoticeRunning
   ClassifyPeerNoticeStopped
+  ClassifyMemberReleaseRunning
+  ClassifyMemberReleaseStopped
   BeginPlacedCompletionLifecycleQuiesceFreshStop
   StopRunning
   ResumeStopped
@@ -214,6 +219,8 @@ terminal_covered_actions=(
   ReleaseMemberMaterializationStaleDestroyed
   ClassifyPeerNoticeCompleted
   ClassifyPeerNoticeDestroyed
+  ClassifyMemberReleaseCompleted
+  ClassifyMemberReleaseDestroyed
   CompleteRunning
   MarkCompleted
   ShutdownRunning
@@ -330,7 +337,8 @@ write_cfg() {
       max_attempts=1
       run_properties="
   AuditSeedRecoverKeepsPhase
-  AuditAttemptEndsClosed"
+  AuditAttemptEndsClosed
+  AuditPlanLeavesSealable"
       run_invariants="
   AuditWakingClosable"
       ;;
@@ -346,7 +354,8 @@ write_cfg() {
   AuditReleaseEpochFence"
       run_invariants="
   AuditWakingClosable
-  AuditWakeExactlyOne"
+  AuditWakeExactlyOne
+  AuditWakeClosesLiveUnlessEndpointOwed"
       ;;
     retire)
       spec="AuditRetireSpec"
@@ -416,7 +425,7 @@ write_cfg() {
   replace_exact_line "  GenerationValues = {1}" "  GenerationValues = {0, 1}" "${cfg}"
   replace_exact_line "  MobIdValues = {}" '  MobIdValues = {"mobid_1"}' "${cfg}"
   replace_exact_line "  SessionIdValues = {}" '  SessionIdValues = {"sessionid_1", "sessionid_2", "sessionid_3"}' "${cfg}"
-  replace_exact_line "  StringValues = {}" '  StringValues = {"profile_1", "model_1", "digest_1", "reason_1", "code_1"}' "${cfg}"
+  replace_exact_line "  StringValues = {}" '  StringValues = {"profile_1", "model_1", "digest_1", "reason_1", "code_1", "objective_1"}' "${cfg}"
   replace_exact_line "  ResumeAttemptIdValues = {}" '  ResumeAttemptIdValues = {"resumeattemptid_1"}' "${cfg}"
   replace_exact_line "CONSTANTS" "CONSTANTS
   AuditStepIndex = ${step_index}
@@ -541,6 +550,7 @@ for witness in \
   "wake:Action property:WokeLive" "wake:Action property:Released" \
   "wake:Action property:StopCloses" "wake:Invariant:StaleInStopped" \
   "wake:Invariant:Drift" "wake:Invariant:BrokenWake" \
+  "wake:Action property:CommsLessWokeLive" \
   "retire:Action property:RetireCloses" "retire:Action property:ArchiveOnlyArchived" \
   "retire:Action property:DestroyBeatsRotation" "retire:Action property:DestroyBeatsHostPending" \
   "retire:Action property:RotatedStopped" \
@@ -831,6 +841,21 @@ for fold in folds:
     line = found[0].group(0)
     assert len(re.findall(epoch, line)) == 1, f"expected one epoch conjunct in {fold}"
     text = text[:found[0].start()] + re.sub(epoch, "TRUE", line) + text[found[0].end():]' "$@"
+  # A local wake that needs an endpoint whatever it owes: a member that owes
+  # no endpoint is held Waking for one.
+  mutate wake succeeded_needs_endpoint \
+    "Error: Invariant AuditWakeClosesLiveUnlessEndpointOwed is violated" \
+    'add_guard("ResolveMemberRevivalSucceededRunningLocal", "(agent_identity \\in DOMAIN member_peer_endpoints)")' "$@"
+  # The release verdict misses a Waking member (its wake in flight would be
+  # answered as nothing materialized).
+  mutate wake release_verdict_misses_waking \
+    "Assumption .* is false" \
+    'replace_in_operator("member_release_verdict", "(residency = Some(\"Waking\"))", "FALSE")' "$@"
+  # The boot plan leaves an endpoint-less member Dormant owing nothing, so
+  # the seal would refuse the whole start.
+  mutate seed stay_dormant_owes_nothing \
+    "Error: Action property AuditPlanLeavesSealable is violated" \
+    'keep_var("PlanBootMaterializationStayDormant", "member_boot_obligation_owed")' "$@"
   # R27: the routed retirement start without its Dormant guard routes a
   # runtime retire for a member with no registration.
   mutate retire archive_only_routes \
