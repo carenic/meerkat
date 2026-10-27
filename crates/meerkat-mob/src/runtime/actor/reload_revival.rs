@@ -61,6 +61,10 @@ struct RevivalWork {
     /// classified the member (a revival that resumes an earlier publication
     /// mints none). Every resolution of the revival is fenced by it.
     attempt: std::sync::OnceLock<u64>,
+    /// What rolls back the provision this revival committed on its Bound
+    /// verdict, until its Ready verdict: a later stale or failed step rolls
+    /// it back, so no materialization outlives the attempt that made it.
+    committed: std::sync::Mutex<Option<WarmRollback>>,
 }
 
 impl RevivalWork {
@@ -78,6 +82,54 @@ impl RevivalWork {
     fn attempt(&self) -> Option<u64> {
         self.attempt.get().copied()
     }
+
+    fn take_committed(&self) -> Option<WarmRollback> {
+        self.committed
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+    }
+}
+
+/// The receipt facts that roll a committed revival provision back, kept
+/// after its `PendingProvision` was committed.
+#[derive(Clone)]
+struct WarmRollback {
+    member_ref: MemberRef,
+    operation_id: meerkat_core::ops::OperationId,
+    session_origin: super::super::provisioner::ProvisionSessionOrigin,
+    rollback_authority: Option<super::super::provisioner::ResumedMemberRollbackAuthority>,
+}
+
+impl WarmRollback {
+    fn pending(
+        self,
+        identity: &AgentIdentity,
+        provisioner: Arc<dyn MobProvisioner>,
+    ) -> PendingProvision {
+        PendingProvision::new(
+            self.member_ref,
+            identity.clone(),
+            provisioner,
+            self.operation_id,
+            self.session_origin,
+            self.rollback_authority,
+            // A failed warm revival keeps the member seated.
+            super::super::provisioner::RollbackOrigin::RevivalOrRebuild,
+        )
+    }
+}
+
+/// How a revival finishes once the provision it committed is rolled back.
+enum WarmRollbackThen {
+    /// It is not current any more: a stale fence, or a stale verdict.
+    NotCurrent,
+    /// A step after the provision failed: the attempt ends with `kind`, and
+    /// the caller gets `error`.
+    Failed {
+        kind: mob_dsl::MemberWakeAbandonKind,
+        error: MobError,
+    },
 }
 
 #[derive(Default)]
@@ -98,6 +150,7 @@ enum RevivalObservation {
 struct RevivalPublication {
     provision: PendingProvision,
     publication: Option<super::super::provisioner::ResumedMemberRollbackAuthority>,
+    rollback: WarmRollback,
 }
 
 struct RevivalTopology {
@@ -121,6 +174,12 @@ enum RevivalStep {
     Failed(MobError),
     AlreadyLiveAfterBuild,
     Inert(MemberLiveRevivalOutcome),
+    /// The committed provision was rolled back (`false`: it could not be
+    /// settled and its custody was abandoned); the revival then finishes.
+    RolledBack {
+        settled: bool,
+        then: WarmRollbackThen,
+    },
     Unsettled,
 }
 
@@ -151,20 +210,6 @@ impl MemberEffectCommit for RevivalCommit {
                 MemberEffectAck::Settled
             }
         })
-    }
-}
-
-/// The abandonment kind a failed step of the reload ends its attempt with: a
-/// refused reload leaves the member Dormant (retryable), any other failure
-/// after the provision records it Broken with `otherwise`.
-fn warm_revival_abandon_kind(
-    error: &MobError,
-    otherwise: mob_dsl::MemberWakeAbandonKind,
-) -> mob_dsl::MemberWakeAbandonKind {
-    if matches!(error, MobError::MemberReloadRefused { .. }) {
-        mob_dsl::MemberWakeAbandonKind::ReloadRefused
-    } else {
-        otherwise
     }
 }
 
@@ -218,6 +263,7 @@ impl MobActor {
             scope,
             reply: std::sync::Mutex::new(Some(reply_tx)),
             attempt: std::sync::OnceLock::new(),
+            committed: std::sync::Mutex::new(None),
         });
         #[cfg(feature = "runtime-adapter")]
         if let Some(publication) = work.scope.publication.clone() {
@@ -431,6 +477,12 @@ impl MobActor {
                     }
                     RevivalStep::Built(receipt.map(|receipt| {
                         let publication = receipt.rollback_authority.clone();
+                        let rollback = WarmRollback {
+                            member_ref: receipt.member_ref.clone(),
+                            operation_id: receipt.operation_id.clone(),
+                            session_origin: receipt.session_origin.clone(),
+                            rollback_authority: receipt.rollback_authority.clone(),
+                        };
                         RevivalPublication {
                             provision: PendingProvision::new(
                                 receipt.member_ref,
@@ -443,6 +495,7 @@ impl MobActor {
                                 super::super::provisioner::RollbackOrigin::RevivalOrRebuild,
                             ),
                             publication,
+                            rollback,
                         }
                     }))
                 });
@@ -508,6 +561,13 @@ impl MobActor {
                     work.reply(Err(fail_stop_reply));
                     return;
                 }
+                // Until the Ready verdict, a stale or failed step rolls this
+                // provision back (F4: no materialization the machine does not
+                // hold outlives its attempt).
+                *work
+                    .committed
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(built.rollback);
                 self.clear_member_restore_failure(&work.entry.agent_identity)
                     .await;
                 self.dispatch_warm_readiness(work, built.publication);
@@ -517,30 +577,37 @@ impl MobActor {
                 result,
             } => {
                 if let Err(error) = result {
-                    let kind = warm_revival_abandon_kind(
-                        &error,
-                        mob_dsl::MemberWakeAbandonKind::ReadinessFailed,
-                    );
-                    self.abandon_warm_revival(&work, kind, error.to_string())
-                        .await;
-                    work.reply(Err(error));
+                    // A reload whose readiness fails is retryable, as the
+                    // reload contract always had it (the member is not
+                    // Broken): its provision is rolled back, the member is
+                    // Dormant, and its next delivery wakes it through the
+                    // cold recipe.
+                    self.roll_back_committed_warm_build(
+                        work,
+                        WarmRollbackThen::Failed {
+                            kind: mob_dsl::MemberWakeAbandonKind::ReloadRefused,
+                            error,
+                        },
+                    )
+                    .await;
                     return;
                 }
                 if !settlement.fence.is_current() {
-                    self.finish_warm_revival_inert(&work, MemberLiveRevivalOutcome::NotCurrent)
+                    self.roll_back_committed_warm_build(work, WarmRollbackThen::NotCurrent)
                         .await;
                     return;
                 }
                 let plan = match self.machine_restore_wiring_plan(&work.entry.agent_identity) {
                     Ok(plan) => plan,
                     Err(error) => {
-                        self.abandon_warm_revival(
-                            &work,
-                            mob_dsl::MemberWakeAbandonKind::TopologyFailed,
-                            error.to_string(),
+                        self.roll_back_committed_warm_build(
+                            work,
+                            WarmRollbackThen::Failed {
+                                kind: mob_dsl::MemberWakeAbandonKind::TopologyFailed,
+                                error,
+                            },
                         )
                         .await;
-                        work.reply(Err(error));
                         return;
                     }
                 };
@@ -573,7 +640,7 @@ impl MobActor {
                 result,
             } => {
                 if !settlement.fence.is_current() {
-                    self.finish_warm_revival_inert(&work, MemberLiveRevivalOutcome::NotCurrent)
+                    self.roll_back_committed_warm_build(work, WarmRollbackThen::NotCurrent)
                         .await;
                     return;
                 }
@@ -581,6 +648,16 @@ impl MobActor {
                     topology.failed.push(peer);
                 }
                 self.advance_warm_topology(work, topology).await;
+            }
+            RevivalStep::RolledBack { settled, then } => {
+                if !settled {
+                    tracing::error!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %work.entry.agent_identity,
+                        "a warm reload could not roll back the provision it committed; its custody was abandoned"
+                    );
+                }
+                self.finish_after_warm_rollback(&work, then).await;
             }
             RevivalStep::Unsettled => {}
         }
@@ -609,6 +686,54 @@ impl MobActor {
                 }
             }
         });
+    }
+
+    /// Roll back the provision this revival committed on its Bound verdict
+    /// (off the actor), then finish with `then`. A revival that committed
+    /// none (a session that was already live, a resumed publication) has
+    /// nothing of its own to roll back and finishes at once.
+    async fn roll_back_committed_warm_build(
+        &mut self,
+        work: Arc<RevivalWork>,
+        then: WarmRollbackThen,
+    ) {
+        let Some(rollback) = work.take_committed() else {
+            self.finish_after_warm_rollback(&work, then).await;
+            return;
+        };
+        let identity = work.entry.agent_identity.clone();
+        let provisioner = Arc::clone(&self.provisioner);
+        self.dispatch_warm_revival(work, "warm_revival_committed_rollback", async move {
+            let settled = match rollback
+                .pending(&identity, provisioner)
+                .rollback_retaining_custody()
+                .await
+            {
+                Ok(()) => true,
+                Err(retained) => {
+                    let _ = retained.abandon("warm reload rollback lost its member incarnation");
+                    false
+                }
+            };
+            RevivalStep::RolledBack { settled, then }
+        });
+    }
+
+    /// Finish a revival whose committed provision was rolled back (or that
+    /// committed none): by the machine's verdict for its attempt, then the
+    /// caller's answer.
+    async fn finish_after_warm_rollback(&mut self, work: &RevivalWork, then: WarmRollbackThen) {
+        match then {
+            WarmRollbackThen::NotCurrent => {
+                self.finish_warm_revival_inert(work, MemberLiveRevivalOutcome::NotCurrent)
+                    .await;
+            }
+            WarmRollbackThen::Failed { kind, error } => {
+                self.abandon_warm_revival(work, kind, error.to_string())
+                    .await;
+                work.reply(Err(error));
+            }
+        }
     }
 
     /// Apply `ResolveMemberRevivalBound` for the revival's attempt (F11 step
@@ -1105,13 +1230,14 @@ impl MobActor {
         if let Err(error) = self
             .resolve_respawn_topology_restore_result(&work.entry.agent_identity, topology.failed)
         {
-            self.abandon_warm_revival(
-                &work,
-                mob_dsl::MemberWakeAbandonKind::TopologyFailed,
-                error.to_string(),
+            self.roll_back_committed_warm_build(
+                work,
+                WarmRollbackThen::Failed {
+                    kind: mob_dsl::MemberWakeAbandonKind::TopologyFailed,
+                    error,
+                },
             )
             .await;
-            work.reply(Err(error));
             return;
         }
         // A session that was already live when the build ran published
@@ -1126,8 +1252,10 @@ impl MobActor {
             return;
         };
         // F11 step 2 (Ready): readiness and topology settled, so the member
-        // is Live. A stale attempt means another transition closed it
-        // meanwhile; the reload is then not current.
+        // is Live. The verdict alone decides the provision (F4): Applied keeps
+        // it (the machine now holds it Live); a stale attempt means another
+        // transition closed it meanwhile, so the provision this reload
+        // committed is rolled back and the reload is not current.
         if self.apply_member_wake_feedback(
             &work.entry.agent_identity,
             attempt,
@@ -1138,11 +1266,13 @@ impl MobActor {
             "resolve_warm_revival_ready",
         ) == mob_dsl::MemberWakeFeedbackVerdict::Applied
         {
+            let _ = work.take_committed();
             self.finish_closed_member_wake(&work.entry.agent_identity, attempt)
                 .await;
             work.reply(Ok(outcome));
         } else {
-            work.reply(Ok(MemberLiveRevivalOutcome::NotCurrent));
+            self.roll_back_committed_warm_build(work, WarmRollbackThen::NotCurrent)
+                .await;
         }
     }
 }

@@ -15256,6 +15256,20 @@ async fn resume_session_with_llm_override(
         let stored_metadata = session
             .session_metadata()
             .ok_or_else(|| anyhow::anyhow!("persisted session {session_id} is missing metadata"))?;
+        // A mob member's session is its mob's to materialize: a standalone
+        // resume would build the member outside its mob, bypassing its wake,
+        // its wiring and its tools. No mob runs in this command's process, so
+        // it is refused typed; deliver to the member through its mob, which
+        // wakes it.
+        if let Some(binding) = stored_metadata.mob_member_binding.as_ref() {
+            return Err(exit_status::typed_failure(
+                meerkat_core::SessionError::Unsupported(format!(
+                    "session {session_id} belongs to member '{}' of mob '{}': deliver to the member through its mob, which wakes it",
+                    binding.member, binding.mob_id
+                )),
+                ToString::to_string,
+            ));
+        }
         let build_state = session.build_state().unwrap_or_default();
         let mut tooling = stored_metadata.tooling.clone();
         let explicit_tooling = if yolo || tools.is_some() {

@@ -964,9 +964,24 @@ async fn wake_session_owner_if_unserved(
         .await
     {
         None | Some(Ok(_)) => Ok(()),
-        Some(Err(error)) => Err(ScheduleDomainError::Internal(format!(
-            "the member owning session {session_id} could not be woken: {error}"
-        ))),
+        Some(Err(error)) => Err(session_owner_wake_schedule_error(session_id, error)),
+    }
+}
+
+/// A refused owner wake, as a scheduled delivery reports it. A retryable
+/// refusal (`SessionError::Busy`: the member's mob is stopped, the wake timed
+/// out, its host still prepares it) admitted nothing, so the occurrence stays
+/// reclaimable and is redriven with the same identity; a final one (the
+/// member is broken or gone) fails the delivery.
+fn session_owner_wake_schedule_error(
+    session_id: &SessionId,
+    error: meerkat_core::service::SessionError,
+) -> ScheduleDomainError {
+    let detail = format!("the member owning session {session_id} could not be woken: {error}");
+    if matches!(error, meerkat_core::service::SessionError::Busy { .. }) {
+        ScheduleDomainError::DeliveryRepairDeferred { detail }
+    } else {
+        ScheduleDomainError::Internal(detail)
     }
 }
 

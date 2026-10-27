@@ -72,9 +72,18 @@ impl RestScheduleContext {
                     .wake(session_id)
                     .await
         {
-            return Err(ScheduleDomainError::Internal(format!(
-                "the member owning session {session_id} could not be woken: {error}"
-            )));
+            // A retryable refusal (`SessionError::Busy`) admitted nothing: the
+            // occurrence stays reclaimable and is redriven with the same
+            // identity. A final one fails the delivery.
+            let detail =
+                format!("the member owning session {session_id} could not be woken: {error}");
+            return Err(
+                if matches!(error, meerkat_core::service::SessionError::Busy { .. }) {
+                    ScheduleDomainError::DeliveryRepairDeferred { detail }
+                } else {
+                    ScheduleDomainError::Internal(detail)
+                },
+            );
         }
 
         let executor = Box::new(RestSessionRuntimeExecutor::new(

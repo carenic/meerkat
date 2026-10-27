@@ -66,6 +66,13 @@ them.
   or answered as an unconfirmed (ambiguous) delivery. The stop closes each live
   member's in-process route for peer ingress and the resume reopens it, so the
   sender retries after the mob resumes.
+- Behaviour: `rkat resume` and the MCP server's `meerkat_resume` refuse a
+  mob member's session that no mob in their own process owns
+  (`SESSION_UNSUPPORTED`, the message names the member and its mob): deliver
+  to the member through its mob, which wakes it. Before, they rebuilt the
+  member's session outside its mob, without its wiring and tools. A session
+  whose mob runs in the same process is woken through the mob instead, as
+  every other session-keyed live operation is.
 - `meerkat-runtime`: `meerkat_machine::composition::MeerkatSeamSignal::RuntimeBound`
   gains `runtime_epoch_id`, and the enum gains `RuntimeRegistrationReleased {
   agent_runtime_id, fence_token, runtime_epoch_id }`. Every final unregister of
