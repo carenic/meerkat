@@ -3800,8 +3800,10 @@ async fn a_boundary_holders_resume_preparation_does_not_wait_head_canonical() {
         "the refused preparation leaves A's tail"
     );
 
+    // The boundary is held for the whole test: a preparation that waited for
+    // it would refuse Busy at its own 1 s bound or never answer.
     let prepared = tokio::time::timeout(
-        Duration::from_millis(500),
+        DEADLINE,
         start
             .service
             .prepare_committed_boundary_resume_under_runtime_turn_boundary(&id),
