@@ -8812,7 +8812,7 @@ pub(super) struct MobActor {
     /// member out: the recovery runs its readiness step itself.
     #[cfg(feature = "runtime-adapter")]
     pub(super) startup_member_recoveries: BTreeMap<AgentIdentity, StartupMemberRecovery>,
-    /// Member wake custody (B6): the wake-route projection, the callers
+    /// Member wake custody: the wake-route projection, the callers
     /// waiting on each wake attempt (keyed by MobMachine's attempt id, so a
     /// second request for a member being woken joins that attempt instead of
     /// racing a second materialization), and the materializations MobMachine
@@ -13604,7 +13604,7 @@ impl MobActor {
         }
         // Every apply seam passes here: the member-residency effects (wake
         // routes, materialization handoffs, wake abandonment, peer ingress)
-        // are realized from the same transition (B6).
+        // are realized from the same transition.
         self.realize_member_residency_effects(effects);
     }
 
@@ -18788,7 +18788,7 @@ impl MobActor {
             {
                 Ok(true) => {}
                 Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {
-                    // #37, now the counted drift path: the live
+                    // The counted drift path: the live
                     // materialization is gone while MobMachine holds the
                     // member Live. The wake is machine authority, so it
                     // re-enters the actor (`WakeMember` with the observed
@@ -28113,7 +28113,7 @@ impl MobActor {
                         .set_step("revive_member_live_materialization");
                     let identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
                     if scope.is_missing_live() {
-                        // B6: a missing live materialization is woken like
+                        // A missing live materialization is woken like
                         // every other: `WakeMember` with the observed miss,
                         // realized by B4's cold recipe (the customizer is
                         // asked). Only an in-process reload keeps the warm
@@ -30749,7 +30749,7 @@ impl MobActor {
                     execution_identity,
                     reply_tx,
                 } => {
-                    // B6 (N7): a live channel to a local member needs the
+                    // A live channel to a local member needs the
                     // member materialized. One that is not is woken first
                     // (`WakeMember(HostDelivery)`), and the open is submitted
                     // again, under its own authority, once it is ready. A
@@ -31476,7 +31476,7 @@ impl MobActor {
                 "test seam: durable recovery fail-stops before command admission".into(),
             ));
         }
-        // B6: every seated member's wake route, rebuilt from machine state
+        // Every seated member's wake route, rebuilt from machine state
         // before any command or peer send is served, and the retry timers of
         // owed boot wakes.
         self.start_member_wakes();
@@ -31959,7 +31959,7 @@ impl MobActor {
                 );
                 continue;
             }
-            // Member wakes (B6): answer the callers of attempts the machine
+            // Member wakes: answer the callers of attempts the machine
             // closed, realize a stop's or a resume's peer-ingress change, and
             // start the materializations the machine handed off.
             boxed_arm_future(|| self.answer_closed_member_wakes()).await;
@@ -59331,7 +59331,7 @@ impl MobActor {
         let readiness = if placed_identity.is_none()
             && let Some(bridge_session_id) = machine_member_ref.bridge_session_id()
         {
-            // B6 (N7): every local host delivery applies
+            // Every local host delivery applies
             // `WakeMember(HostDelivery)` and follows MobMachine's verdict:
             // AlreadyLive proceeds (the live-session probe below stays as
             // drift repair), Authorized or Joined waits for the wake in the

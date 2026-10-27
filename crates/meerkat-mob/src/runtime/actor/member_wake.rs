@@ -1,4 +1,4 @@
-//! Member wake (B6): the runtime path that makes a seated member which is not
+//! Member wake: the runtime path that makes a seated member which is not
 //! materialized in this process ready, for every cause.
 //!
 //! MobMachine owns the member's residency (`member_materialization`:
@@ -1147,7 +1147,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Attempt custody for the explicit-resume lift (C2) and the turn.
+    // Attempt custody for the explicit-resume lift and the turn.
     // ---------------------------------------------------------------
 
     /// Wait on `attempt` of `identity` (an explicit resume that joined it).
@@ -1219,7 +1219,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // The wake bound (G11) and the owed-boot retry (lead decision b).
+    // The wake bound (G11) and the owed-boot retry.
     // ---------------------------------------------------------------
 
     /// Arm the mob's wake bound for one attempt: when it ends, the machine

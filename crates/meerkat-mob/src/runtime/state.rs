@@ -873,7 +873,7 @@ pub(super) enum MobCommand {
         scope: super::actor::MemberLiveRevivalScope,
         reply_tx: oneshot::Sender<Result<super::actor::MemberLiveRevivalOutcome, MobError>>,
     },
-    /// A wake of a seated member that a delivery needs (B6): MobMachine's
+    /// A wake of a seated member that a delivery needs: MobMachine's
     /// `WakeMember` verdict, then, when the wake is authorized or joined, an
     /// answer once the member is ready. Peer sends reach it through the
     /// mob's inproc wake routes; host deliveries and operators wake on the

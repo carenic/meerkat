@@ -317,7 +317,7 @@ impl ActorFlowTurnExecutor {
         message: ContentInput,
         turn_tool_overlay: Option<TurnToolOverlay>,
     ) -> Result<FlowTurnTicket, MobError> {
-        // B6 (N7): a flow step is a host delivery. A member that is not
+        // A flow step is a host delivery. A member that is not
         // materialized in this process is woken first (`WakeMember`, cause
         // HostDelivery); a refused wake fails the step typed.
         self.handle.wake_member_for_delivery(target).await?;

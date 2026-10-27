@@ -1,4 +1,4 @@
-//! The runtime wake turn of one attempt (B6 design section 14).
+//! The runtime wake turn of one attempt.
 //!
 //! A boot restores its members in roster order; a wake restores one member at
 //! runtime, possibly while other members wake. The turn is the actor's commit

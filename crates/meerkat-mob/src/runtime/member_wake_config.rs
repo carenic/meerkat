@@ -1,4 +1,4 @@
-//! Owned configuration of member wakes (B6).
+//! Owned configuration of member wakes.
 
 use std::time::Duration;
 
