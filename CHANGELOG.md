@@ -126,9 +126,11 @@ them.
   seat built nothing creates its session under the id the seat named (see
   `MobHandle::seat_dormant_members`), after the host's build preparation, as
   any wake prepares it; a registration the host refuses there
-  (`MobError::MemberRegistrationRefused`) is the member's restore failure. A
-  wake that ends retryable after that create keeps the session, and the next
-  wake resumes it instead of creating it again. Before that first wake,
+  (`MobError::MemberRegistrationRefused`) is the member's restore failure, as
+  is a create that fails for any other reason: at an eager start it breaks
+  only that member, and the start goes on. A wake that ends retryable after
+  that create keeps the session, and the next wake resumes it instead of
+  creating it again. Before that first wake,
   `MobHandle::reload_member_registration` of the member is refused
   (`MobError::UnsupportedForMode`): its session is created at its first wake.
 - `meerkat-session`: `PersistentSessionService::prepare_cold_attach_as_owner`

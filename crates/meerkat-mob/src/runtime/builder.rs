@@ -2562,7 +2562,7 @@ async fn resolve_member_seat_session_created(
             ),
         ),
     };
-    commit
+    let born = commit
         .authority
         .commit_prepared_authority_after(prepared, || async move {
             events.append(born).await.map_err(MobError::from)
@@ -2577,6 +2577,9 @@ async fn resolve_member_seat_session_created(
             }
             mob_dsl::MobMachinePreparedCommitEffectError::Effect(error) => error,
         })?;
+    // The roster takes the born row as a replay does: the seat's build
+    // inputs are dropped with it.
+    commit.roster.apply(&born);
     for effect in transition.effects().iter().cloned() {
         if let Some(effect) = super::composition::MobSeamEffect::routed(effect) {
             super::composition::dispatch_routed_effect(commit.composition_binding, effect)
@@ -11703,11 +11706,14 @@ pub(super) enum MemberRestoreProvisionOutcome {
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
     },
-    /// A nonpersistent service recreated the member's session.
+    /// The member's session was created fresh: a nonpersistent service
+    /// recreated it, or (`seat_session`) the member's first materialization
+    /// created the session its seat named.
     Fresh {
         admitted_bridge_session_id: SessionId,
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
+        seat_session: bool,
     },
 }
 
@@ -12775,7 +12781,7 @@ pub(super) async fn provision_durable_member_restore(
                 seated.restore_overlay.clone(),
                 None,
             )?,
-            compaction_curator_override: None,
+            compaction_curator_override: restore_spec.compaction_curator_override.clone(),
             context: restore_spec.context.clone(),
             labels: Some(restore_labels.clone()),
             additional_instructions: restore_spec.additional_instructions.clone(),
@@ -12805,6 +12811,7 @@ pub(super) async fn provision_durable_member_restore(
         &mut resumed_config,
         super::tools::resolve_profile_bundle_tools(&profile, ctx.tool_bundles),
     );
+    apply_restore_spec_build_inputs(&mut resumed_config, restore_spec);
     resumed_config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
     // A fork-derived member is rebuilt with its persisted lineage.
     resumed_config.fork_source = entry.fork_source.clone();
@@ -12827,7 +12834,8 @@ pub(super) async fn provision_durable_member_restore(
         "You have been spawned as '{}' (role: {}) in mob '{}'.",
         entry.agent_identity, entry.role, definition.id
     );
-    let req = build::to_create_session_request(&resumed_config, prompt.into());
+    let mut req = build::to_create_session_request(&resumed_config, prompt.into());
+    apply_restore_spec_budget_limits(&mut req, restore_spec);
     let peer_name = match super::actor::render_member_comms_name(
         definition.id.as_str(),
         entry.role.as_str(),
@@ -12964,6 +12972,36 @@ pub(super) async fn provision_durable_member_restore(
     })
 }
 
+/// The restore spec's build inputs a spawn's build takes and the restore's
+/// build parameters do not carry: the tool dispatch admission and the web
+/// search override. For an unborn seat they are the seat's (see
+/// `fork_build::rebuild_seat_resume_spec`); for any member the customizer's
+/// resume request may set them, as a spawn's caller does.
+#[cfg(feature = "runtime-adapter")]
+fn apply_restore_spec_build_inputs(
+    config: &mut build::AgentBuildConfig,
+    restore_spec: &super::handle::SpawnMemberSpec,
+) {
+    config
+        .tool_dispatch_admission
+        .clone_from(&restore_spec.tool_dispatch_admission);
+    config.override_web_search = restore_spec.tool_category_overrides.web_search;
+}
+
+/// The restore spec's budget limits on the build of `req`, as a spawn sets
+/// its own; none leaves the build's limits as they are.
+#[cfg(feature = "runtime-adapter")]
+fn apply_restore_spec_budget_limits(
+    req: &mut meerkat_core::service::CreateSessionRequest,
+    restore_spec: &super::handle::SpawnMemberSpec,
+) {
+    if let Some(limits) = restore_spec.budget_limits.clone() {
+        req.build
+            .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
+            .budget_limits = Some(limits);
+    }
+}
+
 /// The session a fresh restore creates.
 #[cfg(feature = "runtime-adapter")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -13017,6 +13055,58 @@ async fn provision_fresh_member_restore(
     if restore_spec.inherited_tool_filter.is_some() && restore_profile_override.is_none() {
         build::open_profile_tool_categories_for_inherited_filter(&mut profile);
     }
+    let outcome = match provision_fresh_member_session(
+        ctx,
+        entry,
+        seated,
+        bridge_session_id,
+        base,
+        session,
+        &profile,
+        restore_labels,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // A seat's first create breaks only its own member, whatever refused
+        // it: a start or a wake goes on with every other member.
+        Err(error) if session == FreshRestoreSession::UnbornSeat => {
+            MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                bridge_session_id,
+                format!(
+                    "failed to create the session of member '{}': {error}",
+                    entry.agent_identity
+                ),
+            ))
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(MemberRestoreProvision {
+        profile,
+        profile_context: PROFILE_CONTEXT,
+        outcome,
+    })
+}
+
+/// The create of [`provision_fresh_member_restore`] once the member's
+/// profile is resolved: its build, its preparation by the host and its
+/// provision. A refusal the outcome carries ends the member's restore; an
+/// error is the caller's to classify.
+#[cfg(feature = "runtime-adapter")]
+#[allow(clippy::too_many_arguments)]
+async fn provision_fresh_member_session(
+    ctx: &ResumeMemberRestoreContext<'_>,
+    entry: &RosterEntry,
+    seated: &SeatedMemberRestore,
+    bridge_session_id: &SessionId,
+    base: &crate::machines::mob_machine::MobMachineAuthority,
+    session: FreshRestoreSession,
+    profile: &crate::profile::Profile,
+    restore_labels: BTreeMap<String, String>,
+) -> Result<MemberRestoreProvisionOutcome, MobError> {
+    const PROFILE_CONTEXT: &str = RESUME_RECREATE_MEMBER_PROFILE_AUTHORITY;
+    let definition = ctx.definition;
+    let restore_spec = &seated.restore_spec;
     // The member's own fork of the recovered authority stands in for the
     // provision authority: its turn applies the same inputs to the mob's.
     let mut authority = base.fork();
@@ -13024,7 +13114,7 @@ async fn provision_fresh_member_restore(
         &mut authority,
         &entry.agent_identity,
         &entry.role,
-        &profile,
+        profile,
         None,
         PROFILE_CONTEXT,
     )?;
@@ -13036,20 +13126,20 @@ async fn provision_fresh_member_restore(
         mob_id: &definition.id,
         profile_name: &entry.role,
         agent_identity: &entry.agent_identity,
-        profile: &profile,
+        profile,
         definition,
         realm_profile_store: ctx.realm_profile_store,
         external_tools: compose_external_tools_for_profile(
-            &profile,
+            profile,
             ctx.tool_bundles,
             ctx.tool_handle.clone(),
             default_ext_fresh,
             seated.restore_overlay.clone(),
             None,
         )?,
-        compaction_curator_override: None,
+        compaction_curator_override: restore_spec.compaction_curator_override.clone(),
         context: restore_spec.context.clone(),
-        labels: Some(restore_labels.clone()),
+        labels: Some(restore_labels),
         additional_instructions: restore_spec.additional_instructions.clone(),
         shell_env: restore_spec.shell_env.clone(),
         mob_tool_authority_context: None,
@@ -13061,8 +13151,9 @@ async fn provision_fresh_member_restore(
     .await?;
     super::tools::attach_declared_bundle_tools(
         &mut config,
-        super::tools::resolve_profile_bundle_tools(&profile, ctx.tool_bundles),
+        super::tools::resolve_profile_bundle_tools(profile, ctx.tool_bundles),
     );
+    apply_restore_spec_build_inputs(&mut config, restore_spec);
     config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
     config.fork_source = entry.fork_source.clone();
     if let Some(ref auth_binding) = restore_spec.auth_binding {
@@ -13084,7 +13175,8 @@ async fn provision_fresh_member_restore(
         "You have been spawned as '{}' (role: {}) in mob '{}'.",
         entry.agent_identity, entry.role, definition.id
     );
-    let req = build::to_create_session_request(&config, prompt.into());
+    let mut req = build::to_create_session_request(&config, prompt.into());
+    apply_restore_spec_budget_limits(&mut req, restore_spec);
     let peer_name = super::actor::render_member_comms_name(
         definition.id.as_str(),
         entry.role.as_str(),
@@ -13093,9 +13185,7 @@ async fn provision_fresh_member_restore(
     let continuity_intent = match entry_continuity_intent(ctx.recorded_continuity, entry) {
         Ok(intent) => intent,
         Err(reason) => {
-            return Ok(MemberRestoreProvision::failed(
-                profile,
-                PROFILE_CONTEXT,
+            return Ok(MemberRestoreProvisionOutcome::Failed(
                 member_restore_failure(bridge_session_id, reason),
             ));
         }
@@ -13138,11 +13228,7 @@ async fn provision_fresh_member_restore(
         prepare_member_build_before_provision(ctx, entry, &admitted_bridge_session_id, &authority)
             .await?
     {
-        return Ok(MemberRestoreProvision {
-            profile,
-            profile_context: PROFILE_CONTEXT,
-            outcome,
-        });
+        return Ok(outcome);
     }
     let receipt = match ctx.provisioner.provision_member(provision_request).await {
         Ok(receipt) => receipt,
@@ -13151,8 +13237,9 @@ async fn provision_fresh_member_restore(
             // A host refusal of this member's registration breaks only this
             // member, as on the durable arm: the seed records the refusal's
             // code, and the transaction's own rollback already removed the
-            // registration the host was asked about. Any other failure still
-            // fails the resume.
+            // registration the host was asked about. Any other failure is
+            // the caller's to classify (a seat's first create breaks only its
+            // member; a recreation fails the resume).
             let registration_refusal = match &error {
                 MobError::MemberRegistrationRefused { call, .. } => *call,
                 _ => return Err(error),
@@ -13161,9 +13248,7 @@ async fn provision_fresh_member_restore(
                 FreshRestoreSession::New => "recreate",
                 FreshRestoreSession::UnbornSeat => "create",
             };
-            return Ok(MemberRestoreProvision::failed(
-                profile,
-                PROFILE_CONTEXT,
+            return Ok(MemberRestoreProvisionOutcome::Failed(
                 super::handle::RestoreFailureDiagnostic {
                     bridge_session_id: Some(bridge_session_id.clone()),
                     reason: format!(
@@ -13187,14 +13272,11 @@ async fn provision_fresh_member_restore(
                     entry.agent_identity
                 ))
             })?;
-    Ok(MemberRestoreProvision {
-        profile,
-        profile_context: PROFILE_CONTEXT,
-        outcome: MemberRestoreProvisionOutcome::Fresh {
-            admitted_bridge_session_id,
-            receipt,
-            created_bridge_session_id,
-        },
+    Ok(MemberRestoreProvisionOutcome::Fresh {
+        admitted_bridge_session_id,
+        receipt,
+        created_bridge_session_id,
+        seat_session: session == FreshRestoreSession::UnbornSeat,
     })
 }
 
@@ -13578,6 +13660,7 @@ async fn apply_member_restore_provision(
             admitted_bridge_session_id,
             receipt,
             created_bridge_session_id,
+            ..
         } => {
             member_restore_reapplied(
                 entry,

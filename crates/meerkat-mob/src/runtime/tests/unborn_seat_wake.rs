@@ -1,9 +1,11 @@
 //! Rows of a seat that built nothing, on the wake side: a session an earlier
 //! wake created before a crash lost its born row, or one a wake that ended
-//! retryable left, is adopted at the next wake or at an eager start and
-//! resolved born once, never created again; a reload of a member whose
-//! session was never created is refused, typed. They run on the combined
-//! candidate: the machine, the wake path and the boot path together.
+//! retryable left (before or after its born row), is adopted or revived at
+//! the next wake or at an eager start, never created again; one member's
+//! failing create breaks only that member at an eager start; a reload of a
+//! member whose session was never created is refused, typed. They run on
+//! the combined candidate: the machine, the wake path and the boot path
+//! together.
 
 use super::*;
 use crate::machines::mob_machine as dsl;
@@ -42,7 +44,8 @@ impl SeatedMob {
             .create()
             .await
             .expect("create the mob");
-        let identity = AgentIdentity::from("seated-worker");
+        // Named by the row: the wake test seams are keyed by identity.
+        let identity = AgentIdentity::from(format!("{label}-worker"));
         let mut spec = SpawnMemberSpec::new("worker", identity.clone());
         spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
         let outcomes = handle
@@ -329,5 +332,198 @@ async fn a_reload_of_a_member_whose_seat_built_nothing_is_refused_typed() {
         mob.phase(),
         Some(dsl::MemberMaterializationPhase::Dormant),
         "nothing was materialized"
+    );
+}
+
+/// A first wake that created the seat's session and journaled it born, then
+/// ended retryable before the member was live (the mob was stopped under its
+/// readiness), keeps the session: only its live materialization is
+/// released. The next wake revives the same session as any born member's,
+/// never reading it as lost and never creating it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_first_wake_that_ends_retryable_after_the_born_row_leaves_the_session_to_the_next_wake() {
+    let mob = SeatedMob::new("born-retryable").await;
+    let release =
+        crate::runtime::actor::member_wake_turn::hold_wake_readiness_for_test(&mob.identity);
+    let handle = mob.handle.clone();
+    let woken = mob.identity.clone();
+    let first = tokio::spawn(async move { handle.ensure_member_live(&woken).await });
+    let deadline = tokio::time::Instant::now() + STEP;
+    while mob.born_rows().await == 0 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the first wake never journaled its born row"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!mob.unborn(), "the created session is born");
+
+    let handle = mob.handle.clone();
+    let stop = tokio::spawn(async move { handle.stop().await });
+    let deadline = tokio::time::Instant::now() + STEP;
+    while !matches!(mob.handle.status().await, Ok(MobState::Stopped)) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the stop never landed while the wake was held"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let _ = release.send(true);
+    let first = tokio::time::timeout(STEP, first)
+        .await
+        .expect("the first wake answers")
+        .expect("the first wake task joins");
+    assert!(first.is_err(), "the stop ended the first wake: {first:?}");
+    tokio::time::timeout(STEP, stop)
+        .await
+        .expect("the stop answers")
+        .expect("the stop task joins")
+        .expect("the stop succeeds");
+    mob.wait_phase(dsl::MemberMaterializationPhase::Dormant)
+        .await;
+    // The wake's rollback settles once the session's live materialization
+    // is gone; only then is what it did with the session final.
+    let deadline = tokio::time::Instant::now() + STEP;
+    while mob.service.has_live_session(&mob.session).await.unwrap() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the session's live materialization was never released"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(
+        !mob.service.test_is_session_archived(&mob.session).await,
+        "the born session was kept, not archived"
+    );
+
+    tokio::time::timeout(STEP, mob.handle.resume())
+        .await
+        .expect("the resume answers")
+        .expect("the mob resumes");
+    mob.handle
+        .ensure_member_live(&mob.identity)
+        .await
+        .expect("the next wake revives the session");
+    assert_eq!(
+        mob.phase(),
+        Some(dsl::MemberMaterializationPhase::Live),
+        "the member is live"
+    );
+    assert_eq!(
+        mob.handle.resolve_bridge_session_id(&mob.identity).await,
+        Some(mob.session.clone()),
+        "the member serves the session its seat named"
+    );
+    assert_eq!(
+        mob.creates_of_the_session().await,
+        1,
+        "the session is created once across both wakes"
+    );
+    assert_eq!(mob.born_rows().await, 1, "one born row is journaled");
+}
+
+/// An eager start whose create of one never-created seat session fails, for
+/// a reason other than a registration refusal, breaks only that member,
+/// typed, with its session still unborn: every other seat's session is
+/// created and the start completes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn an_eager_start_with_one_failing_seat_create_breaks_only_that_member() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let definition = with_unique_mob_id(sample_definition(), "unborn-eager-one-fails");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .with_member_comms_identity_root(keys.path())
+        .create()
+        .await
+        .expect("create the mob");
+    let identities = (0..3)
+        .map(|index| AgentIdentity::from(format!("eager-seat-{index}")))
+        .collect::<Vec<_>>();
+    let specs = identities
+        .iter()
+        .map(|identity| {
+            let mut spec = SpawnMemberSpec::new("worker", identity.clone());
+            spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+            spec
+        })
+        .collect();
+    let outcomes = handle
+        .seat_dormant_members(specs)
+        .await
+        .expect("the seat batch answers");
+    let sessions = outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            DormantSeatOutcome::Seated { session_id, .. } => session_id.clone(),
+            other => panic!("every fresh spec is seated: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    crash_stop_and_release_routes(handle).await;
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    restarted.set_create_session_failure(&sessions[1]).await;
+
+    let handle = tokio::time::timeout(
+        STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events.clone(),
+                runtime_metadata.clone(),
+            ))
+            .with_session_service(restarted.clone())
+            .with_member_comms_identity_root(keys.path())
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            .notify_orchestrator_on_resume(false)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the start answers")
+    .expect("one failing create does not fail the start");
+
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    let unborn = |identity: &AgentIdentity| {
+        crate::runtime::boot_plan::domain_member_seat_session_unborn(
+            &handle.machine_state_watch_rx.borrow(),
+            identity,
+        )
+    };
+    for index in [0, 2] {
+        let identity = &identities[index];
+        assert_eq!(
+            handle.member_materialization_for_test(identity),
+            Some(dsl::MemberMaterializationPhase::Live),
+            "{identity} is live"
+        );
+        assert!(!unborn(identity), "{identity}'s session was created");
+        assert_eq!(
+            restarted
+                .recorded_create_requests()
+                .await
+                .iter()
+                .filter(|record| record.session_id == sessions[index])
+                .count(),
+            1,
+            "{identity}'s session is created once, under its seat id"
+        );
+    }
+    let failed = handle
+        .member_status(&identities[1])
+        .await
+        .expect("read the failed member's status");
+    assert_eq!(
+        failed.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{failed:?}"
+    );
+    assert!(failed.error.is_some(), "its failure is typed: {failed:?}");
+    assert!(
+        unborn(&identities[1]),
+        "the failed member's session was never created"
     );
 }

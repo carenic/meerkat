@@ -66,6 +66,10 @@ struct WakeRollback {
     operation_id: meerkat_core::ops::OperationId,
     session_origin: super::super::provisioner::ProvisionSessionOrigin,
     rollback_authority: Option<super::super::provisioner::ResumedMemberRollbackAuthority>,
+    /// The provision created the session the member's seat named (its first
+    /// materialization): a wake that ends retryable keeps that session
+    /// ([`MobActor::wake_keeps_created_seat_session`]).
+    seat_session: bool,
 }
 
 impl WakeRollback {
@@ -77,9 +81,13 @@ impl WakeRollback {
         else {
             return None;
         };
-        let receipt = match &provision.outcome {
-            MemberRestoreProvisionOutcome::Durable { receipt, .. }
-            | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
+        let (receipt, seat_session) = match &provision.outcome {
+            MemberRestoreProvisionOutcome::Durable { receipt, .. } => (receipt, false),
+            MemberRestoreProvisionOutcome::Fresh {
+                receipt,
+                seat_session,
+                ..
+            } => (receipt, *seat_session),
             MemberRestoreProvisionOutcome::Failed(_)
             | MemberRestoreProvisionOutcome::Retryable { .. } => return None,
         };
@@ -88,6 +96,7 @@ impl WakeRollback {
             operation_id: receipt.operation_id.clone(),
             session_origin: receipt.session_origin,
             rollback_authority: receipt.rollback_authority.clone(),
+            seat_session,
         })
     }
 
@@ -789,6 +798,8 @@ impl MobActor {
             rollback,
             "member_wake_readiness",
             async move {
+                #[cfg(test)]
+                wait_for_wake_readiness_release_for_test(&identity).await;
                 WakeStep::Ready(
                     readiness
                         .ensure_member_comms_drain(&identity, &member_ref, drain_required)
@@ -1178,9 +1189,8 @@ impl MobActor {
 
     /// Roll back the provision a wake made (off the actor), then finish the
     /// attempt by the state the rollback leaves: NotCurrent (Dormant) while
-    /// it is still open. A seat session the wake created and has not
-    /// journaled born is kept rather than archived
-    /// ([`Self::wake_keeps_unborn_seat_session`]).
+    /// it is still open. A seat session the wake created is kept rather than
+    /// archived ([`Self::wake_keeps_created_seat_session`]).
     fn roll_back_member_wake(&mut self, run: WakeRun, rollback: Option<WakeRollback>) {
         let Some(rollback) = rollback else {
             let identity = run.identity.clone();
@@ -1194,7 +1204,7 @@ impl MobActor {
             Some(fence) => fence,
             None => MemberFence::ExpectedAbsent(run.identity.clone()),
         };
-        if self.wake_keeps_unborn_seat_session(&run.identity) {
+        if self.wake_keeps_created_seat_session(&run.identity, &rollback) {
             let provisioner = Arc::clone(&self.member_wakes.provisioner);
             let mob_id = self.definition.id.clone();
             let identity = run.identity.clone();
@@ -1254,18 +1264,24 @@ impl MobActor {
     }
 
     /// Whether a wake that ends retryable keeps the session it created
-    /// instead of archiving it: the member's seat session is still unborn
-    /// (the create happened, its born row was not journaled), the member is
-    /// still seated and not retiring, and the service keeps durable sessions.
-    /// Only the session's live materialization is released then; the next
-    /// wake adopts the session, as it adopts one a crash left created, and
-    /// never creates it again. A wake that ends Broken rolls its provision
-    /// back as before, and so does one of a member that is leaving.
-    fn wake_keeps_unborn_seat_session(&self, identity: &AgentIdentity) -> bool {
+    /// instead of archiving it: its provision created the session the
+    /// member's seat named (before or after the born row was journaled), the
+    /// member is still seated and not retiring, and the service keeps durable
+    /// sessions. Only the session's live materialization is released then.
+    /// The next wake adopts the session while it is unborn (as one a crash
+    /// left created), or revives it as any born member's once its born row
+    /// stands; it is never created again, and never read as lost. A wake
+    /// that ends Broken rolls its provision back as before, and so does one
+    /// of a member that is leaving.
+    fn wake_keeps_created_seat_session(
+        &self,
+        identity: &AgentIdentity,
+        rollback: &WakeRollback,
+    ) -> bool {
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
-        self.session_service.supports_persistent_sessions()
-            && super::super::boot_plan::domain_member_seat_session_unborn(state, identity)
+        rollback.seat_session
+            && self.session_service.supports_persistent_sessions()
             && state
                 .identity_to_runtime
                 .get(&dsl_identity)
@@ -1286,10 +1302,12 @@ impl MobActor {
 }
 
 /// Release the live materialization of a seat session a retryable wake
-/// keeps: its exact runtime attachment is retired and its live actor
-/// discarded, as before a resume of it, and the run-start hold its build
+/// keeps: this provisioner's own live attachment of it is retired (its
+/// actor discarded, its registration closed), as the explicit resume retires
+/// a live actor it does not reuse, and the run-start hold its build
 /// preparation staged is removed (the next wake prepares the build again).
-/// The session itself stays, for the next wake to adopt.
+/// The session itself stays, for the next wake. Nothing retired is not a
+/// release: the wake's own provision left that attachment live.
 async fn release_kept_seat_session(
     provisioner: &super::super::provisioner::MultiBackendProvisioner,
     member_ref: &MemberRef,
@@ -1297,9 +1315,17 @@ async fn release_kept_seat_session(
     let session_id = member_ref.bridge_session_id().ok_or_else(|| {
         MobError::Internal("a kept seat session's provision names no session".to_string())
     })?;
-    provisioner
-        .retire_exact_attachment_for_explicit_resume(session_id)
+    let retired = provisioner
+        .retire_live_member_session_for_explicit_resume(
+            session_id,
+            Instant::now() + super::super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+        )
         .await?;
+    if !retired {
+        return Err(MobError::Internal(format!(
+            "the live attachment of kept seat session '{session_id}' was not retired"
+        )));
+    }
     if let Err(error) = provisioner
         .unstage_member_registration_run_start_hold(
             member_ref,
@@ -1620,6 +1646,40 @@ async fn live_member_endpoint_for_ref(
     match provisioner.trusted_peer_spec(member_ref, &name, &key).await {
         Ok(spec) => WakeEndpoint::Record(spec),
         Err(_) => WakeEndpoint::Matches,
+    }
+}
+
+/// Test seam: members whose wake readiness waits until the test releases
+/// it, so a row can act between a wake's commit and its readiness.
+#[cfg(test)]
+static WAKE_READINESS_HOLDS_FOR_TEST: std::sync::Mutex<
+    Vec<(AgentIdentity, crate::tokio::sync::watch::Receiver<bool>)>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// Hold the readiness of every wake of `identity` until the returned sender
+/// sends `true`.
+#[cfg(test)]
+pub(in crate::runtime) fn hold_wake_readiness_for_test(
+    identity: &AgentIdentity,
+) -> crate::tokio::sync::watch::Sender<bool> {
+    let (released_tx, released_rx) = crate::tokio::sync::watch::channel(false);
+    WAKE_READINESS_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((identity.clone(), released_rx));
+    released_tx
+}
+
+#[cfg(test)]
+async fn wait_for_wake_readiness_release_for_test(identity: &AgentIdentity) {
+    let held = WAKE_READINESS_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .find(|(armed, _)| armed == identity)
+        .map(|(_, released)| released.clone());
+    if let Some(mut released) = held {
+        let _ = released.wait_for(|released| *released).await;
     }
 }
 
