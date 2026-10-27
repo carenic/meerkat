@@ -258,6 +258,44 @@ async fn the_lift_binds_only_the_members_it_holds_live() {
     );
 }
 
+/// The lift of a stopped mob with no member live in this process settles
+/// its (empty) readiness before the durable Resume, and only then does its
+/// member plan open the wakes of the members it materializes. Each of those
+/// wakes runs its member's readiness itself, so the lift joins them after
+/// its own readiness settled: it answers Ok once every member it planned is
+/// Live, and every other member stays Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lift_joins_the_wakes_its_plan_opens_after_its_readiness() {
+    let mob = CrashedMob::new("lazy-lift-join", 4, false, true).await;
+    let required = [worker(0), worker(2)];
+    let handle = mob
+        .resume(mob.builder().with_host_required_members(required.clone()))
+        .await;
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+
+    tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift joins the wakes its plan opened");
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    for (identity, _) in &mob.sessions {
+        let expected = if required.contains(identity) {
+            dsl::MemberMaterializationPhase::Live
+        } else {
+            dsl::MemberMaterializationPhase::Dormant
+        };
+        assert_eq!(phase_of(&handle, identity), Some(expected), "{identity}");
+    }
+    let mut materialized = mob.materialized().await;
+    materialized.sort();
+    let mut planned = vec![mob.session(0), mob.session(2)];
+    planned.sort();
+    assert_eq!(
+        materialized, planned,
+        "the lift built each member it planned, once"
+    );
+}
+
 /// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eager_policy_materializes_every_member() {
