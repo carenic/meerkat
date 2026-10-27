@@ -138,7 +138,7 @@ impl MobActor {
             let identity = entry.agent_identity.clone();
             self.actor_io_tasks.spawn(async move {
                 crate::runtime::member_build_preparer::report_member_built(
-                    preparer,
+                    Some(preparer),
                     session_service,
                     identity,
                     session_id,

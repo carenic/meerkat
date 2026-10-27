@@ -347,6 +347,7 @@ impl MobActor {
                         let result = self
                             .apply_trusted_peer_remove(side.comms.as_ref(), key, authority)
                             .await
+                            .map(|_| ())
                             .map_err(MobError::from);
                         live_trust_removed = result.is_ok();
                         result
