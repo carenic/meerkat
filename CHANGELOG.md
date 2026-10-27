@@ -490,6 +490,15 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: a mob's start no longer stops when the runtime
+  unregistered a member's session registration after the start restored
+  the member, for example when a run on that session failed and the
+  runtime tore the registration down. Before, the start registered the
+  session again, refused it as holding "a different operation-registry
+  binding incarnation" and came up Stopped, and a host had to resume the
+  mob to bring the members back. The start now replaces the binding to the
+  unregistered registration and binds the session to its new one, and the
+  mob comes up Running.
 - `meerkat-mob`: resuming a stopped mob (`MobHandle::resume`), as a host
   does after a graceful restart, no longer stalls while members' runs that
   the restart suspended are still running. The resume answers once its own

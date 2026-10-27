@@ -25,6 +25,8 @@ mod seat_build_inputs;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_comms_key;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod startup_binding_release;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod unborn_seat_wake;
 use crate::definition::{
     BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowSpec,

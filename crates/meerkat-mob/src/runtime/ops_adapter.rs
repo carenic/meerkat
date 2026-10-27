@@ -439,6 +439,61 @@ fn publish_exact_provision_claim(
     }
 }
 
+/// One replacement of a stale session binding, as test rows read it: the
+/// address of the retired registry the replaced binding named, then the
+/// address of the registry bound instead.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) type SessionBindingReplacementForTest = (usize, usize);
+
+/// Test record: each stale binding
+/// [`MobOpsAdapter::bind_session_registry_installing`] replaced in this
+/// process, by session.
+#[cfg(all(test, feature = "runtime-adapter"))]
+static UNREGISTERED_SESSION_BINDING_REPLACEMENTS_FOR_TEST: Mutex<
+    Vec<(SessionId, SessionBindingReplacementForTest)>,
+> = Mutex::new(Vec::new());
+
+#[cfg(all(test, feature = "runtime-adapter"))]
+fn record_unregistered_session_binding_replacement_for_test(
+    child_session_id: &SessionId,
+    replaced: &Arc<dyn OpsLifecycleRegistry>,
+    bound: &Arc<dyn OpsLifecycleRegistry>,
+) {
+    UNREGISTERED_SESSION_BINDING_REPLACEMENTS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((
+            child_session_id.clone(),
+            (
+                ops_registry_address_for_test(replaced),
+                ops_registry_address_for_test(bound),
+            ),
+        ));
+}
+
+/// Test read: the latest replacement of `child_session_id`'s stale binding
+/// in this process, if one happened.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) fn unregistered_session_binding_replacement_for_test(
+    child_session_id: &SessionId,
+) -> Option<SessionBindingReplacementForTest> {
+    UNREGISTERED_SESSION_BINDING_REPLACEMENTS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .iter()
+        .rev()
+        .find(|(session, _)| session == child_session_id)
+        .map(|(_, replacement)| *replacement)
+}
+
+/// Test identity of an operation registry: the address of its allocation,
+/// comparable across `Arc<dyn OpsLifecycleRegistry>` and the runtime's
+/// concrete registry handle.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) fn ops_registry_address_for_test<T: ?Sized>(registry: &Arc<T>) -> usize {
+    Arc::as_ptr(registry).cast::<()>().addr()
+}
+
 #[cfg(feature = "runtime-adapter")]
 impl MobOpsAdapter {
     pub(crate) fn new() -> Self {
@@ -480,12 +535,33 @@ impl MobOpsAdapter {
         }
     }
 
+    /// Bind `child_session_id`'s operation owner to `registry`. An identical
+    /// unclaimed generic binding is an exact retry. A binding whose
+    /// registration the runtime unregistered is stale and is replaced (see
+    /// [`Self::is_unregistered_session_binding`]). Any other binding is
+    /// refused as a different incarnation.
     pub(crate) fn bind_session_registry(
         &self,
         child_session_id: SessionId,
         owner_bridge_session_id: SessionId,
         registry: Arc<dyn OpsLifecycleRegistry>,
     ) -> Result<(), MobError> {
+        self.bind_session_registry_installing(child_session_id, owner_bridge_session_id, registry)
+            .map(|_| ())
+    }
+
+    /// [`Self::bind_session_registry`], answering the binding it installed:
+    /// `Some` with its witness when this call inserted a binding (into an
+    /// empty slot, or in place of a stale one), `None` for an exact retry of
+    /// the binding the session already held. Decided in the same critical
+    /// section as the insert, so the witness names exactly the binding this
+    /// call installed.
+    pub(crate) fn bind_session_registry_installing(
+        &self,
+        child_session_id: SessionId,
+        owner_bridge_session_id: SessionId,
+        registry: Arc<dyn OpsLifecycleRegistry>,
+    ) -> Result<Option<SessionOpsBindingWitness>, MobError> {
         let member_key = MemberOpsKey::Session(child_session_id.clone());
         let mut bindings = self
             .member_bindings
@@ -496,17 +572,37 @@ impl MobOpsAdapter {
                 && Arc::ptr_eq(&existing.registry, &registry)
                 && Self::is_unclaimed_generic_session_binding(existing, &child_session_id);
             if exact_retry {
-                return Ok(());
+                return Ok(None);
             }
-            return Err(Self::different_session_binding_incarnation(
+            if !Self::is_unregistered_session_binding(existing, &child_session_id) {
+                return Err(Self::different_session_binding_incarnation(
+                    &child_session_id,
+                ));
+            }
+            tracing::info!(
+                session_id = %child_session_id,
+                "replacing the operation binding of a session whose runtime registration was unregistered"
+            );
+            #[cfg(test)]
+            record_unregistered_session_binding_replacement_for_test(
                 &child_session_id,
-            ));
+                &existing.registry,
+                &registry,
+            );
         }
-        bindings.insert(
-            member_key,
-            Self::new_generic_session_binding(child_session_id, owner_bridge_session_id, registry),
+        let binding = Self::new_generic_session_binding(
+            child_session_id,
+            owner_bridge_session_id.clone(),
+            Arc::clone(&registry),
         );
-        Ok(())
+        let installed = SessionOpsBindingWitness {
+            binding_id: binding.binding_id,
+            registry,
+            owner_bridge_session_id,
+            generic_session_child: true,
+        };
+        bindings.insert(member_key, binding);
+        Ok(Some(installed))
     }
 
     /// Re-establish the generated operation binding MobMachine authorized
@@ -578,6 +674,37 @@ impl MobOpsAdapter {
         Err(Self::different_session_binding_incarnation(
             &child_session_id,
         ))
+    }
+
+    /// Whether `existing` is stale because the runtime unregistered the
+    /// registration it names: an unclaimed generic session binding whose
+    /// registry's owner admission is `Retired`. That admission is the
+    /// registry's shell fence, not a generated machine field: it has one
+    /// writer, the runtime's unregister (`retire_owner_for_unregister`),
+    /// which closes it after the generated authority ended every operation
+    /// still live in the registry and before the unregister removes the
+    /// registration, and nothing reopens it. The revival arm already decides
+    /// a parent owner context on the same fence
+    /// (`classify_parent_owner_context`). Such a registry never
+    /// serves again and no flow rebinds or retires a binding to it: the
+    /// explicit-resume and reload flows act only on a current registration.
+    /// The registration a replacing bind names exists only once that
+    /// unregister has finished: the runtime's binding preparation joins an
+    /// unregister in flight before it registers the session again.
+    ///
+    /// A `Sealed` registry (a durability-reload discard) is not stale here:
+    /// the reload moves this exact binding to its cold successor by exact
+    /// compare. An `Open` registry, a claimed or placed binding, and an
+    /// admission the registry cannot answer are not stale either.
+    fn is_unregistered_session_binding(
+        existing: &MemberOpsBinding,
+        child_session_id: &SessionId,
+    ) -> bool {
+        Self::is_unclaimed_generic_session_binding(existing, child_session_id)
+            && matches!(
+                existing.registry.owner_admission(),
+                Ok(OpsOwnerAdmission::Retired)
+            )
     }
 
     /// Adapter-generic session binding shape shared by generated and
@@ -796,6 +923,36 @@ impl MobOpsAdapter {
         }
         bindings.remove(&member_key);
         Ok(ExplicitResumeSessionBindingRelease::Cleared)
+    }
+
+    /// Release the generic session binding a failed provision installed and
+    /// never published, while it is still exactly that binding (`installed`:
+    /// the same incarnation and registry) with no provision claim. The
+    /// attempt published no receipt, so nothing holds the binding as
+    /// established: the failed attempt leaves the session without the
+    /// binding it installed, and the session's next bind starts from that.
+    /// The operation is not touched here. Answers whether it released the
+    /// binding.
+    pub(crate) fn release_unpublished_session_binding(
+        &self,
+        child_session_id: &SessionId,
+        installed: &SessionOpsBindingWitness,
+    ) -> bool {
+        let member_key = MemberOpsKey::Session(child_session_id.clone());
+        let mut bindings = self
+            .member_bindings
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let unpublished = bindings.get(&member_key).is_some_and(|current| {
+            current.binding_id == installed.binding_id
+                && Arc::ptr_eq(&current.registry, &installed.registry)
+                && current.unpublished_attempt
+                && current.provision_claim.is_none()
+        });
+        if unpublished {
+            bindings.remove(&member_key);
+        }
+        unpublished
     }
 
     /// Release the member's session binding after a failed resumed SPAWN
