@@ -10433,9 +10433,9 @@ mod tests {
         assert_eq!(trust_effects(&live_wired), 1);
     }
 
-    /// A wake owed an endpoint (EndpointPending: a member with comms whose
-    /// endpoint arrives with its first wake) closes Live only once the endpoint
-    /// is registered, so a member with comms is reachable when Live.
+    /// A wake owing EndpointPending (a member whose endpoint its first wake
+    /// registers) closes Live only once the endpoint is registered, so a Live
+    /// member is reachable.
     #[test]
     fn a_wake_owed_an_endpoint_closes_live_only_once_it_is_registered() {
         let identity = AgentIdentity::from("endpointless-wake");
@@ -10495,12 +10495,12 @@ mod tests {
         );
     }
 
-    /// A member that owes no endpoint (it carries no EndpointPending, so it
-    /// has no comms endpoint to register) wakes and closes Live without one.
+    /// A member owing no endpoint cause (no EndpointPending) is not held
+    /// Waking for an endpoint: its wake closes Live before one is registered.
     #[test]
-    fn a_wake_that_owes_no_endpoint_closes_live_without_one() {
-        let identity = AgentIdentity::from("comms-less-wake");
-        let runtime_id = AgentRuntimeId::from("comms-less-wake:0");
+    fn a_wake_owing_no_endpoint_cause_closes_live_without_waiting_for_one() {
+        let identity = AgentIdentity::from("unowed-endpoint-wake");
+        let runtime_id = AgentRuntimeId::from("unowed-endpoint-wake:0");
         let mut seeded = MobMachineAuthority::new();
         seed_live_member(&mut seeded, &identity, &runtime_id);
         let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
@@ -10516,7 +10516,7 @@ mod tests {
                 .state()
                 .member_boot_obligation_owed
                 .contains_key(&identity),
-            "an operator wake owes no endpoint"
+            "an operator wake records no endpoint cause"
         );
         let attempt = *authority
             .state()
@@ -10534,7 +10534,7 @@ mod tests {
                 agent_identity: identity.clone(),
                 attempt,
             })
-            .expect("a wake that owes no endpoint closes Live without one");
+            .expect("a wake owing no endpoint cause closes Live");
         assert_eq!(
             authority.state().member_materialization.get(&identity),
             Some(&MemberMaterializationPhase::Live)

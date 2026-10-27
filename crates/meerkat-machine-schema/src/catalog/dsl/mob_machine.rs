@@ -13650,10 +13650,10 @@ macro_rules! mob_catalog_machine_dsl {
             guard "attempt_open" { self.member_wake_attempts.get_copied(agent_identity) == Some(attempt) }
             guard "member_is_local" { self.member_placement.contains_key(agent_identity) == false }
             guard "binding_requested" { self.member_wake_bound.contains(agent_identity) == true }
-            // A member owed EndpointPending closes Live only once its endpoint
-            // is registered (it registers it during the wake, before this
-            // step), so a member with comms is reachable when Live. A member
-            // that owes no endpoint closes Live without one.
+            // A member owing EndpointPending closes Live only once its
+            // endpoint is registered (its wake registers it before this
+            // step), so a Live member is reachable. A member owing no
+            // endpoint cause is not held Waking for one.
             guard "owed_endpoint_registered" {
                 self.member_peer_endpoints.contains_key(agent_identity) == true
                 || self.member_boot_obligation_owed.get_cloned(agent_identity) != Some(MemberBootObligationCause::EndpointPending)
