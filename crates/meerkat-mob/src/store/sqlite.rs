@@ -4537,11 +4537,22 @@ fn member_binding_store_refusal(
 
 /// Every journal event, in cursor order; every row must decode.
 fn query_member_binding_events(conn: &Connection) -> Result<Vec<MobEvent>, MobStoreError> {
+    query_member_binding_events_from(conn, 0)
+}
+
+/// The journal events whose cursor is at least `from_cursor`, in cursor
+/// order, read through the cursor key; every row must decode.
+fn query_member_binding_events_from(
+    conn: &Connection,
+    from_cursor: u64,
+) -> Result<Vec<MobEvent>, MobStoreError> {
+    // A cursor past the SQLite key domain selects no row.
+    let from_cursor = i64::try_from(from_cursor).unwrap_or(i64::MAX);
     let mut statement = conn
-        .prepare("SELECT event_json FROM mob_events ORDER BY cursor")
+        .prepare("SELECT event_json FROM mob_events WHERE cursor >= ?1 ORDER BY cursor")
         .map_err(se)?;
     let rows = statement
-        .query_map([], |row| row.get::<_, Vec<u8>>(0))
+        .query_map(params![from_cursor], |row| row.get::<_, Vec<u8>>(0))
         .map_err(se)?;
     let mut events = Vec::new();
     for row in rows {
@@ -4554,15 +4565,17 @@ fn query_member_binding_events(conn: &Connection) -> Result<Vec<MobEvent>, MobSt
     Ok(events)
 }
 
-/// Read the structural event journal and `mob_id`'s identity intent rows in
-/// one read transaction, so a member binding history and its intent-row fact
-/// come from one snapshot. Reads only; every event row must decode.
+/// Read the structural journal events whose cursor is at least
+/// `from_cursor` and `mob_id`'s identity intent rows in one read
+/// transaction, so a member binding history and its intent-row fact come
+/// from one snapshot. Reads only; every event row read must decode.
 fn read_member_binding_journal_snapshot(
     conn: &Connection,
     mob_id: &MobId,
+    from_cursor: u64,
 ) -> Result<super::MemberBindingJournalRead, MobStoreError> {
     let snapshot = conn.unchecked_transaction().map_err(se)?;
-    let events = query_member_binding_events(&snapshot)?;
+    let events = query_member_binding_events_from(&snapshot, from_cursor)?;
     let intent_rows = query_member_binding_intent_rows(&snapshot, mob_id)?;
     snapshot.commit().map_err(se)?;
     Ok(super::MemberBindingJournalRead {
@@ -6131,6 +6144,14 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         &self,
         mob_id: &MobId,
     ) -> Result<super::MemberBindingJournalRead, MobStoreError> {
+        self.read_member_binding_journal_from(mob_id, 0).await
+    }
+
+    async fn read_member_binding_journal_from(
+        &self,
+        mob_id: &MobId,
+        from_cursor: u64,
+    ) -> Result<super::MemberBindingJournalRead, MobStoreError> {
         if self.event_bus.is_none() {
             return Err(MobStoreError::IdentityMemberAtomicPersistenceUnavailable);
         }
@@ -6139,7 +6160,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let mob_id = mob_id.clone();
         run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
-            read_member_binding_journal_snapshot(&conn, &mob_id)
+            read_member_binding_journal_snapshot(&conn, &mob_id, from_cursor)
         })
         .await
     }
@@ -16250,6 +16271,71 @@ mod tests {
         let db_path = dir.path().join("realm_profiles.db");
         let store = SqliteRealmProfileStore::open(&db_path).unwrap();
         contract_tests::test_list(&store).await;
+    }
+
+    // The SQLite member binding journal tail reads the events from its
+    // cursor on through the cursor key, with the same intent rows, in one
+    // read transaction: from 0 it is the whole journal, past the last cursor
+    // (or past the key domain) it is empty.
+    #[tokio::test]
+    async fn sqlite_member_binding_journal_tail_is_the_whole_read_from_its_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let storage =
+            crate::MobStorage::persistent(dir.path().join("mob.db")).expect("open the mob store");
+        let mob_id = MobId::from("mob");
+        for owner in ["mob", "other-mob", "mob", "mob", "other-mob"] {
+            storage
+                .events
+                .append(NewMobEvent {
+                    mob_id: MobId::from(owner),
+                    timestamp: None,
+                    kind: MobEventKind::MobCompleted,
+                })
+                .await
+                .expect("append");
+        }
+        let store = storage
+            .identity_member
+            .clone()
+            .expect("the SQLite storage has the identity member store");
+        let whole = store
+            .read_member_binding_journal(&mob_id)
+            .await
+            .expect("read the whole journal");
+        assert_eq!(
+            whole.events.len(),
+            5,
+            "the journal holds every mob's events"
+        );
+        for from_cursor in 0..=7u64 {
+            let tail = store
+                .read_member_binding_journal_from(&mob_id, from_cursor)
+                .await
+                .expect("read the journal tail");
+            let expected = whole
+                .events
+                .iter()
+                .filter(|event| event.cursor >= from_cursor)
+                .map(|event| event.cursor)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                tail.events
+                    .iter()
+                    .map(|event| event.cursor)
+                    .collect::<Vec<_>>(),
+                expected,
+                "the tail from {from_cursor}"
+            );
+            assert_eq!(tail.intent_rows, whole.intent_rows);
+        }
+        assert!(
+            store
+                .read_member_binding_journal_from(&mob_id, u64::MAX)
+                .await
+                .expect("read past the key domain")
+                .events
+                .is_empty()
+        );
     }
 }
 

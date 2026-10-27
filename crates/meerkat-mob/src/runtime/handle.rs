@@ -6215,6 +6215,9 @@ pub struct MobHandle {
     /// composition has one: member binding history reads its journal and
     /// identity intent rows in one store transaction. Read-only here.
     pub(super) identity_member: Option<Arc<dyn crate::store::MobIdentityMemberStore>>,
+    /// The member binding fold this handle and its clones keep between
+    /// member binding history reads, so a read folds only the journal tail.
+    pub(super) member_binding_fold: Arc<super::delivery_scope::MemberBindingFoldCache>,
     pub(super) run_store: Arc<dyn MobRunStore>,
     pub(super) runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
     pub(super) flow_streams:
@@ -9913,6 +9916,18 @@ impl MobHandle {
     pub(super) fn project_remote_turn_custody_is_quiet_from_current_machine_state(&self) -> bool {
         let machine_state = self.machine_state_watch_rx.borrow();
         super::remote_turn_reconciler::remote_turn_custody_is_quiet(&machine_state)
+    }
+
+    /// Whether any member is placed on a host, from the published machine
+    /// state: MobMachine records a remote turn only for a placed member, so
+    /// the remote-turn reconciler's scan of a mob without one can skip its
+    /// private rows.
+    pub(super) fn project_any_member_placed_from_current_machine_state(&self) -> bool {
+        !self
+            .machine_state_watch_rx
+            .borrow()
+            .member_placement
+            .is_empty()
     }
 
     /// Observation-only member projection that never enters the mob actor queue.

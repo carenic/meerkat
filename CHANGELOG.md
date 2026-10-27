@@ -513,6 +513,35 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
+- `meerkat-mob`: reading a mob's member binding history
+  (`MobHandle::member_binding_history`, and `last_member_binding`,
+  `member_binding_for_session`, `durable_identity_members` and
+  `identity_management`, which read it) no longer reads the mob's whole
+  event journal each time. A handle and its clones keep the fold between
+  reads: a read reads only the events appended since the previous one,
+  together with the identity intent rows in one store transaction, so its
+  cost no longer grows with the mob's history. Before, every read decoded
+  every stored event on a SQLite store and copied the whole journal on the
+  in-memory and host stores (on a host store while holding the mob's write
+  lock), so a host that reads the history on every page load or message got
+  slower as the journal grew. A journal that a destroy cleared is read whole
+  again.
+- `meerkat-mob`: a mob with no member placed on a host no longer reads every
+  flow run it ever started on each burst of mob events. The remote-turn
+  reconciler that every mob runs listed every run and replayed each run's
+  flow authority log to validate it, about once per 100 ms while events
+  arrived. It now skips that scan while no member is placed on a host and
+  its last scan found nothing to do, and scans again once a member is
+  placed. Its in-memory copy of the mob's current events now keeps only the
+  run starts, step dispatches and remote-turn records it reads, instead of
+  every event of the mob, step outputs included.
+- `meerkat-mob`: reading a mob's events after a cursor (`poll`, `poll_events`,
+  the `mob/events` RPC, and an event subscription catching up from a cursor)
+  on the in-memory and host-store mob stores finds the first event by binary
+  search instead of scanning the event log from its start, and a host-store
+  event append exports its new events the same way. A subscription catching
+  up from an old cursor no longer slows down with the square of the log's
+  length.
 
 ### Known limitations
 

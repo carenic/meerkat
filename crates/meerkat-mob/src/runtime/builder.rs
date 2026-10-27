@@ -9145,6 +9145,7 @@ impl MobBuilder {
                 definition: definition.clone(),
                 events: storage.events.clone(),
                 identity_member: storage.identity_member.clone(),
+                member_binding_fold: Arc::default(),
                 run_store: storage.runs.clone(),
                 runtime_metadata: storage.runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -10789,6 +10790,7 @@ impl MobBuilder {
                 definition: definition.clone(),
                 events: events.clone(),
                 identity_member: identity_member.clone(),
+                member_binding_fold: Arc::default(),
                 run_store: run_store.clone(),
                 runtime_metadata: runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -11094,6 +11096,7 @@ impl MobBuilder {
                 runtime_metadata,
                 identity,
                 identity_member,
+                member_binding_fold: handle.member_binding_fold.clone(),
                 identity_status,
                 #[cfg(not(target_arch = "wasm32"))]
                 identity_status_projection_order,

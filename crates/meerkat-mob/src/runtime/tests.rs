@@ -7077,6 +7077,10 @@ struct RecordingRunStore {
     inner: InMemoryMobRunStore,
     fail_create_run_once: AtomicBool,
     snapshot_cas_history: RwLock<Vec<(RunId, MobRunStatus, MobRunStatus)>>,
+    /// Every `list_runs` call, counted.
+    list_runs_calls: AtomicU64,
+    /// The runs whose remote-turn intents were listed, in call order.
+    listed_intent_runs: Mutex<Vec<RunId>>,
 }
 
 impl RecordingRunStore {
@@ -7085,6 +7089,8 @@ impl RecordingRunStore {
             inner: InMemoryMobRunStore::new(),
             fail_create_run_once: AtomicBool::new(false),
             snapshot_cas_history: RwLock::new(Vec::new()),
+            list_runs_calls: AtomicU64::new(0),
+            listed_intent_runs: Mutex::new(Vec::new()),
         }
     }
 
@@ -7094,6 +7100,17 @@ impl RecordingRunStore {
 
     async fn snapshot_cas_history(&self) -> Vec<(RunId, MobRunStatus, MobRunStatus)> {
         self.snapshot_cas_history.read().await.clone()
+    }
+
+    fn list_runs_calls(&self) -> u64 {
+        self.list_runs_calls.load(Ordering::SeqCst)
+    }
+
+    fn listed_intent_runs(&self) -> Vec<RunId> {
+        self.listed_intent_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 }
 
@@ -7117,7 +7134,62 @@ impl MobRunStore for RecordingRunStore {
         mob_id: &MobId,
         flow_id: Option<&crate::FlowId>,
     ) -> Result<Vec<MobRun>, MobStoreError> {
+        self.list_runs_calls.fetch_add(1, Ordering::SeqCst);
         self.inner.list_runs(mob_id, flow_id).await
+    }
+
+    async fn put_remote_turn_intent(
+        &self,
+        run_id: &RunId,
+        intent: &crate::run::MobRunRemoteTurnIntent,
+    ) -> Result<bool, MobStoreError> {
+        self.inner.put_remote_turn_intent(run_id, intent).await
+    }
+
+    async fn delete_remote_turn_intent(
+        &self,
+        run_id: &RunId,
+        dispatch_sequence: u64,
+    ) -> Result<bool, MobStoreError> {
+        self.inner
+            .delete_remote_turn_intent(run_id, dispatch_sequence)
+            .await
+    }
+
+    async fn list_remote_turn_intents(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<crate::run::MobRunRemoteTurnIntent>, MobStoreError> {
+        self.listed_intent_runs
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(run_id.clone());
+        self.inner.list_remote_turn_intents(run_id).await
+    }
+
+    async fn put_remote_turn_receipt(
+        &self,
+        run_id: &RunId,
+        receipt: &crate::run::MobRunRemoteTurnReceipt,
+    ) -> Result<bool, MobStoreError> {
+        self.inner.put_remote_turn_receipt(run_id, receipt).await
+    }
+
+    async fn list_remote_turn_receipts(
+        &self,
+        run_id: &RunId,
+    ) -> Result<Vec<crate::run::MobRunRemoteTurnReceipt>, MobStoreError> {
+        self.inner.list_remote_turn_receipts(run_id).await
+    }
+
+    async fn delete_remote_turn_receipt(
+        &self,
+        run_id: &RunId,
+        dispatch_sequence: u64,
+    ) -> Result<bool, MobStoreError> {
+        self.inner
+            .delete_remote_turn_receipt(run_id, dispatch_sequence)
+            .await
     }
 
     async fn append_step_entry_with_authority(
@@ -13012,6 +13084,373 @@ async fn create_test_mob_with_run_store(
         .expect("create mob");
 
     (handle, service)
+}
+
+/// The built-in identity member store of a test storage, counting the
+/// journal events its member binding history reads return.
+struct CountingJournalReads {
+    inner: Arc<dyn crate::store::MobIdentityMemberStore>,
+    rows_read: AtomicU64,
+}
+
+impl CountingJournalReads {
+    fn rows_read(&self) -> u64 {
+        self.rows_read.load(Ordering::SeqCst)
+    }
+
+    fn count(&self, read: &crate::store::MemberBindingJournalRead) {
+        self.rows_read
+            .fetch_add(read.events.len() as u64, Ordering::SeqCst);
+    }
+}
+
+#[async_trait]
+impl crate::store::MobIdentityMemberStore for CountingJournalReads {
+    async fn observe_identity_member_target(
+        &self,
+        mob_id: &MobId,
+        identity: &AgentIdentity,
+    ) -> Result<crate::store::IdentityMemberTargetObservation, MobStoreError> {
+        self.inner
+            .observe_identity_member_target(mob_id, identity)
+            .await
+    }
+
+    async fn commit_identity_member_spawned(
+        &self,
+        permit: &crate::identity::IdentityActuationPermit,
+        event: &crate::event::NewMobEvent,
+    ) -> Result<crate::store::IdentityMemberEventCommitOutcome, MobStoreError> {
+        self.inner
+            .commit_identity_member_spawned(permit, event)
+            .await
+    }
+
+    async fn observe_identity_wiring_target(
+        &self,
+        mob_id: &MobId,
+        identity: &AgentIdentity,
+    ) -> Result<crate::store::IdentityWiringTargetObservation, MobStoreError> {
+        self.inner
+            .observe_identity_wiring_target(mob_id, identity)
+            .await
+    }
+
+    async fn commit_identity_wiring_event(
+        &self,
+        permit: &crate::identity::IdentityActuationPermit,
+        event: &crate::event::NewMobEvent,
+    ) -> Result<crate::store::IdentityWiringEventCommitOutcome, MobStoreError> {
+        self.inner.commit_identity_wiring_event(permit, event).await
+    }
+
+    async fn read_member_binding_journal(
+        &self,
+        mob_id: &MobId,
+    ) -> Result<crate::store::MemberBindingJournalRead, MobStoreError> {
+        let read = self.inner.read_member_binding_journal(mob_id).await?;
+        self.count(&read);
+        Ok(read)
+    }
+
+    async fn read_member_binding_journal_from(
+        &self,
+        mob_id: &MobId,
+        from_cursor: u64,
+    ) -> Result<crate::store::MemberBindingJournalRead, MobStoreError> {
+        let read = self
+            .inner
+            .read_member_binding_journal_from(mob_id, from_cursor)
+            .await?;
+        self.count(&read);
+        Ok(read)
+    }
+}
+
+// A console-load-shaped pair of member binding history reads: after one
+// more member joins, the second read reads only the journal events appended
+// since the first and the event the first ended at, not the whole journal,
+// and answers what a fold of the whole journal answers. Before, every read
+// read the whole journal.
+#[tokio::test]
+async fn a_second_member_binding_history_read_reads_only_the_journal_tail() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let mut storage = MobStorage::in_memory();
+    let built_in = storage
+        .identity_member
+        .clone()
+        .expect("the in-memory storage has the identity member store");
+    let counting = Arc::new(CountingJournalReads {
+        inner: Arc::clone(&built_in),
+        rows_read: AtomicU64::new(0),
+    });
+    storage.identity_member =
+        Some(Arc::clone(&counting) as Arc<dyn crate::store::MobIdentityMemberStore>);
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    for name in ["tail-a", "tail-b", "tail-c"] {
+        handle
+            .spawn_spec(SpawnMemberSpec::new("worker", AgentIdentity::from(name)))
+            .await
+            .expect("spawn a member");
+    }
+    let first = handle
+        .member_binding_history()
+        .await
+        .expect("the first read");
+    assert!(first.journal_cursor() > 0, "the spawns wrote the journal");
+    handle
+        .spawn_spec(SpawnMemberSpec::new(
+            "worker",
+            AgentIdentity::from("tail-d"),
+        ))
+        .await
+        .expect("spawn one more member");
+    let before_second = counting.rows_read();
+    let second = handle
+        .member_binding_history()
+        .await
+        .expect("the second read");
+    let second_rows = counting.rows_read() - before_second;
+    let appended = second.journal_cursor() - first.journal_cursor();
+    assert!(appended > 0, "the spawn appended journal events");
+    assert_eq!(
+        second_rows,
+        appended + 1,
+        "the second read reads the events appended since the first and the one it ended at"
+    );
+    assert!(
+        second_rows < second.journal_cursor(),
+        "the second read does not read the whole journal"
+    );
+    let whole = built_in
+        .read_member_binding_journal(handle.mob_id())
+        .await
+        .expect("read the whole journal");
+    let reference =
+        MemberBindingHistory::from_journal(&whole.events, whole.intent_rows, Some(handle.mob_id()));
+    assert_eq!(format!("{second:?}"), format!("{reference:?}"));
+}
+
+/// One structural event of `handle`'s mob that carries no remote-turn work.
+async fn append_quiet_event(handle: &MobHandle) {
+    handle
+        .events
+        .append(crate::event::NewMobEvent {
+            mob_id: handle.mob_id().clone(),
+            timestamp: None,
+            kind: MobEventKind::TopologyViolation {
+                from_role: ProfileName::from("worker"),
+                to_role: ProfileName::from("lead"),
+            },
+        })
+        .await
+        .expect("append a structural event");
+}
+
+/// Wait until `run_store` listed runs at least `at_least` times; answers
+/// the count then.
+async fn wait_for_run_listings(run_store: &RecordingRunStore, at_least: u64) -> u64 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        let calls = run_store.list_runs_calls();
+        if calls >= at_least {
+            return calls;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "runs were listed {calls} times, not {at_least}"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+// A local-only mob's remote-turn reconciler lists no runs for the events
+// after its first, quiescent scan: no member is placed on a host, so the
+// events carry no remote-turn work and the scan skips the private rows.
+// Before, each event burst listed (and re-validated) every run.
+#[tokio::test]
+async fn a_local_mobs_remote_turn_scan_lists_no_runs_per_event_burst() {
+    let run_store = Arc::new(RecordingRunStore::new());
+    let (handle, _service) =
+        create_test_mob_with_run_store(sample_definition(), run_store.clone()).await;
+    let after_first_scan = wait_for_run_listings(&run_store, 1).await;
+    for _ in 0..3 {
+        append_quiet_event(&handle).await;
+        // Past the reconciler's 100 ms debounce: each event is a burst.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        run_store.list_runs_calls(),
+        after_first_scan,
+        "an event of a mob without a placed member lists no runs"
+    );
+}
+
+/// A remote turn's private intent row for `step_id` of `run_id`, dispatched
+/// to the placed `remote-worker`.
+fn placed_turn_intent(
+    mob_id: &MobId,
+    run_id: &RunId,
+    step_id: &crate::ids::StepId,
+) -> crate::run::MobRunRemoteTurnIntent {
+    use meerkat_contracts::wire::supervisor_bridge::{
+        BridgeMemberIncarnation, BridgeTurnCorrelation, BridgeTurnDirective,
+    };
+    let identity = AgentIdentity::from("remote-worker");
+    let obligation = crate::event::RemoteTurnObligationEvent {
+        agent_identity: identity.clone(),
+        host_id: "host-b".to_string(),
+        host_binding_generation: 1,
+        member_session_id: "member-session".to_string(),
+        generation: Generation::new(1),
+        fence_token: FenceToken::new(7),
+        dispatch_sequence: 41,
+        input_id: meerkat_core::time_compat::new_uuid_v7().to_string(),
+        run_id: run_id.clone(),
+        step_id: step_id.clone(),
+    };
+    crate::run::MobRunRemoteTurnIntent {
+        expected_member: BridgeMemberIncarnation {
+            mob_id: mob_id.to_string(),
+            agent_identity: identity.to_string(),
+            host_id: obligation.host_id.clone(),
+            binding_generation: obligation.host_binding_generation,
+            member_session_id: obligation.member_session_id.clone(),
+            generation: obligation.generation.get(),
+            fence_token: obligation.fence_token.get(),
+        },
+        content: ContentInput::from("do it"),
+        handling_mode: meerkat_core::types::HandlingMode::Queue,
+        directive: BridgeTurnDirective {
+            correlation: BridgeTurnCorrelation {
+                run_id: run_id.to_string(),
+                step_id: step_id.to_string(),
+            },
+            tool_overlay: None,
+        },
+        obligation,
+    }
+}
+
+// The scan gate reopens with a placement. A reconciler over a mob without a
+// placed member lists no runs per event; once the published machine state
+// places a member on a host, the next event's scan lists the runs again and
+// reads their private rows, so a remote turn recorded after the placement is
+// reconciled.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test]
+async fn a_placement_reopens_the_remote_turn_scan() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let run_store = Arc::new(RecordingRunStore::new());
+    let (machine_state_tx, machine_state_rx) =
+        tokio::sync::watch::channel(handle.machine_state_watch_rx.borrow().clone());
+    let reconciled = MobHandle {
+        machine_state_watch_rx: machine_state_rx,
+        run_store: crate::store::authority_validating_mob_run_store(run_store.clone()),
+        ..handle.clone()
+    };
+    let provisioner: Arc<dyn super::provisioner::MobProvisioner> = Arc::new(
+        super::provisioner::SessionBackend::new(service.clone(), None, None),
+    );
+    let tickets = super::actor_turn_executor::ActorFlowTurnExecutor::new(
+        reconciled.clone(),
+        Arc::clone(&provisioner),
+    )
+    .remote_flow_ticket_registry();
+    let event_seed = super::remote_turn_reconciler::RemoteTurnEventSeed {
+        last_cursor: handle
+            .events
+            .latest_cursor()
+            .await
+            .expect("read the latest cursor"),
+        epoch_events: Vec::new(),
+    };
+    let reconciler = tokio::spawn(
+        super::remote_turn_reconciler::RemoteTurnIntentReconciler::run_owned(
+            handle.mob_id().clone(),
+            reconciled,
+            provisioner,
+            tickets,
+            BTreeSet::new(),
+            event_seed,
+        ),
+    );
+    let after_first_scan = wait_for_run_listings(&run_store, 1).await;
+    for _ in 0..2 {
+        append_quiet_event(&handle).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+    assert_eq!(
+        run_store.list_runs_calls(),
+        after_first_scan,
+        "an event of a mob without a placed member lists no runs"
+    );
+
+    // A member is placed on a host ...
+    machine_state_tx.send_modify(|state| {
+        state.member_placement.insert(
+            crate::machines::mob_machine::AgentIdentity("remote-worker".to_string()),
+            crate::machines::mob_machine::HostId("host-b".to_string()),
+        );
+    });
+    // ... and a remote turn is recorded after it: its run, its private
+    // intent row and its dispatch.
+    let run_id = RunId::new();
+    let step_id = crate::ids::StepId::from("step");
+    let run = MobRun::authority_backed_for_steps(
+        run_id.clone(),
+        handle.mob_id().clone(),
+        crate::ids::FlowId::from("flow"),
+        [step_id.clone()],
+        MobRunStatus::Running,
+        serde_json::json!({}),
+    )
+    .expect("an authority-backed run");
+    run_store.create_run(run).await.expect("create the run");
+    run_store
+        .put_remote_turn_intent(
+            &run_id,
+            &placed_turn_intent(handle.mob_id(), &run_id, &step_id),
+        )
+        .await
+        .expect("record the private intent");
+    for kind in [
+        MobEventKind::FlowStarted {
+            run_id: run_id.clone(),
+            flow_id: crate::ids::FlowId::from("flow"),
+            params: serde_json::json!({}),
+        },
+        MobEventKind::StepDispatched {
+            run_id: run_id.clone(),
+            step_id: step_id.clone(),
+            target: AgentRuntimeId::new(AgentIdentity::from("remote-worker"), Generation::new(1)),
+        },
+    ] {
+        handle
+            .events
+            .append(crate::event::NewMobEvent {
+                mob_id: handle.mob_id().clone(),
+                timestamp: None,
+                kind,
+            })
+            .await
+            .expect("append the dispatch");
+    }
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !run_store.listed_intent_runs().contains(&run_id) {
+        assert!(
+            Instant::now() < deadline,
+            "the scan after the placement never read the run's private rows"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(run_store.list_runs_calls() > after_first_scan);
+    reconciler.abort();
 }
 
 struct UnusedFlowTurnExecutor;
