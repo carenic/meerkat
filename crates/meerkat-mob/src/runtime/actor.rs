@@ -5332,6 +5332,46 @@ async fn pause_before_startup_binding_restore_if_armed(mob_id: &MobId) {
     }
 }
 
+/// One armed hold of a lift's operation binding of one member: the binding
+/// reports reaching it, then waits for its release.
+#[cfg(test)]
+type ExplicitResumeMemberBindingHold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+#[cfg(test)]
+static HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), ExplicitResumeMemberBindingHold>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Test seam: the next explicit resume of `mob_id` holds its post-commit
+/// operation binding of `member` before that binding starts (a gated step of
+/// the lift's post-commit work). The receiver resolves once the binding
+/// reached the hold; sending on, or dropping, the sender releases it.
+#[cfg(test)]
+pub(super) fn hold_explicit_resume_member_binding_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    if let Ok(mut armed) = HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST.lock() {
+        armed.insert((mob_id.clone(), member.clone()), (entered_tx, release_rx));
+    }
+    (entered_rx, release_tx)
+}
+
+/// The hold armed for `member`'s post-commit operation binding in `mob_id`,
+/// taken once.
+#[cfg(test)]
+fn take_explicit_resume_member_binding_hold_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> Option<ExplicitResumeMemberBindingHold> {
+    HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST
+        .lock()
+        .ok()
+        .and_then(|mut armed| armed.remove(&(mob_id.clone(), member.clone())))
+}
+
 /// How many times a startup restore took each member's stopped registration
 /// over, per mob.
 #[cfg(test)]

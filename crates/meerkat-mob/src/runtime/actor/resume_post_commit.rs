@@ -78,10 +78,20 @@ impl MobActor {
                     Ok(Some(plan)) => {
                         let identity = plan.entry.agent_identity.clone();
                         let io = io.clone();
+                        #[cfg(test)]
+                        let hold = super::take_explicit_resume_member_binding_hold_for_test(
+                            &self.definition.id,
+                            &identity,
+                        );
                         self.spawn_resume_post_commit_member(
                             ResumePostCommitStep::OperationBindings,
                             identity,
                             boxed_arm_future(|| async move {
+                                #[cfg(test)]
+                                if let Some((entered, release)) = hold {
+                                    let _ = entered.send(());
+                                    let _ = release.await;
+                                }
                                 Self::realize_restored_member_operation_binding(
                                     io,
                                     plan,

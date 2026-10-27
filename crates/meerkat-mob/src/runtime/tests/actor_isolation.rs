@@ -34,6 +34,8 @@ mod crash_restart_lease_reclaim;
 mod degraded_retirement;
 #[path = "degraded_shutdown.rs"]
 mod degraded_shutdown;
+#[path = "lift_post_commit_rows.rs"]
+mod lift_post_commit_rows;
 #[path = "reload_lane.rs"]
 mod reload_lane;
 #[path = "run_start_staging.rs"]
