@@ -45278,6 +45278,10 @@ impl MobActor {
             // A local member that is not materialized installs no trust now:
             // its wake's topology step trusts the placed member from machine
             // state; the placed side rides the obligations recorded below.
+            // The wire itself wakes it: a placed member cannot use its
+            // in-process wake route, so MobMachine's wire opens the member's
+            // wake (cause PlacedPeerWired), and the apply below realizes that
+            // materialization with the transition's other residency effects.
             (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::Placed { .. })
             | (WiringEndpoint::Placed { .. }, WiringEndpoint::LocalDormant { .. }) => None,
             (WiringEndpoint::PeerOnly { .. }, _) | (_, WiringEndpoint::PeerOnly { .. }) => {

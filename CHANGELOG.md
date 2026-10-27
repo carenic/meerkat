@@ -110,7 +110,9 @@ them.
   status reports its peer connectivity from MobMachine's membership and its
   capabilities from the catalog model its wake binds (its profile with its
   model override). Wiring and unwiring
-  with a Dormant member commit the edge without waking it, and lifecycle
+  with a Dormant member commit the edge without waking it (except a new edge
+  to a placed member, which wakes it: the placed member, in another process,
+  cannot use its in-process wake route), and lifecycle
   notices to or from a member that is not materialized are not sent (its
   wake installs the trust they carry). A kickoff status notice is content,
   not a lifecycle notice: it wakes a Dormant recipient and is delivered. This holds for an edge to an external

@@ -2301,3 +2301,101 @@ async fn placed_member_external_install_and_removal_rejections_are_typed() {
     );
     scripted.shutdown();
 }
+
+// ==========================================================================
+// A new edge to a placed member wakes a Dormant local member
+// ==========================================================================
+
+/// A Dormant local member that a new edge joins to a member placed on
+/// another host is woken by the wire itself: the placed member cannot use
+/// the member's in-process wake route, so MobMachine's wire opens the
+/// member's wake, and the member is Live with no touch. The placed member
+/// then reaches it over the installed route.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-support")]
+async fn wiring_a_dormant_member_to_a_placed_member_wakes_it_and_the_placed_member_reaches_it() {
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
+    let _guard = REAL_COMMS_TEST_LOCK.lock().await;
+    let fixture = spawn_host_daemon_fixture(
+        HostFixtureOptions::named("xhw-dormant-wire-host-b").with_member_build(),
+    )
+    .await
+    .expect("spawn member-build host fixture");
+    let controlling = create_controlling_mob("xhw-dormant-wire").await;
+    let report = controlling.bind_fixture(&fixture).await;
+    let mob_id = controlling.mob_id.to_string();
+    spawn_local_worker(&controlling, "a1").await;
+    controlling
+        .spawn_placed("worker", "b2", &report.host_id)
+        .await
+        .expect("b2 materializes on host B");
+
+    // a1 is made Dormant: its registration is released once it is quiescent
+    // (a release is refused retryably until its runtime binding landed).
+    wait_until("a1 to be released", || async {
+        controlling
+            .handle
+            .release_member(&identity("a1"))
+            .await
+            .is_ok()
+    })
+    .await;
+    wait_until("a1 to be Dormant", || async {
+        controlling
+            .handle
+            .member_materialization_for_test(&identity("a1"))
+            == Some(MemberMaterializationPhase::Dormant)
+    })
+    .await;
+
+    controlling
+        .handle
+        .wire(identity("a1"), identity("b2"))
+        .await
+        .expect("wire the dormant a1 to the placed b2");
+    wait_until("the wire to wake a1", || async {
+        controlling
+            .handle
+            .member_materialization_for_test(&identity("a1"))
+            == Some(MemberMaterializationPhase::Live)
+    })
+    .await;
+    wait_until("the route installs to settle", || async {
+        route_installs_at_rest(&controlling).await
+    })
+    .await;
+
+    let b2_row = fixture
+        .host_binding_record(&mob_id)
+        .await
+        .materialized
+        .get("b2")
+        .cloned()
+        .expect("b2 materialized row on host B");
+    let a1_session = controlling.member_session_id(&identity("a1")).await;
+    let a1_runtime = controlling.member_comms_runtime(&a1_session).await;
+    let a1_peer = a1_runtime.peer_id().expect("a1 peer id");
+    wait_until("b2 to trust the woken a1", || async {
+        fixture
+            .member_trusts_peer(&b2_row.session_id, &a1_peer.to_string())
+            .await
+    })
+    .await;
+    let b2_runtime = fixture.member_comms_runtime(&b2_row.session_id).await;
+    let receipt = send_peer_text(&b2_runtime, a1_peer, "b2 reaches a1, woken by the wire")
+        .await
+        .expect("b2 -> a1 delivers");
+    assert!(
+        peer_message_receipt_proves_admission(&receipt),
+        "b2 -> a1 must be receiver-acked, got {receipt:?}"
+    );
+    assert_eq!(
+        controlling
+            .handle
+            .member_materialization_for_test(&identity("a1")),
+        Some(MemberMaterializationPhase::Live),
+        "a1 stays Live: a member wired to a placed member is not released"
+    );
+    fixture.shutdown().await;
+}
