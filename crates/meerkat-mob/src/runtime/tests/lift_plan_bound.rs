@@ -780,7 +780,7 @@ async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
     }
     assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
     assert!(
-        matches!(stopped, Ok(Ok(()))),
+        matches!(stopped, Ok(Ok(_))),
         "a Stop after the lift is served: {stopped:?}"
     );
 }
