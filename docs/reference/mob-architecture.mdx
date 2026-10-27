@@ -97,6 +97,16 @@ read-only and never creates or migrates it. A missing file is
 store this build reads is `ForeignSchema`; a store that holds no mob answers
 an empty history.
 
+A binding can name a session no store holds yet. A seat, or a rotation's next
+life, builds nothing: the member's first wake creates its session under the id
+the seat named, so until then the session is unborn, not lost. The history's
+`session_unborn(session_id)` answers it, read from the journal rows the mob's
+own restart restores the fact from, and `MobHandle::session_unborn(session_id)`
+answers it on a running mob. A host that checks a stopped store for bindings
+whose sessions are missing leaves unborn sessions out. A member retired before
+its first wake leaves its session unborn. `MobHandle::member_history` of a
+member whose session is unborn answers an empty page and does not wake it.
+
 ### One-shot durable role migration
 
 Role is durable context, but it is not member identity. `MemberLaunchMode::Resume`

@@ -551,3 +551,162 @@ async fn an_eager_start_with_one_failing_seat_create_leaves_only_that_member_dor
         "its session is created once, under its seat id"
     );
 }
+
+/// The member binding history reads MobMachine's unborn-seat fact from the
+/// journal rows the machine's own replay restores it from, folded the same
+/// way. For every session a seat, a first wake, a rotation and a retirement
+/// before a first wake leave, the history's `session_unborn` equals the live
+/// machine's (`MobHandle::session_unborn`), and both equal what each step
+/// leaves: before a restart, and after the restart rebuilt the machine from
+/// the same journal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds_it() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let definition = with_unique_mob_id(sample_definition(), "unborn-history");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .with_member_comms_identity_root(keys.path())
+        .create()
+        .await
+        .expect("create the mob");
+    let spec = |identity: &AgentIdentity| {
+        let mut spec = SpawnMemberSpec::new("worker", identity.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        spec
+    };
+    let woken = AgentIdentity::from("unborn-history-woken");
+    let dormant = AgentIdentity::from("unborn-history-dormant");
+    let retired = AgentIdentity::from("unborn-history-retired");
+    let outcomes = handle
+        .seat_dormant_members(vec![spec(&woken), spec(&dormant), spec(&retired)])
+        .await
+        .expect("the seat batch answers");
+    let sessions = outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            DormantSeatOutcome::Seated { session_id, .. } => session_id.clone(),
+            other => panic!("every fresh spec is seated: {other:?}"),
+        })
+        .collect::<Vec<_>>();
+    handle
+        .ensure_member_live(&woken)
+        .await
+        .expect("the first wake creates the session");
+    let rotated = tokio::time::timeout(STEP, handle.rotate_member(spec(&woken)))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation seats the next incarnation");
+    tokio::time::timeout(STEP, handle.retire(retired.clone()))
+        .await
+        .expect("the retirement answers")
+        .expect("a member retired before its first wake");
+
+    let expected = [
+        (sessions[0].clone(), false, "created by the first wake"),
+        (rotated, true, "the rotation's next session"),
+        (sessions[1].clone(), true, "never woken"),
+        (sessions[2].clone(), true, "retired before its first wake"),
+        (SessionId::new(), false, "never named"),
+    ];
+    let history_of = |journal: &[MobEvent], handle: &MobHandle| {
+        crate::runtime::MemberBindingHistory::from_journal(
+            journal,
+            BTreeMap::new(),
+            Some(handle.mob_id()),
+        )
+    };
+    let journal = events.replay_all().await.expect("read the journal");
+    let history = history_of(&journal, &handle);
+    let read = handle
+        .member_binding_history()
+        .await
+        .expect("the running mob reads its binding history");
+    for (session, unborn, shape) in &expected {
+        assert_eq!(history.session_unborn(session), *unborn, "history: {shape}");
+        assert_eq!(read.session_unborn(session), *unborn, "read: {shape}");
+        assert_eq!(handle.session_unborn(session), *unborn, "machine: {shape}");
+    }
+
+    crash_stop_and_release_routes(handle).await;
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    let handle = tokio::time::timeout(
+        STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events.clone(),
+                runtime_metadata.clone(),
+            ))
+            .with_session_service(restarted.clone())
+            .with_member_comms_identity_root(keys.path())
+            .with_member_restore_policy(MemberRestorePolicy::OnDemand)
+            .notify_orchestrator_on_resume(false)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the restart answers")
+    .expect("the restart succeeds");
+    let journal = events.replay_all().await.expect("read the journal");
+    let history = history_of(&journal, &handle);
+    for (session, unborn, shape) in &expected {
+        assert_eq!(
+            history.session_unborn(session),
+            *unborn,
+            "history after the restart: {shape}"
+        );
+        assert_eq!(
+            handle.session_unborn(session),
+            *unborn,
+            "replayed machine: {shape}"
+        );
+    }
+}
+
+/// A member whose session is unborn has no history yet: its member history
+/// reads an empty page, without waking it or creating the session. Its
+/// first wake creates the session, and the read then reads that session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_whose_session_is_unborn_reads_an_empty_history() {
+    let mob = SeatedMob::new("unborn-history-read").await;
+    assert!(mob.unborn(), "the seat built nothing");
+    let page = mob
+        .handle
+        .member_history(
+            crate::control_policy::MobControlPrincipal::Owner,
+            mob.identity.clone(),
+            None,
+            Some(16),
+        )
+        .await
+        .expect("the history of an unborn session reads");
+    assert!(page.page.messages.is_empty(), "{page:?}");
+    assert_eq!(page.page.message_count, 0);
+    assert!(mob.unborn(), "the read did not create the session");
+    assert_eq!(
+        mob.phase(),
+        Some(dsl::MemberMaterializationPhase::Dormant),
+        "the read did not wake the member"
+    );
+    assert_eq!(mob.creates_of_the_session().await, 0);
+
+    mob.handle
+        .ensure_member_live(&mob.identity)
+        .await
+        .expect("the first wake creates the session");
+    assert!(!mob.unborn(), "the session is born");
+    mob.handle
+        .member_history(
+            crate::control_policy::MobControlPrincipal::Owner,
+            mob.identity.clone(),
+            None,
+            Some(16),
+        )
+        .await
+        .expect("the history of the created session reads");
+}

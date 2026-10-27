@@ -1349,6 +1349,52 @@ fn is_ephemeral_continuity(intent: &crate::runtime::SpawnContinuityIntent) -> bo
     matches!(intent, crate::runtime::SpawnContinuityIntent::Ephemeral)
 }
 
+/// What one journal row records of MobMachine's unborn-seat fact
+/// (`member_seat_session_unborn` and `unborn_seat_sessions`): the row of a
+/// seat or a rotation that built nothing marks the member's session unborn,
+/// and the row its first wake writes once it created the session marks it
+/// born. Replay restores the machine's fact from these rows
+/// (`RecoverMemberSeatSession`), and the member binding history folds the
+/// same rows the same way, so the offline read and the machine answer one
+/// fact.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct SeatSessionRow<'a> {
+    pub(crate) agent_identity: &'a AgentIdentity,
+    pub(crate) agent_runtime_id: &'a AgentRuntimeId,
+    /// The session the row names.
+    pub(crate) session_id: Option<&'a SessionId>,
+    /// `true` for the seat's row, `false` for the born row.
+    pub(crate) unborn: bool,
+}
+
+impl MobEventKind {
+    /// The unborn-seat fact this row records, when it records one (see
+    /// `SeatSessionRow`).
+    pub(crate) fn seat_session_row(&self) -> Option<SeatSessionRow<'_>> {
+        match self {
+            Self::MemberSpawned(spawned) if spawned.seat_session_unborn() => Some(SeatSessionRow {
+                agent_identity: &spawned.agent_identity,
+                agent_runtime_id: &spawned.agent_runtime_id,
+                session_id: spawned
+                    .bridge_member_ref()
+                    .and_then(MemberRef::bridge_session_id),
+                unborn: true,
+            }),
+            Self::MemberSessionBindingRecovered(recovered)
+                if recovered.records_seat_session_born() =>
+            {
+                Some(SeatSessionRow {
+                    agent_identity: &recovered.agent_identity,
+                    agent_runtime_id: &recovered.agent_runtime_id,
+                    session_id: recovered.bridge_session_id(),
+                    unborn: false,
+                })
+            }
+            _ => None,
+        }
+    }
+}
+
 #[cfg(any(not(target_arch = "wasm32"), test))]
 impl MobEventKind {
     pub(crate) fn member_spawned(&self) -> Option<&MemberSpawnedEvent> {

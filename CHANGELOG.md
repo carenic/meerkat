@@ -255,6 +255,16 @@ them.
     a restart. The new incarnation keeps no wiring. A rotation is refused
     typed unless the mob is Running, and a refused rotation retires
     nothing.
+  - `MobHandle::session_unborn(session_id)` and
+    `MemberBindingHistory::session_unborn(session_id)`: whether a session is
+    unborn, named by a seat or a rotation for a member that builds nothing
+    until its first wake, and not created by that wake yet. No store holds
+    such a session, and none is missing. The handle reads it from the
+    running mob; the history reads it with no running mob, from the journal
+    rows the mob's own restart restores it from, so a host that checks a
+    stopped state directory for lost sessions can leave unborn ones out.
+    `MemberBindingHistory::with_unborn_sessions` (`test-support`) gives a
+    host's test double of these reads its unborn sessions.
 
 - `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the
   runtimes whose durable state holds recovery work, from the head summary
@@ -519,6 +529,10 @@ them.
   runs, as it does for a member with no executor. Before, the wake counted
   the attached executor as a served member, answered ready, and the turn
   ended with "session not found".
+- `meerkat-mob`: `MobHandle::member_history` of a member whose session is
+  unborn (seated and not woken yet, or the next life a rotation seated)
+  answers an empty page, and the read does not wake the member. Before, it
+  failed with an internal "session not found" error.
 
 ### Known limitations
 

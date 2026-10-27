@@ -6622,6 +6622,9 @@ fn mob_bridge_rejection_cause(
     }
 }
 
+/// The per-page cap of the local member history read.
+const LOCAL_HISTORY_PAGE_MAX: usize = 256;
+
 /// Local branch of the placement-switched member history read (DEC-P6E-20/21):
 /// the SAME serving semantics as the member host's `ReadMemberHistory` arm
 /// (tail addressing, per-page cap) over the local session service, projected
@@ -6630,37 +6633,36 @@ async fn local_member_history_page(
     session_service: &dyn super::session_service::MobSessionService,
     session_id: &SessionId,
     generation: u64,
+    session_unborn: bool,
     from_index: Option<u64>,
     limit: Option<u32>,
 ) -> Result<super::member_history_proxy::MemberHistoryPageDomain, MobError> {
-    const LOCAL_HISTORY_PAGE_MAX: usize = 256;
     let requested_limit =
         limit.map(|value| usize::try_from(value).unwrap_or(LOCAL_HISTORY_PAGE_MAX));
     let effective_limit = requested_limit
         .unwrap_or(LOCAL_HISTORY_PAGE_MAX)
         .clamp(1, LOCAL_HISTORY_PAGE_MAX);
-    let offset = match (from_index, requested_limit) {
-        (Some(index), _) => usize::try_from(index).unwrap_or(usize::MAX),
-        (None, Some(tail_limit)) => {
-            let view = session_service.read(session_id).await.map_err(|error| {
-                MobError::Internal(format!("failed to read member session metadata: {error}"))
-            })?;
-            view.state
-                .message_count
-                .saturating_sub(tail_limit.clamp(1, LOCAL_HISTORY_PAGE_MAX))
-        }
-        (None, None) => 0,
+    // A seat's unborn session does not exist yet: the member has no history
+    // until its first wake creates the session, and the read never wakes it.
+    let page = if session_unborn {
+        meerkat_core::service::SessionHistoryPage::from_messages(
+            session_id.clone(),
+            &[],
+            meerkat_core::service::SessionHistoryQuery {
+                offset: 0,
+                limit: Some(effective_limit),
+            },
+        )
+    } else {
+        read_local_member_history_page(
+            session_service,
+            session_id,
+            from_index,
+            requested_limit,
+            effective_limit,
+        )
+        .await?
     };
-    let page = meerkat_core::service::SessionServiceHistoryExt::read_history(
-        session_service,
-        session_id,
-        meerkat_core::service::SessionHistoryQuery {
-            offset,
-            limit: Some(effective_limit),
-        },
-    )
-    .await
-    .map_err(|error| MobError::Internal(format!("failed to read member history: {error}")))?;
     Ok(super::member_history_proxy::MemberHistoryPageDomain {
         generation,
         page: meerkat_contracts::wire::WireMemberHistoryPageBody::try_from_history_page(&page)
@@ -6674,6 +6676,38 @@ async fn local_member_history_page(
         placement: None,
         provenance: meerkat_contracts::wire::WireProjectionProvenance::ControllingHostVerified,
     })
+}
+
+/// The local member history page read from the member's session.
+async fn read_local_member_history_page(
+    session_service: &dyn super::session_service::MobSessionService,
+    session_id: &SessionId,
+    from_index: Option<u64>,
+    requested_limit: Option<usize>,
+    effective_limit: usize,
+) -> Result<meerkat_core::service::SessionHistoryPage, MobError> {
+    let offset = match (from_index, requested_limit) {
+        (Some(index), _) => usize::try_from(index).unwrap_or(usize::MAX),
+        (None, Some(tail_limit)) => {
+            let view = session_service.read(session_id).await.map_err(|error| {
+                MobError::Internal(format!("failed to read member session metadata: {error}"))
+            })?;
+            view.state
+                .message_count
+                .saturating_sub(tail_limit.clamp(1, LOCAL_HISTORY_PAGE_MAX))
+        }
+        (None, None) => 0,
+    };
+    meerkat_core::service::SessionServiceHistoryExt::read_history(
+        session_service,
+        session_id,
+        meerkat_core::service::SessionHistoryQuery {
+            offset,
+            limit: Some(effective_limit),
+        },
+    )
+    .await
+    .map_err(|error| MobError::Internal(format!("failed to read member history: {error}")))
 }
 
 pub(super) struct PendingSpawn {
@@ -42182,12 +42216,20 @@ impl MobActor {
                 .map(|entry| entry.generation.get())
                 .unwrap_or(0)
         };
+        // MobMachine holds the member's session unborn until its first wake
+        // creates it: the read answers an empty history, as for a session
+        // with no turn yet, and never wakes the member.
+        let session_unborn = super::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            &agent_identity,
+        );
         let session_service = self.session_service.clone();
         self.actor_io_tasks.spawn(async move {
             let result = local_member_history_page(
                 session_service.as_ref(),
                 &session_id,
                 generation,
+                session_unborn,
                 from_index,
                 limit,
             )

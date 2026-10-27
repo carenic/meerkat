@@ -52,7 +52,7 @@ use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::SessionId;
 use meerkat_runtime::{InputLifecycleState, InputTerminalOutcome};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The serialized form version a [`MemberDeliveryScope`] is written with.
 /// Decoding any other version is a typed [`DeliveryScopeDecodeError`], so a
@@ -710,6 +710,11 @@ struct JournalFold {
     /// The identity and incarnation that held each session last, across
     /// mob resets.
     sessions: BTreeMap<SessionId, (AgentIdentity, JournalIncarnation)>,
+    /// The sessions MobMachine holds unborn (`unborn_seat_sessions`) as its
+    /// replay of this journal restores them: since the latest mob reset, a
+    /// seat's or a rotation's row adds its session and the row of the
+    /// session's creation removes it.
+    unborn_sessions: BTreeSet<SessionId>,
 }
 
 impl JournalFold {
@@ -729,6 +734,18 @@ impl JournalFold {
     }
 
     fn apply(&mut self, kind: &MobEventKind) {
+        // MobMachine's unborn-seat fact, from the rows its replay restores it
+        // from (`MobEventKind::seat_session_row`). A retirement keeps it: a
+        // session no build created stays unborn after its member left.
+        if let Some(row) = kind.seat_session_row()
+            && let Some(session_id) = row.session_id
+        {
+            if row.unborn {
+                self.unborn_sessions.insert(session_id.clone());
+            } else {
+                self.unborn_sessions.remove(session_id);
+            }
+        }
         match kind {
             // A spawn starts the identity's next membership, bound to the
             // session its bridge reference names (none for a peer-only
@@ -811,9 +828,11 @@ impl JournalFold {
                     head.live = false;
                 }
             }
-            // A mob reset ends every membership.
+            // A mob reset ends every membership, and MobMachine's unborn-seat
+            // fact with it (its replay starts after the latest mob reset).
             MobEventKind::MobReset => {
                 self.heads.clear();
+                self.unborn_sessions.clear();
             }
             _ => {}
         }
@@ -883,6 +902,7 @@ impl JournalFold {
             last_bindings,
             session_bindings,
             intent_rows,
+            unborn_sessions: self.unborn_sessions,
         }
     }
 }
@@ -922,6 +942,9 @@ pub struct MemberBindingHistory {
     session_bindings: BTreeMap<SessionId, MemberBinding>,
     /// How each identity Core holds an identity intent row for reads.
     intent_rows: BTreeMap<AgentIdentity, MemberIdentityManagement>,
+    /// The sessions MobMachine holds unborn, as its replay of the same
+    /// journal restores them.
+    unborn_sessions: BTreeSet<SessionId>,
 }
 
 impl MemberBindingHistory {
@@ -970,7 +993,18 @@ impl MemberBindingHistory {
                 .filter_map(|binding| Some((binding.session_id.clone()?, binding)))
                 .collect(),
             intent_rows: intent_rows.into_iter().collect(),
+            unborn_sessions: BTreeSet::new(),
         }
+    }
+
+    /// Test support: this history with `sessions` read as unborn
+    /// ([`Self::session_unborn`]), for a host's test double of these reads.
+    /// [`Self::for_test`] holds none unborn.
+    #[cfg(any(test, feature = "test-support"))]
+    #[must_use]
+    pub fn with_unborn_sessions(mut self, sessions: impl IntoIterator<Item = SessionId>) -> Self {
+        self.unborn_sessions = sessions.into_iter().collect();
+        self
     }
 
     /// Whether Core holds an identity intent row for `identity`, and whether
@@ -1032,6 +1066,23 @@ impl MemberBindingHistory {
                 SpawnContinuityIntent::DurableIdentity { .. }
             )
         })
+    }
+
+    /// Whether `session_id` is unborn: a seat or a member rotation named it
+    /// for a member that builds nothing until its first wake, and that wake
+    /// has not created it yet. No store holds such a session, and none is
+    /// missing: the member's first wake creates it under this id. A member
+    /// retired before its first wake leaves its session unborn.
+    ///
+    /// This is MobMachine's unborn-seat fact (`unborn_seat_sessions`) as the
+    /// machine's own replay of this journal restores it: the seat's row
+    /// marks the session unborn, the row of its creation marks it born, and
+    /// a mob reset clears the fact. A running mob answers the same fact live
+    /// through [`MobHandle::session_unborn`]. `false` for a session the
+    /// journal does not name unborn, including every session a build
+    /// created.
+    pub fn session_unborn(&self, session_id: &SessionId) -> bool {
+        self.unborn_sessions.contains(session_id)
     }
 }
 

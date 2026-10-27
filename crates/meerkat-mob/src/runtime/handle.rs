@@ -9738,6 +9738,28 @@ impl MobHandle {
         }
     }
 
+    /// Whether `session_id` is unborn: a seat or a member rotation named it
+    /// for a member that builds nothing until its first wake, and that wake
+    /// has not created it yet. No store holds such a session and none is
+    /// missing: the member's first wake creates it under this id. A member
+    /// retired before its first wake leaves its session unborn.
+    ///
+    /// This is MobMachine's unborn-seat fact (`unborn_seat_sessions`), read
+    /// from the machine state the actor last published, without a command.
+    /// A session read answers an unborn session as one with no history yet,
+    /// and never wakes its member to read it: a delivery wakes it. Core's
+    /// member history read does so ([`Self::member_history`]); a host that
+    /// serves its own reads of member sessions checks this first. The same
+    /// fact is read offline, with no running mob, through
+    /// [`crate::MemberBindingHistory::session_unborn`]. `false` for every
+    /// session a build created and for a session this mob never named.
+    pub fn session_unborn(&self, session_id: &SessionId) -> bool {
+        super::boot_plan::domain_seat_session_never_born(
+            &self.machine_state_watch_rx.borrow(),
+            session_id,
+        )
+    }
+
     /// Wait until no explicit-resume lifecycle operation is pending for
     /// `identity`: the operation a `MobError::LifecycleOperationPending`
     /// naming `explicit_resume member <identity>` refers to (the mob's resume
@@ -10175,6 +10197,10 @@ impl MobHandle {
     /// `ReadHistory`-scoped at chokepoint (a); local and remote pages share
     /// ONE wire projection. RPC/REST/MCP exposure is phase 7 (the DTOs
     /// already exist).
+    ///
+    /// A local member whose session is unborn ([`Self::session_unborn`])
+    /// answers an empty page: it has no history until its first wake creates
+    /// the session. The read never wakes the member.
     pub async fn member_history(
         &self,
         caller: crate::control_policy::MobControlPrincipal,
