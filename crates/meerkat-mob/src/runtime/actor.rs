@@ -16,6 +16,9 @@ pub(super) mod explicit_resume;
 pub(super) mod live_durable_source_loads;
 pub(super) mod member_effect_lane;
 pub(super) mod member_status_lane;
+pub(super) mod member_wake;
+#[cfg(feature = "runtime-adapter")]
+pub(super) mod member_wake_turn;
 mod placed_external_routes;
 pub(super) mod reload_revival;
 mod resume_post_commit;
@@ -12215,8 +12218,12 @@ impl MobActor {
     /// the member's registration keeps its typed code and the host's own
     /// reason, so every later answer repeats the first: the member stays
     /// Broken with it until an explicit repair.
+    /// The attempt-fenced Broken resolution of wake `attempt` of
+    /// `agent_identity` for `error`, and the reason it records. A host
+    /// registration refusal keeps its typed code.
     pub(super) fn member_revival_failure_signal(
         agent_identity: mob_dsl::AgentIdentity,
+        attempt: u64,
         session_id: &SessionId,
         error: &MobError,
     ) -> (mob_dsl::MobMachineSignal, String) {
@@ -12226,6 +12233,7 @@ impl MobActor {
                     agent_identity,
                     refusal_code: call.as_code().to_string(),
                     reason: reason.clone(),
+                    attempt,
                 },
                 reason.clone(),
             ),
@@ -12237,6 +12245,7 @@ impl MobActor {
                     mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
                         agent_identity,
                         reason: reason.clone(),
+                        attempt,
                     },
                     reason,
                 )
@@ -12342,7 +12351,8 @@ impl MobActor {
         match command {
             MobCommand::Retire { agent_identity, .. }
             | MobCommand::Respawn { agent_identity, .. }
-            | MobCommand::ReloadMemberRegistration { agent_identity, .. } => Some(agent_identity),
+            | MobCommand::ReloadMemberRegistration { agent_identity, .. }
+            | MobCommand::ReleaseMember { agent_identity, .. } => Some(agent_identity),
             _ => None,
         }
     }
@@ -14764,7 +14774,7 @@ impl MobActor {
             },
             "classify_placed_member_live_materialization",
         )?;
-        let (effect_observation, verdict) = transition
+        let (effect_observation, verdict, attempt) = transition
             .effects()
             .iter()
             .find_map(|effect| match effect {
@@ -14772,8 +14782,9 @@ impl MobActor {
                     agent_identity: effect_identity,
                     observation,
                     verdict,
+                    attempt,
                     ..
-                } if effect_identity == &dsl_identity => Some((*observation, *verdict)),
+                } if effect_identity == &dsl_identity => Some((*observation, *verdict, *attempt)),
                 _ => None,
             })
             .ok_or_else(|| {
@@ -14815,6 +14826,16 @@ impl MobActor {
                 })
             }
             mob_dsl::MemberRevivalVerdictKind::ReviveAuthorized => {
+                // The placed revival is this path's own wake attempt: the
+                // host owns the member's materialization, and this path
+                // realizes it here (the wake effect hook leaves placed
+                // members alone).
+                let attempt = attempt.ok_or_else(|| {
+                    MobError::Internal(
+                        "MobMachine authorized a placed-member revival without a wake attempt"
+                            .into(),
+                    )
+                })?;
                 match self
                     .materialize_revived_placed_member(agent_identity, &host, &binding)
                     .await
@@ -14823,6 +14844,7 @@ impl MobActor {
                         self.apply_dsl_signal(
                             mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
                                 agent_identity: dsl_identity,
+                                attempt,
                             },
                             "resolve_placed_member_revival_succeeded",
                         )?;
@@ -14846,6 +14868,7 @@ impl MobActor {
                             mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
                                 agent_identity: dsl_identity,
                                 reason: failure_reason.clone(),
+                                attempt,
                             },
                             "resolve_placed_member_revival_failed",
                         )?;
@@ -18034,6 +18057,7 @@ impl MobActor {
             MobCommand::Retire { agent_identity, .. }
             | MobCommand::Respawn { agent_identity, .. }
             | MobCommand::ReloadMemberRegistration { agent_identity, .. }
+            | MobCommand::ReleaseMember { agent_identity, .. }
             | MobCommand::EnsureMemberEventPump { agent_identity, .. }
             | MobCommand::EnsureMemberEventTap { agent_identity, .. } => pending(agent_identity),
             MobCommand::Wire { local, target, .. } | MobCommand::Unwire { local, target, .. } => {

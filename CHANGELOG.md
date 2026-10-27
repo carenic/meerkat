@@ -35,8 +35,47 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `comms/send` gains the closed error code `peer_wake_refused`
+  (`meerkat-contracts`: new variant `CommsSendErrorData::PeerWakeRefused { peer,
+  envelope_id, refusal, retryable, message }`; constructor
+  `CommsSendErrorData::peer_wake_refused`). A peer message to a member that is
+  seated but not materialized in its process now waits for the member's wake
+  inside the sender's own send budget (`CommsConfig::ack_timeout_secs`) and is
+  then delivered once through the ordinary receipt path; when the wake is
+  refused or does not finish, the send fails with this code instead of
+  `peer_not_found_or_not_trusted`. `peer_not_found_or_not_trusted` is now
+  reserved for peers that are not members. The refusal is the closed
+  `meerkat_core::comms::PeerWakeRefusal` (tagged on `kind`: `member_broken {
+  reason, hold }`, `member_retiring`, `mob_not_running`, `admission_closed`,
+  `wake_timed_out`, `mob_unavailable`, `materialization_lost`,
+  `non_authoritative_composition`, `host_preparation_pending`,
+  `resume_gate_unavailable`, `host_owned`, `lifecycle_origin_fenced`,
+  `sender_waking`). Every refusal means "not delivered": nothing was handed to
+  the recipient, so a retry cannot duplicate the message; `retryable` says
+  whether a retry can succeed. SDKs that parse the `comms/send` error vocabulary
+  closed must add the code (the Python and TypeScript SDKs do).
+- `meerkat-core`: `comms::SendError` gains `PeerWakeRefused { peer, envelope_id,
+  refusal }`, and `comms::PeerWakeRefusal` is new. `meerkat-comms`:
+  `inproc::InprocSendError` gains `WakeRefused(PeerWakeRefusal)`, and
+  `router::SendError` gains `PeerWakeRefused { envelope_id, refusal }`.
+- Behaviour: a peer message to a live member of a stopped mob is now refused
+  `peer_wake_refused { mob_not_running }`, the same answer a dormant member of a
+  stopped mob gives. Before, it was either delivered to an inbox no drain claimed
+  or answered as an unconfirmed (ambiguous) delivery. The stop closes each live
+  member's in-process route for peer ingress and the resume reopens it, so the
+  sender retries after the mob resumes.
+
 ### Added
 
+- `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
+  and `retract_wake_route` keep, per seated member, a route to the owner that
+  can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route
+  never delivers and never claims a name, and a live route always wins.
+  `CommsRuntime::close_inproc_route` and `reopen_inproc_route` (also on the
+  `meerkat-core` `CommsRuntime` trait, defaulting to no route) close a live
+  route for peer ingress and reopen it without rebuilding the runtime.
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
   `1` restores one member at a time, as before; `0` counts as `1`.

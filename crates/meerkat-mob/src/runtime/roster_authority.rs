@@ -109,6 +109,16 @@ impl RosterAuthority {
         self.roster.get(agent_identity).cloned()
     }
 
+    /// The roster projection a member restore's turn writes (B4's
+    /// `MemberRestoreCommit`): a runtime wake applies the same writes to the
+    /// actor's roster that a boot restore applies to the roster it builds.
+    /// Counted as a mutation.
+    #[cfg(feature = "runtime-adapter")]
+    pub(crate) fn restore_projection_mut(&mut self) -> &mut Roster {
+        self.bump();
+        &mut self.roster
+    }
+
     /// Apply a `MobEvent` through the underlying `Roster` projection so
     /// live actor paths that append events also keep the roster's
     /// projection fields (e.g. `wired_to`) in sync. Mirrors the replay

@@ -126,7 +126,7 @@ pub use error::{
     ForkedParticipantSourceRejection, IncarnationInconsistency, MemberCustodyDeferral,
     MemberCustodyDeferralCause, MemberCustodyRestore, MemberProvisionFailureCause,
     MemberRegistrationHookCall, MemberRuntimeDetachment, MemberSendIdempotencyRefusal,
-    MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
+    MemberWakeRefusal, MobDefinitionProjectionMismatchKind, MobError, MobFailureClass,
     OperatorAuthorityCeilingRefusal, RuntimeEffectKind,
 };
 pub use event::{
@@ -373,6 +373,10 @@ pub use runtime::{
 };
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};
+pub use runtime::{
+    MemberBuildPreparation, MemberBuildPreparationRefusal, MemberBuildPrepared,
+    MemberBuildPreparer, MemberBuildReport, MemberWakeRetryBackoff,
+};
 #[cfg(feature = "runtime-adapter")]
 pub use runtime::{
     MemberDestinationSelection, MemberRuntimeBuildIdentity, MemberRuntimeRegistrationHook,

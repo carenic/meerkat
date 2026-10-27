@@ -10825,14 +10825,14 @@ const DEFAULT_RESUME_RESTORE_CONCURRENCY: usize = 16;
 /// A member a cold resume restores, with the session MobMachine's recovered
 /// state binds it to.
 #[cfg(feature = "runtime-adapter")]
-struct ResumeRestoreCandidate {
-    entry: RosterEntry,
-    machine_session_id: crate::machines::mob_machine::SessionId,
+pub(super) struct ResumeRestoreCandidate {
+    pub(super) entry: RosterEntry,
+    pub(super) machine_session_id: crate::machines::mob_machine::SessionId,
     /// The member is restored entirely in its own turn, after every member
     /// before it: a fork of an in-mob source, whose restore follows its
     /// source's, or a member bound to the session an earlier member is bound
     /// to.
-    in_turn: bool,
+    pub(super) in_turn: bool,
 }
 
 /// The members a cold resume restores, in `entries`' order (every in-mob
@@ -10877,61 +10877,66 @@ fn resume_restore_set(
 
 /// What every member's restore reads and nothing in the restore writes.
 #[cfg(feature = "runtime-adapter")]
-struct ResumeMemberRestoreContext<'a> {
-    definition: &'a Arc<MobDefinition>,
-    session_service: &'a Arc<dyn MobSessionService>,
-    provisioner: &'a MultiBackendProvisioner,
+pub(super) struct ResumeMemberRestoreContext<'a> {
+    pub(super) definition: &'a Arc<MobDefinition>,
+    pub(super) session_service: &'a Arc<dyn MobSessionService>,
+    pub(super) provisioner: &'a MultiBackendProvisioner,
     /// The sessions with a live actor when the resume began.
-    active_ids: &'a HashSet<SessionId>,
-    recorded_continuity: &'a RecordedContinuity,
-    spawn_member_customizer: &'a Option<Arc<dyn super::SpawnMemberCustomizer>>,
-    tool_bundles: &'a BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
-    tool_handle: &'a MobHandle,
-    default_external_tools_provider: &'a Option<crate::ExternalToolsProvider>,
-    realm_profile_store: Option<&'a Arc<dyn crate::store::RealmProfileStore>>,
-    default_llm_client: Option<&'a Arc<dyn LlmClient>>,
-    tool_consequence_policy_registry: Option<&'a Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
+    pub(super) active_ids: &'a HashSet<SessionId>,
+    pub(super) recorded_continuity: &'a RecordedContinuity,
+    pub(super) spawn_member_customizer: &'a Option<Arc<dyn super::SpawnMemberCustomizer>>,
+    pub(super) tool_bundles: &'a BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
+    pub(super) tool_handle: &'a MobHandle,
+    pub(super) default_external_tools_provider: &'a Option<crate::ExternalToolsProvider>,
+    pub(super) realm_profile_store: Option<&'a Arc<dyn crate::store::RealmProfileStore>>,
+    pub(super) default_llm_client: Option<&'a Arc<dyn LlmClient>>,
+    pub(super) tool_consequence_policy_registry:
+        Option<&'a Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
+    /// The host's build preparation, asked once per member restore before
+    /// its provision (every boot-set restore and every wake).
+    pub(super) member_build_preparer: Option<&'a Arc<dyn super::MemberBuildPreparer>>,
 }
 
 /// Everything a member's restore writes, applied in the member's turn.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreCommit<'a> {
-    authority: &'a mut crate::machines::mob_machine::MobMachineAuthority,
-    roster: &'a mut Roster,
-    per_spawn_external_tools_seed: &'a mut super::fork_build::RetainedOverlays,
+pub(super) struct MemberRestoreCommit<'a> {
+    pub(super) authority: &'a mut crate::machines::mob_machine::MobMachineAuthority,
+    pub(super) roster: &'a mut Roster,
+    pub(super) per_spawn_external_tools_seed: &'a mut super::fork_build::RetainedOverlays,
     /// The per-spawn overlay each member was restored with in this pass,
     /// keyed by member: what a fork of that member is restored with.
-    restored_overlays: &'a mut BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
-    tool_handle: &'a MobHandle,
-    composition_binding: &'a super::composition::MobCompositionBinding,
+    pub(super) restored_overlays:
+        &'a mut BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    pub(super) tool_handle: &'a MobHandle,
+    pub(super) composition_binding: &'a super::composition::MobCompositionBinding,
 }
 
 /// The successor search for members whose bound session is absent, run in
 /// those members' turns.
 #[cfg(feature = "runtime-adapter")]
-struct MemberSuccessorSearch<'a> {
-    listed_sessions: &'a [meerkat_core::service::SessionSummary],
-    member_bound_sessions: &'a HashSet<SessionId>,
+pub(super) struct MemberSuccessorSearch<'a> {
+    pub(super) listed_sessions: &'a [meerkat_core::service::SessionSummary],
+    pub(super) member_bound_sessions: &'a HashSet<SessionId>,
     /// Successor search scans the realm at most once for all members.
-    index: &'a mut Option<PersistedMemberSessionIndex>,
+    pub(super) index: &'a mut Option<PersistedMemberSessionIndex>,
     /// Members repointed to a successor whose endpoint was not recovered.
-    recovered_without_endpoint: &'a mut HashSet<AgentIdentity>,
+    pub(super) recovered_without_endpoint: &'a mut HashSet<AgentIdentity>,
 }
 
 /// A member's restore request, settled before its session is resumed.
 #[cfg(feature = "runtime-adapter")]
-struct SeatedMemberRestore {
-    restore_spec: super::handle::SpawnMemberSpec,
-    restore_resume_from_role: Option<ProfileName>,
+pub(super) struct SeatedMemberRestore {
+    pub(super) restore_spec: super::handle::SpawnMemberSpec,
+    pub(super) restore_resume_from_role: Option<ProfileName>,
     /// The per-spawn overlay the member is restored with.
-    restore_overlay: Option<Arc<dyn AgentToolDispatcher>>,
+    pub(super) restore_overlay: Option<Arc<dyn AgentToolDispatcher>>,
 }
 
 /// What a member's restore writes once its request is settled, whatever
 /// happens to its session after: the overlay it is restored with and its
 /// roster entry's effective overrides.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreSeating {
+pub(super) struct MemberRestoreSeating {
     overlay: Option<Arc<dyn AgentToolDispatcher>>,
     overlay_origin: super::fork_build::RetainedOverlayOrigin,
     profile_override: Option<crate::profile::Profile>,
@@ -10940,7 +10945,7 @@ struct MemberRestoreSeating {
 
 /// How far a member's restore got before its turn, and what its turn writes.
 #[cfg(feature = "runtime-adapter")]
-enum MemberRestorePlan {
+pub(super) enum MemberRestorePlan {
     /// The member's live actor serves its bound session: nothing is
     /// restored and nothing is written.
     Kept,
@@ -10953,7 +10958,7 @@ enum MemberRestorePlan {
 }
 
 #[cfg(feature = "runtime-adapter")]
-enum SeatedMemberRestoreOutcome {
+pub(super) enum SeatedMemberRestoreOutcome {
     /// The member's bound session refused its resume without being absent.
     Refused(super::handle::RestoreFailureDiagnostic),
     /// The member's bound session is absent: its turn searches for a
@@ -10970,16 +10975,20 @@ enum SeatedMemberRestoreOutcome {
 /// which the member's turn authorizes on the mob's authority, and how the
 /// provision went.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreProvision {
-    profile: crate::profile::Profile,
-    profile_context: &'static str,
-    outcome: MemberRestoreProvisionOutcome,
+pub(super) struct MemberRestoreProvision {
+    pub(super) profile: crate::profile::Profile,
+    pub(super) profile_context: &'static str,
+    pub(super) outcome: MemberRestoreProvisionOutcome,
 }
 
 #[cfg(feature = "runtime-adapter")]
-enum MemberRestoreProvisionOutcome {
+pub(super) enum MemberRestoreProvisionOutcome {
     /// The member's restore failed after its profile was authorized.
     Failed(super::handle::RestoreFailureDiagnostic),
+    /// The host asked to retry the member's build preparation later
+    /// ([`super::MemberBuildPreparationRefusal::Retryable`]): nothing was
+    /// provisioned, and the member is left dormant.
+    Retryable { reason: String },
     /// The member's durable session was resumed.
     Durable {
         bridge_session_id: SessionId,
@@ -11029,7 +11038,7 @@ const RESUME_RECREATE_MEMBER_PROFILE_AUTHORITY: &str = "resume_recreate_member_p
 /// The diagnostic of a member restore that failed for `reason`, naming the
 /// member's session.
 #[cfg(feature = "runtime-adapter")]
-fn member_restore_failure(
+pub(super) fn member_restore_failure(
     bridge_session_id: &SessionId,
     reason: String,
 ) -> super::handle::RestoreFailureDiagnostic {
@@ -11311,7 +11320,7 @@ async fn apply_member_restore_turn(
 /// overlays the members restored before it in this pass were restored with,
 /// which a rule that follows the member's source reads.
 #[cfg(feature = "runtime-adapter")]
-async fn restore_resumed_member(
+pub(super) async fn restore_resumed_member(
     ctx: &ResumeMemberRestoreContext<'_>,
     candidate: &ResumeRestoreCandidate,
     base: &crate::machines::mob_machine::MobMachineAuthority,
@@ -11558,10 +11567,56 @@ async fn restore_resumed_member(
     Ok(MemberRestorePlan::Seated { seating, outcome })
 }
 
+/// Ask the host's build preparer, when one is configured, before a member's
+/// provision. `Ok(None)` proceeds (a requested hold is staged on the member's
+/// next registration first); `Ok(Some(outcome))` is the provision outcome a
+/// refusal ends the member's restore with.
+#[cfg(feature = "runtime-adapter")]
+async fn prepare_member_build_before_provision(
+    ctx: &ResumeMemberRestoreContext<'_>,
+    entry: &RosterEntry,
+    bridge_session_id: &SessionId,
+    authority: &crate::machines::mob_machine::MobMachineAuthority,
+) -> Result<Option<MemberRestoreProvisionOutcome>, MobError> {
+    let Some(preparer) = ctx.member_build_preparer else {
+        return Ok(None);
+    };
+    let request = super::member_build_preparer::MemberBuildPreparation {
+        agent_identity: entry.agent_identity.clone(),
+        session_id: bridge_session_id.clone(),
+        handle: ctx.tool_handle.read_handle(),
+        wired_peers: super::member_build_preparer::member_build_wired_peers(
+            authority.state(),
+            &entry.agent_identity,
+        ),
+    };
+    match preparer.prepare_member_build(request).await {
+        Ok(super::MemberBuildPrepared::Prepared) => Ok(None),
+        Ok(super::MemberBuildPrepared::HoldUntilReleased) => {
+            ctx.provisioner
+                .stage_member_registration_run_start_hold_only(
+                    &MemberRef::from_bridge_session_id(bridge_session_id.clone()),
+                    meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+                )
+                .await?;
+            Ok(None)
+        }
+        Err(super::MemberBuildPreparationRefusal::Retryable { reason }) => {
+            Ok(Some(MemberRestoreProvisionOutcome::Retryable { reason }))
+        }
+        Err(super::MemberBuildPreparationRefusal::Final { reason }) => Ok(Some(
+            MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                bridge_session_id,
+                format!("the host refused to prepare the member's build: {reason}"),
+            )),
+        )),
+    }
+}
+
 /// Resume `entry`'s durable session `bridge_session_id`, as
 /// `authorized_resume` admits it, on the member's own fork of `base`.
 #[cfg(feature = "runtime-adapter")]
-async fn provision_durable_member_restore(
+pub(super) async fn provision_durable_member_restore(
     ctx: &ResumeMemberRestoreContext<'_>,
     entry: &RosterEntry,
     seated: &SeatedMemberRestore,
@@ -11747,6 +11802,16 @@ async fn provision_durable_member_restore(
             ));
         }
     };
+    // The host prepares the member's build before its provision.
+    if let Some(outcome) =
+        prepare_member_build_before_provision(ctx, entry, bridge_session_id, &authority).await?
+    {
+        return Ok(MemberRestoreProvision {
+            profile,
+            profile_context: PROFILE_CONTEXT,
+            outcome,
+        });
+    }
     let outcome = match ctx
         .provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
@@ -11951,6 +12016,17 @@ async fn provision_fresh_member_restore(
             &admitted_bridge_session_id,
             "resume_fresh_member_session_provision_owner",
         )?);
+    // The host prepares the member's build before its provision.
+    if let Some(outcome) =
+        prepare_member_build_before_provision(ctx, entry, &admitted_bridge_session_id, &authority)
+            .await?
+    {
+        return Ok(MemberRestoreProvision {
+            profile,
+            profile_context: PROFILE_CONTEXT,
+            outcome,
+        });
+    }
     let receipt = match ctx.provisioner.provision_member(provision_request).await {
         Ok(receipt) => receipt,
         Err(error) => {
@@ -12002,7 +12078,7 @@ async fn provision_fresh_member_restore(
 
 /// Apply, in `entry`'s turn, what its restore writes.
 #[cfg(feature = "runtime-adapter")]
-async fn apply_member_restore_plan(
+pub(super) async fn apply_member_restore_plan(
     ctx: &ResumeMemberRestoreContext<'_>,
     commit: &mut MemberRestoreCommit<'_>,
     successors: &mut MemberSuccessorSearch<'_>,
@@ -12240,6 +12316,34 @@ async fn apply_member_restore_provision(
         MemberRestoreProvisionOutcome::Failed(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
         }
+        MemberRestoreProvisionOutcome::Retryable { reason } => {
+            // Nothing was provisioned: the member's open wake attempt ends
+            // retryable (Waking -> Dormant), and a later delivery, or the
+            // owed-boot retry, wakes it again.
+            let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+            if let Some(attempt) = commit
+                .authority
+                .state()
+                .member_wake_attempts
+                .get(&dsl_identity)
+                .copied()
+            {
+                apply_seeded_mob_signal(
+                    commit.authority,
+                    mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
+                        agent_identity: dsl_identity,
+                        attempt,
+                        kind: mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
+                    },
+                    "resume_member_build_preparation_retryable",
+                )?;
+            }
+            tracing::info!(
+                member = %entry.agent_identity,
+                %reason,
+                "the host asked to retry the member's build preparation; the member stays dormant"
+            );
+        }
         MemberRestoreProvisionOutcome::Durable {
             bridge_session_id,
             receipt,
@@ -12348,14 +12452,30 @@ async fn apply_member_restore_provision(
             // the successful receipt back to the existing member authority
             // so it emits the exact runtime binding before startup
             // readiness.
+            // The recreated session is the Bound step of the member's open
+            // wake attempt (F7, F11); its Ready follows readiness.
+            let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+            let attempt = commit
+                .authority
+                .state()
+                .member_wake_attempts
+                .get(&dsl_identity)
+                .copied()
+                .ok_or_else(|| {
+                    MobError::Internal(format!(
+                        "the recreated session of '{}' has no open wake attempt",
+                        entry.agent_identity
+                    ))
+                })?;
             let transition = apply_seeded_mob_signal_transition(
                 commit.authority,
                 mob_dsl::MobMachineSignal::ResolveRecreatedMemberSessionSucceeded {
-                    agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
+                    agent_identity: dsl_identity,
                     agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                     fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
                     generation: mob_dsl::Generation::from_domain(entry.generation),
                     bridge_session_id: mob_dsl::SessionId::from_domain(&created_bridge_session_id),
+                    attempt,
                 },
                 "resume_resolve_recreated_member_session",
             )?;

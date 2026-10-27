@@ -4307,6 +4307,17 @@ fn normalize_mcp_comms_send_error(
                 *envelope_id,
             ))
         }
+        // A seated member that was not woken: typed, not delivered, never
+        // "not found".
+        meerkat_core::comms::SendError::PeerWakeRefused {
+            peer,
+            envelope_id,
+            refusal,
+        } => typed_mcp_comms_send_error(&meerkat_contracts::CommsSendErrorData::peer_wake_refused(
+            peer_name.unwrap_or(peer.as_str()),
+            *envelope_id,
+            refusal,
+        )),
         // Not a failed send: the envelope may already be delivered, and a
         // caller told "failed" retries, which can duplicate the delivery.
         meerkat_core::comms::SendError::AmbiguousDelivery {

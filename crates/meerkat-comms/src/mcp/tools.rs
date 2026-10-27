@@ -981,6 +981,16 @@ async fn dispatch(ctx: &ToolContext, command: CommsCommand) -> Result<Value, Com
                 peer_for_errors.as_deref().unwrap_or("<unknown>")
             )
             .into(),
+            SendError::PeerWakeRefused {
+                envelope_id,
+                refusal,
+                ..
+            } => peer_wake_refused_message(
+                peer_for_errors.as_deref().unwrap_or("<unknown>"),
+                envelope_id,
+                &refusal,
+            )
+            .into(),
             other => other.to_string().into(),
         })?;
         return Ok(sent_result(&cmd_kind, receipt));
@@ -1163,8 +1173,31 @@ fn ensure_peer_id_is_trusted(ctx: &ToolContext, peer_id: &PeerId) -> Result<(), 
     }
 }
 
+/// Tool text for a peer that is a seated member whose wake was refused. Not
+/// delivered, and never `peer_not_found_or_not_trusted`: the peer is a member.
+/// The text names whether a retry can succeed (nothing was handed off, so a
+/// retry never duplicates the message).
+fn peer_wake_refused_message(
+    peer_name: &str,
+    envelope_id: uuid::Uuid,
+    refusal: &meerkat_core::comms::PeerWakeRefusal,
+) -> String {
+    let retry = if refusal.is_retryable() {
+        "not delivered; retry later"
+    } else {
+        "not delivered; retrying will not help"
+    };
+    format!(
+        "peer_wake_refused: peer '{peer_name}' was not woken for envelope {envelope_id} ({refusal}): {retry}"
+    )
+}
+
 fn format_router_send_error(peer_name: &str, error: crate::router::SendError) -> String {
     match error {
+        crate::router::SendError::PeerWakeRefused {
+            envelope_id,
+            refusal,
+        } => peer_wake_refused_message(peer_name, envelope_id, &refusal),
         crate::router::SendError::PeerNotFound(_) => {
             format!("peer_not_found_or_not_trusted: peer '{peer_name}' is not found or not trusted")
         }

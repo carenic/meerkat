@@ -1750,7 +1750,8 @@ impl MobActor {
             | MobCommand::RotateSupervisor { .. } => true,
             MobCommand::Retire { agent_identity, .. }
             | MobCommand::Respawn { agent_identity, .. }
-            | MobCommand::ReloadMemberRegistration { agent_identity, .. } => {
+            | MobCommand::ReloadMemberRegistration { agent_identity, .. }
+            | MobCommand::ReleaseMember { agent_identity, .. } => {
                 self.retirements.contains_key(agent_identity)
             }
             // Work for a member whose retirement is durably started is

@@ -239,9 +239,11 @@ mod identity_recovery_test_support;
 mod lifecycle_observation;
 #[cfg(feature = "openai-live")]
 mod live_bridge_operation;
+mod member_build_preparer;
 mod member_creation;
 #[cfg(any(test, feature = "test-support"))]
 mod member_status_test_support;
+mod member_wake_config;
 mod read_handle;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
@@ -524,8 +526,13 @@ pub use live_bridge_operation::{
     LiveBridgeOperationStartError, LiveBridgeOperationTerminal, LiveBridgeOperationTerminalError,
     LiveBridgeOperationTerminalFuture, LiveDurableSourceReadinessError,
 };
+pub use member_build_preparer::{
+    MemberBuildPreparation, MemberBuildPreparationRefusal, MemberBuildPrepared,
+    MemberBuildPreparer, MemberBuildReport,
+};
 pub use member_history_proxy::MemberHistoryPageDomain;
 pub use member_live_proxy::MemberLiveStatusDomain;
+pub use member_wake_config::MemberWakeRetryBackoff;
 #[cfg(feature = "runtime-adapter")]
 pub use mobpack_execution::run_mobpack_callable;
 pub use mobpack_execution::{MobpackCallableConfig, MobpackRunOutcome, MobpackRunSpec};

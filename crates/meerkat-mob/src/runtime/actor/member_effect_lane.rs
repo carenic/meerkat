@@ -591,7 +591,8 @@ impl MobActor {
         match command {
             MobCommand::Retire { agent_identity, .. }
             | MobCommand::Respawn { agent_identity, .. }
-            | MobCommand::ReloadMemberRegistration { agent_identity, .. } => {
+            | MobCommand::ReloadMemberRegistration { agent_identity, .. }
+            | MobCommand::ReleaseMember { agent_identity, .. } => {
                 self.member_effect_pending_for_member(agent_identity)
             }
             MobCommand::Wire { local, target, .. } | MobCommand::Unwire { local, target, .. } => {
