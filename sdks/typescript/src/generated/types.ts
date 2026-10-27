@@ -5683,15 +5683,6 @@ export interface CommsSendErrorDataPeerInputRejected {
   peer: string;
 }
 
-export interface CommsSendErrorDataPeerWakeRefused {
-  code: "peer_wake_refused";
-  envelope_id: string;
-  message: string;
-  peer: string;
-  refusal: PeerWakeRefusal;
-  retryable: boolean;
-}
-
 export interface CommsSendErrorDataSendAmbiguous {
   code: "send_ambiguous";
   envelope_id: string;
@@ -5710,7 +5701,16 @@ export interface CommsSendErrorDataInvalidCommand {
   message: string;
 }
 
-export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataPeerWakeRefused | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand;
+export interface CommsSendErrorDataPeerWakeRefused {
+  code: "peer_wake_refused";
+  envelope_id: string;
+  message: string;
+  peer: string;
+  refusal: PeerWakeRefusal;
+  retryable: boolean;
+}
+
+export type CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand | CommsSendErrorDataPeerWakeRefused;
 
 export type CommsChecksumTokenResultIntent = "checksum_token";
 

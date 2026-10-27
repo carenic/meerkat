@@ -9533,14 +9533,6 @@ class CommsSendErrorDataPeerInputRejected(TypedDict, total=False):
     message: Required[str]
     peer: Required[str]
 
-class CommsSendErrorDataPeerWakeRefused(TypedDict, total=False):
-    code: Required[Literal['peer_wake_refused']]
-    envelope_id: Required[str]
-    message: Required[str]
-    peer: Required[str]
-    refusal: Required[PeerWakeRefusal]
-    retryable: Required[bool]
-
 class CommsSendErrorDataSendAmbiguous(TypedDict, total=False):
     code: Required[Literal['send_ambiguous']]
     envelope_id: Required[str]
@@ -9556,7 +9548,15 @@ class CommsSendErrorDataInvalidCommand(TypedDict, total=False):
     code: Required[Literal['invalid_command']]
     message: Required[str]
 
-CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataPeerWakeRefused | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand
+class CommsSendErrorDataPeerWakeRefused(TypedDict, total=False):
+    code: Required[Literal['peer_wake_refused']]
+    envelope_id: Required[str]
+    message: Required[str]
+    peer: Required[str]
+    refusal: Required[PeerWakeRefusal]
+    retryable: Required[bool]
+
+CommsSendErrorData = CommsSendErrorDataPeerNotFoundOrNotTrusted | CommsSendErrorDataPeerUnreachable | CommsSendErrorDataPeerAdmissionDropped | CommsSendErrorDataPeerInputRejected | CommsSendErrorDataSendAmbiguous | CommsSendErrorDataSendFailed | CommsSendErrorDataInvalidCommand | CommsSendErrorDataPeerWakeRefused
 
 # Closed discriminator carried in [`CommsChecksumTokenResult`].
 CommsChecksumTokenResultIntent = Literal['checksum_token']

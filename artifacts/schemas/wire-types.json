@@ -94107,39 +94107,6 @@
         "type": "object"
       },
       {
-        "description": "The peer is a seated member that was not materialized, and the wake\nthe message needed was refused or did not finish. Not delivered:\nnothing reached the peer, so a retry cannot duplicate it. `retryable`\nsays whether a later retry can succeed without an operator action\n(the refusal kind decides it). A peer that is not a member is\n`peer_not_found_or_not_trusted`, never this.",
-        "properties": {
-          "code": {
-            "const": "peer_wake_refused",
-            "type": "string"
-          },
-          "envelope_id": {
-            "type": "string"
-          },
-          "message": {
-            "type": "string"
-          },
-          "peer": {
-            "type": "string"
-          },
-          "refusal": {
-            "$ref": "#/$defs/PeerWakeRefusal"
-          },
-          "retryable": {
-            "type": "boolean"
-          }
-        },
-        "required": [
-          "code",
-          "peer",
-          "envelope_id",
-          "refusal",
-          "retryable",
-          "message"
-        ],
-        "type": "object"
-      },
-      {
         "description": "The delivery outcome is unknown: the envelope may already be\ndelivered, so this is not a failed send. Reconcile against durable\nwork truth by `envelope_id` before any new attempt; a retry can\nduplicate the delivery.",
         "properties": {
           "code": {
@@ -94197,6 +94164,39 @@
         },
         "required": [
           "code",
+          "message"
+        ],
+        "type": "object"
+      },
+      {
+        "description": "The peer is a seated member that was not materialized, and the wake\nthe message needed was refused or did not finish. Not delivered:\nnothing reached the peer, so a retry cannot duplicate it. `retryable`\nsays whether a later retry can succeed without an operator action\n(the refusal kind decides it). A peer that is not a member is\n`peer_not_found_or_not_trusted`, never this.",
+        "properties": {
+          "code": {
+            "const": "peer_wake_refused",
+            "type": "string"
+          },
+          "envelope_id": {
+            "type": "string"
+          },
+          "message": {
+            "type": "string"
+          },
+          "peer": {
+            "type": "string"
+          },
+          "refusal": {
+            "$ref": "#/$defs/PeerWakeRefusal"
+          },
+          "retryable": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "code",
+          "peer",
+          "envelope_id",
+          "refusal",
+          "retryable",
           "message"
         ],
         "type": "object"
