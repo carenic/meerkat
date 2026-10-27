@@ -11968,6 +11968,13 @@ pub mod effects {
         pub agent_identity: AgentIdentity,
         pub verdict: MemberReleaseVerdict,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RuntimeBindingRefusalStale {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub session_id: SessionId,
+        pub attempt: Option<u64>,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12140,6 +12147,7 @@ pub enum Effect {
     PeerNoticeClassified(effects::PeerNoticeClassified),
     MemberMaterializationReleased(effects::MemberMaterializationReleased),
     MemberReleaseClassified(effects::MemberReleaseClassified),
+    RuntimeBindingRefusalStale(effects::RuntimeBindingRefusalStale),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -12307,6 +12315,7 @@ pub enum EffectKind {
     PeerNoticeClassified,
     MemberMaterializationReleased,
     MemberReleaseClassified,
+    RuntimeBindingRefusalStale,
 }
 
 pub mod command_capabilities {

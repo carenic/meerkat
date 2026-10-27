@@ -8776,7 +8776,7 @@ RetireMemberPeerOnly(agent_identity, agent_runtime_id, fence_token, session_id) 
 
 ResolveRuntimeBindingRefusalRunning(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt) ==
     /\ phase = "Running"
-    /\ (IF (attempt = None) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) = attempt))
+    /\ ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) = attempt)
     /\ ((agent_identity \in DOMAIN member_placement) = FALSE)
     /\ ((IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) = Some(agent_runtime_id))
     /\ (agent_runtime_id \in live_runtime_ids)
@@ -20126,7 +20126,7 @@ WakeMemberRefusedDestroyed(agent_identity, cause, observed_missing, input_class,
 PlanBootMaterializationWake(agent_identity, obligation, host_required, orchestrator_notified) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN member_materialization) THEN Some((IF agent_identity \in DOMAIN member_materialization THEN member_materialization[agent_identity] ELSE "None")) ELSE None) = Some("Dormant"))
-    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "Wake"))
+    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (IF (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")) THEN TRUE ELSE (\E edge \in wiring_edges : (IF ((mob_machine_wiring_edge_a(edge) = agent_identity) /\ ((mob_machine_wiring_edge_b(edge) \in DOMAIN member_placement) = TRUE)) THEN TRUE ELSE ((mob_machine_wiring_edge_b(edge) = agent_identity) /\ ((mob_machine_wiring_edge_a(edge) \in DOMAIN member_placement) = TRUE))))), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "Wake"))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ member_startup_binding_requested' = (member_startup_binding_requested \ {(IF "value" \in DOMAIN (IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None) THEN (IF (agent_identity \in DOMAIN identity_to_runtime) THEN Some((IF agent_identity \in DOMAIN identity_to_runtime THEN identity_to_runtime[agent_identity] ELSE "None")) ELSE None)["value"] ELSE None)})
@@ -20144,7 +20144,7 @@ PlanBootMaterializationWake(agent_identity, obligation, host_required, orchestra
 PlanBootMaterializationVerify(agent_identity, obligation, host_required, orchestrator_notified) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN member_materialization) THEN Some((IF agent_identity \in DOMAIN member_materialization THEN member_materialization[agent_identity] ELSE "None")) ELSE None) = Some("Dormant"))
-    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "VerifyThenDormant"))
+    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (IF (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")) THEN TRUE ELSE (\E edge \in wiring_edges : (IF ((mob_machine_wiring_edge_a(edge) = agent_identity) /\ ((mob_machine_wiring_edge_b(edge) \in DOMAIN member_placement) = TRUE)) THEN TRUE ELSE ((mob_machine_wiring_edge_b(edge) = agent_identity) /\ ((mob_machine_wiring_edge_a(edge) \in DOMAIN member_placement) = TRUE))))), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "VerifyThenDormant"))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5b7c70157a807279
@@ -20153,7 +20153,7 @@ PlanBootMaterializationVerify(agent_identity, obligation, host_required, orchest
 PlanBootMaterializationStayDormant(agent_identity, obligation, host_required, orchestrator_notified) ==
     /\ phase = "Running"
     /\ ((IF (agent_identity \in DOMAIN member_materialization) THEN Some((IF agent_identity \in DOMAIN member_materialization THEN member_materialization[agent_identity] ELSE "None")) ELSE None) = Some("Dormant"))
-    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "StayDormant"))
+    /\ ((IF ~(((agent_identity \in DOMAIN member_peer_endpoints) = TRUE)) THEN TRUE ELSE (agent_identity \in DOMAIN member_peer_endpoints)) /\ (member_boot_materialization(member_restore_policy, (composition_authority = "Authoritative"), (agent_identity \in member_host_preparation_pending), (placed_completion_lifecycle_quiescing = FALSE), obligation, (IF (agent_identity \in member_kickoff_pending) THEN TRUE ELSE (agent_identity \in member_kickoff_starting)), (IF (((agent_identity \in DOMAIN member_peer_endpoints) = TRUE) /\ ((member_peer_endpoints)[agent_identity].transport # "Inproc")) THEN TRUE ELSE (\E edge \in wiring_edges : (IF ((mob_machine_wiring_edge_a(edge) = agent_identity) /\ ((mob_machine_wiring_edge_b(edge) \in DOMAIN member_placement) = TRUE)) THEN TRUE ELSE ((mob_machine_wiring_edge_b(edge) = agent_identity) /\ ((mob_machine_wiring_edge_a(edge) \in DOMAIN member_placement) = TRUE))))), orchestrator_notified, (agent_identity \in DOMAIN member_peer_endpoints), host_required) = "StayDormant"))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ member_boot_obligation_owed' = IF ((agent_identity \in DOMAIN member_peer_endpoints) = FALSE) THEN MapSet(member_boot_obligation_owed, agent_identity, "EndpointPending") ELSE member_boot_obligation_owed
@@ -21565,7 +21565,7 @@ CommitMemberRotationRetiredKickoffStopped(agent_identity, agent_runtime_id, fenc
 
 ResolveRuntimeBindingRefusalStaleRunning(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt) ==
     /\ phase = "Running"
-    /\ ((attempt # None) /\ ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id)))
     /\ phase' = "Running"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5b7c70157a807279
@@ -21573,7 +21573,7 @@ ResolveRuntimeBindingRefusalStaleRunning(agent_identity, agent_runtime_id, sessi
 
 ResolveRuntimeBindingRefusalStaleStopped(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt) ==
     /\ phase = "Stopped"
-    /\ ((attempt # None) /\ ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id)))
     /\ phase' = "Stopped"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5b7c70157a807279
@@ -21581,7 +21581,7 @@ ResolveRuntimeBindingRefusalStaleStopped(agent_identity, agent_runtime_id, sessi
 
 ResolveRuntimeBindingRefusalStaleCompleted(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt) ==
     /\ phase = "Completed"
-    /\ ((attempt # None) /\ ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id)))
     /\ phase' = "Completed"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5b7c70157a807279
@@ -21589,7 +21589,7 @@ ResolveRuntimeBindingRefusalStaleCompleted(agent_identity, agent_runtime_id, ses
 
 ResolveRuntimeBindingRefusalStaleDestroyed(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt) ==
     /\ phase = "Destroyed"
-    /\ ((attempt # None) /\ ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt))
+    /\ (IF ((IF (agent_identity \in DOMAIN member_wake_attempts) THEN Some((IF agent_identity \in DOMAIN member_wake_attempts THEN member_wake_attempts[agent_identity] ELSE 0)) ELSE None) # attempt) THEN TRUE ELSE ((IF (agent_identity \in DOMAIN member_session_bindings) THEN Some((IF agent_identity \in DOMAIN member_session_bindings THEN member_session_bindings[agent_identity] ELSE "None")) ELSE None) # Some(session_id)))
     /\ phase' = "Destroyed"
     /\ model_step_count' = model_step_count + 1
     /\ UnchangedFrame_5b7c70157a807279

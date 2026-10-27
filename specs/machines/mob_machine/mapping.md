@@ -5132,6 +5132,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `MemberReleaseClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RuntimeBindingRefusalStale`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Invariants
 - `stopped_mob_holds_member_run_starts`
