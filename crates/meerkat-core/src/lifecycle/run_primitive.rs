@@ -3482,7 +3482,7 @@ mod tests {
             serde_json::json!({ "mode": "implicit", "ttl": "12h" })
         );
 
-        let mut cleared = effective.provider_tag.clone().expect("merged provider tag");
+        let mut cleared = effective.provider_tag.expect("merged provider tag");
         cleared.clear_matching_defaults(&defaults);
         assert_eq!(
             cleared,
