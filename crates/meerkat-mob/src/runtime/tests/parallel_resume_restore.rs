@@ -306,6 +306,9 @@ impl SpawnedMob {
             .with_session_service(self.service.clone())
             .notify_orchestrator_on_resume(false)
             .with_resume_restore_concurrency(concurrency)
+            // Every member is restored at start: the parallel restore stream is
+            // what these rows measure.
+            .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
     }
 
     /// Start a resume at `concurrency` in a task of its own.
@@ -398,7 +401,10 @@ impl SpawnedMob {
                             .map(|session| session.0 == spawned.to_string()),
                         state.member_profile_names.get(&dsl_identity),
                         state.member_runtime_modes.get(&dsl_identity),
-                        state.member_revival_pending.contains(&dsl_identity),
+                        crate::runtime::boot_plan::member_materialization_phase(
+                            &state,
+                            &dsl_identity,
+                        ),
                         state.member_restore_failures.get(&dsl_identity),
                         state
                             .spawn_profile_authority_profile_names
@@ -879,6 +885,9 @@ async fn a_fork_child_restored_after_a_crash_is_built_as_its_source_at_any_resto
                 source: source_identity.clone(),
             }))
             .with_resume_restore_concurrency(concurrency)
+            // Every member is restored at start: the parallel restore stream is
+            // what these rows measure.
+            .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
             .resume()
             .await
             .unwrap_or_else(|error| panic!("resume at concurrency {concurrency}: {error}"));
@@ -961,6 +970,9 @@ impl RecreatableMob {
             .allow_ephemeral_sessions(true)
             .notify_orchestrator_on_resume(false)
             .with_resume_restore_concurrency(concurrency)
+            // Every member is restored at start: the parallel restore stream is
+            // what these rows measure.
+            .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
     }
 
     /// Resume at `concurrency`; the resume succeeds.
@@ -1230,6 +1242,9 @@ async fn a_cold_resume_repoints_a_member_to_its_successor_while_other_members_ho
             .with_spawn_member_customizer(migration.clone())
             .notify_orchestrator_on_resume(false)
             .with_resume_restore_concurrency(CONCURRENCY)
+            // Every member is restored at start: the parallel restore stream is
+            // what these rows measure.
+            .with_member_restore_policy(crate::runtime::MemberRestorePolicy::Eager)
             .resume(),
     );
     let restored = tokio::time::timeout(

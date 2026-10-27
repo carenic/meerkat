@@ -1609,6 +1609,21 @@ impl MobActor {
                         spec,
                     }));
                 }
+                // A member that is not materialized is observed from its
+                // durable endpoint: no comms runtime of it is looked up.
+                if crate::runtime::boot_plan::domain_member_is_dormant(
+                    self.dsl_authority.state(),
+                    &identity,
+                ) && let Some(spec) =
+                    self.machine_member_peer_spec_for(&identity, "retirement endpoint observation")?
+                {
+                    return Ok(RetirementEndpointPlan::Ready(
+                        WiringEndpoint::LocalDormant {
+                            entry: Box::new(entry.clone()),
+                            spec,
+                        },
+                    ));
+                }
                 Ok(RetirementEndpointPlan::Local {
                     entry: entry.clone(),
                     member_ref,
@@ -2028,6 +2043,24 @@ impl MobActor {
             let Some(entry) = entry else {
                 continue;
             };
+            // MobMachine's notice verdict (R4) decides whether this peer
+            // gets the retirement notices (a member that is not
+            // materialized, on either side, is Suppressed). The trust
+            // cleanup does not depend on it.
+            let deliver_notice = match self.lifecycle_notice_delivers(identity, &ctx.agent_identity)
+            {
+                Ok(deliver) => deliver,
+                Err(error) => {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %ctx.agent_identity,
+                        peer_id = %identity,
+                        %error,
+                        "retirement lifecycle notice verdict failed; continuing with trust cleanup"
+                    );
+                    false
+                }
+            };
             let endpoint = observed.endpoints.remove(identity).unwrap_or_else(|| {
                 Err(MobError::Internal(
                     "retirement notification endpoint observation missing".into(),
@@ -2035,7 +2068,9 @@ impl MobActor {
             });
             match endpoint {
                 Ok(WiringEndpoint::Local { comms, spec, .. }) => {
-                    notice_targets.push(spec.clone());
+                    if deliver_notice {
+                        notice_targets.push(spec.clone());
+                    }
                     let Some(authority) = ctx.trust_unwire_authority_by_peer.get(identity).cloned()
                     else {
                         let error = MobError::RetirementTopologyIncomplete(format!(
@@ -2057,10 +2092,38 @@ impl MobActor {
                     }
                 }
                 Ok(WiringEndpoint::PeerOnly { spec, .. }) => {
-                    notice_targets.push(spec);
+                    if deliver_notice {
+                        notice_targets.push(spec);
+                    }
                     continuation.remote_peers.push(identity.clone());
                 }
                 Ok(WiringEndpoint::Placed { .. }) => {}
+                // A peer that is not materialized holds no trust row to
+                // remove, and MobMachine suppresses its notices: its wake's
+                // topology step reads the machine, which no longer wires it
+                // to the retiring member. A peer-only retiring member's own
+                // trust toward the peer's durable endpoint is unwired like a
+                // peer whose comms runtime is gone.
+                Ok(WiringEndpoint::LocalDormant { .. }) => {
+                    if deliver_notice {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %ctx.agent_identity,
+                            peer_id = %identity,
+                            error = %Self::unmaterialized_notice_drift(
+                                identity,
+                                &ctx.agent_identity,
+                                "Deliver",
+                            ),
+                            "retirement lifecycle notice not sent; continuing with trust cleanup"
+                        );
+                    }
+                    if Self::runtime_binding_for_entry(&ctx.entry).is_some()
+                        && !ctx.preserve_machine_topology
+                    {
+                        continuation.remote_peers.push(identity.clone());
+                    }
+                }
                 Err(error) if Self::runtime_binding_for_entry(&entry).is_none() => {
                     let retained = self
                         .machine_member_peer_spec_for(
@@ -5550,6 +5613,12 @@ impl MobActor {
                         rollback.phase = SpawnRollbackPhase::PlacedTrust;
                         continue;
                     };
+                    // MobMachine's notice verdict (R4): a peer that is not
+                    // materialized is Suppressed and gets no notice.
+                    if !self.lifecycle_notice_delivers(peer, &identity)? {
+                        rollback.notice_index += 1;
+                        continue;
+                    }
                     let target = rollback
                         .endpoints
                         .get(peer)
@@ -5918,7 +5987,10 @@ impl MobActor {
                                 },
                             );
                         }
-                        Ok(WiringEndpoint::Placed { spec, .. }) => {
+                        Ok(
+                            WiringEndpoint::Placed { spec, .. }
+                            | WiringEndpoint::LocalDormant { spec, .. },
+                        ) => {
                             rollback.endpoints.insert(
                                 identity,
                                 SpawnRollbackEndpoint {

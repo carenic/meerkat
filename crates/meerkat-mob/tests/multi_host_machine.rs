@@ -67,12 +67,12 @@ fn provision_operation_id(identity_name: &str, generation: u64) -> String {
 }
 
 fn member_endpoint(identity_name: &str, key_byte: u8) -> MemberPeerEndpoint {
-    MemberPeerEndpoint {
-        name: PeerName(identity_name.to_string()),
-        peer_id: PeerId(format!("peer-{identity_name}")),
-        address: PeerAddress(format!("tcp://members/{identity_name}")),
-        signing_key: PeerSigningKey([key_byte; 32]),
-    }
+    MemberPeerEndpoint::new(
+        PeerName(identity_name.to_string()),
+        PeerId(format!("peer-{identity_name}")),
+        PeerAddress(format!("tcp://members/{identity_name}")),
+        PeerSigningKey([key_byte; 32]),
+    )
 }
 
 /// Capability shape for a bind/rebind test host.

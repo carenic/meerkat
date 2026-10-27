@@ -12,6 +12,7 @@ use super::transaction::LifecycleRollback;
 use super::*;
 
 pub(super) mod boot_lift;
+mod dormant_wiring;
 pub(super) mod explicit_resume;
 #[cfg(feature = "openai-live")]
 pub(super) mod live_durable_source_loads;
@@ -5597,20 +5598,29 @@ enum BatchWiringEndpoint {
         spec: TrustedPeerDescriptor,
         removal_key: String,
     },
+    /// A seated local member that is not materialized: its durable endpoint
+    /// feeds a live counterpart's trust row, and nothing is installed on its
+    /// own side (its wake's topology step realizes its trust).
+    NotMaterialized {
+        spec: TrustedPeerDescriptor,
+        removal_key: String,
+    },
 }
 
 impl BatchWiringEndpoint {
     fn spec(&self) -> &TrustedPeerDescriptor {
         match self {
             Self::Local(local) => &local.spec,
-            Self::Placed { spec, .. } => spec,
+            Self::Placed { spec, .. } | Self::NotMaterialized { spec, .. } => spec,
         }
     }
 
     fn removal_key(&self) -> &str {
         match self {
             Self::Local(local) => &local.removal_key,
-            Self::Placed { removal_key, .. } => removal_key,
+            Self::Placed { removal_key, .. } | Self::NotMaterialized { removal_key, .. } => {
+                removal_key
+            }
         }
     }
 }
@@ -23157,7 +23167,7 @@ impl MobActor {
     }
 
     async fn emit_prepared_kickoff_notices(
-        &self,
+        &mut self,
         agent_identity: &AgentIdentity,
         effects: &[mob_dsl::MobMachineEffect],
     ) {
@@ -45676,6 +45686,16 @@ impl MobActor {
                     let removal_key = Self::trusted_peer_removal_key(&spec);
                     endpoints.insert(identity, BatchWiringEndpoint::Placed { spec, removal_key });
                 }
+                // A member that is not materialized rides the batch from its
+                // durable endpoint, with no wake: a live counterpart trusts
+                // it now, its own side is realized by its wake.
+                WiringEndpoint::LocalDormant { spec, .. } => {
+                    let removal_key = Self::trusted_peer_removal_key(&spec);
+                    endpoints.insert(
+                        identity,
+                        BatchWiringEndpoint::NotMaterialized { spec, removal_key },
+                    );
+                }
                 // V3 legacy-external members were never batch-wireable
                 // (descriptor exchange and rollback are per-peer
                 // semantics); this reject names that class only — placed
@@ -46031,7 +46051,11 @@ impl MobActor {
                     fence_token: expected.fence_token,
                 })
             }
-            WiringEndpoint::Local { .. } | WiringEndpoint::PeerOnly { .. } => None,
+            // A recipient that is not materialized is addressed by its durable
+            // endpoint: the send reaches its wake route, which wakes it.
+            WiringEndpoint::Local { .. }
+            | WiringEndpoint::PeerOnly { .. }
+            | WiringEndpoint::LocalDormant { .. } => None,
         };
         let recipient_spec = recipient_endpoint.spec().clone();
         let route =
@@ -49332,7 +49356,9 @@ impl MobActor {
                     Some(observed) => observed.supervisor_comms.clone(),
                     None => self.supervisor_bridge.runtime_core().await,
                 }),
-                Ok(WiringEndpoint::Placed { .. }) => None,
+                // A retiring member that is not materialized holds no trust
+                // row of its own.
+                Ok(WiringEndpoint::Placed { .. } | WiringEndpoint::LocalDormant { .. }) => None,
                 Err(error) => {
                     tracing::debug!(
                         mob_id = %self.definition.id,
@@ -49363,8 +49389,12 @@ impl MobActor {
                 ),
                 // A retiring PLACED member's own runtime is remote: peers'
                 // local rows are cleaned with its machine-recorded spec; its
-                // own rows die with the host-side release.
-                Ok(WiringEndpoint::Placed { spec, .. }) => (spec, None),
+                // own rows die with the host-side release. A retiring member
+                // that is not materialized holds no rows of its own: peers'
+                // rows are cleaned with its durable endpoint.
+                Ok(
+                    WiringEndpoint::Placed { spec, .. } | WiringEndpoint::LocalDormant { spec, .. },
+                ) => (spec, None),
                 Err(error) => {
                     let retained_spec = match self.machine_member_peer_spec_for(
                         &retiring_identity,
@@ -49464,7 +49494,8 @@ impl MobActor {
                 Ok(
                     WiringEndpoint::Local { spec, .. }
                     | WiringEndpoint::PeerOnly { spec, .. }
-                    | WiringEndpoint::Placed { spec, .. },
+                    | WiringEndpoint::Placed { spec, .. }
+                    | WiringEndpoint::LocalDormant { spec, .. },
                 ) => spec,
                 Err(error) => {
                     let retained_spec = match self.machine_member_peer_spec_for(
@@ -49954,6 +49985,15 @@ impl MobActor {
             .iter()
             .cloned()
             .collect::<Vec<_>>();
+        // Destroy admits every roster member into Retiring before disposal
+        // starts. A peer-lifecycle send from one destroy-admitted member to
+        // another waits for that recipient's comms drain to hand off the
+        // volatile notice, but teardown is the sole remaining authority and
+        // the drain may already be quiescent. The notice carries no cleanup
+        // authority: MobMachine owns topology and the exact trust removals
+        // below own the physical rows. Skip only that redundant notice while
+        // preserving every generated trust mutation and wiring cleanup.
+        let emit_peer_lifecycle_notice = !self.destroy_cleanup_active;
         let mut local_jobs = Vec::new();
         let mut local_peer_specs = Vec::new();
         let mut peer_only_jobs = Vec::new();
@@ -49971,6 +50011,24 @@ impl MobActor {
                 );
                 continue;
             };
+            // MobMachine's notice verdict (R4) decides whether this peer
+            // gets the retirement notice (a member that is not materialized,
+            // on either side, is Suppressed). The trust cleanup below does
+            // not depend on it.
+            let deliver_notice = emit_peer_lifecycle_notice
+                && match self.lifecycle_notice_delivers(&peer_identity, &ctx.agent_identity) {
+                    Ok(deliver) => deliver,
+                    Err(error) => {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %ctx.agent_identity,
+                            peer_id = %peer_identity,
+                            %error,
+                            "dispose_notify_peers: lifecycle notice verdict failed; continuing with critical trust cleanup"
+                        );
+                        false
+                    }
+                };
             let endpoint = match self
                 .resolve_wiring_endpoint(&peer_entry, "dispose_notify_peers")
                 .await
@@ -50040,10 +50098,11 @@ impl MobActor {
                         comms,
                         authority,
                         historical_authorities,
+                        deliver_notice,
                     ));
                 }
                 WiringEndpoint::PeerOnly { spec, binding } => {
-                    peer_only_jobs.push((peer_identity, spec, binding));
+                    peer_only_jobs.push((peer_identity, spec, binding, deliver_notice));
                 }
                 WiringEndpoint::Placed { .. } => {
                     // A placed peer's runtime is remote: its trust row for
@@ -50056,17 +50115,30 @@ impl MobActor {
                         "dispose_notify_peers skipping placed peer (remote runtime)"
                     );
                 }
+                // A peer that is not materialized holds no trust row for the
+                // retiring member, and MobMachine suppresses its notice: its
+                // wake's topology step reads the machine, which no longer
+                // wires it. A peer-only retiring member's own trust toward
+                // the peer's durable endpoint is removed below, as for a
+                // peer whose comms runtime is gone.
+                WiringEndpoint::LocalDormant { spec, .. } => {
+                    if deliver_notice {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %ctx.agent_identity,
+                            peer_id = %peer_identity,
+                            error = %Self::unmaterialized_notice_drift(
+                                &peer_identity,
+                                &ctx.agent_identity,
+                                "Deliver",
+                            ),
+                            "dispose_notify_peers: lifecycle notice not sent; continuing with critical trust cleanup"
+                        );
+                    }
+                    local_peer_specs.push((peer_identity, spec));
+                }
             }
         }
-        // Destroy admits every roster member into Retiring before disposal
-        // starts. A peer-lifecycle send from one destroy-admitted member to
-        // another waits for that recipient's comms drain to hand off the
-        // volatile notice, but teardown is the sole remaining authority and
-        // the drain may already be quiescent. The notice carries no cleanup
-        // authority: MobMachine owns topology and the exact trust removals
-        // below own the physical rows. Skip only that redundant notice while
-        // preserving every generated trust mutation and wiring cleanup.
-        let emit_peer_lifecycle_notice = !self.destroy_cleanup_active;
         let retiring_key = Self::trusted_peer_removal_key(retiring_spec);
         let retiring_comms = ctx.retiring_comms.clone();
         let retiring_spec_for_jobs = retiring_spec.clone();
@@ -50084,6 +50156,7 @@ impl MobActor {
                 recipient_comms,
                 authority,
                 historical_authorities,
+                deliver_notice,
             ) in local_jobs
             {
                 let retiring_key = retiring_key.clone();
@@ -50094,7 +50167,7 @@ impl MobActor {
                 let owner_token = owner_token.clone();
                 let mob_id = mob_id.clone();
                 local_tasks.push(async move {
-                if emit_peer_lifecycle_notice
+                if deliver_notice
                     && let Some(retiring_comms) = retiring_comms.as_ref()
                 {
                     if let Err(error) = Self::notify_peer_retired_bounded(
@@ -50130,7 +50203,7 @@ impl MobActor {
                             "dispose_notify_peers: lifecycle notice sent"
                         );
                     }
-                } else if emit_peer_lifecycle_notice {
+                } else if deliver_notice {
                     if retiring_member_is_placed {
                         tracing::warn!(
                             mob_id = %mob_id,
@@ -50146,6 +50219,13 @@ impl MobActor {
                             "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                         );
                     }
+                } else if emit_peer_lifecycle_notice {
+                    tracing::debug!(
+                        mob_id = %mob_id,
+                        agent_identity = %retired_id,
+                        peer_id = %peer_identity,
+                        "dispose_notify_peers: MobMachine suppressed the lifecycle notice"
+                    );
                 } else {
                     tracing::debug!(
                         mob_id = %mob_id,
@@ -50256,9 +50336,8 @@ impl MobActor {
                 }
             }
         }
-        for (peer_identity, recipient_spec, recipient_binding) in peer_only_jobs {
-            if emit_peer_lifecycle_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref()
-            {
+        for (peer_identity, recipient_spec, recipient_binding, deliver_notice) in peer_only_jobs {
+            if deliver_notice && let Some(retiring_comms) = ctx.retiring_comms.as_ref() {
                 if let Err(error) = Self::notify_peer_retired_bounded(
                     &recipient_spec,
                     &ctx.agent_identity,
@@ -50292,7 +50371,7 @@ impl MobActor {
                         "dispose_notify_peers: lifecycle notice sent"
                     );
                 }
-            } else if emit_peer_lifecycle_notice {
+            } else if deliver_notice {
                 if super::member_runtime_is_host_owned(
                     self.dsl_authority.state(),
                     &ctx.agent_identity,
@@ -50311,6 +50390,13 @@ impl MobActor {
                         "dispose_notify_peers: skipping lifecycle notice because retiring member has no live comms runtime"
                     );
                 }
+            } else if emit_peer_lifecycle_notice {
+                tracing::debug!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %ctx.agent_identity,
+                    peer_id = %peer_identity,
+                    "dispose_notify_peers: MobMachine suppressed the lifecycle notice"
+                );
             } else {
                 tracing::debug!(
                     mob_id = %self.definition.id,
@@ -62088,7 +62174,8 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. }
             | WiringEndpoint::PeerOnly { spec, .. }
-            | WiringEndpoint::Placed { spec, .. } => spec,
+            | WiringEndpoint::Placed { spec, .. }
+            | WiringEndpoint::LocalDormant { spec, .. } => spec,
         };
         let peer_route =
             PeerRoute::with_display_name(recipient_spec.peer_id, recipient_spec.name.clone());
@@ -62129,7 +62216,8 @@ impl MobActor {
         {
             WiringEndpoint::Local { spec, .. }
             | WiringEndpoint::PeerOnly { spec, .. }
-            | WiringEndpoint::Placed { spec, .. } => spec,
+            | WiringEndpoint::Placed { spec, .. }
+            | WiringEndpoint::LocalDormant { spec, .. } => spec,
         };
         self.notify_peer_event_with_spec(
             intent,
@@ -62254,7 +62342,7 @@ impl MobActor {
     }
 
     async fn notify_kickoff_event(
-        &self,
+        &mut self,
         agent_identity: &AgentIdentity,
         intent: &'static str,
     ) -> Result<(), MobError> {
@@ -62310,11 +62398,25 @@ impl MobActor {
             let Some(recipient_entry) = recipient_entry else {
                 continue;
             };
+            // MobMachine's notice verdict (R4) decides whether this notice
+            // is sent: a recipient or sender that is not materialized is
+            // Suppressed, and its wake's topology step realizes the
+            // membership from machine state.
+            if !self.lifecycle_notice_delivers(&recipient_entry.agent_identity, agent_identity)? {
+                continue;
+            }
             let recipient_spec = match self
                 .resolve_wiring_endpoint(&recipient_entry, "notify_kickoff_event")
                 .await?
             {
                 WiringEndpoint::Local { spec, .. } | WiringEndpoint::PeerOnly { spec, .. } => spec,
+                WiringEndpoint::LocalDormant { .. } => {
+                    return Err(Self::unmaterialized_notice_drift(
+                        &recipient_entry.agent_identity,
+                        agent_identity,
+                        "Deliver",
+                    ));
+                }
                 WiringEndpoint::Placed { .. } => {
                     return Err(MobError::WiringError(format!(
                         "kickoff lifecycle notice to placed member '{}' has no remote-recipient realization",

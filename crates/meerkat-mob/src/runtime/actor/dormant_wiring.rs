@@ -101,36 +101,49 @@ impl MobActor {
         b: &AgentIdentity,
     ) -> Result<(), MobError> {
         for (recipient, sender) in [(a, b), (b, a)] {
-            let recipient_identity = mob_dsl::AgentIdentity::from_domain(recipient);
-            let sender_identity = mob_dsl::AgentIdentity::from_domain(sender);
-            let effects = self.apply_dsl_input_collect_effects(
-                mob_dsl::MobMachineInput::ClassifyPeerNotice {
-                    recipient: recipient_identity.clone(),
-                    sender: sender_identity.clone(),
-                    notice_class: mob_dsl::PeerInputClass::Lifecycle,
-                },
-                "classify_unmaterialized_edge_lifecycle_notice",
-            )?;
-            let disposition = effects.iter().find_map(|effect| match effect {
-                mob_dsl::MobMachineEffect::PeerNoticeClassified {
-                    recipient: classified_recipient,
-                    sender: classified_sender,
-                    disposition,
-                    ..
-                } if classified_recipient == &recipient_identity
-                    && classified_sender == &sender_identity =>
-                {
-                    Some(disposition.clone())
-                }
-                _ => None,
-            });
-            if !matches!(disposition, Some(mob_dsl::PeerNoticeDisposition::Suppressed)) {
-                return Err(MobError::Internal(format!(
-                    "MobMachine classified the lifecycle notice from '{sender}' to '{recipient}' as {disposition:?}, which no comms runtime can carry for a member that is not materialized"
-                )));
+            let disposition =
+                self.classify_peer_notice(recipient, sender, mob_dsl::PeerInputClass::Lifecycle)?;
+            if !matches!(disposition, mob_dsl::PeerNoticeDisposition::Suppressed) {
+                return Err(Self::unmaterialized_notice_drift(
+                    recipient,
+                    sender,
+                    &format!("{disposition:?}"),
+                ));
             }
         }
         Ok(())
+    }
+
+    /// MobMachine's verdict on one lifecycle notice from `sender` to
+    /// `recipient` (R4), realized through the notice consumer: true only
+    /// for `Deliver`. A notice that is not delivered is skipped because of
+    /// that verdict, never because of the recipient's endpoint.
+    pub(super) fn lifecycle_notice_delivers(
+        &mut self,
+        recipient: &AgentIdentity,
+        sender: &AgentIdentity,
+    ) -> Result<bool, MobError> {
+        Ok(matches!(
+            self.realize_peer_notice_disposition(
+                recipient,
+                sender,
+                mob_dsl::PeerInputClass::Lifecycle,
+            )?,
+            super::member_wake::PeerNoticeRealization::Deliver
+        ))
+    }
+
+    /// A lifecycle notice whose MobMachine verdict needs a comms runtime that
+    /// a member that is not materialized does not have: the verdict and the
+    /// member's materialization disagree.
+    pub(super) fn unmaterialized_notice_drift(
+        recipient: &AgentIdentity,
+        sender: &AgentIdentity,
+        verdict: &str,
+    ) -> MobError {
+        MobError::Internal(format!(
+            "MobMachine's verdict {verdict} on the lifecycle notice from '{sender}' to '{recipient}' needs a comms runtime that a member that is not materialized does not have"
+        ))
     }
 
     /// Wire a new edge one of whose members is not materialized (see the

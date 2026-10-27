@@ -9457,9 +9457,19 @@ impl MobHandle {
         bridge_session_id: &SessionId,
         _roster_snapshot: &Roster,
     ) -> Option<MobPeerConnectivitySnapshot> {
-        self.session_service
-            .comms_runtime(bridge_session_id)
-            .await?;
+        // A member seated and not materialized in this process has no live
+        // comms runtime; its connectivity is the machine's wiring, projected
+        // exactly as a live member's is, so a dormant member reads like an
+        // idle live one. A read never wakes it.
+        let unmaterialized = {
+            let machine_state = self.machine_state_watch_rx.borrow();
+            super::boot_plan::domain_member_is_unmaterialized(&machine_state, &entry.agent_identity)
+        };
+        if !unmaterialized {
+            self.session_service
+                .comms_runtime(bridge_session_id)
+                .await?;
+        }
 
         let reachable_peer_count = 0usize;
         // Watch-borrow discipline: the borrow guard blocks the actor's next
@@ -16685,6 +16695,29 @@ impl MobHandle {
                 return None;
             }
             let session_id = snapshot.current_bridge_session_id().cloned()?;
+            let unmaterialized = {
+                let machine_state = self.machine_state_watch_rx.borrow();
+                super::boot_plan::domain_member_is_unmaterialized(&machine_state, identity)
+            };
+            if unmaterialized {
+                // A member that is not materialized has no live registration:
+                // its capabilities are those its durable session's model
+                // resolves to, the resolution its wake binds. Read-only: no
+                // session is registered and nothing wakes.
+                let metadata = self
+                    .session_service
+                    .load_persisted_session_metadata(&session_id)
+                    .await
+                    .ok()
+                    .flatten()?
+                    .session_metadata?;
+                let profile =
+                    meerkat_models::canonical().profile_for(metadata.provider, &metadata.model)?;
+                return Some(
+                    meerkat_runtime::SessionLlmCapabilitySurface::from_model_profile(&profile)
+                        .to_wire_resolved(),
+                );
+            }
             let runtime = self.runtime_adapter.as_ref()?.as_ref();
             runtime
                 .resolved_session_llm_capabilities(&session_id)
