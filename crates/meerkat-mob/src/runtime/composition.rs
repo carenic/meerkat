@@ -868,6 +868,22 @@ mod tests {
             other => panic!("the attempt is projected opaque, got {other:?}"),
         }
         assert!(effect.field(&fid("unknown_field")).is_none());
+
+        // A wake's binding carries its attempt the same way.
+        let woken = seam(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            agent_identity: mob_dsl::AgentIdentity::from("agent"),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from("rt-1"),
+            fence_token: mob_dsl::FenceToken(7),
+            generation: Some(mob_dsl::Generation(3)),
+            session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: Some(9),
+        });
+        match woken.field(&fid("attempt")).expect("present") {
+            FieldValue::Opaque(value) => {
+                assert_eq!(value.downcast_ref::<Option<u64>>(), Some(&Some(9)));
+            }
+            other => panic!("the attempt is projected opaque, got {other:?}"),
+        }
     }
 
     #[test]

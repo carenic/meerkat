@@ -91,8 +91,11 @@ them.
   records (stamped with the realm that declares it). Otherwise the spawn is
   refused with the new `MobError::MemberAuthBindingConflict { member_id,
   session_id, requested, recorded }` (wire code `INVALID_PARAMS`, structured
-  data kind `member_auth_binding_conflict`), and nothing changes. Before, the
-  live actor was reused on whatever binding it ran.
+  data kind `member_auth_binding_conflict`), and nothing changes. A restore at
+  a mob's start or a wake that would keep a member's live actor, or a live
+  successor session, applies the same check: on a conflict the member's
+  restore or wake fails with that typed reason and the member is recorded
+  broken. Before, the live actor was reused on whatever binding it ran.
 
 ### Added
 

@@ -3387,6 +3387,9 @@ struct PreparedMemberRegistrationReload {
     entry: RosterEntry,
     member_ref: MemberRef,
     bridge_session_id: SessionId,
+    /// [`member_requires_comms_drain`], read from the machine when the reload
+    /// was prepared.
+    drain_required: bool,
 }
 
 pub(super) enum MemberLiveRevivalOutcome {
@@ -18983,10 +18986,12 @@ impl MobActor {
                 reason: "registration reload requires a session-backed member".to_string(),
             }
         })?;
+        let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
         Ok(PreparedMemberRegistrationReload {
             entry,
             member_ref,
             bridge_session_id,
+            drain_required,
         })
     }
 
@@ -19056,6 +19061,7 @@ impl MobActor {
         entry: &RosterEntry,
         member_ref: &MemberRef,
         bridge_session_id: &SessionId,
+        drain_required: bool,
         set_stage: &(dyn Fn(&'static str) + Sync),
     ) -> Result<super::handle::MemberReloadDisposition, MobError> {
         set_stage("live_session_revival");
@@ -19108,7 +19114,7 @@ impl MobActor {
                 .await?;
         } else {
             context
-                .ensure_mob_comms_drain(&entry.agent_identity, member_ref)
+                .ensure_member_comms_drain(&entry.agent_identity, member_ref, drain_required)
                 .await?;
         }
         Ok(super::handle::MemberReloadDisposition::Reattached)
@@ -19125,6 +19131,7 @@ impl MobActor {
             entry,
             member_ref,
             bridge_session_id,
+            drain_required,
         } = prepared;
         if reply_tx.is_closed() {
             return;
@@ -19174,6 +19181,7 @@ impl MobActor {
                             &entry,
                             &member_ref,
                             &bridge_session_id,
+                            drain_required,
                             &set_stage,
                         )
                         .await
@@ -19270,7 +19278,11 @@ impl MobActor {
                         .await?;
                 } else {
                     context
-                        .ensure_mob_comms_drain(&entry.agent_identity, &member_ref)
+                        .ensure_member_comms_drain(
+                            &entry.agent_identity,
+                            &member_ref,
+                            drain_required,
+                        )
                         .await?;
                 }
                 let disposition = if !adapter
