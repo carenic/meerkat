@@ -179,8 +179,17 @@ pub(crate) mod scan_contract {
         /// One runtime for each kind of recovery work.
         pub(crate) listed: HashSet<LogicalRuntimeId>,
         /// An idle runtime, an archived one that holds a nonterminal input,
-        /// and one whose ops lifecycle snapshot's completion was delivered.
+        /// an archived one that keeps an ops lifecycle snapshot owing a
+        /// completion, and one whose ops lifecycle snapshot's completion was
+        /// delivered.
         pub(crate) unlisted: HashSet<LogicalRuntimeId>,
+        /// The listed runtime whose only work is the background operation
+        /// completion its ops lifecycle snapshot owes.
+        pub(crate) owed_completion: LogicalRuntimeId,
+        /// The archived runtime that keeps an ops lifecycle snapshot owing
+        /// the same kind of completion, as a runtime retired before it
+        /// unregisters keeps its snapshot.
+        pub(crate) archived_owed_completion: LogicalRuntimeId,
     }
 
     impl ScanFixture {
@@ -438,7 +447,24 @@ pub(crate) mod scan_contract {
             .persist_ops_lifecycle(&undelivered, &completed_background_operation(None))
             .await
             .unwrap();
-        listed.insert(undelivered);
+        listed.insert(undelivered.clone());
+
+        // Archived, keeping an ops lifecycle snapshot that owes the same
+        // kind of completion (a runtime retired before it unregisters keeps
+        // its snapshot): an archived runtime holds no recovery work,
+        // whatever its snapshot says.
+        let mut retired_session = meerkat_core::Session::new();
+        retired_session.push(Message::User(UserMessage::text("a retired session")));
+        let archived_owed = LogicalRuntimeId::for_session(retired_session.id());
+        store
+            .persist_ops_lifecycle(&archived_owed, &completed_background_operation(None))
+            .await
+            .unwrap();
+        retired_session
+            .set_lifecycle_terminal(meerkat_core::SessionLifecycleTerminal::Archived)
+            .unwrap();
+        commit_session(store, &retired_session).await;
+        unlisted.insert(archived_owed.clone());
 
         // An ops lifecycle snapshot holding a running detached job wait, and
         // nothing else.
@@ -465,7 +491,12 @@ pub(crate) mod scan_contract {
             .unwrap();
         unlisted.insert(delivered);
 
-        ScanFixture { listed, unlisted }
+        ScanFixture {
+            listed,
+            unlisted,
+            owed_completion: undelivered,
+            archived_owed_completion: archived_owed,
+        }
     }
 
     /// The scan of a store that holds exactly `fixture` lists each runtime
@@ -480,6 +511,14 @@ pub(crate) mod scan_contract {
             unique.len(),
             listed.len(),
             "each runtime is listed once: {listed:?}"
+        );
+        assert!(
+            unique.contains(&fixture.owed_completion),
+            "a completion its ops lifecycle snapshot owes is recovery work"
+        );
+        assert!(
+            !unique.contains(&fixture.archived_owed_completion),
+            "an archived runtime holds no recovery work, whatever its kept snapshot owes"
         );
         assert_eq!(
             unique, fixture.listed,

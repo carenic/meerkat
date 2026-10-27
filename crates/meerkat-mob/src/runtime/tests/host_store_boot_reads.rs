@@ -57,8 +57,9 @@ const SETTLED_RESULT_BYTES: usize = 512;
 /// way and cost the row less time.
 const SETTLED_PER_SNAPSHOT: usize = 50;
 
-/// Heads a host store listing answers per call (the realm's page).
-const HEADS_PER_LIST: usize = 256;
+/// Heads a host store listing answers per call (the realm's page, 256
+/// before 0.9.7).
+const HEADS_PER_LIST: usize = 2048;
 
 /// The family tag of Core's chunk scopes (a chunk head names its owner).
 const CHUNK_TAG: &str = "ch";
@@ -590,7 +591,7 @@ async fn restart_after_history(label: &str, settled: usize) -> RestartReads {
 // Unrun until the candidate's validation. A start and a lift read no
 // Dormant member's rows, whatever its history.
 //
-// The start makes one acquire and `list_heads` per kind at 256 heads per
+// The start makes one acquire and `list_heads` per kind at 2048 heads per
 // call, reads the mob's own scopes, and makes no `load_head` or `read_rows`
 // that names a member's session scope or a chunk it owns; the lift of the
 // stopped mob reads none either. Every other count is the same for 0, 1,000

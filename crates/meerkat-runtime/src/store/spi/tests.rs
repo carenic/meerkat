@@ -3,7 +3,7 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
@@ -2086,7 +2086,7 @@ fn counted_calls(host: &TestHost) -> Vec<HostCall> {
 // Unrun until the candidate's validation.
 //
 // Runtimes with long settled histories and no work cost an open their heads
-// only: one acquire, `list_heads` per kind at 256 heads per call, and no
+// only: one acquire, `list_heads` per kind at 2048 heads per call, and no
 // `load_head` or `read_rows` at all, the obligation scan included. Every
 // count is the same for 0, 1,000 and 10,000 settled operations per runtime.
 #[tokio::test]
@@ -2148,6 +2148,165 @@ async fn an_open_reads_only_heads_for_quiet_runtimes_whatever_their_history() {
         recorded.windows(2).all(|pair| pair[0] == pair[1]),
         "every open makes the same calls whatever the history: {recorded:?}"
     );
+}
+
+/// The heads a listing asks one `list_heads` call for, as the host store
+/// reference names it (256 before 0.9.7). The rows below count calls
+/// against this number, not against the realm's constant.
+const DOCUMENTED_LIST_PAGE_HEADS: usize = 2048;
+
+/// Create `count` test scopes, `listed-00000` onwards, each holding one
+/// small pinned entry, committed a few hundred scopes per batch. Answers
+/// their keys.
+async fn seed_listed_scopes(realm: &SpiRealm, count: usize) -> BTreeSet<String> {
+    let ids: Vec<ScopeId> = (0..count)
+        .map(|n| ScopeId::new(TEST_FAMILY, format!("listed-{n:05}")))
+        .collect();
+    for batch in ids.chunks(256) {
+        let mut guards = realm.lock_scopes(batch).await;
+        let mut states: Vec<_> = guards.iter_mut().map(|guard| &mut **guard).collect();
+        let deltas = batch
+            .iter()
+            .map(|_| ScopeDelta::Changes(vec![("pin".into(), Some(Arc::new(b"listed".to_vec())))]))
+            .collect();
+        realm
+            .commit(&mut states, deltas)
+            .await
+            .expect("the test scopes land");
+    }
+    ids.into_iter().map(|id| id.key).collect()
+}
+
+/// The keys of every test scope `realm` claims from its listing.
+async fn claimed_test_keys(realm: &SpiRealm) -> BTreeSet<String> {
+    let mut keys = BTreeSet::new();
+    for cell in realm.claim(TEST_FAMILY).expect("the test scopes claim") {
+        keys.insert(cell.lock().await.id().key.clone());
+    }
+    keys
+}
+
+/// How many `list_heads` calls of `kind` `calls` holds.
+fn listings_of(calls: &[HostCall], kind: ScopeKind) -> usize {
+    calls
+        .iter()
+        .filter(|call| **call == HostCall::ListHeads { kind })
+        .count()
+}
+
+/// Wait until `realm`'s writer stops on a failed renew and acquires the
+/// fence again (renew interval 1 s), and answer the calls of that
+/// re-acquire.
+async fn reacquire_recording(host: &TestHost, realm: &SpiRealm) -> Vec<HostCall> {
+    let first = realm.fence();
+    host.faults.lock().unwrap().renew_unavailable = 1;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert!(
+        !realm.lease_is_live(),
+        "the failed renew stopped the writer"
+    );
+    host.take_calls();
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    assert!(
+        realm.lease_is_live() && realm.fence() > first,
+        "the writer acquired again and resumed: {:?}",
+        realm.realm_poisoned()
+    );
+    counted_calls(host)
+}
+
+// Unrun until the candidate's validation.
+//
+// An open and a stopped writer's re-acquire list a scope kind in pages of
+// 2048 heads: `ceil(n / 2048)` `list_heads` calls for n heads, one for a
+// kind with none. 2048 heads take one call, 2049 two and 4097 three (at 256
+// heads per call they took 8, 9 and 17), and the open claims every head.
+#[tokio::test(start_paused = true)]
+async fn an_open_and_a_reacquire_list_a_kind_in_pages_of_2048_heads() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    for scopes in [
+        DOCUMENTED_LIST_PAGE_HEADS,
+        DOCUMENTED_LIST_PAGE_HEADS + 1,
+        2 * DOCUMENTED_LIST_PAGE_HEADS + 1,
+    ] {
+        let host = Arc::new(TestHost::with_timing(timing));
+        let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+            .await
+            .unwrap();
+        let keys = seed_listed_scopes(&realm, scopes).await;
+        assert_eq!(
+            host.scope_count(ScopeKind::Record),
+            scopes,
+            "the test scopes are the only record scopes"
+        );
+        drop(realm);
+        host.expire_lease();
+        host.take_calls();
+        let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+            .await
+            .unwrap();
+        let opened = counted_calls(&host);
+        let reacquired = reacquire_recording(&host, &realm).await;
+        for (step, calls) in [("open", &opened), ("re-acquire", &reacquired)] {
+            assert_eq!(
+                listings_of(calls, ScopeKind::Record),
+                scopes.div_ceil(DOCUMENTED_LIST_PAGE_HEADS),
+                "the {step} lists {scopes} record heads {DOCUMENTED_LIST_PAGE_HEADS} per call"
+            );
+            for kind in [ScopeKind::Session, ScopeKind::Identity, ScopeKind::Mob] {
+                assert_eq!(
+                    listings_of(calls, kind),
+                    1,
+                    "the {step} lists the empty {kind} kind in one call"
+                );
+            }
+        }
+        assert_eq!(
+            claimed_test_keys(&realm).await,
+            keys,
+            "the open claims every head it listed"
+        );
+    }
+}
+
+// Unrun until the candidate's validation.
+//
+// A store may answer fewer heads than a listing asks for, with `next` set.
+// Over a store whose pages hold 100 heads, an open lists 250 record heads in
+// three calls and claims every one, and a stopped writer's re-acquire lists
+// them the same way and finds every version it knows, so it resumes.
+#[tokio::test(start_paused = true)]
+async fn a_store_with_shorter_pages_still_lists_every_head() {
+    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let host = Arc::new(TestHost::with_timing(timing));
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    let keys = seed_listed_scopes(&realm, 250).await;
+    drop(realm);
+    host.expire_lease();
+    host.faults.lock().unwrap().list_page_cap = Some(100);
+    host.take_calls();
+    let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        listings_of(&counted_calls(&host), ScopeKind::Record),
+        3,
+        "the open reads on from each short page"
+    );
+    assert_eq!(
+        claimed_test_keys(&realm).await,
+        keys,
+        "the open claims every head"
+    );
+    let reacquired = reacquire_recording(&host, &realm).await;
+    assert_eq!(
+        listings_of(&reacquired, ScopeKind::Record),
+        3,
+        "the re-acquire reads on from each short page"
+    );
+    assert!(realm.realm_poisoned().is_none());
 }
 
 // Unrun until the candidate's validation.

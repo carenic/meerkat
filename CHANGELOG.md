@@ -457,6 +457,21 @@ them.
   unwired turn-driven member binds it only when its runtime has comms. Before,
   a restore or a reload of an unwired turn-driven member whose session
   builder makes no comms failed its readiness, although its spawn succeeded.
+- `meerkat-runtime`: a host store realm asks `list_heads` for 2048 heads per
+  call, instead of 256, when it opens and when a writer that stopped
+  acquires the fence again. Every listing visits every scope the realm
+  holds, archived sessions and chunk scopes included, so a realm with many
+  scopes takes `ceil(scopes / 2048)` calls per scope kind (at least one), an
+  eighth of the calls it took before. A store may still answer fewer heads
+  per call with `HeadPage::next` set, and Core reads on from there. No
+  stored format changes.
+- `meerkat-runtime`: the SQLite runtime store's recovery scan, which a mob
+  start reads, no longer decodes the ops lifecycle snapshot of an archived
+  runtime. A runtime retired before it unregisters keeps that snapshot, so
+  the scan decoded one more snapshot for each such session ever archived; it
+  now reads the runtime's catalog entry first. The scan answers the same (an
+  archived runtime never holds recovery work), and an archived session still
+  revives on a resume that names it.
 
 ### Fixed
 

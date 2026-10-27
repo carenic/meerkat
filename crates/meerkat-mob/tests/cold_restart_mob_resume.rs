@@ -1493,6 +1493,157 @@ async fn mob_cold_restart_explicit_resume_revives_archived_retired_session_in_pl
     handle_2.shutdown().await.expect("final shutdown");
 }
 
+/// The same explicit revival over a durable SQLite runtime store that the
+/// restart reopens, so the restart's recovery scan runs over the archived
+/// worker's runtime: the scan lists no recovery work for it, and a resume
+/// that names its session still revives it in place, with its transcript.
+#[tokio::test(flavor = "multi_thread")]
+async fn mob_cold_restart_explicit_resume_revives_archived_session_over_reopened_sqlite_store() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let open_runtime_store = || -> Arc<dyn meerkat_runtime::RuntimeStore> {
+        Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+                .expect("open durable runtime store"),
+        )
+    };
+
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.id = MobId::from("retired-revival-sqlite-mob");
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+
+    // ---------------- Lifetime 1: create, use, then retire ----------------
+    let runtime_store_1 = open_runtime_store();
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store_1.clone());
+    let storage_1 = MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage");
+    let handle_1 = MobBuilder::new(definition, storage_1)
+        .with_session_service(service_1.clone())
+        .with_default_llm_client(openai_test_client())
+        .create()
+        .await
+        .expect("create persistent mob");
+
+    let worker = AgentIdentity::from("w-1");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("spawn worker before retirement");
+    let original_session_id = handle_1
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("worker session id before retirement");
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_RETIRE_SQLITE_REVIVAL_TOKEN alpha",
+        "before-retirement",
+    )
+    .await;
+    handle_1
+        .retire(worker.clone())
+        .await
+        .expect("retire worker before cold restart");
+
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&original_session_id);
+    assert_eq!(
+        meerkat_runtime::store::load_runtime_state(runtime_store_1.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state after retirement"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "retirement must durably retire runtime authority"
+    );
+    assert!(
+        service_1
+            .load_persisted_session(&original_session_id)
+            .await
+            .expect("ordinary persisted-session read after retirement")
+            .is_none(),
+        "ordinary reads must hide the archived session"
+    );
+
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    drop(handle_1);
+    drop(service_1);
+    drop(runtime_store_1);
+
+    // ---------------- Lifetime 2: reopen the store, then explicitly revive ----
+    let runtime_store_2 = open_runtime_store();
+    let scanned =
+        meerkat_runtime::RuntimeStore::list_runtimes_with_recovery_work(runtime_store_2.as_ref())
+            .await
+            .expect("the reopened store's recovery scan");
+    assert!(
+        !scanned.contains(&runtime_id),
+        "an archived runtime holds no recovery work: {scanned:?}"
+    );
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_2.clone());
+    let storage_2 = MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage");
+    let handle_2 = MobBuilder::for_resume(storage_2)
+        .with_session_service(service_2.clone())
+        .with_default_llm_client(openai_test_client())
+        .notify_orchestrator_on_resume(false)
+        .resume()
+        .await
+        .expect("resume mob after cold restart");
+
+    handle_2
+        .spawn_spec(
+            SpawnMemberSpec::new("worker", worker.clone())
+                .with_resume_bridge_session_id(original_session_id.clone()),
+        )
+        .await
+        .expect("explicitly revive the archived worker session");
+    assert_eq!(
+        handle_2.resolve_bridge_session_id(&worker).await,
+        Some(original_session_id.clone()),
+        "revival must preserve the exact bridge-session id"
+    );
+    assert_member_active(&member_entry(&handle_2, "w-1").await, "after revival");
+    assert_ne!(
+        meerkat_runtime::store::load_runtime_state(runtime_store_2.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state after revival"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "revival must reactivate runtime authority"
+    );
+
+    wait_for_history_contains_all(
+        service_2.as_ref(),
+        &original_session_id,
+        &["PRE_RETIRE_SQLITE_REVIVAL_TOKEN alpha"],
+        "after-revival-history",
+    )
+    .await;
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "POST_REVIVAL_SQLITE_TOKEN omega",
+        "after-revival-turn",
+    )
+    .await;
+    wait_for_history_contains_all(
+        service_2.as_ref(),
+        &original_session_id,
+        &[
+            "PRE_RETIRE_SQLITE_REVIVAL_TOKEN alpha",
+            "POST_REVIVAL_SQLITE_TOKEN omega",
+        ],
+        "final-revival-history",
+    )
+    .await;
+
+    handle_2.shutdown().await.expect("final shutdown");
+}
+
 /// Destruction must fit the same worker stack as ordinary mob operation.
 /// The parent-owned child operations make archive disposal inspect the real
 /// operation registry beneath the actor's complete destroy call chain.
