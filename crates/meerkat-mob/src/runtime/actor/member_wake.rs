@@ -1698,8 +1698,11 @@ impl MobActor {
             self.member_wakes.edge_repairs.remove(&edge);
             return;
         }
-        if self.dsl_authority.state().lifecycle_phase != mob_dsl::MobPhase::Running {
-            // Wiring is a Running verb: try again later.
+        if self.dsl_authority.state().lifecycle_phase != mob_dsl::MobPhase::Running
+            || edge_end_retiring(self.dsl_authority.state(), &edge)
+        {
+            // Wiring is a Running verb, and a retiring end's edges go with
+            // its retirement: check again later.
             self.schedule_owed_edge_repair(edge);
             return;
         }
@@ -2100,6 +2103,22 @@ impl MobActor {
             .member_wake_attempts
             .get(&mob_dsl::AgentIdentity::from_domain(identity))
             == Some(&attempt)
+    }
+}
+
+/// Whether an end of `edge` is retiring (its member's runtime is marked
+/// Retiring).
+fn edge_end_retiring(state: &mob_dsl::MobMachineState, edge: &MemberWiringEdge) -> bool {
+    let retiring = |identity: &mob_dsl::AgentIdentity| {
+        state
+            .identity_to_runtime
+            .get(identity)
+            .and_then(|runtime_id| state.member_state_markers.get(runtime_id))
+            == Some(&mob_dsl::MobMemberState::Retiring)
+    };
+    match edge {
+        MemberWiringEdge::Member(edge) => retiring(&edge.a) || retiring(&edge.b),
+        MemberWiringEdge::External(edge) => retiring(&edge.local),
     }
 }
 
