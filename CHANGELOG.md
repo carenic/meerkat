@@ -35,6 +35,34 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
+  how many members `MobBuilder::resume` restores at once. The default is 16;
+  `1` restores one member at a time, as before; `0` counts as `1`.
+
+### Changed
+
+- `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
+  concurrently, up to the builder's restore concurrency, instead of one at a
+  time. Each member's session reads, spawn customizer calls and provision run
+  alongside other members', so a resume no longer takes the member count times
+  the session store's latency. Everything a restore writes (the mob's
+  MobMachine authority, roster, journal and restore diagnostics, and each
+  member's runtime binding) is still applied one member at a time in roster
+  order, so the resumed mob is the one a restore of one member at a time
+  leaves. A fork of a member of the same mob, a member bound to the session an
+  earlier member is bound to, and, from its successor search on, a member
+  whose bound session is absent are restored in their own turn, after every
+  member before them. The first failure in roster order fails the resume with
+  the error it failed with before; once a member's restore has failed the
+  resume, no further member's restore starts, and the restores already
+  running finish without being applied. The host callbacks a restore makes
+  (the spawn member customizer, the default external tools provider, the
+  member runtime registration hook and the durable resume gate) are now made
+  for several members at once, in no fixed order across members; each
+  member's own calls keep their order.
+
 ## [0.9.6] - 2026-10-27
 
 ### Breaking
