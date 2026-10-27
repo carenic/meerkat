@@ -58,9 +58,11 @@
 # that a resume seat is unborn exactly when no build created its session. The
 # resume run checks that the explicit resume can always join a wake in flight
 # while its readiness is not in flight and its topology has not started,
-# whatever readiness it already settled (AuditResumeJoinable), and that it
+# whatever readiness it already settled (AuditResumeJoinable), that it
 # holds no member work while its readiness is in flight or once its topology
-# started (AuditResumeStagesHoldNoWork).
+# started (AuditResumeStagesHoldNoWork), and that it reserves a member it
+# rebuilds (Dormant or Live) only before a readiness of its own started
+# (AuditResumeReservesBeforeReadiness).
 # TLC evaluates the module's wake refusal ASSUME (a present, bound member with
 # a phase is never refused as not a member) and its release ASSUMEs (the
 # verdict helper, and no member wired to a placed member is releasable) at the
@@ -420,7 +422,8 @@ write_cfg() {
       max_attempts=2
       run_properties="
   AuditResumeRecoverKeepsPhase
-  AuditAttemptEndsClosed"
+  AuditAttemptEndsClosed
+  AuditResumeReservesBeforeReadiness"
       run_invariants="
   AuditWakingClosable
   AuditResumeJoinable
@@ -986,14 +989,33 @@ add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (ag
   mutate resume join_refused_after_readiness \
     "Error: Invariant AuditResumeJoinable is violated" \
     'add_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_readiness_settled = FALSE")' "$@"
-  # A join admitted once the topology started: member work the topology
-  # stage never waits for.
-  mutate resume join_during_topology \
+  # A join admitted while the topology is pending (the topology guard keeps
+  # only its settled conjunct): member work the topology stage never waits
+  # for.
+  mutate resume join_while_topology_pending \
     "Error: Invariant AuditResumeStagesHoldNoWork is violated" \
-    'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_topology_pending")' "$@"
+    'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_topology_pending")
+add_guard("AuthorizeExplicitResumeMemberJoinRunning", "(explicit_resume_topology_settled = FALSE)")' "$@"
+  # A join admitted once the topology settled, before the finish (the
+  # topology guard keeps only its pending conjunct).
+  mutate resume join_after_topology_settled \
+    "Error: Invariant AuditResumeStagesHoldNoWork is violated" \
+    'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_topology_pending")
+add_guard("AuthorizeExplicitResumeMemberJoinRunning", "(explicit_resume_topology_pending = FALSE)")' "$@"
   # A join admitted while a readiness is in flight.
   mutate resume join_during_readiness \
     "Error: Invariant AuditResumeStagesHoldNoWork is violated" \
     'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_readiness_pending")' "$@"
+  # The Dormant and Live reservation arms relaxed as the Join was (their
+  # readiness guard keeps only its pending conjunct): a member the resume
+  # rebuilds reserved after the readiness that should have settled it.
+  mutate resume reserve_dormant_after_readiness \
+    "Error: Action property AuditResumeReservesBeforeReadiness is violated" \
+    'drop_guard("AuthorizeExplicitResumeMemberRunning", "explicit_resume_readiness_settled")
+add_guard("AuthorizeExplicitResumeMemberRunning", "(explicit_resume_readiness_pending = FALSE)")' "$@"
+  mutate resume reserve_live_after_readiness \
+    "Error: Action property AuditResumeReservesBeforeReadiness is violated" \
+    'drop_guard("AuthorizeExplicitResumeMemberLiveRunning", "explicit_resume_readiness_settled")
+add_guard("AuthorizeExplicitResumeMemberLiveRunning", "(explicit_resume_readiness_pending = FALSE)")' "$@"
 fi
 echo "member residency audit passed over the whole reachable space of its domains"

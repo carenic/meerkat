@@ -554,13 +554,13 @@ fi
 # (under an admitted destroy no rotation or host carry-out holds it), no
 # rotation under an admitted destroy, a resume seat unborn exactly when no
 # build created its session, an explicit resume that can always join a wake
-# in flight before its topology whatever readiness it settled, and one that
-# holds no member work in its readiness or topology stages, with the ASSUME
-# over the wake refusal helper. It runs with TLC coverage and requires every
-# listed arm to fire and a floor of distinct states per run, and requires its
-# thirty-one witnesses reached. Its --mutants mode (run by hand, outside the
-# shard's budget) refuses forty-eight seeded defects, one per residency
-# invariant and property.
+# in flight before its topology whatever readiness it settled, holds no member
+# work in its readiness or topology stages and reserves the members it
+# rebuilds only before its readiness, with the ASSUME over the wake refusal
+# helper. It runs with TLC coverage and requires every listed arm to fire and
+# a floor of distinct states per run, and requires its thirty-one witnesses
+# reached. Its --mutants mode (run by hand, outside the shard's budget)
+# refuses fifty-one seeded defects, one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
   echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2

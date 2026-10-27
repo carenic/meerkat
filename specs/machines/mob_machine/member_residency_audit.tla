@@ -907,6 +907,16 @@ AuditResumeStagesHoldNoWork ==
     /\ explicit_resume_topology_pending => DOMAIN explicit_resume_member_work = {}
     /\ explicit_resume_topology_settled => DOMAIN explicit_resume_member_work = {}
 
+\* Action form: the resume reserves a member it rebuilds (the Dormant and Live
+\* arms) only before a readiness of its own started, since that readiness
+\* settles the members it reserves. Only a Join, of a wake the resume did not
+\* start, may follow a settled readiness.
+AuditResumeReservesBeforeReadiness ==
+    [][(\/ AuthorizeExplicitResumeMemberRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
+        \/ AuthorizeExplicitResumeMemberLiveRunning(AuditResumeAttempt, Id1, AuditResumeBinding))
+       => /\ explicit_resume_readiness_pending = FALSE
+          /\ explicit_resume_readiness_settled = FALSE]_vars
+
 \* A Lifecycle wake input never opens an attempt, and a peer notice
 \* classification never changes residency.
 AuditLifecycleNeverWakes ==
