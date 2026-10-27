@@ -1721,8 +1721,8 @@ async fn assistant_message_count(
 /// the runtime's kept state still owes a background operation completion;
 /// the store's recovery scan does not list an archived runtime. The
 /// member's next wake revives the session and runs that work as a turn.
-#[tokio::test(flavor = "multi_thread")]
 #[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
 async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_next_wake() {
     use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
 

@@ -157,9 +157,10 @@ pub(crate) fn runtime_is_archived(
 /// `facts` are the runtime's boot facts ([`BootFactsV1::default`] for a
 /// runtime that holds nothing), `lifecycle` its machine lifecycle record as
 /// stored, `catalog` its session catalog entry. An archived runtime holds no
-/// recovery work, whatever its other facts say: its work stays durable and
-/// runs once its session is revived (a resume that names it, or the next
-/// wake of a mob member still seated on it). The SQLite scan asks the parts
+/// recovery work, whatever its other facts say. A retired runtime's work
+/// stays durable and runs once its session is revived (a resume that names
+/// it, or the next wake of a mob member still seated on it); a destroyed
+/// runtime's session is never revived. The SQLite scan asks the parts
 /// itself, so that it decodes a catalog entry or an ops lifecycle snapshot
 /// only when the answer needs it.
 pub(crate) fn runtime_has_recovery_obligation(

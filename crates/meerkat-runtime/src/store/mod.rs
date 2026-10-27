@@ -10042,11 +10042,11 @@ pub trait RuntimeStore: Send + Sync {
     /// holds none, by the rule the session owner applies: its session
     /// catalog entry carries the Archived terminal, or its machine lifecycle
     /// record names a Retired or Destroyed runtime (a retire records the
-    /// archive only there). Its work stays durable and runs once its session
-    /// is revived: by a resume that names it, or by the next wake of a mob
-    /// member still seated on it. The host store adapter's open
-    /// loads exactly the bodies of runtimes that hold work, by the same
-    /// predicate.
+    /// archive only there). A retired runtime's work stays durable and runs
+    /// once its session is revived: by a resume that names it, or by the next
+    /// wake of a mob member still seated on it. A destroyed runtime's session
+    /// is never revived. The host store adapter's open loads exactly the
+    /// bodies of runtimes that hold work, by the same predicate.
     ///
     /// A mob boot reads this to decide which members it materializes: a
     /// member whose runtime appears here is materialized, and one with no

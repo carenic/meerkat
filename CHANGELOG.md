@@ -457,18 +457,18 @@ them.
   unwired turn-driven member binds it only when its runtime has comms. Before,
   a restore or a reload of an unwired turn-driven member whose session
   builder makes no comms failed its readiness, although its spawn succeeded.
-- `meerkat-runtime`: a host store realm asks `list_heads` for 2048 heads per
-  call, instead of 256, when it opens and when a writer that stopped
-  acquires the fence again. Every listing visits every scope the realm
-  holds, archived sessions and chunk scopes included, so it takes
-  `ceil(scopes / 2048)` calls per scope kind (at least one): about an
-  eighth of the calls for a realm with many scopes. No stored format
-  changes. Upgrade note for store authors: one answer of typical runtime
-  heads is now several MiB. A store whose backend or transport caps an
-  answer below that must answer the heads that fit with `HeadPage::next`
-  set, as the SPI already requires; a store that sets `next` only after a
-  full page of `limit` heads ends the listing early, and the realm opens
-  without the scopes it was not given.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`: a host
+  store realm asks `list_heads` for 2048 heads per call, instead of 256,
+  when it opens and when a writer that stopped acquires the fence again.
+  Every listing visits every scope the realm holds, archived sessions and
+  chunk scopes included, so it takes `ceil(scopes / 2048)` calls per scope
+  kind (at least one): about an eighth of the calls for a realm with many
+  scopes. No stored format changes. Upgrade note for store authors: one
+  answer of typical runtime heads is now several MiB. A store whose backend
+  or transport caps an answer below that must answer the heads that fit
+  with `HeadPage::next` set, as the SPI already requires; a store that sets
+  `next` only after a full page of `limit` heads ends the listing early,
+  and the realm opens without the scopes it was not given.
 - Behaviour-only (not measured by the gate): `meerkat-runtime`: the
   recovery scan a mob start reads
   (`RuntimeStore::list_runtimes_with_recovery_work`) and the host store
@@ -480,11 +480,13 @@ them.
   each retired runtime keeps, the host store adapter's open loaded the body
   of each one whose snapshot still owed work, and the scan listed it. An
   archived runtime now holds no recovery work, and none of that is read.
-  A mob member still seated on a session whose runtime was retired or
-  destroyed outside the mob (through `RuntimeControlPlane`) now stays
-  Dormant at a start instead of having that session revived, and its owed
-  work runs at its next wake or at a resume that names the session. An
-  archived session still revives on a resume that names it.
+  A mob member still seated on a session whose runtime was retired outside
+  the mob (through `RuntimeControlPlane`) now stays Dormant at a start
+  instead of having that session revived, and its owed work runs at its
+  next wake or at a resume that names the session. A destroyed runtime's
+  session is never revived: for a member seated on one, the refused
+  restore moves from the start to its next wake. A session archived by a
+  retire still revives on a resume that names it.
 
 ### Fixed
 
