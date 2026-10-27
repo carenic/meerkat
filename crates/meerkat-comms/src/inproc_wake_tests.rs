@@ -182,7 +182,7 @@ impl InprocPeerWaker for ScriptedOwner {
     }
 }
 
-/// R1 (comms half): a dormant member's key has only a wake route. The send
+/// A dormant member's key has only a wake route. The send
 /// asks the owner once, then hands the envelope off once to the inbox the
 /// wake registered; a second send finds the live route and wakes nothing.
 #[tokio::test]
@@ -245,7 +245,7 @@ async fn a_send_to_a_dormant_member_wakes_it_once_then_delivers_once() {
     );
 }
 
-/// R3 (comms half): a key with neither route is not a member.
+/// A key with neither route is not a member.
 #[tokio::test]
 async fn a_key_with_no_route_at_all_is_peer_not_found() {
     let registry = InprocRegistry::new();
@@ -263,7 +263,7 @@ async fn a_key_with_no_route_at_all_is_peer_not_found() {
     assert!(matches!(result, Err(InprocSendError::PeerNotFound(_))));
 }
 
-/// R4/R5 (comms half): a refused wake is typed and hands nothing off.
+/// A refused wake is typed and hands nothing off.
 #[tokio::test]
 async fn a_refused_wake_is_typed_and_never_peer_not_found() {
     let registry = InprocRegistry::new();
@@ -292,7 +292,7 @@ async fn a_refused_wake_is_typed_and_never_peer_not_found() {
     }
 }
 
-/// R8 (comms half): a closed live route of a seated member is stale. It takes
+/// A closed live route of a seated member is stale. It takes
 /// the wake path (observed missing), and the envelope reaches the member's
 /// next inbox exactly once; the closed generation never received it.
 #[tokio::test]
@@ -340,7 +340,7 @@ async fn a_closed_stale_live_route_takes_the_wake_path() {
     assert_eq!(queued(&fresh_inbox), 1, "handed off exactly once");
 }
 
-/// R8 (comms half): a member that answers ready but has no route twice is
+/// A member that answers ready but has no route twice is
 /// `materialization_lost` after exactly two wakes, and nothing was handed off.
 #[tokio::test]
 async fn ready_without_a_route_twice_is_materialization_lost() {
@@ -373,7 +373,7 @@ async fn ready_without_a_route_twice_is_materialization_lost() {
     );
 }
 
-/// R93 (comms half): the sender's budget bounds the wait for the wake. It
+/// The sender's budget bounds the wait for the wake. It
 /// ends as `wake_timed_out` (not delivered); the owner's wake goes on.
 #[tokio::test(start_paused = true)]
 async fn a_pending_wake_ends_with_the_senders_budget_as_wake_timed_out() {
@@ -400,7 +400,7 @@ async fn a_pending_wake_ends_with_the_senders_budget_as_wake_timed_out() {
     assert_eq!(owner.calls(), 1);
 }
 
-/// R108 (comms half): a sender that is itself being woken never waits on a
+/// A sender that is itself being woken never waits on a
 /// recipient that is waking too, even through the recipient's early live
 /// route: the recipient's owner is asked first with `sender_waking`, answers
 /// from its machine, and nothing is handed off.
@@ -450,7 +450,7 @@ async fn a_waking_sender_never_waits_on_a_waking_recipient() {
     );
 }
 
-/// R13: a wake route is namespace-scoped. A member dormant in namespace A is
+/// A wake route is namespace-scoped. A member dormant in namespace A is
 /// not wakeable from namespace B: `PeerNotFound`, and its owner is not asked.
 #[tokio::test]
 async fn a_wake_route_never_crosses_namespaces() {
@@ -562,7 +562,7 @@ fn a_wake_route_claims_no_name_and_classifies_lifecycle_notices() {
     );
 }
 
-/// R9 (comms half): a live route closed for peer ingress stops resolving, so a
+/// A live route closed for peer ingress stops resolving, so a
 /// send meets the member's owner; reopening restores the same generation with
 /// its metadata.
 #[tokio::test]
@@ -618,7 +618,7 @@ async fn a_closed_live_route_routes_to_the_owner_until_reopened() {
     assert_eq!(owner.calls(), 1);
 }
 
-/// R7 (comms half): a member whose wake is in flight already has its inbox
+/// A member whose wake is in flight already has its inbox
 /// registered. A send from a live sender that finds that early live route
 /// joins the wake through the owner first (no observed miss), and hands off
 /// only after the owner answered ready.
@@ -678,7 +678,7 @@ async fn a_stale_route_whose_owner_denies_membership_is_peer_not_found() {
     assert!(matches!(result, Err(InprocSendError::PeerNotFound(_))));
 }
 
-/// R4/R100 (comms half): a silent lifecycle notice to a dormant member is
+/// A silent lifecycle notice to a dormant member is
 /// consumed by its owner without a wake, as a live member's drain consumes
 /// one; the sender gets the volatile hand-off fact, and no inbox received
 /// anything.

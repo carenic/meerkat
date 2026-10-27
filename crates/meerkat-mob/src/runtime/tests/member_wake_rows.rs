@@ -638,7 +638,7 @@ fn token(label: &str) -> String {
     format!("{label}-token-{}", Uuid::new_v4().simple())
 }
 
-/// R1
+/// A peer message to a released member wakes it once and is delivered once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_peer_message_wakes_a_released_member_once_and_is_delivered_once() {
     let fixture = WakeFixture::new("wake-r1").await;
@@ -674,7 +674,7 @@ async fn a_peer_message_wakes_a_released_member_once_and_is_delivered_once() {
     fixture.finish().await;
 }
 
-/// R2
+/// Two peers messaging one released member share one wake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn two_peers_messaging_one_released_member_share_one_wake() {
     let fixture = WakeFixture::new("wake-r2").await;
@@ -714,7 +714,8 @@ async fn two_peers_messaging_one_released_member_share_one_wake() {
     fixture.finish().await;
 }
 
-/// R112 (final refusal) and R4: a broken member answers peers typed.
+/// A final build preparation refusal breaks the member, and a broken member
+/// answers peers typed.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_final_preparation_refusal_breaks_the_member_and_peers_get_member_broken() {
     let fixture = WakeFixture::new("wake-r4").await;
@@ -760,7 +761,7 @@ async fn a_final_preparation_refusal_breaks_the_member_and_peers_get_member_brok
     fixture.finish().await;
 }
 
-/// R26
+/// Reads of a released member never wake it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reads_of_a_released_member_never_wake_it() {
     let fixture = WakeFixture::new("wake-r26").await;
@@ -782,7 +783,7 @@ async fn reads_of_a_released_member_never_wake_it() {
     fixture.finish().await;
 }
 
-/// R30
+/// A steer to a released member wakes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steer_to_a_released_member_wakes_it() {
     let fixture = WakeFixture::new("wake-r30").await;
@@ -804,7 +805,7 @@ async fn a_steer_to_a_released_member_wakes_it() {
     fixture.finish().await;
 }
 
-/// R50
+/// A host turn to a released member wakes it and runs once.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_host_turn_to_a_released_member_wakes_it_and_runs_once() {
     let fixture = WakeFixture::new("wake-r50").await;
@@ -911,7 +912,8 @@ async fn a_comms_less_member_wakes_and_serves() {
     let _ = tokio::time::timeout(WAIT, handle.shutdown()).await;
 }
 
-/// R26 (operator wake) and the attempt-keyed waiters (G13).
+/// An operator wake, and the attempt-keyed waiters: concurrent callers share
+/// one wake.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ensure_member_live_wakes_a_released_member_once_for_concurrent_callers() {
     let fixture = WakeFixture::new("wake-ensure").await;
@@ -929,7 +931,8 @@ async fn ensure_member_live_wakes_a_released_member_once_for_concurrent_callers(
     fixture.finish().await;
 }
 
-/// R65 and R66
+/// A release keeps the member seated, and its wake restores the same
+/// incarnation.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn release_keeps_the_seat_and_the_wake_restores_the_same_incarnation() {
     let fixture = WakeFixture::new("wake-r65").await;
@@ -964,7 +967,7 @@ async fn release_keeps_the_seat_and_the_wake_restores_the_same_incarnation() {
     fixture.finish().await;
 }
 
-/// R65: a release has nothing to release on a dormant member.
+/// A release has nothing to release on a dormant member.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_release_of_a_dormant_member_changes_nothing() {
     let fixture = WakeFixture::new("wake-release-twice").await;
@@ -983,7 +986,7 @@ async fn a_release_of_a_dormant_member_changes_nothing() {
     fixture.finish().await;
 }
 
-/// R65: a release never interrupts work.
+/// A release never interrupts work.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_release_with_a_run_in_flight_is_refused_retryably() {
     let fixture = WakeFixture::new("wake-release-busy").await;
@@ -1025,7 +1028,7 @@ async fn a_release_with_a_run_in_flight_is_refused_retryably() {
     fixture.finish().await;
 }
 
-/// R98
+/// A stopped mob refuses peer messages to dormant and live members alike.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stopped_mob_refuses_peer_messages_to_dormant_and_live_members_alike() {
     let fixture = WakeFixture::new("wake-r98").await;
@@ -1072,7 +1075,8 @@ async fn a_stopped_mob_refuses_peer_messages_to_dormant_and_live_members_alike()
     fixture.finish().await;
 }
 
-/// R109
+/// A wake asks the host to prepare the member build once and reports it
+/// built.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wake_prepares_the_member_build_once_and_reports_it_built() {
     let fixture = WakeFixture::new("wake-r109").await;
@@ -1123,7 +1127,8 @@ async fn a_wake_prepares_the_member_build_once_and_reports_it_built() {
     fixture.finish().await;
 }
 
-/// R112 (retryable refusal)
+/// A retryable build preparation refusal leaves the member dormant until
+/// its next delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_retryable_preparation_refusal_leaves_the_member_dormant_until_the_next_delivery() {
     let fixture = WakeFixture::new("wake-r112").await;
@@ -1159,7 +1164,7 @@ async fn a_retryable_preparation_refusal_leaves_the_member_dormant_until_the_nex
     fixture.finish().await;
 }
 
-/// R113
+/// A stop during a wake abandons the wake without a fail-stop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_stop_during_a_wake_abandons_the_wake_without_fail_stop() {
     let fixture = WakeFixture::new("wake-r113").await;
@@ -1232,7 +1237,7 @@ async fn a_stop_during_a_wake_abandons_the_wake_without_fail_stop() {
     fixture.finish().await;
 }
 
-/// R123: a wake rebuilds the member through the customizer's resume hook,
+/// A wake rebuilds the member through the customizer's resume hook,
 /// with what the customizer answers now, never a previous build's spec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wake_asks_the_customizer_again_with_its_current_answer() {
@@ -1688,5 +1693,97 @@ async fn a_retire_during_a_wake_answers_its_callers_member_retiring() {
         .expect("the retirement finishes once the wake's provision rolls back")
         .expect("the retire task joins")
         .expect("the member retires");
+    fixture.finish().await;
+}
+
+/// The composition carries each registration's epoch on both signals, the
+/// binding's (`RuntimeBound`) and the release's
+/// (`RuntimeRegistrationReleased`), through the mob's projection. A member
+/// registered, released and woken again holds a fresh epoch, and a release
+/// that states the earlier registration's epoch, with the same runtime id
+/// and fence, is refused at the mob: the member stays Live on its new
+/// registration. Were the epoch dropped on both signals, the two absent
+/// epochs would match and that stale release would demote the member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_release_stating_an_earlier_registrations_epoch_is_refused_at_the_mob() {
+    let fixture = WakeFixture::new("wake-epoch-aba").await;
+    let member = fixture.spawn("epoch-aba-member").await;
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let epoch = || {
+        fixture
+            .handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization_epoch
+            .get(&key)
+            .cloned()
+            .flatten()
+    };
+    let first = epoch().expect("the first registration's epoch reached the mob with its binding");
+    let seated = fixture.entry(&member).await;
+
+    // The release demotes the member only when it states the epoch the mob
+    // recorded, so the release signal carried it.
+    fixture.release(&member).await;
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("a delivery wakes the released member");
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Live))
+        .await;
+    let second = epoch().expect("the new registration's epoch reached the mob with its binding");
+    assert_ne!(first, second, "a new registration has a fresh epoch");
+    let woken = fixture.entry(&member).await;
+    assert_eq!(
+        (&woken.agent_runtime_id, woken.fence_token),
+        (&seated.agent_runtime_id, seated.fence_token),
+        "the wake restores the same incarnation, so only the epoch tells the registrations apart"
+    );
+
+    // The earlier registration's release, routed to the mob the way the
+    // runtime routes a final unregister.
+    let session = fixture.session(&member).await;
+    let machine = MobSessionService::acquire_runtime_adapter(&*fixture.service, None)
+        .expect("the service's runtime")
+        .expect("a runtime-backed service");
+    let dispatcher = machine
+        .session_composition_signal_dispatcher_for_test(&session)
+        .await
+        .expect("the member's registration routes its signals to the mob");
+    meerkat_runtime::meerkat_machine::composition::dispatch_routed_signal(
+        &dispatcher,
+        meerkat_runtime::meerkat_machine::composition::MeerkatSeamSignal::RuntimeRegistrationReleased {
+            agent_runtime_id: Some(meerkat_runtime::meerkat_machine::dsl::AgentRuntimeId::from(
+                mob_dsl::AgentRuntimeId::from_domain(&seated.agent_runtime_id).0,
+            )),
+            fence_token: Some(meerkat_runtime::meerkat_machine::dsl::FenceToken::from(
+                seated.fence_token.get(),
+            )),
+            runtime_epoch_id: Some(meerkat_runtime::meerkat_machine::dsl::RuntimeEpochId(
+                first.0.clone(),
+            )),
+        },
+    )
+    .await
+    .expect("the stale release reaches the mob");
+    // The actor handles its commands in order: a poll answered after the
+    // signal was queued was handled after it.
+    fixture
+        .handle
+        .poll_events(0, 1)
+        .await
+        .expect("an actor round trip after the signal");
+
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live),
+        "a release stating an earlier registration's epoch demotes nothing"
+    );
+    assert_eq!(
+        epoch(),
+        Some(second),
+        "the mob keeps the new registration's epoch"
+    );
     fixture.finish().await;
 }

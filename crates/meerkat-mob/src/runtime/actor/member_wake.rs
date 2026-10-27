@@ -20,7 +20,7 @@
 //!   a peer send that finds no live inbox for a seated member reaches the
 //!   actor through it as `WakeMember(PeerDelivery)`.
 //!
-//! The wake turn itself (B4's cold recipe off the actor, its plan applied on
+//! The wake turn itself (the cold restore recipe off the actor, its plan applied on
 //! the actor, readiness, topology, the Ready resolution) is in
 //! `member_wake_turn`.
 
@@ -35,7 +35,7 @@ pub(in crate::runtime) enum MemberWakeOutcome {
     /// The member is ready: live, its trust and drain settled.
     Ready,
     /// The request was a silent lifecycle notice the machine consumed for a
-    /// member that is not live, without waking it (R4): its topology at its
+    /// member that is not live, without waking it: its topology at its
     /// next wake carries the notice's content.
     LifecycleNoticeConsumed,
 }
@@ -328,7 +328,7 @@ pub(in crate::runtime) struct PendingMemberMaterialization {
     pub(in crate::runtime) attempt: MemberWakeAttempt,
 }
 
-/// A stopped mob's peer-ingress change for its live members (R9).
+/// A stopped mob's peer-ingress change for its live members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum MemberPeerIngressChange {
     Close,
@@ -456,7 +456,7 @@ pub(in crate::runtime) struct MemberWakes {
     pub(in crate::runtime) running: BTreeMap<MemberWakeAttempt, RunningMemberWake>,
     /// Peer-ingress changes to realize at the next loop boundary.
     ingress: VecDeque<MemberPeerIngressChange>,
-    /// The concrete provisioner B4's cold recipe runs on.
+    /// The concrete provisioner the cold restore recipe runs on.
     pub(in crate::runtime) provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
     pub(in crate::runtime) continuity: MemberContinuityIndex,
     /// Owed-boot retry state per member: the backoff step, and whether its
@@ -729,7 +729,7 @@ impl MobActor {
         };
         match phase {
             Some(mob_dsl::MemberMaterializationPhase::Live) => Ok(MemberWakeOutcome::Ready),
-            // A retire start closed the attempt (F3).
+            // A retire start closed the attempt.
             Some(_) if retiring => Err(MemberWakeFailure::Refused(
                 crate::MemberWakeRefusal::Retiring,
             )),
@@ -750,12 +750,12 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Wake routes (a declared projection of machine membership, G7).
+    // Wake routes (a declared projection of machine membership).
     // ---------------------------------------------------------------
 
     /// What `identity`'s routes are, read from machine state: a local
     /// session-bound member is routed by its session (session-owner
-    /// registry, R10), and by its durable endpoint's key once it has one
+    /// registry), and by its durable endpoint's key once it has one
     /// (inproc wake route).
     fn member_wake_route_source(&self, identity: &AgentIdentity) -> Option<PublishedMemberRoutes> {
         let state = self.dsl_authority.state();
@@ -966,7 +966,7 @@ impl MobActor {
         }
     }
 
-    /// The counted drift path (G1): a routing miss or a liveness probe
+    /// The counted drift path: a routing miss or a liveness probe
     /// observed the live materialization of a member the machine holds Live.
     /// The machine's drift arm moves it to Waking under a new attempt, which
     /// this actor realizes (the drift arm hands nothing off).
@@ -1256,7 +1256,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Stopped-mob peer ingress (R9), at the loop boundary.
+    // Stopped-mob peer ingress, at the loop boundary.
     // ---------------------------------------------------------------
 
     /// Close or reopen the live members' inproc routes for peer ingress, as
@@ -1302,7 +1302,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // The wake bound (G11) and the owed-boot retry.
+    // The wake bound and the owed-boot retry.
     // ---------------------------------------------------------------
 
     /// Arm the mob's wake bound for one attempt: when it ends, the machine
@@ -1374,7 +1374,7 @@ impl MobActor {
 
     /// Apply one attempt-fenced wake feedback signal and read the machine's
     /// verdict. A transition the machine refuses is recorded as a fault and
-    /// read as stale: wake feedback never fail-stops the mob (F4).
+    /// read as stale: wake feedback never fail-stops the mob.
     pub(in crate::runtime) fn apply_member_wake_feedback(
         &mut self,
         identity: &AgentIdentity,
@@ -1616,7 +1616,7 @@ impl MobActor {
     /// A missing-live revival request (a host's liveness probe, a reload's
     /// re-attachment, a start's recovery of a member it left out): applied
     /// as `WakeMember` with the observed miss and answered in the revival
-    /// vocabulary. The wake runs B4's cold recipe like every other wake.
+    /// vocabulary. The wake runs the cold restore recipe like every other wake.
     pub(in crate::runtime) async fn revive_missing_member_through_wake(
         &mut self,
         identity: AgentIdentity,
@@ -1678,7 +1678,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Make dormant (`MobHandle::release_member`, R6).
+    // Make dormant (`MobHandle::release_member`).
     // ---------------------------------------------------------------
 
     /// Release `identity`'s live materialization: its runtime registration is
@@ -1780,7 +1780,7 @@ impl MobActor {
     }
 
     // ---------------------------------------------------------------
-    // Peer-notice dispositions (R4): MobMachine's verdict, realized.
+    // Peer-notice dispositions: MobMachine's verdict, realized.
     // ---------------------------------------------------------------
 
     /// MobMachine's disposition of one lifecycle or kickoff notice from

@@ -117,9 +117,9 @@ pub enum MeerkatSeamSignal {
         agent_runtime_id: mm_dsl::AgentRuntimeId,
         fence_token: mm_dsl::FenceToken,
     },
-    /// A runtime registration was released (every unregister, the idle
-    /// executor teardown included), with the released registration's own
-    /// runtime id, fence and epoch, each absent when it held none.
+    /// A runtime registration was released (its final unregister), with the
+    /// released registration's own runtime id, fence and epoch, each absent
+    /// when it held none.
     RuntimeRegistrationReleased {
         agent_runtime_id: Option<mm_dsl::AgentRuntimeId>,
         fence_token: Option<mm_dsl::FenceToken>,

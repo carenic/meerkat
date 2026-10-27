@@ -66203,7 +66203,7 @@ fn resume_launch_spec_for_test(
     )
 }
 
-/// R127: attaching an existing session as a member (a Resume-mode spawn of a
+/// Attaching an existing session as a member (a Resume-mode spawn of a
 /// session with no live actor) builds the member on the auth binding its spec
 /// names, never on the binding the session recorded at an earlier build.
 #[tokio::test]

@@ -398,7 +398,7 @@ impl MeerkatMachine {
     /// epoch is a meerkat-owned fact about a meerkat-owned session entry: the
     /// mob never states it on an input. (It does learn the bound epoch from
     /// the routed `RuntimeBound` and `RuntimeRegistrationReleased` signals, to
-    /// fence a release against a newer registration, G2.) Resolving it here, from
+    /// fence a release against a newer registration.) Resolving it here, from
     /// the ENTRY (never from the authority's own state, which would make the
     /// receiving guard tautological), under the same `sessions` guard that
     /// resolved the entry and with the caller's session mutation gate held,

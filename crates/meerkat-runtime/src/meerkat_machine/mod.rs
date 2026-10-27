@@ -1326,8 +1326,8 @@ impl StagedSessionDslInput {
             .any(|effect| composition::lift_routed_signal(effect).is_some())
     }
 
-    /// [`Self::has_routed_signal_effect`] without the registration release
-    /// (G1), which the final unregister holds back and dispatches only once
+    /// [`Self::has_routed_signal_effect`] without the registration release,
+    /// which the final unregister holds back and dispatches only once
     /// its durable finalization committed.
     fn has_routed_signal_effect_besides_registration_release(&self) -> bool {
         self.effects.as_slice().iter().any(|effect| {
@@ -1338,7 +1338,7 @@ impl StagedSessionDslInput {
         })
     }
 
-    /// The released registration's routed signal (G1): every final
+    /// The released registration's routed signal: every final
     /// unregister publishes the exact runtime id, fence and epoch it released
     /// to the owning mob.
     fn registration_release_signals(&self) -> Vec<composition::MeerkatSeamSignal> {
@@ -13903,6 +13903,20 @@ impl MeerkatMachine {
             .get_mut(session_id)
             .expect("test registration remains current under its mutation gate")
             .composition_signal_dispatcher = Some(dispatcher);
+    }
+
+    /// The exact registration's installed signal endpoint, for tests that
+    /// route a signal to its consumer the way the runtime does.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn session_composition_signal_dispatcher_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<composition::MeerkatCompositionSignalDispatcher> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|entry| entry.composition_signal_dispatcher.clone())
     }
 
     /// Apply a routed-input variant delivered by the `meerkat_mob_seam`

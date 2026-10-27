@@ -28141,7 +28141,7 @@ impl MobActor {
                     if scope.is_missing_live() {
                         // A missing live materialization is woken like
                         // every other: `WakeMember` with the observed miss,
-                        // realized by B4's cold recipe (the customizer is
+                        // realized by the cold restore recipe (the customizer is
                         // asked). Only an in-process reload keeps the warm
                         // recipe below.
                         Box::pin(self.revive_missing_member_through_wake(agent_identity, reply_tx))

@@ -507,7 +507,7 @@ impl MobActor {
                     return;
                 }
                 // The session was already live when the build ran: the
-                // attempt binds to it (F11 step 1), and readiness and
+                // attempt binds to it (its Bound step), and readiness and
                 // topology run before the Ready resolution, as for a build.
                 if self.resolve_warm_revival_bound(&work) {
                     self.clear_member_restore_failure(&work.entry.agent_identity)
@@ -527,7 +527,7 @@ impl MobActor {
                     self.roll_back_warm_build(work, built, matches_session);
                     return;
                 }
-                // F4/F11: the attempt's Bound verdict alone chooses between
+                // The attempt's Bound verdict alone chooses between
                 // commit and rollback. A stale attempt (a stop, a retire or
                 // another resolution closed it meanwhile) rolls the provision
                 // back; it never fail-stops the mob.
@@ -562,7 +562,7 @@ impl MobActor {
                     return;
                 }
                 // Until the Ready verdict, a stale or failed step rolls this
-                // provision back (F4: no materialization the machine does not
+                // provision back (no materialization the machine does not
                 // hold outlives its attempt).
                 *work
                     .committed
@@ -736,8 +736,8 @@ impl MobActor {
         }
     }
 
-    /// Apply `ResolveMemberRevivalBound` for the revival's attempt (F11 step
-    /// 1: the runtime binding is requested, the member stays Waking).
+    /// Apply `ResolveMemberRevivalBound` for the revival's attempt (its
+    /// Bound step: the runtime binding is requested, the member stays Waking).
     /// `true` only when the machine applied it; a stale attempt, or a
     /// revival that minted none, answers `false`.
     fn resolve_warm_revival_bound(&mut self, work: &RevivalWork) -> bool {
@@ -1287,8 +1287,8 @@ impl MobActor {
             work.reply(Ok(outcome));
             return;
         };
-        // F11 step 2 (Ready): readiness and topology settled, so the member
-        // is Live. The verdict alone decides the provision (F4): Applied keeps
+        // The Ready step: readiness and topology settled, so the member
+        // is Live. The verdict alone decides the provision: Applied keeps
         // it (the machine now holds it Live); a stale attempt means another
         // transition closed it meanwhile, so the provision this reload
         // committed is rolled back and the reload is not current.

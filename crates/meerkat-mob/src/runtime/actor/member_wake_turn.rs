@@ -8,14 +8,14 @@
 //!   attempt MobMachine authorized is still open; take the member's own fork
 //!   of the authority, its overlay rule and the overlays it may follow, its
 //!   continuity intent, and dispatch the restore.
-//! - Step B (off the actor, [`plan_member_wake`]): B4's cold recipe
+//! - Step B (off the actor, [`plan_member_wake`]): the cold restore recipe
 //!   (`restore_resumed_member`) plans the member's restore on its own fork,
 //!   writing nothing shared. A missing bound session searches its successor
 //!   here and provisions it on a fork repointed to it. The woken comms
 //!   runtime's endpoint is checked against the durable one.
 //! - Step C (on the actor, [`MobActor::commit_member_wake_plan`]): the
 //!   attempt is still this wake's (attempt and incarnation fences); a
-//!   successor is repointed (journal first); B4's `apply_member_restore_plan`
+//!   successor is repointed (journal first); `apply_member_restore_plan`
 //!   applies the plan to the actor's authority, rosters and overlays in the
 //!   member's turn, ending in `ResolveMemberRevivalBound` (the runtime
 //!   binding is requested, the member is still Waking).
@@ -25,7 +25,7 @@
 //!   attempt is answered.
 //!
 //! Every wake feedback is attempt-fenced and answered by a machine verdict:
-//! a stale attempt is a no-op, never a fail-stop (F4). A provision a stale or
+//! a stale attempt is a no-op, never a fail-stop. A provision a stale or
 //! failed wake leaves behind is rolled back through its `PendingProvision`.
 
 use super::member_effect_lane::{
@@ -188,7 +188,7 @@ impl MemberEffectCommit for WakeCommit {
 }
 
 /// Everything Step B reads, owned: the effect future outlives the actor's
-/// borrow (B4's lesson: never hand a borrowed item into a `Send` future).
+/// borrow (never hand a borrowed item into a `Send` future).
 struct WakeRestoreInput {
     definition: Arc<MobDefinition>,
     session_service: Arc<dyn MobSessionService>,
@@ -648,7 +648,7 @@ impl MobActor {
             .await;
     }
 
-    /// Apply a plan through B4's `apply_member_restore_plan` over the
+    /// Apply a plan through `apply_member_restore_plan` over the
     /// actor's own state: its authority, its roster, its retained overlays.
     async fn apply_member_wake_plan(
         &mut self,
@@ -923,7 +923,8 @@ impl MobActor {
         self.resolve_member_wake_ready(run, rollback).await;
     }
 
-    /// Waking -> Live, after readiness and topology settled (R7, F11).
+    /// Waking -> Live, after readiness and topology settled (Live means
+    /// ready).
     async fn resolve_member_wake_ready(&mut self, run: WakeRun, rollback: Option<WakeRollback>) {
         let verdict = self.apply_member_wake_feedback(
             &run.identity,

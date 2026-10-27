@@ -1136,7 +1136,7 @@ impl InprocRegistry {
                 (None, Some(route)) => route,
             };
             // The wake path. The first wake answers the miss; one more is
-            // allowed after a miss that follows a ready answer (R8).
+            // allowed after a miss that follows a ready answer.
             if wakes >= 2 {
                 return Err(InprocSendError::WakeRefused(
                     PeerWakeRefusal::MaterializationLost,

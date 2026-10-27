@@ -10066,7 +10066,7 @@ impl MobBuilder {
         )>,
     ) -> RuntimeStartFuture {
         Box::pin(async move {
-            // The member wake path runs B4's cold restore recipe, which needs
+            // The member wake path runs the cold restore recipe, which needs
             // the concrete provisioner; everything else holds the trait.
             let member_wake_provisioner = Arc::clone(&provisioner);
             let provisioner: Arc<dyn MobProvisioner> = provisioner;
@@ -12873,7 +12873,7 @@ async fn apply_member_restore_provision(
             // so it emits the exact runtime binding before startup
             // readiness.
             // The recreated session is the Bound step of the member's open
-            // wake attempt (F7, F11); its Ready follows readiness.
+            // wake attempt; its Ready follows readiness.
             let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
             let attempt = commit
                 .authority

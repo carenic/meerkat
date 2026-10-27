@@ -1265,7 +1265,7 @@ async fn readiness_failure_rolls_the_reload_back_and_leaves_the_member_dormant()
             .status,
         crate::runtime::handle::MobMemberStatus::Broken
     );
-    // R125 (F4): the provision the reload committed on its Bound verdict is
+    // The provision the reload committed on its Bound verdict is
     // rolled back with its attempt. Nothing MobMachine does not hold stays
     // live: the member is Dormant until its next delivery wakes it through
     // the cold recipe.
@@ -1674,7 +1674,7 @@ async fn reload_reports_not_current_for_a_member_absent_from_the_runtime() {
     assert_eq!(&outcome.session_id, mob.session(0));
 }
 
-/// R125 (F4, warm reload): a reload whose attempt a stop closes after its
+/// A warm reload whose attempt a stop closes after its
 /// Bound verdict committed the provision gets a stale Ready verdict, and the
 /// provision is rolled back: no materialization outlives the attempt that
 /// made it, the member is Dormant, and the mob stops normally (no
