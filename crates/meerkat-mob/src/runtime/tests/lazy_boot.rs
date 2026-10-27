@@ -1568,8 +1568,7 @@ async fn a_crash_during_a_rotated_kickoff_turn_runs_the_kickoff_once_after_the_r
             .contains(&dsl_identity),
         "the kickoff is starting when the process ends"
     );
-    let crashed = mob.service.clone();
-    assert_eq!(turns_with(&crashed, &new, prompt).await, 1);
+    assert_eq!(turns_with(&mob.service, &new, prompt).await, 1);
 
     mob.restart().await;
     wait_for("the kickoff to run after the restart", || async {

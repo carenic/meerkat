@@ -232,7 +232,7 @@ pub(crate) fn member_materialization_phase(
     state: &mob_dsl::MobMachineState,
     identity: &mob_dsl::AgentIdentity,
 ) -> Option<mob_dsl::MemberMaterializationPhase> {
-    state.member_materialization.get(identity).cloned()
+    state.member_materialization.get(identity).copied()
 }
 
 /// Whether MobMachine holds `identity` seated and not materialized in this
@@ -632,7 +632,7 @@ pub(crate) fn boot_materialization_input(
         obligation: obligations
             .by_member
             .get(identity)
-            .cloned()
+            .copied()
             .unwrap_or(mob_dsl::MemberRecoveryObligationKind::None),
         host_required: host_required.contains(&domain),
         orchestrator_notified: notified_orchestrators.contains(&domain),

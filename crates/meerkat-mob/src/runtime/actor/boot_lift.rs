@@ -226,8 +226,7 @@ impl MobActor {
                 first_error.get_or_insert(error);
                 continue;
             }
-            let outcome_rx =
-                self.join_member_wake(&member.agent_identity, member.wake_attempt.into());
+            let outcome_rx = self.join_member_wake(&member.agent_identity, member.wake_attempt);
             let command_tx = self.command_tx.clone();
             self.actor_io_tasks.spawn(async move {
                 let joined = outcome_rx.await.is_ok_and(|outcome| outcome.is_ok());
