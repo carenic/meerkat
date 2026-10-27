@@ -437,12 +437,38 @@ impl WakeFixture {
 
     /// Spawn one durable turn-driven worker. Identities are unique per test:
     /// comms routes are process-wide.
+    /// The member returned is Live and its registration's binding landed
+    /// (MobMachine recorded the registration's epoch), so it can be released.
     async fn spawn(&self, label: &str) -> AgentIdentity {
         let identity = AgentIdentity::from(format!("{label}-{}", Uuid::new_v4().simple()));
-        self.spawn_as(identity).await
+        let identity = self.spawn_as(identity).await;
+        self.wait_binding_landed(&identity).await;
+        identity
     }
 
-    /// [`Self::spawn`] of a given identity.
+    /// Wait until MobMachine recorded the epoch of `identity`'s registration
+    /// (the routed binding landed).
+    async fn wait_binding_landed(&self, identity: &AgentIdentity) {
+        let key = mob_dsl::AgentIdentity::from_domain(identity);
+        let mut state = self.handle.machine_state_watch_rx.clone();
+        let landed = tokio::time::timeout(
+            WAIT,
+            state.wait_for(|state| {
+                state
+                    .member_materialization_epoch
+                    .get(&key)
+                    .is_some_and(Option::is_some)
+            }),
+        )
+        .await;
+        assert!(
+            matches!(landed, Ok(Ok(_))),
+            "the binding of member {identity}'s registration never landed"
+        );
+    }
+
+    /// Spawn `identity` and wait until it is Live (its binding may still be
+    /// in flight).
     async fn spawn_as(&self, identity: AgentIdentity) -> AgentIdentity {
         let mut spec = SpawnMemberSpec::new("worker", identity.clone());
         spec.continuity_intent = SpawnContinuityIntent::DurableIdentity {
@@ -877,6 +903,20 @@ async fn a_comms_less_member_wakes_and_serves() {
             .contains_key(&key),
         "a member whose runtime has no comms has no peer endpoint"
     );
+    // The release needs the registration's binding to have landed.
+    let mut state = handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|state| {
+            state
+                .member_materialization_epoch
+                .get(&key)
+                .is_some_and(Option::is_some)
+        }),
+    )
+    .await
+    .expect("the member's binding lands in time")
+    .expect("the machine state stays published");
 
     tokio::time::timeout(WAIT, handle.release_member(&member))
         .await
@@ -1737,7 +1777,21 @@ async fn a_release_stating_an_earlier_registrations_epoch_is_refused_at_the_mob(
     fixture
         .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Live))
         .await;
-    let second = epoch().expect("the new registration's epoch reached the mob with its binding");
+    // The woken registration's binding lands with a fresh epoch.
+    let mut state = fixture.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|state| {
+            state
+                .member_materialization_epoch
+                .get(&key)
+                .is_some_and(|recorded| recorded.as_ref().is_some_and(|epoch| *epoch != first))
+        }),
+    )
+    .await
+    .expect("the new registration's epoch reaches the mob with its binding")
+    .expect("the machine state stays published");
+    let second = epoch().expect("the new registration's epoch is recorded");
     assert_ne!(first, second, "a new registration has a fresh epoch");
     let woken = fixture.entry(&member).await;
     assert_eq!(
