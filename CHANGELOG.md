@@ -513,6 +513,12 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
+- Host-store realms: opening a realm loads the sessions that hold recovery
+  work (an unsettled input, an undelivered background result, an open run)
+  up to 16 at a time, instead of one after another. With K such sessions,
+  an open over a store whose reads are slow waits about ceil(K / 16) times
+  as long as one session's reads, not K times. Each session's rows are still
+  read in order, and a failed read still fails the open with nothing loaded.
 
 ### Known limitations
 

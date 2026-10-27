@@ -375,6 +375,12 @@ reads:
 
 No other row is read at open.
 
+Core reads up to 16 runtimes at once: their head entries kept as chunks, and
+the rows of those with recovery work. One runtime's reads run in order, its
+rows and then its chunks. An open of K runtimes with recovery work therefore
+waits about ceil(K / 16) times as long as the reads of one runtime, not K
+times. If any of those reads fails, the open fails and serves nothing.
+
 **When a mob's storage is opened** (its resume after a restart), Core reads
 the mob's own scopes whole: its event log, identity, flow runs and statuses.
 The lift of a mob stopped in the same process finds them in memory and reads

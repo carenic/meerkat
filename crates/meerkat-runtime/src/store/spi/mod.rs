@@ -44,6 +44,12 @@
 //! runtime's pinned head entries. The store's obligation scan asks the same
 //! predicate as the boot and answers from memory, with no host read.
 //!
+//! The boot reads the runtimes up to 16 at once (the head entries a runtime
+//! keeps as chunks, and the bodies it loads at boot); one runtime's reads
+//! stay in order. It installs nothing until every read succeeded, then each
+//! runtime in key order, so a failed read fails the open with no runtime
+//! installed.
+//!
 //! # Retention
 //!
 //! A row entry that changes is appended again, whole, so a scope's rows
