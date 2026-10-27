@@ -49,6 +49,22 @@ impl MobActor {
             let _ = reply_tx.send(result);
             return;
         }
+        // A lift that rebuilt no attachment observed its members' readiness
+        // before the durable Resume (settled), and each member its plan
+        // materialized ran its readiness in its own wake, which this resume
+        // joined and settled. Nothing is left to observe, and MobMachine
+        // admits one readiness per resume attempt.
+        if self.dsl_authority.state().explicit_resume_readiness_settled {
+            let _ = self.settle_held_member_readiness(Vec::new()).await;
+            self.begin_resume_lifecycle_post_commit(
+                admission,
+                progress,
+                post_commit_error,
+                reply_tx,
+            )
+            .await;
+            return;
+        }
         progress
             .awaiting_stage(crate::runtime::state::LifecycleProgressStage::PostRebuildReadiness);
         match self.collect_member_readiness_targets(false).await {
