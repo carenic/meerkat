@@ -232,6 +232,15 @@ them.
   `RuntimeRecoveryWorkUnobserved` reads it with the pending-delivery scan.
   `SessionLlmCapabilitySurface::from_model_profile`.
 
+- `meerkat-runtime`: `MeerkatMachine::serving_member_binding_ops_registry`
+  answers, without waiting on anything a run holds, whether a session's
+  registration already serves one exact member binding (an attached, live,
+  durability-ready registration with no unregister, stop cleanup or
+  materialization claim in flight, whose active runtime id, fence and
+  generation are the given ones, with the given composition endpoint), and
+  returns its operation registry when it does. The lift of a stopped mob
+  uses it to bind such a member without queueing behind its run.
+
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
   or resumes, the child mobs its agents create included, starts with that

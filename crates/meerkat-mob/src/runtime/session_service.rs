@@ -1611,7 +1611,15 @@ pub trait MobSessionService:
     /// Mechanical presence of the live session actor, without exporting its
     /// document or reconciling durable authority. Health/revival uses this
     /// process-carrier witness so an actor busy inside a provider turn cannot
-    /// block observation or be mistaken for dead state.
+    /// block observation or be mistaken for dead state, and the lift of a
+    /// stopped mob reads it to bind a member whose registration already
+    /// serves its binding without the lanes the member's run holds.
+    ///
+    /// The default answers from [`SessionService::has_live_session`], which
+    /// classifies durable authority instead. Both stock services override it
+    /// with the mechanical witness; a host's own `MobSessionService` wrapper
+    /// should forward it to the service it wraps, or those callers fall back
+    /// to that classification.
     async fn live_session_actor_registered(
         &self,
         session_id: &SessionId,
