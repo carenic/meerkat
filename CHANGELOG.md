@@ -460,11 +460,15 @@ them.
 - `meerkat-runtime`: a host store realm asks `list_heads` for 2048 heads per
   call, instead of 256, when it opens and when a writer that stopped
   acquires the fence again. Every listing visits every scope the realm
-  holds, archived sessions and chunk scopes included, so a realm with many
-  scopes takes `ceil(scopes / 2048)` calls per scope kind (at least one), an
-  eighth of the calls it took before. A store may still answer fewer heads
-  per call with `HeadPage::next` set, and Core reads on from there. No
-  stored format changes.
+  holds, archived sessions and chunk scopes included, so it takes
+  `ceil(scopes / 2048)` calls per scope kind (at least one): about an
+  eighth of the calls for a realm with many scopes. No stored format
+  changes. Upgrade note for store authors: one answer of typical runtime
+  heads is now several MiB. A store whose backend or transport caps an
+  answer below that must answer the heads that fit with `HeadPage::next`
+  set, as the SPI already requires; a store that sets `next` only after a
+  full page of `limit` heads ends the listing early, and the realm opens
+  without the scopes it was not given.
 - `meerkat-runtime`: the SQLite runtime store's recovery scan, which a mob
   start reads, no longer decodes the ops lifecycle snapshot of an archived
   runtime. A runtime retired before it unregisters keeps that snapshot, so

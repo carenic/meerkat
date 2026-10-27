@@ -2194,9 +2194,17 @@ fn listings_of(calls: &[HostCall], kind: ScopeKind) -> usize {
         .count()
 }
 
+/// A 1 s renew interval with a 30 s lease: the self-fence window (29 s, on
+/// the wall clock) stays open however long a row's open takes, so only the
+/// injected renew failure stops the writer.
+fn listing_row_timing() -> FenceTiming {
+    FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(30)).unwrap()
+}
+
 /// Wait until `realm`'s writer stops on a failed renew and acquires the
-/// fence again (renew interval 1 s), and answer the calls of that
-/// re-acquire.
+/// fence again ([`listing_row_timing`]: the renew at 1 s fails, the tick at
+/// 2 s re-acquires over its own recorded lease), and answer the calls of
+/// that re-acquire.
 async fn reacquire_recording(host: &TestHost, realm: &SpiRealm) -> Vec<HostCall> {
     let first = realm.fence();
     host.faults.lock().unwrap().renew_unavailable = 1;
@@ -2223,7 +2231,7 @@ async fn reacquire_recording(host: &TestHost, realm: &SpiRealm) -> Vec<HostCall>
 // heads per call they took 8, 9 and 17), and the open claims every head.
 #[tokio::test(start_paused = true)]
 async fn an_open_and_a_reacquire_list_a_kind_in_pages_of_2048_heads() {
-    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
+    let timing = listing_row_timing();
     for scopes in [
         DOCUMENTED_LIST_PAGE_HEADS,
         DOCUMENTED_LIST_PAGE_HEADS + 1,
@@ -2277,8 +2285,7 @@ async fn an_open_and_a_reacquire_list_a_kind_in_pages_of_2048_heads() {
 // them the same way and finds every version it knows, so it resumes.
 #[tokio::test(start_paused = true)]
 async fn a_store_with_shorter_pages_still_lists_every_head() {
-    let timing = FenceTiming::try_new(Duration::from_secs(1), Duration::from_secs(3)).unwrap();
-    let host = Arc::new(TestHost::with_timing(timing));
+    let host = Arc::new(TestHost::with_timing(listing_row_timing()));
     let realm = SpiRealm::open(Arc::clone(&host) as _, SpiRealmConfig::default())
         .await
         .unwrap();
