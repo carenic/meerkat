@@ -351,11 +351,23 @@ struct BootObligationIndex<'a> {
 
 #[cfg(feature = "runtime-adapter")]
 impl<'a> BootObligationIndex<'a> {
+    /// The index over every seated local member, or, with `among`, only as
+    /// much of it as `among`'s members are answered from: their own entries,
+    /// and the session entries of every member bound to one of their
+    /// sessions (so a session two members share still names the member the
+    /// whole index names). Every binding is still validated.
     fn new(
         state: &mob_dsl::MobMachineState,
         mob_id: &'a MobId,
         incarnation: meerkat_core::service::MobIncarnationId,
+        among: Option<&BTreeSet<mob_dsl::AgentIdentity>>,
     ) -> Result<Self, MobError> {
+        let among_sessions = among.map(|among| {
+            among
+                .iter()
+                .filter_map(|identity| state.member_session_bindings.get(identity))
+                .collect::<BTreeSet<_>>()
+        });
         let mut members = BTreeSet::new();
         let mut by_session_runtime = HashMap::new();
         let mut by_identity = HashMap::new();
@@ -373,14 +385,22 @@ impl<'a> BootObligationIndex<'a> {
                     session.0, identity.0
                 ))
             })?;
-            by_session_runtime.insert(
-                meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-                identity.clone(),
-            );
-            by_session_runtime.insert(
-                meerkat_runtime::LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
-                identity.clone(),
-            );
+            if among_sessions
+                .as_ref()
+                .is_none_or(|sessions| sessions.contains(session))
+            {
+                by_session_runtime.insert(
+                    meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+                    identity.clone(),
+                );
+                by_session_runtime.insert(
+                    meerkat_runtime::LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
+                    identity.clone(),
+                );
+            }
+            if among.is_some_and(|among| !among.contains(identity)) {
+                continue;
+            }
             members.insert(identity.clone());
             if let Some(generation) = state.identity_runtime_generations.get(identity) {
                 by_identity.insert(
@@ -472,11 +492,27 @@ pub(crate) async fn scan_boot_obligations(
     mob_id: &MobId,
     incarnation: meerkat_core::service::MobIncarnationId,
 ) -> Result<BootObligations, MobError> {
+    scan_boot_obligations_among(runtime_adapter, state, None, mob_id, incarnation).await
+}
+
+/// [`scan_boot_obligations`], answered for `among`'s members only when
+/// `among` names them (a seat chunk's planned identities): the same store
+/// scan, and the same obligation for each of them, with an index the size
+/// of the chunk instead of the whole roster's. A seat chunk that indexed
+/// every member made seating a large roster quadratic.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) async fn scan_boot_obligations_among(
+    runtime_adapter: Option<&Arc<meerkat_runtime::MeerkatMachine>>,
+    state: &mob_dsl::MobMachineState,
+    among: Option<&BTreeSet<mob_dsl::AgentIdentity>>,
+    mob_id: &MobId,
+    incarnation: meerkat_core::service::MobIncarnationId,
+) -> Result<BootObligations, MobError> {
     let Some(adapter) = runtime_adapter else {
         // No runtime authority: no runtime store can hold member work.
         return Ok(BootObligations::none());
     };
-    let index = BootObligationIndex::new(state, mob_id, incarnation)?;
+    let index = BootObligationIndex::new(state, mob_id, incarnation, among)?;
     let scanned = match adapter.boot_recovery_obligations().await {
         Ok(scanned) => scanned,
         Err(error) => {

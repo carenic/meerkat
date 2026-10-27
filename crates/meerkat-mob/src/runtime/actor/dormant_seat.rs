@@ -2,11 +2,15 @@
 //! [`super::super::MobHandle::seat_dormant_members`] (see
 //! [`super::super::dormant_seat`] for the three steps).
 //!
-//! The commit is one actor step per chunk: one prepared authority, one
-//! runtime obligation scan, one `append_batch` before the base-checked
-//! commit. An identity the machine refuses is undone alone (its batch of
-//! inputs restores the prepared authority) and answered typed; only a store
-//! failure fails the chunk, before anything of it is committed.
+//! The plan probes the whole chunk's next generations on one fork of the
+//! authority. The commit is one actor step per chunk: one prepared
+//! authority, the chunk's seat inputs as one batch and its boot plans as
+//! another, one runtime obligation scan, one `append_batch` before the
+//! base-checked commit. An identity the machine refuses is answered alone,
+//! typed: a refused batch leaves the prepared authority as it was, and the
+//! chunk's inputs are applied again one identity at a time. Only a store
+//! failure fails the chunk, before anything of it is committed. Nothing in
+//! a chunk copies the machine state once per identity.
 
 use super::super::dormant_seat::{
     DormantSeatCandidate, DormantSeatCommitEntry, DormantSeatLaunch, DormantSeatOutcome,
@@ -52,12 +56,19 @@ impl MobActor {
         &mut self,
         specs: Vec<super::super::handle::SpawnMemberSpec>,
     ) -> DormantSeatPlan {
+        // Every spec's next generation from one probe of the machine for the
+        // whole chunk (one fork), each answer the one its own probe gives.
+        let mut minted = self.mint_spawn_generations(specs.iter().map(|spec| &spec.identity));
         let mut named = BTreeSet::new();
         let mut entries = Vec::with_capacity(specs.len());
         for spec in specs {
             let agent_identity = spec.identity.clone();
             let entry = if named.insert(agent_identity.clone()) {
-                match self.plan_dormant_seat(spec, SeatPlanMode::Seat).await {
+                let generation = minted.remove(&agent_identity);
+                match self
+                    .plan_dormant_seat(spec, SeatPlanMode::Seat, generation)
+                    .await
+                {
                     Ok(entry) => entry,
                     Err(error) => DormantSeatPlanEntry::Done(DormantSeatOutcome::Refused {
                         agent_identity,
@@ -99,7 +110,10 @@ impl MobActor {
             .state()
             .identity_to_runtime
             .contains_key(&dsl_identity);
-        match self.plan_dormant_seat(spec, SeatPlanMode::Rotation).await? {
+        match self
+            .plan_dormant_seat(spec, SeatPlanMode::Rotation, None)
+            .await?
+        {
             DormantSeatPlanEntry::Seat(candidate) => Ok(MemberRotationPlan::Seat {
                 candidate,
                 seated,
@@ -113,11 +127,14 @@ impl MobActor {
     }
 
     /// Plan one spec. Every check a spawn makes before anything exists is
-    /// made here; the machine makes the rest at the commit.
+    /// made here; the machine makes the rest at the commit. `minted` is the
+    /// spec's next generation when the chunk probed it already; without it
+    /// the generation is probed here.
     async fn plan_dormant_seat(
         &mut self,
         mut spec: super::super::handle::SpawnMemberSpec,
         mode: SeatPlanMode,
+        minted: Option<Result<crate::ids::Generation, MobError>>,
     ) -> Result<DormantSeatPlanEntry, MobError> {
         let agent_identity = spec.identity.clone();
         // CommitDormantSeat and BeginMemberRotation are Running-only: a
@@ -281,7 +298,10 @@ impl MobActor {
             });
         }
         let runtime_mode = spec.runtime_mode.unwrap_or(profile.runtime_mode);
-        let generation = self.mint_spawn_generation(&agent_identity)?;
+        let generation = match minted {
+            Some(minted) => minted?,
+            None => self.mint_spawn_generation(&agent_identity)?,
+        };
 
         // A fresh member that owes a kickoff (an AutonomousHost member's one
         // kickoff turn, or the initial message a fresh spawn runs as its
@@ -382,21 +402,29 @@ impl MobActor {
 
     /// Commit one prepared seat chunk in one actor step, answering each
     /// entry in order.
+    ///
+    /// Each entry's machine inputs are built once (the seat's fence token
+    /// and creation record included), then the whole chunk is applied as ONE
+    /// batch on the prepared authority, and its boot plans as one more: one
+    /// copy of the machine state per batch, not one per identity. When a
+    /// batch is refused, it leaves the prepared authority as it was, and
+    /// its inputs are applied again one identity at a time, exactly as
+    /// before: an identity the machine refuses is answered alone. A batch
+    /// the machine accepts applied the same inputs in the same order, each
+    /// on the state the earlier ones left, so both ways answer every entry
+    /// the same. Entries of one chunk name distinct identities, so an
+    /// already-seated entry's check, which reads only its own identity,
+    /// reads the same before the chunk's inputs as between them.
     pub(super) async fn commit_dormant_seats(
         &mut self,
         entries: Vec<DormantSeatCommitEntry>,
     ) -> Result<Vec<DormantSeatOutcome>, MobError> {
         let mut outcomes: Vec<Option<DormantSeatOutcome>> = Vec::with_capacity(entries.len());
         let mut authority = self.dsl_authority.prepare_authority();
-        let mut effects = Vec::new();
-        let mut journal = Vec::new();
-        let mut seated = Vec::new();
-        // Identities planned after the scan: each new seat, and each
-        // already-seated identity that is still Dormant.
-        let mut plan = Vec::new();
+        let mut staged = Vec::with_capacity(entries.len());
         for (index, entry) in entries.into_iter().enumerate() {
             outcomes.push(None);
-            match entry {
+            let entry = match entry {
                 DormantSeatCommitEntry::AlreadySeated {
                     agent_identity,
                     session_id,
@@ -415,131 +443,132 @@ impl MobActor {
                         });
                         continue;
                     }
-                    outcomes[index] = Some(
-                        match Self::clear_host_preparation(&mut authority, &dsl_identity) {
-                            Ok(cleared) => {
-                                effects.extend(cleared);
-                                plan.push(dsl_identity);
-                                DormantSeatOutcome::AlreadySeated {
-                                    agent_identity,
-                                    session_id,
-                                }
-                            }
-                            Err(error) => DormantSeatOutcome::Refused {
-                                agent_identity,
-                                error,
-                            },
-                        },
-                    );
+                    StagedSeatEntry::AlreadySeated {
+                        agent_identity,
+                        session_id,
+                        dsl_identity,
+                    }
                 }
                 DormantSeatCommitEntry::Embodied {
                     agent_identity,
                     session_id,
-                } => {
-                    let dsl_identity = mob_dsl::AgentIdentity::from_domain(&agent_identity);
-                    outcomes[index] = Some(
-                        match Self::clear_host_preparation(&mut authority, &dsl_identity) {
-                            Ok(cleared) => {
-                                effects.extend(cleared);
-                                DormantSeatOutcome::Embodied {
-                                    agent_identity,
-                                    session_id,
-                                }
-                            }
-                            Err(error) => DormantSeatOutcome::Refused {
-                                agent_identity,
-                                error,
-                            },
-                        },
-                    );
-                }
+                } => StagedSeatEntry::Embodied {
+                    dsl_identity: mob_dsl::AgentIdentity::from_domain(&agent_identity),
+                    agent_identity,
+                    session_id,
+                },
                 DormantSeatCommitEntry::Seat {
-                    mut candidate,
+                    candidate,
                     endpoint,
                 } => {
-                    let agent_identity = candidate.agent_identity.clone();
                     let creation = self.seat_creation_record(&candidate).await;
-                    match self.apply_dormant_seat(
-                        &mut authority,
-                        &candidate,
-                        endpoint.as_ref(),
-                        creation,
-                    ) {
-                        Ok(SeatApplied::Seated { transitions, event }) => {
-                            for transition in transitions {
-                                effects.extend(transition.into_effects());
-                            }
-                            journal.push(NewMobEvent {
-                                mob_id: self.definition.id.clone(),
-                                timestamp: None,
-                                kind: MobEventKind::MemberSpawned(*event),
-                            });
-                            plan.push(mob_dsl::AgentIdentity::from_domain(&agent_identity));
-                            let local_build_inputs = candidate
-                                .session_unborn
-                                .then(|| std::mem::take(&mut candidate.seat_build.local))
-                                .filter(|local| !local.is_empty());
-                            seated.push(SeatedInChunk {
-                                index,
-                                agent_identity,
-                                session_id: candidate.session_id.clone(),
-                                endpoint,
-                                local_build_inputs,
-                            });
-                        }
-                        Ok(SeatApplied::Refused(error)) => {
-                            outcomes[index] = Some(DormantSeatOutcome::Refused {
-                                agent_identity,
-                                error,
-                            });
-                        }
-                        // The machine accepted the seat without its typed
-                        // authority: a defect, nothing of the chunk commits.
-                        Err(error) => return Err(error),
-                    }
+                    StagedSeatEntry::Seat(Box::new(
+                        self.stage_dormant_seat(candidate, endpoint, creation)?,
+                    ))
+                }
+            };
+            staged.push((index, entry));
+        }
+
+        let mut settled = SettledSeatChunk::default();
+        let chunk_inputs = staged
+            .iter()
+            .flat_map(|(_, entry)| entry.inputs())
+            .collect::<Vec<_>>();
+        let chunk = if chunk_inputs.is_empty() {
+            Ok(Vec::new())
+        } else {
+            authority.apply_batch(chunk_inputs)
+        };
+        match chunk {
+            Ok(transitions) => {
+                let mut transitions = transitions.into_iter();
+                for (index, entry) in staged {
+                    let own = transitions.by_ref().take(entry.input_count()).collect();
+                    outcomes[index] = settled.settle(&self.definition.id, index, entry, Ok(own))?;
+                }
+            }
+            // One identity's refusal: the batch left the prepared authority
+            // as it was, and each entry is applied alone, in order.
+            Err(_) => {
+                for (index, entry) in staged {
+                    let applied = authority.apply_batch(entry.inputs());
+                    outcomes[index] = settled.settle(&self.definition.id, index, entry, applied)?;
                 }
             }
         }
+        let SettledSeatChunk {
+            mut effects,
+            journal,
+            mut seated,
+            plan,
+        } = settled;
 
         // Each identity's boot verdict, from one runtime obligation scan
         // over the chunk's seated state. Exactly the Wake verdicts wake,
         // cause Boot, once the chunk is committed.
         if !plan.is_empty() {
             #[cfg(feature = "runtime-adapter")]
-            let obligations = super::super::boot_plan::scan_boot_obligations(
-                self.runtime_adapter.as_ref(),
-                authority.state(),
-                &self.definition.id,
-                self.incarnation.incarnation(),
-            )
-            .await?;
+            let obligations = {
+                let among = plan.iter().cloned().collect::<BTreeSet<_>>();
+                super::super::boot_plan::scan_boot_obligations_among(
+                    self.runtime_adapter.as_ref(),
+                    authority.state(),
+                    Some(&among),
+                    &self.definition.id,
+                    self.incarnation.incarnation(),
+                )
+                .await?
+            };
             #[cfg(not(feature = "runtime-adapter"))]
             let obligations = super::super::boot_plan::BootObligations::none();
             let not_notified = BTreeSet::new();
-            for dsl_identity in plan {
-                if !super::super::boot_plan::member_is_dormant(authority.state(), &dsl_identity) {
-                    continue;
-                }
-                let input = super::super::boot_plan::boot_materialization_input(
-                    &dsl_identity,
-                    &obligations,
-                    &self.member_residency.host_required,
-                    &not_notified,
-                );
-                match authority.apply_batch([input]) {
+            // A plan moves only its own identity's residency, so each
+            // identity's dormancy reads the same before the chunk's plans
+            // as between them.
+            let planned = plan
+                .into_iter()
+                .filter(|dsl_identity| {
+                    super::super::boot_plan::member_is_dormant(authority.state(), dsl_identity)
+                })
+                .map(|dsl_identity| {
+                    let input = super::super::boot_plan::boot_materialization_input(
+                        &dsl_identity,
+                        &obligations,
+                        &self.member_residency.host_required,
+                        &not_notified,
+                    );
+                    (dsl_identity, input)
+                })
+                .collect::<Vec<_>>();
+            if !planned.is_empty() {
+                match authority.apply_batch(planned.iter().map(|(_, input)| input.clone())) {
                     Ok(transitions) => {
                         for transition in transitions {
                             effects.extend(transition.into_effects());
                         }
                     }
-                    // The member stays seated and Dormant: its first
-                    // delivery wakes it.
-                    Err(error) => tracing::warn!(
-                        mob_id = %self.definition.id,
-                        agent_identity = %dsl_identity.0,
-                        %error,
-                        "MobMachine refused a seated member's boot plan"
-                    ),
+                    // A refused plan: each identity is planned alone, in
+                    // order, as before.
+                    Err(_) => {
+                        for (dsl_identity, input) in planned {
+                            match authority.apply_batch([input]) {
+                                Ok(transitions) => {
+                                    for transition in transitions {
+                                        effects.extend(transition.into_effects());
+                                    }
+                                }
+                                // The member stays seated and Dormant: its
+                                // first delivery wakes it.
+                                Err(error) => tracing::warn!(
+                                    mob_id = %self.definition.id,
+                                    agent_identity = %dsl_identity.0,
+                                    %error,
+                                    "MobMachine refused a seated member's boot plan"
+                                ),
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -622,39 +651,15 @@ impl MobActor {
             .collect()
     }
 
-    /// Clear an identity's host preparation (its host's carry-out is this
-    /// seat step): total, a no-op for an identity that is not pending.
-    fn clear_host_preparation(
-        authority: &mut mob_dsl::MobMachinePreparedAuthority,
-        dsl_identity: &mob_dsl::AgentIdentity,
-    ) -> Result<Vec<mob_dsl::MobMachineEffect>, MobError> {
-        authority
-            .apply_batch([mob_dsl::MobMachineInput::ResolveMemberHostPreparation {
-                agent_identity: dsl_identity.clone(),
-            }])
-            .map(|transitions| {
-                transitions
-                    .into_iter()
-                    .flat_map(mob_dsl::MobMachineTransition::into_effects)
-                    .collect()
-            })
-            .map_err(|error| MobError::MobMachineRejected {
-                context: "dormant_seat_resolve_host_preparation",
-                reason: error.to_string(),
-            })
-    }
-
-    /// Apply one seat on the chunk's prepared authority: the spawn ladder's
-    /// admission (`AuthorizeSpawnProfile`, `BeginSpawnExec`) and
-    /// `CommitDormantSeat`, as one batch. A refusal restores the prepared
-    /// authority to before this identity and is answered alone.
-    fn apply_dormant_seat(
+    /// Stage one seat: the spawn ladder's admission (`AuthorizeSpawnProfile`,
+    /// `BeginSpawnExec`) and `CommitDormantSeat`, built once with the seat's
+    /// fence token, applied with its chunk or alone.
+    fn stage_dormant_seat(
         &self,
-        authority: &mut mob_dsl::MobMachinePreparedAuthority,
-        candidate: &DormantSeatCandidate,
-        endpoint: Option<&TrustedPeerDescriptor>,
+        candidate: Box<DormantSeatCandidate>,
+        endpoint: Option<TrustedPeerDescriptor>,
         creation: crate::MemberCreationRecord,
-    ) -> Result<SeatApplied, MobError> {
+    ) -> Result<StagedSeat, MobError> {
         let agent_identity = &candidate.agent_identity;
         let fence_token = self.issue_fence_token()?;
         let agent_runtime_id =
@@ -705,7 +710,7 @@ impl MobActor {
             external_addressable,
             runtime_mode,
             bridge_session_id: dsl_session.clone(),
-            member_peer_endpoint: endpoint.map(mob_dsl::MemberPeerEndpoint::from),
+            member_peer_endpoint: endpoint.as_ref().map(mob_dsl::MemberPeerEndpoint::from),
             // An archived session was answered at preparation, typed.
             session_archived: false,
             // A spec that owes a kickoff is embodied at the plan; the machine
@@ -718,56 +723,14 @@ impl MobActor {
             // A resume seat is unborn only on a session no build created.
             fresh_launch: candidate.launch == DormantSeatLaunch::Fresh,
         };
-        let transitions =
-            match authority.apply_batch([candidate.authorize_input.clone(), begin, seat]) {
-                Ok(transitions) => transitions,
-                Err(error) => {
-                    return Ok(SeatApplied::Refused(MobError::MobMachineRejected {
-                        context: "dormant_seat",
-                        reason: error.to_string(),
-                    }));
-                }
-            };
-        let [authorized, _, committed] = transitions.as_slice() else {
-            return Err(MobError::Internal(format!(
-                "the dormant seat of '{agent_identity}' applied {} transitions for its three inputs",
-                transitions.len()
-            )));
-        };
-        require_authorized_effect(authorized, &candidate.authorized, "dormant_seat")?;
-        Self::require_member_lifecycle_journal_effect(
-            committed,
-            mob_dsl::MobLifecycleJournalKind::MemberSpawned,
-            agent_identity,
-            &agent_runtime_id,
-            Some(fence_token),
-            candidate.generation,
-            Some(dsl_session),
-            "dormant_seat",
-        )?;
-        let mut event = crate::event::MemberSpawnedEvent::new(
-            agent_identity.clone(),
-            candidate.generation,
+        Ok(StagedSeat {
+            inputs: [candidate.authorize_input.clone(), begin, seat],
             fence_token,
             agent_runtime_id,
-            candidate.profile_name.clone(),
-        )
-        .with_bridge_member_ref(Some(MemberRef::Session {
-            session_id: candidate.session_id.clone(),
-        }))
-        .with_member_peer_endpoint(endpoint.cloned())
-        .with_seat_session_unborn(candidate.session_unborn)
-        // What the unborn session's first build applies.
-        .with_seat_build_inputs(candidate.unborn_seat_build_inputs());
-        event.creation = creation;
-        event.runtime_mode = candidate.runtime_mode;
-        event.labels = candidate.labels.clone();
-        event.continuity_intent = candidate.continuity_intent.clone();
-        event.effective_profile_override = candidate.effective_profile_override.clone();
-        event.effective_model_override = candidate.effective_model_override.clone();
-        Ok(SeatApplied::Seated {
-            transitions,
-            event: Box::new(event),
+            dsl_session,
+            creation,
+            candidate,
+            endpoint,
         })
     }
 
@@ -1258,13 +1221,227 @@ impl MobActor {
     }
 }
 
-/// One seat applied on the chunk's prepared authority.
-enum SeatApplied {
-    /// Seated: its transitions' effects and its `MemberSpawned` row.
-    Seated {
-        transitions: Vec<mob_dsl::MobMachineTransition>,
-        event: Box<crate::event::MemberSpawnedEvent>,
+/// One entry of a seat chunk with its machine inputs, built once: applied
+/// with the whole chunk, or alone when the chunk's batch is refused.
+enum StagedSeatEntry {
+    /// Seated on exactly this session already: its host preparation is
+    /// cleared, and it is planned while it is still Dormant.
+    AlreadySeated {
+        agent_identity: AgentIdentity,
+        session_id: SessionId,
+        dsl_identity: mob_dsl::AgentIdentity,
     },
-    /// The machine refused it; the prepared authority is as before it.
-    Refused(MobError),
+    /// Spawned live by the ordinary spawn path: its host preparation is
+    /// cleared.
+    Embodied {
+        agent_identity: AgentIdentity,
+        session_id: SessionId,
+        dsl_identity: mob_dsl::AgentIdentity,
+    },
+    /// A seat.
+    Seat(Box<StagedSeat>),
+}
+
+impl StagedSeatEntry {
+    /// The entry's machine inputs, in order.
+    fn inputs(&self) -> Vec<mob_dsl::MobMachineInput> {
+        match self {
+            Self::AlreadySeated { dsl_identity, .. } | Self::Embodied { dsl_identity, .. } => {
+                vec![mob_dsl::MobMachineInput::ResolveMemberHostPreparation {
+                    agent_identity: dsl_identity.clone(),
+                }]
+            }
+            Self::Seat(seat) => seat.inputs.to_vec(),
+        }
+    }
+
+    fn input_count(&self) -> usize {
+        match self {
+            Self::AlreadySeated { .. } | Self::Embodied { .. } => 1,
+            Self::Seat(seat) => seat.inputs.len(),
+        }
+    }
+}
+
+/// A seat's machine inputs (the spawn ladder's admission and
+/// `CommitDormantSeat`) and what its `MemberSpawned` row is built from.
+struct StagedSeat {
+    /// `AuthorizeSpawnProfile`, `BeginSpawnExec`, `CommitDormantSeat`.
+    inputs: [mob_dsl::MobMachineInput; 3],
+    fence_token: crate::ids::FenceToken,
+    agent_runtime_id: crate::ids::AgentRuntimeId,
+    dsl_session: mob_dsl::SessionId,
+    creation: crate::MemberCreationRecord,
+    candidate: Box<DormantSeatCandidate>,
+    endpoint: Option<TrustedPeerDescriptor>,
+}
+
+impl StagedSeat {
+    /// The seat's `MemberSpawned` row, from its own three transitions; a
+    /// transition that does not carry what the seat must is a defect.
+    fn member_spawned(
+        &self,
+        transitions: &[mob_dsl::MobMachineTransition],
+    ) -> Result<crate::event::MemberSpawnedEvent, MobError> {
+        let candidate = &self.candidate;
+        let agent_identity = &candidate.agent_identity;
+        let [authorized, _, committed] = transitions else {
+            return Err(MobError::Internal(format!(
+                "the dormant seat of '{agent_identity}' applied {} transitions for its three inputs",
+                transitions.len()
+            )));
+        };
+        require_authorized_effect(authorized, &candidate.authorized, "dormant_seat")?;
+        MobActor::require_member_lifecycle_journal_effect(
+            committed,
+            mob_dsl::MobLifecycleJournalKind::MemberSpawned,
+            agent_identity,
+            &self.agent_runtime_id,
+            Some(self.fence_token),
+            candidate.generation,
+            Some(self.dsl_session.clone()),
+            "dormant_seat",
+        )?;
+        let mut event = crate::event::MemberSpawnedEvent::new(
+            agent_identity.clone(),
+            candidate.generation,
+            self.fence_token,
+            self.agent_runtime_id.clone(),
+            candidate.profile_name.clone(),
+        )
+        .with_bridge_member_ref(Some(MemberRef::Session {
+            session_id: candidate.session_id.clone(),
+        }))
+        .with_member_peer_endpoint(self.endpoint.clone())
+        .with_seat_session_unborn(candidate.session_unborn)
+        // What the unborn session's first build applies.
+        .with_seat_build_inputs(candidate.unborn_seat_build_inputs());
+        event.creation = self.creation.clone();
+        event.runtime_mode = candidate.runtime_mode;
+        event.labels = candidate.labels.clone();
+        event.continuity_intent = candidate.continuity_intent.clone();
+        event.effective_profile_override = candidate.effective_profile_override.clone();
+        event.effective_model_override = candidate.effective_model_override.clone();
+        Ok(event)
+    }
+}
+
+/// What a seat chunk's applied entries leave for its commit.
+#[derive(Default)]
+struct SettledSeatChunk {
+    effects: Vec<mob_dsl::MobMachineEffect>,
+    journal: Vec<NewMobEvent>,
+    seated: Vec<SeatedInChunk>,
+    /// Identities planned after the scan: each new seat, and each
+    /// already-seated identity that is still Dormant.
+    plan: Vec<mob_dsl::AgentIdentity>,
+}
+
+impl SettledSeatChunk {
+    /// Settle one entry from how its inputs applied (`Ok` holds its own
+    /// transitions, in order): its outcome now, or `None` for a seat, whose
+    /// outcome follows the commit. A machine refusal answers the entry
+    /// alone. A seat whose transitions lack what it must carry is a defect,
+    /// and nothing of the chunk commits.
+    fn settle(
+        &mut self,
+        mob_id: &MobId,
+        index: usize,
+        entry: StagedSeatEntry,
+        applied: Result<Vec<mob_dsl::MobMachineTransition>, mob_dsl::MobMachineTransitionError>,
+    ) -> Result<Option<DormantSeatOutcome>, MobError> {
+        let host_preparation_refused =
+            |error: mob_dsl::MobMachineTransitionError| MobError::MobMachineRejected {
+                context: "dormant_seat_resolve_host_preparation",
+                reason: error.to_string(),
+            };
+        match entry {
+            StagedSeatEntry::AlreadySeated {
+                agent_identity,
+                session_id,
+                dsl_identity,
+            } => Ok(Some(match applied {
+                Ok(transitions) => {
+                    self.effects.extend(
+                        transitions
+                            .into_iter()
+                            .flat_map(mob_dsl::MobMachineTransition::into_effects),
+                    );
+                    self.plan.push(dsl_identity);
+                    DormantSeatOutcome::AlreadySeated {
+                        agent_identity,
+                        session_id,
+                    }
+                }
+                Err(error) => DormantSeatOutcome::Refused {
+                    agent_identity,
+                    error: host_preparation_refused(error),
+                },
+            })),
+            StagedSeatEntry::Embodied {
+                agent_identity,
+                session_id,
+                ..
+            } => Ok(Some(match applied {
+                Ok(transitions) => {
+                    self.effects.extend(
+                        transitions
+                            .into_iter()
+                            .flat_map(mob_dsl::MobMachineTransition::into_effects),
+                    );
+                    DormantSeatOutcome::Embodied {
+                        agent_identity,
+                        session_id,
+                    }
+                }
+                Err(error) => DormantSeatOutcome::Refused {
+                    agent_identity,
+                    error: host_preparation_refused(error),
+                },
+            })),
+            StagedSeatEntry::Seat(seat) => {
+                let transitions = match applied {
+                    Ok(transitions) => transitions,
+                    Err(error) => {
+                        return Ok(Some(DormantSeatOutcome::Refused {
+                            agent_identity: seat.candidate.agent_identity.clone(),
+                            error: MobError::MobMachineRejected {
+                                context: "dormant_seat",
+                                reason: error.to_string(),
+                            },
+                        }));
+                    }
+                };
+                let event = seat.member_spawned(&transitions)?;
+                for transition in transitions {
+                    self.effects.extend(transition.into_effects());
+                }
+                self.journal.push(NewMobEvent {
+                    mob_id: mob_id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MemberSpawned(event),
+                });
+                let StagedSeat {
+                    mut candidate,
+                    endpoint,
+                    ..
+                } = *seat;
+                let agent_identity = candidate.agent_identity.clone();
+                self.plan
+                    .push(mob_dsl::AgentIdentity::from_domain(&agent_identity));
+                let local_build_inputs = candidate
+                    .session_unborn
+                    .then(|| std::mem::take(&mut candidate.seat_build.local))
+                    .filter(|local| !local.is_empty());
+                self.seated.push(SeatedInChunk {
+                    index,
+                    agent_identity,
+                    session_id: candidate.session_id.clone(),
+                    endpoint,
+                    local_build_inputs,
+                });
+                Ok(None)
+            }
+        }
+    }
 }

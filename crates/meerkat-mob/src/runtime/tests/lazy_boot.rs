@@ -855,6 +855,321 @@ async fn a_seat_batch_refuses_only_the_identity_whose_peer_id_is_held() {
     assert_eq!(journal_kinds(&events).await.len(), journal);
 }
 
+/// A mob for the seat comparison, with `sessions` live and their comms key
+/// pairs stored under `keys`, as a host's import leaves them.
+async fn seat_comparison_mob(
+    label: &str,
+    keys: &std::path::Path,
+    sessions: &[&SessionId],
+) -> (MobHandle, Arc<dyn MobEventStore>) {
+    let (handle, service, events) = seat_mob(label, |builder| {
+        builder.with_member_comms_identity_root(keys)
+    })
+    .await;
+    for &session in sessions {
+        service
+            .replace_live_session(Session::with_id(session.clone()))
+            .await;
+        meerkat_comms::Keypair::generate()
+            .save(&keys.join(session.to_string()))
+            .await
+            .expect("the session's comms key pair");
+    }
+    (handle, events)
+}
+
+/// The comparison's two chunks: one the machine accepts whole, and a mixed
+/// one: a fresh seat, two resume seats of one session (the second one's peer
+/// id is the first one's, so the machine refuses it at the commit), an
+/// identity seated already, and one more resume seat.
+fn seat_comparison_chunks(
+    own: &SessionId,
+    shared: &SessionId,
+    other: &SessionId,
+) -> [Vec<SpawnMemberSpec>; 2] {
+    let resume = |index: usize, session: &SessionId| {
+        let mut spec = turn_driven(&worker(index));
+        spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: session.clone(),
+            resume_from_role: None,
+        };
+        spec
+    };
+    [
+        vec![
+            turn_driven(&worker(0)),
+            resume(1, own),
+            turn_driven(&worker(2)),
+        ],
+        vec![
+            turn_driven(&worker(3)),
+            resume(4, shared),
+            resume(5, shared),
+            resume(1, own),
+            resume(6, other),
+        ],
+    ]
+}
+
+/// A name for each session the seat comparison meets: the resume sessions
+/// by role, and each fresh seat's name-based session by its identity (its id
+/// differs from mob to mob).
+fn seat_session_names(
+    handle: &MobHandle,
+    resumed: &[(&SessionId, &str)],
+    fresh: &[AgentIdentity],
+) -> BTreeMap<String, String> {
+    resumed
+        .iter()
+        .map(|&(session, name)| (session.to_string(), name.to_owned()))
+        .chain(fresh.iter().map(|identity| {
+            let session = fresh_seat_session_id(
+                handle.mob_id(),
+                handle.incarnation(),
+                identity,
+                crate::ids::Generation::INITIAL,
+            );
+            (session.to_string(), format!("fresh {identity}"))
+        }))
+        .collect()
+}
+
+/// `session` by its name in `names`.
+fn session_name(names: &BTreeMap<String, String>, session: &str) -> String {
+    names
+        .get(session)
+        .cloned()
+        .unwrap_or_else(|| format!("unnamed {session}"))
+}
+
+/// Each seat outcome, its session named.
+fn seat_outcome_summaries(
+    outcomes: &[DormantSeatOutcome],
+    names: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let named = |session_id: &SessionId| session_name(names, &session_id.to_string());
+    outcomes
+        .iter()
+        .map(|outcome| match outcome {
+            DormantSeatOutcome::Seated {
+                agent_identity,
+                session_id,
+            } => format!("{agent_identity} seated on {}", named(session_id)),
+            DormantSeatOutcome::AlreadySeated {
+                agent_identity,
+                session_id,
+            } => format!("{agent_identity} already seated on {}", named(session_id)),
+            DormantSeatOutcome::SessionArchived {
+                agent_identity,
+                session_id,
+            } => format!("{agent_identity} on archived {}", named(session_id)),
+            DormantSeatOutcome::Embodied {
+                agent_identity,
+                session_id,
+            } => format!("{agent_identity} embodied on {}", named(session_id)),
+            DormantSeatOutcome::Refused {
+                agent_identity,
+                error,
+            } => format!("{agent_identity} refused: {error:?}"),
+        })
+        .collect()
+}
+
+/// What MobMachine holds for each of `identities`, sessions named.
+fn seat_machine_facts(
+    handle: &MobHandle,
+    identities: &[AgentIdentity],
+    names: &BTreeMap<String, String>,
+) -> Vec<String> {
+    let state = handle.machine_state_watch_rx.borrow();
+    identities
+        .iter()
+        .map(|identity| {
+            let id = dsl::AgentIdentity::from_domain(identity);
+            format!(
+                "{identity}: runtime {:?}, generation {:?}, fence {:?}, session {:?}, \
+                 residency {:?}, unborn {}, endpoint {}, peer id {}, host preparation {}, \
+                 boot obligation {:?}, wake attempts {:?}, profile {:?}, mode {:?}",
+                state.identity_to_runtime.get(&id),
+                state.identity_runtime_generations.get(&id),
+                state.identity_runtime_fence_tokens.get(&id),
+                state
+                    .member_session_bindings
+                    .get(&id)
+                    .map(|session| session_name(names, &session.0)),
+                state.member_materialization.get(&id),
+                state.member_seat_session_unborn.contains(&id),
+                state.member_peer_endpoints.contains_key(&id),
+                state.member_peer_ids.contains_key(&id),
+                state.member_host_preparation_pending.contains(&id),
+                state.member_boot_obligation_owed.get(&id),
+                state.member_wake_attempts.get(&id),
+                state.member_profile_names.get(&id),
+                state.member_runtime_modes.get(&id),
+            )
+        })
+        .collect()
+}
+
+/// The journal's rows after its first `from`, sessions named: each
+/// `MemberSpawned` row with what a seat writes into it.
+async fn seat_journal_rows(
+    events: &Arc<dyn MobEventStore>,
+    from: usize,
+    names: &BTreeMap<String, String>,
+) -> Vec<String> {
+    events
+        .replay_all()
+        .await
+        .expect("read the journal")
+        .iter()
+        .skip(from)
+        .map(|event| match &event.kind {
+            MobEventKind::MemberSpawned(spawned) => format!(
+                "MemberSpawned({}): generation {:?}, fence {:?}, runtime {:?}, role {:?}, \
+                 mode {:?}, session {:?}, unborn {}, endpoint {}, provenance {:?}",
+                spawned.agent_identity,
+                spawned.generation,
+                spawned.fence_token,
+                spawned.agent_runtime_id,
+                spawned.role,
+                spawned.runtime_mode,
+                spawned
+                    .bridge_member_ref
+                    .as_ref()
+                    .and_then(crate::event::MemberRef::bridge_session_id)
+                    .map(|session_id| session_name(names, &session_id.to_string())),
+                spawned.seat_session_unborn,
+                spawned.member_peer_endpoint.is_some(),
+                spawned.creation.provenance,
+            ),
+            other => format!("{:?}", std::mem::discriminant(other)),
+        })
+        .collect()
+}
+
+/// The commit applies a seat chunk's inputs as one batch and its boot plans
+/// as another, and applies a batch the machine refuses again one identity
+/// at a time: either way each entry is answered exactly as seating its spec
+/// alone answers it. Two mobs seat the same specs, one a chunk per call and
+/// the other one spec per call: first a chunk the machine accepts whole,
+/// then a mixed one (a fresh seat, resume seats, an identity seated already,
+/// and an identity whose peer id another seat of the chunk holds, which the
+/// machine refuses at the commit). The outcomes, the refusal, the journal
+/// rows (fence tokens included) and each identity's machine facts are the
+/// same. The sessions' key pairs exist before the seats, so both seats of
+/// the shared session carry its one key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_chunk_answers_each_entry_as_seating_its_spec_alone_does() {
+    let own = SessionId::new();
+    let shared = SessionId::new();
+    let other = SessionId::new();
+    let sessions = [&own, &shared, &other];
+    let resumed = [(&own, "own"), (&shared, "shared"), (&other, "other")];
+    let fresh = [worker(0), worker(2), worker(3)];
+    let identities = (0..7).map(worker).collect::<Vec<_>>();
+    let batch_keys = tempfile::tempdir().expect("a comms identity root");
+    let alone_keys = tempfile::tempdir().expect("a comms identity root");
+    let (batch, batch_events) =
+        seat_comparison_mob("seat-chunk-batch", batch_keys.path(), &sessions).await;
+    let (alone, alone_events) =
+        seat_comparison_mob("seat-chunk-alone", alone_keys.path(), &sessions).await;
+    let batch_names = seat_session_names(&batch, &resumed, &fresh);
+    let alone_names = seat_session_names(&alone, &resumed, &fresh);
+    let batch_from = journal_kinds(&batch_events).await.len();
+    let alone_from = journal_kinds(&alone_events).await.len();
+
+    let mut batched = Vec::new();
+    for chunk in seat_comparison_chunks(&own, &shared, &other) {
+        batched.push(
+            batch
+                .seat_dormant_members(chunk)
+                .await
+                .expect("the chunk answers"),
+        );
+    }
+    let mut one_by_one = Vec::new();
+    for chunk in seat_comparison_chunks(&own, &shared, &other) {
+        let mut answers = Vec::new();
+        for spec in chunk {
+            answers.extend(
+                alone
+                    .seat_dormant_members(vec![spec])
+                    .await
+                    .expect("the spec answers"),
+            );
+        }
+        one_by_one.push(answers);
+    }
+
+    assert!(
+        matches!(
+            &batched[1][2],
+            DormantSeatOutcome::Refused {
+                error: MobError::MobMachineRejected {
+                    context: "dormant_seat",
+                    ..
+                },
+                ..
+            }
+        ),
+        "the machine refuses the seat whose peer id is held: {:?}",
+        batched[1]
+    );
+    let batched = batched
+        .iter()
+        .map(|outcomes| seat_outcome_summaries(outcomes, &batch_names))
+        .collect::<Vec<_>>();
+    let one_by_one = one_by_one
+        .iter()
+        .map(|outcomes| seat_outcome_summaries(outcomes, &alone_names))
+        .collect::<Vec<_>>();
+    assert_eq!(batched, one_by_one);
+    assert_eq!(
+        batched[0],
+        vec![
+            "lazy-00 seated on fresh lazy-00",
+            "lazy-01 seated on own",
+            "lazy-02 seated on fresh lazy-02",
+        ]
+    );
+    assert_eq!(
+        [&batched[1][..2], &batched[1][3..]].concat(),
+        vec![
+            "lazy-03 seated on fresh lazy-03",
+            "lazy-04 seated on shared",
+            "lazy-01 already seated on own",
+            "lazy-06 seated on other",
+        ]
+    );
+
+    assert_eq!(
+        seat_machine_facts(&batch, &identities, &batch_names),
+        seat_machine_facts(&alone, &identities, &alone_names)
+    );
+    for index in [0, 1, 2, 3, 4, 6] {
+        assert_eq!(
+            phase_of(&batch, &worker(index)),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{}",
+            worker(index)
+        );
+    }
+    assert_eq!(phase_of(&batch, &worker(5)), None);
+
+    assert_eq!(
+        seat_journal_rows(&batch_events, batch_from, &batch_names).await,
+        seat_journal_rows(&alone_events, alone_from, &alone_names).await
+    );
+    assert_eq!(
+        journal_kinds(&batch_events).await.split_off(batch_from),
+        [0, 1, 2, 3, 4, 6]
+            .into_iter()
+            .map(|index| format!("MemberSpawned({})", worker(index)))
+            .collect::<Vec<_>>()
+    );
+}
+
 /// A seat needs the members' comms transport: without it every spec is
 /// refused typed and nothing is written.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1276,11 +1591,34 @@ struct SeatCostRun {
     restart: Duration,
 }
 
+/// Microseconds per seat of `elapsed` over `seats` seats.
+fn per_seat_micros(elapsed: Duration, seats: usize) -> f64 {
+    elapsed.as_secs_f64() * 1_000_000.0 / seats.max(1) as f64
+}
+
 impl SeatCostRun {
-    fn report(&self) {
-        let per_seat = |elapsed: Duration, seats: usize| {
-            elapsed.as_secs_f64() * 1_000_000.0 / seats.max(1) as f64
+    /// The per-seat cost of the last full chunk over the first chunk's, in
+    /// total and for the commit alone. A trailing partial chunk is left out:
+    /// its fixed per-chunk work over a few seats is not a per-seat cost.
+    fn per_seat_growth(&self) -> Option<(f64, f64)> {
+        let first = self.chunks.first()?;
+        let last = self
+            .chunks
+            .iter()
+            .rev()
+            .find(|chunk| chunk.specs == crate::runtime::dormant_seat::DORMANT_SEAT_CHUNK)?;
+        let total = |chunk: &crate::runtime::handle::seat_chunk_timing::SeatChunkTiming| {
+            per_seat_micros(chunk.plan + chunk.prepare + chunk.commit, chunk.specs)
         };
+        Some((
+            total(last) / total(first).max(f64::EPSILON),
+            per_seat_micros(last.commit, last.specs)
+                / per_seat_micros(first.commit, first.specs).max(f64::EPSILON),
+        ))
+    }
+
+    fn report(&self) {
+        let per_seat = per_seat_micros;
         let millis = |elapsed: Duration| elapsed.as_secs_f64() * 1_000.0;
         eprintln!("seat cost: {} identities", self.members);
         eprintln!(
@@ -1310,15 +1648,9 @@ impl SeatCostRun {
             );
             seated += chunk.specs;
         }
-        if let (Some(first), Some(last)) = (self.chunks.first(), self.chunks.last()) {
-            let total = |chunk: &crate::runtime::handle::seat_chunk_timing::SeatChunkTiming| {
-                per_seat(chunk.plan + chunk.prepare + chunk.commit, chunk.specs)
-            };
+        if let Some((total, commit)) = self.per_seat_growth() {
             eprintln!(
-                "  per-seat cost, last chunk over first: {:.1}x (commit alone {:.1}x)",
-                total(last) / total(first).max(f64::EPSILON),
-                per_seat(last.commit, last.specs)
-                    / per_seat(first.commit, first.specs).max(f64::EPSILON),
+                "  per-seat cost, last full chunk over first: {total:.1}x (commit alone {commit:.1}x)"
             );
         }
         eprintln!("  restart: {:?}", self.restart);
@@ -1443,8 +1775,19 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
 /// wall time of each phase and of each seat chunk's plan (on the actor),
 /// preparation (off it) and commit (on the actor), so the per-seat cost can
 /// be read against how many members are seated already. Deterministic
-/// counters are the assertions. The 10,000 seats must also fit the
-/// five-minute first-boot bound, and the restart the 60-second restart bound.
+/// counters are the assertions, with three bounds on the 10,000 run:
+/// - seating takes under 10 s. Before the plan probed each chunk on one
+///   fork and the commit applied each chunk as one batch, every seat copied
+///   the whole machine state about five times, and the 10,000 seats took
+///   about four minutes: quadratic in the roster. The bound sits well above
+///   the few seconds that remain and far below anything quadratic;
+/// - the per-seat cost of the last full chunk is at most 6x the first
+///   chunk's. Some cost still grows with the roster: each chunk copies the
+///   machine state a few times as a whole (its prepared commit and the state
+///   it publishes), and the seat's peer-id guard reads every member's
+///   endpoint. A per-seat copy of the state would put the ratio in the tens;
+/// - the restart takes under 60 s, the restart bound.
+///
 /// The session service is a mock: a store's own read per seat comes on top.
 /// Run explicitly, in the release profile, with the output shown (nextest
 /// `--no-capture`).
@@ -1459,10 +1802,18 @@ async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
     }
     let largest = runs.last().expect("the 10,000-identity run");
     assert!(
-        largest.seat < Duration::from_secs(300),
-        "seating {} identities took {:?}, over the five-minute first-boot bound",
+        largest.seat < Duration::from_secs(10),
+        "seating {} identities took {:?}, over the 10 s bound",
         largest.members,
         largest.seat
+    );
+    let (growth, commit_growth) = largest
+        .per_seat_growth()
+        .expect("the 10,000-identity run has full chunks");
+    assert!(
+        growth <= 6.0,
+        "the per-seat cost of the last full chunk is {growth:.1}x the first chunk's \
+         (commit alone {commit_growth:.1}x), over the 6x bound"
     );
     assert!(
         largest.restart < Duration::from_secs(60),
