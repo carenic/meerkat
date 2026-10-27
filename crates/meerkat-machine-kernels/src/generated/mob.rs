@@ -3754,6 +3754,8 @@ pub enum MemberReleaseVerdict {
     HostOwned,
     #[serde(rename = "NotAMember")]
     NotAMember,
+    #[serde(rename = "NotYetReleasable")]
+    NotYetReleasable,
 }
 impl MemberReleaseVerdict {
     pub fn as_str(&self) -> &'static str {
@@ -3763,6 +3765,7 @@ impl MemberReleaseVerdict {
             Self::WakeInFlight => "WakeInFlight",
             Self::HostOwned => "HostOwned",
             Self::NotAMember => "NotAMember",
+            Self::NotYetReleasable => "NotYetReleasable",
         }
     }
 }
@@ -3775,6 +3778,7 @@ impl std::convert::TryFrom<&str> for MemberReleaseVerdict {
             "WakeInFlight" => Ok(Self::WakeInFlight),
             "HostOwned" => Ok(Self::HostOwned),
             "NotAMember" => Ok(Self::NotAMember),
+            "NotYetReleasable" => Ok(Self::NotYetReleasable),
             other => Err(format!("invalid MemberReleaseVerdict value `{other}`")),
         }
     }
@@ -8867,6 +8871,7 @@ pub mod inputs {
         pub session_id: SessionId,
         pub refusal_code: String,
         pub reason: String,
+        pub attempt: Option<u64>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveRuntimeIngressRefusal {
@@ -11049,6 +11054,7 @@ pub mod effects {
         pub fence_token: FenceToken,
         pub generation: Option<Generation>,
         pub session_id: SessionId,
+        pub attempt: Option<u64>,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct SpawnProfileAuthorized {
@@ -13972,6 +13978,10 @@ pub enum TransitionId {
     CommitMemberRotationLiveKickoffStopped,
     CommitMemberRotationRetiredKickoffRunning,
     CommitMemberRotationRetiredKickoffStopped,
+    ResolveRuntimeBindingRefusalStaleRunning,
+    ResolveRuntimeBindingRefusalStaleStopped,
+    ResolveRuntimeBindingRefusalStaleCompleted,
+    ResolveRuntimeBindingRefusalStaleDestroyed,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

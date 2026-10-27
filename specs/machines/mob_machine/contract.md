@@ -458,7 +458,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `SessionIngressDetachedForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId)
 - `SessionIngressDetachFailedForMobDestroy`(mob_id: MobId, agent_runtime_id: AgentRuntimeId, reason: String)
 - `ResolveSubmitWorkRejection`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, expected_session_id: Option<SessionId>, origin: WorkOrigin)
-- `ResolveRuntimeBindingRefusal`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String)
+- `ResolveRuntimeBindingRefusal`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String, attempt: Option<u64>)
 - `ResolveRuntimeIngressRefusal`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, session_id: SessionId, work_id: WorkId, origin: WorkOrigin, refusal_code: String, reason: String)
 - `ResolveRuntimeRetireRefusal`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, refusal_code: String, reason: String)
 - `RetryRuntimeRetire`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId)
@@ -636,7 +636,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `HoldMemberRunStarts`
 - `ReleaseMemberRunStarts`
 - `DefinitionEpochAdvanced`(previous_epoch: u64, epoch: u64)
-- `RequestRuntimeBinding`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId)
+- `RequestRuntimeBinding`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId, attempt: Option<u64>)
 - `SpawnProfileAuthorized`(agent_identity: AgentIdentity, profile_name: String, model: String, profile_material_digest: String, tool_config_digest: String, skills_digest: String, provider_params_digest: Option<String>, output_schema_digest: Option<String>, external_addressable: Bool, resolved_spec_digest: Option<String>)
 - `RequestRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, session_id: SessionId, work_id: WorkId, origin: WorkOrigin, content_attribution: WorkContentAttribution)
 - `RequestPeerRuntimeIngress`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Option<Generation>, work_id: WorkId, origin: WorkOrigin, content_attribution: WorkContentAttribution)
@@ -803,7 +803,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `member_wake_refusal`(member_present: Bool, session_bound: Bool, placed: Bool, broken: Bool, retiring: Bool, mob_admitting: Bool, composition_authoritative: Bool, origin_open: Bool, host_pending: Bool, input_class: PeerInputClass, sender_waking: Bool, observed_missing: Bool, phase: Option<MemberMaterializationPhase>) -> `Option<MemberWakeRefusalKind>`
 - `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool) -> `BootMaterializationKind`
 - `peer_notice_disposition`(recipient_phase: Option<MemberMaterializationPhase>, sender_phase: Option<MemberMaterializationPhase>, notice_class: PeerInputClass) -> `PeerNoticeDisposition`
-- `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>) -> `MemberReleaseVerdict`
+- `member_registration_releasable`(residency: Option<MemberMaterializationPhase>, placed: Bool, sealed: Bool, has_endpoint: Bool, epoch_recorded: Bool) -> `Bool`
+- `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>, releasable: Bool) -> `MemberReleaseVerdict`
 
 ## Command Plans
 ### `AuthorizedMobSpawnStart`
@@ -6988,8 +6989,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `ResolveRuntimeBindingRefusalRunning`
 - From: `Running`
-- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason)
+- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt)
 - Guards:
+  - `refusal_attempt_current`
   - `placement_absent`
   - `identity_binding_matches`
   - `current_binding_matches`
@@ -13652,6 +13654,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `explicit_resume_settled`
   - `adaptive_lifecycle_drained`
+  - `rotations_abandoned_at_admission`
   - `session_ingress_detaches_closed`
   - `placed_completion_quiesce_started`
   - `placed_completion_destroy_intent`
@@ -16510,6 +16513,38 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_peer_id_is_not_host`
 - Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`, `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
 - To: `Stopped`
+
+### `ResolveRuntimeBindingRefusalStaleRunning`
+- From: `Running`
+- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt)
+- Guards:
+  - `refusal_attempt_stale`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveRuntimeBindingRefusalStaleStopped`
+- From: `Stopped`
+- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt)
+- Guards:
+  - `refusal_attempt_stale`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveRuntimeBindingRefusalStaleCompleted`
+- From: `Completed`
+- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt)
+- Guards:
+  - `refusal_attempt_stale`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveRuntimeBindingRefusalStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveRuntimeBindingRefusal`(agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt)
+- Guards:
+  - `refusal_attempt_stale`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
 
 ## Coverage
 ### Code Anchors

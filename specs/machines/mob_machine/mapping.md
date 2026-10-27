@@ -4626,6 +4626,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `CommitMemberRotationRetiredKickoffStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveRuntimeBindingRefusalStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeBindingRefusalStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeBindingRefusalStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveRuntimeBindingRefusalStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`

@@ -209,6 +209,10 @@ pub mod fields {
         FieldId::parse("agent_runtime_id").expect("field slug")
     }
 
+    pub fn attempt() -> FieldId {
+        FieldId::parse("attempt").expect("field slug")
+    }
+
     pub fn cause() -> FieldId {
         FieldId::parse("cause").expect("field slug")
     }
@@ -378,6 +382,12 @@ pub fn refusal_closure_binding_request_reaches_meerkat() -> TypedDispatchRefusal
             (
                 GeneratedRefusalFieldSource::ConsumerErrorMessage,
                 FieldId::parse("reason").expect("feedback field slug"),
+            ),
+            (
+                GeneratedRefusalFieldSource::EffectField(
+                    FieldId::parse("attempt").expect("effect field slug"),
+                ),
+                FieldId::parse("attempt").expect("feedback field slug"),
             ),
         ],
     }
