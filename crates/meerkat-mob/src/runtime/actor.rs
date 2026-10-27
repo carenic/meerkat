@@ -23326,7 +23326,7 @@ impl MobActor {
         // plan's wakes are open (the rest as they close, `boot_lift`). Each
         // planned member is woken through the one cold recipe; the resume
         // joins its wake and settles it once the wake closes.
-        let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set().await {
+        let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set(&progress).await {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),
         };

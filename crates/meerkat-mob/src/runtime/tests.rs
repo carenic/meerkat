@@ -2233,6 +2233,9 @@ struct MockSessionService {
     session_read_barriers: RwLock<HashMap<SessionId, Arc<TestRuntimeControlBarrier>>>,
     session_read_started: tokio::sync::Notify,
     create_session_delay_ms: AtomicU64,
+    /// How long each resume-authority observation waits before it reads, as
+    /// a slow store's read of a member's stored session answers late.
+    resume_authority_observe_delay_ms: AtomicU64,
     load_persisted_session_delay_ms: AtomicU64,
     load_persisted_session_started: tokio::sync::Notify,
     live_durable_source_observations: AtomicUsize,
@@ -2483,6 +2486,7 @@ impl MockSessionService {
             session_read_barriers: RwLock::new(HashMap::new()),
             session_read_started: tokio::sync::Notify::new(),
             create_session_delay_ms: AtomicU64::new(0),
+            resume_authority_observe_delay_ms: AtomicU64::new(0),
             load_persisted_session_delay_ms: AtomicU64::new(0),
             load_persisted_session_started: tokio::sync::Notify::new(),
             live_durable_source_observations: AtomicUsize::new(0),
@@ -3263,6 +3267,11 @@ impl MockSessionService {
 
     fn set_create_session_delay_ms(&self, delay_ms: u64) {
         self.create_session_delay_ms
+            .store(delay_ms, Ordering::Relaxed);
+    }
+
+    fn set_resume_authority_observe_delay_ms(&self, delay_ms: u64) {
+        self.resume_authority_observe_delay_ms
             .store(delay_ms, Ordering::Relaxed);
     }
 
@@ -5604,6 +5613,12 @@ impl MobSessionService for MockSessionService {
         self.count_durable_read(session_id, |reads| {
             reads.observe_session_resume_authority += 1;
         });
+        let observe_delay_ms = self
+            .resume_authority_observe_delay_ms
+            .load(Ordering::Relaxed);
+        if observe_delay_ms > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(observe_delay_ms)).await;
+        }
         if self
             .resume_authority_absent_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {

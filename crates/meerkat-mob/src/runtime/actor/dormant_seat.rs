@@ -602,7 +602,7 @@ impl MobActor {
         // Dormant and their wake classifies them as the pass would have.
         #[cfg(feature = "runtime-adapter")]
         if !verify.is_empty()
-            && let Err(error) = self.verify_dormant_member_set(&verify).await
+            && let Err(error) = self.verify_dormant_member_set(&verify, None).await
         {
             tracing::warn!(
                 mob_id = %self.definition.id,

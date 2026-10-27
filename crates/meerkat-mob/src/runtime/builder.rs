@@ -10185,6 +10185,7 @@ impl MobBuilder {
                 listed_sessions: &listed_sessions,
                 member_bound_sessions: &member_bound_sessions,
                 concurrency: restore_concurrency,
+                progress: None,
             },
             &mut successor_index,
         )

@@ -127,6 +127,8 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     /// How many of the plan's wakes may be open at once: the restore
     /// concurrency.
     bound: usize,
+    /// The lift's progress: the plan's store reads report to it.
+    progress: super::super::state::LifecycleProgressSignal,
 }
 
 impl MobActor {
@@ -137,8 +139,14 @@ impl MobActor {
     /// the members it made Waking now, for the explicit resume to join. The
     /// rest are dispatched as those wakes close
     /// ([`Self::dispatch_explicit_resume_boot_members`]).
+    ///
+    /// The plan's store reads report to the lift's `progress` as units of
+    /// work: the obligation scan, and each member's read in the verified
+    /// pass. A slow store then never reads as a stalled lift; only one read
+    /// that outlasts the inactivity budget does.
     pub(super) async fn plan_explicit_resume_boot_set(
         &mut self,
+        progress: &super::super::state::LifecycleProgressSignal,
     ) -> Result<Vec<ExplicitResumeBootMember>, MobError> {
         let resume_attempt = self
             .dsl_authority
@@ -149,13 +157,23 @@ impl MobActor {
                 MobError::Internal("the lift's member plan lost its resume attempt".to_string())
             })?;
         #[cfg(feature = "runtime-adapter")]
-        let obligations = super::super::boot_plan::scan_boot_obligations(
-            self.runtime_adapter.as_ref(),
-            self.dsl_authority.state(),
-            &self.definition.id,
-            self.incarnation.incarnation(),
-        )
-        .await?;
+        let obligations = {
+            // The scan is a unit of work of its own: its two store-wide
+            // reads start a new inactivity budget, and so does what follows
+            // them.
+            progress
+                .stage_progress(super::super::state::LifecycleProgressStage::BootObligationScan);
+            let obligations = super::super::boot_plan::scan_boot_obligations(
+                self.runtime_adapter.as_ref(),
+                self.dsl_authority.state(),
+                &self.definition.id,
+                self.incarnation.incarnation(),
+            )
+            .await?;
+            progress
+                .stage_progress(super::super::state::LifecycleProgressStage::BootObligationScan);
+            obligations
+        };
         #[cfg(not(feature = "runtime-adapter"))]
         let obligations = super::super::boot_plan::BootObligations::none();
         self.boot_set_basis.set(obligations.basis);
@@ -176,6 +194,7 @@ impl MobActor {
             watched: BTreeSet::new(),
             verify: BTreeSet::new(),
             bound,
+            progress: progress.clone(),
         });
         self.dispatch_explicit_resume_boot_members().await
     }
@@ -282,7 +301,8 @@ impl MobActor {
             dispatch.verify.retain(|identity| {
                 super::super::boot_plan::domain_member_is_dormant(state, identity)
             });
-            self.verify_dormant_member_set(&dispatch.verify).await?;
+            self.verify_dormant_member_set(&dispatch.verify, Some(&dispatch.progress))
+                .await?;
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = &dispatch.verify;
@@ -378,11 +398,13 @@ impl MobActor {
     /// leaves Dormant, before the caller is answered. A member whose durable
     /// session cannot be resumed is recorded Broken through the machine,
     /// with nothing materialized; the others stay Dormant. The realm is
-    /// listed once and scanned at most once.
+    /// listed once and scanned at most once. A lift passes its `progress`:
+    /// each member's read is reported as that member's progress.
     #[cfg(feature = "runtime-adapter")]
     pub(super) async fn verify_dormant_member_set(
         &mut self,
         verify: &BTreeSet<AgentIdentity>,
+        progress: Option<&super::super::state::LifecycleProgressSignal>,
     ) -> Result<(), MobError> {
         if verify.is_empty() {
             return Ok(());
@@ -430,6 +452,7 @@ impl MobActor {
                 listed_sessions: &listed_sessions,
                 member_bound_sessions: &member_bound_sessions,
                 concurrency: self.member_residency.verify_concurrency,
+                progress,
             },
             targets,
             &mut successor_index,

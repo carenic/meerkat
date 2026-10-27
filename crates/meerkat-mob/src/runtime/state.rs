@@ -530,6 +530,9 @@ pub(super) enum LifecycleProgressStage {
     MemberCommsReadiness,
     AutonomousRuntimeReadiness,
     DurableResumeTransition,
+    /// The lift's runtime obligation scan: two store-wide reads of the
+    /// runtime store before its member plan.
+    BootObligationScan,
     PostRebuildReadiness,
     ResumeTopologyReconciliation,
     ResumeRollback,
@@ -548,6 +551,7 @@ impl LifecycleProgressStage {
             Self::MemberCommsReadiness => "member_comms_readiness",
             Self::AutonomousRuntimeReadiness => "autonomous_runtime_readiness",
             Self::DurableResumeTransition => "durable_resume_transition",
+            Self::BootObligationScan => "boot_obligation_scan",
             Self::PostRebuildReadiness => "post_rebuild_readiness",
             Self::ResumeTopologyReconciliation => "resume_topology_reconciliation",
             Self::ResumeRollback => "resume_rollback",
@@ -650,6 +654,27 @@ impl LifecycleProgressSignal {
         });
         tracing::debug!(
             agent_identity = %member_id,
+            stage = stage.as_str(),
+            elapsed_ms = elapsed.as_millis(),
+            "explicit resume lifecycle work progressed"
+        );
+    }
+
+    /// Progress of a unit of work that belongs to no member (`stage`): the
+    /// caller's inactivity budget starts again, as after a member's
+    /// progress.
+    pub(super) fn stage_progress(&self, stage: LifecycleProgressStage) {
+        let now = meerkat_core::time_compat::Instant::now();
+        let mut elapsed = meerkat_core::time_compat::Duration::ZERO;
+        self.sender.send_modify(|observation| {
+            elapsed = now.saturating_duration_since(observation.observed_at);
+            observation.epoch = observation.epoch.wrapping_add(1);
+            observation.member_id = None;
+            observation.members_owed = None;
+            observation.stage = stage;
+            observation.observed_at = now;
+        });
+        tracing::debug!(
             stage = stage.as_str(),
             elapsed_ms = elapsed.as_millis(),
             "explicit resume lifecycle work progressed"
