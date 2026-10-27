@@ -9554,7 +9554,7 @@ impl MobBuilder {
         };
         restore_resumed_members(
             &restore_context,
-            &restore_set,
+            restore_set,
             restore_concurrency,
             &mut MemberRestoreCommit {
                 authority: &mut *dsl_authority,
@@ -11016,6 +11016,9 @@ enum MemberRestoreStep {
     /// ([`ResumeRestoreCandidate::in_turn`]).
     InTurn,
     Planned(MemberRestorePlan),
+    /// An earlier member's restore failed the resume before this one
+    /// started, so it never started.
+    NotStarted,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -11152,7 +11155,7 @@ fn member_restore_reapplied<T>(
 #[cfg(feature = "runtime-adapter")]
 async fn restore_resumed_members(
     ctx: &ResumeMemberRestoreContext<'_>,
-    restore_set: &[ResumeRestoreCandidate],
+    restore_set: Vec<ResumeRestoreCandidate>,
     concurrency: usize,
     commit: &mut MemberRestoreCommit<'_>,
     successors: &mut MemberSuccessorSearch<'_>,
@@ -11169,31 +11172,36 @@ async fn restore_resumed_members(
     let admission_open = AtomicBool::new(true);
     let (base, no_restored_overlays, admission) =
         (&recovered, &no_restored_overlays, &admission_open);
-    let restores = futures::stream::iter(
-        restore_set
-            .iter()
-            .take_while(move |_| admission.load(Ordering::Acquire)),
-    )
-    .map(move |candidate| async move {
-        let step = if candidate.in_turn {
-            Ok(MemberRestoreStep::InTurn)
-        } else {
-            restore_resumed_member(
-                ctx,
-                candidate,
-                base,
-                super::fork_build::ForkOverlayRule::Own,
-                no_restored_overlays,
-            )
-            .await
-            .map(MemberRestoreStep::Planned)
-        };
-        if step.is_err() {
-            admission.store(false, Ordering::Release);
-        }
-        (candidate, step)
-    })
-    .buffered(concurrency.max(1));
+    // The stream owns its candidates: a restore future that borrowed its
+    // stream item would leave the resume future Send for one lifetime only.
+    let restores = futures::stream::iter(restore_set)
+        .map(move |candidate| async move {
+            // A restore starts only while no restore has failed the resume.
+            // The stream first polls the restores in roster order, so one
+            // that does not start comes after the failed one, whose error the
+            // resume returns first.
+            if !admission.load(Ordering::Acquire) {
+                return (candidate, Ok(MemberRestoreStep::NotStarted));
+            }
+            let step = if candidate.in_turn {
+                Ok(MemberRestoreStep::InTurn)
+            } else {
+                restore_resumed_member(
+                    ctx,
+                    &candidate,
+                    base,
+                    super::fork_build::ForkOverlayRule::Own,
+                    no_restored_overlays,
+                )
+                .await
+                .map(MemberRestoreStep::Planned)
+            };
+            if step.is_err() {
+                admission.store(false, Ordering::Release);
+            }
+            (candidate, step)
+        })
+        .buffered(concurrency.max(1));
     let mut restores = std::pin::pin!(restores);
     let mut ready = VecDeque::new();
     let mut exhausted = false;
@@ -11209,7 +11217,7 @@ async fn restore_resumed_members(
         let applied = match step {
             Ok(step) => {
                 let turn = Box::pin(apply_member_restore_turn(
-                    ctx, commit, successors, candidate, step,
+                    ctx, commit, successors, &candidate, step,
                 ));
                 keep_member_restores_moving(turn, &mut restores, &mut ready, &mut exhausted).await
             }
@@ -11268,6 +11276,12 @@ async fn apply_member_restore_turn(
     step: MemberRestoreStep,
 ) -> Result<(), MobError> {
     let plan = match step {
+        MemberRestoreStep::NotStarted => {
+            return Err(MobError::Internal(format!(
+                "the restore of '{}' did not start, but no earlier member restore failed the resume",
+                candidate.entry.agent_identity
+            )));
+        }
         MemberRestoreStep::Planned(plan) => plan,
         MemberRestoreStep::InTurn => {
             let fork_rule = super::fork_build::fork_overlay_rule(
