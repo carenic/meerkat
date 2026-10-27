@@ -35,6 +35,8 @@ them.
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-10-27
+
 ### Breaking
 
 - `meerkat-runtime`: `meerkat_runtime::completion::CompletionOutcome` gains
@@ -36015,7 +36017,8 @@ tag, so its comparison link uses v0.3.0 as the exact ancestry base.
 
 Initial development release.
 
-[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/lukacf/meerkat/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/lukacf/meerkat/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/lukacf/meerkat/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/lukacf/meerkat/compare/v0.9.3...v0.9.4
 [0.9.3]: https://github.com/lukacf/meerkat/compare/v0.9.2...v0.9.3
