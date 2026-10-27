@@ -24594,6 +24594,10 @@ macro_rules! mob_catalog_machine_dsl {
 
         // PlanBootMaterialization: the boot verdict for one Dormant member, on
         // both start paths, from the generated member_boot_materialization.
+        // A member is network-reachable (the helper's network_transport) when
+        // its endpoint's transport is Tcp or Uds, or when a wiring edge joins
+        // it to a placed member: a peer in another process cannot use an
+        // inproc wake route either way.
         transition PlanBootMaterializationWake {
             on input PlanBootMaterialization { agent_identity, obligation, host_required, orchestrator_notified }
             guard { self.lifecycle_phase == Phase::Running }
@@ -24606,8 +24610,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::Wake
@@ -24659,8 +24668,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::VerifyThenDormant
@@ -24687,8 +24701,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::StayDormant
