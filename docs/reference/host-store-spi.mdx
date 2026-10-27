@@ -365,8 +365,8 @@ reads:
   wait, pending terminal owners, an open run's provisional tail, or a current
   run (a lifecycle record Core cannot decode counts as one). Core reads its
   visible rows from the first visible row, 16 rows per `read_rows` call, then
-  the chunks its live entries refer to. An archived runtime is never read at
-  open.
+  the chunks its rows and live entries refer to. An archived runtime is never
+  read at open.
 
 No other row is read at open.
 
