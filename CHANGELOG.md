@@ -141,8 +141,11 @@ them.
   member's runtime attachment is retired and the member is rebuilt on that
   binding, on its own session. A backend with no runtime attachment to retire
   refuses the member instead: it is recorded broken with
-  `MobError::MemberAuthBindingConflict`, and its live actor is retired. Before,
-  the lift kept every live actor on whatever binding it ran.
+  `MobError::MemberAuthBindingConflict`, and its live actor is retired. The
+  lift releases the run starts the stop held only after every member's check
+  (and any retirement) completed, so a run queued while the mob was stopped
+  never starts on the old binding. Before, the lift released them first and
+  kept every live actor on whatever binding it ran.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a

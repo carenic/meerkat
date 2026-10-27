@@ -16,12 +16,37 @@ const WAIT: Duration = Duration::from_secs(30);
 
 type Service = meerkat_session::PersistentSessionService<meerkat::FactoryAgentBuilder>;
 
-/// Answers every turn with one fixed text block (no row runs a turn).
+/// Answers every turn with one fixed text block, and records for each model
+/// request whether the probed member's live actor then ran the probed
+/// binding (by the one check every live-actor reuse runs).
+#[derive(Clone, Default)]
+struct BindingProbeClient {
+    probe: Arc<Mutex<Option<BindingProbe>>>,
+    requests: Arc<Mutex<Vec<bool>>>,
+}
+
 #[derive(Clone)]
-struct FixedAnswerClient;
+struct BindingProbe {
+    service: Arc<Service>,
+    member: AgentIdentity,
+    session: SessionId,
+    binding: meerkat_core::AuthBindingRef,
+}
+
+impl BindingProbeClient {
+    fn probe(&self, probe: BindingProbe) {
+        *self.probe.lock().expect("probe") = Some(probe);
+    }
+
+    /// For each model request so far, in order, whether it ran on the probed
+    /// binding.
+    fn requests(&self) -> Vec<bool> {
+        self.requests.lock().expect("requests").clone()
+    }
+}
 
 #[async_trait]
-impl meerkat_client::LlmClient for FixedAnswerClient {
+impl meerkat_client::LlmClient for BindingProbeClient {
     fn project_replay_messages(
         &self,
         messages: &[Message],
@@ -33,7 +58,21 @@ impl meerkat_client::LlmClient for FixedAnswerClient {
         &'a self,
         request: &'a meerkat_client::LlmRequest,
     ) -> meerkat_client::types::LlmStream<'a> {
+        let probe = self.probe.lock().expect("probe").clone();
+        let requests = Arc::clone(&self.requests);
         Box::pin(async_stream::try_stream! {
+            let on_binding = match probe.as_ref() {
+                Some(probe) => crate::runtime::live_actor_binding::verify_live_actor_auth_binding(
+                    probe.service.as_ref(),
+                    &probe.member,
+                    &probe.session,
+                    &probe.binding,
+                )
+                .await
+                .is_ok(),
+                None => false,
+            };
+            requests.lock().expect("requests").push(on_binding);
             yield meerkat_client::LlmEvent::TextDelta {
                 delta: "lift-answer".to_string(),
                 meta: None,
@@ -114,6 +153,7 @@ struct LiftFixture {
     handle: MobHandle,
     service: Arc<Service>,
     customizer: Arc<BindingCustomizer>,
+    client: BindingProbeClient,
 }
 
 impl LiftFixture {
@@ -140,8 +180,9 @@ impl LiftFixture {
             "global".to_string(),
             meerkat_core::RealmConfigSection::from_inline_api_keys(&[("openai", "test-key")]),
         );
+        let client = BindingProbeClient::default();
         let mut builder = meerkat::FactoryAgentBuilder::new(factory, config);
-        builder.default_llm_client = Some(Arc::new(FixedAnswerClient));
+        builder.default_llm_client = Some(Arc::new(client.clone()));
         let db = root_path.join("realm.db");
         let session_store =
             Arc::new(meerkat_store::SqliteSessionStore::open(&db).expect("session store"));
@@ -162,7 +203,7 @@ impl LiftFixture {
         let customizer = Arc::new(BindingCustomizer::default());
         let handle = MobBuilder::new(lift_definition(label), MobStorage::in_memory())
             .with_session_service(service.clone())
-            .with_default_llm_client(Arc::new(FixedAnswerClient))
+            .with_default_llm_client(Arc::new(client.clone()))
             .with_spawn_member_customizer(customizer.clone())
             .create()
             .await
@@ -172,6 +213,7 @@ impl LiftFixture {
             handle,
             service,
             customizer,
+            client,
         }
     }
 
@@ -233,6 +275,23 @@ impl LiftFixture {
         .is_ok()
     }
 
+    /// Wait until the model has been asked at least `count` times.
+    async fn wait_requests(&self, count: usize) -> Vec<bool> {
+        let deadline = tokio::time::Instant::now() + WAIT;
+        loop {
+            let requests = self.client.requests();
+            if requests.len() >= count {
+                return requests;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the model was asked {} times, not {count}",
+                requests.len()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
     async fn finish(self) {
         let _ = tokio::time::timeout(WAIT, self.handle.shutdown()).await;
     }
@@ -284,6 +343,67 @@ async fn a_lift_after_the_binding_changed_rebuilds_the_member_on_the_new_binding
     assert!(
         fixture.live_actor_runs(&member, &session, &binding).await,
         "the member's live actor runs the binding its resume request names"
+    );
+    fixture.finish().await;
+}
+
+/// A run queued while the mob is stopped (here an input admitted straight to
+/// the member's runtime, as a peer message or an external event is) starts
+/// only on the binding the lift's request names: the run starts the stop held
+/// stay held until the lift's binding check retired the actor on the old
+/// binding, so no model request is ever made on it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_run_queued_while_stopped_starts_only_on_the_new_binding() {
+    let fixture = LiftFixture::new("lift-queued-run").await;
+    let member = fixture.spawn("lift-queued-member").await;
+    let session = fixture.session(&member).await;
+    let binding = configured_openai_binding();
+    assert!(
+        !fixture.live_actor_runs(&member, &session, &binding).await,
+        "precondition: the member was not built on the binding the lift names"
+    );
+    fixture.client.probe(BindingProbe {
+        service: fixture.service.clone(),
+        member: member.clone(),
+        session: session.clone(),
+        binding: binding.clone(),
+    });
+
+    tokio::time::timeout(WAIT, fixture.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("stop the mob");
+    let runtime = MobSessionService::acquire_runtime_adapter(&*fixture.service, None)
+        .expect("the service's runtime")
+        .expect("a runtime-backed service");
+    let (admitted, _completion) = runtime
+        .accept_input_with_completion(
+            &session,
+            meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::new(
+                "queued while the mob is stopped",
+                None,
+            )),
+        )
+        .await
+        .expect("the member's runtime admits the input while the mob is stopped");
+    assert!(
+        matches!(admitted, meerkat_runtime::AcceptOutcome::Accepted { .. }),
+        "the input is queued: {admitted:?}"
+    );
+    assert!(
+        fixture.client.requests().is_empty(),
+        "no run starts while the mob is stopped"
+    );
+    fixture.customizer.name_binding(binding.clone());
+    tokio::time::timeout(WAIT, fixture.handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("lift the mob");
+
+    let requests = fixture.wait_requests(1).await;
+    assert!(
+        requests.iter().all(|on_binding| *on_binding),
+        "every model request of the queued run ran on the binding the lift names: {requests:?}"
     );
     fixture.finish().await;
 }

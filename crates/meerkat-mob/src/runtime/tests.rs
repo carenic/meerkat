@@ -93556,8 +93556,9 @@ async fn test_stop_holds_an_admitted_member_input_until_resume() {
 
 /// #1500: a resume that fails at an internal-error site of its readiness
 /// fan-out must leave the mob Stopped with every member held again. Resume
-/// releases the members at its begin, so a failure that skipped the re-hold
-/// would leave a Stopped mob whose members can start runs.
+/// releases the members once its preparation settled, before its readiness,
+/// so a failure that skipped the re-hold would leave a Stopped mob whose
+/// members can start runs.
 async fn assert_failed_resume_readiness_reholds_members(
     fault: super::state::ResumeReadinessFaultForTest,
 ) {
