@@ -10,7 +10,8 @@
 
 use super::super::dormant_seat::{
     DormantSeatCandidate, DormantSeatCommitEntry, DormantSeatLaunch, DormantSeatOutcome,
-    DormantSeatPlan, DormantSeatPlanEntry, MemberRotationPlan, fresh_seat_session_id,
+    DormantSeatPlan, DormantSeatPlanEntry, MemberRotationPlan, SeatBuild, SeatLocalBuildInputs,
+    fresh_seat_session_id,
 };
 use super::*;
 
@@ -39,6 +40,9 @@ struct SeatedInChunk {
     agent_identity: AgentIdentity,
     session_id: SessionId,
     endpoint: Option<TrustedPeerDescriptor>,
+    /// The process-local build inputs its unborn session's first build
+    /// applies in this process, kept once the seat is committed.
+    local_build_inputs: Option<SeatLocalBuildInputs>,
 }
 
 impl MobActor {
@@ -73,7 +77,6 @@ impl MobActor {
         DormantSeatPlan {
             entries,
             endpoint_source: self.member_residency.seat_endpoints.clone(),
-            provisioner: Arc::clone(&self.provisioner),
         }
     }
 
@@ -101,7 +104,6 @@ impl MobActor {
                 candidate,
                 seated,
                 endpoint_source: self.member_residency.seat_endpoints.clone(),
-                provisioner: Arc::clone(&self.provisioner),
             }),
             DormantSeatPlanEntry::Embody(spec) if !seated => Ok(MemberRotationPlan::Embody(spec)),
             _ => Err(MobError::Internal(format!(
@@ -167,6 +169,15 @@ impl MobActor {
         {
             return Err(MobError::Internal(format!(
                 "'{agent_identity}' cannot be seated dormant: a placed or fork-derived member is spawned"
+            )));
+        }
+        // The tool visibility a member inherits from its creator is minted
+        // for one build and is never journaled: a seat could not carry it to
+        // a first build after a restart, so such a member is spawned.
+        if spec.inherited_tool_filter.is_some() {
+            return Err(MobError::Internal(format!(
+                "'{agent_identity}' cannot be seated dormant: a member that inherits its creator's \
+                 tool visibility is spawned"
             )));
         }
         if spec.resume_provider_params.is_some() && launch != DormantSeatLaunch::Resume {
@@ -251,9 +262,6 @@ impl MobActor {
             || spec.tool_category_overrides != meerkat_core::ToolCategoryOverrides::default())
         .then(|| profile.clone());
         let explicit_workgraph = profile.tools.workgraph;
-        if spec.inherited_tool_filter.is_some() && effective_profile_override.is_none() {
-            build::open_profile_tool_categories_for_inherited_filter(&mut profile);
-        }
         let binding = resolve_binding(
             spec.binding.clone(),
             spec.backend,
@@ -302,9 +310,12 @@ impl MobActor {
             explicit_workgraph,
             spec.external_tools.is_some(),
             spec.shell_env.as_ref(),
-            spec.inherited_tool_filter.is_some(),
+            false,
             None,
         );
+        // What the seat carries to its session's first build: the spec's
+        // build inputs, applied there as a spawn of this spec applies them.
+        let seat_build = SeatBuild::take_from(&mut spec);
         let (authorize_input, authorized) =
             authorize_spawn_profile_input(&agent_identity, &spec.role_name, &profile, None)?;
         let session_id = match launch {
@@ -324,32 +335,27 @@ impl MobActor {
                 generation,
             ),
         };
-        let create_session = match launch {
-            DormantSeatLaunch::Fresh if self.session_service.keeps_durable_member_sessions() => {
-                Some(Box::new(
-                    self.fresh_seat_create_request(
-                        &spec,
-                        &agent_identity,
-                        &profile,
-                        runtime_mode,
-                        session_id.clone(),
-                    )
-                    .await?,
-                ))
-            }
-            _ => None,
-        };
         let continuity_intent = spec
             .continuity_intent
             .clone()
             .for_profile(&profile, &agent_identity);
+        // A session a seat named and no build created (its member was retired
+        // before its first wake) is seated unborn again: MobMachine's fact.
+        let session_never_born = super::super::boot_plan::domain_seat_session_never_born(
+            self.dsl_authority.state(),
+            &session_id,
+        );
         Ok(DormantSeatPlanEntry::Seat(Box::new(DormantSeatCandidate {
             agent_identity,
             profile_name: spec.role_name.clone(),
             launch,
             session_id,
             generation,
-            create_session,
+            session_never_born,
+            // Decided by the preparation, from the session owner's
+            // observation: a fresh seat's absent session is unborn, as is a
+            // session no build created.
+            session_unborn: false,
             runtime_mode,
             labels: spec.labels.clone().unwrap_or_default(),
             continuity_intent,
@@ -362,71 +368,8 @@ impl MobActor {
             kickoff_owed,
             kickoff_prompt: kickoff_owed.then(|| spec.initial_message.clone()).flatten(),
             kickoff_objective_id: spec.objective_id.unwrap_or_default(),
+            seat_build,
         })))
-    }
-
-    /// A fresh seat's create request, built exactly as a fresh spawn builds
-    /// its own (`enqueue_spawn_with_origin`), under the seat's name-based
-    /// session id. The create defers its first turn, and its prompt is the
-    /// fallback role prompt a spawn without an initial message discards.
-    async fn fresh_seat_create_request(
-        &self,
-        spec: &super::super::handle::SpawnMemberSpec,
-        agent_identity: &AgentIdentity,
-        profile: &crate::profile::Profile,
-        runtime_mode: crate::MobRuntimeMode,
-        session_id: SessionId,
-    ) -> Result<meerkat_core::service::CreateSessionRequest, MobError> {
-        let external_tools =
-            self.external_tools_for_profile(profile, spec.external_tools.clone())?;
-        let mut config = build::build_agent_config(build::BuildAgentConfigParams {
-            mob_id: &self.definition.id,
-            profile_name: &spec.role_name,
-            agent_identity,
-            profile,
-            definition: &self.definition,
-            realm_profile_store: self.realm_profile_store.as_ref(),
-            external_tools,
-            compaction_curator_override: spec.compaction_curator_override.clone(),
-            context: spec.context.clone(),
-            labels: spec.labels.clone(),
-            additional_instructions: spec.additional_instructions.clone(),
-            shell_env: spec.shell_env.clone(),
-            mob_tool_authority_context: None,
-            mob_incarnation: Some(self.incarnation),
-            inherited_tool_filter: spec.inherited_tool_filter.clone(),
-            tool_access_policy: spec.tool_access_policy.clone(),
-            system_prompt_override: spec.system_prompt_override.clone(),
-        })
-        .await?;
-        super::super::tools::attach_declared_bundle_tools(
-            &mut config,
-            super::super::tools::resolve_profile_bundle_tools(profile, &self.tool_bundles),
-        );
-        config.tool_dispatch_admission = spec.tool_dispatch_admission.clone();
-        config.keep_alive = runtime_mode == crate::MobRuntimeMode::AutonomousHost;
-        config.override_web_search = spec.tool_category_overrides.web_search;
-        build::apply_application_tool_policy_choice(
-            &mut config,
-            spec.application_tool_policy.clone(),
-        );
-        config.tool_consequence_policy_registry = self.tool_consequence_policy_registry.clone();
-        config.fork_source = None;
-        if let Some(client) = self.default_llm_client.as_ref() {
-            config.llm_client_override = Some(client.clone());
-        }
-        if let Some(binding) = spec.auth_binding.as_ref() {
-            config.auth_binding = Some(binding.clone());
-        }
-        let prompt =
-            ContentInput::from(self.fallback_spawn_prompt(&spec.role_name, agent_identity));
-        let request = build::to_create_session_request(&config, prompt);
-        let mut request = with_spawn_budget_limits(request, spec.budget_limits.clone());
-        request
-            .build
-            .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
-            .mint_session_with_id(session_id);
-        Ok(request)
     }
 
     /// Commit one prepared seat chunk in one actor step, answering each
@@ -503,7 +446,7 @@ impl MobActor {
                     );
                 }
                 DormantSeatCommitEntry::Seat {
-                    candidate,
+                    mut candidate,
                     endpoint,
                 } => {
                     let agent_identity = candidate.agent_identity.clone();
@@ -524,11 +467,16 @@ impl MobActor {
                                 kind: MobEventKind::MemberSpawned(*event),
                             });
                             plan.push(mob_dsl::AgentIdentity::from_domain(&agent_identity));
+                            let local_build_inputs = candidate
+                                .session_unborn
+                                .then(|| std::mem::take(&mut candidate.seat_build.local))
+                                .filter(|local| !local.is_empty());
                             seated.push(SeatedInChunk {
                                 index,
                                 agent_identity,
                                 session_id: candidate.session_id.clone(),
                                 endpoint,
+                                local_build_inputs,
                             });
                         }
                         Ok(SeatApplied::Refused(error)) => {
@@ -618,6 +566,13 @@ impl MobActor {
             let mut roster = self.roster.write().await;
             for event in &stored {
                 roster.apply_event(event);
+            }
+            // This process keeps what its seats' unborn sessions' first
+            // builds apply and the journal cannot hold.
+            for seat in &mut seated {
+                if let Some(local) = seat.local_build_inputs.take() {
+                    roster.retain_seat_local_build_inputs(&seat.session_id, local);
+                }
             }
         }
         for seat in seated {
@@ -748,6 +703,12 @@ impl MobActor {
             // A spec that owes a kickoff is embodied at the plan; the machine
             // refuses a seat that owes one.
             kickoff_owed: candidate.kickoff_owed,
+            // The seat created nothing: a fresh seat's absent session is
+            // unborn, as is a session no build created, and the member's first
+            // wake creates it.
+            session_unborn: candidate.session_unborn,
+            // A resume seat is unborn only on a session no build created.
+            fresh_launch: candidate.launch == DormantSeatLaunch::Fresh,
         };
         let transitions =
             match authority.apply_batch([candidate.authorize_input.clone(), begin, seat]) {
@@ -786,7 +747,10 @@ impl MobActor {
         .with_bridge_member_ref(Some(MemberRef::Session {
             session_id: candidate.session_id.clone(),
         }))
-        .with_member_peer_endpoint(endpoint.cloned());
+        .with_member_peer_endpoint(endpoint.cloned())
+        .with_seat_session_unborn(candidate.session_unborn)
+        // What the unborn session's first build applies.
+        .with_seat_build_inputs(candidate.unborn_seat_build_inputs());
         event.creation = creation;
         event.runtime_mode = candidate.runtime_mode;
         event.labels = candidate.labels.clone();
@@ -1017,9 +981,10 @@ impl MobActor {
             .collect()
     }
 
-    /// Archive the empty sessions of rotations a destroy abandoned. Each
-    /// holds no member and no runtime: a failure is logged and leaves an
-    /// empty session behind; the destroy goes on.
+    /// Archive the sessions of rotations a destroy abandoned. Each holds no
+    /// member and no runtime, and is usually unborn (absent, which archives
+    /// as nothing): a failure is logged and leaves the session behind; the
+    /// destroy goes on.
     pub(super) async fn archive_abandoned_rotation_sessions(
         &mut self,
         abandoned: Vec<(AgentIdentity, SessionId)>,
@@ -1207,7 +1172,14 @@ impl MobActor {
             session_id: candidate.session_id.clone(),
         }))
         .with_member_peer_endpoint(rotation.endpoint.clone())
-        .with_kickoff_prompt(candidate.kickoff_prompt.clone());
+        .with_kickoff_prompt(candidate.kickoff_prompt.clone())
+        // The next incarnation's session is unborn (CommitMemberRotation
+        // records it so): its first wake creates it, applying what the
+        // rotation's spec named.
+        .with_seat_session_unborn(true)
+        .with_seat_build_inputs(
+            Some(candidate.seat_build.inputs.clone()).filter(|inputs| !inputs.is_empty()),
+        );
         spawned.creation = creation;
         spawned.runtime_mode = candidate.runtime_mode;
         spawned.labels = candidate.labels.clone();
@@ -1254,6 +1226,12 @@ impl MobActor {
             let mut roster = self.roster.write().await;
             for event in &stored {
                 roster.apply_event(event);
+            }
+            if !candidate.seat_build.local.is_empty() {
+                roster.retain_seat_local_build_inputs(
+                    &candidate.session_id,
+                    candidate.seat_build.local.clone(),
+                );
             }
         }
         // The owed kickoff's notices, effects of the now-durable step; a

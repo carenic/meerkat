@@ -18,6 +18,10 @@ mod member_creation_upcall;
 mod member_wake_rows;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod parallel_resume_restore;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod seat_build_inputs;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod unborn_seat_wake;
 use crate::definition::{
     BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowSpec,
     FlowStepSpec, LimitsSpec, MobDefinition, OrchestratorConfig, PolicyMode, RoleWiringRule,
@@ -1739,6 +1743,20 @@ struct CreateSessionRecord {
     application_tool_policy_masked: bool,
     /// The auth binding the build names.
     auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The create's system prompt policy.
+    system_prompt: meerkat_core::SystemPromptOverride,
+    /// The build's additional instruction sections.
+    additional_instructions: Option<Vec<String>>,
+    /// The build's tool access policy.
+    tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+    /// The build's application tool policy binding.
+    application_tool_policy: meerkat_core::ApplicationToolPolicyBinding,
+    /// The build's web search override.
+    override_web_search: ToolCategoryOverride,
+    /// Whether the build carries a final dispatch admission.
+    tool_dispatch_admission: bool,
+    /// The build's shell environment.
+    shell_env: Option<std::collections::HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -4280,6 +4298,30 @@ impl MockSessionService {
                     .build
                     .as_ref()
                     .and_then(|build| build.auth_binding.clone()),
+                system_prompt: req.system_prompt.clone(),
+                additional_instructions: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.additional_instructions.clone()),
+                tool_access_policy: req
+                    .build
+                    .as_ref()
+                    .and_then(|build| build.tool_access_policy.clone()),
+                application_tool_policy: req
+                    .build
+                    .as_ref()
+                    .map(|build| build.application_tool_policy.clone())
+                    .unwrap_or_default(),
+                override_web_search: req
+                    .build
+                    .as_ref()
+                    .map(|build| build.override_web_search)
+                    .unwrap_or(ToolCategoryOverride::Inherit),
+                tool_dispatch_admission: req
+                    .build
+                    .as_ref()
+                    .is_some_and(|build| build.tool_dispatch_admission.is_some()),
+                shell_env: req.build.as_ref().and_then(|build| build.shell_env.clone()),
             });
 
         let mcp_server_names: Vec<String> = req
@@ -87966,7 +88008,9 @@ fn mob_runtime_parity_field_value(
         | "member_host_preparation_pending"
         | "runtime_retire_archive_only"
         | "owed_edge_repairs"
-        | "owed_external_edge_repairs" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
+        | "owed_external_edge_repairs"
+        | "member_seat_session_unborn"
+        | "unborn_seat_sessions" => Some(MobRuntimeParityExprValue::Set(BTreeSet::new())),
         "member_materialization_epoch"
         | "member_boot_obligation_owed"
         | "member_rotation_session_ids"

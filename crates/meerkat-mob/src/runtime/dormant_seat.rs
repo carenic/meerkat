@@ -7,10 +7,13 @@
 //!    spawn of a fresh spec that owes a kickoff (such a member is
 //!    embodied exactly as a spawn is), or what the seat needs.
 //! 2. The handle prepares each seat off the actor: the session's archived
-//!    state from the session owner's pinned observation (no body load), a
-//!    fresh seat's empty session through the fresh-spawn create path when it
-//!    does not exist yet (under its name-based id), and the
-//!    endpoint from the session's stored comms key.
+//!    state from the session owner's pinned observation (no body load), and
+//!    the endpoint from the session's stored comms key. A seat builds
+//!    nothing: a fresh seat's session (under its name-based id) does not
+//!    exist yet, and MobMachine records it unborn. The member's first wake
+//!    creates it through the spawn provision path, with the runtime
+//!    registration and the host's registration hook any member build has,
+//!    and applies the build inputs the seat carried ([`SeatBuild`]).
 //! 3. The actor commits the chunk in one step: on one prepared
 //!    authority, per identity `AuthorizeSpawnProfile`, `BeginSpawnExec` and
 //!    `CommitDormantSeat` as one batch (an identity the machine refuses is
@@ -19,13 +22,15 @@
 //!    `MemberSpawned` rows in one `append_batch` before the base-checked
 //!    commit.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use meerkat_core::comms::TrustedPeerDescriptor;
-use meerkat_core::service::{CreateSessionRequest, MobIncarnationId};
+use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::SessionId;
+use meerkat_core::{AgentToolDispatcher, ToolCategoryOverride};
+use serde::{Deserialize, Serialize};
 
 use crate::error::{MobError, SessionResumeUnavailableReason};
 use crate::ids::{AgentIdentity, Generation, MobId, ProfileName};
@@ -33,6 +38,203 @@ use crate::machines::mob_machine as mob_dsl;
 
 /// Specs one seat step commits at most: one `append_batch` per chunk.
 pub(crate) const DORMANT_SEAT_CHUNK: usize = 256;
+
+/// The build inputs a seat's spec names that a spawn applies at its build.
+/// A seat builds nothing, so it carries them to the member's first build,
+/// which applies them once, as a spawn of the seat's spec would.
+///
+/// The seat's `MemberSpawned` row journals them (an internal field of the
+/// stored row, absent from rows written before it), so a restart before the
+/// first build keeps them. The born row clears them: after the first build
+/// the member's session holds them, as any member's does. The spec's role,
+/// labels, runtime mode, continuity and profile and model overrides (its
+/// provider params included) are the seat's roster facts already.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub(crate) struct SeatBuildInputs {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) context: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) additional_instructions: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) system_prompt_override: Option<super::handle::SpawnSystemPromptOverride>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) budget_limits: Option<meerkat_core::BudgetLimits>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tool_access_policy: Option<meerkat_core::ops::ToolAccessPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) application_tool_policy: Option<meerkat_core::ApplicationToolPolicyBinding>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) auth_binding: Option<meerkat_core::AuthBindingRef>,
+    /// The spec's web search override (`ToolCategoryOverrides::web_search`):
+    /// the one tool category the seat's profile override does not hold.
+    #[serde(default, skip_serializing_if = "web_search_inherits")]
+    pub(crate) web_search: ToolCategoryOverride,
+}
+
+fn web_search_inherits(web_search: &ToolCategoryOverride) -> bool {
+    *web_search == ToolCategoryOverride::Inherit
+}
+
+impl SeatBuildInputs {
+    /// Whether the seat carries none of these inputs.
+    pub(crate) fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+
+    /// Overlay what `later` names: a later seat of the same never-born
+    /// session sets the inputs its spec names and keeps the rest of the
+    /// earlier seat's.
+    pub(crate) fn overlay(&mut self, later: &Self) {
+        if let Some(context) = &later.context {
+            self.context = Some(context.clone());
+        }
+        if let Some(instructions) = &later.additional_instructions {
+            self.additional_instructions = Some(instructions.clone());
+        }
+        if let Some(prompt) = &later.system_prompt_override {
+            self.system_prompt_override = Some(prompt.clone());
+        }
+        if let Some(limits) = &later.budget_limits {
+            self.budget_limits = Some(limits.clone());
+        }
+        if let Some(policy) = &later.tool_access_policy {
+            self.tool_access_policy = Some(policy.clone());
+        }
+        if let Some(policy) = &later.application_tool_policy {
+            self.application_tool_policy = Some(policy.clone());
+        }
+        if let Some(binding) = &later.auth_binding {
+            self.auth_binding = Some(binding.clone());
+        }
+        if !web_search_inherits(&later.web_search) {
+            self.web_search = later.web_search;
+        }
+    }
+}
+
+/// The process-local build inputs of a seat's spec: objects of the process
+/// that seated the member, and its shell environment, which may hold
+/// secrets. They are never journaled. That process keeps them for the
+/// member's first build there; after a restart the spawn customizer
+/// supplies them, as it does for any member's rebuild.
+#[derive(Clone, Default)]
+pub(crate) struct SeatLocalBuildInputs {
+    pub(crate) external_tools: Option<Arc<dyn AgentToolDispatcher>>,
+    pub(crate) compaction_curator_override: Option<Arc<dyn meerkat_core::CompactionCurator>>,
+    pub(crate) tool_dispatch_admission: Option<Arc<dyn meerkat_core::ToolDispatchAdmission>>,
+    pub(crate) shell_env: Option<HashMap<String, String>>,
+}
+
+impl SeatLocalBuildInputs {
+    /// Whether the seat carries none of these inputs.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.external_tools.is_none()
+            && self.compaction_curator_override.is_none()
+            && self.tool_dispatch_admission.is_none()
+            && self.shell_env.is_none()
+    }
+}
+
+impl std::fmt::Debug for SeatLocalBuildInputs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SeatLocalBuildInputs")
+            .field("external_tools", &self.external_tools.is_some())
+            .field(
+                "compaction_curator_override",
+                &self.compaction_curator_override.is_some(),
+            )
+            .field(
+                "tool_dispatch_admission",
+                &self.tool_dispatch_admission.is_some(),
+            )
+            .field("shell_env", &self.shell_env.is_some())
+            .finish()
+    }
+}
+
+/// What a seat carries to the first build of its unborn session: its spec's
+/// build inputs ([`SeatBuildInputs`]) and, in the process that seated it, the
+/// process-local ones ([`SeatLocalBuildInputs`]). The roster keeps it per
+/// session until the session's born row ([`crate::roster::Roster::seat_build`]),
+/// also across a retirement of its member before the first build, so a later
+/// seat of the same never-born session builds from it. A rebuild of the
+/// member sets it on its resume request before the spawn customizer is asked
+/// ([`super::fork_build::rebuild_seat_resume_spec`]), as a spawn's caller
+/// sets these inputs on its spec.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SeatBuild {
+    pub(crate) inputs: SeatBuildInputs,
+    pub(crate) local: SeatLocalBuildInputs,
+}
+
+impl SeatBuild {
+    /// Take the inputs a seat carries out of `spec`.
+    pub(in crate::runtime) fn take_from(spec: &mut super::handle::SpawnMemberSpec) -> Self {
+        Self {
+            inputs: SeatBuildInputs {
+                context: spec.context.take(),
+                additional_instructions: spec.additional_instructions.take(),
+                system_prompt_override: spec.system_prompt_override.take(),
+                budget_limits: spec.budget_limits.take(),
+                tool_access_policy: spec.tool_access_policy.take(),
+                application_tool_policy: spec.application_tool_policy.take(),
+                auth_binding: spec.auth_binding.take(),
+                web_search: spec.tool_category_overrides.web_search,
+            },
+            local: SeatLocalBuildInputs {
+                external_tools: spec.external_tools.take(),
+                compaction_curator_override: spec.compaction_curator_override.take(),
+                tool_dispatch_admission: spec.tool_dispatch_admission.take(),
+                shell_env: spec.shell_env.take(),
+            },
+        }
+    }
+
+    /// Set these inputs on `spec`, a rebuild's resume request, as a spawn's
+    /// caller sets them on its spec. The spawn customizer is asked after, as
+    /// it is at a spawn: it may append to the instructions, compose over the
+    /// overlay, or refuse.
+    pub(crate) fn apply_to(&self, spec: &mut super::handle::SpawnMemberSpec) {
+        let inputs = &self.inputs;
+        if let Some(context) = &inputs.context {
+            spec.context = Some(context.clone());
+        }
+        if let Some(instructions) = &inputs.additional_instructions {
+            spec.additional_instructions = Some(instructions.clone());
+        }
+        if let Some(prompt) = &inputs.system_prompt_override {
+            spec.system_prompt_override = Some(prompt.clone());
+        }
+        if let Some(limits) = &inputs.budget_limits {
+            spec.budget_limits = Some(limits.clone());
+        }
+        if let Some(policy) = &inputs.tool_access_policy {
+            spec.tool_access_policy = Some(policy.clone());
+        }
+        if let Some(policy) = &inputs.application_tool_policy {
+            spec.application_tool_policy = Some(policy.clone());
+        }
+        if let Some(binding) = &inputs.auth_binding {
+            spec.auth_binding = Some(binding.clone());
+        }
+        if !web_search_inherits(&inputs.web_search) {
+            spec.tool_category_overrides.web_search = inputs.web_search;
+        }
+        let local = &self.local;
+        if let Some(tools) = &local.external_tools {
+            spec.external_tools = Some(Arc::clone(tools));
+        }
+        if let Some(curator) = &local.compaction_curator_override {
+            spec.compaction_curator_override = Some(Arc::clone(curator));
+        }
+        if let Some(admission) = &local.tool_dispatch_admission {
+            spec.tool_dispatch_admission = Some(Arc::clone(admission));
+        }
+        if let Some(env) = &local.shell_env {
+            spec.shell_env = Some(env.clone());
+        }
+    }
+}
 
 /// Seats a chunk prepares at once off the actor.
 pub(crate) const DORMANT_SEAT_PREPARE_CONCURRENCY: usize = 16;
@@ -149,9 +351,12 @@ pub(crate) fn fresh_seat_session_id(
 /// How a seat binds its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum DormantSeatLaunch {
-    /// A new empty session under the fresh seat's name-based id.
+    /// A session under the fresh seat's name-based id, created by the
+    /// member's first wake (unborn until then).
     Fresh,
-    /// The existing session the spec names.
+    /// The session the spec names: an existing one, or one a seat named and
+    /// no build created (its member was retired before its first wake),
+    /// which is seated unborn again.
     Resume,
 }
 
@@ -176,7 +381,6 @@ pub(in crate::runtime) enum DormantSeatPlanEntry {
 pub(in crate::runtime) struct DormantSeatPlan {
     pub(in crate::runtime) entries: Vec<DormantSeatPlanEntry>,
     pub(in crate::runtime) endpoint_source: Option<MemberSeatEndpointSource>,
-    pub(in crate::runtime) provisioner: Arc<dyn super::provisioner::MobProvisioner>,
 }
 
 /// What one seat's commit needs, as the actor planned it.
@@ -186,10 +390,19 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     pub(in crate::runtime) launch: DormantSeatLaunch,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) generation: Generation,
-    /// A fresh seat's create request, built as a fresh spawn builds it.
-    /// `None` for a resume, and for a service that keeps no durable member
-    /// sessions (its wake's fresh recreation creates the session there).
-    pub(in crate::runtime) create_session: Option<Box<CreateSessionRequest>>,
+    /// Whether a seat or a rotation named the seat's session unborn and no
+    /// build has created it (MobMachine's `unborn_seat_sessions`, read at the
+    /// plan): its member was retired before its first wake. Such a session
+    /// is seated unborn again, whatever the store shows.
+    pub(in crate::runtime) session_never_born: bool,
+    /// Whether no build has created the seat's session: a fresh launch whose
+    /// session the preparation found absent, or a session no build created
+    /// ([`Self::session_never_born`]). Nothing is created at the seat;
+    /// MobMachine records the member's session unborn, and the member's
+    /// first wake creates it (or adopts the one an interrupted create left)
+    /// through the spawn provision path, with the host's registration hook.
+    /// Set by [`prepare_dormant_seat`].
+    pub(in crate::runtime) session_unborn: bool,
     pub(in crate::runtime) runtime_mode: crate::MobRuntimeMode,
     pub(in crate::runtime) labels: BTreeMap<String, String>,
     pub(in crate::runtime) continuity_intent: super::SpawnContinuityIntent,
@@ -214,6 +427,20 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     /// The objective the owed kickoff resolves under (the spec's, or the
     /// default a spawn uses).
     pub(in crate::runtime) kickoff_objective_id: meerkat_core::interaction::ObjectiveId,
+    /// What the seat carries to its session's first build: the spec's build
+    /// inputs, taken out of it at the plan. Journaled and kept only for an
+    /// unborn session; a seat whose session exists binds what that session
+    /// holds.
+    pub(in crate::runtime) seat_build: SeatBuild,
+}
+
+impl DormantSeatCandidate {
+    /// The build inputs the seat's `MemberSpawned` row journals: those the
+    /// first build of its unborn session applies, when it names any.
+    pub(in crate::runtime) fn unborn_seat_build_inputs(&self) -> Option<SeatBuildInputs> {
+        (self.session_unborn && !self.seat_build.inputs.is_empty())
+            .then(|| self.seat_build.inputs.clone())
+    }
 }
 
 /// The plan of a rotation (`rotate_member`).
@@ -227,7 +454,6 @@ pub(in crate::runtime) enum MemberRotationPlan {
         /// rotation is one fresh seat.
         seated: bool,
         endpoint_source: Option<MemberSeatEndpointSource>,
-        provisioner: Arc<dyn super::provisioner::MobProvisioner>,
     },
     /// An identity that is not seated, whose spec owes a kickoff: spawned
     /// through the ordinary spawn path on its name-based session, as a seat
@@ -248,21 +474,21 @@ pub(in crate::runtime) enum DormantSeatCommitEntry {
         agent_identity: AgentIdentity,
         session_id: SessionId,
     },
-    /// A prepared seat: its session exists (or is recreated at its wake),
-    /// and `endpoint` is its stored-key endpoint (`None` under network
-    /// comms).
+    /// A prepared seat: its session exists, or is unborn (created by the
+    /// member's first wake), and `endpoint` is its stored-key endpoint
+    /// (`None` under network comms).
     Seat {
         candidate: Box<DormantSeatCandidate>,
         endpoint: Option<TrustedPeerDescriptor>,
     },
 }
 
-/// Prepare one seat off the actor: its session's archived state, a fresh
-/// seat's empty session, and its endpoint. A spec this refuses is answered
-/// with its typed outcome, and nothing of it is written.
+/// Prepare one seat off the actor: its session's archived state, whether a
+/// fresh seat's session is unborn, and its endpoint. Nothing is built or
+/// created. A spec this refuses is answered with its typed outcome, and
+/// nothing of it is written.
 pub(in crate::runtime) async fn prepare_dormant_seat(
     session_service: &dyn super::session_service::MobSessionService,
-    provisioner: &dyn super::provisioner::MobProvisioner,
     endpoint_source: Option<&MemberSeatEndpointSource>,
     mob_id: &MobId,
     mut candidate: Box<DormantSeatCandidate>,
@@ -288,7 +514,7 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
         .await
         .map_err(|error| refused(MobError::from(error)))?
         .lifecycle();
-    let created_key = match lifecycle {
+    candidate.session_unborn = match lifecycle {
         super::session_service::SessionResumeLifecycle::Archived { .. } => {
             return Err(Box::new(DormantSeatOutcome::SessionArchived {
                 agent_identity: agent_identity.clone(),
@@ -306,20 +532,23 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
                 verdict: None,
             }));
         }
-        // The session exists: a resume's, or the one an earlier attempt of
-        // this fresh seat created.
-        super::session_service::SessionResumeLifecycle::Active { .. } => None,
+        // The session exists: a resume's, or one an earlier build created
+        // under this fresh seat's name-based id, and its wake resumes it. One
+        // a seat named and no build created (a create that ended before its
+        // born row) is still unborn: the member's first wake adopts it.
+        super::session_service::SessionResumeLifecycle::Active { .. } => {
+            candidate.session_never_born
+        }
         super::session_service::SessionResumeLifecycle::NoCurrentDurableAuthority => {
-            match (candidate.launch, candidate.create_session.take()) {
-                (DormantSeatLaunch::Fresh, Some(create_session)) => {
-                    created_dormant_session_key(provisioner, *create_session)
-                        .await
-                        .map_err(&refused)?
-                }
-                // A service with no durable member sessions: the member's
-                // wake recreates its session fresh.
-                (DormantSeatLaunch::Fresh, None) => None,
-                (DormantSeatLaunch::Resume, _) => {
+            match candidate.launch {
+                // Nothing is created here: the member's first wake creates
+                // the session, through the spawn provision path.
+                DormantSeatLaunch::Fresh => true,
+                // A session a seat named and no build created (its member
+                // was retired before its first wake) is seated unborn again.
+                DormantSeatLaunch::Resume if candidate.session_never_born => true,
+                // Any other absent session was lost.
+                DormantSeatLaunch::Resume => {
                     return Err(refused(MobError::SessionUnavailableForResume {
                         session_id,
                         reason: SessionResumeUnavailableReason::Absent,
@@ -333,19 +562,15 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
     let endpoint = match endpoint_source {
         MemberSeatEndpointSource::Network => None,
         MemberSeatEndpointSource::SessionScopedInproc { identity_root } => {
-            let public_key = stored_member_comms_key(identity_root, &session_id, candidate.launch)
-                .await
-                .map_err(&refused)?;
-            // The key the session's own build loaded must be the stored one:
-            // a different one means the configured root is not the session
-            // service's, and the seat would record an endpoint its wake
-            // disagrees with.
-            if created_key.is_some_and(|created| created != public_key) {
-                return Err(refused(MobError::WiringError(format!(
-                    "the comms identity session '{session_id}' was built with differs from \
-                     the one under the configured member comms identity root"
-                ))));
-            }
+            // The member's first build loads this key; its wake checks that
+            // the endpoint it built is the one recorded here.
+            let public_key = stored_member_comms_key(
+                identity_root,
+                &session_id,
+                candidate.launch == DormantSeatLaunch::Fresh || candidate.session_unborn,
+            )
+            .await
+            .map_err(&refused)?;
             Some(
                 inproc_member_endpoint(
                     mob_id,
@@ -363,60 +588,37 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
     })
 }
 
-/// Create a fresh seat's empty session; the public key its build used.
-#[cfg(feature = "runtime-adapter")]
-async fn created_dormant_session_key(
-    provisioner: &dyn super::provisioner::MobProvisioner,
-    create_session: CreateSessionRequest,
-) -> Result<Option<[u8; 32]>, MobError> {
-    provisioner
-        .create_dormant_member_session(create_session)
-        .await
-        .map(|created| created.public_key)
-}
-
-#[cfg(not(feature = "runtime-adapter"))]
-async fn created_dormant_session_key(
-    _provisioner: &dyn super::provisioner::MobProvisioner,
-    _create_session: CreateSessionRequest,
-) -> Result<Option<[u8; 32]>, MobError> {
-    Err(MobError::Internal(
-        "a dormant seat's session is created through the runtime adapter".into(),
-    ))
-}
-
 /// The public key of a member session's stored comms identity: one local
-/// key-store read, no session load. A fresh seat's session whose identity
-/// does not exist yet gets the one its first build will load. A resumed
-/// session's identity must exist: an existing session built its identity
-/// already, so a missing one means the configured root is not the session
-/// service's, and the seat is refused typed instead of minting a key its
-/// wake would disagree with.
+/// key-store read, no session load. A session no build created yet (a fresh
+/// seat's, or an unborn one: `unbuilt`) whose identity does not exist yet
+/// gets the one its first build will load. A resumed session's identity must
+/// exist: an existing session built its identity already, so a missing one
+/// means the configured root is not the session service's, and the seat is
+/// refused typed instead of minting a key its wake would disagree with.
 #[cfg(not(target_arch = "wasm32"))]
 async fn stored_member_comms_key(
     identity_root: &std::path::Path,
     session_id: &SessionId,
-    launch: DormantSeatLaunch,
+    unbuilt: bool,
 ) -> Result<[u8; 32], MobError> {
     let dir = identity_root.join(session_id.to_string());
-    let loaded = match launch {
-        DormantSeatLaunch::Fresh => meerkat_comms::Keypair::load_or_generate(&dir).await,
-        DormantSeatLaunch::Resume => {
-            let exists = tokio::fs::try_exists(dir.join("identity.key"))
-                .await
-                .map_err(|error| {
-                    MobError::WiringError(format!(
-                        "the comms identity of session '{session_id}' could not be read: {error}"
-                    ))
-                })?;
-            if !exists {
-                return Err(MobError::WiringError(format!(
-                    "session '{session_id}' has no comms identity under the configured member \
-                     comms identity root"
-                )));
-            }
-            meerkat_comms::Keypair::load(&dir).await
+    let loaded = if unbuilt {
+        meerkat_comms::Keypair::load_or_generate(&dir).await
+    } else {
+        let exists = tokio::fs::try_exists(dir.join("identity.key"))
+            .await
+            .map_err(|error| {
+                MobError::WiringError(format!(
+                    "the comms identity of session '{session_id}' could not be read: {error}"
+                ))
+            })?;
+        if !exists {
+            return Err(MobError::WiringError(format!(
+                "session '{session_id}' has no comms identity under the configured member \
+                 comms identity root"
+            )));
         }
+        meerkat_comms::Keypair::load(&dir).await
     };
     let keypair = loaded.map_err(|error| {
         MobError::WiringError(format!(
@@ -430,7 +632,7 @@ async fn stored_member_comms_key(
 async fn stored_member_comms_key(
     _identity_root: &std::path::Path,
     session_id: &SessionId,
-    _launch: DormantSeatLaunch,
+    _unbuilt: bool,
 ) -> Result<[u8; 32], MobError> {
     Err(MobError::WiringError(format!(
         "a browser runtime keeps no durable comms identity for session '{session_id}'"

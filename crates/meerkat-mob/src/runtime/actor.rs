@@ -14838,6 +14838,14 @@ impl MobActor {
             );
             return None;
         }
+        // A seat's unborn session is not missing: it does not exist yet, and
+        // the member's first wake creates it (MobMachine's fact).
+        if super::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            &domain_identity,
+        ) {
+            return None;
+        }
         if let Some(reason) = self
             .dsl_authority
             .state()
@@ -19062,6 +19070,22 @@ impl MobActor {
                 reason: "registration reload requires a session-backed member".to_string(),
             }
         })?;
+        // A seat that built nothing has no session to reload: its session is
+        // created at the member's first wake, through the spawn provision
+        // path, never by a reload of durable truth it does not have. Not a
+        // busy refusal: a retry of the reload answers the same until a wake
+        // created the session.
+        if super::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            agent_identity,
+        ) {
+            return Err(MobError::UnsupportedForMode {
+                mode: entry.runtime_mode,
+                reason: "the member's session is created at its first wake; it has no session \
+                         to reload yet"
+                    .to_string(),
+            });
+        }
         let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
         Ok(PreparedMemberRegistrationReload {
             entry,
@@ -51654,6 +51678,14 @@ impl MobActor {
                     ..
                 }),
             ) => {
+                // A seat's unborn session was never created: there is
+                // nothing to archive, and nothing will create it now.
+                if super::boot_plan::domain_member_seat_session_unborn(
+                    self.dsl_authority.state(),
+                    &ctx.agent_identity,
+                ) {
+                    return Ok(mob_dsl::MemberSessionDisposal::Archived);
+                }
                 if let Some(session_id) = ctx.entry.member_ref.bridge_session_id()
                     && self.retirement_archive_already_complete(session_id).await?
                 {

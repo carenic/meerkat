@@ -6794,6 +6794,10 @@ impl ResumedMemberView {
 ///   each member whose live actor the stop kept: the actor is kept only when
 ///   it runs the auth binding the answer names, and otherwise the member is
 ///   rebuilt on that binding.
+/// - The first build of a dormant seat's member, which creates the session
+///   its seat named: [`customize_resume`](Self::customize_resume) too, with
+///   the build inputs of the seat's spec already on the request, as a
+///   spawn's caller sets them before `customize_spawn`.
 ///
 /// # Which spawns never ask it
 ///
@@ -9341,14 +9345,30 @@ impl MobHandle {
     /// does at once, for a member whose session holds runtime work, a network
     /// endpoint or a member the host requires live).
     ///
-    /// Each spec is a spawn spec: `Fresh` seats the identity on a new empty
-    /// session under a name-based id (a seat re-driven after a crash finds
-    /// the session its earlier attempt created), `Resume` binds the session
-    /// it names, which is never archived. A fresh spec that owes a kickoff
-    /// (an `AutonomousHost` member, or one with an initial message) is not
-    /// seated: it is spawned through the ordinary spawn path and answered
-    /// [`super::DormantSeatOutcome::Embodied`]. A fork is refused. Seating
-    /// needs the members' comms transport
+    /// Each spec is a spawn spec: `Fresh` seats the identity under a
+    /// name-based session id and builds nothing (no session, no tools, no
+    /// MCP connection, no runtime registration): the member's first wake
+    /// creates its session through the spawn provision path, with the
+    /// runtime registration and the host's registration hook
+    /// ([`super::MobBuilder::with_member_runtime_registration_hook`]) any
+    /// member build has. That first build applies the spec's build inputs
+    /// exactly as a spawn of the spec would: its context, additional
+    /// instructions, system prompt override, budget limits, tool access and
+    /// application tool policies, auth binding and web search override (kept
+    /// in the seat's journal row, so a restart before the first wake keeps
+    /// them), and its per-spawn tools overlay, compaction curator, dispatch
+    /// admission and shell environment (kept by this process only; after a
+    /// restart the spawn customizer supplies them, as for any member's
+    /// rebuild). The spawn customizer is asked at that build, after the
+    /// inputs are set. `Resume` binds the session it names, which is never
+    /// archived; a session a seat named and no build created yet (its member
+    /// retired before its first wake) is seated unborn again, and its first
+    /// wake creates it. A fresh spec that owes a kickoff (an `AutonomousHost`
+    /// member, or one with an initial message) is not seated: it is spawned
+    /// through the ordinary spawn path and answered
+    /// [`super::DormantSeatOutcome::Embodied`]. A fork, a placed member and a
+    /// member that inherits its creator's tool visibility are refused.
+    /// Seating needs the members' comms transport
     /// ([`super::MobBuilder::with_member_comms_identity_root`] or
     /// [`super::MobBuilder::with_network_member_comms`]) and a running mob.
     ///
@@ -9390,11 +9410,13 @@ impl MobHandle {
 
     /// Rotate a member onto a fresh life (a reset, or a deleted identity
     /// created anew): its current incarnation is retired and the next one is
-    /// seated Dormant, at the next generation, on a new empty session under a
-    /// name-based id, in the retirement's terminal step. Both journal rows are
-    /// written in one batch, so the identity is never a non-member: during
-    /// the retirement its current incarnation is Retiring, and deliveries to
-    /// it are refused typed. Returns the new session.
+    /// seated Dormant, at the next generation, under a name-based session id
+    /// in the retirement's terminal step. Nothing is built for it: its first
+    /// wake creates its session with the spec's build inputs, as a fresh
+    /// seat's first wake does. Both journal rows are written in one batch, so
+    /// the identity is never a non-member: during the retirement its current
+    /// incarnation is Retiring, and deliveries to it are refused typed.
+    /// Returns the new session.
     ///
     /// The spec launches `Fresh`. When it owes a kickoff (an
     /// `AutonomousHost` member's one kickoff turn, or an initial message),
@@ -9435,11 +9457,9 @@ impl MobHandle {
                 candidate,
                 seated,
                 endpoint_source,
-                provisioner,
             } => {
                 let entry = super::dormant_seat::prepare_dormant_seat(
                     self.session_service.as_ref(),
-                    provisioner.as_ref(),
                     endpoint_source.as_ref(),
                     &self.definition.id,
                     candidate,
@@ -9511,7 +9531,6 @@ impl MobHandle {
         let super::dormant_seat::DormantSeatPlan {
             entries,
             endpoint_source,
-            provisioner,
         } = self
             .send_actor_command(|reply_tx| MobCommand::PlanDormantSeats { specs, reply_tx })
             .await??;
@@ -9569,14 +9588,12 @@ impl MobHandle {
         let mob_id = &self.definition.id;
         let prepared = futures::stream::iter(to_prepare)
             .map(|(index, candidate)| {
-                let provisioner = provisioner.as_ref();
                 let endpoint_source = endpoint_source.as_ref();
                 async move {
                     (
                         index,
                         super::dormant_seat::prepare_dormant_seat(
                             session_service,
-                            provisioner,
                             endpoint_source,
                             mob_id,
                             candidate,
@@ -15758,7 +15775,10 @@ impl MobHandle {
     /// too: its pending unregister is completed and the same session is
     /// re-attached (`Reattached`). `NotDegraded` is a success no-op and is
     /// reported only for a registration with a committed attachment. Placed
-    /// members are reloaded by their member host and are rejected typed.
+    /// members are reloaded by their member host and are rejected typed. A
+    /// member whose seat built nothing has no session to reload: its session
+    /// is created at its first wake, and until then the reload is refused
+    /// with [`MobError::UnsupportedForMode`] saying so; a delivery wakes it.
     /// While the mob is Stopped the reload discards the degraded registration
     /// and publishes its successor, which the Stop's staged `MobStop` holds,
     /// and answers `Discarded`: the successor's revival waits for Running,

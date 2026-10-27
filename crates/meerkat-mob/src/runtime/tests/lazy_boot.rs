@@ -201,6 +201,63 @@ async fn the_lift_of_a_stopped_mob_materializes_no_member_without_work() {
     }
 }
 
+/// The lift binds the operation owners of the members it holds live, and
+/// only those: a member left Dormant gets its binding at its wake, through
+/// the shared cold recipe, so the lift's post-commit work neither reads its
+/// persisted session nor registers a runtime for it. Here the host requires
+/// one member, which the lift's plan materializes; every other member's
+/// durable reads are refused, so a read of one fails the lift.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_lift_binds_only_the_members_it_holds_live() {
+    let mob = CrashedMob::new("lazy-lift-bindings", 6, false, true).await;
+    let live = worker(0);
+    let handle = mob
+        .resume(mob.builder().with_host_required_members([live.clone()]))
+        .await;
+    assert_eq!(handle.status().await.unwrap(), MobState::Stopped);
+    let dormant = mob
+        .sessions
+        .iter()
+        .filter(|(identity, _)| identity != &live)
+        .cloned()
+        .collect::<Vec<_>>();
+    for (_, session) in &dormant {
+        mob.service
+            .refuse_persisted_session_reads(session, PersistedSessionReadRefusal::StoreFailure);
+    }
+
+    tokio::time::timeout(LAZY_STEP, handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift reads no dormant member's session");
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
+    assert_eq!(
+        phase_of(&handle, &live),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    let runtime = mob.service.enable_runtime_adapter();
+    assert!(
+        runtime.contains_session(&mob.session(0)).await,
+        "the live member's runtime is registered"
+    );
+    for (identity, session) in &dormant {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+        assert!(
+            !runtime.contains_session(session).await,
+            "the lift registers no runtime for the dormant member {identity}"
+        );
+    }
+    assert_eq!(
+        mob.materialized().await,
+        vec![mob.session(0)],
+        "the lift built the live member only"
+    );
+}
+
 /// The Eager policy restores every member at start, as before.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_eager_policy_materializes_every_member() {
@@ -816,14 +873,25 @@ async fn a_fresh_autonomous_spec_is_embodied_on_its_name_based_session() {
     );
 }
 
-/// A fresh turn-driven spec with no initial message is seated, its
-/// empty session created once through the fresh-spawn create path with no
-/// runtime registration, under its name-based id. On network comms it is
-/// seated owed its endpoint, which its boot wake registers.
+/// Whether MobMachine holds `identity`'s seat session unborn.
+fn seat_session_unborn(handle: &MobHandle, identity: &AgentIdentity) -> bool {
+    crate::runtime::boot_plan::domain_member_seat_session_unborn(
+        &handle.machine_state_watch_rx.borrow(),
+        identity,
+    )
+}
+
+/// A fresh turn-driven spec with no initial message is seated under its
+/// name-based id and creates nothing: no session, no build, no runtime
+/// registration. MobMachine records the session unborn, and the member's
+/// first wake creates it, once, through the spawn provision path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_fresh_seat_creates_its_empty_session_once_under_its_name_based_id() {
-    let (handle, service, events) =
-        seat_mob("fresh-seat", MobBuilder::with_network_member_comms).await;
+async fn a_fresh_seat_creates_nothing_and_its_first_wake_creates_its_session_once() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, events) = seat_mob("fresh-seat", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
     let identity = worker(0);
     let before = journal_kinds(&events).await.len();
     let outcomes = handle
@@ -840,25 +908,39 @@ async fn a_fresh_seat_creates_its_empty_session_once_under_its_name_based_id() {
         matches!(&outcomes[0], DormantSeatOutcome::Seated { session_id, .. } if session_id == &expected),
         "{outcomes:?}"
     );
-    let creates = service.recorded_create_requests().await;
-    let seat_create = creates
-        .iter()
-        .find(|record| record.session_id == expected)
-        .expect("the seat created its session");
     assert!(
-        !seat_create.runtime_build_mode_session_owned,
-        "the seat's create registers no runtime"
+        service.recorded_create_requests().await.is_empty(),
+        "the seat creates no session"
     );
+    assert!(seat_session_unborn(&handle, &identity));
     assert_eq!(
         journal_kinds(&events).await.split_off(before),
         vec![format!("MemberSpawned({identity})")]
     );
+
+    handle
+        .ensure_member_live(&identity)
+        .await
+        .expect("the first wake materializes the member");
+    let creates = service
+        .recorded_create_requests()
+        .await
+        .into_iter()
+        .filter(|record| record.session_id == expected)
+        .collect::<Vec<_>>();
+    assert_eq!(creates.len(), 1, "the first wake creates the session once");
+    assert!(
+        creates[0].runtime_build_mode_session_owned,
+        "the create is a registered member build"
+    );
+    assert!(!seat_session_unborn(&handle, &identity));
 }
 
-/// A seat whose journal append failed after its empty session was
-/// created is retried onto the same session, created once.
+/// A seat whose journal append failed wrote and created nothing; its retry
+/// seats the identity on the same name-based session, still creating nothing.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_seat_retried_after_a_failed_journal_reuses_its_fresh_session() {
+async fn a_seat_retried_after_a_failed_journal_seats_its_fresh_session_once() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let storage = MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -871,7 +953,7 @@ async fn a_seat_retried_after_a_failed_journal_reuses_its_fresh_session() {
         storage,
     )
     .with_session_service(service.clone())
-    .with_network_member_comms()
+    .with_member_comms_identity_root(keys.path())
     .create()
     .await
     .expect("create the mob");
@@ -900,15 +982,81 @@ async fn a_seat_retried_after_a_failed_journal_reuses_its_fresh_session() {
         matches!(&outcomes[0], DormantSeatOutcome::Seated { session_id, .. } if session_id == &expected),
         "{outcomes:?}"
     );
-    let created = service
+    assert!(
+        service.recorded_create_requests().await.is_empty(),
+        "neither attempt created a session"
+    );
+    assert!(seat_session_unborn(&handle, &identity));
+}
+
+/// A member whose session existed (it is not an unborn seat) and is then lost
+/// stays lost: its wake finds no successor and records it Broken, and nothing
+/// recreates an empty session in its place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lost_session_of_a_born_member_ends_broken_and_is_not_recreated() {
+    let mob = CrashedMob::new("lost-born-session", 2, false, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    let lost = worker(1);
+    assert!(!seat_session_unborn(&handle, &lost));
+    mob.service.delete_persisted_session(&mob.session(1)).await;
+    let woken = handle.ensure_member_live(&lost).await;
+    assert!(woken.is_err(), "a lost session is not recreated: {woken:?}");
+    let status = handle
+        .member_status(&lost)
+        .await
+        .expect("the member's status");
+    assert_eq!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{status:?}"
+    );
+    assert!(
+        mob.materialized().await.is_empty(),
+        "no session was created in the lost one's place: {:?}",
+        mob.materialized().await
+    );
+}
+
+/// On a service that keeps no durable member sessions the seat creates
+/// nothing either, and the member's first wake creates its session fresh,
+/// once, under the seat's session id: that service's path is unchanged.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_fresh_seat_on_a_service_without_durable_sessions_is_created_at_its_first_wake() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let definition = with_unique_mob_id(sample_definition(), "seat-non-durable");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    service.keep_no_durable_sessions();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_member_comms_identity_root(keys.path())
+        .create()
+        .await
+        .expect("create the mob");
+    let identity = worker(0);
+    let outcomes = handle
+        .seat_dormant_members(vec![turn_driven(&identity)])
+        .await
+        .expect("the batch answers");
+    let DormantSeatOutcome::Seated { session_id, .. } = &outcomes[0] else {
+        panic!("the fresh spec is seated: {outcomes:?}");
+    };
+    let session_id = session_id.clone();
+    assert!(service.recorded_create_requests().await.is_empty());
+    handle
+        .ensure_member_live(&identity)
+        .await
+        .expect("the first wake materializes the member");
+    let creates = service
         .recorded_create_requests()
         .await
         .into_iter()
-        .filter(|record| record.session_id == expected && !record.runtime_build_mode_session_owned)
+        .filter(|record| record.session_id == session_id)
         .count();
+    assert_eq!(creates, 1, "the first wake creates the session once");
     assert_eq!(
-        created, 1,
-        "the retry found the session its first attempt created"
+        phase_of(&handle, &identity),
+        Some(dsl::MemberMaterializationPhase::Live)
     );
 }
 

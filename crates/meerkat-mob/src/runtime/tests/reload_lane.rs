@@ -1285,7 +1285,7 @@ async fn readiness_failure_rolls_the_reload_back_and_leaves_the_member_dormant()
             .borrow()
             .member_materialization
             .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
-            .cloned(),
+            .copied(),
         Some(mob_dsl::MemberMaterializationPhase::Dormant)
     );
     peer_progresses(&mob).await;
@@ -1317,7 +1317,7 @@ async fn a_reload_of_an_unwired_member_without_comms_repairs_its_registration() 
             .borrow()
             .member_materialization
             .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
-            .cloned(),
+            .copied(),
         Some(mob_dsl::MemberMaterializationPhase::Live)
     );
 }
@@ -1773,7 +1773,7 @@ async fn a_stale_ready_verdict_after_bound_rolls_the_reload_back() {
             .borrow()
             .member_materialization
             .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
-            .cloned(),
+            .copied(),
         Some(mob_dsl::MemberMaterializationPhase::Dormant)
     );
 }

@@ -139,7 +139,22 @@ them.
   cause of one member joins one wake. A refused wake is typed:
   `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
   (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
-  boot restore records it. Reads never wake.
+  boot restore records it. Reads never wake. The first wake of a member whose
+  seat built nothing creates its session under the id the seat named (see
+  `MobHandle::seat_dormant_members`), after the host's build preparation, as
+  any wake prepares it; a registration the host refuses there
+  (`MobError::MemberRegistrationRefused`) is the member's restore failure, as
+  is a create the factory or the host refuses for any other reason. A create
+  that fails for a cause that clears on its own (the session store, the
+  session's runtime authority or its hosting claim unavailable) leaves the
+  member dormant with its session not created, answered
+  `MemberWakeRefusal::ResumeGateUnavailable`, and its next delivery tries
+  again. Either way an eager start ends only that member's restore and goes
+  on with the others. A wake that ends retryable after
+  that create keeps the session, and the next wake resumes it instead of
+  creating it again. Before that first wake,
+  `MobHandle::reload_member_registration` of the member is refused
+  (`MobError::UnsupportedForMode`): its session is created at its first wake.
 - `meerkat-session`: `PersistentSessionService::prepare_cold_attach_as_owner`
   and `prepare_cold_attach_reporting_as_owner`: the cold attach of a session
   by its own owner (a mob settling its member's session), which does not ask
@@ -205,17 +220,34 @@ them.
     start).
   - `MobHandle::seat_dormant_members(specs)` with `DormantSeatOutcome`:
     seats members Dormant without materializing them, at most 256 per
-    journal batch, one typed outcome per spec. A fresh spec gets a new
-    empty session under a name-based id, created through the fresh-spawn
-    create path; a resume spec binds its session (never an archived one); a
-    fresh spec that owes a kickoff is spawned instead, as a spawn is.
+    journal batch, one typed outcome per spec. A fresh spec is seated under
+    a name-based session id and builds nothing (no session, tools, MCP
+    connection or runtime registration): the member's first wake creates
+    its session through the spawn provision path, with the runtime
+    registration and the host's registration hook, and applies the spec's
+    build inputs there as a spawn of the spec would, with the spawn
+    customizer asked after them. The seat's journal row keeps its context,
+    additional instructions, system prompt override, budget limits, tool
+    access and application tool policies, auth binding and web search
+    override, so a restart before the first wake keeps them; its tools
+    overlay, compaction curator, dispatch admission and shell environment
+    stay in the process that seated it (after a restart the spawn
+    customizer supplies them, as for any member). A resume spec binds its
+    session (never an archived one); a resume of a session a seat named and
+    no build created (its member was retired before its first wake) seats
+    it unborn again, and its first wake creates it with the first seat's
+    inputs and what the resume spec names over them. A fresh spec that owes
+    a kickoff is spawned instead, as a spawn is. A spec whose member
+    inherits its creator's tool visibility is refused (spawn it).
     `MobBuilder::with_member_comms_identity_root` (inproc comms) or
     `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
     a seat's endpoint comes from.
   - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
     reset): its current incarnation is retired and the next one is seated
-    Dormant on a new empty session in the retirement's terminal step, both
-    journal rows in one batch, so the identity is never a non-member. A spec
+    Dormant under a new name-based session id in the retirement's terminal
+    step, both journal rows in one batch, so the identity is never a
+    non-member; nothing is built for it until its first wake, which applies
+    the spec's build inputs as a fresh seat's first wake does. A spec
     that owes a kickoff (an `AutonomousHost` member, or an initial message)
     records it on the new incarnation in the same batch: it wakes the new
     incarnation once and runs exactly once on its new session, also across
@@ -330,6 +362,12 @@ them.
 - Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
   member rotated with `MobHandle::rotate_member`, so a rotated member whose
   owed kickoff has not run yet does not run it after a rollback to 0.9.6.
+
+- Upgrade note, rollback: a fresh dormant seat (`MobHandle::seat_dormant_members`
+  or a `MobHandle::rotate_member` next incarnation) has no session until its
+  first wake. A rollback to 0.9.6 restores such a member that never woke as
+  Broken, with a missing session; 0.9.6 ignores the build inputs 0.9.7
+  stores for its first build.
 
 - Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
   (`MobHandle::resume`) keeps a member's live actor only when it runs the auth

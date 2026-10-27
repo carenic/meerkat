@@ -11259,6 +11259,8 @@ mod tests {
             member_peer_endpoint: None,
             session_archived: false,
             kickoff_owed,
+            session_unborn: true,
+            fresh_launch: true,
         };
         assert!(
             MobMachineMutator::apply(&mut authority, seat(true)).is_err(),
@@ -11270,5 +11272,601 @@ mod tests {
             authority.state().member_materialization.get(&identity),
             Some(&MemberMaterializationPhase::Dormant)
         );
+        assert!(
+            authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&identity),
+            "a fresh launch's seat builds nothing: its session is unborn"
+        );
+    }
+
+    fn replay_seat_session(member: &SeatedMember, unborn: bool) -> MobMachineSignal {
+        MobMachineSignal::RecoverMemberSeatSession {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+            unborn,
+        }
+    }
+
+    /// A replay-shaped Dormant member whose seat row marks its session
+    /// unborn: a fresh launch's seat that never woke before the restart.
+    fn unborn_member_authority(name: &str) -> (MobMachineAuthority, SeatedMember) {
+        let (mut authority, member) = dormant_member_authority(name);
+        authority
+            .apply_signal(replay_seat_session(&member, true))
+            .expect("the seat's row marks its session unborn");
+        assert!(
+            authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&member.identity)
+        );
+        assert!(
+            authority
+                .state()
+                .unborn_seat_sessions
+                .contains(&member.session_id),
+            "the seat's row records its session as never created"
+        );
+        (authority, member)
+    }
+
+    fn open_wake_attempt(authority: &mut MobMachineAuthority, identity: &AgentIdentity) -> u64 {
+        MobMachineMutator::apply(authority, wake_input(identity)).expect("the member wakes");
+        *authority
+            .state()
+            .member_wake_attempts
+            .get(identity)
+            .expect("the wake opened an attempt")
+    }
+
+    /// An unborn seat has no session to restore: the plain Bound step is
+    /// refused and only the fresh create binds it. That step requests the
+    /// runtime binding for the wake's attempt, clears the fact and asks the
+    /// owner to journal the birth; the wake then closes Live as any other.
+    #[test]
+    fn an_unborn_seat_binds_only_through_the_fresh_create() {
+        let (mut authority, member) = unborn_member_authority("unborn-seat");
+        let attempt = open_wake_attempt(&mut authority, &member.identity);
+        assert!(
+            authority
+                .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                    agent_identity: member.identity.clone(),
+                    attempt,
+                })
+                .is_err(),
+            "a session that was never created is never restored"
+        );
+        let created = authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSessionCreated {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the fresh create binds the unborn seat");
+        assert!(created.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::RequestRuntimeBinding {
+                agent_runtime_id,
+                session_id,
+                attempt: Some(bound_attempt),
+                ..
+            } if agent_runtime_id == &member.runtime_id
+                && session_id == &member.session_id
+                && *bound_attempt == attempt
+        )));
+        assert!(created.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::PersistMemberSeatSessionBorn {
+                agent_identity,
+                agent_runtime_id,
+                session_id,
+            } if agent_identity == &member.identity
+                && agent_runtime_id == &member.runtime_id
+                && session_id == &member.session_id
+        )));
+        assert!(
+            !authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&member.identity)
+        );
+        assert!(
+            !authority
+                .state()
+                .unborn_seat_sessions
+                .contains(&member.session_id)
+        );
+        assert!(
+            authority
+                .state()
+                .member_wake_bound
+                .contains(&member.identity)
+        );
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the created session's wake closes Live");
+        assert_eq!(
+            authority
+                .state()
+                .member_materialization
+                .get(&member.identity),
+            Some(&MemberMaterializationPhase::Live)
+        );
+    }
+
+    /// A member whose session was created before (here a recovered member)
+    /// never takes the fresh create: a missing session of its takes the
+    /// successor search, else Broken. Its wake restores its session through
+    /// the plain Bound step.
+    #[test]
+    fn a_born_member_never_takes_the_fresh_create() {
+        let (mut authority, member) = dormant_member_authority("born-member");
+        let attempt = open_wake_attempt(&mut authority, &member.identity);
+        assert!(
+            authority
+                .apply_signal(MobMachineSignal::ResolveMemberRevivalSessionCreated {
+                    agent_identity: member.identity.clone(),
+                    attempt,
+                })
+                .is_err(),
+            "only an unborn seat's session is created afresh"
+        );
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the born member's wake restores its session");
+    }
+
+    /// Replay restores the fact from the seat's rows before the boot plan is
+    /// sealed: the seat's row marks the session unborn, the row of its
+    /// creation marks it born. While it is unborn a missing durable session is
+    /// no restore failure; once born the member is classified Broken for it.
+    /// After the seal no replay row applies.
+    #[test]
+    fn replay_restores_the_seat_session_fact_before_the_seal() {
+        let (mut authority, member) = unborn_member_authority("unborn-replay");
+        let missing = MobMachineSignal::ClassifyMemberLiveMaterialization {
+            agent_identity: member.identity.clone(),
+            observation: MemberLiveMaterializationObservationKind::DurableSnapshotMissing,
+            reason: "the durable session is missing".to_string(),
+        };
+        assert!(
+            authority.apply_signal(missing.clone()).is_err(),
+            "an unborn seat's missing session is no restore failure"
+        );
+        authority
+            .apply_signal(replay_seat_session(&member, false))
+            .expect("the creation row marks the session born");
+        assert!(
+            !authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&member.identity)
+        );
+        assert!(
+            !authority
+                .state()
+                .unborn_seat_sessions
+                .contains(&member.session_id)
+        );
+        MobMachineMutator::apply(&mut authority, MobMachineInput::SealBootMaterializationPlan)
+            .expect("the seal admits the Dormant member");
+        assert!(
+            authority
+                .apply_signal(replay_seat_session(&member, true))
+                .is_err(),
+            "no replay row applies after the seal"
+        );
+        authority
+            .apply_signal(missing)
+            .expect("a born member's missing session is classified");
+        assert!(
+            !authority
+                .state()
+                .member_materialization
+                .contains_key(&member.identity),
+            "the born member is Broken"
+        );
+    }
+
+    /// Under the verified restore policy the boot plan verifies a Dormant
+    /// member's durable session; an unborn seat has none yet, so it stays
+    /// Dormant unverified until its first wake creates the session.
+    #[test]
+    fn an_unborn_seat_is_not_verified_at_boot() {
+        let planned = |name: &str, unborn: bool, verdict: BootMaterializationKind| {
+            let (mut authority, member) = dormant_member_authority(name);
+            authority
+                .apply_signal(replay_seat_session(&member, unborn))
+                .expect("the seat's rows replay");
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::SeedMemberResidency {
+                    policy: MemberRestorePolicyKind::OnDemandVerified,
+                    composition_authority: CompositionAuthorityKind::Authoritative,
+                    host_pending: std::collections::BTreeSet::new(),
+                },
+            )
+            .expect("the build seeds the verified restore policy");
+            MobMachineMutator::apply(
+                &mut authority,
+                MobMachineInput::PlanBootMaterialization {
+                    agent_identity: member.identity.clone(),
+                    obligation: MemberRecoveryObligationKind::None,
+                    host_required: false,
+                    orchestrator_notified: false,
+                },
+            )
+            .expect("the boot plan answers")
+            .effects()
+            .iter()
+            .any(|effect| {
+                matches!(
+                    effect,
+                    MobMachineEffect::BootMaterializationPlanned { verdict: answered, .. }
+                        if *answered == verdict
+                )
+            })
+        };
+        assert!(planned(
+            "verified-born",
+            false,
+            BootMaterializationKind::VerifyThenDormant
+        ));
+        assert!(planned(
+            "verified-unborn",
+            true,
+            BootMaterializationKind::StayDormant
+        ));
+    }
+
+    /// An unborn seat that leaves before its first wake takes the fact with
+    /// it: the archive unseats the member and clears it.
+    #[test]
+    fn an_unborn_seat_archived_before_its_first_wake_clears_the_fact() {
+        let (mut authority, member) = unborn_member_authority("unborn-archived");
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the unborn seat's retirement is admitted");
+        close_ingress_detach(&mut authority, &member);
+        authority
+            .apply_signal(archived_signal(&member))
+            .expect("the session archive terminates the retirement");
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&member.identity)
+        );
+        assert!(authority.state().member_seat_session_unborn.is_empty());
+        assert!(
+            authority
+                .state()
+                .unborn_seat_sessions
+                .contains(&member.session_id),
+            "the never-created session's record outlives the member"
+        );
+    }
+
+    /// A rotation seats its next incarnation on a new session that does not
+    /// exist yet: the next incarnation is unborn, and its first wake binds
+    /// only through the fresh create of that session.
+    #[test]
+    fn a_rotation_seats_its_next_incarnation_unborn() {
+        let mut authority = MobMachineAuthority::new();
+        let member = seat_live_member_with_endpoint(&mut authority, "unborn-rotation", 37);
+        let next_session = SessionId::from("unborn-rotation-next");
+        let next_runtime = AgentRuntimeId::from("unborn-rotation:1");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "unborn-rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the rotation's retirement starts");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: next_session.clone(),
+                peer_endpoint: None,
+                session_archived: false,
+            },
+        )
+        .expect("the rotation records its intent");
+        close_ingress_detach(&mut authority, &member);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::CommitMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: Some(member.session_id.clone()),
+                disposal: MemberSessionDisposal::Archived,
+                next_agent_runtime_id: next_runtime.clone(),
+                next_fence_token: FenceToken(8),
+                next_generation: Generation(1),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: false,
+                kickoff_owed: false,
+                kickoff_objective_id: String::new(),
+            },
+        )
+        .expect("the rotation re-seats the next incarnation");
+        assert!(
+            authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&member.identity)
+        );
+        let attempt = open_wake_attempt(&mut authority, &member.identity);
+        assert!(
+            authority
+                .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                    agent_identity: member.identity.clone(),
+                    attempt,
+                })
+                .is_err(),
+            "the next incarnation's session was never created"
+        );
+        let created = authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSessionCreated {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the fresh create binds the next incarnation");
+        assert!(created.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::PersistMemberSeatSessionBorn {
+                agent_runtime_id,
+                session_id,
+                ..
+            } if agent_runtime_id == &next_runtime && session_id == &next_session
+        )));
+        assert!(authority.state().member_seat_session_unborn.is_empty());
+    }
+
+    /// Open a seat's spawn ladder (profile authorization and BeginSpawnExec)
+    /// for `member` at `generation`, naming its session.
+    fn open_seat_ladder(
+        authority: &mut MobMachineAuthority,
+        member: &SeatedMember,
+        generation: Generation,
+    ) {
+        let profile_material_digest = "reseat-profile-digest".to_string();
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: profile_material_digest.clone(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the seat's profile is authorized");
+        MobMachineMutator::apply(
+            authority,
+            MobMachineInput::BeginSpawnExec {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation,
+                profile_material_digest,
+                external_addressable: false,
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                bridge_session_id: Some(member.session_id.clone()),
+                replacing: None,
+                placement: None,
+                workgraph_required: false,
+                rust_bundles_present: false,
+                per_spawn_external_tools_present: false,
+                mob_default_external_tools_present: false,
+                default_llm_client_override_present: false,
+                host_surface_mcp_allowlist_present: false,
+                inherited_tool_filter_present: false,
+                shell_env_present: false,
+                mcp_stdio_env_present: false,
+                mcp_http_headers_present: false,
+                memory_required: false,
+                mcp_required: false,
+                resume_session_id: None,
+                placed_spawn_id: None,
+                placed_provision_operation_id: None,
+                placed_operation_owner_session_id: None,
+                effective_profile_override_present: false,
+                effective_model_override_present: false,
+            },
+        )
+        .expect("the seat opens the spawn ladder");
+    }
+
+    fn seat_input(
+        member: &SeatedMember,
+        generation: Generation,
+        session_unborn: bool,
+        fresh_launch: bool,
+    ) -> MobMachineInput {
+        MobMachineInput::CommitDormantSeat {
+            agent_identity: member.identity.clone(),
+            agent_runtime_id: member.runtime_id.clone(),
+            fence_token: member.fence_token,
+            generation,
+            external_addressable: false,
+            runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+            bridge_session_id: member.session_id.clone(),
+            member_peer_endpoint: None,
+            session_archived: false,
+            kickoff_owed: false,
+            session_unborn,
+            fresh_launch,
+        }
+    }
+
+    /// Retire `member` (Dormant, so archive-only) and archive it: the identity
+    /// is no longer seated.
+    fn retire_and_archive(authority: &mut MobMachineAuthority, member: &SeatedMember) {
+        MobMachineMutator::apply(
+            authority,
+            retire_input(member, Some(member.session_id.clone())),
+        )
+        .expect("the Dormant member's retirement is admitted");
+        close_ingress_detach(authority, member);
+        authority
+            .apply_signal(archived_signal(member))
+            .expect("the session archive terminates the retirement");
+        assert!(
+            !authority
+                .state()
+                .identity_to_runtime
+                .contains_key(&member.identity)
+        );
+    }
+
+    /// A member retired before its first wake leaves a session no build
+    /// created. Seated again on that session (a resume seat), it is unborn:
+    /// a born seat of it is refused, and its first wake creates the session,
+    /// once.
+    #[test]
+    fn a_member_retired_before_its_first_wake_is_seated_again_unborn() {
+        let identity = AgentIdentity::from("never-born-reseat");
+        let session_id = SessionId::from("never-born-reseat-session");
+        let first = SeatedMember {
+            identity: identity.clone(),
+            runtime_id: AgentRuntimeId::from("never-born-reseat:0"),
+            session_id: session_id.clone(),
+            fence_token: FenceToken(7),
+        };
+        let mut authority = MobMachineAuthority::new();
+        open_seat_ladder(&mut authority, &first, Generation(0));
+        MobMachineMutator::apply(
+            &mut authority,
+            seat_input(&first, Generation(0), true, true),
+        )
+        .expect("a fresh launch's seat commits unborn");
+        assert!(authority.state().unborn_seat_sessions.contains(&session_id));
+        retire_and_archive(&mut authority, &first);
+        assert!(authority.state().member_seat_session_unborn.is_empty());
+        assert!(
+            authority.state().unborn_seat_sessions.contains(&session_id),
+            "the never-created session's record outlives the member"
+        );
+
+        let second = SeatedMember {
+            identity: identity.clone(),
+            runtime_id: AgentRuntimeId::from("never-born-reseat:1"),
+            session_id: session_id.clone(),
+            fence_token: FenceToken(8),
+        };
+        open_seat_ladder(&mut authority, &second, Generation(1));
+        assert!(
+            MobMachineMutator::apply(
+                &mut authority,
+                seat_input(&second, Generation(1), false, false)
+            )
+            .is_err(),
+            "a session no build created is never seated born"
+        );
+        MobMachineMutator::apply(
+            &mut authority,
+            seat_input(&second, Generation(1), true, false),
+        )
+        .expect("the resume seat of a never-created session is unborn");
+        assert!(
+            authority
+                .state()
+                .member_seat_session_unborn
+                .contains(&identity)
+        );
+
+        let attempt = open_wake_attempt(&mut authority, &identity);
+        let created = MobMachineSignal::ResolveMemberRevivalSessionCreated {
+            agent_identity: identity.clone(),
+            attempt,
+        };
+        let transition = authority
+            .apply_signal(created.clone())
+            .expect("the first wake creates the session");
+        assert!(transition.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::PersistMemberSeatSessionBorn {
+                agent_runtime_id,
+                session_id: born,
+                ..
+            } if agent_runtime_id == &second.runtime_id && born == &session_id
+        )));
+        assert!(!authority.state().unborn_seat_sessions.contains(&session_id));
+        assert!(
+            authority.apply_signal(created).is_err(),
+            "a created session is never created again"
+        );
+    }
+
+    /// A session that was created and is gone is lost. A resume seat of it is
+    /// never unborn (its first wake would create an empty session under the
+    /// lost id); seated born, its missing session takes the successor
+    /// search, else Broken.
+    #[test]
+    fn a_lost_session_is_never_seated_unborn() {
+        let (mut authority, member) = dormant_member_authority("lost-session");
+        retire_and_archive(&mut authority, &member);
+        assert!(
+            !authority
+                .state()
+                .unborn_seat_sessions
+                .contains(&member.session_id)
+        );
+        let reseat = SeatedMember {
+            identity: member.identity.clone(),
+            runtime_id: AgentRuntimeId::from("lost-session:1"),
+            session_id: member.session_id.clone(),
+            fence_token: FenceToken(9),
+        };
+        open_seat_ladder(&mut authority, &reseat, Generation(1));
+        assert!(
+            MobMachineMutator::apply(
+                &mut authority,
+                seat_input(&reseat, Generation(1), true, false)
+            )
+            .is_err(),
+            "a lost session is never seated unborn"
+        );
+        MobMachineMutator::apply(
+            &mut authority,
+            seat_input(&reseat, Generation(1), false, false),
+        )
+        .expect("the resume seat of a created session is born");
+        assert!(authority.state().member_seat_session_unborn.is_empty());
     }
 }

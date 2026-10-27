@@ -57,9 +57,9 @@ if [[ "${1:-}" == "--mutants" ]]; then
 fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane.
-lifecycle_states=79476
+lifecycle_states=136308
 min_distinct_states=$(( lifecycle_states * 9 / 10 ))
-scope_states=5908
+scope_states=10132
 min_scope_distinct_states=$(( scope_states * 9 / 10 ))
 
 # Every lifecycle-run arm the audit's domains can enable; each must fire.

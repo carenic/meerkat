@@ -256,6 +256,33 @@ pub(crate) fn domain_member_is_dormant(
     member_is_dormant(state, &mob_dsl::AgentIdentity::from_domain(identity))
 }
 
+/// Whether MobMachine holds `identity`'s session unborn: a seat (or a
+/// rotation's next incarnation) created nothing, and the member's first wake
+/// creates the session through the spawn provision path. A retirement keeps
+/// the fact until its archive step, which then has nothing to archive when
+/// the session was never created.
+pub(crate) fn domain_member_seat_session_unborn(
+    state: &mob_dsl::MobMachineState,
+    identity: &AgentIdentity,
+) -> bool {
+    state
+        .member_seat_session_unborn
+        .contains(&mob_dsl::AgentIdentity::from_domain(identity))
+}
+
+/// Whether a seat or a rotation named `session_id` unborn and no build has
+/// created it (MobMachine's `unborn_seat_sessions`, keyed on the born row,
+/// not on what the session store shows), whether or not a member is seated
+/// on it now: a later seat naming it seats it unborn again.
+pub(crate) fn domain_seat_session_never_born(
+    state: &mob_dsl::MobMachineState,
+    session_id: &meerkat_core::types::SessionId,
+) -> bool {
+    state
+        .unborn_seat_sessions
+        .contains(&mob_dsl::SessionId::from_domain(session_id))
+}
+
 /// Whether MobMachine holds `identity` seated and not (yet) materialized in
 /// this process: Dormant, or Waking under an open wake attempt whose owner
 /// runs the member's readiness itself.

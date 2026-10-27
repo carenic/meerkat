@@ -101,6 +101,27 @@ impl RosterAuthority {
         self.roster.owed_kickoff_prompt(identity)
     }
 
+    /// What the unborn seat session `identity` is bound to carries to its
+    /// first build ([`Roster::seat_build`]).
+    pub(crate) fn seat_build(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<std::sync::Arc<crate::runtime::SeatBuild>> {
+        self.roster.seat_build(identity)
+    }
+
+    /// Keep the process-local build inputs of the seat just committed on the
+    /// unborn session `session_id` ([`Roster::retain_seat_local_build_inputs`]).
+    pub(crate) fn retain_seat_local_build_inputs(
+        &mut self,
+        session_id: &meerkat_core::types::SessionId,
+        local: crate::runtime::SeatLocalBuildInputs,
+    ) {
+        self.bump();
+        self.roster
+            .retain_seat_local_build_inputs(session_id, local);
+    }
+
     pub(crate) fn list(&self) -> impl Iterator<Item = &RosterEntry> {
         self.roster.list()
     }
