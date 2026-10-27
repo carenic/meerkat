@@ -23,6 +23,8 @@ mod parallel_resume_restore;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_build_inputs;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod seat_comms_key;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod unborn_seat_wake;
 use crate::definition::{
     BackendConfig, CollectionPolicy, ConditionExpr, DependencyMode, DispatchMode, FlowSpec,
@@ -36937,8 +36939,13 @@ async fn test_owner_bridge_create_authority_rejects_implicit_without_cleanup() {
     );
 }
 
+/// A lift (explicit resume) hands its TurnDriven orchestrator's resume
+/// notification to the actor's lifecycle owner, as a cold resume does: the
+/// lift never waits on that turn. A notification whose turn fails does not
+/// fail the lift; the failure reaches the host as a mob event naming the
+/// orchestrator and its session, and the mob keeps running.
 #[tokio::test]
-async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
+async fn test_explicit_resume_records_a_failed_orchestrator_notification_without_failing() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
     let mut def = sample_definition();
@@ -36963,6 +36970,10 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
         )
         .await
         .expect("spawn orchestrator");
+    let orchestrator_session = handle
+        .resolve_bridge_session_id(&AgentIdentity::from("lead-1"))
+        .await
+        .expect("orchestrator session");
     handle.stop().await.expect("stop");
     service.set_fail_start_turn(true);
 
@@ -36980,16 +36991,32 @@ async fn test_resume_fails_when_orchestrator_resume_notification_fails() {
         MobState::Stopped,
         "reconstruction must not notify or materialize the orchestrator"
     );
-    let error = resumed
-        .resume()
+    let cursor = resumed
+        .events()
+        .latest_cursor()
         .await
-        .expect_err("explicit resume must surface orchestrator start_turn failures");
+        .expect("event cursor before the lift");
+    tokio::time::timeout(Duration::from_secs(30), resumed.resume())
+        .await
+        .expect("the lift does not wait on the orchestrator's notification turn")
+        .expect("a failed notification turn does not fail the lift");
+    assert_eq!(
+        resumed.status().await.expect("lifted mob status"),
+        MobState::Running
+    );
+    let failures = wait_for_orchestrator_resume_notification_failures(&resumed, cursor).await;
+    assert_eq!(failures.len(), 1, "exactly one failure event: {failures:?}");
+    let (member_id, session_id, reason) = failures.into_iter().next().expect("one failure");
+    assert_eq!(member_id, AgentIdentity::from("lead-1"));
+    assert_eq!(session_id, orchestrator_session);
     assert!(
-        matches!(
-            shared_lifecycle_failure_source(&error),
-            MobError::Internal(message) if message.contains("mock start_turn failure")
-        ),
-        "resume must surface orchestrator start_turn failures, got {error:?}"
+        reason.contains("mock start_turn failure"),
+        "the recorded reason is the delivery failure: {reason}"
+    );
+    assert_eq!(
+        resumed.status().await.expect("status after the failure"),
+        MobState::Running,
+        "a failed notification leaves the lifted mob running"
     );
 }
 

@@ -78,9 +78,9 @@ if [[ "${1:-}" == "--mutants" ]]; then
 fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane.
-seed_states=1659
-wake_states=987
-retire_states=4096
+seed_states=3078
+wake_states=1608
+retire_states=7974
 terminal_states=238
 resume_states=3438
 edge_states=1148

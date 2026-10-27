@@ -305,6 +305,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `runtime_retire_archive_only`: `Set<AgentRuntimeId>`
 - `owed_edge_repairs`: `Set<WiringEdge>`
 - `owed_external_edge_repairs`: `Set<ExternalPeerEdge>`
+- `member_seat_session_unborn`: `Set<AgentIdentity>`
+- `unborn_seat_sessions`: `Set<SessionId>`
 
 ## Inputs
 - `RunFlow`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_status: Map<StepId, Option<StepRunStatus>>, output_recorded: Map<StepId, Bool>, step_condition_results: Map<StepId, Option<Bool>>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, step_target_counts: Map<StepId, u64>, step_target_success_counts: Map<StepId, u64>, step_target_terminal_failure_counts: Map<StepId, u64>, escalation_threshold: u64, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
@@ -544,7 +546,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PlanBootMaterialization`(agent_identity: AgentIdentity, obligation: MemberRecoveryObligationKind, host_required: Bool, orchestrator_notified: Bool)
 - `SealBootMaterializationPlan`
 - `ClassifyPeerNotice`(recipient: AgentIdentity, sender: AgentIdentity, notice_class: PeerInputClass)
-- `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool, kickoff_owed: Bool)
+- `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool, kickoff_owed: Bool, session_unborn: Bool, fresh_launch: Bool)
 - `ResolveMemberHostPreparation`(agent_identity: AgentIdentity)
 - `BeginMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId, peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
 - `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool, kickoff_owed: Bool, kickoff_objective_id: String)
@@ -635,6 +637,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ReleaseMemberMaterialization`(agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>, cause: MemberMaterializationLossCause)
 - `ResolveWiringEdgeRealization`(edge: WiringEdge, realized: Bool)
 - `ResolveExternalEdgeRealization`(edge: ExternalPeerEdge, realized: Bool)
+- `ResolveMemberRevivalSessionCreated`(agent_identity: AgentIdentity, attempt: u64)
+- `RecoverMemberSeatSession`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, unborn: Bool)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -804,11 +808,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RuntimeBindingRefusalStale`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, attempt: Option<u64>)
 - `OwedMemberWakesRecorded`
 - `OwedEdgeRepairsRecorded`
+- `PersistMemberSeatSessionBorn`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId)
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
 - `member_wake_refusal`(member_present: Bool, session_bound: Bool, placed: Bool, broken: Bool, retiring: Bool, mob_admitting: Bool, composition_authoritative: Bool, origin_open: Bool, host_pending: Bool, input_class: PeerInputClass, sender_waking: Bool, observed_missing: Bool, phase: Option<MemberMaterializationPhase>) -> `Option<MemberWakeRefusalKind>`
-- `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool) -> `BootMaterializationKind`
+- `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool, session_unborn: Bool) -> `BootMaterializationKind`
 - `peer_notice_disposition`(recipient_phase: Option<MemberMaterializationPhase>, sender_phase: Option<MemberMaterializationPhase>, notice_class: PeerInputClass) -> `PeerNoticeDisposition`
 - `member_registration_releasable`(residency: Option<MemberMaterializationPhase>, placed: Bool, sealed: Bool, has_endpoint: Bool, epoch_recorded: Bool, wired_to_placed: Bool) -> `Bool`
 - `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>, releasable: Bool, wired_to_placed: Bool) -> `MemberReleaseVerdict`
@@ -975,6 +980,9 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `only_a_running_mob_wakes`
 - `rotation_intent_is_a_retiring_member`
 - `archive_only_retirement_is_retiring`
+- `seat_session_unborn_is_seated`
+- `seat_session_unborn_is_never_bound`
+- `unborn_seat_session_is_recorded`
 - `owed_edge_repairs_join_seated_members`
 - `destroyed_mob_holds_no_member_lifecycle`
 
@@ -8062,6 +8070,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `lifecycle_origin_open`
   - `attempt_open`
   - `member_is_local`
+  - `seat_session_born`
   - `identity_runtime_matches`
   - `runtime_live`
   - `member_not_retiring`
@@ -15851,7 +15860,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitDormantSeatRunning`
 - From: `Running`
-- On: `CommitDormantSeat`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed)
+- On: `CommitDormantSeat`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed, session_unborn, fresh_launch)
 - Guards:
   - `lifecycle_origin_open`
   - `composition_authoritative`
@@ -15865,6 +15874,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `spawn_profile_name_authorized`
   - `spawn_profile_addressability_authorized`
   - `session_not_archived`
+  - `never_born_session_seats_unborn`
+  - `unborn_seat_session_is_new_or_never_born`
   - `peer_id_available_for_identity`
   - `member_peer_id_is_not_host`
   - `member_peer_not_registered`
@@ -16031,6 +16042,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_binding_present`
   - `generation_binding_present`
   - `session_binding_present`
+  - `seat_session_born`
 - Emits: `RequestRuntimeBinding`, `MemberWakeFeedbackResolved`
 - To: `Running`
 
@@ -16349,6 +16361,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_dormant`
   - `no_explicit_resume_work`
   - `durable_snapshot_missing`
+  - `seat_session_born`
 - Emits: `MemberLiveMaterializationClassified`
 - To: `Running`
 
@@ -16831,6 +16844,74 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `unrealized`
   - `edge_not_repairable`
 - To: `Destroyed`
+
+### `ResolveMemberRevivalSessionCreatedRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalSessionCreated`(agent_identity, attempt)
+- Guards:
+  - `attempt_open`
+  - `member_is_local`
+  - `runtime_binding_present`
+  - `fence_binding_present`
+  - `generation_binding_present`
+  - `session_binding_present`
+  - `seat_session_unborn`
+- Emits: `RequestRuntimeBinding`, `MemberWakeFeedbackResolved`, `PersistMemberSeatSessionBorn`
+- To: `Running`
+
+### `ResolveMemberRevivalSessionCreatedStaleRunning`
+- From: `Running`
+- On: `ResolveMemberRevivalSessionCreated`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Running`
+
+### `ResolveMemberRevivalSessionCreatedStaleStopped`
+- From: `Stopped`
+- On: `ResolveMemberRevivalSessionCreated`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Stopped`
+
+### `ResolveMemberRevivalSessionCreatedStaleCompleted`
+- From: `Completed`
+- On: `ResolveMemberRevivalSessionCreated`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Completed`
+
+### `ResolveMemberRevivalSessionCreatedStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveMemberRevivalSessionCreated`(agent_identity, attempt)
+- Guards:
+  - `attempt_not_open`
+- Emits: `MemberWakeFeedbackResolved`
+- To: `Destroyed`
+
+### `RecoverMemberSeatSessionUnbornRunning`
+- From: `Running`
+- On: `RecoverMemberSeatSession`(agent_identity, agent_runtime_id, unborn)
+- Guards:
+  - `seat_session_unborn_row`
+  - `replay_not_sealed`
+  - `identity_runtime_matches`
+  - `session_binding_present`
+  - `member_is_local`
+  - `member_not_materialized`
+- To: `Running`
+
+### `RecoverMemberSeatSessionBornRunning`
+- From: `Running`
+- On: `RecoverMemberSeatSession`(agent_identity, agent_runtime_id, unborn)
+- Guards:
+  - `seat_session_born_row`
+  - `replay_not_sealed`
+  - `identity_runtime_matches`
+  - `session_binding_present`
+- To: `Running`
 
 ## Coverage
 ### Code Anchors

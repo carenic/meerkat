@@ -372,8 +372,9 @@ pub use runtime::{
 pub use runtime::{
     ForkSupervisorExitForTest, IdentityRecoveryFailStopPoint, MemberStatusDeadlineTestObservation,
     MemberTurnAdmissionTestStage, RestoreTupleFault, arm_identity_recovery_fail_stop_for_test,
-    fail_stop_next_actor_start_for_test, fault_next_restore_tuple_for_test,
-    member_operator_tool_defs_for_test, member_status_deadline_after_snapshot_wait_for_test,
+    explicit_resume_served_bindings_for_test, fail_stop_next_actor_start_for_test,
+    fault_next_restore_tuple_for_test, member_operator_tool_defs_for_test,
+    member_status_deadline_after_snapshot_wait_for_test,
 };
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 pub use runtime::{HeldSpawn, HeldSpawnSettlement, HeldSpawnStart, abort_all_held};
@@ -412,6 +413,9 @@ pub use store::{
     MobOperatorGrantRecord, MobRunStore, MobRuntimeMetadataStore, MobSpecStore, MobStoreError,
     RealmProfileStore, StoredRealmProfile, SupervisorAuthorityRecord, SystemMobIdentityStoreClock,
 };
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub use store::{ParkedStoreReadForTest, StoreReadReleaseForTest, park_next_store_read_for_test};
 #[cfg(not(target_arch = "wasm32"))]
 pub use store::{
     SqliteMobEventStore, SqliteMobObserverDrain, SqliteMobObserverDrainRefused,

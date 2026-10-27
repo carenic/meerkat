@@ -8052,6 +8052,8 @@ pub struct State {
     pub runtime_retire_archive_only: std::collections::BTreeSet<AgentRuntimeId>,
     pub owed_edge_repairs: std::collections::BTreeSet<WiringEdge>,
     pub owed_external_edge_repairs: std::collections::BTreeSet<ExternalPeerEdge>,
+    pub member_seat_session_unborn: std::collections::BTreeSet<AgentIdentity>,
+    pub unborn_seat_sessions: std::collections::BTreeSet<SessionId>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -9472,6 +9474,8 @@ pub mod inputs {
         pub member_peer_endpoint: Option<MemberPeerEndpoint>,
         pub session_archived: bool,
         pub kickoff_owed: bool,
+        pub session_unborn: bool,
+        pub fresh_launch: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveMemberHostPreparation {
@@ -10764,6 +10768,17 @@ pub mod signals {
         pub edge: ExternalPeerEdge,
         pub realized: bool,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveMemberRevivalSessionCreated {
+        pub agent_identity: AgentIdentity,
+        pub attempt: u64,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RecoverMemberSeatSession {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub unborn: bool,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10854,6 +10869,8 @@ pub enum Signal {
     ReleaseMemberMaterialization(signals::ReleaseMemberMaterialization),
     ResolveWiringEdgeRealization(signals::ResolveWiringEdgeRealization),
     ResolveExternalEdgeRealization(signals::ResolveExternalEdgeRealization),
+    ResolveMemberRevivalSessionCreated(signals::ResolveMemberRevivalSessionCreated),
+    RecoverMemberSeatSession(signals::RecoverMemberSeatSession),
 }
 impl Signal {
     pub fn kind(&self) -> SignalKind {
@@ -10974,6 +10991,10 @@ impl Signal {
             Self::ReleaseMemberMaterialization(_) => SignalKind::ReleaseMemberMaterialization,
             Self::ResolveWiringEdgeRealization(_) => SignalKind::ResolveWiringEdgeRealization,
             Self::ResolveExternalEdgeRealization(_) => SignalKind::ResolveExternalEdgeRealization,
+            Self::ResolveMemberRevivalSessionCreated(_) => {
+                SignalKind::ResolveMemberRevivalSessionCreated
+            }
+            Self::RecoverMemberSeatSession(_) => SignalKind::RecoverMemberSeatSession,
         }
     }
 }
@@ -11063,6 +11084,8 @@ pub enum SignalKind {
     ReleaseMemberMaterialization,
     ResolveWiringEdgeRealization,
     ResolveExternalEdgeRealization,
+    ResolveMemberRevivalSessionCreated,
+    RecoverMemberSeatSession,
 }
 
 pub mod effects {
@@ -12009,6 +12032,12 @@ pub mod effects {
     pub struct OwedMemberWakesRecorded {}
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OwedEdgeRepairsRecorded {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct PersistMemberSeatSessionBorn {
+        pub agent_identity: AgentIdentity,
+        pub agent_runtime_id: AgentRuntimeId,
+        pub session_id: SessionId,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12184,6 +12213,7 @@ pub enum Effect {
     RuntimeBindingRefusalStale(effects::RuntimeBindingRefusalStale),
     OwedMemberWakesRecorded(effects::OwedMemberWakesRecorded),
     OwedEdgeRepairsRecorded(effects::OwedEdgeRepairsRecorded),
+    PersistMemberSeatSessionBorn(effects::PersistMemberSeatSessionBorn),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -12354,6 +12384,7 @@ pub enum EffectKind {
     RuntimeBindingRefusalStale,
     OwedMemberWakesRecorded,
     OwedEdgeRepairsRecorded,
+    PersistMemberSeatSessionBorn,
 }
 
 pub mod command_capabilities {
@@ -14057,6 +14088,13 @@ pub enum TransitionId {
     RetireRunningPreservingBindingArchiveOnly,
     RetireStoppedReleasingArchiveOnly,
     RetireStoppedPreservingBindingArchiveOnly,
+    ResolveMemberRevivalSessionCreatedRunning,
+    ResolveMemberRevivalSessionCreatedStaleRunning,
+    ResolveMemberRevivalSessionCreatedStaleStopped,
+    ResolveMemberRevivalSessionCreatedStaleCompleted,
+    ResolveMemberRevivalSessionCreatedStaleDestroyed,
+    RecoverMemberSeatSessionUnbornRunning,
+    RecoverMemberSeatSessionBornRunning,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -14428,5 +14466,7 @@ pub fn initial_state() -> State {
         runtime_retire_archive_only: Default::default(),
         owed_edge_repairs: Default::default(),
         owed_external_edge_repairs: Default::default(),
+        member_seat_session_unborn: Default::default(),
+        unborn_seat_sessions: Default::default(),
     }
 }

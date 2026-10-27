@@ -2687,7 +2687,174 @@ fn open_existing_read_connection(path: &Path) -> Result<Connection, MobStoreErro
     // maintenance fence; reader quiescence during maintenance happens at the
     // SQLite layer. No schema preflight either: a read-only open never
     // mutates the file, and refusal belongs to the write-capable openers.
-    meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly).map_err(se)
+    let conn =
+        meerkat_sqlite::open(path, meerkat_sqlite::ConnectionProfile::ReadOnly).map_err(se)?;
+    #[cfg(any(test, feature = "test-support"))]
+    store_read_park::park_if_armed(path);
+    Ok(conn)
+}
+
+/// Test-support seam: the next store operation that opens the mob database
+/// at `path` read-only parks right after its connection opened, before its
+/// first statement, until the returned park is released or dropped. Only a
+/// store operation's blocking work parks (see `run_sqlite_task`), never an
+/// observer catch-up. The seam fires once.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn park_next_store_read_for_test(path: &Path) -> ParkedStoreReadForTest {
+    store_read_park::arm(path)
+}
+
+/// A store read armed by [`park_next_store_read_for_test`]. Dropping it lets
+/// the read go on, and disarms the seam when no read reached it.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct ParkedStoreReadForTest {
+    key: PathBuf,
+    id: u64,
+    opened: Option<tokio::sync::oneshot::Receiver<()>>,
+    release: StoreReadReleaseForTest,
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl ParkedStoreReadForTest {
+    /// Resolves once the parked read opened its connection: `true` then,
+    /// `false` when this was awaited before.
+    pub async fn opened(&mut self) -> bool {
+        match self.opened.take() {
+            Some(opened) => opened.await.is_ok(),
+            None => false,
+        }
+    }
+
+    /// A handle that lets the parked read go on from elsewhere.
+    pub fn release_handle(&self) -> StoreReadReleaseForTest {
+        self.release.clone()
+    }
+
+    /// Let the parked read go on; a read that reaches the seam later does
+    /// not wait.
+    pub fn release(&self) {
+        self.release.release();
+    }
+}
+
+#[cfg(any(test, feature = "test-support"))]
+impl Drop for ParkedStoreReadForTest {
+    fn drop(&mut self) {
+        self.release.release();
+        store_read_park::disarm(&self.key, self.id);
+    }
+}
+
+/// Lets a read parked by [`park_next_store_read_for_test`] go on.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct StoreReadReleaseForTest(std::sync::mpsc::Sender<()>);
+
+#[cfg(any(test, feature = "test-support"))]
+impl StoreReadReleaseForTest {
+    /// Let the parked read go on. Releasing again does nothing.
+    pub fn release(&self) {
+        let _ = self.0.send(());
+    }
+}
+
+/// The seam behind [`park_next_store_read_for_test`].
+#[cfg(any(test, feature = "test-support"))]
+mod store_read_park {
+    use std::cell::Cell;
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError, mpsc};
+
+    use super::{ParkedStoreReadForTest, StoreReadReleaseForTest};
+
+    /// One armed park.
+    struct Armed {
+        id: u64,
+        opened: tokio::sync::oneshot::Sender<()>,
+        release: mpsc::Receiver<()>,
+    }
+
+    fn armed() -> MutexGuard<'static, HashMap<PathBuf, Armed>> {
+        static ARMED: OnceLock<Mutex<HashMap<PathBuf, Armed>>> = OnceLock::new();
+        ARMED
+            .get_or_init(Mutex::default)
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    thread_local! {
+        /// Set while this thread runs a store operation's blocking work.
+        static IN_STORE_OPERATION: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Marks this thread as running a store operation's blocking work until
+    /// dropped.
+    pub(super) struct StoreOperation {
+        outer: bool,
+    }
+
+    impl StoreOperation {
+        pub(super) fn enter() -> Self {
+            Self {
+                outer: IN_STORE_OPERATION.with(|flag| flag.replace(true)),
+            }
+        }
+    }
+
+    impl Drop for StoreOperation {
+        fn drop(&mut self) {
+            IN_STORE_OPERATION.with(|flag| flag.set(self.outer));
+        }
+    }
+
+    pub(super) fn arm(path: &Path) -> ParkedStoreReadForTest {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        // The stores open their database under its canonical path.
+        let key = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        let (opened_tx, opened_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        armed().insert(
+            key.clone(),
+            Armed {
+                id,
+                opened: opened_tx,
+                release: release_rx,
+            },
+        );
+        ParkedStoreReadForTest {
+            key,
+            id,
+            opened: Some(opened_rx),
+            release: StoreReadReleaseForTest(release_tx),
+        }
+    }
+
+    pub(super) fn disarm(key: &Path, id: u64) {
+        let mut parks = armed();
+        if parks.get(key).is_some_and(|park| park.id == id) {
+            parks.remove(key);
+        }
+    }
+
+    /// Park a store operation's read of the armed database `path`, its
+    /// connection open, until the park is released or dropped.
+    pub(super) fn park_if_armed(path: &Path) {
+        if !IN_STORE_OPERATION.with(Cell::get) {
+            return;
+        }
+        let Some(park) = armed().remove(path) else {
+            return;
+        };
+        let _ = park.opened.send(());
+        let _ = park.release.recv();
+    }
 }
 
 fn initialize_identity_store_instance(conn: &Connection) -> Result<String, MobStoreError> {
@@ -2864,15 +3031,45 @@ fn append_loop_iteration_ledger_if_absent(run: &mut MobRun, entry: LoopIteration
     }
 }
 
+/// Run one store operation's SQLite work on a blocking thread.
+///
+/// `owner` is the observer owner of the calling store
+/// ([`ObserverOwningStore::observer_owner`]), `None` only for a standalone
+/// database, which has no observer. The blocking work keeps it until the
+/// work has returned and its connection is closed. Cancelling the future
+/// that awaits this (an aborted task) leaves blocking work that already
+/// started running, so the work itself must own the observer: while it runs,
+/// [`SqliteMobStores::drain_observers`] refuses as for any other live owner,
+/// and a drain that settles, the removal of the database after it, and a
+/// new database created under the same path can never meet the work's
+/// connection.
 async fn run_sqlite_task<T>(
+    owner: Option<Arc<SqliteMobEventBus>>,
     task: impl FnOnce() -> Result<T, MobStoreError> + Send + 'static,
 ) -> Result<T, MobStoreError>
 where
     T: Send + 'static,
 {
-    tokio::task::spawn_blocking(task)
-        .await
-        .map_err(|error| MobStoreError::Internal(format!("sqlite task join failed: {error}")))?
+    tokio::task::spawn_blocking(move || {
+        #[cfg(any(test, feature = "test-support"))]
+        let _store_operation = store_read_park::StoreOperation::enter();
+        let result = task();
+        // The work returned and closed its connection: only now does this
+        // operation stop owning the observer.
+        drop(owner);
+        result
+    })
+    .await
+    .map_err(|error| MobStoreError::Internal(format!("sqlite task join failed: {error}")))?
+}
+
+/// A store whose operations run their SQLite work through
+/// [`run_sqlite_task`].
+trait ObserverOwningStore {
+    /// The observer owner this store holds, cloned for one operation's
+    /// blocking work; `None` for a standalone database, which has no
+    /// observer.
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>>;
 }
 
 // ---------------------------------------------------------------------------
@@ -2922,16 +3119,17 @@ fn attach_sqlite_event_bus(
 }
 
 /// A logical owner of one database's event observer: what stores, storage
-/// bundles and handles hold.
+/// bundles and handles hold, and each store operation's blocking work until
+/// it returns ([`run_sqlite_task`]).
 ///
 /// Ownership graph: owners hold the [`SqliteMobEventCatchUp`] strongly, and so
 /// does each watch worker's tick closure for the life of its thread; the
 /// catch-up state holds the join custody of its watches; the registry holds
 /// it weakly. No worker ever holds an owner, so an owner is never dropped on
 /// a worker thread, and `Arc::strong_count` of the owner counts owner handles
-/// only. Dropping the last owner requests its watch's stop and never blocks:
-/// the catch-up state, and with it the joinable worker, stays reachable until
-/// the worker returns.
+/// and running store operations only. Dropping the last owner requests its
+/// watch's stop and never blocks: the catch-up state, and with it the
+/// joinable worker, stays reachable until the worker returns.
 struct SqliteMobEventBus {
     catch_up: Arc<SqliteMobEventCatchUp>,
     /// Stops this owner's own watch; never joins.
@@ -3325,12 +3523,18 @@ impl SqliteMobEventCatchUp {
 /// What [`SqliteMobStores::drain_observers`] did for one database path in this
 /// process.
 ///
-/// Its scope is the path's event observer only: the cross-process change
-/// watch, its worker threads, and its catch-up reads. It says nothing about
-/// operations through store handles (guarded writers, unguarded reads, or
-/// blocking work whose awaiting future was cancelled), other processes, or
-/// openers that attach a new observer later. It is never a statement that
-/// the database or its directory may be deleted.
+/// Its scope is the path's event observer: the cross-process change watch,
+/// its worker threads, and its catch-up reads. Store operations of this
+/// process are inside it through ownership: a store operation owns the
+/// observer until its blocking work has returned with its connection closed,
+/// also once the future awaiting it was cancelled, so a drain that was not
+/// refused leaves none of them running on the database. Outside it stay
+/// other processes, openers that attach a new observer later, and the work
+/// that opens the file by path without a store: the identity runtime write
+/// fence a member runtime's writes go through
+/// (`MobIdentityStore::prepare_runtime_write_fence`) and
+/// `MobStorage::read_member_binding_history`. So on its own it is never a
+/// statement that the database or its directory may be deleted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[must_use]
 pub enum SqliteMobObserverDrain {
@@ -3389,7 +3593,9 @@ pub struct SqliteMobObserverDrainReport {
 pub enum SqliteMobObserverDrainRefused {
     /// Logical owners of the observer are alive in this process: stores,
     /// storage bundles, handles or runtimes opened on the path, including
-    /// read-only use. They keep observing.
+    /// read-only use, and store operations whose blocking work still runs,
+    /// also once the caller awaiting it was cancelled. They keep observing,
+    /// or keep a connection to the database open.
     #[error("{owner_handles} owner handle(s) still observe this mob database")]
     OtherOwners {
         /// Live owner handles at the time of the refusal.
@@ -3437,16 +3643,18 @@ impl SqliteMobStores {
     ///
     /// While any logical owner of the observer is alive in this process
     /// (stores, storage bundles, handles or runtimes opened on the path,
-    /// including read-only use), it refuses and closes, stops and drains
-    /// nothing: those owners keep observing. Otherwise it closes the
-    /// observer, under the registry lock, so no owner attaches to it again
-    /// (an opener from then on gets a replacement observer, which the report
-    /// names), waits out a catch-up read in flight on any thread, and joins
-    /// every watch worker, waiting for a tick that is running. It holds no
-    /// registry, catch-up or custody lock across that wait or a join. It
-    /// never waits for a watch's notification registration, which the
-    /// operating system can hold without bound: one still running is counted
-    /// in the report (`retained_registrations`).
+    /// including read-only use, and store operations whose blocking work
+    /// still runs, also once their caller was cancelled), it refuses and
+    /// closes, stops and drains nothing: those owners keep observing, and a
+    /// caller that retries the refusal waits such an operation out.
+    /// Otherwise it closes the observer, under the registry lock, so no owner
+    /// attaches to it again (an opener from then on gets a replacement
+    /// observer, which the report names), waits out a catch-up read in
+    /// flight on any thread, and joins every watch worker, waiting for a tick
+    /// that is running. It holds no registry, catch-up or custody lock across
+    /// that wait or a join. It never waits for a watch's notification
+    /// registration, which the operating system can hold without bound: one
+    /// still running is counted in the report (`retained_registrations`).
     ///
     /// Blocking and unbounded by design: it waits as long as a running
     /// catch-up read or tick runs. From async code run it on a blocking
@@ -3455,11 +3663,13 @@ impl SqliteMobStores {
     /// a concurrent drain is joining, it neither waits nor joins, and its
     /// report says so.
     ///
-    /// The result is scoped to that observer; see [`SqliteMobObserverDrain`].
-    /// It never states that the database or its directory may be deleted:
-    /// store operations through any handle, other processes and later
-    /// openers are outside it. When `path` no longer resolves and is not
-    /// itself the registered key, it refuses with
+    /// The result is scoped to that observer and the store operations that
+    /// own it; see [`SqliteMobObserverDrain`]. It never states on its own
+    /// that the database or its directory may be deleted: other processes,
+    /// later openers, and the work that opens the file without a store (the
+    /// identity runtime write fence, `MobStorage::read_member_binding_history`)
+    /// are outside it. When `path` no longer resolves and is not itself the
+    /// registered key, it refuses with
     /// [`SqliteMobObserverDrainRefused::UnresolvedPath`] instead of reading
     /// the miss as a missing observer.
     pub fn drain_observers(
@@ -3512,14 +3722,14 @@ impl SqliteMobStores {
     pub fn spec_store(&self) -> SqliteMobSpecStore {
         SqliteMobSpecStore {
             path: self.path.clone(),
-            _owner: Arc::clone(&self.event_bus),
+            owner: Arc::clone(&self.event_bus),
         }
     }
 
     pub fn runtime_metadata_store(&self) -> SqliteMobRuntimeMetadataStore {
         SqliteMobRuntimeMetadataStore {
             path: self.path.clone(),
-            _owner: Arc::clone(&self.event_bus),
+            owner: Arc::clone(&self.event_bus),
         }
     }
 
@@ -3527,7 +3737,7 @@ impl SqliteMobStores {
     pub fn forked_participant_store(&self) -> SqliteForkedParticipantStore {
         SqliteForkedParticipantStore {
             path: self.path.clone(),
-            _owner: Some(Arc::clone(&self.event_bus)),
+            owner: Some(Arc::clone(&self.event_bus)),
         }
     }
 
@@ -3557,7 +3767,7 @@ impl SqliteMobStores {
         SqliteMobIdentityStatusStore {
             path: self.path.clone(),
             store_instance_id: self.identity_store_instance_id.clone(),
-            _owner: Arc::clone(&self.event_bus),
+            owner: Arc::clone(&self.event_bus),
         }
     }
 
@@ -3568,7 +3778,7 @@ impl SqliteMobStores {
     pub fn realm_profile_store(&self) -> SqliteRealmProfileStore {
         SqliteRealmProfileStore {
             path: self.path.clone(),
-            _owner: Some(Arc::clone(&self.event_bus)),
+            owner: Some(Arc::clone(&self.event_bus)),
         }
     }
 }
@@ -3904,13 +4114,25 @@ impl SqliteMobIdentityStore {
     }
 }
 
+impl ObserverOwningStore for SqliteMobIdentityStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        self.event_bus.clone()
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SqliteMobIdentityStatusStore {
     path: PathBuf,
     store_instance_id: String,
     /// Owns the database's observer while this handle lives, so an observer
     /// drain counts this public reader.
-    _owner: Arc<SqliteMobEventBus>,
+    owner: Arc<SqliteMobEventBus>,
+}
+
+impl ObserverOwningStore for SqliteMobIdentityStatusStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        Some(Arc::clone(&self.owner))
+    }
 }
 
 fn sqlite_identity_write_error(error: rusqlite::Error, context: &str) -> MobStoreError {
@@ -4944,7 +5166,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let identity = identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             query_identity_intent_observation(&conn, &mob_id, &identity)
         })
@@ -4994,7 +5216,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let request = request.clone();
         let compiled = compiled.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             let existing_receipt: Option<Vec<u8>> = tx
@@ -5100,7 +5322,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let clock = Arc::clone(&self.clock);
         let request = request.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let committed_at_ms = clock.now_ms()?;
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
@@ -5200,7 +5422,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let clock = Arc::clone(&self.clock);
         let request = request.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let committed_at_ms = clock.now_ms()?;
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
@@ -5304,7 +5526,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let path = self.path.clone();
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             let mut stmt = conn
                 .prepare(
@@ -5424,7 +5646,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let after = after.cloned();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             let after_storage_class = after
                 .as_ref()
@@ -5582,7 +5804,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let identity = identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             query_identity_lease_observation(&conn, &mob_id, &identity)
         })
@@ -5613,7 +5835,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let identity = identity.clone();
         let holder_id = holder_id.to_string();
         let incarnation_id = incarnation_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             // Time is sampled only after the writer lock is held, so a queued
@@ -5699,7 +5921,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let mob_id = mob_id.clone();
         let identity = identity.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             let Some(current) = query_identity_lease_authority(&tx, &mob_id, &identity)? else {
@@ -5729,7 +5951,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let clock = Arc::clone(&self.clock);
         let permit = permit.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let observed_at_ms = clock.now_ms()?;
             permit.validate_for_write(observed_at_ms).map_err(|error| {
                 MobStoreError::CasConflict(format!(
@@ -5791,7 +6013,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let mob_id = mob_id.clone();
         let subject = subject.clone();
         let slot = slot.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             query_identity_receipt_observation(&conn, &mob_id, &subject, &slot)
         })
@@ -5809,7 +6031,7 @@ impl MobIdentityStore for SqliteMobIdentityStore {
         let clock = Arc::clone(&self.clock);
         let receipt = receipt.clone();
         let permit = permit.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             if let Some(existing) = require_identity_authority(
@@ -5915,7 +6137,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let path = self.path.clone();
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             read_member_binding_journal_snapshot(&conn, &mob_id)
         })
@@ -5934,7 +6156,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let identity = identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             Ok(query_identity_member_target_state(&conn, &mob_id, &identity)?.observation)
         })
@@ -5960,7 +6182,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let clock = Arc::clone(&self.clock);
         let permit = permit.clone();
         let event = event.clone();
-        let result = run_sqlite_task(move || {
+        let result = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             // Sample only after BEGIN IMMEDIATE has acquired the writer lock.
@@ -6155,7 +6377,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let identity = identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             Ok(query_identity_wiring_target_state(&conn, &mob_id, &identity)?.observation)
         })
@@ -6181,7 +6403,7 @@ impl MobIdentityMemberStore for SqliteMobIdentityStore {
         let clock = Arc::clone(&self.clock);
         let permit = permit.clone();
         let event = event.clone();
-        let result = run_sqlite_task(move || {
+        let result = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             let observed_at_ms = match clock.now_ms() {
@@ -6357,7 +6579,7 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let identity = identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             query_identity_status_observation(&conn, &mob_id, &identity)
         })
@@ -6374,7 +6596,7 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
         let path = self.path.clone();
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_identity_read_connection(&path, &store_instance_id)?;
             let mut stmt = conn
                 .prepare(
@@ -6431,7 +6653,7 @@ impl MobIdentityStatusStore for SqliteMobIdentityStatusStore {
         let store_instance_id = self.store_instance_id.clone();
         let mob_id = mob_id.clone();
         let status = status.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_existing_identity_write_connection(&path, &store_instance_id)?;
             let tx = begin_identity_immediate(&mut conn, &store_instance_id)?;
             tx.execute(
@@ -6466,7 +6688,7 @@ pub struct SqliteMobRuntimeMetadataStore {
     path: PathBuf,
     /// Owns the database's observer while this handle lives, so an observer
     /// drain counts this public reader.
-    _owner: Arc<SqliteMobEventBus>,
+    owner: Arc<SqliteMobEventBus>,
 }
 
 impl std::fmt::Debug for SqliteMobRuntimeMetadataStore {
@@ -6474,6 +6696,12 @@ impl std::fmt::Debug for SqliteMobRuntimeMetadataStore {
         f.debug_struct("SqliteMobRuntimeMetadataStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteMobRuntimeMetadataStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        Some(Arc::clone(&self.owner))
     }
 }
 
@@ -6485,7 +6713,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Option<SupervisorAuthorityRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<Vec<u8>> = conn
                 .query_row(
@@ -6510,7 +6738,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -6537,7 +6765,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected = expected.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6568,7 +6796,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6593,7 +6821,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6616,7 +6844,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let verifier = *verifier.as_bytes();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6638,7 +6866,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Option<crate::MobClaimVerifier>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<Vec<u8>> = conn
                 .query_row(
@@ -6666,7 +6894,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     async fn delete_callback_claim_verifier(&self, mob_id: &MobId) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let deleted = tx
@@ -6689,7 +6917,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let host_id = host_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<Vec<u8>> = conn
                 .query_row(
@@ -6711,7 +6939,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobHostAuthorityRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -6743,7 +6971,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -6769,7 +6997,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6797,7 +7025,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected = expected.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6829,7 +7057,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -6856,7 +7084,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let host_id = expected.host_id.clone();
         let binding_generation = u64_to_sql_key(expected.binding_generation);
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -6884,7 +7112,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<(String, u64)>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -6918,7 +7146,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let generation = u64_to_sql_key(record.generation);
@@ -7035,7 +7263,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let key = key.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<Vec<u8>> = conn
                 .query_row(
@@ -7079,7 +7307,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected = expected.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -7117,7 +7345,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobMemberOperatorRequestRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7194,7 +7422,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let authority = authority.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let stale = {
@@ -7297,7 +7525,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     async fn delete_member_operator_requests(&self, mob_id: &MobId) -> Result<u64, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let deleted = tx
@@ -7322,7 +7550,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let agent_identity = agent_identity.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let row: Option<Vec<u8>> = conn
                 .query_row(
@@ -7349,7 +7577,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobPlacedSpawnCarrierRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7385,7 +7613,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let row: Option<Vec<u8>> = tx
@@ -7453,7 +7681,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected_pending = expected_pending.clone();
         let committed = committed.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let row: Option<Vec<u8>> = tx
@@ -7513,7 +7741,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected = expected.clone();
         let promoted = promoted.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let row: Option<Vec<u8>> = tx
@@ -7566,7 +7794,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let row: Option<Vec<u8>> = tx
@@ -7608,7 +7836,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobOperatorGrantRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7640,7 +7868,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -7666,7 +7894,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let principal = principal.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -7685,7 +7913,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     async fn delete_mob_operator_grants(&self, mob_id: &MobId) -> Result<u64, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -7706,7 +7934,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobMemberEventCursorRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7736,7 +7964,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -7760,7 +7988,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let agent_identity = agent_identity.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -7779,7 +8007,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     async fn delete_member_event_cursors(&self, mob_id: &MobId) -> Result<u64, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -7800,7 +8028,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobMemberLiveCleanupRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7828,7 +8056,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let encoded = encode_json(&record)?;
@@ -7870,7 +8098,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let expected_encoded = encode_json(&expected)?;
@@ -7914,7 +8142,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<MobForkedParticipantMemberAssociation>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -7942,7 +8170,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let encoded = encode_json(&record)?;
@@ -7968,7 +8196,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let expected_encoded = encode_json(&expected)?;
@@ -8012,7 +8240,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     ) -> Result<Vec<ExternalBindingOverlayRecord>, MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -8043,7 +8271,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let changed = tx
@@ -8078,7 +8306,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let record = record.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -8116,7 +8344,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let mob_id = mob_id.clone();
         let expected = expected.clone();
         let desired = desired.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let current = tx
@@ -8176,7 +8404,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let expected = expected.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let generation = i64::try_from(expected.generation.get()).map_err(|_| {
@@ -8232,7 +8460,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let agent_identity = agent_identity.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -8259,7 +8487,7 @@ impl MobRuntimeMetadataStore for SqliteMobRuntimeMetadataStore {
     async fn delete_external_binding_overlays(&self, mob_id: &MobId) -> Result<(), MobStoreError> {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(
@@ -8289,6 +8517,12 @@ impl std::fmt::Debug for SqliteMobEventStore {
         f.debug_struct("SqliteMobEventStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteMobEventStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        Some(Arc::clone(&self.event_bus))
     }
 }
 
@@ -8474,7 +8708,7 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
         let previous_epoch = authority.previous_epoch;
         let epoch = authority.epoch;
         let expected_event_head_cursor = authority.event_head_cursor;
-        let (outcome, appended) = run_sqlite_task(move || {
+        let (outcome, appended) = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let mut stmt = tx
@@ -8674,7 +8908,7 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
 
     async fn creation_record(&self) -> Result<Option<MobCreationRecord>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             read_creation_record(&conn)
         })
@@ -8696,7 +8930,7 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
             finalized_at_ms: None,
         };
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             validate_initial_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
@@ -8757,7 +8991,7 @@ impl private::MobEventStoreSealed for SqliteMobEventStore {
             finalized_at_ms: None,
         };
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             if let Some(existing) = read_creation_record(&tx)? {
@@ -8794,7 +9028,7 @@ impl MobEventStore for SqliteMobEventStore {
         intent.validate()?;
         let path = self.path.clone();
         let intent = intent.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let existing = tx
@@ -8872,7 +9106,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let intent = intent.clone();
         let terminal = terminal.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -8963,7 +9197,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let intent = intent.clone();
         let realization_run_id = commit.run_id().clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -9053,7 +9287,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let intent = intent.clone();
         let completion_run_id = commit.run_id().clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -9150,7 +9384,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let intent = intent.clone();
         let terminal = terminal.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -9232,7 +9466,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let intent = intent.clone();
         let terminal = terminal.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -9318,7 +9552,7 @@ impl MobEventStore for SqliteMobEventStore {
         intent.validate()?;
         let path = self.path.clone();
         let intent = intent.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = tx
@@ -9400,7 +9634,7 @@ impl MobEventStore for SqliteMobEventStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let idempotency_key = idempotency_key.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let record = conn
                 .query_row(
@@ -9426,7 +9660,7 @@ impl MobEventStore for SqliteMobEventStore {
         validate_mob_event_write_authority(&event.kind)?;
 
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             validate_raw_mob_created_sqlite(&tx, std::slice::from_ref(&event))?;
@@ -9467,7 +9701,7 @@ impl MobEventStore for SqliteMobEventStore {
         let mob_id = event.mob_id.clone();
 
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let mut stmt = tx
@@ -9532,7 +9766,7 @@ impl MobEventStore for SqliteMobEventStore {
         let mob_id = event.mob_id.clone();
 
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let mut stmt = tx
@@ -9602,7 +9836,7 @@ impl MobEventStore for SqliteMobEventStore {
         super::ForkJobTerminalScan::new(&event)?;
 
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let mut stmt = tx
@@ -9654,7 +9888,7 @@ impl MobEventStore for SqliteMobEventStore {
         }
 
         let path = self.path.clone();
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             validate_raw_mob_created_sqlite(&tx, &batch)?;
@@ -9688,12 +9922,15 @@ impl MobEventStore for SqliteMobEventStore {
 
     async fn poll(&self, after_cursor: u64, limit: usize) -> Result<Vec<MobEvent>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || poll_events_sync(&path, after_cursor, limit)).await
+        run_sqlite_task(self.observer_owner(), move || {
+            poll_events_sync(&path, after_cursor, limit)
+        })
+        .await
     }
 
     async fn replay_all(&self) -> Result<Vec<MobEvent>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let mut stmt = conn
                 .prepare("SELECT event_json FROM mob_events ORDER BY cursor")
@@ -9716,7 +9953,10 @@ impl MobEventStore for SqliteMobEventStore {
 
     async fn latest_cursor(&self) -> Result<u64, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || latest_event_cursor_sync(&path)).await
+        run_sqlite_task(self.observer_owner(), move || {
+            latest_event_cursor_sync(&path)
+        })
+        .await
     }
 
     fn subscribe(&self) -> Result<super::MobEventReceiver, MobStoreError> {
@@ -9725,7 +9965,7 @@ impl MobEventStore for SqliteMobEventStore {
 
     async fn clear(&self) -> Result<(), MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute("DELETE FROM mob_events", []).map_err(se)?;
@@ -9750,7 +9990,7 @@ impl MobEventStore for SqliteMobEventStore {
 
     async fn prune(&self, older_than: DateTime<Utc>) -> Result<u64, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -9883,6 +10123,12 @@ impl std::fmt::Debug for SqliteMobRunStore {
     }
 }
 
+impl ObserverOwningStore for SqliteMobRunStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        Some(Arc::clone(&self.event_bus))
+    }
+}
+
 impl SqliteMobRunStore {
     async fn update_run_with_authority_if<F>(
         &self,
@@ -9897,7 +10143,7 @@ impl SqliteMobRunStore {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
@@ -9930,7 +10176,7 @@ impl MobRunStore for SqliteMobRunStore {
     async fn create_run(&self, run: MobRun) -> Result<(), MobStoreError> {
         let path = self.path.clone();
         let key = run.run_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -9967,7 +10213,7 @@ impl MobRunStore for SqliteMobRunStore {
     async fn get_run(&self, run_id: &RunId) -> Result<Option<MobRun>, MobStoreError> {
         let path = self.path.clone();
         let key = run_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let bytes: Option<Vec<u8>> = conn
                 .query_row(
@@ -9993,7 +10239,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let mob_id = mob_id.clone();
         let flow_id = flow_id.cloned();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let mut stmt = conn.prepare("SELECT run_json FROM mob_runs").map_err(se)?;
             let rows = stmt
@@ -10026,7 +10272,7 @@ impl MobRunStore for SqliteMobRunStore {
         let run_key = run_id.to_string();
         let sequence = u64_to_sql_key(intent.obligation.dispatch_sequence);
         let intent = intent.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let run_json: Option<Vec<u8>> = tx
@@ -10086,7 +10332,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let run_key = run_id.to_string();
         let sequence = u64_to_sql_key(dispatch_sequence);
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             Ok(conn
                 .execute(
@@ -10106,7 +10352,7 @@ impl MobRunStore for SqliteMobRunStore {
     ) -> Result<Vec<MobRunRemoteTurnIntent>, MobStoreError> {
         let path = self.path.clone();
         let run_key = run_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -10140,7 +10386,7 @@ impl MobRunStore for SqliteMobRunStore {
         let run_key = run_id.to_string();
         let sequence = u64_to_sql_key(receipt.obligation.dispatch_sequence);
         let receipt = receipt.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let run_json: Option<Vec<u8>> = tx
@@ -10216,7 +10462,7 @@ impl MobRunStore for SqliteMobRunStore {
     ) -> Result<Vec<MobRunRemoteTurnReceipt>, MobStoreError> {
         let path = self.path.clone();
         let run_key = run_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_existing_read_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -10244,7 +10490,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let run_key = run_id.to_string();
         let sequence = u64_to_sql_key(dispatch_sequence);
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             Ok(conn
                 .execute(
@@ -10351,7 +10597,7 @@ impl MobRunStore for SqliteMobRunStore {
         let expected_flow_state = expected_flow_state.clone();
         let next_flow_state = next_flow_state.clone();
         let event_bus = Arc::clone(&self.event_bus);
-        let stored = run_sqlite_task(move || {
+        let stored = run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes = load_run_bytes(&tx, &key)?;
@@ -10415,7 +10661,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes: Option<Vec<u8>> = tx
@@ -10457,7 +10703,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes: Option<Vec<u8>> = tx
@@ -10507,7 +10753,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes: Option<Vec<u8>> = tx
@@ -10549,7 +10795,7 @@ impl MobRunStore for SqliteMobRunStore {
         let path = self.path.clone();
         let key = run_id.to_string();
         let run_id = run_id.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let bytes: Option<Vec<u8>> = tx
@@ -10920,7 +11166,7 @@ pub struct SqliteMobSpecStore {
     path: PathBuf,
     /// Owns the database's observer while this handle lives, so an observer
     /// drain counts this public reader.
-    _owner: Arc<SqliteMobEventBus>,
+    owner: Arc<SqliteMobEventBus>,
 }
 
 impl std::fmt::Debug for SqliteMobSpecStore {
@@ -10928,6 +11174,12 @@ impl std::fmt::Debug for SqliteMobSpecStore {
         f.debug_struct("SqliteMobSpecStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteMobSpecStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        Some(Arc::clone(&self.owner))
     }
 }
 
@@ -10949,7 +11201,7 @@ impl MobSpecStore for SqliteMobSpecStore {
         let key = mob_id.to_string();
         let mob_id = mob_id.clone();
         let definition = definition.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -10999,7 +11251,7 @@ impl MobSpecStore for SqliteMobSpecStore {
     ) -> Result<Option<(MobDefinition, u64)>, MobStoreError> {
         let path = self.path.clone();
         let key = mob_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let bytes: Option<Vec<u8>> = conn
                 .query_row(
@@ -11022,7 +11274,7 @@ impl MobSpecStore for SqliteMobSpecStore {
 
     async fn list_specs(&self) -> Result<Vec<MobId>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn.prepare("SELECT mob_id FROM mob_specs").map_err(se)?;
             let rows = stmt
@@ -11045,7 +11297,7 @@ impl MobSpecStore for SqliteMobSpecStore {
     ) -> Result<bool, MobStoreError> {
         let path = self.path.clone();
         let key = mob_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -11093,7 +11345,7 @@ pub struct SqliteForkedParticipantStore {
     /// Owns the database's observer while this handle lives, so an observer
     /// drain counts this public reader.
     /// None for a standalone capability database, which has no observer.
-    _owner: Option<Arc<SqliteMobEventBus>>,
+    owner: Option<Arc<SqliteMobEventBus>>,
 }
 
 impl std::fmt::Debug for SqliteForkedParticipantStore {
@@ -11101,6 +11353,12 @@ impl std::fmt::Debug for SqliteForkedParticipantStore {
         f.debug_struct("SqliteForkedParticipantStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteForkedParticipantStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        self.owner.clone()
     }
 }
 
@@ -11115,7 +11373,7 @@ impl SqliteForkedParticipantStore {
         let _conn = open_connection(&path)?;
         Ok(Self {
             path: std::fs::canonicalize(&path).map_err(se)?,
-            _owner: None,
+            owner: None,
         })
     }
 }
@@ -11141,7 +11399,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
         let path = self.path.clone();
         let mut stored = record.clone();
         stored.revision = 1;
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let capability_id = stored.capability_id.expose_bearer_token().to_string();
@@ -11180,7 +11438,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
     ) -> Result<Option<ForkedParticipantRecord>, MobStoreError> {
         let path = self.path.clone();
         let key = capability_id.expose_bearer_token().to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<(Vec<u8>, i64)> = conn
                 .query_row(
@@ -11203,7 +11461,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
     ) -> Result<Option<ForkedParticipantRecord>, MobStoreError> {
         let path = self.path.clone();
         let key = request_id.as_str().to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<(Vec<u8>, i64)> = conn
                 .query_row(
@@ -11226,7 +11484,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
     ) -> Result<Option<ForkedParticipantRecord>, MobStoreError> {
         let path = self.path.clone();
         let key = fork_session_id.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<(Vec<u8>, i64)> = conn
                 .query_row(
@@ -11283,7 +11541,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
         let mut next = record.clone();
         next.revision = next_revision;
         next.updated_at = Utc::now();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let capability_id = next.capability_id.expose_bearer_token().to_string();
@@ -11350,7 +11608,7 @@ impl ForkedParticipantStore for SqliteForkedParticipantStore {
 
     async fn list_all(&self) -> Result<Vec<ForkedParticipantRecord>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -11390,6 +11648,13 @@ impl std::fmt::Debug for SqliteTemporaryCouncilStore {
         f.debug_struct("SqliteTemporaryCouncilStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteTemporaryCouncilStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        // A standalone database, which has no observer.
+        None
     }
 }
 
@@ -11433,7 +11698,7 @@ impl TemporaryCouncilStore for SqliteTemporaryCouncilStore {
         let path = self.path.clone();
         let mut stored = record.clone();
         stored.revision = 1;
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let council_id = stored.council_id.as_str().to_string();
@@ -11472,7 +11737,7 @@ impl TemporaryCouncilStore for SqliteTemporaryCouncilStore {
     ) -> Result<Option<TemporaryCouncilRecord>, MobStoreError> {
         let path = self.path.clone();
         let key = council_id.as_str().to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<(Vec<u8>, i64)> = conn
                 .query_row(
@@ -11504,7 +11769,7 @@ impl TemporaryCouncilStore for SqliteTemporaryCouncilStore {
         let mut next = record.clone();
         next.revision = next_revision;
         next.updated_at = Utc::now();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
             let council_id = next.council_id.as_str().to_string();
@@ -11564,7 +11829,7 @@ impl TemporaryCouncilStore for SqliteTemporaryCouncilStore {
 
     async fn list_all(&self) -> Result<Vec<TemporaryCouncilRecord>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare(
@@ -11593,7 +11858,7 @@ pub struct SqliteRealmProfileStore {
     /// Owns the database's observer while this handle lives, so an observer
     /// drain counts this public reader.
     /// None for a standalone realm profile database, which has no observer.
-    _owner: Option<Arc<SqliteMobEventBus>>,
+    owner: Option<Arc<SqliteMobEventBus>>,
 }
 
 impl SqliteRealmProfileStore {
@@ -11607,7 +11872,7 @@ impl SqliteRealmProfileStore {
         drop(conn);
         Ok(Self {
             path: db_path.to_path_buf(),
-            _owner: None,
+            owner: None,
         })
     }
 }
@@ -11617,6 +11882,12 @@ impl std::fmt::Debug for SqliteRealmProfileStore {
         f.debug_struct("SqliteRealmProfileStore")
             .field("path", &self.path)
             .finish()
+    }
+}
+
+impl ObserverOwningStore for SqliteRealmProfileStore {
+    fn observer_owner(&self) -> Option<Arc<SqliteMobEventBus>> {
+        self.owner.clone()
     }
 }
 
@@ -11630,7 +11901,7 @@ impl RealmProfileStore for SqliteRealmProfileStore {
         let path = self.path.clone();
         let name = name.to_string();
         let profile = profile.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -11675,7 +11946,7 @@ impl RealmProfileStore for SqliteRealmProfileStore {
     async fn get(&self, name: &str) -> Result<Option<StoredRealmProfile>, MobStoreError> {
         let path = self.path.clone();
         let name = name.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let row: Option<(Vec<u8>, i64, String, String)> = conn
                 .query_row(
@@ -11711,7 +11982,7 @@ impl RealmProfileStore for SqliteRealmProfileStore {
 
     async fn list(&self) -> Result<Vec<StoredRealmProfile>, MobStoreError> {
         let path = self.path.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let conn = open_connection(&path)?;
             let mut stmt = conn
                 .prepare("SELECT name, profile_json, revision, created_at, updated_at FROM realm_profiles ORDER BY name")
@@ -11760,7 +12031,7 @@ impl RealmProfileStore for SqliteRealmProfileStore {
         let path = self.path.clone();
         let name = name.to_string();
         let profile = profile.clone();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -11817,7 +12088,7 @@ impl RealmProfileStore for SqliteRealmProfileStore {
     ) -> Result<StoredRealmProfile, MobStoreError> {
         let path = self.path.clone();
         let name = name.to_string();
-        run_sqlite_task(move || {
+        run_sqlite_task(self.observer_owner(), move || {
             let mut conn = open_connection(&path)?;
             let tx = begin_immediate(&mut conn)?;
 
@@ -13755,54 +14026,68 @@ mod tests {
         );
     }
 
-    // Multi-threaded: this test blocks its own thread while the spawned read
-    // must still be polled into its blocking work.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn observer_drain_does_not_cover_a_cancelled_unguarded_read() {
-        let (_dir, path) = temp_db_path();
-        let stores = SqliteMobStores::open(&path).unwrap();
-        wait_for_watch_registrations(&path);
-        let catch_up = Arc::clone(&stores.event_bus.catch_up);
-        let (entered_tx, entered_rx) = mpsc::channel();
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let (done_tx, done_rx) = mpsc::channel();
-        let read_path = path.clone();
-        // An unguarded store read whose awaiting future is cancelled: the
-        // blocking work keeps running with its connection.
-        let read = tokio::spawn(run_sqlite_task(move || {
-            let conn = open_existing_read_connection(&read_path)?;
-            let _ = entered_tx.send(());
-            let _ = release_rx.recv();
-            let events = poll_events_from_connection(&conn, 0, 10);
-            drop(conn);
-            let _ = done_tx.send(());
-            events
-        }));
-        entered_rx
-            .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the read holds its connection");
-        read.abort();
-        assert!(read.await.unwrap_err().is_cancelled());
-
-        drop(stores);
+    /// Drain the observer of `path` on a thread of its own, within the hang
+    /// guard.
+    fn drain_observers_within_hang_guard(
+        path: &Path,
+    ) -> Result<SqliteMobObserverDrain, SqliteMobObserverDrainRefused> {
         let (drain_tx, drain_rx) = mpsc::channel();
-        let drain_path = path.clone();
+        let drain_path = path.to_path_buf();
         std::thread::spawn(move || {
             let _ = drain_tx.send(SqliteMobStores::drain_observers(&drain_path));
         });
-        let outcome = drain_rx
+        drain_rx
             .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the drain never waits for store reads");
-        assert_eq!(outcome, Ok(closed_report(true, 1, 0, false)));
-        assert!(
-            done_rx.try_recv().is_err(),
-            "the cancelled read still holds its connection: the drain's scope ends at the observer"
-        );
+            .expect("the drain returns within the hang guard")
+    }
 
-        release_tx.send(()).unwrap();
-        done_rx
-            .recv_timeout(OBSERVER_HANG_GUARD)
-            .expect("the released read finishes on its own");
+    /// A store read whose caller is cancelled while its blocking work holds
+    /// the connection open, as an actor's teardown aborts its background
+    /// tasks, owns the observer until that work returns: the observer drain
+    /// refuses meanwhile, and drains once the connection closed. A drain that
+    /// settled with the read still running would let the database be
+    /// removed, and a new one created under its path, under that connection.
+    #[tokio::test]
+    async fn an_aborted_read_keeps_the_observer_drain_refused_until_its_connection_closes() {
+        let (_dir, path) = temp_db_path();
+        let stores = SqliteMobStores::open(&path).unwrap();
+        wait_for_watch_registrations(&path);
+        let catch_up = registered_catch_up(&path);
+        let events = stores.event_store();
+        // Dropping the park releases the read on every way out of this test:
+        // the runtime's shutdown waits for blocking work.
+        let mut parked = park_next_store_read_for_test(&path);
+        let read = tokio::spawn(async move { events.latest_cursor().await });
+        assert!(
+            tokio::time::timeout(OBSERVER_HANG_GUARD, parked.opened())
+                .await
+                .expect("the read reaches the park within the hang guard"),
+            "the read parks with its connection open"
+        );
+        read.abort();
+        assert!(read.await.unwrap_err().is_cancelled());
+        drop(stores);
+
+        assert_eq!(
+            drain_observers_within_hang_guard(&path),
+            Err(SqliteMobObserverDrainRefused::OtherOwners { owner_handles: 1 }),
+            "the cancelled read's blocking work still owns the observer"
+        );
+        assert!(!catch_up.is_closed(), "the refusal closed nothing");
+
+        parked.release();
+        let deadline = std::time::Instant::now() + OBSERVER_HANG_GUARD;
+        while catch_up.live_owner().is_some() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the released read returns within the hang guard"
+            );
+            tokio::time::sleep(Duration::from_millis(2)).await;
+        }
+        assert_eq!(
+            drain_observers_within_hang_guard(&path),
+            Ok(closed_report(true, 1, 0, false))
+        );
         drop(catch_up);
     }
 
@@ -14186,7 +14471,9 @@ mod tests {
         let encoded = encode_stored_mob_event(&stored).unwrap();
         let writer_path = path.clone();
 
-        run_sqlite_task(move || {
+        // A raw writer outside every store, as another process is: it owns
+        // no observer.
+        run_sqlite_task(None, move || {
             let mut conn = open_connection(&writer_path)?;
             let tx = begin_immediate(&mut conn)?;
             tx.execute(

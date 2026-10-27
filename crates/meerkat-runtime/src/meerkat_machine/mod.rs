@@ -12041,6 +12041,19 @@ impl MeerkatMachine {
         self.lock_session_registration_transaction(session_id).await
     }
 
+    /// Hold `session_id`'s session mutation gate until the guard drops, as a
+    /// run's finalization holds it, so a test can stand work that takes the
+    /// gate behind it. `None` when the session is not registered.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn hold_session_mutation_gate_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+        let gate = self.session_mutation_gate(session_id).await?;
+        Some(gate.lock_settled(SettledGateWait::TestFixture).await)
+    }
+
     #[cfg(test)]
     pub(crate) fn probe_next_session_registration_transaction_contention_for_test(
         &self,
@@ -14069,6 +14082,83 @@ impl MeerkatMachine {
         entry.composition_signal_dispatcher = Some(dispatcher);
         entry.composition_materialization_claim_id = None;
         Ok(true)
+    }
+
+    /// The operation registry of `session_id`'s registration when that
+    /// registration already serves exactly one member binding, read without
+    /// waiting on anything a run holds.
+    ///
+    /// `Some` only while the full binding restore (local session bindings,
+    /// then [`Self::recover_composition_signal_dispatcher`]) would leave the
+    /// registration as it is: an executor attached and live under an Active
+    /// registration that is durability ready; no unregister, stop cleanup or
+    /// predecessor settlement; no actor materialization claim in flight;
+    /// runtime bindings already issued; MeerkatMachine's active runtime
+    /// binding exactly `runtime_id`, `fence` and `generation`; and, when the
+    /// caller delivers composition signals, `dispatcher` already its open
+    /// composition endpoint. The attachment that adopted the registration
+    /// stamped its use, so a pending unregister of an earlier use cannot take
+    /// it over either.
+    ///
+    /// Read under the session map's read lock and the entry's synchronous
+    /// locks alone: it never takes the session mutation gate, the driver or
+    /// the registration transaction, so a run in flight (whose finalization
+    /// holds the gate) never holds it up. `None` otherwise; the caller then
+    /// takes the full restore.
+    pub async fn serving_member_binding_ops_registry(
+        &self,
+        session_id: &SessionId,
+        runtime_id: &dsl::AgentRuntimeId,
+        fence: dsl::FenceToken,
+        generation: Option<dsl::Generation>,
+        dispatcher: Option<&composition::MeerkatCompositionSignalDispatcher>,
+    ) -> Option<Arc<crate::ops_lifecycle::RuntimeOpsLifecycleRegistry>> {
+        let sessions = self.sessions.read().await;
+        let entry = sessions.get(session_id)?;
+        if entry.require_durability_ready().is_err()
+            || entry
+                .registration_blocked_by_unregister(session_id)
+                .is_some()
+            || !entry.generated_executor_registration_active()
+            || !entry.attachment_is_live()
+            || entry.canonical_runtime_bindings.is_none()
+        {
+            return None;
+        }
+        {
+            let authority = entry
+                .dsl_authority
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let state = authority.state();
+            if state.active_runtime_id.as_ref() != Some(runtime_id)
+                || state.active_fence_token != Some(fence)
+                || state.active_runtime_generation != generation
+            {
+                return None;
+            }
+        }
+        {
+            let claim = entry
+                .materialization_claim_state
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            if !matches!(
+                claim.phase,
+                crate::RuntimeActorMaterializationClaimPhase::Vacant
+                    | crate::RuntimeActorMaterializationClaimPhase::RetainedActor
+            ) {
+                return None;
+            }
+        }
+        if let Some(dispatcher) = dispatcher {
+            let current = entry.composition_signal_dispatcher.as_ref()?;
+            if !Arc::ptr_eq(current, dispatcher) || dispatcher.transport_is_closed() != Some(false)
+            {
+                return None;
+            }
+        }
+        Some(Arc::clone(&entry.ops_lifecycle))
     }
 
     pub(crate) async fn apply_routed_meerkat_input_with_signal_dispatcher(

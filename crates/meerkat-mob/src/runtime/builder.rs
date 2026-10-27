@@ -392,10 +392,55 @@ impl OrchestratorResumeNotification {
     /// orchestrator's turn: a local AutonomousHost notification is a queued
     /// injection. A local TurnDriven or placed notification runs the
     /// orchestrator's whole turn.
-    fn realizes_without_a_turn(&self) -> bool {
+    pub(super) fn realizes_without_a_turn(&self) -> bool {
         self.placed_turn_context.is_none()
             && self.runtime_mode == crate::MobRuntimeMode::AutonomousHost
     }
+}
+
+/// A resume notification that runs the orchestrator's turn, as the actor's
+/// lifecycle owner holds it (`MobActor::lifecycle_tasks`): no resume awaits
+/// it, since its model and tool work may need the very restore that resume
+/// is part of (a mob tool that spawns, wires, lists or restores). The owner
+/// joins it and surfaces its typed failure like every other orchestrator
+/// lifecycle delivery. A delivery failure is also recorded as a mob event
+/// naming the planned target, so a host observes it through the ordinary
+/// event channel after the resume has returned. The realization ends at the
+/// notification input's terminal, so the event is recorded once, after the
+/// runtime's bounded retries, and never for a notification a retry delivers.
+/// The cold resume and the explicit resume (the lift) both hand their turn
+/// notifications here.
+pub(super) async fn realize_orchestrator_resume_notification_turn(
+    plan: OrchestratorResumeNotification,
+    session_service: Arc<dyn MobSessionService>,
+    provisioner: Arc<dyn MobProvisioner>,
+    emitter: super::events::MobEventEmitter,
+) -> Result<(), MobError> {
+    let member_id = plan.member_id.clone();
+    let session_id = plan.bridge_session_id.clone();
+    let outcome = realize_planned_orchestrator_resume_notification(
+        plan,
+        session_service.as_ref(),
+        provisioner.as_ref(),
+    )
+    .await;
+    if let Err(error) = &outcome
+        && let Err(record_error) = emitter
+            .orchestrator_resume_notification_failed(
+                member_id.clone(),
+                session_id,
+                error.to_string(),
+            )
+            .await
+    {
+        tracing::warn!(
+            member_id = %member_id,
+            error = %error,
+            record_error = %record_error,
+            "orchestrator resume notification failure could not be recorded"
+        );
+    }
+    outcome
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -11397,48 +11442,20 @@ impl MobBuilder {
             }
             // Resume notifications that run an orchestrator turn, planned by
             // the resume reconcile: the actor's lifecycle owner holds each one
-            // from here, joins it, and surfaces its typed failure like every
-            // other orchestrator lifecycle delivery.
-            // A delivery failure is also recorded as a mob event naming the
-            // planned target, so a host observes it through the ordinary
-            // event channel after the resume has returned. The realization
-            // ends at the notification input's terminal, so the event is
-            // recorded once, after the runtime's bounded retries, and never
-            // for a notification a retry delivers.
+            // from here (`realize_orchestrator_resume_notification_turn`).
             for plan in deferred_orchestrator_resume_notifications {
-                let session_service = Arc::clone(&actor.session_service);
-                let provisioner = Arc::clone(&actor.provisioner);
                 let emitter = super::events::MobEventEmitter::new(
                     Arc::clone(&actor.events),
                     actor.definition.id.clone(),
                 );
-                actor.lifecycle_tasks.spawn(async move {
-                    let member_id = plan.member_id.clone();
-                    let session_id = plan.bridge_session_id.clone();
-                    let outcome = realize_planned_orchestrator_resume_notification(
+                actor
+                    .lifecycle_tasks
+                    .spawn(realize_orchestrator_resume_notification_turn(
                         plan,
-                        session_service.as_ref(),
-                        provisioner.as_ref(),
-                    )
-                    .await;
-                    if let Err(error) = &outcome
-                        && let Err(record_error) = emitter
-                            .orchestrator_resume_notification_failed(
-                                member_id.clone(),
-                                session_id,
-                                error.to_string(),
-                            )
-                            .await
-                    {
-                        tracing::warn!(
-                            member_id = %member_id,
-                            error = %error,
-                            record_error = %record_error,
-                            "orchestrator resume notification failure could not be recorded"
-                        );
-                    }
-                    outcome
-                });
+                        Arc::clone(&actor.session_service),
+                        Arc::clone(&actor.provisioner),
+                        emitter,
+                    ));
             }
             let actor_task_end = ActorTaskEndGuard {
                 observations: Some(Arc::clone(&handle.lifecycle_observations)),

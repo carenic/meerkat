@@ -22,6 +22,9 @@ pub use realm_profile::{RealmProfileStore, StoredRealmProfile};
 pub(crate) use sqlite::{IDENTITY_RUNTIME_WRITE_FENCE_WAIT, identity_fence_test_hooks};
 #[cfg(not(target_arch = "wasm32"))]
 pub(crate) use sqlite::{MemberBindingStoreRead, read_member_binding_store_at};
+#[cfg(all(any(test, feature = "test-support"), not(target_arch = "wasm32")))]
+#[doc(hidden)]
+pub use sqlite::{ParkedStoreReadForTest, StoreReadReleaseForTest, park_next_store_read_for_test};
 #[cfg(not(target_arch = "wasm32"))]
 pub use sqlite::{
     SqliteForkedParticipantStore, SqliteMobEventStore, SqliteMobIdentityStatusStore,

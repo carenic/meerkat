@@ -5332,12 +5332,84 @@ async fn pause_before_startup_binding_restore_if_armed(mob_id: &MobId) {
     }
 }
 
+/// One armed hold of a lift's operation binding of one member: the binding
+/// reports reaching it, then waits for its release.
+#[cfg(test)]
+type ExplicitResumeMemberBindingHold = (oneshot::Sender<()>, oneshot::Receiver<()>);
+
+#[cfg(test)]
+static HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), ExplicitResumeMemberBindingHold>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+/// Test seam: the next explicit resume of `mob_id` holds its post-commit
+/// operation binding of `member` before that binding starts (a gated step of
+/// the lift's post-commit work). The receiver resolves once the binding
+/// reached the hold; sending on, or dropping, the sender releases it.
+#[cfg(test)]
+pub(super) fn hold_explicit_resume_member_binding_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
+    let (entered_tx, entered_rx) = oneshot::channel();
+    let (release_tx, release_rx) = oneshot::channel();
+    HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((mob_id.clone(), member.clone()), (entered_tx, release_rx));
+    (entered_rx, release_tx)
+}
+
+/// The hold armed for `member`'s post-commit operation binding in `mob_id`,
+/// taken once.
+#[cfg(test)]
+fn take_explicit_resume_member_binding_hold_for_test(
+    mob_id: &MobId,
+    member: &AgentIdentity,
+) -> Option<ExplicitResumeMemberBindingHold> {
+    HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(mob_id.clone(), member.clone()))
+}
+
 /// How many times a startup restore took each member's stopped registration
 /// over, per mob.
 #[cfg(test)]
 static STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST: std::sync::Mutex<
     BTreeMap<(MobId, AgentIdentity), u64>,
 > = std::sync::Mutex::new(BTreeMap::new());
+
+/// How many times a lift bound each member through the serving-binding path
+/// (its registration already served the binding, so only its owner context
+/// was restored), per mob.
+#[cfg(any(test, feature = "test-support"))]
+static EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), u64>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+fn record_explicit_resume_served_binding_for_test(mob_id: &MobId, member: &AgentIdentity) {
+    *EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((mob_id.clone(), member.clone()))
+        .or_default() += 1;
+}
+
+/// Test read: how many times a lift of `mob_id` bound `member` through the
+/// serving-binding path, without the lanes a member's run holds. Rows read
+/// it before and after a lift and compare.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn explicit_resume_served_bindings_for_test(mob_id: &MobId, member: &AgentIdentity) -> u64 {
+    EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(mob_id.clone(), member.clone()))
+        .copied()
+        .unwrap_or_default()
+}
 
 #[cfg(all(test, feature = "runtime-adapter"))]
 fn record_startup_registration_takeover_for_test(mob_id: &MobId, member: &AgentIdentity) {
@@ -18523,11 +18595,43 @@ impl MobActor {
         let ready: Vec<_> = self
             .member_admission_lanes
             .iter()
-            .filter(|(_, lane)| lane.inflight.is_none() && !lane.parked.is_empty())
+            .filter(|(_, lane)| {
+                lane.inflight.is_none()
+                    && lane
+                        .parked
+                        .front()
+                        .is_some_and(|head| !self.explicit_resume_parks_member_admission(head))
+            })
             .map(|(identity, _)| identity.clone())
             .collect();
         for identity in ready {
             self.start_next_member_admission(&identity);
+        }
+    }
+
+    /// Whether the explicit resume keeps `pending` parked. Work a member's run
+    /// can wait on (its submitted work) waits only for the resume's topology
+    /// reconciliation, never for its post-commit work: that work waits on no
+    /// member run, and keeping run-facing work out of it is defence in depth
+    /// should it ever wait on one again. A registration reload waits for the
+    /// resume's whole member work.
+    fn explicit_resume_parks_member_admission(&self, pending: &ParkedMemberTurnAdmission) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            match pending {
+                ParkedMemberTurnAdmission::SubmitWorkPump(_) => {
+                    self.resume_topology_mutation_pending()
+                }
+                ParkedMemberTurnAdmission::Reload { .. } => {
+                    self.explicit_resume_member_work_fenced()
+                }
+                _ => false,
+            }
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = pending;
+            false
         }
     }
 
@@ -18609,11 +18713,7 @@ impl MobActor {
     fn spawn_member_turn_admission(&mut self, pending: ParkedMemberTurnAdmission) {
         let agent_identity = pending.agent_identity().clone();
         #[cfg(feature = "runtime-adapter")]
-        if matches!(
-            &pending,
-            ParkedMemberTurnAdmission::Reload { .. } | ParkedMemberTurnAdmission::SubmitWorkPump(_)
-        ) && self.resume_topology_mutation_pending()
-        {
+        if self.explicit_resume_parks_member_admission(&pending) {
             #[cfg(test)]
             let is_reload = matches!(&pending, ParkedMemberTurnAdmission::Reload { .. });
             let lane = self
@@ -31710,9 +31810,11 @@ impl MobActor {
         let wiring_io_pending = !self.wiring_io_tasks.is_empty();
         let member_effect_pending = !self.member_effect_tasks.is_empty();
         let identity_reconcile_pending = !self.identity_reconcile_queue.is_empty();
+        // The identity reconcile waits for an explicit resume's whole member
+        // work: its topology reconciliation and its post-commit work.
         #[cfg(feature = "runtime-adapter")]
         let identity_reconcile_pending =
-            identity_reconcile_pending && !self.resume_topology_mutation_pending();
+            identity_reconcile_pending && !self.explicit_resume_member_work_fenced();
         // A Shutdown parked on its runtime teardown releases members' identity
         // leases from there: no reconcile pass claims one again meanwhile.
         let identity_reconcile_pending =
@@ -32984,6 +33086,33 @@ impl MobActor {
         } = plan;
         let local_member_owner = placed_operation.is_none()
             && entry.member_ref.bridge_session_id() == Some(&generated_owner_session_id);
+        // The lift binds a member whose registration already serves this
+        // exact binding (attached and live, as a member with a run in flight
+        // always is) by restoring its owner context alone. The full restore
+        // below would change nothing else for it, and it queues behind lanes
+        // a member's run holds or serializes (the session's mutation gate,
+        // which the run's finalization holds, the runtime driver and the
+        // registration transaction): a lift must never wait on a member's
+        // run. The check reads MeerkatMachine's registration and binding
+        // state, and the actor's mechanical presence, without taking any of
+        // those lanes.
+        if seam == RestoredOperationBindingSeam::ExplicitResumePostCommit
+            && local_member_owner
+            && let Some(ops_registry) =
+                Self::serving_member_binding_registry(&io, &entry, &generated_owner_session_id)
+                    .await?
+        {
+            io.provisioner
+                .restore_member_owner_context_for_explicit_resume(
+                    &entry.member_ref,
+                    generated_owner_session_id,
+                    ops_registry,
+                )
+                .await?;
+            #[cfg(any(test, feature = "test-support"))]
+            record_explicit_resume_served_binding_for_test(&io.mob_id, &entry.agent_identity);
+            return Ok(RestoredOperationBinding::Restored);
+        }
         // Operation restoration must not resurrect an absent local session.
         // Broken cleanup and completed archive publication retain their exact
         // MobMachine journal authority without a fabricated runtime residue.
@@ -33228,6 +33357,44 @@ impl MobActor {
             // current: nothing changed, and the ordinary restore decides.
             _ => Ok(None),
         }
+    }
+
+    /// The operation registry of a member whose session actor is registered
+    /// and whose runtime registration already serves the member's exact
+    /// generated binding (`MeerkatMachine::serving_member_binding_ops_registry`),
+    /// for the lift's operation binding. `None` when either does not hold;
+    /// the full restore then runs. Mechanical presence and machine state
+    /// reads alone: never a lane a member's run holds.
+    #[cfg(feature = "runtime-adapter")]
+    async fn serving_member_binding_registry(
+        io: &ResumeOperationBindingIo,
+        entry: &RosterEntry,
+        session_id: &SessionId,
+    ) -> Result<Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>, MobError> {
+        if !io
+            .session_service
+            .live_session_actor_registered(session_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        let dispatcher = io.provisioner.composition_signal_dispatcher();
+        let registry = io
+            .adapter
+            .serving_member_binding_ops_registry(
+                session_id,
+                &meerkat_runtime::meerkat_machine::dsl::AgentRuntimeId::from(
+                    entry.agent_runtime_id.to_string(),
+                ),
+                meerkat_runtime::meerkat_machine::dsl::FenceToken::from(entry.fence_token.get()),
+                Some(meerkat_runtime::meerkat_machine::dsl::Generation::from(
+                    entry.generation.get(),
+                )),
+                dispatcher.as_ref(),
+            )
+            .await;
+        Ok(registry
+            .map(|registry| registry as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>))
     }
 
     #[cfg(feature = "runtime-adapter")]
@@ -33617,14 +33784,15 @@ impl MobActor {
 
     /// The deferred custody re-attempts share the identity reconcile's backoff
     /// deadline wake: the time until the earliest due entry, or `None` with no
-    /// entry, or while a Shutdown's runtime teardown or a resume's topology
-    /// mutation is in progress.
+    /// entry, or while a Shutdown's runtime teardown or an explicit resume's
+    /// member work (its topology reconciliation and its post-commit work) is
+    /// in progress.
     fn deferred_member_custody_next_wait(&self) -> Option<Duration> {
         if self.pending_shutdown_teardown.is_some() {
             return None;
         }
         #[cfg(feature = "runtime-adapter")]
-        if self.resume_topology_mutation_pending() {
+        if self.explicit_resume_member_work_fenced() {
             return None;
         }
         self.deferred_member_custody.next_wait(Instant::now())
