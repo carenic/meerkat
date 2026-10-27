@@ -1,7 +1,8 @@
 //! Boot-side rows of member residency (design section 13): the lazy start
 //! (R20, R21, R25), reads that never wake (R26, R47), the verified pass
-//! (R48, R48n), wiring with dormant members (R28, H-D), seats (R13, R64,
-//! R94, R115) and rotation (R62). They run on the combined candidate: the
+//! (R48, R48n), wiring with dormant members (R28, H-D, and external peers),
+//! retiring and destroying dormant members (R27), seats (R13, R64, R94,
+//! R115) and rotation (R62). They run on the combined candidate: the
 //! machine, the wake path and the boot path together.
 
 use super::*;
@@ -336,6 +337,259 @@ async fn r28_wiring_dormant_members_wakes_neither() {
             "{identity}"
         );
     }
+}
+
+/// R28 for external peers: wiring and unwiring a dormant member's external
+/// peers commit the machine edges and their events without waking it (the
+/// verdict owes a member that is not materialized no trust row), and its
+/// wake installs the row of the edge the machine still holds, not the row
+/// of the edge it no longer holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r28e_external_peer_wiring_of_a_dormant_member_wakes_nothing() {
+    let mob = CrashedMob::new("r28e-dormant-external", 2, false, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    let member = worker(0);
+    let kept = test_trusted_peer_descriptor(
+        "remote-mob/worker/r28e-kept",
+        "inproc://remote-mob/worker/r28e-kept",
+    );
+    let dropped = test_trusted_peer_descriptor(
+        "remote-mob/worker/r28e-dropped",
+        "inproc://remote-mob/worker/r28e-dropped",
+    );
+    for external in [&kept, &dropped] {
+        tokio::time::timeout(
+            LAZY_STEP,
+            handle.wire(member.clone(), PeerTarget::External(external.clone())),
+        )
+        .await
+        .expect("the wire answers")
+        .expect("wire a dormant member to an external peer");
+    }
+    tokio::time::timeout(
+        LAZY_STEP,
+        handle.unwire(member.clone(), AgentIdentity::from(dropped.name.as_str())),
+    )
+    .await
+    .expect("the unwire answers")
+    .expect("unwire a dormant member from an external peer");
+    assert!(
+        mob.materialized().await.is_empty(),
+        "no wiring verb woke the member: {:?}",
+        mob.materialized().await
+    );
+    assert_eq!(
+        phase_of(&handle, &member),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+    let edge = |peer: &TrustedPeerDescriptor| {
+        dsl::ExternalPeerEdge::new(
+            dsl::AgentIdentity::from_domain(&member),
+            dsl::ExternalPeerEndpoint::from(peer),
+        )
+    };
+    let edges = handle
+        .machine_state_watch_rx
+        .borrow()
+        .external_peer_edges
+        .clone();
+    assert!(edges.contains(&edge(&kept)), "{edges:?}");
+    assert!(!edges.contains(&edge(&dropped)), "{edges:?}");
+    let events = mob.events.replay_all().await.expect("replay the journal");
+    let wired = events
+        .iter()
+        .filter(|event| matches!(event.kind, MobEventKind::ExternalPeerWired { .. }))
+        .count();
+    let unwired = events
+        .iter()
+        .filter(|event| matches!(event.kind, MobEventKind::ExternalPeerUnwired { .. }))
+        .count();
+    assert_eq!((wired, unwired), (2, 1), "each verb is journaled once");
+
+    handle
+        .member(&member)
+        .await
+        .expect("a member handle")
+        .send("first touch", HandlingMode::Queue)
+        .await
+        .expect("the delivery wakes the member and is accepted");
+    assert_eq!(
+        phase_of(&handle, &member),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+    let trusted = mob.service.trusted_peer_names(&mob.session(0)).await;
+    assert!(
+        trusted.iter().any(|name| name == kept.name.as_str()),
+        "the wake installs the held edge's row: {trusted:?}"
+    );
+    assert!(
+        !trusted.iter().any(|name| name == dropped.name.as_str()),
+        "the wake installs no row for the edge the machine no longer holds: {trusted:?}"
+    );
+}
+
+/// The MemberRetired rows the journal holds for `identity`.
+async fn retired_rows(events: &Arc<dyn MobEventStore>, identity: &AgentIdentity) -> usize {
+    events
+        .replay_all()
+        .await
+        .expect("replay the journal")
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == identity
+            )
+        })
+        .count()
+}
+
+/// R27: after a restart, a dormant member is retired without waking it.
+/// MobMachine retires it archive-only: no runtime retire is routed to the
+/// session no runtime holds, its durable session is archived, nothing is
+/// materialized, and its wired peer stays dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r27_a_dormant_member_is_retired_after_a_restart_without_waking() {
+    let mob = CrashedMob::new("r27-dormant-retire", 3, true, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    let retiring = worker(1);
+    assert_eq!(
+        phase_of(&handle, &retiring),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+    tokio::time::timeout(LAZY_STEP, handle.retire(retiring.clone()))
+        .await
+        .expect("the retirement answers")
+        .expect("the dormant member is retired");
+    assert!(
+        handle
+            .get_member(&retiring)
+            .await
+            .expect("read the roster")
+            .is_none(),
+        "the retired member left the roster"
+    );
+    assert!(
+        mob.service.test_is_session_archived(&mob.session(1)).await,
+        "its durable session is archived"
+    );
+    assert!(
+        mob.materialized().await.is_empty(),
+        "nothing was materialized: {:?}",
+        mob.materialized().await
+    );
+    for identity in [worker(0), worker(2)] {
+        assert_eq!(
+            phase_of(&handle, &identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity} stays dormant"
+        );
+    }
+    let state = handle.machine_state_watch_rx.borrow().clone();
+    assert!(state.wiring_edges.is_empty(), "its edge left with it");
+    assert!(
+        state.runtime_retire_archive_only.is_empty(),
+        "the retirement's terminal closed it"
+    );
+    assert_eq!(retired_rows(&mob.events, &retiring).await, 1);
+}
+
+/// R27: after a restart, a mob whose members are all dormant is destroyed
+/// without waking any of them: every member's durable session is archived
+/// and nothing is materialized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r27_a_mob_of_dormant_members_is_destroyed_after_a_restart_without_waking() {
+    let mob = CrashedMob::new("r27-dormant-destroy", 3, true, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    tokio::time::timeout(LAZY_STEP, handle.destroy())
+        .await
+        .expect("the destroy answers")
+        .expect("the mob of dormant members is destroyed");
+    for (identity, session) in &mob.sessions {
+        assert!(
+            mob.service.test_is_session_archived(session).await,
+            "{identity}'s durable session is archived"
+        );
+    }
+    assert!(
+        mob.materialized().await.is_empty(),
+        "nothing was materialized: {:?}",
+        mob.materialized().await
+    );
+}
+
+/// R27: a retirement that started before a crash and could not archive is
+/// recovered archive-only by the restart: its member is not materialized,
+/// no runtime retire is routed to its session, and the start's re-drive
+/// archives the session and journals the retirement once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn r27_a_retirement_recovered_at_a_restart_completes_archive_only() {
+    let definition = with_unique_mob_id(sample_definition(), "r27-recovered-retirement");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(definition, storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let retiring = worker(0);
+    handle
+        .spawn_spec(turn_driven(&retiring))
+        .await
+        .expect("spawn a worker");
+    let session = handle
+        .resolve_bridge_session_id(&retiring)
+        .await
+        .expect("a session-backed worker");
+    service.set_archive_failure(&session).await;
+    handle
+        .retire(retiring.clone())
+        .await
+        .expect_err("the failing archive leaves the retirement started");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    let resumed = tokio::time::timeout(
+        LAZY_STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events.clone(),
+                runtime_metadata,
+            ))
+            .with_session_service(restarted.clone())
+            .notify_orchestrator_on_resume(false)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the restart answers")
+    .expect("the restart succeeds");
+    tokio::time::timeout(LAZY_STEP, async {
+        while resumed
+            .get_member(&retiring)
+            .await
+            .expect("read the roster")
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the start's re-drive completes the recovered retirement");
+    assert!(
+        restarted.test_is_session_archived(&session).await,
+        "the recovered retirement archived the session"
+    );
+    assert!(
+        restarted.recorded_create_requests().await.is_empty(),
+        "the restart materialized nothing for the retiring member"
+    );
+    assert_eq!(retired_rows(&events, &retiring).await, 1);
 }
 
 /// A running mob over the mock service, for seats and rotations.

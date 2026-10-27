@@ -1333,10 +1333,13 @@ impl MobActor {
         if super::super::member_runtime_is_host_owned(
             self.dsl_authority.state(),
             &continuation.entry.agent_identity,
-        ) {
+        ) || self.runtime_retire_archive_only(&continuation.entry.agent_runtime_id)
+        {
             // A retiring placed member's external trust rows live on its host
             // and die with the exact ReleaseMember, exactly like its
             // member-member rows: there is no local comms runtime to observe.
+            // An archive-only retirement's member holds no row of its own in
+            // this process (MobMachine refuses its trust-bearing cleanup).
             continuation.external_comms = None;
             self.retirement_next_external_edge(continuation).await;
             return;
@@ -3186,7 +3189,11 @@ impl MobActor {
         let member = continuation.entry.member_ref.clone();
         let identity = identity.clone();
         let deadline = continuation.deadline;
-        let registration_refused = continuation.registration_refused;
+        // A host-refused member, and one MobMachine retires archive-only (no
+        // runtime of this process holds its session), may hold no owner
+        // operation binding here.
+        let archive_only = continuation.registration_refused
+            || self.runtime_retire_archive_only(&continuation.entry.agent_runtime_id);
         let observation = RetirementArchiveObservationSource {
             service: self.session_service.clone(),
             #[cfg(feature = "runtime-adapter")]
@@ -3212,9 +3219,9 @@ impl MobActor {
                             "injected session archive failure".to_string(),
                         ));
                     }
-                    let result = if registration_refused {
+                    let result = if archive_only {
                         provisioner
-                            .retire_refused_member(&member, &identity, Some(deadline))
+                            .retire_member_archive_only(&member, &identity, Some(deadline))
                             .await
                     } else {
                         provisioner
