@@ -54216,6 +54216,8 @@ impl MobActor {
             .await);
         }
         report.events_cleared = true;
+        // The handles' member binding fold folded the journal just cleared.
+        self.member_binding_fold.clear();
         boxed_arm_future(|| self.edge_locks.clear()).await;
         if report.remote_cleanup_deadline_exceeded
             || !report.orphaned_remote_members.is_empty()

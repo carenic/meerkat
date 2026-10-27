@@ -1029,6 +1029,24 @@ impl MemberBindingFoldCache {
             *fold = next.clone();
         }
     }
+
+    /// Forget the kept fold. The destroy that clears the mob's journal calls
+    /// it, so no fold of the removed journal outlives it. A read in flight
+    /// across the clear may keep its fold of the removed journal again; the
+    /// next read finds that fold's last event gone and folds the journal
+    /// whole, so no answer depends on this call.
+    pub(crate) fn clear(&self) {
+        *self
+            .fold
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = MemberBindingFold::default();
+    }
+
+    /// The journal cursor of the kept fold (0 when none is kept).
+    #[cfg(test)]
+    pub(crate) fn kept_cursor(&self) -> u64 {
+        self.cached().cursor
+    }
 }
 
 /// One mob's member binding history: one fold of its durable journal, read

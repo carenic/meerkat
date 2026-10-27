@@ -13236,6 +13236,29 @@ async fn a_second_member_binding_history_read_reads_only_the_journal_tail() {
     assert_eq!(format!("{second:?}"), format!("{reference:?}"));
 }
 
+// A destroy forgets the member binding fold the mob's handles kept, with the
+// journal it clears.
+#[tokio::test]
+async fn a_destroy_forgets_the_kept_member_binding_fold() {
+    let (handle, _service) = create_test_mob(sample_definition()).await;
+    let history = handle
+        .member_binding_history()
+        .await
+        .expect("read the member binding history");
+    assert!(history.journal_cursor() > 0, "the create wrote the journal");
+    assert_eq!(
+        handle.member_binding_fold.kept_cursor(),
+        history.journal_cursor(),
+        "the read kept its fold"
+    );
+    handle.destroy().await.expect("destroy");
+    assert_eq!(
+        handle.member_binding_fold.kept_cursor(),
+        0,
+        "the destroy forgot the fold"
+    );
+}
+
 /// One structural event of `handle`'s mob that carries no remote-turn work.
 async fn append_quiet_event(handle: &MobHandle) {
     handle
