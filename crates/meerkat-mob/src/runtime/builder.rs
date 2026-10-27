@@ -12468,11 +12468,14 @@ pub(super) async fn restore_resumed_member(
     // this member's restore with the refusal as its diagnostic; the rest of
     // the mob still comes up, and the member is restored once the customizer
     // admits it.
-    let restore_spec = match super::fork_build::rebuild_resume_spec(
+    // A seat's build inputs are set on the request before the customizer,
+    // as a spawn's caller sets a spawn's: the customizer runs over them.
+    let restore_spec = match super::fork_build::rebuild_seat_resume_spec(
         &definition.id,
         spawn_member_customizer.as_ref(),
         entry,
         &restore_view,
+        candidate.seat_build.as_deref(),
     ) {
         Ok(spec) => spec,
         Err(error) => {
