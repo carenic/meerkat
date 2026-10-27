@@ -3856,6 +3856,29 @@ impl SessionRuntime {
         Ok(true)
     }
 
+    /// A session-keyed live operation (a turn, a live channel) on a session
+    /// no runtime registration serves asks the session's owner first: a mob
+    /// that holds the session's member dormant wakes it
+    /// ([`meerkat_core::session_owner_wake`]), so this surface never attaches
+    /// a member's session on its own. A session no owner holds, or one its
+    /// owner no longer binds, proceeds as before. Call it before any session
+    /// lock or turn boundary: the member's wake resumes the session itself.
+    pub(crate) async fn wake_session_owner_if_unserved(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<(), RpcError> {
+        if self.runtime_adapter.contains_session(session_id).await {
+            return Ok(());
+        }
+        match meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global()
+            .wake(session_id)
+            .await
+        {
+            None | Some(Ok(_)) => Ok(()),
+            Some(Err(error)) => Err(session_error_to_rpc(error)),
+        }
+    }
+
     /// Resolve a crash-window provisional tail before this host starts or
     /// attaches `session_id` (see
     /// [`PersistentSessionService::prepare_cold_attach`]). Called at every
@@ -9063,6 +9086,9 @@ impl SessionRuntime {
                 data: None,
             });
         }
+        // A dormant mob member's session is woken by its owner before this
+        // surface would attach the session on its own.
+        self.wake_session_owner_if_unserved(session_id).await?;
         self.prepare_cold_attach(session_id).await?;
         self.reject_archived_persisted_session_without_live(session_id)
             .await?;

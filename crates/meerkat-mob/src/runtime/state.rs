@@ -877,6 +877,32 @@ pub(super) enum MobCommand {
         scope: super::actor::MemberLiveRevivalScope,
         reply_tx: oneshot::Sender<Result<super::actor::MemberLiveRevivalOutcome, MobError>>,
     },
+    /// A wake of a seated member that a delivery needs: MobMachine's
+    /// `WakeMember` verdict, then, when the wake is authorized or joined, an
+    /// answer once the member is ready. Peer sends reach it through the
+    /// mob's inproc wake routes; host deliveries and operators wake on the
+    /// actor directly.
+    WakeMember {
+        agent_identity: AgentIdentity,
+        cause: mob_dsl::MemberWakeCause,
+        observed_missing: bool,
+        input_class: mob_dsl::PeerInputClass,
+        sender_waking: bool,
+        reply_tx: super::actor::member_wake::MemberWakeReply,
+    },
+    /// Internal: the mob's wake bound for one wake attempt ended.
+    MemberWakeTimedOut {
+        agent_identity: AgentIdentity,
+        attempt: u64,
+    },
+    /// Internal: the retry of a member whose boot work is still owed is due.
+    RetryOwedMemberWake { agent_identity: AgentIdentity },
+    /// Release a live member's materialization, keeping it seated
+    /// ([`super::handle::MobHandle::release_member`]).
+    ReleaseMember {
+        agent_identity: AgentIdentity,
+        reply_tx: oneshot::Sender<Result<(), MobError>>,
+    },
     /// Internal re-entry carrying the settled recovery, and the readiness
     /// step, of one member a Running start left out (a stopped registration
     /// it took over, or one that needed a durability reload). Boxed so the
@@ -1993,6 +2019,11 @@ impl MobCommand {
             #[cfg(test)]
             Self::MemberStatusLaneProbe { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ReviveMemberLiveMaterialization { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::WakeMember { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::ReleaseMember { .. } => ShutdownAnswerClass::CallerRequest,
+            Self::MemberWakeTimedOut { .. } | Self::RetryOwedMemberWake { .. } => {
+                ShutdownAnswerClass::ActorCompletion
+            }
             Self::ReloadMemberRegistration { .. } => ShutdownAnswerClass::CallerRequest,
             #[cfg(feature = "openai-live")]
             Self::StartLiveBridgeOperation { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2175,6 +2206,10 @@ impl MobCommand {
             Self::PolicySpawnSettled { .. } => "PolicySpawnSettled",
             Self::MemberTurnAdmissionSettled { .. } => "MemberTurnAdmissionSettled",
             Self::ReviveMemberLiveMaterialization { .. } => "ReviveMemberLiveMaterialization",
+            Self::WakeMember { .. } => "WakeMember",
+            Self::MemberWakeTimedOut { .. } => "MemberWakeTimedOut",
+            Self::RetryOwedMemberWake { .. } => "RetryOwedMemberWake",
+            Self::ReleaseMember { .. } => "ReleaseMember",
             Self::StartupMemberRecovered { .. } => "StartupMemberRecovered",
             Self::ReloadMemberRegistration { .. } => "ReloadMemberRegistration",
             Self::ResumeLifecycleReadinessResolved { .. } => "ResumeLifecycleReadinessResolved",

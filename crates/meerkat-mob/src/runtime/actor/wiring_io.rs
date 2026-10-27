@@ -106,6 +106,31 @@ impl PreparedWiring {
         self.plan.members()
     }
 
+    /// The (sender, recipient) pair of every lifecycle notice this plan
+    /// sends: the sender is the step's owner (whose comms carries it), the
+    /// recipient its counterpart.
+    fn notice_pairs(&self) -> Vec<(AgentIdentity, AgentIdentity)> {
+        self.steps
+            .iter()
+            .filter_map(|step| match step {
+                WiringStep::Notify {
+                    owner, counterpart, ..
+                } => Some((owner.clone(), counterpart.clone())),
+                WiringStep::AddTrust { .. } | WiringStep::RemoveTrust { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Keep only the lifecycle notices in `deliver`; trust steps stay.
+    fn retain_notices(&mut self, deliver: &BTreeSet<(AgentIdentity, AgentIdentity)>) {
+        self.steps.retain(|step| match step {
+            WiringStep::Notify {
+                owner, counterpart, ..
+            } => deliver.contains(&(owner.clone(), counterpart.clone())),
+            WiringStep::AddTrust { .. } | WiringStep::RemoveTrust { .. } => true,
+        });
+    }
+
     /// Stable lane name for logs and typed uncertainty reasons.
     pub(in crate::runtime) fn context(&self) -> &'static str {
         self.plan.context()
@@ -855,7 +880,8 @@ impl MobActor {
         match command {
             MobCommand::Retire { agent_identity, .. }
             | MobCommand::Respawn { agent_identity, .. }
-            | MobCommand::ReloadMemberRegistration { agent_identity, .. } => {
+            | MobCommand::ReloadMemberRegistration { agent_identity, .. }
+            | MobCommand::ReleaseMember { agent_identity, .. } => {
                 self.wiring_effect_pending_for_member(agent_identity)
             }
             MobCommand::Wire { local, target, .. } | MobCommand::Unwire { local, target, .. } => {
@@ -993,6 +1019,7 @@ impl MobActor {
         prepared: PreparedWiring,
         reply: Option<WiringIoReply>,
     ) -> WiringIoTicket {
+        let prepared = self.classify_wiring_notices(prepared);
         let ticket = self.next_wiring_io_ticket();
         if self.member_effect_start_is_gated() {
             // Reciprocal graph fence is up: preserve the owned preparation
@@ -1003,6 +1030,36 @@ impl MobActor {
             return ticket;
         }
         self.start_prepared_wiring(ticket, prepared, reply)
+    }
+
+    /// R4: a plan's lifecycle notices are sent only where MobMachine's
+    /// disposition says `Deliver`. A notice to or from a member that is not
+    /// live is `Suppressed`: it wakes no one, and the member's trust, which
+    /// its wake realizes from the machine's edges, carries its content. A
+    /// classifier fault skips the notice (it is advisory) and is logged; the
+    /// trust steps always run.
+    fn classify_wiring_notices(&mut self, mut prepared: PreparedWiring) -> PreparedWiring {
+        let mut deliver = BTreeSet::new();
+        for (sender, recipient) in prepared.notice_pairs() {
+            match self.classify_peer_notice(&recipient, &sender, mob_dsl::PeerInputClass::Lifecycle)
+            {
+                Ok(mob_dsl::PeerNoticeDisposition::Deliver) => {
+                    deliver.insert((sender, recipient));
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        sender = %sender,
+                        recipient = %recipient,
+                        %error,
+                        "a wiring notice could not be classified; it is not sent"
+                    );
+                }
+            }
+        }
+        prepared.retain_notices(&deliver);
+        prepared
     }
 
     /// Start every queued wiring dispatch whose gate has cleared. Driven by
@@ -1171,6 +1228,7 @@ impl MobActor {
         &mut self,
         prepared: PreparedWiring,
     ) -> Result<(), MobError> {
+        let prepared = self.classify_wiring_notices(prepared);
         let realized = prepared.realize().await;
         self.commit_realized_wiring(realized).await
     }

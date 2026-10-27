@@ -35,11 +35,94 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- `comms/send` gains the closed error code `peer_wake_refused`
+  (`meerkat-contracts`: new variant `CommsSendErrorData::PeerWakeRefused { peer,
+  envelope_id, refusal, retryable, message }`; constructor
+  `CommsSendErrorData::peer_wake_refused`). A peer message to a member that is
+  seated but not materialized in its process now waits for the member's wake
+  inside the sender's own send budget (`CommsConfig::ack_timeout_secs`) and is
+  then delivered once through the ordinary receipt path; when the wake is
+  refused or does not finish, the send fails with this code instead of
+  `peer_not_found_or_not_trusted`. `peer_not_found_or_not_trusted` is now
+  reserved for peers that are not members. The refusal is the closed
+  `meerkat_core::comms::PeerWakeRefusal` (tagged on `kind`: `member_broken {
+  reason, hold }`, `member_retiring`, `mob_not_running`, `admission_closed`,
+  `wake_timed_out`, `mob_unavailable`, `materialization_lost`,
+  `non_authoritative_composition`, `host_preparation_pending`,
+  `resume_gate_unavailable`, `host_owned`, `lifecycle_origin_fenced`,
+  `sender_waking`). Every refusal means "not delivered": nothing was handed to
+  the recipient, so a retry cannot duplicate the message; `retryable` says
+  whether a retry can succeed. SDKs that parse the `comms/send` error vocabulary
+  closed must add the code (the Python and TypeScript SDKs do).
+- `meerkat-core`: `comms::SendError` gains `PeerWakeRefused { peer, envelope_id,
+  refusal }`, and `comms::PeerWakeRefusal` is new. `meerkat-comms`:
+  `inproc::InprocSendError` gains `WakeRefused(PeerWakeRefusal)`, and
+  `router::SendError` gains `PeerWakeRefused { envelope_id, refusal }`.
+- Behaviour: a peer message to a live member of a stopped mob is now refused
+  `peer_wake_refused { mob_not_running }`, the same answer a dormant member of a
+  stopped mob gives. Before, it was either delivered to an inbox no drain claimed
+  or answered as an unconfirmed (ambiguous) delivery. The stop closes each live
+  member's in-process route for peer ingress and the resume reopens it, so the
+  sender retries after the mob resumes.
+- Behaviour: `rkat resume` and the MCP server's `meerkat_resume` refuse a
+  mob member's session that no mob in their own process owns
+  (`SESSION_UNSUPPORTED`, the message names the member and its mob): deliver
+  to the member through its mob, which wakes it. Before, they rebuilt the
+  member's session outside its mob, without its wiring and tools. A session
+  whose mob runs in the same process is woken through the mob instead, as
+  every other session-keyed live operation is.
+- `meerkat-runtime`: `meerkat_machine::composition::MeerkatSeamSignal::RuntimeBound`
+  gains `runtime_epoch_id`, and the enum gains `RuntimeRegistrationReleased {
+  agent_runtime_id, fence_token, runtime_epoch_id }`. Every final unregister of
+  a session registration (the idle-executor teardown included) now publishes
+  the released registration to the mob that owns the session, once the
+  unregister committed; the mob demotes exactly that materialization of its
+  member to dormant, and a release for any other registration changes nothing.
+
 ### Added
 
+- `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
+  and `retract_wake_route` keep, per seated member, a route to the owner that
+  can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route
+  never delivers and never claims a name, and a live route always wins.
+  `CommsRuntime::close_inproc_route` and `reopen_inproc_route` (also on the
+  `meerkat-core` `CommsRuntime` trait, defaulting to no route) close a live
+  route for peer ingress and reopen it without rebuilding the runtime.
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
   `1` restores one member at a time, as before; `0` counts as `1`.
+- `meerkat-mob`: member wakes. A seated member that is not materialized in its
+  process (dormant) is materialized on its first delivery, through MobMachine's
+  wake verdict, and the delivery then proceeds as to a live member: a host
+  delivery (`MobHandle::start_work_*`, steer included), a peer message, a mob
+  peer message it sends, a continuation's address resolution, a session-keyed
+  live operation on its session, and `MobHandle::ensure_member_live`. Every
+  cause of one member joins one wake. A refused wake is typed:
+  `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
+  (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
+  boot restore records it. Reads never wake.
+- `meerkat-mob`: `MobHandle::release_member(identity)` makes a member dormant:
+  it releases the member's materialization in its process while the member is
+  quiescent, and keeps it seated at the same session, generation and fence;
+  its next delivery wakes it. A member being woken, or with work in flight, is
+  refused retryably (`MobError::LifecycleOperationPending`).
+- `meerkat-mob`: `MemberBuildPreparer` (with `MemberBuildPreparation`,
+  `MemberBuildPrepared`, `MemberBuildPreparationRefusal` and
+  `MemberBuildReport`): a host's preparation of each member build, asked once
+  per build right before the member's provision, on every wake and every
+  restore at a mob's start (`Prepared`, or `HoldUntilReleased`, which holds
+  the member's run starts until the host releases them; a retryable refusal
+  leaves the member dormant, a final one records it broken), and told the
+  built tool surface once the member is live (`member_built`).
+  `MemberWakeRetryBackoff` is the backoff of the retry of a member whose
+  boot work is still owed after its boot wake ended retryably.
+- `meerkat-core`: `session_owner_wake` (`SessionOwnerWakeRegistry`,
+  `SessionOwnerWaker`, `SessionOwnerWakeOutcome`): the process-wide registry
+  through which a session-keyed live operation on a session that has no live
+  actor asks the session's owner (a mob, for a dormant member's session) to
+  wake it first. Interrupts and reads never wake.
 
 ### Changed
 
@@ -89,6 +172,24 @@ them.
   required review settled as `ReviewUnavailable { UnsupportedEntry }`
   before any reviewer or consent, and a read-only member was refused every
   tool behind them.
+
+### Known limitations
+
+- A session-keyed live operation (a turn, a live channel, comms sent as the
+  member, a scheduled session target, a session-addressed delivery) whose
+  session belongs to a dormant mob member that cannot be woken has no typed
+  session error yet. A retryable wake refusal is reported as
+  `SessionError::Busy` (retry later); a final one as an internal agent error
+  whose message names the refusal. Do not parse that message: a typed form is
+  planned for the next release.
+- A durable job delivery to a dormant member whose wake is refused is never
+  settled: the row stays pending, in order, and is retried on later delivery
+  wakes, also for a broken member, so a repaired member still gets it.
+- A durable worker woken while its host's durable resume gate stays
+  unavailable still has its interrupted run settled as refused after the
+  runtime's attempts, and that run's own kept inputs are abandoned, as in
+  0.9.6. The delivery that woke the member is a new input and is not
+  abandoned with them.
 
 ## [0.9.6] - 2026-10-27
 

@@ -353,6 +353,96 @@ impl std::fmt::Display for MemberRuntimeDetachment {
     }
 }
 
+/// Why Core did not make a seated member ready for a host delivery that
+/// needed it (see [`MobError::MemberWakeRefused`]). A member whose restore
+/// failed is [`MobError::MemberRestoreFailed`] instead, and a non-member is
+/// [`MobError::MemberNotFound`]. Nothing was delivered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum MemberWakeRefusal {
+    /// The member is being retired.
+    Retiring,
+    /// The member is placed on a member host, which owns its materialization.
+    HostOwned,
+    /// The mob is not running (stopped, completed or destroyed).
+    MobNotRunning,
+    /// The mob is quiescing its lifecycle (completion or destroy).
+    LifecycleOriginFenced,
+    /// The mob is a candidate composition, which never materializes members.
+    NonAuthoritativeComposition,
+    /// The member's host has preparation pending for it (a first-boot row,
+    /// or its build preparation asked to be retried).
+    HostPreparationPending,
+    /// The member's durable resume gate was unavailable.
+    ResumeGateUnavailable,
+    /// The mob's wake bound (`MobBuilder::with_member_wake_timeout`) ended
+    /// before the member was ready. The member is dormant again.
+    WakeTimedOut,
+    /// The mob is shutting down and admits no new work.
+    AdmissionClosed,
+    /// The mob's actor exited while the wake waited.
+    MobUnavailable,
+}
+
+impl MemberWakeRefusal {
+    /// Whether the same delivery can succeed later without an operator
+    /// action. Every refusal is safe to retry: nothing was delivered.
+    pub fn is_retryable(self) -> bool {
+        match self {
+            Self::MobNotRunning
+            | Self::HostPreparationPending
+            | Self::ResumeGateUnavailable
+            | Self::WakeTimedOut
+            | Self::AdmissionClosed
+            | Self::MobUnavailable => true,
+            Self::Retiring
+            | Self::HostOwned
+            | Self::LifecycleOriginFenced
+            | Self::NonAuthoritativeComposition => false,
+        }
+    }
+
+    /// Stable snake_case token.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Retiring => "retiring",
+            Self::HostOwned => "host_owned",
+            Self::MobNotRunning => "mob_not_running",
+            Self::LifecycleOriginFenced => "lifecycle_origin_fenced",
+            Self::NonAuthoritativeComposition => "non_authoritative_composition",
+            Self::HostPreparationPending => "host_preparation_pending",
+            Self::ResumeGateUnavailable => "resume_gate_unavailable",
+            Self::WakeTimedOut => "wake_timed_out",
+            Self::AdmissionClosed => "admission_closed",
+            Self::MobUnavailable => "mob_unavailable",
+        }
+    }
+
+    /// The same refusal on the peer-message wire.
+    pub fn peer_refusal(self) -> meerkat_core::comms::PeerWakeRefusal {
+        use meerkat_core::comms::PeerWakeRefusal;
+        match self {
+            Self::Retiring => PeerWakeRefusal::MemberRetiring,
+            Self::HostOwned => PeerWakeRefusal::HostOwned,
+            Self::MobNotRunning => PeerWakeRefusal::MobNotRunning,
+            Self::LifecycleOriginFenced => PeerWakeRefusal::LifecycleOriginFenced,
+            Self::NonAuthoritativeComposition => PeerWakeRefusal::NonAuthoritativeComposition,
+            Self::HostPreparationPending => PeerWakeRefusal::HostPreparationPending,
+            Self::ResumeGateUnavailable => PeerWakeRefusal::ResumeGateUnavailable,
+            Self::WakeTimedOut => PeerWakeRefusal::WakeTimedOut,
+            Self::AdmissionClosed => PeerWakeRefusal::AdmissionClosed,
+            Self::MobUnavailable => PeerWakeRefusal::MobUnavailable,
+        }
+    }
+}
+
+impl std::fmt::Display for MemberWakeRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
 /// The member registration hook call that refused a member's registration.
 /// A restored member its host refused stays Broken with this call recorded
 /// (see [`MobError::MemberRegistrationRefused`]).
@@ -828,6 +918,16 @@ pub enum MobError {
         session_id: Option<meerkat_core::types::SessionId>,
         reason: String,
         hold: Option<meerkat_core::service::DurableResumeHold>,
+    },
+
+    /// Member `member_id` is seated but was not materialized in this
+    /// process, and the wake the delivery needed was refused or did not
+    /// finish. Nothing was delivered, so a retry cannot duplicate it;
+    /// [`MemberWakeRefusal::is_retryable`] says whether a retry can succeed.
+    #[error("member {member_id} was not made ready for the delivery: {refusal}")]
+    MemberWakeRefused {
+        member_id: AgentIdentity,
+        refusal: MemberWakeRefusal,
     },
 
     /// The mob's startup recovery could not restore member `member_id`'s
@@ -2741,6 +2841,13 @@ impl MobError {
                 "authority_retained": true,
                 "required_action": "reload_member_registration",
             })),
+            Self::MemberWakeRefused { member_id, refusal } => Some(serde_json::json!({
+                "kind": "mob_member_wake_refused",
+                "member_id": member_id.as_str(),
+                "refusal": refusal.as_str(),
+                "retryable": refusal.is_retryable(),
+                "delivered": false,
+            })),
             Self::MemberAdmissionBacklogFull { member_id, depth } => Some(serde_json::json!({
                 "kind": "mob_member_admission_backlog_full",
                 "member_id": member_id.as_str(),
@@ -2921,6 +3028,28 @@ impl MobError {
                 Self::MemberReloadRequired { .. } => {
                     Some(meerkat_contracts::ErrorCode::MemberReloadRequired)
                 }
+                // A refused member wake: the member's runtime could not be
+                // made available now (retry later), is held by its own
+                // lifecycle (busy), or is never materialized here.
+                Self::MemberWakeRefused { refusal, .. } => Some(match refusal {
+                    MemberWakeRefusal::Retiring | MemberWakeRefusal::LifecycleOriginFenced => {
+                        meerkat_contracts::ErrorCode::SessionBusy
+                    }
+                    MemberWakeRefusal::MobNotRunning => {
+                        meerkat_contracts::ErrorCode::SessionNotRunning
+                    }
+                    MemberWakeRefusal::HostOwned
+                    | MemberWakeRefusal::NonAuthoritativeComposition => {
+                        meerkat_contracts::ErrorCode::CapabilityUnavailable
+                    }
+                    MemberWakeRefusal::HostPreparationPending
+                    | MemberWakeRefusal::ResumeGateUnavailable
+                    | MemberWakeRefusal::WakeTimedOut
+                    | MemberWakeRefusal::AdmissionClosed
+                    | MemberWakeRefusal::MobUnavailable => {
+                        meerkat_contracts::ErrorCode::SessionRuntimeUnavailable
+                    }
+                }),
                 Self::SupervisorProtocolUpgradeRequired { .. } => {
                     Some(meerkat_contracts::ErrorCode::SupervisorRotationIncomplete)
                 }
@@ -3059,6 +3188,16 @@ impl MobError {
             | Self::MemberStartupRecoveryFailed { cause: error, .. } => error.failure_class(),
             // A failed probe is classified by what failed it.
             Self::HostFeaturesProbeFailed { cause, .. } => cause.failure_class(),
+            // A refused member wake delivered nothing: a retryable refusal is
+            // resubmitted (the next delivery wakes the member again), a final
+            // one is the mob's answer.
+            Self::MemberWakeRefused { refusal, .. } => {
+                if refusal.is_retryable() {
+                    MobFailureClass::Transport
+                } else {
+                    MobFailureClass::MobRejected
+                }
+            }
             // The close's answer: AdmissionClosed falls to MobRejected.
             Self::DurabilityFailStop { .. } => MobFailureClass::MobRejected,
             Self::MobNotFound(_)

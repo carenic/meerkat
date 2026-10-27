@@ -19040,34 +19040,78 @@ impl MobHandle {
         })
     }
 
-    /// Make sure `identity`'s live session materialization exists, reviving
-    /// it through MobMachine authority when the runtime retired it (for
-    /// example an idle executor torn down, or a restart). Runs no turn.
+    /// Make sure `identity` is materialized and ready in this process,
+    /// waking it through MobMachine (`WakeMember`, cause Operator) when it is
+    /// not: a dormant member, or one whose live materialization the runtime
+    /// retired (an idle executor torn down, a restart). Joins a wake already
+    /// in flight. Runs no turn. A refusal is typed
+    /// ([`MobError::MemberWakeRefused`], [`MobError::MemberRestoreFailed`]).
     pub async fn ensure_member_live(&self, identity: &AgentIdentity) -> Result<(), MobError> {
+        self.wake_member(identity, mob_dsl::MemberWakeCause::Operator)
+            .await
+    }
+
+    /// Wake `identity` for a delivery that is about to reach it (a
+    /// continuation's address resolution): `WakeMember` with cause
+    /// HostDelivery, as Core's own host dispatch applies it.
+    pub(crate) async fn wake_member_for_delivery(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Result<(), MobError> {
+        self.wake_member(identity, mob_dsl::MemberWakeCause::HostDelivery)
+            .await
+    }
+
+    /// Apply `WakeMember` for `identity` and wait for its answer. The live
+    /// session probe is the observation that MobMachine's drift arm needs for
+    /// a member it holds Live whose materialization is gone; it decides
+    /// nothing here.
+    async fn wake_member(
+        &self,
+        identity: &AgentIdentity,
+        cause: mob_dsl::MemberWakeCause,
+    ) -> Result<(), MobError> {
         let session_id = self
             .resolve_bridge_session_id(identity)
             .await
             .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
-        match self
+        let observed_missing = match self
             .session_service
             .live_session_actor_registered(&session_id)
             .await
         {
-            Ok(true) => return Ok(()),
-            Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {}
+            Ok(true) => false,
+            Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => true,
             Err(error) => return Err(MobError::SessionError(error)),
-        }
+        };
         let agent_identity = identity.clone();
-        self.send_actor_command(
-            move |reply_tx| MobCommand::ReviveMemberLiveMaterialization {
-                agent_identity,
-                bridge_session_id: session_id,
-                scope: super::actor::MemberLiveRevivalScope::default(),
-                reply_tx,
-            },
-        )
+        self.send_actor_command(move |reply_tx| MobCommand::WakeMember {
+            agent_identity,
+            cause,
+            observed_missing,
+            input_class: mob_dsl::PeerInputClass::Content,
+            sender_waking: false,
+            reply_tx,
+        })
         .await?
         .map(|_| ())
+        .map_err(|failure| failure.into_mob_error(identity))
+    }
+
+    /// Make `identity` dormant: release its live materialization in this
+    /// process while it is quiescent. It stays seated at the same session,
+    /// generation and fence, every surface keeps showing it, and its next
+    /// delivery (host or peer) wakes it. A member that is not materialized
+    /// has nothing to release. Refused retryably
+    /// ([`MobError::LifecycleOperationPending`]) while it is being woken or
+    /// has work in flight: nothing is interrupted.
+    pub async fn release_member(&self, identity: &AgentIdentity) -> Result<(), MobError> {
+        let agent_identity = identity.clone();
+        self.send_actor_command(move |reply_tx| MobCommand::ReleaseMember {
+            agent_identity,
+            reply_tx,
+        })
+        .await?
     }
 
     /// Members transitively spawned by `identity` (via durable spawned_by
@@ -21066,6 +21110,7 @@ mod tests {
             .apply_signal(mob_dsl::MobMachineSignal::ObserveRuntimeReady {
                 agent_runtime_id: runtime_id,
                 fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
+                runtime_epoch_id: None,
             })
             .expect("runtime ready observation should admit for current runtime");
 

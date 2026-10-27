@@ -12304,12 +12304,20 @@ ControlFlow::Break(()) => return Ok(()),
         })
         .await?;
         let expected_terminal_snapshot = staged.committed_snapshot.clone();
-        if staged.has_routed_signal_effect() {
-            // Final unregister currently has no cross-machine seam signal.
-            // Its dispatch-failure recovery may therefore restore the local
-            // Draining retry anchor. If the generated contract ever adds a
-            // routed effect, fail before dispatch and restore the staged local
-            // state; that future contract needs a non-rollback delivery saga.
+        // G1: the final unregister publishes the released registration to the
+        // owning mob (`RuntimeRegistrationReleased`). That is a post-commit
+        // fact, never rolled back: it is held here, the staged commit below
+        // dispatches nothing, and it is sent only after the exact entry was
+        // removed, so a finalization that fails and restores Draining has told
+        // the mob nothing.
+        let registration_release_signals = staged.registration_release_signals();
+        if staged.has_routed_signal_effect_besides_registration_release() {
+            // Besides the release, the final unregister has no cross-machine
+            // seam signal. Its dispatch-failure recovery may therefore restore
+            // the local Draining retry anchor. If the generated contract ever
+            // adds another routed effect, fail before dispatch and restore the
+            // staged local state; that future contract needs a non-rollback
+            // delivery saga, as the release has.
             let previous_snapshot = staged.previous_snapshot.clone();
             crate::stack_relief::box_in_own_frame(|| {
                 self.restore_session_dsl_state(session_id, previous_snapshot)
@@ -12333,9 +12341,10 @@ ControlFlow::Break(()) => return Ok(()),
         .await
         {
             crate::stack_relief::box_in_own_frame(
-                || // Safe only because `has_routed_signal_effect` was rejected above
-            // before dispatch. No cross-machine observer can have seen this
-            // final transition while local authority is restored.
+                || // Safe only because every routed effect but the held release
+            // was rejected above before dispatch, and the release is sent only
+            // after the entry's removal. No cross-machine observer can have
+            // seen this final transition while local authority is restored.
             self.restore_session_dsl_state(session_id, unregister_rollback_snapshot.clone()),
             )
             .await;
@@ -12359,7 +12368,7 @@ ControlFlow::Break(()) => return Ok(()),
                 ))),
             };
         }
-        let expected_pending_finalization = {
+        let (expected_pending_finalization, registration_release_dispatcher) = {
             let sessions = crate::stack_relief::box_in_own_frame(|| self.sessions.read()).await;
             let entry = sessions.get(session_id).ok_or_else(|| {
                 RuntimeDriverError::Internal(format!(
@@ -12378,7 +12387,10 @@ ControlFlow::Break(()) => return Ok(()),
             {
                 return Ok(());
             }
-            entry.pending_unregister_finalization.clone()
+            (
+                entry.pending_unregister_finalization.clone(),
+                entry.composition_signal_dispatcher.clone(),
+            )
         };
         if self.store.is_some() && expected_pending_finalization.is_none() {
             return Err(RuntimeDriverError::Internal(format!(
@@ -12512,6 +12524,25 @@ ControlFlow::Break(()) => return Ok(()),
             )
         })
         .await?;
+        // G1: the registration is gone; tell the owning mob, once. A failed
+        // send is not rolled back: the mob's member stays Live with nothing
+        // materialized until its next delivery observes the loss (the
+        // machine's counted drift arm), and a stale release is a no-op there.
+        if let Some(dispatcher) = registration_release_dispatcher.as_ref() {
+            for signal in registration_release_signals {
+                if let Err(error) = crate::stack_relief::box_in_own_frame(|| {
+                    composition::dispatch_routed_signal(dispatcher, signal)
+                })
+                .await
+                {
+                    tracing::warn!(
+                        %session_id,
+                        %error,
+                        "the released registration did not reach its mob"
+                    );
+                }
+            }
+        }
         tracing::info!(%session_id, "MeerkatMachine::unregister_session_inner_locked_authorized complete");
 Ok::<(), RuntimeDriverError>(())
 })

@@ -4147,6 +4147,23 @@ pub trait CommsRuntime: Send + Sync {
         false
     }
 
+    /// Close this runtime's in-process route for peer ingress while the
+    /// runtime lives on (its owner stopped admitting peer work): peers then
+    /// meet the route's wake owner, which answers typed, instead of an inbox
+    /// no drain claims. Generation-exact; the closed route keeps its name
+    /// free and its metadata for [`Self::reopen_inproc_route`]. Returns
+    /// whether this call closed a route. The default is for runtimes that
+    /// publish no in-process route.
+    fn close_inproc_route(&self) -> bool {
+        false
+    }
+
+    /// Reopen the route [`Self::close_inproc_route`] closed, if its name is
+    /// still unbound. Returns whether this call reopened it.
+    fn reopen_inproc_route(&self) -> bool {
+        false
+    }
+
     /// Runtime-local advertised comms address, if available.
     ///
     /// This is the canonical address the runtime expects peers to use when

@@ -25,6 +25,7 @@ impl MobActor {
                 | MobCommand::Respawn { .. }
                 | MobCommand::ReloadMemberRegistration { .. }
                 | MobCommand::ReviveMemberLiveMaterialization { .. }
+                | MobCommand::ReleaseMember { .. }
                 | MobCommand::RevivePlacedMember { .. }
                 | MobCommand::Wire { .. }
                 | MobCommand::Unwire { .. }
