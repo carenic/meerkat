@@ -3321,6 +3321,106 @@ fn assert_wired_member_pinned_live(placed: &str, local: &str) {
     );
 }
 
+/// A placed member's retirement cleans its wiring up and restores it when the
+/// disposal rolls back. A local neighbour released while the edge was gone is
+/// Dormant when the edge returns: the restore records it owed
+/// (PlacedPeerWired) for the owner's retry timer and tells the owner so
+/// (OwedMemberWakesRecorded). Both edge orders.
+#[test]
+fn a_restored_edge_of_a_placed_member_owes_its_dormant_neighbour_a_wake() {
+    assert_restored_edge_owes_dormant_neighbour("alpha", "beta");
+    assert_restored_edge_owes_dormant_neighbour("zulu", "beta");
+}
+
+fn assert_restored_edge_owes_dormant_neighbour(placed: &str, local: &str) {
+    let mut authority = placed_and_local_members(placed, local);
+    let epoch = RuntimeEpochId(format!("epoch-{local}"));
+    authority
+        .apply_signal(MobMachineSignal::ObserveRuntimeReady {
+            agent_runtime_id: runtime_id(local, 0),
+            fence_token: FenceToken(1),
+            runtime_epoch_id: Some(epoch.clone()),
+        })
+        .expect("the routed binding records the registration's epoch");
+    let edge = WiringEdge::new(identity(placed), identity(local));
+    MobMachineMutator::apply(
+        &mut authority,
+        MobMachineInput::WireMembers { edge: edge.clone() },
+    )
+    .expect("wire accepted");
+    let placed_session = authority
+        .state()
+        .member_session_bindings
+        .get(&identity(placed))
+        .cloned()
+        .expect("the placed member's session is bound");
+    MobMachineMutator::apply(
+        &mut authority,
+        MobMachineInput::Retire {
+            mob_id: MobId("test-mob".to_string()),
+            agent_runtime_id: runtime_id(placed, 0),
+            agent_identity: identity(placed),
+            generation: Generation(0),
+            releasing: Some(placed_session.clone()),
+            session_id: Some(placed_session),
+        },
+    )
+    .expect("the placed member's retirement starts");
+    let cleanup = MobMachineInput::CleanupRetiringMemberWiring {
+        edge: edge.clone(),
+        a_identity: edge.a.clone(),
+        b_identity: edge.b.clone(),
+        agent_identity: identity(placed),
+        agent_runtime_id: runtime_id(placed, 0),
+        fence_token: FenceToken(1),
+        generation: Generation(0),
+    };
+    MobMachineMutator::apply(&mut authority, cleanup).expect("the retirement unwires the edge");
+    assert_eq!(
+        release_registration(&mut authority, local, &epoch),
+        MemberMaterializationReleaseOutcome::Released,
+        "with the edge gone the neighbour is releasable"
+    );
+
+    let restored = MobMachineMutator::apply(
+        &mut authority,
+        MobMachineInput::RestoreRetiringMemberWiring {
+            edge: edge.clone(),
+            a_identity: edge.a.clone(),
+            b_identity: edge.b.clone(),
+            agent_identity: identity(placed),
+            agent_runtime_id: runtime_id(placed, 0),
+            fence_token: FenceToken(1),
+            generation: Generation(0),
+        },
+    )
+    .expect("the rolled-back disposal restores the edge");
+    let shape = format!("{placed} - {local}");
+    assert!(
+        restored
+            .effects()
+            .iter()
+            .any(|effect| matches!(effect, MobMachineEffect::OwedMemberWakesRecorded)),
+        "the owner is told to arm its retry timer ({shape})"
+    );
+    assert_eq!(
+        authority
+            .state()
+            .member_boot_obligation_owed
+            .get(&identity(local)),
+        Some(&MemberBootObligationCause::PlacedPeerWired),
+        "the Dormant neighbour of a placed member is owed a wake ({shape})"
+    );
+    assert_eq!(
+        authority
+            .state()
+            .member_materialization
+            .get(&identity(local)),
+        Some(&MemberMaterializationPhase::Dormant)
+    );
+    assert!(authority.state().wiring_edges.contains(&edge));
+}
+
 fn wire_input(edge: &WiringEdge, trust: bool) -> MobMachineInput {
     if trust {
         MobMachineInput::WireMembersWithTrust {
@@ -3336,8 +3436,9 @@ fn wire_input(edge: &WiringEdge, trust: bool) -> MobMachineInput {
 /// F2 at wiring: wiring a Dormant local member to a placed member wakes it
 /// through the machine, never a shell decision. The wiring opens one wake
 /// attempt and emits its materialization (cause PlacedPeerWired), owed until
-/// Live like a boot wake. Both wiring inputs, both edge orders. Wired to a
-/// local member instead, the Dormant member stays Dormant.
+/// Live (cause PlacedPeerWired) like a boot wake. Both wiring inputs, both
+/// edge orders. Wired to a local member instead, the Dormant member stays
+/// Dormant.
 #[test]
 fn wiring_a_dormant_member_to_a_placed_member_wakes_it() {
     for trust in [false, true] {
@@ -3406,7 +3507,7 @@ fn assert_wiring_wakes_dormant_member(placed: &str, local: &str, trust: bool) {
             .state()
             .member_boot_obligation_owed
             .get(&identity(local)),
-        Some(&MemberBootObligationCause::Obligation),
+        Some(&MemberBootObligationCause::PlacedPeerWired),
         "the wake is owed until Live, so a retryable failure is retried ({shape})"
     );
     assert!(authority.state().wiring_edges.contains(&edge));

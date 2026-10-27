@@ -8088,11 +8088,20 @@ mod tests {
         host: &HostId,
         spawn_id: &PlacedSpawnId,
     ) -> MobMachineInput {
+        begin_remote_placed_spawn_at(identity, host, spawn_id, 0)
+    }
+
+    fn begin_remote_placed_spawn_at(
+        identity: &AgentIdentity,
+        host: &HostId,
+        spawn_id: &PlacedSpawnId,
+        generation: u64,
+    ) -> MobMachineInput {
         MobMachineInput::BeginSpawnExec {
             agent_identity: identity.clone(),
-            agent_runtime_id: AgentRuntimeId(format!("{}:0", identity.0)),
+            agent_runtime_id: AgentRuntimeId(format!("{}:{generation}", identity.0)),
             fence_token: FenceToken(42),
-            generation: Generation(0),
+            generation: Generation(generation),
             profile_material_digest: "profile-digest".to_string(),
             external_addressable: true,
             runtime_mode: SpawnPolicyRuntimeMode::TurnDriven,
@@ -10753,6 +10762,71 @@ mod tests {
                 .member_materialization
                 .get(&member.identity),
             Some(&MemberMaterializationPhase::Dormant)
+        );
+    }
+
+    /// A held identity (a respawn's preserved topology) respawned PLACED joins
+    /// a Dormant local neighbour to a placed member through its kept edge.
+    /// The placed begin records the neighbour owed (PlacedPeerWired) for the
+    /// owner's retry timer and tells the owner so (OwedMemberWakesRecorded);
+    /// the neighbour stays Dormant until that wake.
+    #[test]
+    fn a_held_identity_respawned_placed_owes_its_dormant_neighbour_a_wake() {
+        let (mut held, identity, runtime_id, fence_token, session_id, member_edge, _, _) =
+            seed_preserving_retirement_with_topology();
+        held.apply_signal(MobMachineSignal::ObserveRuntimeRetired {
+            agent_runtime_id: runtime_id.clone(),
+            fence_token,
+        })
+        .expect("retire the old runtime while preserving topology");
+        held.apply_signal(MobMachineSignal::ObserveMemberRetirementArchived {
+            agent_identity: identity.clone(),
+            agent_runtime_id: runtime_id,
+            fence_token,
+            generation: Generation(0),
+            session_id: Some(session_id),
+            disposal: MemberSessionDisposal::Archived,
+            preserve_machine_topology: true,
+        })
+        .expect("the retirement keeps the topology for a successor");
+        assert!(held.state().pending_respawn_topology.contains(&identity));
+        assert!(held.state().wiring_edges.contains(&member_edge));
+
+        let peer = AgentIdentity::from("surviving-peer");
+        let peer_runtime = AgentRuntimeId::from("surviving-peer:0");
+        let mut authority = MobMachineAuthority::recover_from_state(as_replayed_dormant(
+            held.state().clone(),
+            &peer,
+            &peer_runtime,
+        ))
+        .expect("a replay-shaped Dormant neighbour recovers");
+        let host = HostId("respawn-placed-host".to_string());
+        authorize_remote_placed_spawn(&mut authority, &identity, &host, "spec-digest");
+        let begin = MobMachineMutator::apply(
+            &mut authority,
+            begin_remote_placed_spawn_at(
+                &identity,
+                &host,
+                &PlacedSpawnId("respawn-placed-spawn".to_string()),
+                1,
+            ),
+        )
+        .expect("the held identity's placed respawn begins");
+        assert!(
+            begin
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, MobMachineEffect::OwedMemberWakesRecorded))
+        );
+        assert_eq!(
+            authority.state().member_boot_obligation_owed.get(&peer),
+            Some(&MemberBootObligationCause::PlacedPeerWired),
+            "the Dormant neighbour of a placed member is owed a wake"
+        );
+        assert_eq!(
+            authority.state().member_materialization.get(&peer),
+            Some(&MemberMaterializationPhase::Dormant),
+            "the owner's retry timer wakes it, not the begin"
         );
     }
 
