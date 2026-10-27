@@ -255,16 +255,6 @@ them.
     a restart. The new incarnation keeps no wiring. A rotation is refused
     typed unless the mob is Running, and a refused rotation retires
     nothing.
-  - `MobHandle::session_unborn(session_id)` and
-    `MemberBindingHistory::session_unborn(session_id)`: whether a session is
-    unborn, named by a seat or a rotation for a member that builds nothing
-    until its first wake, and not created by that wake yet. No store holds
-    such a session, and none is missing. The handle reads it from the
-    running mob; the history reads it with no running mob, from the journal
-    rows the mob's own restart restores it from, so a host that checks a
-    stopped state directory for lost sessions can leave unborn ones out.
-    `MemberBindingHistory::with_unborn_sessions` (`test-support`) gives a
-    host's test double of these reads its unborn sessions.
 
 - `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the
   runtimes whose durable state holds recovery work, from the head summary
@@ -283,6 +273,19 @@ them.
   generation are the given ones, with the given composition endpoint), and
   returns its operation registry when it does. The lift of a stopped mob
   uses it to bind such a member without queueing behind its run.
+
+- `meerkat-mob`: `MobHandle::session_unborn(session_id)` and
+  `MemberBindingHistory::session_unborn(session_id)` answer whether a session
+  is unborn: a seat or a rotation named it for a member that builds nothing
+  until its first wake, and that wake has not created it yet. No store holds
+  such a session, and none is missing. The handle reads it from the running
+  mob; the history reads it with no running mob, from the journal rows the
+  mob's own restart restores it from, so a host that checks a stopped state
+  directory for lost sessions can leave unborn ones out.
+  `MemberBindingHistory::with_unborn_sessions` (`test-support`) gives a host's
+  test double of these reads its unborn sessions. `MobHandle::member_history`
+  of a member whose session is unborn answers an empty page, and the read
+  does not wake the member.
 
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
@@ -523,10 +526,6 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
-- `meerkat-mob`: `MobHandle::member_history` of a member whose session is
-  unborn (seated and not woken yet, or the next life a rotation seated)
-  answers an empty page, and the read does not wake the member. Before, it
-  failed with an internal "session not found" error.
 
 ### Known limitations
 
