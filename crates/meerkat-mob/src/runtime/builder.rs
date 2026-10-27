@@ -10122,6 +10122,9 @@ impl MobBuilder {
             &definition.id,
             &boot_plan.materialize,
         );
+        // The host's build preparer reads through this restore's own handle,
+        // the launch's owner authority, as every wake's preparation does.
+        let host_read_handle = tool_handle.read_handle();
         let restore_context = ResumeMemberRestoreContext {
             definition,
             session_service,
@@ -10136,6 +10139,7 @@ impl MobBuilder {
             default_llm_client: default_llm_client.as_ref(),
             tool_consequence_policy_registry,
             member_build_preparer: member_residency.build_preparer.as_ref(),
+            host_read_handle: &host_read_handle,
         };
         restore_resumed_members(
             &restore_context,
@@ -10947,6 +10951,10 @@ impl MobBuilder {
                 command_tx.clone(),
                 machine_state_watch_tx.subscribe(),
                 &durable_events,
+                // The host's build preparer reads through the launch's own
+                // handle on every wake, as the preactivation hook above and
+                // a boot restore do.
+                handle.read_handle(),
             )?;
             let mut actor = MobActor {
                 definition,
@@ -11634,6 +11642,12 @@ pub(super) struct ResumeMemberRestoreContext<'a> {
     /// The host's build preparation, asked once per member restore before
     /// its provision (every boot-set restore and every wake).
     pub(super) member_build_preparer: Option<&'a Arc<dyn super::MemberBuildPreparer>>,
+    /// The read-only view the host's build preparer receives: the mob's own
+    /// handle as its launch minted it (the owner's authority), on a boot
+    /// restore and on a wake alike. Never `tool_handle` on a wake, whose
+    /// authority is the member tools' agent lane: the preparer is the host's
+    /// callback, and a read handle issues no actor command.
+    pub(super) host_read_handle: &'a super::MobReadHandle,
 }
 
 /// Everything a member's restore writes, applied in the member's turn.
@@ -12767,7 +12781,7 @@ async fn prepare_member_build_before_provision(
     let request = super::member_build_preparer::MemberBuildPreparation {
         agent_identity: entry.agent_identity.clone(),
         session_id: bridge_session_id.clone(),
-        handle: ctx.tool_handle.read_handle(),
+        handle: ctx.host_read_handle.clone(),
         wired_peers: super::member_build_preparer::member_build_wired_peers(
             authority.state(),
             &entry.agent_identity,

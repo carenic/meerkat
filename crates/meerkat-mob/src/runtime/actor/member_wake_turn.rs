@@ -221,6 +221,9 @@ struct WakeRestoreInput {
     default_llm_client: Option<Arc<dyn LlmClient>>,
     tool_consequence_policy_registry: Option<Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
     member_build_preparer: Option<Arc<dyn super::super::MemberBuildPreparer>>,
+    /// The read-only view the host's build preparer receives: the launch's
+    /// own (the owner's authority), never `tool_handle`'s agent lane.
+    host_read_handle: super::super::MobReadHandle,
     candidate: ResumeRestoreCandidate,
     base: mob_dsl::MobMachineAuthority,
     fork_rule: super::super::fork_build::ForkOverlayRule,
@@ -342,6 +345,7 @@ impl MobActor {
             default_llm_client: self.default_llm_client.clone(),
             tool_consequence_policy_registry: self.tool_consequence_policy_registry.clone(),
             member_build_preparer: self.member_residency.build_preparer.clone(),
+            host_read_handle: self.member_wakes.host_read_handle.clone(),
             candidate: ResumeRestoreCandidate {
                 entry: entry.clone(),
                 machine_session_id,
@@ -709,6 +713,7 @@ impl MobActor {
             default_llm_client: self.default_llm_client.as_ref(),
             tool_consequence_policy_registry: self.tool_consequence_policy_registry.as_ref(),
             member_build_preparer: None,
+            host_read_handle: &self.member_wakes.host_read_handle,
         };
         let mut commit = MemberRestoreCommit {
             authority: &mut self.dsl_authority,
@@ -1366,6 +1371,7 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         default_llm_client,
         tool_consequence_policy_registry,
         member_build_preparer,
+        host_read_handle,
         candidate,
         base,
         fork_rule,
@@ -1403,6 +1409,7 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         default_llm_client: default_llm_client.as_ref(),
         tool_consequence_policy_registry: tool_consequence_policy_registry.as_ref(),
         member_build_preparer: member_build_preparer.as_ref(),
+        host_read_handle: &host_read_handle,
     };
     let plan = restore_resumed_member(&ctx, &candidate, &base, fork_rule, &overlays).await?;
     let entry = &candidate.entry;

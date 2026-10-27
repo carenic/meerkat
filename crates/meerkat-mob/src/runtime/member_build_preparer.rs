@@ -33,7 +33,9 @@ pub struct MemberBuildPreparation {
     /// The session the member is built on (its durable binding, or the
     /// successor its restore repointed it to).
     pub session_id: SessionId,
-    /// A read-only observer of the mob. It issues no actor command.
+    /// A read-only observer of the mob. It issues no actor command. Its reads
+    /// carry the authority the mob's launch minted (the owner's), on a wake
+    /// as on a boot restore: never the agent lane of the member being built.
     pub handle: MobReadHandle,
     /// The member's local wired peers, from the mob's durable wiring (not
     /// from live comms, which a member being built does not have yet).

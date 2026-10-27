@@ -467,6 +467,12 @@ pub(in crate::runtime) struct MemberWakes {
     /// The concrete provisioner the cold restore recipe runs on.
     pub(in crate::runtime) provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
     pub(in crate::runtime) continuity: MemberContinuityIndex,
+    /// The read-only view of the mob the host's build preparer receives on
+    /// every wake: the mob's handle as its launch minted it (the owner's
+    /// authority), as a boot restore hands it. Never the member tools'
+    /// agent lane: the preparer is the host's callback, and a read handle
+    /// issues no actor command.
+    pub(in crate::runtime) host_read_handle: crate::runtime::MobReadHandle,
     /// Owed-boot retry state per member: the backoff step, and whether its
     /// one retry timer is armed.
     owed_retries: BTreeMap<AgentIdentity, OwedMemberWakeRetry>,
@@ -486,13 +492,15 @@ struct OwedMemberWakeRetry {
 
 impl MemberWakes {
     /// `replayed` is the journal the actor's start replayed: the continuity
-    /// index starts caught up to it.
+    /// index starts caught up to it. `host_read_handle` is the launch's own
+    /// read-only view, which the host's build preparer receives.
     pub(in crate::runtime) fn new(
         provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
         mob_id: &MobId,
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
         replayed: &[MobEvent],
+        host_read_handle: crate::runtime::MobReadHandle,
     ) -> Result<Self, MobError> {
         let namespace = meerkat_core::mob_realm_id(mob_id.as_str())
             .map_err(|error| {
@@ -514,6 +522,7 @@ impl MemberWakes {
             ingress: VecDeque::new(),
             provisioner,
             continuity: MemberContinuityIndex::seeded(replayed, mob_id),
+            host_read_handle,
             owed_retries: BTreeMap::new(),
             edge_repairs: BTreeMap::new(),
         })

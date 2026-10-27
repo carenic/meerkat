@@ -152,6 +152,11 @@ enum PreparerAnswer {
     Prepared,
     Retryable,
     Final,
+    /// Read the member's identity management through the handle Core hands
+    /// the preparer, as a host that checks who manages an identity before it
+    /// builds it: prepared once the read answers, retryable when it is
+    /// refused.
+    ReadsIdentityManagement,
 }
 
 /// One `prepare_member_build` call, as the preparer saw it.
@@ -168,6 +173,8 @@ struct RecordingPreparer {
     answer: Mutex<PreparerAnswer>,
     prepared: Mutex<Vec<PreparedBuild>>,
     built: Mutex<Vec<MemberBuildReport>>,
+    /// Each identity management read a preparation made, as it answered.
+    management_reads: Mutex<Vec<Result<crate::MemberIdentityManagement, String>>>,
     /// Open (`true`) lets a preparation answer; closed holds it.
     gate: tokio::sync::watch::Sender<bool>,
     /// Preparations that reached the gate.
@@ -182,6 +189,7 @@ impl RecordingPreparer {
             answer: Mutex::new(PreparerAnswer::Prepared),
             prepared: Mutex::new(Vec::new()),
             built: Mutex::new(Vec::new()),
+            management_reads: Mutex::new(Vec::new()),
             gate,
             entered,
         }
@@ -201,6 +209,13 @@ impl RecordingPreparer {
 
     fn built(&self) -> Vec<MemberBuildReport> {
         self.built.lock().expect("build reports").clone()
+    }
+
+    fn management_reads(&self) -> Vec<Result<crate::MemberIdentityManagement, String>> {
+        self.management_reads
+            .lock()
+            .expect("identity management reads")
+            .clone()
     }
 
     fn close_gate(&self) {
@@ -253,7 +268,8 @@ impl MemberBuildPreparer for RecordingPreparer {
                 break;
             }
         }
-        match *self.answer.lock().expect("preparer answer") {
+        let answer = *self.answer.lock().expect("preparer answer");
+        match answer {
             PreparerAnswer::Prepared => Ok(MemberBuildPrepared::Prepared),
             PreparerAnswer::Retryable => Err(MemberBuildPreparationRefusal::Retryable {
                 reason: "the host is not ready for this member yet".to_string(),
@@ -261,6 +277,25 @@ impl MemberBuildPreparer for RecordingPreparer {
             PreparerAnswer::Final => Err(MemberBuildPreparationRefusal::Final {
                 reason: "the host refuses to build this member".to_string(),
             }),
+            PreparerAnswer::ReadsIdentityManagement => {
+                let read = request
+                    .handle
+                    .identity_management(&request.agent_identity)
+                    .await
+                    .map_err(|error| error.to_string());
+                self.management_reads
+                    .lock()
+                    .expect("identity management reads")
+                    .push(read.clone());
+                match read {
+                    Ok(_) => Ok(MemberBuildPrepared::Prepared),
+                    Err(error) => Err(MemberBuildPreparationRefusal::Retryable {
+                        reason: format!(
+                            "the member's identity management could not be read: {error}"
+                        ),
+                    }),
+                }
+            }
         }
     }
 
@@ -1206,6 +1241,42 @@ async fn a_retryable_preparation_refusal_leaves_the_member_dormant_until_the_nex
         Some(mob_dsl::MemberMaterializationPhase::Live)
     );
     assert_eq!(fixture.preparer.prepared_count(), 2);
+    fixture.finish().await;
+}
+
+/// The host's build preparer reads through the mob's own read-only view on
+/// a wake, as on a boot restore: the authority the mob's launch minted (the
+/// owner's), never the agent lane of the member tools the wake builds. A
+/// preparer that reads who manages the member's identity before it builds
+/// the member is answered, so the member's on-demand wake goes ahead. On the
+/// agent lane that read is refused (it needs the List scope), the preparer
+/// answers retryable, and every wake of the member is refused
+/// `HostPreparationPending` again: the member never wakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_hands_the_build_preparer_the_mobs_own_read_view() {
+    let fixture = WakeFixture::new("wake-preparer-read-view").await;
+    let member = fixture.spawn("preparer-read-view").await;
+    fixture.release(&member).await;
+    fixture
+        .preparer
+        .answer_with(PreparerAnswer::ReadsIdentityManagement);
+
+    let woken = fixture.ensure_live(&member).await;
+    let reads = fixture.preparer.management_reads();
+    assert!(
+        woken.is_ok(),
+        "the wake goes ahead once its preparer could read the member's identity \
+         management: {woken:?}, reads {reads:?}"
+    );
+    assert_eq!(
+        reads,
+        vec![Ok(crate::MemberIdentityManagement::CommandDriven)],
+        "one preparation, whose read of the member's identity management was answered"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
     fixture.finish().await;
 }
 
