@@ -220,6 +220,17 @@ them.
   build. A host that changed a member's binding between launches no longer
   gets the member back on the old account, or broken when the old credential
   is gone.
+- `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its
+  name-collision filter (which hides external tools whose names another of
+  the member's tools already uses) now pass each allowed tool's review
+  support and mutation class (`review_entry_support`,
+  `tool_mutation_class`) through, so a tool that requires operation review
+  reaches consent and a read-only member can use tools declared read-only.
+  Filtered-out tools stay refused. Before, both filters answered
+  `Unsupported` and `Unknown` for every tool behind them: a call that
+  required review settled as `ReviewUnavailable { UnsupportedEntry }`
+  before any reviewer or consent, and a read-only member was refused every
+  tool behind them.
 
 ### Known limitations
 
