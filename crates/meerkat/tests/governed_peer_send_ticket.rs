@@ -656,6 +656,21 @@ async fn input_census(machine: &MeerkatMachine, session: &SessionId) -> Vec<Stri
     rows
 }
 
+/// The session's native input ids, sorted: which inputs it holds, whatever
+/// lifecycle step each has reached.
+async fn input_ids(machine: &MeerkatMachine, session: &SessionId) -> Vec<String> {
+    let mut ids: Vec<String> = machine
+        .session_input_states(session)
+        .await
+        .expect("input census")
+        .report
+        .into_iter()
+        .map(|row| row.state.input_id.to_string())
+        .collect();
+    ids.sort();
+    ids
+}
+
 /// A governed send's ticket the dispatch kept unused: after its run is
 /// consumed, its first entry refuses as malformed facts at the run fence,
 /// not as an ended dispatch. The delivery itself reached the destination
@@ -871,11 +886,15 @@ async fn an_unused_peer_send_ticket_refuses_after_its_run_is_consumed() {
         "the sender's run completed: {outcome:?}"
     );
     let sender_census = input_census(&machine, &sender).await;
-    let destination_census = input_census(&destination_machine, &destination).await;
+    // The sender's input is terminal once its completion resolves. The
+    // destination's own run may still be consuming the delivered input, so
+    // only which inputs the destination holds is fixed here, not how far
+    // each has run.
+    let destination_inputs = input_ids(&destination_machine, &destination).await;
     assert_eq!(
-        destination_census.len(),
+        destination_inputs.len(),
         1,
-        "the delivery reached the destination once: {destination_census:?}"
+        "the delivery reached the destination once: {destination_inputs:?}"
     );
 
     let ticket = capture
@@ -902,8 +921,8 @@ async fn an_unused_peer_send_ticket_refuses_after_its_run_is_consumed() {
         "the refused entry adds no sender input"
     );
     assert_eq!(
-        input_census(&destination_machine, &destination).await,
-        destination_census,
+        input_ids(&destination_machine, &destination).await,
+        destination_inputs,
         "the refused entry delivers nothing more"
     );
 }
