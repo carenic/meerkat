@@ -127,7 +127,9 @@ them.
   route for peer ingress and reopen it without rebuilding the runtime.
 - `meerkat-mob`: `MobBuilder::with_resume_restore_concurrency(usize)` bounds
   how many members `MobBuilder::resume` restores at once. The default is 16;
-  `1` restores one member at a time, as before; `0` counts as `1`.
+  `1` restores one member at a time, as before; `0` counts as `1`, and a
+  value above tokio's `Semaphore::MAX_PERMITS` (such as `usize::MAX`) counts
+  as that maximum.
 - `meerkat-mob`: member wakes. A seated member that is not materialized in its
   process (dormant) is materialized on its first delivery, through MobMachine's
   wake verdict, and the delivery then proceeds as to a live member: a host
@@ -513,6 +515,26 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
+- Host-store realms: opening a realm loads the sessions that hold recovery
+  work (an unsettled input, an undelivered background result, an open run)
+  up to 16 at a time, instead of one after another. With K such sessions,
+  an open over a store whose reads are slow waits about ceil(K / 16) times
+  as long as one session's reads, not K times. Each session's rows are still
+  read in order, and a failed read still fails the open with nothing loaded.
+- `meerkat-mob`: a lift of a stopped mob (`MobHandle::resume`) wakes the
+  dormant members its plan materializes (for example members with recovery
+  work, those the host requires, or every member under
+  `MemberRestorePolicy::Eager`) at most the mob's restore concurrency at a
+  time (`MobBuilder::with_resume_restore_concurrency`, 16 by default),
+  instead of all at once: it starts the next member's wake only as an
+  earlier one finishes. A member the lift has not reached yet stays dormant,
+  so its wake timeout does not run while it waits, and a message or an
+  operation for it wakes it at once, never queued behind the lift; the lift
+  then waits for that wake and, if it ends with the member still dormant,
+  wakes the member itself. The lift also observes the members it
+  rebuilds (members still materialized in the process) at most that many at
+  a time. On a host store each such wake or observation may read the
+  member's stored session.
 
 ### Known limitations
 

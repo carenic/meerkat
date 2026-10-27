@@ -12,6 +12,12 @@ impl MobActor {
         {
             return;
         }
+        // The lift's plan still has members to reach: it dispatches them as
+        // its open wakes close (`boot_lift`), and the lift goes on after the
+        // last of them settled.
+        if self.explicit_resume_boot_dispatch_pending() {
+            return;
+        }
         let Some(pending) = self.pending_resume_lifecycle.take_if(|pending| {
             matches!(
                 pending.phase,

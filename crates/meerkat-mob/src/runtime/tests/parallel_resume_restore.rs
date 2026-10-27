@@ -522,6 +522,26 @@ async fn a_resume_restores_members_up_to_its_concurrency_and_leaves_the_serial_m
         .expect("shut the concurrent resume down");
 }
 
+// Unrun until the candidate's validation.
+//
+// A restore concurrency above the semaphore maximum (`usize::MAX` for "no
+// limit") counts as that maximum: the resume restores every member as at
+// any other bound.
+//
+// RED on the base (e294b75f29, with the row applied): the resume panicked
+// where it sized its permits (`Semaphore::new` refuses more than
+// `Semaphore::MAX_PERMITS`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_at_a_restore_concurrency_above_the_maximum_restores_every_member() {
+    let mob = SpawnedMob::spawn(MEMBERS).await;
+    let (handle, restored) = mob
+        .resume(usize::MAX, None)
+        .await
+        .expect("the resume succeeds");
+    every_member_back(&restored);
+    handle.shutdown().await.expect("shut the resume down");
+}
+
 /// At concurrency 1 a member's restore starts only once the turn of the
 /// member before it returned: while worker-00's turn is held, worker-01's
 /// restore has asked for its permit and has not started. The whole pass is
