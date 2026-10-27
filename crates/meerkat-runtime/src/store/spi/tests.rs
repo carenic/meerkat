@@ -8,20 +8,33 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use meerkat_core::completion_feed::CompletionFeed;
 use meerkat_core::host_store::{AcquireMode, FenceTiming, ScopeKind};
 use meerkat_core::lifecycle::InputId;
+use meerkat_core::ops_lifecycle::{
+    CompletionCursorConsumer, OperationId, OperationKind, OperationResult, OperationSource,
+    OperationSpec, OpsLifecycleRegistry,
+};
+use meerkat_core::types::SessionId;
+use meerkat_core::{EpochCursorState, RuntimeEpochId};
 
-use super::realm::{CHECKPOINT_MIN_BYTES, INLINE_VALUE_LIMIT};
-use super::test_host::TestHost;
+use super::codec::{self, RowOp, ScopeHeadV1};
+use super::realm::{
+    CHECKPOINT_FACTOR, CHECKPOINT_MIN_BYTES, INLINE_VALUE_LIMIT, LIST_PAGE_HEADS, READ_PAGE_ROWS,
+};
+use super::test_host::{HostCall, TestHost};
 use super::{
     ArmedScopes, ScopeDelta, ScopeFamily, ScopeId, SpiError, SpiRealm, SpiRealmConfig,
     SpiRuntimeStore,
 };
 use crate::identifiers::LogicalRuntimeId;
 use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
+use crate::ops_lifecycle::{OpsLifecycleConfig, PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry};
+use crate::runtime_state::RuntimeState;
 use crate::store::{
-    RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord, RuntimeDeliveryStoreRecord,
-    RuntimeStore, RuntimeStoreError,
+    MachineLifecycleBindingFacts, MachineLifecycleCommit, MachineLifecyclePreRunPhase,
+    MachineLifecycleRunFacts, RuntimeDeliveryAuthorityCasOutcome, RuntimeDeliveryAuthorityRecord,
+    RuntimeDeliveryStoreRecord, RuntimeStore, RuntimeStoreError, SupervisorAuthoritySnapshot,
 };
 
 const TEST_FAMILY: ScopeFamily = ScopeFamily {
@@ -1728,4 +1741,603 @@ async fn boot_obligation_scan_spi_store_agrees_with_the_open_on_each_pinned_head
             "the open and the scan decide {runtime:?} alike"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// What a realm's history costs a host store: the reads of an open and the
+// rows a runtime keeps, over a host that records every call.
+// ---------------------------------------------------------------------------
+
+/// Completed operations the settling registry keeps (a runtime keeps 256 by
+/// default). With [`SETTLED_RESULT_BYTES`] of result each, a snapshot weighs
+/// some tens of KiB, as a busy runtime's does, and stays inline.
+const SETTLED_RETAINED: usize = 24;
+
+/// The result text of each settled operation, in bytes.
+const SETTLED_RESULT_BYTES: usize = 512;
+
+/// Settled operations between two persisted snapshots in a history. The
+/// runtime persists one at every terminal transition (and one more when it
+/// injects the completion); each snapshot supersedes every earlier one, so a
+/// history of fewer, equal snapshots grows the rows the same way and costs a
+/// row less time.
+const SETTLED_PER_SNAPSHOT: usize = 50;
+
+/// The quiet runtimes of a history row: registered, with settled operations
+/// and nothing else.
+const QUIET_RUNTIMES: usize = 2;
+
+/// The retention rule these rows hold the realm to: a scope's visible rows
+/// stay within `max(REBASE_FACTOR x live bytes, REBASE_FLOOR)` plus its last
+/// commit's rows. The rows pin the values instead of reading the realm's
+/// constants, so a floor that grows back fails them.
+const REBASE_FACTOR: u64 = 4;
+
+/// See [`REBASE_FACTOR`].
+const REBASE_FLOOR: u64 = 256 * 1024;
+
+/// A runtime's ops lifecycle registry settling background operations one
+/// after another: each is registered, runs, completes, and has its
+/// completion injected into its owner, so a snapshot taken between two
+/// operations holds no recovery work.
+struct SettlingOps {
+    registry: RuntimeOpsLifecycleRegistry,
+    feed: Arc<dyn CompletionFeed>,
+    epoch: RuntimeEpochId,
+    owner: SessionId,
+    completed: usize,
+}
+
+impl SettlingOps {
+    fn new() -> Self {
+        let registry = RuntimeOpsLifecycleRegistry::with_config(OpsLifecycleConfig {
+            max_completed: SETTLED_RETAINED,
+            max_concurrent: None,
+        });
+        let feed = registry.completion_feed_handle();
+        Self {
+            registry,
+            feed,
+            epoch: RuntimeEpochId::new(),
+            owner: SessionId::new(),
+            completed: 0,
+        }
+    }
+
+    /// Register, run and complete one background operation.
+    fn complete_one(&mut self) {
+        let id = OperationId::new();
+        self.registry
+            .register_operation(OperationSpec {
+                id: id.clone(),
+                kind: OperationKind::BackgroundToolOp,
+                owner_session_id: self.owner.clone(),
+                display_name: format!("settled operation {}", self.completed),
+                source_label: "host-store-history".into(),
+                operation_source: None,
+                child_session_id: None,
+                expect_peer_channel: false,
+            })
+            .expect("register the operation");
+        self.registry
+            .provisioning_succeeded(&id)
+            .expect("start the operation");
+        self.registry
+            .complete_operation(
+                &id,
+                OperationResult {
+                    id: id.clone(),
+                    content: "r".repeat(SETTLED_RESULT_BYTES),
+                    is_error: false,
+                    duration_ms: 1,
+                    tokens_used: 0,
+                },
+            )
+            .expect("complete the operation");
+        self.completed += 1;
+    }
+
+    /// Settle one more operation: complete it and inject its completion.
+    fn settle_one(&mut self) {
+        self.complete_one();
+        let completion = self.feed.watermark();
+        self.registry
+            .advance_completion_cursor(CompletionCursorConsumer::RuntimeInjected, completion, None)
+            .expect("inject the completion");
+    }
+
+    /// Settle `count` more operations.
+    fn settle(&mut self, count: usize) {
+        for _ in 0..count {
+            self.settle_one();
+        }
+    }
+
+    /// Owe the work a restart must act on: one completion no consumer took,
+    /// and one running detached job wait.
+    fn owe_work(&mut self) {
+        self.complete_one();
+        let wait = OperationId::for_detached_job_wait(&self.owner, "history-realm", "history-job");
+        self.registry
+            .register_operation(OperationSpec {
+                id: wait.clone(),
+                kind: OperationKind::DetachedJobWait,
+                owner_session_id: self.owner.clone(),
+                display_name: "await detached job".into(),
+                source_label: "await_job".into(),
+                operation_source: Some(OperationSource::detached_job(
+                    "history-realm",
+                    "history-job",
+                )),
+                child_session_id: None,
+                expect_peer_channel: false,
+            })
+            .expect("register the job wait");
+        self.registry
+            .provisioning_succeeded(&wait)
+            .expect("the job wait runs");
+    }
+
+    /// The snapshot the runtime persists now.
+    fn snapshot(&self) -> PersistedOpsSnapshot {
+        self.registry
+            .capture_persistence_snapshot(self.epoch.clone(), &EpochCursorState::new())
+            .expect("the ops lifecycle snapshot")
+    }
+}
+
+/// An idle lifecycle bound to `runtime`: what a registered runtime with no
+/// run commits.
+fn idle_lifecycle(runtime: &LogicalRuntimeId) -> MachineLifecycleCommit {
+    MachineLifecycleCommit::new_with_binding_run_and_unregister_progress(
+        RuntimeState::Idle,
+        MachineLifecycleBindingFacts::new(
+            Some(runtime.0.clone()),
+            Some(1),
+            Some(1),
+            Some("epoch-1".to_string()),
+        ),
+        MachineLifecycleRunFacts::new(None, Some(MachineLifecyclePreRunPhase::Idle)),
+        SupervisorAuthoritySnapshot::UnboundNoReceipt,
+        None,
+    )
+}
+
+/// Write the history of `settled` settled operations into `runtime`: a
+/// snapshot every [`SETTLED_PER_SNAPSHOT`] operations and one after the last.
+async fn write_settled_history(
+    store: &SpiRuntimeStore,
+    runtime: &LogicalRuntimeId,
+    ops: &mut SettlingOps,
+    settled: usize,
+) {
+    let mut done = 0;
+    while done < settled {
+        let batch = SETTLED_PER_SNAPSHOT.min(settled - done);
+        ops.settle(batch);
+        done += batch;
+        store
+            .persist_ops_lifecycle(runtime, &ops.snapshot())
+            .await
+            .expect("the snapshot persists");
+    }
+}
+
+/// [`QUIET_RUNTIMES`] registered runtimes, each with a history of `settled`
+/// settled operations and nothing else.
+async fn quiet_runtimes_with_history(
+    store: &SpiRuntimeStore,
+    settled: usize,
+) -> Vec<LogicalRuntimeId> {
+    let mut runtimes = Vec::with_capacity(QUIET_RUNTIMES);
+    for index in 0..QUIET_RUNTIMES {
+        let runtime = LogicalRuntimeId::new(format!("quiet-{index}"));
+        store
+            .commit_machine_lifecycle(&runtime, idle_lifecycle(&runtime), &[])
+            .await
+            .expect("the runtime is registered");
+        write_settled_history(store, &runtime, &mut SettlingOps::new(), settled).await;
+        runtimes.push(runtime);
+    }
+    runtimes
+}
+
+/// The start of the host name of `runtime`'s session scope.
+fn runtime_scope_prefix(runtime: &LogicalRuntimeId) -> String {
+    format!(
+        "{}:{}~",
+        super::RUNTIME_FAMILY.tag,
+        codec::key_part(&runtime.0)
+    )
+}
+
+/// A runtime scope's window as the host holds it.
+struct HostWindow {
+    name: String,
+    start: u64,
+    end: u64,
+    /// Bytes of the visible rows.
+    bytes: u64,
+    /// The head's count of live row entry bytes.
+    live: u64,
+    row_lens: BTreeMap<u64, usize>,
+}
+
+/// `runtime`'s window on the host, checked against its head: the head names
+/// exactly the visible rows and counts their bytes (the counter the re-base
+/// rule reads).
+fn host_window(host: &TestHost, runtime: &LogicalRuntimeId) -> HostWindow {
+    let scope = host
+        .window_of(ScopeKind::Session, &runtime_scope_prefix(runtime))
+        .expect("the runtime's scope is on the host");
+    let head = ScopeHeadV1::decode(&scope.head).expect("the head decodes");
+    let bytes: u64 = scope.row_lens.values().map(|len| *len as u64).sum();
+    assert_eq!(
+        (head.w.s, head.w.e),
+        (scope.start, scope.end),
+        "the head names {}'s visible rows",
+        scope.name
+    );
+    assert_eq!(
+        head.sb, bytes,
+        "the head counts {}'s visible row bytes",
+        scope.name
+    );
+    HostWindow {
+        name: scope.name,
+        start: scope.start,
+        end: scope.end,
+        bytes,
+        live: head.lb,
+        row_lens: scope.row_lens,
+    }
+}
+
+/// The retention rule after one commit: the visible rows stay within
+/// `max(REBASE_FACTOR x the live bytes before the commit, REBASE_FLOOR)`
+/// plus the rows the commit appended, and a commit that re-based the scope
+/// did it in its one batch, a reset first, with every row before the
+/// image's first row dropped. Answers whether it re-based.
+fn assert_retention(
+    host: &TestHost,
+    before: &HostWindow,
+    after: &HostWindow,
+    commits_before: u64,
+) -> bool {
+    let appended: u64 = after
+        .row_lens
+        .range(before.end..)
+        .map(|(_, len)| *len as u64)
+        .sum();
+    let bound = (REBASE_FACTOR * before.live).max(REBASE_FLOOR) + appended;
+    assert!(
+        after.bytes <= bound,
+        "{} holds {} row bytes, over max({REBASE_FACTOR} x {} live bytes, \
+         {REBASE_FLOOR}) + {appended} appended",
+        after.name,
+        after.bytes,
+        before.live
+    );
+    if after.start == before.start {
+        return false;
+    }
+    assert_eq!(
+        after.start, before.end,
+        "the re-base drops every row before the image's first row"
+    );
+    assert_eq!(
+        host.commit_count(),
+        commits_before + 1,
+        "the re-base lands in the commit's one batch"
+    );
+    let first = host
+        .row_at(ScopeKind::Session, &after.name, after.start)
+        .expect("the image's first row");
+    assert!(
+        matches!(
+            codec::decode_row(&first).expect("the row decodes").first(),
+            Some(RowOp::Reset)
+        ),
+        "the image starts with a reset"
+    );
+    true
+}
+
+/// Persist `snapshot` to `runtime` and check the retention rule against the
+/// window before. Answers the window after, and whether the commit re-based.
+async fn persist_checked(
+    host: &TestHost,
+    store: &SpiRuntimeStore,
+    runtime: &LogicalRuntimeId,
+    snapshot: &PersistedOpsSnapshot,
+    before: &HostWindow,
+) -> (HostWindow, bool) {
+    let commits = host.commit_count();
+    store
+        .persist_ops_lifecycle(runtime, snapshot)
+        .await
+        .expect("the snapshot persists");
+    let after = host_window(host, runtime);
+    let rebased = assert_retention(host, before, &after, commits);
+    (after, rebased)
+}
+
+/// Drop a process and open another over the same host, with the host's call
+/// record cleared in between: the calls recorded next are the new open's.
+async fn reopen_recording(
+    host: &Arc<TestHost>,
+    old: (Arc<SpiRealm>, SpiRuntimeStore),
+) -> (Arc<SpiRealm>, SpiRuntimeStore) {
+    drop(old);
+    host.expire_lease();
+    host.take_calls();
+    open(host).await
+}
+
+/// The calls a row counts: renews run on the realm's own timer, not on the
+/// path a row measures.
+fn counted_calls(host: &TestHost) -> Vec<HostCall> {
+    host.take_calls()
+        .into_iter()
+        .filter(|call| *call != HostCall::RenewFence)
+        .collect()
+}
+
+// Unrun until the candidate's validation.
+//
+// Runtimes with long settled histories and no work cost an open their heads
+// only: one acquire, `list_heads` per kind at 256 heads per call, and no
+// `load_head` or `read_rows` at all, the obligation scan included. Every
+// count is the same for 0, 1,000 and 10,000 settled operations per runtime.
+#[tokio::test]
+async fn an_open_reads_only_heads_for_quiet_runtimes_whatever_their_history() {
+    let mut recorded = Vec::new();
+    for settled in [0, 1_000, 10_000] {
+        let host = Arc::new(TestHost::new());
+        let opened = open(&host).await;
+        let quiet = quiet_runtimes_with_history(&opened.1, settled).await;
+        let reopened = reopen_recording(&host, opened).await;
+        let listed = reopened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers");
+        let calls = counted_calls(&host);
+        assert!(listed.is_empty(), "no quiet runtime holds work: {listed:?}");
+        // A runtime with no rows has nothing to load and reads as loaded.
+        if settled > 0 {
+            for runtime in &quiet {
+                assert!(
+                    !reopened.1.runtime_loaded_for_test(&runtime.0).await,
+                    "{runtime:?} stays on the host after {settled} settled operations"
+                );
+            }
+        }
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == HostCall::AcquireFence)
+                .count(),
+            1,
+            "one acquire: {calls:?}"
+        );
+        for kind in [
+            ScopeKind::Session,
+            ScopeKind::Identity,
+            ScopeKind::Mob,
+            ScopeKind::Record,
+        ] {
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| **call == HostCall::ListHeads { kind })
+                    .count(),
+                host.scope_count(kind).div_ceil(LIST_PAGE_HEADS).max(1),
+                "the {kind} heads, {LIST_PAGE_HEADS} per call"
+            );
+        }
+        assert!(
+            calls
+                .iter()
+                .all(|call| matches!(call, HostCall::AcquireFence | HostCall::ListHeads { .. })),
+            "the open reads heads only after {settled} settled operations: {calls:?}"
+        );
+        recorded.push(calls);
+    }
+    assert!(
+        recorded.windows(2).all(|pair| pair[0] == pair[1]),
+        "every open makes the same calls whatever the history: {recorded:?}"
+    );
+}
+
+// Unrun until the candidate's validation.
+//
+// One runtime holds work (an unsettled input) beside quiet runtimes, and all
+// of them settled the same number of operations. The open reads rows of that
+// runtime only: `ceil(window rows / 16)` `read_rows` calls, and no
+// `load_head` since no live entry is chunked. Its window stays under
+// `max(4 x live bytes, 256 KiB)` plus one commit after every commit, so the
+// reads are the same for 1,000 and 10,000 settled operations.
+#[tokio::test]
+async fn an_open_reads_only_the_obligated_runtimes_bounded_window() {
+    let mut row_reads = Vec::new();
+    for settled in [1_000, 10_000] {
+        let host = Arc::new(TestHost::new());
+        let opened = open(&host).await;
+        let quiet = quiet_runtimes_with_history(&opened.1, settled).await;
+        let obligated = LogicalRuntimeId::new("obligated");
+        opened
+            .1
+            .commit_machine_lifecycle(&obligated, idle_lifecycle(&obligated), &[])
+            .await
+            .expect("the runtime is registered");
+        opened
+            .1
+            .persist_input_state(
+                &obligated,
+                &persistable(StoredInputState::new_accepted(InputId::new())),
+            )
+            .await
+            .expect("an unsettled input");
+        let mut ops = SettlingOps::new();
+        let mut window = host_window(&host, &obligated);
+        let mut done = 0;
+        while done < settled {
+            let batch = SETTLED_PER_SNAPSHOT.min(settled - done);
+            ops.settle(batch);
+            done += batch;
+            window = persist_checked(&host, &opened.1, &obligated, &ops.snapshot(), &window)
+                .await
+                .0;
+        }
+        assert!(
+            host.window_of(ScopeKind::Record, "ch:").is_none(),
+            "every snapshot is inline: no live entry is chunked"
+        );
+
+        let reopened = reopen_recording(&host, opened).await;
+        let reads: Vec<HostCall> = counted_calls(&host)
+            .into_iter()
+            .filter(|call| matches!(call, HostCall::LoadHead { .. } | HostCall::ReadRows { .. }))
+            .collect();
+        for call in &reads {
+            assert!(
+                matches!(
+                    call,
+                    HostCall::ReadRows { kind: ScopeKind::Session, name } if *name == window.name
+                ),
+                "the open reads the obligated runtime's rows only: {call:?}"
+            );
+        }
+        assert_eq!(
+            reads.len() as u64,
+            (window.end - window.start).div_ceil(READ_PAGE_ROWS as u64),
+            "one read_rows per {READ_PAGE_ROWS} rows of the window {}..{}",
+            window.start,
+            window.end
+        );
+        assert!(
+            reopened.1.runtime_loaded_for_test(&obligated.0).await,
+            "the runtime with work loads at open"
+        );
+        for runtime in &quiet {
+            assert!(
+                !reopened.1.runtime_loaded_for_test(&runtime.0).await,
+                "{runtime:?} stays on the host"
+            );
+        }
+        row_reads.push(reads.len());
+    }
+    assert_eq!(
+        row_reads[0], row_reads[1],
+        "the open reads as many rows after 1,000 settled operations as after 10,000"
+    );
+}
+
+// Unrun until the candidate's validation.
+//
+// A runtime settles operations one after another and persists its ops
+// lifecycle snapshot after each, as the runtime does at every terminal
+// transition. After every commit its visible rows stay within
+// `max(4 x live bytes, 256 KiB)` plus that commit's rows; each re-base is the
+// commit's one batch, a reset and the live image, with every earlier row
+// dropped at the image's first row; and a reopen folds the same entries: the
+// newest snapshot with the work it owes, the unsettled input, the committed
+// document and the run's provisional tail.
+#[tokio::test]
+async fn a_settling_runtime_keeps_its_window_under_the_rebase_bound() {
+    use meerkat_core::lifecycle::RunId;
+    use meerkat_core::types::{Message, UserMessage};
+
+    use crate::store::{PreparedWholeBlobProvisionalTail, SerializedSessionSnapshot};
+
+    const SETTLED: usize = 100;
+
+    assert_eq!(
+        (CHECKPOINT_FACTOR, CHECKPOINT_MIN_BYTES),
+        (REBASE_FACTOR, REBASE_FLOOR),
+        "the realm re-bases by the rule these rows hold it to"
+    );
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let mut session = meerkat_core::Session::new();
+    session.push(Message::User(UserMessage::text("the committed base")));
+    let runtime = LogicalRuntimeId::for_session(session.id());
+    opened
+        .1
+        .commit_session_snapshot(
+            &runtime,
+            SerializedSessionSnapshot {
+                session_snapshot: Arc::new(serde_json::to_vec(&session).unwrap()),
+            },
+        )
+        .await
+        .expect("the committed document");
+    let base = opened
+        .1
+        .load_whole_blob_store_authority(&runtime)
+        .await
+        .unwrap()
+        .expect("a committed base");
+    session.push(Message::User(UserMessage::text("the run's first round")));
+    opened
+        .1
+        .write_prepared_whole_blob_provisional_tail(
+            &runtime,
+            PreparedWholeBlobProvisionalTail::prepare_from_session(base, RunId::new(), 1, &session)
+                .unwrap(),
+        )
+        .await
+        .expect("the run's provisional tail");
+    opened
+        .1
+        .persist_input_state(
+            &runtime,
+            &persistable(StoredInputState::new_accepted(InputId::new())),
+        )
+        .await
+        .expect("an unsettled input");
+
+    let mut ops = SettlingOps::new();
+    let mut window = host_window(&host, &runtime);
+    let mut rebases = 0;
+    for _ in 0..SETTLED {
+        ops.settle_one();
+        let (after, rebased) =
+            persist_checked(&host, &opened.1, &runtime, &ops.snapshot(), &window).await;
+        rebases += usize::from(rebased);
+        window = after;
+    }
+    ops.owe_work();
+    let (_, rebased) = persist_checked(&host, &opened.1, &runtime, &ops.snapshot(), &window).await;
+    rebases += usize::from(rebased);
+    assert!(
+        rebases >= 2,
+        "{rebases} re-bases over {SETTLED} settled operations"
+    );
+    assert!(
+        host.window_of(ScopeKind::Record, "ch:").is_none(),
+        "every snapshot is inline"
+    );
+
+    let image = opened.1.export_runtime_for_test(&runtime.0).await;
+    let reopened = reopen(&host, opened).await;
+    assert!(
+        reopened.1.runtime_loaded_for_test(&runtime.0).await,
+        "its work loads it at open"
+    );
+    assert_eq!(
+        reopened.1.export_runtime_for_test(&runtime.0).await,
+        image,
+        "the reopen folds the same entries"
+    );
+    assert!(
+        reopened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&runtime),
+        "the owed work is still owed"
+    );
 }

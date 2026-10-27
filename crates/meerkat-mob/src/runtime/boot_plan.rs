@@ -52,7 +52,12 @@ pub enum MemberRestorePolicy {
     /// left unmaterialized, before the mob reports ready: a member whose
     /// durable session cannot be resumed reads Broken at ready, as under
     /// [`Self::Eager`], without being materialized. It costs one durable read
-    /// per such member per start.
+    /// per such member per start. On a SQLite store that read is small (the
+    /// session's authority, catalog entry and lifecycle row). On a host store
+    /// (`meerkat_core::host_store`) the runtime store answers it by loading
+    /// the member's stored session: its visible rows and the chunks of its
+    /// large values, for every dormant member at every start. Use
+    /// [`Self::OnDemand`] there.
     OnDemandVerified,
     /// Materialize every seated member at start.
     Eager,
@@ -788,8 +793,10 @@ pub(crate) struct VerifiedMemberTarget {
     pub(crate) session_id: meerkat_core::types::SessionId,
 }
 
-/// The verified pass's read-only inputs. It loads no session body, takes no
-/// hosting claim, provisions nothing and registers no runtime.
+/// The verified pass's read-only inputs. It builds no session, takes no
+/// hosting claim, provisions nothing and registers no runtime. Its reads are
+/// the resume observations of `verify_dormant_members`: on a host store
+/// each one loads the member's stored session rows.
 #[cfg(feature = "runtime-adapter")]
 pub(crate) struct VerifiedPassContext<'a> {
     pub(crate) mob_id: &'a MobId,
@@ -815,7 +822,11 @@ pub(crate) async fn verify_dormant_members(
     use futures::StreamExt as _;
 
     // First the bound sessions' own observations, concurrently: one
-    // backend-atomic head read each, no body.
+    // backend-atomic read of the session's authority, catalog entry and
+    // lifecycle each. No session is built, but on a host store the runtime
+    // store answers each by loading the member's stored session rows (the
+    // authority is one of its row entries), so this pass reads every
+    // dormant member's rows at every start there.
     let session_service = ctx.session_service;
     let observed = futures::stream::iter(targets)
         .map(|target| async move {

@@ -9649,8 +9649,13 @@ pub trait RuntimeStore: Send + Sync {
     /// to authorize a session resume attempt.
     ///
     /// Backends must read the session authority, catalog projection, and raw
-    /// lifecycle row under one snapshot. This method never materializes the
-    /// accumulated Session body.
+    /// lifecycle row under one snapshot. This method decodes no Session. On
+    /// most backends it reads only those rows; the host store adapter
+    /// (`spi::SpiRuntimeStore`) keeps the session authority among a
+    /// runtime's rows, so it answers the first such read of a runtime whose
+    /// rows are not resident by loading all of them from the host, the
+    /// committed session document's bytes included (its row entry, or the
+    /// chunk that holds it), and they then stay resident.
     async fn load_session_resume_observation(
         &self,
         runtime_id: &LogicalRuntimeId,

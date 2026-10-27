@@ -8,6 +8,8 @@ mod existing_live_delegation;
 mod historical_metadata;
 mod host_human_input;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod host_store_boot_reads;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lazy_boot;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lift_binding_rows;
@@ -1860,6 +1862,16 @@ impl Drop for AtomicInFlightGuard<'_> {
     }
 }
 
+/// Durable reads of one session through the mob session service, by
+/// method: what a row pins when it requires that a dormant member's session
+/// is not read.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct DurableSessionReadCounts {
+    load_persisted_session: u64,
+    observe_session_resume_authority: u64,
+    materialize_session_resume_verdict: u64,
+}
+
 /// Session reads of one session: calls, reads in flight, and the most in
 /// flight at once.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -2236,6 +2248,10 @@ struct MockSessionService {
     /// per-session metadata read counts (proves a single realm scan).
     load_persisted_session_metadata_delay_ms: AtomicU64,
     metadata_reads_for: std::sync::Mutex<HashMap<SessionId, u64>>,
+    /// Per-session durable reads (`load_persisted_session`,
+    /// `observe_session_resume_authority` and
+    /// `materialize_session_resume_verdict`).
+    durable_reads_for: std::sync::Mutex<HashMap<SessionId, DurableSessionReadCounts>>,
     /// Sessions whose metadata-only read fails with a store error.
     metadata_read_failures_for: std::sync::Mutex<HashSet<SessionId>>,
     load_persisted_session_in_flight: AtomicU64,
@@ -2474,6 +2490,7 @@ impl MockSessionService {
             load_persisted_session_metadata_calls: AtomicU64::new(0),
             load_persisted_session_metadata_delay_ms: AtomicU64::new(0),
             metadata_reads_for: Default::default(),
+            durable_reads_for: Default::default(),
             metadata_read_failures_for: Default::default(),
             load_persisted_session_in_flight: AtomicU64::new(0),
             load_persisted_session_max_in_flight: AtomicU64::new(0),
@@ -3407,6 +3424,35 @@ impl MockSessionService {
 
     fn session_read_calls(&self) -> u64 {
         self.session_read_calls.load(Ordering::Relaxed)
+    }
+
+    /// Count one durable read of `session_id`.
+    fn count_durable_read(
+        &self,
+        session_id: &SessionId,
+        count: impl FnOnce(&mut DurableSessionReadCounts),
+    ) {
+        count(
+            self.durable_reads_for
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .entry(session_id.clone())
+                .or_default(),
+        );
+    }
+
+    /// Durable reads of `session_id` so far.
+    #[cfg_attr(
+        any(not(feature = "runtime-adapter"), target_arch = "wasm32"),
+        allow(dead_code)
+    )]
+    fn durable_reads_of(&self, session_id: &SessionId) -> DurableSessionReadCounts {
+        self.durable_reads_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
     }
 
     /// Reads of `session_id` so far.
@@ -5515,6 +5561,9 @@ impl MobSessionService for MockSessionService {
         session_id: &SessionId,
     ) -> Result<super::session_service::SessionResumeVerdict, SessionError> {
         self.resume_prepare_calls.fetch_add(1, Ordering::Relaxed);
+        self.count_durable_read(session_id, |reads| {
+            reads.materialize_session_resume_verdict += 1;
+        });
         if self
             .resume_verdict_divergence_sessions
             .read()
@@ -5548,6 +5597,9 @@ impl MobSessionService for MockSessionService {
         &self,
         session_id: &SessionId,
     ) -> Result<SessionResumeAuthority, SessionError> {
+        self.count_durable_read(session_id, |reads| {
+            reads.observe_session_resume_authority += 1;
+        });
         if self
             .resume_authority_absent_remaining
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
@@ -6122,6 +6174,9 @@ impl MobSessionService for MockSessionService {
         self.load_persisted_session_started.notify_one();
         self.load_persisted_session_calls
             .fetch_add(1, Ordering::Relaxed);
+        self.count_durable_read(session_id, |reads| {
+            reads.load_persisted_session += 1;
+        });
         let in_flight = self
             .load_persisted_session_in_flight
             .fetch_add(1, Ordering::Relaxed)

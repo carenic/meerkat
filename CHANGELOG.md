@@ -201,7 +201,8 @@ them.
     must run (see Changed), `OnDemandVerified` also reads each member it
     leaves Dormant once, read-only, and records one whose durable session
     cannot be resumed as Broken, and `Eager` materializes every member, as
-    before.
+    before. On a host store, `OnDemandVerified`'s read loads each dormant
+    member's stored session rows at every start, so use `OnDemand` there.
   - `MobBuilder::with_host_required_members` (members the host needs live at
     start), `MobBuilder::with_host_pending_members` (members whose host
     preparation is still pending: never materialized, and every wake of one
@@ -369,13 +370,6 @@ them.
   snapshot: until then a restart presents it again (one more wake and one
   repeated notice, never a lost completion).
 
-- Upgrade note, behaviour-only: the first start after upgrading a host-store
-  deployment restores members whose runtime heads predate 0.9.7. Such a
-  head may not record a background operation completion its runtime still
-  owes, so the obligation scan reads it as holding work and the start wakes
-  its member, once: the runtime's next commit records its facts in full, and
-  a release before 0.9.7 still reads them.
-
 - Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
   member rotated with `MobHandle::rotate_member`, so a rotated member whose
   owed kickoff has not run yet does not run it after a rollback to 0.9.6.
@@ -506,6 +500,19 @@ them.
   until it finishes, even when its caller was cancelled, and the destroy
   removes the files only after that (`SqliteMobStores::drain_observers`
   refuses while one runs).
+- Host-store realms: a session no longer keeps up to 4 MiB of superseded
+  copies of its runtime's registry of background operations. Core rewrites
+  that registry whole each time an operation finishes or its result is
+  delivered, and dropped the earlier copies only once the session's rows
+  passed four times its live state or 4 MiB, whichever is larger. The floor
+  is now 256 KiB: in one batch, Core writes the session's live state again
+  and drops every earlier row, so its rows stay within 256 KiB or four times
+  its live state, plus its last change. A wake or a recovery of the session
+  reads that much less, and an append-only store has that much less to
+  compact. The stored format is unchanged and 0.9.6 reads a session written
+  this way, so a rollback needs nothing. A session's existing rows shrink at
+  its next commit; a dormant member's session keeps its rows until the
+  member is next woken, and Core does not read them meanwhile.
 
 ### Known limitations
 
@@ -524,9 +531,23 @@ them.
   runtime's attempts, and that run's own kept inputs are abandoned, as in
   0.9.6. The delivery that woke the member is a new input and is not
   abandoned with them.
+- With TCP or UDS member comms (`MobBuilder::with_network_member_comms`),
+  members are not lazy: every start of the mob, and every lift of a stopped
+  one, wakes every member, whatever the restore policy. A dormant member has
+  no listener for peers that reach it over the network, and a seat records
+  no durable endpoint for it, so Core keeps such members live. Lazy
+  residency applies to members on in-process comms, the default.
 
 ### Upgrade notes
 
+- Host-store realms: the first 0.9.7 start over a realm that 0.9.6 or an
+  earlier release last wrote wakes every mob member that is not archived,
+  once. The session heads those releases wrote cannot show that no
+  background operation completion is still owed, so the start treats each
+  member as holding work rather than risk losing one. Each member's next
+  commit records its state in the 0.9.7 form, and later starts wake only
+  the members that hold work. Expect that first start to take about as long
+  as a 0.9.6 start. 0.9.6 still reads the heads 0.9.7 writes.
 - Upgrade the Python and TypeScript SDKs with the server before selecting
   `prompt_cache_options.ttl = "12h"` for a session you fork. Once such a
   session runs in `explicit` mode (the GPT-5.6 default), its cache-breakpoint

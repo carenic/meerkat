@@ -9372,6 +9372,11 @@ impl MobHandle {
     /// Seating needs the members' comms transport
     /// ([`super::MobBuilder::with_member_comms_identity_root`] or
     /// [`super::MobBuilder::with_network_member_comms`]) and a running mob.
+    /// A seat reads its session's resume observation once, to refuse an
+    /// archived or lost session; on a host store (`meerkat_core::host_store`)
+    /// that read loads the session's stored rows, so seating members on
+    /// existing sessions reads each one's rows once. A session that does not
+    /// exist yet is not read.
     ///
     /// Outcomes come back in input order, one per spec: a spec the machine or
     /// its session refuses is answered alone and nothing of it is written.

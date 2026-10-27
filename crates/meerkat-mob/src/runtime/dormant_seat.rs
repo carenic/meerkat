@@ -7,13 +7,16 @@
 //!    spawn of a fresh spec that owes a kickoff (such a member is
 //!    embodied exactly as a spawn is), or what the seat needs.
 //! 2. The handle prepares each seat off the actor: the session's archived
-//!    state from the session owner's pinned observation (no body load), and
-//!    the endpoint from the session's stored comms key. A seat builds
-//!    nothing: a fresh seat's session (under its name-based id) does not
-//!    exist yet, and MobMachine records it unborn. The member's first wake
-//!    creates it through the spawn provision path, with the runtime
-//!    registration and the host's registration hook any member build has,
-//!    and applies the build inputs the seat carried ([`SeatBuild`]).
+//!    state from the session owner's resume observation (no session is
+//!    built; on a host store the observation loads the stored session's
+//!    rows once per seat, while a session that does not exist yet reads
+//!    nothing), and the endpoint from the session's stored comms key. A
+//!    seat builds nothing: a fresh seat's session (under its name-based id)
+//!    does not exist yet, and MobMachine records it unborn. The member's
+//!    first wake creates it through the spawn provision path, with the
+//!    runtime registration and the host's registration hook any member
+//!    build has, and applies the build inputs the seat carried
+//!    ([`SeatBuild`]).
 //! 3. The actor commits the chunk in one step: on one prepared
 //!    authority, per identity `AuthorizeSpawnProfile`, `BeginSpawnExec` and
 //!    `CommitDormantSeat` as one batch (an identity the machine refuses is
@@ -513,8 +516,11 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
              (MobBuilder::with_member_comms_identity_root or with_network_member_comms)"
         ))));
     };
-    // The session owner's pinned observation: authority, catalog lifecycle
-    // and runtime lifecycle in one snapshot, no body load.
+    // The session owner's resume observation: authority, catalog lifecycle
+    // and runtime lifecycle in one snapshot. No session is built. On a host
+    // store the runtime store answers it by loading the stored session's
+    // rows (the authority is one of its row entries): one load per seat of
+    // an existing session, none for a session that does not exist yet.
     let lifecycle = session_service
         .observe_session_resume_authority(&session_id)
         .await

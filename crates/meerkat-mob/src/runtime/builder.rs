@@ -7932,7 +7932,10 @@ impl MobBuilder {
     /// it first, and a read never does. The policy only decides how much the
     /// start materializes up front. [`MemberRestorePolicy::OnDemandVerified`]
     /// reads each member it leaves unmaterialized once, read-only, at most
-    /// [`Self::with_resume_restore_concurrency`] at a time.
+    /// [`Self::with_resume_restore_concurrency`] at a time; on a host store
+    /// (`meerkat_core::host_store`) each such read loads the member's stored
+    /// session rows, at every start, so prefer
+    /// [`MemberRestorePolicy::OnDemand`] there.
     pub fn with_member_restore_policy(mut self, policy: super::MemberRestorePolicy) -> Self {
         self.member_residency.restore_policy = policy;
         self
