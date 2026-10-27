@@ -7531,13 +7531,38 @@ impl MobBuilder {
     /// Restoring a member reads its session and provisions it, round trips to
     /// the session store that, one member at a time, make a resume grow with
     /// the member count and the store's latency. Members are restored
-    /// alongside each other up to this bound. What a restore writes (the
-    /// mob's machine authority, roster and journal, and its restore
-    /// diagnostics) is still applied one member at a time in roster order, so
-    /// the resumed mob is the one a restore of one member at a time leaves,
-    /// and the first failure in roster order fails the resume as before. `1`
-    /// restores one member at a time. A host whose session store serializes
-    /// its writers can lower it.
+    /// alongside each other up to this bound: a member counts against it from
+    /// the start of its restore until its writes are applied. What a restore
+    /// writes (the mob's machine authority, roster and journal, and its
+    /// restore diagnostics) is applied one member at a time in roster order,
+    /// so the resumed mob is the one a restore of one member at a time
+    /// leaves. `1` restores one member at a time, as before.
+    ///
+    /// The first failure in roster order fails the resume with the error it
+    /// failed with before. The restores already running when it fails
+    /// finish first; then every member they restored but that the resume
+    /// does not apply (at most `concurrency - 1`) has its provision
+    /// released: a resumed session is detached with its durable session
+    /// kept, and a session a service without durable sessions recreated is
+    /// retired. The error comes after those restores and releases; detaching
+    /// a resumed session waits for a turn that session is already running to
+    /// end.
+    ///
+    /// A restore no longer checks the recovered machine state against the
+    /// machine's invariants for each member. On a state that breaks one, a
+    /// restore of one member at a time left a durable member unrestored with
+    /// a restore failure and failed the resume on a recreated member; each
+    /// member is now restored on it as on any other state.
+    ///
+    /// The spawn member customizer and the default external tools provider
+    /// stay synchronous calls on the resume's task: never two at once, but one
+    /// that blocks holds up every member restore in flight. The member runtime
+    /// registration hook runs inside each member's provision, so for several
+    /// members at once.
+    ///
+    /// A resume dropped before it returns drops the restores in flight with
+    /// it: up to `concurrency` members are left provisioned, or part way
+    /// through their provision, without their release.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
         self.resume_restore_concurrency = concurrency.max(1);
@@ -11126,32 +11151,51 @@ fn member_restore_reapplied<T>(
 
 /// Restore `restore_set` (see [`resume_restore_set`]) in a cold resume.
 ///
-/// Each member's restore runs alongside other members', at most
-/// `concurrency` at a time: its reads, its customizer calls and its
-/// provision, the store round trips that made a serial restore grow with
-/// the fleet and the store's latency. Those steps write nothing another
-/// member's restore reads: the member's MobMachine inputs are applied to its
-/// own fork of the recovered authority. Everything a restore writes (the
-/// mob's authority, roster and restore diagnostics, the overlay maps, the
-/// member's runtime binding, a repointed binding's journal event) is applied
-/// in the member's turn, in `restore_set`'s order, with the inputs the
-/// member's own fork admitted. Each of those inputs reads only the member's
-/// own entries and the mob's lifecycle phase, and writes only the member's
-/// own entries and the topology epoch, which none of them reads, so the
-/// mob's authority, roster and diagnostics end exactly as a restore of one
-/// member at a time leaves them.
+/// Each member's restore runs alongside other members': its reads and its
+/// provision, the store round trips that made a serial restore grow with the
+/// fleet and the store's latency. Those steps write nothing another member's
+/// restore reads: the member's MobMachine inputs are applied to its own fork
+/// of the recovered authority. Everything a restore writes (the mob's
+/// authority, roster and restore diagnostics, the overlay maps, the member's
+/// runtime binding, a repointed binding's journal event) is applied in the
+/// member's turn, in `restore_set`'s order, with the inputs the member's own
+/// fork admitted. Each of those inputs reads only the member's own entries
+/// and the mob's lifecycle phase, and writes only the member's own entries
+/// and the topology epoch, which none of them reads, so the mob's authority,
+/// roster and diagnostics end exactly as a restore of one member at a time
+/// leaves them.
 ///
-/// Some members restore entirely in their turns, after every member before
-/// them: a fork of an in-mob source (its restore follows its source's), a
-/// member bound to the session an earlier member is bound to, and, from its
-/// successor search on, a member whose bound session is absent (the search
-/// repoints its binding in the journal before its provision).
+/// A member counts against `concurrency` from the start of its restore until
+/// its turn returns: it takes a permit before it restores, and the permit is
+/// dropped when its turn returns. So at most `concurrency` members are
+/// between the start of their restore and the end of their turn, and at
+/// concurrency 1 each member is restored and applied before the next one's
+/// restore starts. The stream first polls the restores in roster order and
+/// the semaphore hands its permits out in the order they were asked for, so
+/// the next member to apply always holds a permit or is the first in line
+/// for one.
+///
+/// Some members restore entirely in their turns: a fork of an in-mob source
+/// (its restore follows its source's), a member bound to the session an
+/// earlier member is bound to, and, from its successor search on, a member
+/// whose bound session is absent (the search repoints its binding in the
+/// journal before its provision).
 ///
 /// The first error in `restore_set`'s order is returned, after every member
 /// before it was applied, as a restore of one member at a time returns it.
-/// Once any member's restore has failed the resume, no further member's
-/// restore starts; the restores already running finish (a provision is not
-/// cancelled half way) and are not applied.
+/// Once any restore or turn has failed the resume, no further member's
+/// restore starts. The restores already running finish (a provision is not
+/// cancelled half way); then every member restored but not applied (at most
+/// `concurrency - 1`) has its provision released, one after another
+/// ([`release_unapplied_member_restore`]), so no live session is left that
+/// no authority holds; and only then is the error returned. Detaching a
+/// resumed session waits at its turn boundary, so a turn that session is
+/// already running holds the error until the turn ends.
+///
+/// A resume dropped before it returns (no production caller cancels one)
+/// drops the restores in flight at their await points, as the serial restore
+/// dropped its one: at most `concurrency` members, provisioned or part way
+/// through their provision, without a release.
 #[cfg(feature = "runtime-adapter")]
 async fn restore_resumed_members(
     ctx: &ResumeMemberRestoreContext<'_>,
@@ -11166,47 +11210,89 @@ async fn restore_resumed_members(
     // Every independent member's restore forks the authority as recovered:
     // what it reads there no other member's restore writes. Its overlay is
     // its own, so it reads no other member's restored overlay.
+    //
+    // A fork, here or in a member's turn, does not check the state against
+    // the MobMachine invariants. The restore of one member at a time rebuilt
+    // each member's provision authority with `recover_from_state`, which
+    // does: on a recovered state that broke an invariant, it left a durable
+    // member unrestored with a restore failure and failed the resume on a
+    // recreated member. Each member is now restored on such a state as on
+    // any other.
     let recovered = commit.authority.fork();
     let no_restored_overlays: BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>> =
         BTreeMap::new();
     let admission_open = AtomicBool::new(true);
+    let permits = Arc::new(tokio::sync::Semaphore::new(concurrency.max(1)));
+    #[cfg(test)]
+    let probe = restore_pass_probe::probe_for(&ctx.definition.id);
+    #[cfg(test)]
+    let probe = probe.as_ref();
     let (base, no_restored_overlays, admission) =
         (&recovered, &no_restored_overlays, &admission_open);
     // The stream owns its candidates: a restore future that borrowed its
     // stream item would leave the resume future Send for one lifetime only.
     let restores = futures::stream::iter(restore_set)
-        .map(move |candidate| async move {
-            // A restore starts only while no restore has failed the resume.
-            // The stream first polls the restores in roster order, so one
-            // that does not start comes after the failed one, whose error the
-            // resume returns first.
-            if !admission.load(Ordering::Acquire) {
-                return (candidate, Ok(MemberRestoreStep::NotStarted));
+        .map(move |candidate| {
+            let permits = Arc::clone(&permits);
+            async move {
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe.record(restore_pass_probe::RestorePassEvent::PermitRequested(
+                        candidate.entry.agent_identity.clone(),
+                    ));
+                }
+                let Ok(permit) = permits.acquire_owned().await else {
+                    return (
+                        candidate,
+                        Err(MobError::Internal(
+                            "the resume's member restore permits were closed".to_string(),
+                        )),
+                        None,
+                    );
+                };
+                // A restore starts only while no restore or turn has failed
+                // the resume. One that does not start comes after the failed
+                // one in roster order, whose error the resume returns first.
+                if !admission.load(Ordering::Acquire) {
+                    return (candidate, Ok(MemberRestoreStep::NotStarted), Some(permit));
+                }
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe.record(restore_pass_probe::RestorePassEvent::RestoreStarted(
+                        candidate.entry.agent_identity.clone(),
+                    ));
+                }
+                let step = if candidate.in_turn {
+                    Ok(MemberRestoreStep::InTurn)
+                } else {
+                    restore_resumed_member(
+                        ctx,
+                        &candidate,
+                        base,
+                        super::fork_build::ForkOverlayRule::Own,
+                        no_restored_overlays,
+                    )
+                    .await
+                    .map(MemberRestoreStep::Planned)
+                };
+                if step.is_err() {
+                    admission.store(false, Ordering::Release);
+                }
+                #[cfg(test)]
+                if let Some(probe) = probe {
+                    probe.record(restore_pass_probe::RestorePassEvent::RestoreFinished(
+                        candidate.entry.agent_identity.clone(),
+                    ));
+                }
+                (candidate, step, Some(permit))
             }
-            let step = if candidate.in_turn {
-                Ok(MemberRestoreStep::InTurn)
-            } else {
-                restore_resumed_member(
-                    ctx,
-                    &candidate,
-                    base,
-                    super::fork_build::ForkOverlayRule::Own,
-                    no_restored_overlays,
-                )
-                .await
-                .map(MemberRestoreStep::Planned)
-            };
-            if step.is_err() {
-                admission.store(false, Ordering::Release);
-            }
-            (candidate, step)
         })
         .buffered(concurrency.max(1));
     let mut restores = std::pin::pin!(restores);
     let mut ready = VecDeque::new();
     let mut exhausted = false;
     loop {
-        let (candidate, step) = match ready.pop_front() {
+        let (candidate, step, permit) = match ready.pop_front() {
             Some(next) => next,
             None if exhausted => break,
             None => match restores.next().await {
@@ -11223,18 +11309,101 @@ async fn restore_resumed_members(
             }
             Err(error) => Err(error),
         };
+        // The member's turn has returned: its permit lets the next member's
+        // restore start.
+        drop(permit);
         if let Err(error) = applied {
             admission.store(false, Ordering::Release);
-            while restores.next().await.is_some() {}
+            // Nothing after the failed member is applied. Collect every
+            // restore that finished or is still running (each drops its
+            // permit at once, so a restore waiting for one ends without
+            // starting), and only then release the provisions, with nothing
+            // left in flight.
+            let mut unapplied = Vec::new();
+            for (candidate, step, permit) in ready.drain(..) {
+                drop(permit);
+                unapplied.push((candidate, step));
+            }
+            while let Some((candidate, step, permit)) = restores.next().await {
+                drop(permit);
+                unapplied.push((candidate, step));
+            }
+            for (candidate, step) in unapplied {
+                release_unapplied_member_restore(ctx.provisioner, &candidate, step).await;
+            }
             return Err(error);
         }
     }
     Ok(())
 }
 
+/// Release the provision of a member the resume restored but does not apply,
+/// because a member before it failed the resume: the restore of one member at
+/// a time never started it. Its resumed session is detached and returned to
+/// durable idle with its durable session kept, and a session a nonpersistent
+/// service created for it is retired, as a failed spawn's provision is rolled
+/// back. A release that fails is logged: the next resume retires that
+/// session's attachment before it restores the member.
+#[cfg(feature = "runtime-adapter")]
+async fn release_unapplied_member_restore(
+    provisioner: &MultiBackendProvisioner,
+    candidate: &ResumeRestoreCandidate,
+    step: Result<MemberRestoreStep, MobError>,
+) {
+    let Ok(MemberRestoreStep::Planned(MemberRestorePlan::Seated {
+        outcome: SeatedMemberRestoreOutcome::Provision(provision),
+        ..
+    })) = step
+    else {
+        return;
+    };
+    let receipt = match &provision.outcome {
+        MemberRestoreProvisionOutcome::Durable { receipt, .. }
+        | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
+        MemberRestoreProvisionOutcome::Failed(_) => return,
+    };
+    let released = match receipt.session_origin {
+        super::provisioner::ProvisionSessionOrigin::Fresh => {
+            super::provisioner::MobProvisioner::retire_member(provisioner, &receipt.member_ref)
+                .await
+                .map(|_| ())
+        }
+        super::provisioner::ProvisionSessionOrigin::ResumedDurable
+        | super::provisioner::ProvisionSessionOrigin::RevivedRetired => {
+            match receipt.rollback_authority.as_ref() {
+                Some(rollback_authority) => {
+                    super::provisioner::MobProvisioner::restore_resumed_member(
+                        provisioner,
+                        &receipt.member_ref,
+                        &receipt.operation_id,
+                        receipt.session_origin,
+                        rollback_authority,
+                        // The member stays seated.
+                        super::provisioner::RollbackOrigin::RevivalOrRebuild,
+                    )
+                    .await
+                }
+                None => Err(MobError::Internal(format!(
+                    "the restored provision of '{}' carries no rollback authority",
+                    candidate.entry.agent_identity
+                ))),
+            }
+        }
+    };
+    if let Err(error) = released {
+        tracing::warn!(
+            member = %candidate.entry.agent_identity,
+            %error,
+            "a failed resume could not release the provision of a member it restored but did \
+             not apply; the next resume retires its session's attachment"
+        );
+    }
+}
+
 /// Await `turn` while the member restores in flight go on: whatever they
-/// finish is queued in `ready`, in order. A restore never waits for a turn,
-/// and a turn never waits for a restore that is not being polled.
+/// finish is queued in `ready`, in order. A restore waits for a turn only
+/// for its permit, and a turn never waits for a restore that is not being
+/// polled.
 #[cfg(feature = "runtime-adapter")]
 async fn keep_member_restores_moving<T, W, S>(
     mut turn: W,
@@ -11264,11 +11433,177 @@ where
     .await
 }
 
+/// What a test sees of the parallel restore pass of a mob's resume, and the
+/// turns it holds or fails there. Compiled only for this crate's tests.
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(super) mod restore_pass_probe {
+    use super::*;
+
+    /// One step of the restore pass, in the order the pass took them.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum RestorePassEvent {
+        /// The member's restore asked for its permit.
+        PermitRequested(AgentIdentity),
+        /// The member's restore started: it holds its permit and no restore
+        /// has failed the resume.
+        RestoreStarted(AgentIdentity),
+        /// The member's restore finished (up to and including its
+        /// provision).
+        RestoreFinished(AgentIdentity),
+        /// The member's turn started.
+        TurnStarted(AgentIdentity),
+        /// The member's turn returned.
+        TurnFinished(AgentIdentity),
+    }
+
+    pub(crate) struct RestorePassProbe {
+        events: tokio::sync::watch::Sender<Vec<RestorePassEvent>>,
+        held_turns: std::sync::Mutex<BTreeMap<AgentIdentity, Arc<tokio::sync::Semaphore>>>,
+        failing_turns: std::sync::Mutex<BTreeSet<AgentIdentity>>,
+    }
+
+    /// The probes, keyed by mob: tests in one process watch their own mobs.
+    static PROBES: std::sync::Mutex<BTreeMap<MobId, Arc<RestorePassProbe>>> =
+        std::sync::Mutex::new(BTreeMap::new());
+
+    /// Watch the restore passes of `mob_id`'s resumes from now on.
+    pub(crate) fn install(mob_id: &MobId) -> Arc<RestorePassProbe> {
+        let probe = Arc::new(RestorePassProbe {
+            events: tokio::sync::watch::Sender::new(Vec::new()),
+            held_turns: std::sync::Mutex::new(BTreeMap::new()),
+            failing_turns: std::sync::Mutex::new(BTreeSet::new()),
+        });
+        PROBES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(mob_id.clone(), Arc::clone(&probe));
+        probe
+    }
+
+    pub(super) fn probe_for(mob_id: &MobId) -> Option<Arc<RestorePassProbe>> {
+        PROBES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(mob_id)
+            .cloned()
+    }
+
+    impl RestorePassProbe {
+        pub(super) fn record(&self, event: RestorePassEvent) {
+            self.events.send_modify(|events| events.push(event));
+        }
+
+        /// Every event so far.
+        pub(crate) fn events(&self) -> Vec<RestorePassEvent> {
+            self.events.borrow().clone()
+        }
+
+        /// Forget the events so far (between two resumes of one mob).
+        pub(crate) fn clear(&self) {
+            self.events.send_replace(Vec::new());
+        }
+
+        /// Wait until the events so far satisfy `until`.
+        pub(crate) async fn wait_for(&self, mut until: impl FnMut(&[RestorePassEvent]) -> bool) {
+            let mut events = self.events.subscribe();
+            let _ = events.wait_for(|events| until(events)).await;
+        }
+
+        /// Hold `identity`'s next turn at its start until
+        /// [`Self::release_turn`].
+        pub(crate) fn hold_turn(&self, identity: &AgentIdentity) {
+            self.held_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(identity.clone(), Arc::new(tokio::sync::Semaphore::new(0)));
+        }
+
+        pub(crate) fn release_turn(&self, identity: &AgentIdentity) {
+            if let Some(hold) = self
+                .held_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .remove(identity)
+            {
+                hold.add_permits(1);
+            }
+        }
+
+        /// Fail `identity`'s turns with an injected error that fails the
+        /// resume, until [`Self::stop_failing_turns`].
+        pub(crate) fn fail_turn(&self, identity: &AgentIdentity) {
+            self.failing_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(identity.clone());
+        }
+
+        pub(crate) fn stop_failing_turns(&self) {
+            self.failing_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
+        }
+
+        pub(super) async fn turn_started(&self, identity: &AgentIdentity) -> Result<(), MobError> {
+            self.record(RestorePassEvent::TurnStarted(identity.clone()));
+            let hold = self
+                .held_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(identity)
+                .cloned();
+            if let Some(hold) = hold {
+                let _released = hold.acquire().await;
+            }
+            if self
+                .failing_turns
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(identity)
+            {
+                return Err(MobError::Internal(format!(
+                    "injected restore turn failure for '{identity}'"
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
 /// A member's turn: restore a member that is restored in its own turn now,
 /// as the members before it left the mob (for a fork, its source), then
 /// apply what the member's restore writes.
 #[cfg(feature = "runtime-adapter")]
 async fn apply_member_restore_turn(
+    ctx: &ResumeMemberRestoreContext<'_>,
+    commit: &mut MemberRestoreCommit<'_>,
+    successors: &mut MemberSuccessorSearch<'_>,
+    candidate: &ResumeRestoreCandidate,
+    step: MemberRestoreStep,
+) -> Result<(), MobError> {
+    #[cfg(not(test))]
+    {
+        apply_member_restore_step(ctx, commit, successors, candidate, step).await
+    }
+    #[cfg(test)]
+    {
+        let probe = restore_pass_probe::probe_for(&ctx.definition.id);
+        if let Some(probe) = &probe {
+            probe.turn_started(&candidate.entry.agent_identity).await?;
+        }
+        let applied = apply_member_restore_step(ctx, commit, successors, candidate, step).await;
+        if let Some(probe) = &probe {
+            probe.record(restore_pass_probe::RestorePassEvent::TurnFinished(
+                candidate.entry.agent_identity.clone(),
+            ));
+        }
+        applied
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+async fn apply_member_restore_step(
     ctx: &ResumeMemberRestoreContext<'_>,
     commit: &mut MemberRestoreCommit<'_>,
     successors: &mut MemberSuccessorSearch<'_>,
@@ -12500,19 +12835,21 @@ mod tests {
         assert!(entry_continuity_intent(&recorded, &unrecorded).is_err());
     }
 
-    /// A parallel resume admits each member's provision on its own fork of
-    /// the recovered authority, in any order, and then applies the same
-    /// seeded inputs to the mob's authority in roster order. That leaves the
-    /// authority exactly as the serial restore leaves it, which forked the
-    /// authority as each member's turn found it and replaced the authority
-    /// with that fork: every input reads and writes only its member's own
-    /// entries, and the topology epoch, which some of them advance, is read
-    /// by none of them. Half the members are restored onto another session
-    /// than the one they were bound to, so the epoch advances in roster
-    /// order.
+    /// The seeded restore inputs of six durable members, each admitted on
+    /// its own fork of the recovered authority (here last member first) and
+    /// then applied to the mob's authority in roster order with the helpers
+    /// a member's turn applies them with, leave the authority the serial
+    /// restore left: it applied the same inputs to a fork of the authority
+    /// as each member's turn found it, and replaced the authority with that
+    /// fork. Half the members are restored onto another session than the one
+    /// they were bound to, so the topology epoch advances. This pins the
+    /// admission on a fork of the recovered state and the inputs' result on
+    /// this fixture only: the inputs commute, so it says nothing about the
+    /// order the pass applies turns in, which
+    /// `turns_apply_in_roster_order_however_the_restores_finish` pins.
     #[cfg(feature = "runtime-adapter")]
     #[test]
-    fn restore_inputs_applied_in_roster_order_leave_the_serial_restores_authority() {
+    fn restore_inputs_admitted_on_own_forks_leave_the_serial_restores_authority() {
         let profile = crate::profile::Profile {
             model_fallback: None,
             model: "claude-sonnet-4-5".into(),
