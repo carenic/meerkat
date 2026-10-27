@@ -5851,6 +5851,26 @@ pub(crate) trait MobIdentityMemberStore: Send + Sync {
         &self,
         mob_id: &MobId,
     ) -> Result<MemberBindingJournalRead, MobStoreError>;
+
+    /// Read the journal events whose cursor is at least `from_cursor`, in
+    /// cursor order, and the identities `mob_id` holds an identity intent
+    /// row for, in one store transaction, as
+    /// [`Self::read_member_binding_journal`] reads the whole journal. Never
+    /// writes. A reader that folded the journal up to one event reads from
+    /// that event's cursor, so the event it gets back first shows whether
+    /// the journal still holds what it folded.
+    ///
+    /// The default filters a whole read: the same answer, at the cost of a
+    /// whole read. The built-in stores read only the tail.
+    async fn read_member_binding_journal_from(
+        &self,
+        mob_id: &MobId,
+        from_cursor: u64,
+    ) -> Result<MemberBindingJournalRead, MobStoreError> {
+        let mut read = self.read_member_binding_journal(mob_id).await?;
+        read.events.retain(|event| event.cursor >= from_cursor);
+        Ok(read)
+    }
 }
 
 /// One store-transaction read of a mob store's structural event journal and
@@ -5858,7 +5878,8 @@ pub(crate) trait MobIdentityMemberStore: Send + Sync {
 /// [`crate::MemberBindingHistory`] fold.
 #[derive(Debug)]
 pub(crate) struct MemberBindingJournalRead {
-    /// Every journal event, in cursor order.
+    /// The journal events read (all of them, or those from the read's cursor
+    /// on), in cursor order.
     pub(crate) events: Vec<MobEvent>,
     /// How each identity intent row (Present or Absent) of the read mob
     /// reads: [`intent_row_management`] of its stored observation.

@@ -9121,6 +9121,9 @@ pub(super) struct MobActor {
     /// Built-in atomic join between identity authority and the structural
     /// member event target. Split custom stores cannot provide this guarantee.
     pub(super) identity_member: Option<Arc<dyn crate::store::MobIdentityMemberStore>>,
+    /// The member binding fold the mob's handles keep between member binding
+    /// history reads; the handles the actor builds share it.
+    pub(super) member_binding_fold: Arc<super::delivery_scope::MemberBindingFoldCache>,
     /// Replaceable output-only identity convergence diagnostics.
     pub(super) identity_status: Arc<dyn crate::store::MobIdentityStatusStore>,
     /// Volatile per-identity write ordering for replaceable status projections.
@@ -15951,6 +15954,7 @@ impl MobActor {
             definition: self.definition.clone(),
             events: self.events.clone(),
             identity_member: self.identity_member.clone(),
+            member_binding_fold: self.member_binding_fold.clone(),
             run_store: self.run_store.clone(),
             runtime_metadata: self.runtime_metadata.clone(),
             flow_streams: self.flow_streams.clone(),
@@ -54212,6 +54216,8 @@ impl MobActor {
             .await);
         }
         report.events_cleared = true;
+        // The handles' member binding fold folded the journal just cleared.
+        self.member_binding_fold.clear();
         boxed_arm_future(|| self.edge_locks.clear()).await;
         if report.remote_cleanup_deadline_exceeded
             || !report.orphaned_remote_members.is_empty()

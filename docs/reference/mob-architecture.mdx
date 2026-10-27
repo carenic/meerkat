@@ -84,7 +84,12 @@ build cannot read; do not drive the identity).
 
 The reads are store reads: they never wait behind the mob actor, need
 `ControlScope::List` (`MobError::ScopeDenied` otherwise), and a failed read is
-an error, never an empty history. A storage composition without the built-in
+an error, never an empty history. A handle and its clones keep the fold
+between reads, so a read reads only the journal events appended since the
+previous one (with the identity intent rows, in one store transaction) instead
+of reading or decoding the whole journal: it costs those events plus the size
+of the history it answers (its members and sessions). A journal that a destroy
+cleared is read whole again. A storage composition without the built-in
 identity and member store refuses them with
 `MobStoreError::IdentityMemberAtomicPersistenceUnavailable`. Pruning never
 removes the events the history reads. Destroying the mob clears its journal,
