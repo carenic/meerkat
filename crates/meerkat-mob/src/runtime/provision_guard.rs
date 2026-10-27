@@ -155,6 +155,24 @@ impl PendingProvision {
         match rollback {
             Ok(()) => {
                 self.committed = true;
+                // A rebuild that is rolled back leaves no run-start hold its
+                // build preparation staged for the member's next
+                // registration: that registration's build is prepared again.
+                if self.rollback_origin == RollbackOrigin::RevivalOrRebuild
+                    && let Err(error) = self
+                        .provisioner
+                        .unstage_member_registration_run_start_hold(
+                            &member_ref,
+                            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+                        )
+                        .await
+                {
+                    tracing::warn!(
+                        agent_identity = %self.agent_identity,
+                        %error,
+                        "a rolled-back rebuild's staged run-start hold could not be removed"
+                    );
+                }
                 Ok(())
             }
             Err(error) => {

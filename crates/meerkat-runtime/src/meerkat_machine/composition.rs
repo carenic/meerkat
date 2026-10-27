@@ -1898,6 +1898,53 @@ mod tests {
         ]
     }
 
+    /// A composition placement that names the exact binding its registration
+    /// already holds (a wake that keeps a live session asks for its binding
+    /// again) is accepted idempotently: the registration keeps its binding,
+    /// is still composition-owned, and no second `RuntimeBound` reaches the
+    /// composition.
+    #[tokio::test]
+    async fn an_exact_repeat_placement_is_idempotent_and_signals_nothing() {
+        let machine = Arc::new(MeerkatMachine::ephemeral());
+        let session_id = SessionId::new();
+        let surface = Arc::new(RecordingSignalSurface::default());
+        let dispatcher = recording_dispatcher(surface.clone());
+        let _prepared = prepare_composed_session(&machine, &session_id, &dispatcher).await;
+        bind_composed_session(&machine, &session_id, &dispatcher, "kept:0").await;
+        assert_eq!(
+            surface.log.lock().await.len(),
+            1,
+            "precondition: the first placement signals its binding"
+        );
+        let bound = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("the bound state");
+
+        bind_composed_session(&machine, &session_id, &dispatcher, "kept:0").await;
+
+        assert_eq!(
+            surface.log.lock().await.len(),
+            1,
+            "an exact repeat placement signals nothing"
+        );
+        let repeated = machine
+            .session_dsl_state(&session_id)
+            .await
+            .expect("the state after the repeat");
+        assert_eq!(repeated.active_runtime_id, bound.active_runtime_id);
+        assert_eq!(repeated.active_fence_token, bound.active_fence_token);
+        assert_eq!(
+            repeated.active_runtime_generation,
+            bound.active_runtime_generation
+        );
+        assert_eq!(
+            repeated.residency_owner,
+            mm_dsl::SessionResidencyOwner::Composition,
+            "a composition placement owns the registration's residency"
+        );
+    }
+
     #[tokio::test]
     async fn shared_machine_routes_signals_to_exact_composition_registration() {
         use crate::traits::RuntimeControlPlane;

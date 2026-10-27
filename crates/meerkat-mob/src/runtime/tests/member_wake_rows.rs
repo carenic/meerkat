@@ -1551,3 +1551,54 @@ async fn a_rebuilt_members_binding_is_recorded_before_it_serves() {
     );
     fixture.finish().await;
 }
+
+/// A retirement that starts while its member is being woken closes the wake,
+/// and the wake's callers are told the member is retiring (not a fenced
+/// lifecycle origin): the retire start removes the member's phase, and its
+/// retiring marker is the answer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_retire_during_a_wake_answers_its_callers_member_retiring() {
+    let fixture = WakeFixture::new("wake-retiring").await;
+    let member = fixture.spawn("retiring-member").await;
+    fixture.release(&member).await;
+
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+
+    let retire = {
+        let handle = fixture.handle.clone();
+        let retired = member.clone();
+        tokio::spawn(async move { handle.retire(retired).await })
+    };
+    let woken = tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake's callers are answered at the retire start")
+        .expect("the wake task joins");
+    assert!(
+        matches!(
+            &woken,
+            Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::Retiring,
+                ..
+            })
+        ),
+        "a wake a retirement closes answers member_retiring: {woken:?}"
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, retire)
+        .await
+        .expect("the retirement finishes once the wake's provision rolls back")
+        .expect("the retire task joins")
+        .expect("the member retires");
+    fixture.finish().await;
+}

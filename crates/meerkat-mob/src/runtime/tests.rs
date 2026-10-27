@@ -66328,6 +66328,61 @@ async fn a_resume_never_reuses_a_live_actor_on_another_binding() {
     );
 }
 
+/// The one check every live-actor reuse runs (a Resume-mode spawn, a restore
+/// that keeps a live session, a live successor at a restore or a wake): the
+/// session's recorded binding must be the requested one, as named or as a
+/// build of it records it. Any other binding, or none recorded, is the typed
+/// conflict; a metadata read that fails is its error, never a reuse.
+#[tokio::test]
+async fn the_live_actor_binding_check_accepts_only_the_requested_binding() {
+    use super::live_actor_binding::verify_live_actor_auth_binding;
+    let service = Arc::new(MockSessionService::new());
+    service
+        .resolve_recorded_auth_binding(scoped_auth_binding(), owner_stamped_scoped_auth_binding());
+    let member = AgentIdentity::from("binding-check");
+    let check = |session: SessionId| {
+        let service = Arc::clone(&service);
+        let member = member.clone();
+        async move {
+            verify_live_actor_auth_binding(
+                service.as_ref(),
+                &member,
+                &session,
+                &scoped_auth_binding(),
+            )
+            .await
+        }
+    };
+
+    let named = live_session_on_binding_for_test(&service, &member, scoped_auth_binding()).await;
+    check(named)
+        .await
+        .expect("the named binding is the requested one");
+
+    let owner =
+        live_session_on_binding_for_test(&service, &member, owner_stamped_scoped_auth_binding())
+            .await;
+    check(owner)
+        .await
+        .expect("the owner-stamped form is the requested binding as a build records it");
+
+    let other = live_session_on_binding_for_test(&service, &member, other_auth_binding()).await;
+    assert!(
+        matches!(
+            check(other.clone()).await,
+            Err(MobError::MemberAuthBindingConflict { ref recorded, .. })
+                if recorded.as_ref() == Some(&other_auth_binding())
+        ),
+        "another binding is the typed conflict"
+    );
+
+    service.fail_persisted_session_metadata_reads_for(other.clone());
+    assert!(
+        matches!(check(other).await, Err(MobError::SessionError(_))),
+        "an unreadable recorded binding is never a reuse"
+    );
+}
+
 /// A live actor that runs the spec's binding is reused, whether its session
 /// recorded the binding as the spec names it or as a build of it records it
 /// (stamped with the realm that declares it). Nothing is rebuilt.

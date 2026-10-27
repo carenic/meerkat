@@ -978,14 +978,6 @@ impl ToolCallError {
     }
 }
 
-/// A failed session preparation as a tool error. A session another runtime
-/// owner hosts keeps its typed wire form (session busy, with
-/// `kind = "session_served_elsewhere"`; #1813), as does one whose hosting
-/// claim is unavailable (runtime unavailable, with
-/// `kind = "session_hosting_unavailable"`), and one whose durable tail is
-/// withheld from resume (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` and the
-/// other durable holds, with the typed `durable_resume_hold` payload; the
-/// content is retained); anything else is internal.
 /// A refused session-owner wake (or a refused standalone attach of a mob
 /// member's session), in its typed wire form.
 fn session_owner_wake_tool_error(error: SessionError) -> ToolCallError {
@@ -993,6 +985,7 @@ fn session_owner_wake_tool_error(error: SessionError) -> ToolCallError {
     ToolCallError::new(wire.code.jsonrpc_code(), wire.message, wire.details)
 }
 
+/// A mob member's session that no mob in this process owns: refused, typed.
 fn mob_member_session_tool_error(
     session_id: &meerkat::SessionId,
     binding: &meerkat_core::MobMemberBinding,
@@ -1003,6 +996,14 @@ fn mob_member_session_tool_error(
     )))
 }
 
+/// A failed session preparation as a tool error. A session another runtime
+/// owner hosts keeps its typed wire form (session busy, with
+/// `kind = "session_served_elsewhere"`; #1813), as does one whose hosting
+/// claim is unavailable (runtime unavailable, with
+/// `kind = "session_hosting_unavailable"`), and one whose durable tail is
+/// withheld from resume (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` and the
+/// other durable holds, with the typed `durable_resume_hold` payload; the
+/// content is retained); anything else is internal.
 fn prepare_session_tool_error(error: SessionError) -> ToolCallError {
     // A hosting refusal, and a session whose durable tail is withheld from
     // resume (its content retained), keep their typed wire form.

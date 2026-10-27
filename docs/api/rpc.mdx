@@ -3437,7 +3437,7 @@ variant also carries a `message`.
 
 | `code` | Meaning | Other fields |
 |--------|---------|--------------|
-| `peer_not_found_or_not_trusted` | The peer is unknown or not trusted: not a member. A seated member is never reported this way | `peer` |
+| `peer_not_found_or_not_trusted` | The peer is unknown or not trusted: not a member, or a member the sender is not wired to (does not trust). A seated member the sender trusts is never reported this way | `peer` |
 | `peer_unreachable` | The peer is offline, or the transport failed | `peer`, `reason` (`offline_or_no_ack` or `transport_error`), optional `details` |
 | `peer_admission_dropped` | The peer's ingress dropped the envelope | `peer`, `reason` |
 | `peer_input_rejected` | The peer durably rejected the envelope | `peer`, `envelope_id` |

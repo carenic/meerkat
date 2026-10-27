@@ -46,7 +46,8 @@ them.
   then delivered once through the ordinary receipt path; when the wake is
   refused or does not finish, the send fails with this code instead of
   `peer_not_found_or_not_trusted`. `peer_not_found_or_not_trusted` is now
-  reserved for peers that are not members. The refusal is the closed
+  reserved for a peer that is not a member, or that the sender does not trust
+  (a member it is not wired to). The refusal is the closed
   `meerkat_core::comms::PeerWakeRefusal` (tagged on `kind`: `member_broken {
   reason, hold }`, `member_retiring`, `mob_not_running`, `admission_closed`,
   `wake_timed_out`, `mob_unavailable`, `materialization_lost`,

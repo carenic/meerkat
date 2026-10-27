@@ -11699,7 +11699,13 @@ pub(super) async fn restore_resumed_member(
     } else {
         false
     };
-    if ctx.active_ids.contains(&bridge_session_id) && !replaced_for_explicit_resume {
+    // A live actor this restore would keep: kept as before when no host spec
+    // names a binding for the member (a fork-derived member, or no
+    // customizer); otherwise kept only once the spec below is known and the
+    // actor runs its binding.
+    let keeps_live_actor =
+        ctx.active_ids.contains(&bridge_session_id) && !replaced_for_explicit_resume;
+    if keeps_live_actor && (entry.fork_source.is_some() || spawn_member_customizer.is_none()) {
         return Ok(MemberRestorePlan::Kept);
     }
 
@@ -11772,6 +11778,25 @@ pub(super) async fn restore_resumed_member(
             "spawn customizer cannot change resume session for '{}' from '{}' to '{}'",
             entry.agent_identity, bridge_session_id, customized_session_id
         )));
+    }
+    if keeps_live_actor {
+        // The live actor runs the binding the spec names, or it is not
+        // reused: this member's restore fails, typed, and nothing is built.
+        if let Some(requested) = restore_spec.auth_binding.as_ref()
+            && let Err(conflict) = super::live_actor_binding::verify_live_actor_auth_binding(
+                session_service.as_ref(),
+                &entry.agent_identity,
+                &bridge_session_id,
+                requested,
+            )
+            .await
+        {
+            return Ok(MemberRestorePlan::Unseated(member_restore_failure(
+                &bridge_session_id,
+                conflict.to_string(),
+            )));
+        }
+        return Ok(MemberRestorePlan::Kept);
     }
     let restore_resume_from_role = restore_resume_from_role.clone();
     // The overlay this member is restored with: the customizer's overlay for
@@ -11911,6 +11936,31 @@ pub(super) async fn restore_resumed_member(
         ))
     };
     Ok(MemberRestorePlan::Seated { seating, outcome })
+}
+
+/// Remove the run-start hold the host's build preparation staged for the
+/// member's next registration (`HoldUntilReleased`) once the provision it
+/// was staged for failed: no registration will apply it, and the member's
+/// next build is prepared again. Nothing happens without a preparer.
+#[cfg(feature = "runtime-adapter")]
+async fn unstage_member_build_hold(ctx: &ResumeMemberRestoreContext<'_>, session_id: &SessionId) {
+    if ctx.member_build_preparer.is_none() {
+        return;
+    }
+    if let Err(error) = ctx
+        .provisioner
+        .unstage_member_registration_run_start_hold(
+            &MemberRef::from_bridge_session_id(session_id.clone()),
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            %error,
+            "a failed provision's staged run-start hold could not be removed"
+        );
+    }
 }
 
 /// Ask the host's build preparer, when one is configured, before a member's
@@ -12202,6 +12252,7 @@ pub(super) async fn provision_durable_member_restore(
                 MobError::MemberRegistrationRefused { call, .. } => Some(*call),
                 _ => None,
             };
+            unstage_member_build_hold(ctx, bridge_session_id).await;
             MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
                 bridge_session_id: Some(bridge_session_id.clone()),
                 reason: format!("failed to restore durable session '{bridge_session_id}': {error}"),
@@ -12376,6 +12427,7 @@ async fn provision_fresh_member_restore(
     let receipt = match ctx.provisioner.provision_member(provision_request).await {
         Ok(receipt) => receipt,
         Err(error) => {
+            unstage_member_build_hold(ctx, &admitted_bridge_session_id).await;
             // A host refusal of this member's registration breaks only this
             // member, as on the durable arm: the seed records the refusal's
             // code, and the transaction's own rollback already removed the
@@ -12538,6 +12590,27 @@ async fn restore_member_on_successor(
         .await?;
     let reuse_active_replacement =
         ctx.active_ids.contains(&replacement_session_id) && !replacement_rebuilt;
+    // A live successor is kept only when it runs the binding the member's
+    // spec names; otherwise this member's restore fails, typed, before
+    // anything is repointed, and the live actor is not reused.
+    if reuse_active_replacement
+        && let Some(requested) = seated.restore_spec.auth_binding.as_ref()
+        && let Err(conflict) = super::live_actor_binding::verify_live_actor_auth_binding(
+            session_service.as_ref(),
+            &entry.agent_identity,
+            &replacement_session_id,
+            requested,
+        )
+        .await
+    {
+        record_member_restore_failure(
+            commit.tool_handle,
+            entry,
+            member_restore_failure(&replacement_session_id, conflict.to_string()),
+        )
+        .await;
+        return Ok(None);
+    }
     let recovered_endpoint = if reuse_active_replacement {
         let member_ref = MemberRef::from_bridge_session_id(replacement_session_id.clone());
         let fallback_name = super::actor::render_member_comms_name(

@@ -205,8 +205,9 @@ receipt path. The envelope stays in the sender's send call meanwhile; nothing
 is buffered anywhere else. When the wake is refused or does not finish, the
 send fails `peer_wake_refused` with a typed `refusal`: nothing was delivered,
 so a retry cannot duplicate the message. If the budget ends after the hand-off,
-the result is the ordinary ambiguous delivery. Only a peer that is not a member
-is `peer_not_found_or_not_trusted`. A send from a member that is itself being
+the result is the ordinary ambiguous delivery. Only a peer that is not a member,
+or one the sender does not trust (a member it is not wired to), is
+`peer_not_found_or_not_trusted`. A send from a member that is itself being
 woken (from inside its own build) to a member that is not live is refused
 `sender_waking` instead of waiting, so two builds that message each other
 cannot wait on each other.

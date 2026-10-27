@@ -241,10 +241,14 @@ impl meerkat_comms::InprocPeerWaker for MobPeerWaker {
 }
 
 impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
-    /// A session-keyed live operation on a member's session (R10): the
-    /// member bound to it, per the machine state the actor last published,
-    /// is woken as a host delivery wakes it. A session no member is bound to
-    /// any more answers `NotOwned`.
+    /// A session-keyed live operation on a member's session: the member
+    /// bound to it, per the machine state the actor last published, is woken
+    /// as a host delivery wakes it. A session no member is bound to any more
+    /// answers `NotOwned`. The caller found no live actor serving the
+    /// session, and that observation goes with the wake: a member the
+    /// machine still holds Live has lost its materialization, and the
+    /// machine's drift verdict decides its wake (re-observed on the actor
+    /// first).
     fn wake_session_owner(
         &self,
         session_id: &SessionId,
@@ -268,7 +272,7 @@ impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
             let command = MobCommand::WakeMember {
                 agent_identity: identity.clone(),
                 cause: mob_dsl::MemberWakeCause::HostDelivery,
-                observed_missing: false,
+                observed_missing: true,
                 input_class: mob_dsl::PeerInputClass::Content,
                 sender_waking: false,
                 reply_tx,
@@ -946,6 +950,14 @@ impl MobActor {
         identity: &AgentIdentity,
         cause: mob_dsl::MemberWakeCause,
     ) -> MemberWakeAdmission {
+        // The miss was observed before this command ran (off the actor, or
+        // by a sender's route lookup), so it may be stale: a concurrent wake
+        // may have served the member since. Observe again here, and a member
+        // whose runtime registration serves it with an executor is ready,
+        // not drifted.
+        if self.member_materialization_served(identity).await {
+            return MemberWakeAdmission::Ready;
+        }
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         let transition = match self.apply_dsl_signal_collect_transition(
             mob_dsl::MobMachineSignal::ClassifyMemberLiveMaterialization {
@@ -1014,6 +1026,36 @@ impl MobActor {
             _ => MemberWakeAdmission::Failed(MemberWakeFailure::Refused(
                 crate::MemberWakeRefusal::MobUnavailable,
             )),
+        }
+    }
+
+    /// Whether `identity`'s session is served in this process right now: its
+    /// runtime registration has an executor attached. The fresh observation
+    /// the drift path takes on the actor before it trusts an earlier miss.
+    async fn member_materialization_served(&self, identity: &AgentIdentity) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            let Some(adapter) = self.runtime_adapter.as_ref() else {
+                return false;
+            };
+            let Some(session_id) = self
+                .roster
+                .read()
+                .await
+                .get(identity)
+                .and_then(|entry| entry.member_ref.bridge_session_id().cloned())
+            else {
+                return false;
+            };
+            adapter
+                .session_has_executor(&session_id)
+                .await
+                .unwrap_or(false)
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = identity;
+            false
         }
     }
 
@@ -1093,7 +1135,10 @@ impl MobActor {
     }
 
     /// The answer by the member's state alone (no verdict to read).
-    async fn member_wake_failure_from_state(&self, identity: &AgentIdentity) -> MemberWakeFailure {
+    pub(in crate::runtime) async fn member_wake_failure_from_state(
+        &self,
+        identity: &AgentIdentity,
+    ) -> MemberWakeFailure {
         let state = self.dsl_authority.state();
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         if state.member_restore_failures.contains_key(&dsl_identity) {
@@ -1101,6 +1146,16 @@ impl MobActor {
         }
         if !state.identity_to_runtime.contains_key(&dsl_identity) {
             return MemberWakeFailure::NotAMember;
+        }
+        // A retirement start closes the member's wake and removes its phase:
+        // the member is retiring, which is the answer.
+        if state
+            .identity_to_runtime
+            .get(&dsl_identity)
+            .and_then(|runtime_id| state.member_state_markers.get(runtime_id))
+            == Some(&mob_dsl::MobMemberState::Retiring)
+        {
+            return MemberWakeFailure::Refused(crate::MemberWakeRefusal::Retiring);
         }
         if !matches!(state.lifecycle_phase, mob_dsl::MobPhase::Running) {
             return MemberWakeFailure::Refused(crate::MemberWakeRefusal::MobNotRunning);

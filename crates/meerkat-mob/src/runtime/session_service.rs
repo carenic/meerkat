@@ -3598,7 +3598,9 @@ where
         // session another runtime owner hosts is refused here, typed, before
         // any recovery.
         let claim = self.grant_session_hosting(session_id)?;
-        self.prepare_cold_attach(session_id, claim).await
+        // The mob settles its own member's session: it is that session's
+        // owner, so the settle never asks the owner to wake it.
+        self.prepare_cold_attach_as_owner(session_id, claim).await
     }
 
     async fn settle_durable_tail_before_cold_start_reporting(
@@ -3609,7 +3611,7 @@ where
         let claim = self.grant_session_hosting(session_id)?;
         Ok(
             match self
-                .prepare_cold_attach_reporting(session_id, claim)
+                .prepare_cold_attach_reporting_as_owner(session_id, claim)
                 .await?
             {
                 meerkat_session::ColdAttachSettlement::ContinuesOpenRun { run_id, committed } => {

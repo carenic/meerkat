@@ -393,9 +393,10 @@ fn signal_project_u64(
 
 /// An optional fact the producer projects as an opaque `Option<T>` (a
 /// runtime id or epoch as `Option<String>`, a fence as `Option<u64>`), so an
-/// absent value survives the route as `None`. A field the route does not
-/// project at all also reads as `None`; a projected field of another shape is
-/// refused.
+/// absent value survives the route as `None`. Only that projected `None`
+/// means absent: a field the route does not project at all is refused, as
+/// is a projected field of another shape, so a route that stops projecting
+/// a fact can never turn it into an absent one.
 #[cfg(feature = "runtime-adapter")]
 fn signal_project_optional<T>(
     fields: &[(FieldId, OwnedFieldValue)],
@@ -405,7 +406,10 @@ where
     T: Clone + Send + Sync + 'static,
 {
     match fields.iter().find(|(id, _)| id == field) {
-        None => Ok(None),
+        None => Err(format!(
+            "missing projected signal field `{}`",
+            field.as_str()
+        )),
         Some((_, OwnedFieldValue::Opaque(value))) => {
             value.downcast_ref::<Option<T>>().cloned().ok_or_else(|| {
                 format!(
@@ -1212,6 +1216,10 @@ mod tests {
                         OwnedFieldValue::Str("rt-deferred".to_string()),
                     ),
                     (seam_facts::fields::fence_token(), OwnedFieldValue::U64(7)),
+                    (
+                        seam_facts::fields::runtime_epoch_id(),
+                        OwnedFieldValue::Opaque(Arc::new(None::<String>)),
+                    ),
                 ],
             ),
         )
@@ -1363,5 +1371,25 @@ mod tests {
                 cause: mob_dsl::MemberMaterializationLossCause::RegistrationReleased,
             }
         ));
+
+        // A release whose route stopped projecting a fact is refused, never
+        // read as a release that names nothing.
+        let unprojected = build_mob_signal(
+            &release,
+            &[
+                (
+                    seam_facts::fields::agent_runtime_id(),
+                    OwnedFieldValue::Opaque(Arc::new(Some("rt-released".to_string()))),
+                ),
+                (
+                    seam_facts::fields::fence_token(),
+                    OwnedFieldValue::Opaque(Arc::new(Some(9_u64))),
+                ),
+            ],
+        );
+        assert!(
+            unprojected.is_err(),
+            "a release missing its epoch field is refused"
+        );
     }
 }

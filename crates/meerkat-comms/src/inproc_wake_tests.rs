@@ -717,3 +717,133 @@ async fn a_silent_lifecycle_notice_to_a_dormant_member_is_consumed_by_its_owner(
 fn make_keypair() -> Keypair {
     Keypair::generate()
 }
+
+/// Two inbox generations of one member, both finalized by one runtime
+/// session: the inbox a member had, and the one its re-wake installed.
+fn runtime_backed_inbox_generations() -> (
+    (Inbox, InboxSender),
+    (Inbox, InboxSender),
+    Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+) {
+    let (handle, finalizer) = meerkat_runtime::test_peer_comms_handle_and_runtime_finalizer();
+    let context = || {
+        Arc::new(crate::classify::IngressClassificationContext {
+            require_peer_auth: false,
+            trusted_peers: Arc::new(parking_lot::RwLock::new(TrustStore::new())),
+            peer_comms_handle: Arc::new(parking_lot::RwLock::new(Some(Arc::clone(&handle)))),
+            inproc_namespace: None,
+            durable_runtime_consumer: true,
+        })
+    };
+    (
+        Inbox::new_classified(context()),
+        Inbox::new_classified(context()),
+        Arc::new(finalizer),
+    )
+}
+
+/// Claim the next classified head of `inbox` and finalize it through the
+/// member's runtime.
+fn finalize_next(
+    inbox: Arc<Inbox>,
+    finalizer: Arc<meerkat_runtime::TestPeerIngressRuntimeFinalizer>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let claimed = loop {
+            if let Some(claimed) = inbox.try_claim_one_classified() {
+                break claimed;
+            }
+            tokio::task::yield_now().await;
+        };
+        let claim = crate::runtime::comms_runtime::test_peer_ingress_queue_claim(claimed);
+        finalizer
+            .finalize(claim)
+            .await
+            .expect("the member's runtime finalizes the claim");
+    })
+}
+
+/// A durable message the member's runtime already admitted, sent again
+/// through a stale route (as a sender does when the closing inbox lost the
+/// receipt), takes the wake path with its own envelope id: the re-wake's
+/// inbox hands it to the same runtime, which resolves it `Deduplicated`. The
+/// member gets one input.
+#[tokio::test]
+async fn a_re_wake_hands_an_admitted_message_off_with_its_id_and_it_is_deduplicated() {
+    let registry = Arc::new(InprocRegistry::new());
+    let member = make_keypair();
+    let sender = make_keypair();
+    let ((first_inbox, first_sender), (fresh_inbox, fresh_sender), finalizer) =
+        runtime_backed_inbox_generations();
+    let first_inbox = Arc::new(first_inbox);
+    let fresh_inbox = Arc::new(fresh_inbox);
+    registry.register_with_meta_in_namespace(
+        "realm",
+        "worker-1",
+        member.public_key(),
+        first_sender.clone(),
+        PeerMeta::default(),
+    );
+    let envelope_id = Uuid::new_v4();
+
+    let first_finalize = finalize_next(Arc::clone(&first_inbox), Arc::clone(&finalizer));
+    let first = registry
+        .send_to_pubkey_in_namespace_with_id_wait(
+            "realm",
+            &sender,
+            &member.public_key(),
+            envelope_id,
+            message("admitted once"),
+            true,
+            BUDGET,
+        )
+        .await
+        .expect("the live inbox admits the message");
+    first_finalize.await.expect("the first admission completes");
+    assert!(matches!(
+        first.outcome,
+        InprocDeliveryOutcome::Resolved(IngressDeliveryOutcome::DurablyResolved(
+            meerkat_core::PeerIngressTerminalOutcomeKind::Accepted
+        ))
+    ));
+
+    // The member's inbox closes; its owner re-wakes it into a fresh inbox of
+    // the same runtime session.
+    drop(first_inbox);
+    let owner = ScriptedOwner::new(OnWake::Replace {
+        registry: Arc::clone(&registry),
+        namespace: "realm".to_string(),
+        name: "worker-1".to_string(),
+        pubkey: member.public_key(),
+        stale: first_sender,
+        fresh: std::sync::Mutex::new(Some(fresh_sender)),
+    });
+    registry.publish_wake_route("realm", member.public_key(), "worker-1", owner.weak());
+
+    let retry_finalize = finalize_next(Arc::clone(&fresh_inbox), Arc::clone(&finalizer));
+    let retried = registry
+        .send_to_pubkey_in_namespace_with_id_wait(
+            "realm",
+            &sender,
+            &member.public_key(),
+            envelope_id,
+            message("admitted once"),
+            true,
+            BUDGET,
+        )
+        .await
+        .expect("the re-wake hands the message off");
+    retry_finalize.await.expect("the redelivery is finalized");
+    assert_eq!(owner.calls(), 1, "the stale route took one wake");
+    assert_eq!(retried.envelope_id, envelope_id, "the same envelope id");
+    assert!(
+        matches!(
+            retried.outcome,
+            InprocDeliveryOutcome::Resolved(IngressDeliveryOutcome::DurablyResolved(
+                meerkat_core::PeerIngressTerminalOutcomeKind::Deduplicated
+            ))
+        ),
+        "the member's runtime admits the message once: {:?}",
+        retried.outcome
+    );
+}
