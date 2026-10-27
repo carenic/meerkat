@@ -897,6 +897,10 @@ pub(super) enum MobCommand {
     },
     /// Internal: the retry of a member whose boot work is still owed is due.
     RetryOwedMemberWake { agent_identity: AgentIdentity },
+    /// An owed edge repair's timer fired (the actor's own self-send).
+    RepairOwedEdge {
+        edge: super::actor::member_wake::MemberWiringEdge,
+    },
     /// Release a live member's materialization, keeping it seated
     /// ([`super::handle::MobHandle::release_member`]).
     ReleaseMember {
@@ -2029,9 +2033,9 @@ impl MobCommand {
             Self::ReviveMemberLiveMaterialization { .. } => ShutdownAnswerClass::CallerRequest,
             Self::WakeMember { .. } => ShutdownAnswerClass::CallerRequest,
             Self::ReleaseMember { .. } => ShutdownAnswerClass::CallerRequest,
-            Self::MemberWakeTimedOut { .. } | Self::RetryOwedMemberWake { .. } => {
-                ShutdownAnswerClass::ActorCompletion
-            }
+            Self::MemberWakeTimedOut { .. }
+            | Self::RetryOwedMemberWake { .. }
+            | Self::RepairOwedEdge { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ReloadMemberRegistration { .. } => ShutdownAnswerClass::CallerRequest,
             #[cfg(feature = "openai-live")]
             Self::StartLiveBridgeOperation { .. } => ShutdownAnswerClass::CallerRequest,
@@ -2219,6 +2223,7 @@ impl MobCommand {
             Self::WakeMember { .. } => "WakeMember",
             Self::MemberWakeTimedOut { .. } => "MemberWakeTimedOut",
             Self::RetryOwedMemberWake { .. } => "RetryOwedMemberWake",
+            Self::RepairOwedEdge { .. } => "RepairOwedEdge",
             Self::ReleaseMember { .. } => "ReleaseMember",
             Self::StartupMemberRecovered { .. } => "StartupMemberRecovered",
             Self::ReloadMemberRegistration { .. } => "ReloadMemberRegistration",

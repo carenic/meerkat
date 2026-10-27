@@ -28312,6 +28312,10 @@ impl MobActor {
                     self.inline_step_watchdog.set_step("retry_owed_member_wake");
                     Box::pin(self.retry_owed_member_wake(agent_identity)).await;
                 }
+                MobCommand::RepairOwedEdge { edge } => {
+                    self.inline_step_watchdog.set_step("repair_owed_edge");
+                    Box::pin(self.repair_owed_edge(edge)).await;
+                }
                 MobCommand::ReleaseMember {
                     agent_identity,
                     reply_tx,

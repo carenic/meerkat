@@ -328,6 +328,14 @@ pub(in crate::runtime) struct PendingMemberMaterialization {
     pub(in crate::runtime) attempt: MemberWakeAttempt,
 }
 
+/// One wiring edge of a member, keyed as MobMachine keys its owed repairs: an
+/// edge between two members, or a member's edge to an external peer.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(in crate::runtime) enum MemberWiringEdge {
+    Member(mob_dsl::WiringEdge),
+    External(mob_dsl::ExternalPeerEdge),
+}
+
 /// A stopped mob's peer-ingress change for its live members.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum MemberPeerIngressChange {
@@ -462,6 +470,9 @@ pub(in crate::runtime) struct MemberWakes {
     /// Owed-boot retry state per member: the backoff step, and whether its
     /// one retry timer is armed.
     owed_retries: BTreeMap<AgentIdentity, OwedMemberWakeRetry>,
+    /// Owed edge repair state per edge, with the same backoff and one armed
+    /// timer per edge.
+    edge_repairs: BTreeMap<MemberWiringEdge, OwedMemberWakeRetry>,
 }
 
 /// One member's owed-boot retry: consecutive retries (the backoff step) and
@@ -504,6 +515,7 @@ impl MemberWakes {
             provisioner,
             continuity: MemberContinuityIndex::seeded(replayed, mob_id),
             owed_retries: BTreeMap::new(),
+            edge_repairs: BTreeMap::new(),
         })
     }
 
@@ -606,6 +618,7 @@ impl MobActor {
     ) {
         let mut residency_changed = false;
         let mut owed_wakes_recorded = false;
+        let mut owed_edge_repairs_recorded = false;
         for effect in effects {
             match effect {
                 mob_dsl::MobMachineEffect::PublishWakeRoute { agent_identity, .. } => {
@@ -658,6 +671,11 @@ impl MobActor {
                 mob_dsl::MobMachineEffect::OwedMemberWakesRecorded => {
                     owed_wakes_recorded = true;
                 }
+                // An edge whose trust failed to realize is owed a repair:
+                // its timer is armed below.
+                mob_dsl::MobMachineEffect::OwedEdgeRepairsRecorded => {
+                    owed_edge_repairs_recorded = true;
+                }
                 mob_dsl::MobMachineEffect::CloseMemberPeerIngress { .. } => {
                     self.member_wakes
                         .ingress
@@ -682,6 +700,9 @@ impl MobActor {
         if owed_wakes_recorded {
             // An armed timer stays as it is.
             self.schedule_owed_member_wake_retries();
+        }
+        if owed_edge_repairs_recorded {
+            self.schedule_owed_edge_repairs();
         }
     }
 
@@ -1585,6 +1606,152 @@ impl MobActor {
         }
     }
 
+    // ---------------------------------------------------------------
+    // Owed edge repairs: an edge whose trust a wake (or a repair) could not
+    // realize is owed in MobMachine until a repair realizes it.
+    // ---------------------------------------------------------------
+
+    /// Tell MobMachine whether `edge`'s trust was realized: a realized edge
+    /// clears its owed repair; a failed one is owed (MobMachine answers
+    /// `OwedEdgeRepairsRecorded`, which arms its repair timer) unless the edge
+    /// is no longer wired between seated members.
+    pub(in crate::runtime) fn resolve_member_edge_realization(
+        &mut self,
+        edge: &MemberWiringEdge,
+        realized: bool,
+    ) {
+        let signal = match edge {
+            MemberWiringEdge::Member(edge) => {
+                mob_dsl::MobMachineSignal::ResolveWiringEdgeRealization {
+                    edge: edge.clone(),
+                    realized,
+                }
+            }
+            MemberWiringEdge::External(edge) => {
+                mob_dsl::MobMachineSignal::ResolveExternalEdgeRealization {
+                    edge: edge.clone(),
+                    realized,
+                }
+            }
+        };
+        if let Err(error) =
+            self.apply_dsl_signal_collect_transition(signal, "resolve_member_edge_realization")
+        {
+            tracing::error!(
+                mob_id = %self.definition.id,
+                ?edge,
+                realized,
+                %error,
+                "MobMachine refused an edge realization outcome"
+            );
+        }
+    }
+
+    /// Arm a repair timer for every edge MobMachine owes a repair (an armed
+    /// timer stays as it is), and forget the state of edges no longer owed.
+    pub(in crate::runtime) fn schedule_owed_edge_repairs(&mut self) {
+        let owed = owed_edge_repairs(self.dsl_authority.state());
+        self.member_wakes
+            .edge_repairs
+            .retain(|edge, retry| retry.armed || owed.contains(edge));
+        for edge in owed {
+            self.schedule_owed_edge_repair(edge);
+        }
+    }
+
+    /// Arm `edge`'s repair timer unless it is armed. Backoff doubles from the
+    /// configured initial delay up to the cap, as the owed-boot retry does.
+    fn schedule_owed_edge_repair(&mut self, edge: MemberWiringEdge) {
+        let backoff = self.member_residency.owed_wake_retry;
+        let retry = self
+            .member_wakes
+            .edge_repairs
+            .entry(edge.clone())
+            .or_default();
+        if retry.armed {
+            return;
+        }
+        let delay = backoff.delay(retry.retries);
+        retry.retries = retry.retries.saturating_add(1);
+        retry.armed = true;
+        let command_tx = self.command_tx.clone();
+        self.actor_io_tasks.spawn(async move {
+            tokio::time::sleep(delay).await;
+            let _ = command_tx
+                .send(RoutedMobCommand::internal(MobCommand::RepairOwedEdge {
+                    edge,
+                }))
+                .await;
+        });
+    }
+
+    /// An owed edge repair is due. When MobMachine still owes it, re-realize
+    /// the edge through the existing-edge repair path and tell MobMachine the
+    /// outcome; a failure is owed again and re-armed with the next backoff
+    /// step. An edge no longer owed (repaired by a wake of either end,
+    /// unwired, or an end retired) is forgotten.
+    pub(in crate::runtime) async fn repair_owed_edge(&mut self, edge: MemberWiringEdge) {
+        if let Some(retry) = self.member_wakes.edge_repairs.get_mut(&edge) {
+            retry.armed = false;
+        }
+        if !owed_edge_repairs(self.dsl_authority.state()).contains(&edge) {
+            self.member_wakes.edge_repairs.remove(&edge);
+            return;
+        }
+        if self.dsl_authority.state().lifecycle_phase != mob_dsl::MobPhase::Running {
+            // Wiring is a Running verb: try again later.
+            self.schedule_owed_edge_repair(edge);
+            return;
+        }
+        let (local, target) = match &edge {
+            MemberWiringEdge::Member(member_edge) => (
+                AgentIdentity::from(member_edge.a.0.as_str()),
+                super::super::handle::PeerTarget::Local(AgentIdentity::from(
+                    member_edge.b.0.as_str(),
+                )),
+            ),
+            MemberWiringEdge::External(external_edge) => {
+                match Self::trusted_peer_descriptor_from_machine_endpoint(&external_edge.endpoint) {
+                    Ok(descriptor) => (
+                        AgentIdentity::from(external_edge.local.0.as_str()),
+                        super::super::handle::PeerTarget::External(descriptor),
+                    ),
+                    Err(error) => {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            ?edge,
+                            %error,
+                            "an owed edge repair has no valid peer descriptor"
+                        );
+                        self.resolve_member_edge_realization(&edge, false);
+                        return;
+                    }
+                }
+            }
+        };
+        let realized = match self.prepare_member_wire(local, target).await {
+            Ok(prepared) => match prepared.into_prepared() {
+                None => Ok(()),
+                Some(prepared) => self.realize_wiring_inline(*prepared).await,
+            },
+            Err(error) => Err(error),
+        };
+        match &realized {
+            Ok(()) => {
+                self.member_wakes.edge_repairs.remove(&edge);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    ?edge,
+                    %error,
+                    "an owed edge repair failed; it stays owed"
+                );
+            }
+        }
+        self.resolve_member_edge_realization(&edge, realized.is_ok());
+    }
+
     /// Answer the callers of a running wake the machine closed under it, by
     /// the member's state, and forget the run.
     pub(in crate::runtime) async fn finish_closed_member_wake(
@@ -1934,6 +2101,23 @@ impl MobActor {
             .get(&mob_dsl::AgentIdentity::from_domain(identity))
             == Some(&attempt)
     }
+}
+
+/// Every edge MobMachine owes a repair.
+fn owed_edge_repairs(state: &mob_dsl::MobMachineState) -> BTreeSet<MemberWiringEdge> {
+    state
+        .owed_edge_repairs
+        .iter()
+        .cloned()
+        .map(MemberWiringEdge::Member)
+        .chain(
+            state
+                .owed_external_edge_repairs
+                .iter()
+                .cloned()
+                .map(MemberWiringEdge::External),
+        )
+        .collect()
 }
 
 /// What a notice sender does with one notice, per MobMachine's disposition.
