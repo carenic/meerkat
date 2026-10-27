@@ -11541,18 +11541,292 @@ impl meerkat_client::LlmClient for SpawningResumeNotificationClient {
     }
 }
 
+/// The model request a [`GatedRequestClient`] holds.
+#[cfg(feature = "test-support")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GatedRequest {
+    /// The member loop's next request: the resumed open run's.
+    ResumedRunLoop,
+    /// The orchestrator's resume notification turn.
+    ResumeNotification,
+}
+
+/// [`HoldingToolLoopClient`] that holds the first model request of the
+/// selected kind until the row releases it, then answers it as the inner
+/// client does. The held request stands for a long model call or a long
+/// gated tool: the run's turn stays in flight, holding everything a running
+/// turn holds, until the row releases it.
+#[cfg(feature = "test-support")]
+struct GatedRequestClient {
+    inner: HoldingToolLoopClient,
+    gated: GatedRequest,
+    taken: std::sync::atomic::AtomicBool,
+    entered: tokio::sync::watch::Sender<bool>,
+    released: tokio::sync::watch::Sender<bool>,
+    answered: tokio::sync::watch::Sender<bool>,
+}
+
+#[cfg(feature = "test-support")]
+impl GatedRequestClient {
+    fn new(gated: GatedRequest) -> Self {
+        Self {
+            inner: HoldingToolLoopClient::new(0),
+            gated,
+            taken: std::sync::atomic::AtomicBool::new(false),
+            entered: tokio::sync::watch::channel(false).0,
+            released: tokio::sync::watch::channel(false).0,
+            answered: tokio::sync::watch::channel(false).0,
+        }
+    }
+
+    fn selects(&self, request: &meerkat_client::LlmRequest) -> bool {
+        match self.gated {
+            GatedRequest::ResumedRunLoop => request.messages.iter().any(|message| {
+                matches!(
+                    message,
+                    meerkat_core::Message::User(user)
+                        if user.text_content().contains(HoldingToolLoopClient::LOOP_MARKER)
+                )
+            }),
+            GatedRequest::ResumeNotification => request
+                .messages
+                .iter()
+                .rev()
+                .find_map(|message| match message {
+                    meerkat_core::Message::User(user) => Some(user.text_content()),
+                    _ => None,
+                })
+                .is_some_and(|text| {
+                    text.contains(SpawningResumeNotificationClient::RESUME_NOTIFICATION)
+                }),
+        }
+    }
+
+    /// Wait until the held request has been made, bounded.
+    async fn wait_until_held(&self, context: &str) {
+        let mut entered = self.entered.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            entered.wait_for(|entered| *entered),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("[{context}] the gated model request was never made"))
+        .expect("entered signal");
+    }
+
+    fn release(&self) {
+        self.released.send_replace(true);
+    }
+
+    fn answered(&self) -> bool {
+        *self.answered.borrow()
+    }
+
+    /// Wait until the held request has been answered, bounded.
+    async fn wait_until_answered(&self, context: &str) {
+        let mut answered = self.answered.subscribe();
+        tokio::time::timeout(
+            Duration::from_secs(60),
+            answered.wait_for(|answered| *answered),
+        )
+        .await
+        .unwrap_or_else(|_| panic!("[{context}] the released request was never answered"))
+        .expect("answered signal");
+    }
+}
+
+#[cfg(feature = "test-support")]
+#[async_trait::async_trait]
+impl meerkat_client::LlmClient for GatedRequestClient {
+    fn project_replay_messages(
+        &self,
+        messages: &[meerkat_core::Message],
+    ) -> Result<Vec<meerkat_core::Message>, meerkat_client::LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(
+        &'a self,
+        request: &'a meerkat_client::LlmRequest,
+    ) -> meerkat_client::types::LlmStream<'a> {
+        if !self.selects(request) || self.taken.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return self.inner.stream(request);
+        }
+        Box::pin(async_stream::stream! {
+            use futures::StreamExt as _;
+            self.entered.send_replace(true);
+            let mut released = self.released.subscribe();
+            let _ = released.wait_for(|released| *released).await;
+            let mut answer = self.inner.stream(request);
+            while let Some(event) = answer.next().await {
+                yield event;
+            }
+            self.answered.send_replace(true);
+        })
+    }
+
+    fn provider(&self) -> meerkat_core::Provider {
+        meerkat_core::Provider::OpenAI
+    }
+
+    async fn health_check(&self) -> Result<(), meerkat_client::LlmError> {
+        Ok(())
+    }
+}
+
+/// How long a lift may take while a member's run or the orchestrator's turn
+/// is held: the explicit resume's own stall budget
+/// (`EXPLICIT_RESUME_PROGRESS_TIMEOUT`, 30 s), well inside a host's budget of
+/// ten such stalls.
+#[cfg(feature = "test-support")]
+const LIFT_WHILE_HELD_BOUND: Duration = Duration::from_secs(30);
+
+/// A host's graceful shutdown suspends a member's open run; the next start
+/// finds the mob stopped. Its lift resumes the run, whose next model request
+/// is held (a long model call or a long gated tool, held well past the
+/// lift): the lift reaches ready within its stall budget while the run is
+/// still in flight, and the run continues afterwards, resumes once and
+/// completes once. RED before: the lift's operation binding of the member
+/// waited for the member's run to end, so the lift held its readiness for
+/// the whole run (the row's bound expires with the run still held).
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continues() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_gracefully_over_an_open_member_run(&paths, runtime_store.clone(), true).await;
+
+    let client_2 = Arc::new(GatedRequestClient::new(GatedRequest::ResumedRunLoop));
+    let (service_2, _store_2) = persistent_head_canonical_service_with(
+        &paths,
+        runtime_store.clone(),
+        Config::default(),
+        client_2.clone(),
+    );
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(client_2.clone())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .unwrap_or_else(|error| panic!("the start restores the member over its open run: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Stopped)),
+        "the mob starts as it was left, stopped: {status:?}"
+    );
+
+    let lifted = tokio::time::timeout(LIFT_WHILE_HELD_BOUND, handle.resume()).await;
+    // Released whatever the lift did, so a RED run ends instead of hanging.
+    let held_through_the_lift = !client_2.answered();
+    client_2.release();
+    lifted
+        .expect("the lift reaches ready while the member's resumed run is still in flight")
+        .expect("the lift succeeds");
+    client_2.wait_until_held("long-resumed-run").await;
+    assert!(
+        held_through_the_lift,
+        "the member's resumed run was still in flight when the lift answered"
+    );
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the lift reached ready: {status:?}"
+    );
+    client_2.wait_until_answered("long-resumed-run").await;
+    assert_the_open_run_resumes_once_and_completes(
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &client_2.inner,
+        &run,
+        true,
+        "long-resumed-run",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
+/// The same lift with the orchestrator's resume notification turn held at its
+/// model request (a long turn): the lift reaches ready within its stall budget
+/// while that turn is still in flight, and the turn is answered once
+/// released. RED before: the lift awaited the notification turn, so it held
+/// its readiness for the whole turn (the row's bound expires with the turn
+/// still held).
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_lift_whose_resume_notification_turn_is_long_reaches_ready() {
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> =
+        Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
+    let run = stop_gracefully_over_an_open_member_run(&paths, runtime_store.clone(), true).await;
+
+    let client_2 = Arc::new(GatedRequestClient::new(GatedRequest::ResumeNotification));
+    let (service_2, _store_2) = persistent_head_canonical_service_with(
+        &paths,
+        runtime_store.clone(),
+        Config::default(),
+        client_2.clone(),
+    );
+    let handle = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(client_2.clone())
+    .notify_orchestrator_on_resume(true)
+    .resume()
+    .await
+    .unwrap_or_else(|error| panic!("the start restores the member over its open run: {error}"));
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Stopped)),
+        "the mob starts as it was left, stopped: {status:?}"
+    );
+
+    let lifted = tokio::time::timeout(LIFT_WHILE_HELD_BOUND, handle.resume()).await;
+    let held_through_the_lift = !client_2.answered();
+    client_2.release();
+    lifted
+        .expect("the lift reaches ready while the notification turn is still in flight")
+        .expect("the lift succeeds");
+    client_2.wait_until_held("long-notification-turn").await;
+    assert!(
+        held_through_the_lift,
+        "the notification turn was still in flight when the lift answered"
+    );
+    let status = handle.status().await;
+    assert!(
+        matches!(status, Ok(meerkat_mob::MobState::Running)),
+        "the lift reached ready: {status:?}"
+    );
+    client_2.wait_until_answered("long-notification-turn").await;
+    assert_the_open_run_resumes_once_and_completes(
+        service_2.as_ref(),
+        runtime_store.as_ref(),
+        &client_2.inner,
+        &run,
+        true,
+        "long-notification-turn",
+    )
+    .await;
+    let _ = handle.shutdown().await;
+}
+
 /// A host's graceful shutdown suspends a member's short open run; the next
 /// start finds the mob stopped. Its lift resumes that run, which finishes
-/// during the lift, and runs the orchestrator's resume notification turn,
-/// which spawns a worker through the mob and waits for the receipt, as a
-/// lead's spawn tool call does. The lift's post-commit work (operation
-/// bindings, then that notification turn) waits on member runs, so a spawn
-/// such a run makes is admitted while the work is in flight: the lift
-/// reaches ready, the worker is a member, and the open run resumed once.
-/// RED before: the lift's topology fence stayed up until its post-commit
-/// work finished and deferred every spawn until then, so the notification
-/// turn waited on a spawn the lift withheld while the lift waited on the
-/// turn; the spawn got no receipt.
+/// during the lift, and hands the orchestrator's resume notification turn to
+/// the mob's lifecycle owner. That turn spawns a worker through the mob and
+/// waits for the receipt, as a lead's spawn tool call does: the lift reaches
+/// ready, the spawn is admitted, the worker is a member, and the open run
+/// resumed once. RED before: the lift awaited the notification turn, and its
+/// topology fence stayed up until its post-commit work finished and deferred
+/// every spawn until then, so the turn waited on a spawn the lift withheld
+/// while the lift waited on the turn; the lift never answered and the spawn
+/// got no receipt.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lift_whose_resume_notification_turn_spawns_a_member_reaches_ready() {
@@ -11586,19 +11860,33 @@ async fn a_lift_whose_resume_notification_turn_spawns_a_member_reaches_ready() {
     client_2.arm(handle.clone());
 
     let lifted = tokio::time::timeout(Duration::from_secs(120), handle.resume()).await;
+    let spawns = match &lifted {
+        // The notification turn runs under the mob's lifecycle owner, so it
+        // may still be on its way when the lift answers.
+        Ok(Ok(())) => tokio::time::timeout(Duration::from_secs(60), async {
+            loop {
+                let spawns = client_2.spawns();
+                if !spawns.is_empty() {
+                    break spawns;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .unwrap_or_default(),
+        _ => client_2.spawns(),
+    };
     client_2.disarm();
     lifted
         .expect("the lift answers")
         .expect("the lift succeeds");
-    let spawns = client_2.spawns();
     assert!(
         !spawns.is_empty(),
-        "the lift ran the orchestrator's resume notification turn"
+        "the orchestrator's resume notification turn ran"
     );
     assert!(
         spawns.iter().all(Result::is_ok),
-        "the spawn the notification turn made during the lift's post-commit work was admitted \
-         without waiting for that work: {spawns:?}"
+        "the spawn the notification turn made was admitted: {spawns:?}"
     );
     for spawned in spawns.into_iter().filter_map(Result::ok) {
         handle
