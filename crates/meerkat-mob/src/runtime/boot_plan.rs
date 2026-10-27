@@ -270,6 +270,19 @@ pub(crate) fn domain_member_seat_session_unborn(
         .contains(&mob_dsl::AgentIdentity::from_domain(identity))
 }
 
+/// Whether a seat or a rotation named `session_id` unborn and no build has
+/// created it (MobMachine's `unborn_seat_sessions`, keyed on the born row,
+/// not on what the session store shows), whether or not a member is seated
+/// on it now: a later seat naming it seats it unborn again.
+pub(crate) fn domain_seat_session_never_born(
+    state: &mob_dsl::MobMachineState,
+    session_id: &meerkat_core::types::SessionId,
+) -> bool {
+    state
+        .unborn_seat_sessions
+        .contains(&mob_dsl::SessionId::from_domain(session_id))
+}
+
 /// Whether MobMachine holds `identity` seated and not (yet) materialized in
 /// this process: Dormant, or Waking under an open wake attempt whose owner
 /// runs the member's readiness itself.

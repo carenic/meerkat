@@ -10,7 +10,8 @@
 
 use super::super::dormant_seat::{
     DormantSeatCandidate, DormantSeatCommitEntry, DormantSeatLaunch, DormantSeatOutcome,
-    DormantSeatPlan, DormantSeatPlanEntry, MemberRotationPlan, fresh_seat_session_id,
+    DormantSeatPlan, DormantSeatPlanEntry, MemberRotationPlan, SeatBuild, SeatLocalBuildInputs,
+    fresh_seat_session_id,
 };
 use super::*;
 
@@ -39,6 +40,9 @@ struct SeatedInChunk {
     agent_identity: AgentIdentity,
     session_id: SessionId,
     endpoint: Option<TrustedPeerDescriptor>,
+    /// The process-local build inputs its unborn session's first build
+    /// applies in this process, kept once the seat is committed.
+    local_build_inputs: Option<SeatLocalBuildInputs>,
 }
 
 impl MobActor {
@@ -167,6 +171,15 @@ impl MobActor {
                 "'{agent_identity}' cannot be seated dormant: a placed or fork-derived member is spawned"
             )));
         }
+        // The tool visibility a member inherits from its creator is minted
+        // for one build and is never journaled: a seat could not carry it to
+        // a first build after a restart, so such a member is spawned.
+        if spec.inherited_tool_filter.is_some() {
+            return Err(MobError::Internal(format!(
+                "'{agent_identity}' cannot be seated dormant: a member that inherits its creator's \
+                 tool visibility is spawned"
+            )));
+        }
         if spec.resume_provider_params.is_some() && launch != DormantSeatLaunch::Resume {
             return Err(MobError::ResumeProviderParamsRequireResume {
                 identity: agent_identity,
@@ -249,9 +262,6 @@ impl MobActor {
             || spec.tool_category_overrides != meerkat_core::ToolCategoryOverrides::default())
         .then(|| profile.clone());
         let explicit_workgraph = profile.tools.workgraph;
-        if spec.inherited_tool_filter.is_some() && effective_profile_override.is_none() {
-            build::open_profile_tool_categories_for_inherited_filter(&mut profile);
-        }
         let binding = resolve_binding(
             spec.binding.clone(),
             spec.backend,
@@ -300,9 +310,12 @@ impl MobActor {
             explicit_workgraph,
             spec.external_tools.is_some(),
             spec.shell_env.as_ref(),
-            spec.inherited_tool_filter.is_some(),
+            false,
             None,
         );
+        // What the seat carries to its session's first build: the spec's
+        // build inputs, applied there as a spawn of this spec applies them.
+        let seat_build = SeatBuild::take_from(&mut spec);
         let (authorize_input, authorized) =
             authorize_spawn_profile_input(&agent_identity, &spec.role_name, &profile, None)?;
         let session_id = match launch {
@@ -326,14 +339,22 @@ impl MobActor {
             .continuity_intent
             .clone()
             .for_profile(&profile, &agent_identity);
+        // A session a seat named and no build created (its member was retired
+        // before its first wake) is seated unborn again: MobMachine's fact.
+        let session_never_born = super::super::boot_plan::domain_seat_session_never_born(
+            self.dsl_authority.state(),
+            &session_id,
+        );
         Ok(DormantSeatPlanEntry::Seat(Box::new(DormantSeatCandidate {
             agent_identity,
             profile_name: spec.role_name.clone(),
             launch,
             session_id,
             generation,
+            session_never_born,
             // Decided by the preparation, from the session owner's
-            // observation: a fresh seat's absent session is unborn.
+            // observation: a fresh seat's absent session is unborn, as is a
+            // session no build created.
             session_unborn: false,
             runtime_mode,
             labels: spec.labels.clone().unwrap_or_default(),
@@ -347,6 +368,7 @@ impl MobActor {
             kickoff_owed,
             kickoff_prompt: kickoff_owed.then(|| spec.initial_message.clone()).flatten(),
             kickoff_objective_id: spec.objective_id.unwrap_or_default(),
+            seat_build,
         })))
     }
 
@@ -424,7 +446,7 @@ impl MobActor {
                     );
                 }
                 DormantSeatCommitEntry::Seat {
-                    candidate,
+                    mut candidate,
                     endpoint,
                 } => {
                     let agent_identity = candidate.agent_identity.clone();
@@ -445,11 +467,16 @@ impl MobActor {
                                 kind: MobEventKind::MemberSpawned(*event),
                             });
                             plan.push(mob_dsl::AgentIdentity::from_domain(&agent_identity));
+                            let local_build_inputs = candidate
+                                .session_unborn
+                                .then(|| std::mem::take(&mut candidate.seat_build.local))
+                                .filter(|local| !local.is_empty());
                             seated.push(SeatedInChunk {
                                 index,
                                 agent_identity,
                                 session_id: candidate.session_id.clone(),
                                 endpoint,
+                                local_build_inputs,
                             });
                         }
                         Ok(SeatApplied::Refused(error)) => {
@@ -539,6 +566,13 @@ impl MobActor {
             let mut roster = self.roster.write().await;
             for event in &stored {
                 roster.apply_event(event);
+            }
+            // This process keeps what its seats' unborn sessions' first
+            // builds apply and the journal cannot hold.
+            for seat in &mut seated {
+                if let Some(local) = seat.local_build_inputs.take() {
+                    roster.retain_seat_local_build_inputs(&seat.session_id, local);
+                }
             }
         }
         for seat in seated {
@@ -670,8 +704,11 @@ impl MobActor {
             // refuses a seat that owes one.
             kickoff_owed: candidate.kickoff_owed,
             // The seat created nothing: a fresh seat's absent session is
-            // unborn, and the member's first wake creates it.
+            // unborn, as is a session no build created, and the member's first
+            // wake creates it.
             session_unborn: candidate.session_unborn,
+            // A resume seat is unborn only on a session no build created.
+            fresh_launch: candidate.launch == DormantSeatLaunch::Fresh,
         };
         let transitions =
             match authority.apply_batch([candidate.authorize_input.clone(), begin, seat]) {
@@ -711,7 +748,9 @@ impl MobActor {
             session_id: candidate.session_id.clone(),
         }))
         .with_member_peer_endpoint(endpoint.cloned())
-        .with_seat_session_unborn(candidate.session_unborn);
+        .with_seat_session_unborn(candidate.session_unborn)
+        // What the unborn session's first build applies.
+        .with_seat_build_inputs(candidate.unborn_seat_build_inputs());
         event.creation = creation;
         event.runtime_mode = candidate.runtime_mode;
         event.labels = candidate.labels.clone();
@@ -1135,8 +1174,12 @@ impl MobActor {
         .with_member_peer_endpoint(rotation.endpoint.clone())
         .with_kickoff_prompt(candidate.kickoff_prompt.clone())
         // The next incarnation's session is unborn (CommitMemberRotation
-        // records it so): its first wake creates it.
-        .with_seat_session_unborn(true);
+        // records it so): its first wake creates it, applying what the
+        // rotation's spec named.
+        .with_seat_session_unborn(true)
+        .with_seat_build_inputs(
+            Some(candidate.seat_build.inputs.clone()).filter(|inputs| !inputs.is_empty()),
+        );
         spawned.creation = creation;
         spawned.runtime_mode = candidate.runtime_mode;
         spawned.labels = candidate.labels.clone();
@@ -1183,6 +1226,12 @@ impl MobActor {
             let mut roster = self.roster.write().await;
             for event in &stored {
                 roster.apply_event(event);
+            }
+            if !candidate.seat_build.local.is_empty() {
+                roster.retain_seat_local_build_inputs(
+                    &candidate.session_id,
+                    candidate.seat_build.local.clone(),
+                );
             }
         }
         // The owed kickoff's notices, effects of the now-durable step; a

@@ -6784,6 +6784,10 @@ impl ResumedMemberView {
 ///   each member whose live actor the stop kept: the actor is kept only when
 ///   it runs the auth binding the answer names, and otherwise the member is
 ///   rebuilt on that binding.
+/// - The first build of a dormant seat's member, which creates the session
+///   its seat named: [`customize_resume`](Self::customize_resume) too, with
+///   the build inputs of the seat's spec already on the request, as a
+///   spawn's caller sets them before `customize_spawn`.
 ///
 /// # Which spawns never ask it
 ///
@@ -9337,15 +9341,24 @@ impl MobHandle {
     /// creates its session through the spawn provision path, with the
     /// runtime registration and the host's registration hook
     /// ([`super::MobBuilder::with_member_runtime_registration_hook`]) any
-    /// member build has. Only the member's roster facts are seated (role,
-    /// labels, profile and model overrides, runtime mode, continuity); its
-    /// build inputs come from the spawn customizer at that wake. `Resume`
-    /// binds the session it names, which is never archived. A fresh spec
-    /// that owes a kickoff (an `AutonomousHost` member, or one with an
-    /// initial message) is not seated: it is spawned through the ordinary
-    /// spawn path and answered [`super::DormantSeatOutcome::Embodied`]. A
-    /// fork is refused. Seating
-    /// needs the members' comms transport
+    /// member build has. That first build applies the spec's build inputs
+    /// exactly as a spawn of the spec would: its context, additional
+    /// instructions, system prompt override, budget limits, tool access and
+    /// application tool policies, auth binding and web search override (kept
+    /// in the seat's journal row, so a restart before the first wake keeps
+    /// them), and its per-spawn tools overlay, compaction curator, dispatch
+    /// admission and shell environment (kept by this process only; after a
+    /// restart the spawn customizer supplies them, as for any member's
+    /// rebuild). The spawn customizer is asked at that build, after the
+    /// inputs are set. `Resume` binds the session it names, which is never
+    /// archived; a session a seat named and no build created yet (its member
+    /// retired before its first wake) is seated unborn again, and its first
+    /// wake creates it. A fresh spec that owes a kickoff (an `AutonomousHost`
+    /// member, or one with an initial message) is not seated: it is spawned
+    /// through the ordinary spawn path and answered
+    /// [`super::DormantSeatOutcome::Embodied`]. A fork, a placed member and a
+    /// member that inherits its creator's tool visibility are refused.
+    /// Seating needs the members' comms transport
     /// ([`super::MobBuilder::with_member_comms_identity_root`] or
     /// [`super::MobBuilder::with_network_member_comms`]) and a running mob.
     ///
@@ -9389,10 +9402,11 @@ impl MobHandle {
     /// created anew): its current incarnation is retired and the next one is
     /// seated Dormant, at the next generation, under a name-based session id
     /// in the retirement's terminal step. Nothing is built for it: its first
-    /// wake creates its session, as a fresh seat's first wake does. Both journal rows are
-    /// written in one batch, so the identity is never a non-member: during
-    /// the retirement its current incarnation is Retiring, and deliveries to
-    /// it are refused typed. Returns the new session.
+    /// wake creates its session with the spec's build inputs, as a fresh
+    /// seat's first wake does. Both journal rows are written in one batch, so
+    /// the identity is never a non-member: during the retirement its current
+    /// incarnation is Retiring, and deliveries to it are refused typed.
+    /// Returns the new session.
     ///
     /// The spec launches `Fresh`. When it owes a kickoff (an
     /// `AutonomousHost` member's one kickoff turn, or an initial message),

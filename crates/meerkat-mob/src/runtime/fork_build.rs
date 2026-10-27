@@ -853,9 +853,27 @@ pub(crate) fn rebuild_resume_spec(
     entry: &RosterEntry,
     durable: &super::handle::ResumedMemberView,
 ) -> Result<super::handle::SpawnMemberSpec, MobError> {
+    rebuild_seat_resume_spec(mob_id, customizer, entry, durable, None)
+}
+
+/// [`rebuild_resume_spec`] for a member whose session no build has created
+/// yet: `seat_build`, what its seat carries to that first build
+/// ([`super::SeatBuild`]), is set on the request before the customizer is
+/// asked, as a spawn's caller sets these inputs on its spec. `None` is
+/// [`rebuild_resume_spec`].
+pub(crate) fn rebuild_seat_resume_spec(
+    mob_id: &MobId,
+    customizer: Option<&Arc<dyn super::handle::SpawnMemberCustomizer>>,
+    entry: &RosterEntry,
+    durable: &super::handle::ResumedMemberView,
+    seat_build: Option<&super::SeatBuild>,
+) -> Result<super::handle::SpawnMemberSpec, MobError> {
     let mut spec = member_resume_spec(entry, &durable.session_id);
     if entry.fork_source.is_some() {
         return Ok(spec);
+    }
+    if let Some(seat_build) = seat_build {
+        seat_build.apply_to(&mut spec);
     }
     if let Some(customizer) = customizer {
         customizer.customize_resume(

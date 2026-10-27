@@ -214,8 +214,10 @@ impl<'de> Deserialize<'de> for MemberRef {
 // v9: stored member lifecycle events may carry the internal canonical
 // `placed_spawn_id` ABA fence and exact peer endpoints; public event payloads
 // still exclude every replay-only field. A stored `MemberSpawned` may also
-// carry the internal `kickoff_prompt` of the kickoff its incarnation owes; a
-// reader that predates it ignores it.
+// carry the internal `kickoff_prompt` of the kickoff its incarnation owes,
+// and a dormant seat's `seat_session_unborn` marker with the
+// `seat_build_inputs` its first build applies; a reader that predates them
+// ignores them.
 const CURRENT_STORED_MOB_EVENT_SCHEMA_VERSION: u32 = 9;
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1125,6 +1127,13 @@ pub struct MemberSpawnedEvent {
     /// written before it decode it as `false`.
     #[serde(skip, default)]
     pub(crate) seat_session_unborn: bool,
+    /// The build inputs this row's unborn seat carries to the member's first
+    /// build ([`crate::runtime::SeatBuildInputs`]): a seat builds nothing, so
+    /// its first build applies them, as a spawn of the seat's spec would. The
+    /// born row clears them. Stored only by the internal event codec;
+    /// journals written before it decode them as absent.
+    #[serde(skip, default)]
+    pub(crate) seat_build_inputs: Option<crate::runtime::SeatBuildInputs>,
 }
 
 impl MemberSpawnedEvent {
@@ -1158,6 +1167,7 @@ impl MemberSpawnedEvent {
             direct_member_fence: None,
             kickoff_prompt: None,
             seat_session_unborn: false,
+            seat_build_inputs: None,
         }
     }
 
@@ -1168,6 +1178,18 @@ impl MemberSpawnedEvent {
 
     pub(crate) fn seat_session_unborn(&self) -> bool {
         self.seat_session_unborn
+    }
+
+    pub(crate) fn with_seat_build_inputs(
+        mut self,
+        seat_build_inputs: Option<crate::runtime::SeatBuildInputs>,
+    ) -> Self {
+        self.seat_build_inputs = seat_build_inputs;
+        self
+    }
+
+    pub(crate) fn seat_build_inputs(&self) -> Option<&crate::runtime::SeatBuildInputs> {
+        self.seat_build_inputs.as_ref()
     }
 
     pub(crate) fn with_kickoff_prompt(
@@ -1553,6 +1575,15 @@ pub(crate) fn encode_stored_mob_event(event: &MobEvent) -> Result<Vec<u8>, serde
     {
         kind.insert("seat_session_unborn".to_string(), Value::Bool(true));
     }
+    if let Some(member_spawned) = event.kind.member_spawned()
+        && let Some(seat_build_inputs) = member_spawned.seat_build_inputs()
+        && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
+    {
+        kind.insert(
+            "seat_build_inputs".to_string(),
+            serde_json::to_value(seat_build_inputs)?,
+        );
+    }
     if let Some(recovered) = event.kind.member_session_binding_recovered()
         && recovered.records_seat_session_born()
         && let Some(kind) = value.get_mut("kind").and_then(Value::as_object_mut)
@@ -1714,6 +1745,18 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
         .map(serde_json::from_value::<bool>)
         .transpose()?
         .unwrap_or(false);
+    let spawned_seat_build_inputs = value
+        .get_mut("kind")
+        .and_then(Value::as_object_mut)
+        .and_then(|kind| {
+            if kind.get("type").and_then(Value::as_str) == Some("member_spawned") {
+                kind.remove("seat_build_inputs")
+            } else {
+                None
+            }
+        })
+        .map(serde_json::from_value::<crate::runtime::SeatBuildInputs>)
+        .transpose()?;
     let recovered_seat_session_born = value
         .get_mut("kind")
         .and_then(Value::as_object_mut)
@@ -1857,6 +1900,11 @@ pub(crate) fn decode_stored_mob_event(bytes: &[u8]) -> Result<MobEvent, serde_js
     }
     if spawned_seat_session_unborn && let Some(member_spawned) = event.kind.member_spawned_mut() {
         member_spawned.seat_session_unborn = true;
+    }
+    if let Some(seat_build_inputs) = spawned_seat_build_inputs
+        && let Some(member_spawned) = event.kind.member_spawned_mut()
+    {
+        member_spawned.seat_build_inputs = Some(seat_build_inputs);
     }
     if recovered_seat_session_born
         && let Some(recovered) = event.kind.member_session_binding_recovered_mut()
@@ -2443,6 +2491,76 @@ mod tests {
                 other => panic!("unexpected kind {other:?}"),
             }
         }
+    }
+
+    /// The build inputs an unborn seat carries to its first build survive the
+    /// stored roundtrip, never reach the public event, and are absent from a
+    /// row written before them.
+    #[test]
+    fn test_stored_seat_build_inputs_roundtrip_and_stay_internal() {
+        let sid = SessionId::from_uuid(Uuid::nil());
+        let identity = AgentIdentity::from("seated");
+        let inputs = crate::runtime::SeatBuildInputs {
+            context: Some(serde_json::json!({"desk": "north"})),
+            additional_instructions: Some(vec!["Answer briefly.".to_string()]),
+            system_prompt_override: Some(crate::runtime::SpawnSystemPromptOverride::Replace(
+                "You keep the north desk.".to_string(),
+            )),
+            budget_limits: Some(meerkat_core::BudgetLimits {
+                max_tokens: Some(4096),
+                ..Default::default()
+            }),
+            tool_access_policy: Some(meerkat_core::ops::ToolAccessPolicy::default()),
+            application_tool_policy: Some(meerkat_core::ApplicationToolPolicyBinding::Inherit),
+            auth_binding: None,
+            web_search: meerkat_core::ToolCategoryOverride::Disable,
+        };
+        let seat = MobEvent {
+            cursor: 1,
+            timestamp: Utc::now(),
+            mob_id: MobId::from("test-mob"),
+            kind: MobEventKind::MemberSpawned(
+                MemberSpawnedEvent::new(
+                    identity.clone(),
+                    Generation::new(1),
+                    FenceToken::new(2),
+                    AgentRuntimeId::new(identity, Generation::new(1)),
+                    ProfileName::from("worker"),
+                )
+                .with_bridge_member_ref(Some(MemberRef::from_bridge_session_id(sid)))
+                .with_seat_session_unborn(true)
+                .with_seat_build_inputs(Some(inputs.clone())),
+            ),
+        };
+        let public = serde_json::to_value(&seat).expect("public event payload");
+        assert!(
+            public["kind"].get("seat_build_inputs").is_none(),
+            "the public event never carries the seat's build inputs"
+        );
+        let encoded = encode_stored_mob_event(&seat).expect("encode");
+        let decoded = decode_stored_mob_event(&encoded).expect("decode").kind;
+        let MobEventKind::MemberSpawned(spawned) = &decoded else {
+            panic!("unexpected kind {decoded:?}");
+        };
+        assert_eq!(spawned.seat_build_inputs(), Some(&inputs));
+
+        let mut stored: serde_json::Value = serde_json::from_slice(&encoded).expect("parse");
+        let removed = stored
+            .get_mut("event")
+            .and_then(|event| event.get_mut("kind"))
+            .and_then(serde_json::Value::as_object_mut)
+            .and_then(|kind| kind.remove("seat_build_inputs"));
+        assert!(removed.is_some(), "the stored row carries the inputs");
+        let legacy = serde_json::to_vec(&stored).expect("encode without the inputs");
+        let decoded = decode_stored_mob_event(&legacy).expect("decode").kind;
+        let MobEventKind::MemberSpawned(spawned) = &decoded else {
+            panic!("unexpected kind {decoded:?}");
+        };
+        assert_eq!(
+            spawned.seat_build_inputs(),
+            None,
+            "a row written before the inputs decodes them as absent"
+        );
     }
 
     #[test]
