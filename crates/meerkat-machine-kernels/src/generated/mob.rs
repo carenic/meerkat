@@ -3742,6 +3742,68 @@ impl std::fmt::Display for MemberRecoveryObligationKind {
     serde::Serialize,
     serde::Deserialize,
 )]
+pub enum MemberReleaseVerdict {
+    #[default]
+    #[serde(rename = "Release")]
+    Release,
+    #[serde(rename = "NothingMaterialized")]
+    NothingMaterialized,
+    #[serde(rename = "WakeInFlight")]
+    WakeInFlight,
+    #[serde(rename = "HostOwned")]
+    HostOwned,
+    #[serde(rename = "NotAMember")]
+    NotAMember,
+}
+impl MemberReleaseVerdict {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Release => "Release",
+            Self::NothingMaterialized => "NothingMaterialized",
+            Self::WakeInFlight => "WakeInFlight",
+            Self::HostOwned => "HostOwned",
+            Self::NotAMember => "NotAMember",
+        }
+    }
+}
+impl std::convert::TryFrom<&str> for MemberReleaseVerdict {
+    type Error = String;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "Release" => Ok(Self::Release),
+            "NothingMaterialized" => Ok(Self::NothingMaterialized),
+            "WakeInFlight" => Ok(Self::WakeInFlight),
+            "HostOwned" => Ok(Self::HostOwned),
+            "NotAMember" => Ok(Self::NotAMember),
+            other => Err(format!("invalid MemberReleaseVerdict value `{other}`")),
+        }
+    }
+}
+impl std::convert::TryFrom<String> for MemberReleaseVerdict {
+    type Error = String;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::try_from(value.as_str())
+    }
+}
+impl std::fmt::Display for MemberReleaseVerdict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+#[allow(non_camel_case_types)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
 pub enum MemberRestorePolicyKind {
     #[default]
     #[serde(rename = "OnDemand")]
@@ -9420,6 +9482,11 @@ pub mod inputs {
         pub runtime_mode: SpawnPolicyRuntimeMode,
         pub external_addressable: bool,
         pub kickoff_owed: bool,
+        pub kickoff_objective_id: String,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ClassifyMemberRelease {
+        pub agent_identity: AgentIdentity,
     }
 }
 
@@ -9660,6 +9727,7 @@ pub enum Input {
     ResolveMemberHostPreparation(inputs::ResolveMemberHostPreparation),
     BeginMemberRotation(inputs::BeginMemberRotation),
     CommitMemberRotation(inputs::CommitMemberRotation),
+    ClassifyMemberRelease(inputs::ClassifyMemberRelease),
 }
 impl Input {
     pub fn kind(&self) -> InputKind {
@@ -9975,6 +10043,7 @@ impl Input {
             Self::ResolveMemberHostPreparation(_) => InputKind::ResolveMemberHostPreparation,
             Self::BeginMemberRotation(_) => InputKind::BeginMemberRotation,
             Self::CommitMemberRotation(_) => InputKind::CommitMemberRotation,
+            Self::ClassifyMemberRelease(_) => InputKind::ClassifyMemberRelease,
         }
     }
 }
@@ -10207,6 +10276,7 @@ pub enum InputKind {
     ResolveMemberHostPreparation,
     BeginMemberRotation,
     CommitMemberRotation,
+    ClassifyMemberRelease,
 }
 
 pub mod signals {
@@ -11887,6 +11957,11 @@ pub mod effects {
         pub cause: MemberMaterializationLossCause,
         pub outcome: MemberMaterializationReleaseOutcome,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct MemberReleaseClassified {
+        pub agent_identity: AgentIdentity,
+        pub verdict: MemberReleaseVerdict,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12058,6 +12133,7 @@ pub enum Effect {
     RebuildWakeRoutes(effects::RebuildWakeRoutes),
     PeerNoticeClassified(effects::PeerNoticeClassified),
     MemberMaterializationReleased(effects::MemberMaterializationReleased),
+    MemberReleaseClassified(effects::MemberReleaseClassified),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -12224,6 +12300,7 @@ pub enum EffectKind {
     RebuildWakeRoutes,
     PeerNoticeClassified,
     MemberMaterializationReleased,
+    MemberReleaseClassified,
 }
 
 pub mod command_capabilities {
@@ -13887,6 +13964,14 @@ pub enum TransitionId {
     ClassifyMemberLiveMaterializationTerminalDormant,
     AuthorizeExplicitResumeMemberLiveRunning,
     AuthorizeExplicitResumeMemberJoinRunning,
+    ClassifyMemberReleaseRunning,
+    ClassifyMemberReleaseStopped,
+    ClassifyMemberReleaseCompleted,
+    ClassifyMemberReleaseDestroyed,
+    CommitMemberRotationLiveKickoffRunning,
+    CommitMemberRotationLiveKickoffStopped,
+    CommitMemberRotationRetiredKickoffRunning,
+    CommitMemberRotationRetiredKickoffStopped,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]

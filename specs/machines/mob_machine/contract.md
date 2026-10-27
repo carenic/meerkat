@@ -545,7 +545,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool, kickoff_owed: Bool)
 - `ResolveMemberHostPreparation`(agent_identity: AgentIdentity)
 - `BeginMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId, peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
-- `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool, kickoff_owed: Bool)
+- `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool, kickoff_owed: Bool, kickoff_objective_id: String)
+- `ClassifyMemberRelease`(agent_identity: AgentIdentity)
 
 ## Signals
 - `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, runtime_epoch_id: Option<RuntimeEpochId>)
@@ -795,12 +796,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `RebuildWakeRoutes`
 - `PeerNoticeClassified`(recipient: AgentIdentity, sender: AgentIdentity, notice_class: PeerInputClass, disposition: PeerNoticeDisposition)
 - `MemberMaterializationReleased`(agent_runtime_id: Option<AgentRuntimeId>, cause: MemberMaterializationLossCause, outcome: MemberMaterializationReleaseOutcome)
+- `MemberReleaseClassified`(agent_identity: AgentIdentity, verdict: MemberReleaseVerdict)
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
 - `member_wake_refusal`(member_present: Bool, session_bound: Bool, placed: Bool, broken: Bool, retiring: Bool, mob_admitting: Bool, composition_authoritative: Bool, origin_open: Bool, host_pending: Bool, input_class: PeerInputClass, sender_waking: Bool, observed_missing: Bool, phase: Option<MemberMaterializationPhase>) -> `Option<MemberWakeRefusalKind>`
 - `member_boot_materialization`(policy: MemberRestorePolicyKind, composition_authoritative: Bool, host_pending: Bool, origin_open: Bool, obligation: MemberRecoveryObligationKind, kickoff_pending: Bool, network_transport: Bool, orchestrator_notified: Bool, has_durable_endpoint: Bool, host_required: Bool) -> `BootMaterializationKind`
 - `peer_notice_disposition`(recipient_phase: Option<MemberMaterializationPhase>, sender_phase: Option<MemberMaterializationPhase>, notice_class: PeerInputClass) -> `PeerNoticeDisposition`
+- `member_release_verdict`(seated: Bool, placed: Bool, residency: Option<MemberMaterializationPhase>) -> `MemberReleaseVerdict`
 
 ## Command Plans
 ### `AuthorizedMobSpawnStart`
@@ -8038,7 +8041,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `attempt_open`
   - `member_is_local`
   - `binding_requested`
-  - `endpoint_registered`
+  - `owed_endpoint_registered`
 - Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
@@ -15889,11 +15892,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationLiveRunning`
 - From: `Running`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
-  - `seat_owes_no_kickoff`
+  - `rotation_owes_no_kickoff`
   - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -15918,11 +15921,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationLiveStopped`
 - From: `Stopped`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
-  - `seat_owes_no_kickoff`
+  - `rotation_owes_no_kickoff`
   - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -15947,11 +15950,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationRetiredRunning`
 - From: `Running`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
-  - `seat_owes_no_kickoff`
+  - `rotation_owes_no_kickoff`
   - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -15976,11 +15979,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationRetiredStopped`
 - From: `Stopped`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
-  - `seat_owes_no_kickoff`
+  - `rotation_owes_no_kickoff`
   - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -16367,6 +16370,146 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `current_session`
   - `member_waking`
 - To: `Running`
+
+### `ClassifyMemberReleaseRunning`
+- From: `Running`
+- On: `ClassifyMemberRelease`(agent_identity)
+- Emits: `MemberReleaseClassified`
+- To: `Running`
+
+### `ClassifyMemberReleaseStopped`
+- From: `Stopped`
+- On: `ClassifyMemberRelease`(agent_identity)
+- Emits: `MemberReleaseClassified`
+- To: `Stopped`
+
+### `ClassifyMemberReleaseCompleted`
+- From: `Completed`
+- On: `ClassifyMemberRelease`(agent_identity)
+- Emits: `MemberReleaseClassified`
+- To: `Completed`
+
+### `ClassifyMemberReleaseDestroyed`
+- From: `Destroyed`
+- On: `ClassifyMemberRelease`(agent_identity)
+- Emits: `MemberReleaseClassified`
+- To: `Destroyed`
+
+### `CommitMemberRotationLiveKickoffRunning`
+- From: `Running`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `rotation_owes_kickoff`
+  - `destroy_not_admitted`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_live`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`, `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `CommitMemberRotationLiveKickoffStopped`
+- From: `Stopped`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `rotation_owes_kickoff`
+  - `destroy_not_admitted`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_live`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`, `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
+
+### `CommitMemberRotationRetiredKickoffRunning`
+- From: `Running`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `rotation_owes_kickoff`
+  - `destroy_not_admitted`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`, `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Running`
+
+### `CommitMemberRotationRetiredKickoffStopped`
+- From: `Stopped`
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id)
+- Guards:
+  - `rotation_pending`
+  - `composition_authoritative`
+  - `rotation_owes_kickoff`
+  - `destroy_not_admitted`
+  - `session_ingress_detach_closed`
+  - `identity_binding_matches`
+  - `placed_carrier_absent`
+  - `member_not_placed`
+  - `runtime_not_live`
+  - `fence_token_matches_history`
+  - `generation_matches`
+  - `member_retiring`
+  - `retirement_session_matches`
+  - `session_present`
+  - `session_binding_matches_or_cleared`
+  - `kickoff_quiesced`
+  - `generation_is_next`
+  - `next_runtime_fresh`
+  - `spawn_profile_name_authorized`
+  - `spawn_profile_addressability_authorized`
+  - `peer_id_available_for_identity`
+  - `member_peer_id_is_not_host`
+- Emits: `AppendLifecycleJournal`, `AppendLifecycleJournal`, `WiringGraphChanged`, `MemberSessionBindingChanged`, `EmitMemberLifecycleNotice`, `EmitMemberLifecycleNotice`, `PublishWakeRoute`, `PersistKickoffUpdate`, `EmitKickoffLifecycleNotice`
+- To: `Stopped`
 
 ## Coverage
 ### Code Anchors

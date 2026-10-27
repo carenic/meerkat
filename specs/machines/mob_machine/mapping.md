@@ -4602,6 +4602,30 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AuthorizeExplicitResumeMemberJoinRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ClassifyMemberReleaseRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyMemberReleaseStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyMemberReleaseCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ClassifyMemberReleaseDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationLiveKickoffRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationLiveKickoffStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationRetiredKickoffRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `CommitMemberRotationRetiredKickoffStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -5091,6 +5115,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `MemberMaterializationReleased`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `MemberReleaseClassified`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 

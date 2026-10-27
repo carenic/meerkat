@@ -231,6 +231,7 @@ pub enum MobMachineCatalogInput {
     ResolveMemberHostPreparation,
     BeginMemberRotation,
     CommitMemberRotation,
+    ClassifyMemberRelease,
 }
 
 impl MobMachineCatalogInput {
@@ -462,6 +463,7 @@ impl MobMachineCatalogInput {
         Self::ResolveMemberHostPreparation,
         Self::BeginMemberRotation,
         Self::CommitMemberRotation,
+        Self::ClassifyMemberRelease,
     ];
 
     #[must_use]
@@ -696,6 +698,7 @@ impl MobMachineCatalogInput {
             Self::ResolveMemberHostPreparation => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::ResolveMemberHostPreparation,
             Self::BeginMemberRotation => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::BeginMemberRotation,
             Self::CommitMemberRotation => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::CommitMemberRotation,
+            Self::ClassifyMemberRelease => meerkat_machine_schema::catalog::dsl::mob_machine::MobMachineInputVariant::ClassifyMemberRelease,
         }
     }
 
@@ -955,6 +958,7 @@ impl MobMachineCatalogInput {
             Self::ResolveMemberHostPreparation => "ResolveMemberHostPreparation",
             Self::BeginMemberRotation => "BeginMemberRotation",
             Self::CommitMemberRotation => "CommitMemberRotation",
+            Self::ClassifyMemberRelease => "ClassifyMemberRelease",
         }
     }
 }
