@@ -4650,6 +4650,78 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `WireMembersWithTrustPlacedPeerWakeSecondEnd`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationRealizedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationRealizedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationRealizedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationRealizedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationOwedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationOwedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationOwedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationOwedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveWiringEdgeRealizationStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationRealizedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationRealizedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationRealizedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationRealizedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationOwedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationOwedStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationOwedCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationOwedDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationStaleRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationStaleStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationStaleCompleted`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `ResolveExternalEdgeRealizationStaleDestroyed`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -5150,6 +5222,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `OwedMemberWakesRecorded`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `OwedEdgeRepairsRecorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Invariants
 - `stopped_mob_holds_member_run_starts`
@@ -5363,6 +5438,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `archive_only_retirement_is_retiring`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `owed_edge_repairs_join_seated_members`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `destroyed_mob_holds_no_member_lifecycle`

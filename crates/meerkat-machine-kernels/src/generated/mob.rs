@@ -8050,6 +8050,8 @@ pub struct State {
     pub member_rotation_peer_endpoints:
         std::collections::BTreeMap<AgentIdentity, MemberPeerEndpoint>,
     pub runtime_retire_archive_only: std::collections::BTreeSet<AgentRuntimeId>,
+    pub owed_edge_repairs: std::collections::BTreeSet<WiringEdge>,
+    pub owed_external_edge_repairs: std::collections::BTreeSet<ExternalPeerEdge>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -10752,6 +10754,16 @@ pub mod signals {
         pub runtime_epoch_id: Option<RuntimeEpochId>,
         pub cause: MemberMaterializationLossCause,
     }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveWiringEdgeRealization {
+        pub edge: WiringEdge,
+        pub realized: bool,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct ResolveExternalEdgeRealization {
+        pub edge: ExternalPeerEdge,
+        pub realized: bool,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -10840,6 +10852,8 @@ pub enum Signal {
     ResolveMemberRevivalRetryable(signals::ResolveMemberRevivalRetryable),
     AbandonMemberWake(signals::AbandonMemberWake),
     ReleaseMemberMaterialization(signals::ReleaseMemberMaterialization),
+    ResolveWiringEdgeRealization(signals::ResolveWiringEdgeRealization),
+    ResolveExternalEdgeRealization(signals::ResolveExternalEdgeRealization),
 }
 impl Signal {
     pub fn kind(&self) -> SignalKind {
@@ -10958,6 +10972,8 @@ impl Signal {
             Self::ResolveMemberRevivalRetryable(_) => SignalKind::ResolveMemberRevivalRetryable,
             Self::AbandonMemberWake(_) => SignalKind::AbandonMemberWake,
             Self::ReleaseMemberMaterialization(_) => SignalKind::ReleaseMemberMaterialization,
+            Self::ResolveWiringEdgeRealization(_) => SignalKind::ResolveWiringEdgeRealization,
+            Self::ResolveExternalEdgeRealization(_) => SignalKind::ResolveExternalEdgeRealization,
         }
     }
 }
@@ -11045,6 +11061,8 @@ pub enum SignalKind {
     ResolveMemberRevivalRetryable,
     AbandonMemberWake,
     ReleaseMemberMaterialization,
+    ResolveWiringEdgeRealization,
+    ResolveExternalEdgeRealization,
 }
 
 pub mod effects {
@@ -11989,6 +12007,8 @@ pub mod effects {
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct OwedMemberWakesRecorded {}
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct OwedEdgeRepairsRecorded {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -12163,6 +12183,7 @@ pub enum Effect {
     MemberReleaseClassified(effects::MemberReleaseClassified),
     RuntimeBindingRefusalStale(effects::RuntimeBindingRefusalStale),
     OwedMemberWakesRecorded(effects::OwedMemberWakesRecorded),
+    OwedEdgeRepairsRecorded(effects::OwedEdgeRepairsRecorded),
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum EffectKind {
@@ -12332,6 +12353,7 @@ pub enum EffectKind {
     MemberReleaseClassified,
     RuntimeBindingRefusalStale,
     OwedMemberWakesRecorded,
+    OwedEdgeRepairsRecorded,
 }
 
 pub mod command_capabilities {
@@ -13127,7 +13149,6 @@ pub enum TransitionId {
     ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable,
     ResolveSubmitWorkRejectionStaleSessionBinding,
     RetireMember,
-    RetireMemberArchiveOnly,
     RetireMemberRemote,
     RetireMemberRemoteConfirmedRevoked,
     RetireMemberPeerOnly,
@@ -13146,9 +13167,7 @@ pub enum TransitionId {
     RecordRemoteMemberSupervisorRevokedAlreadyRecordedRunning,
     RecordRemoteMemberSupervisorRevokedAlreadyRecordedStopped,
     AdmitDestroyMemberRetireLiveRunning,
-    AdmitDestroyMemberRetireArchiveOnlyRunning,
     AdmitDestroyMemberRetireLiveStopped,
-    AdmitDestroyMemberRetireArchiveOnlyStopped,
     AdmitDestroyMemberRetireRemoteRunning,
     AdmitDestroyMemberRetireRemoteStopped,
     AdmitDestroyMemberRetireConfirmedRevokedRunning,
@@ -13247,9 +13266,7 @@ pub enum TransitionId {
     RestoreRetiringMemberWiringRunning,
     RestoreRetiringMemberWiringStopped,
     WireExternalPeerRunning,
-    WireExternalPeerDormantRunning,
     WireExternalPeerAlreadyWired,
-    WireExternalPeerAlreadyWiredDormant,
     RegisterMemberPeerRunning,
     RegisterMemberPeerAlreadyCurrentRunning,
     AuthorizeMemberEndpointMigrationTrustCleanupRunningRunning,
@@ -13272,7 +13289,6 @@ pub enum TransitionId {
     RecoverExternalPeerUnwireRunning,
     RecoverExternalPeerUnwireAlreadyAbsent,
     UnwireExternalPeerRunning,
-    UnwireExternalPeerDormantRunning,
     UnwireExternalPeerAlreadyAbsent,
     CleanupRetiringExternalPeerRunning,
     CleanupRetiringExternalPeerStopped,
@@ -13722,14 +13738,11 @@ pub enum TransitionId {
     ClassifyRetirePendingSpawnDispositionPreserveAbsentRunning,
     ClassifyRetirePendingSpawnDispositionPreserveAbsentStopped,
     RetireRunningReleasing,
-    RetireRunningReleasingArchiveOnly,
     RetireRemoteReleasingRunning,
     RetireRemoteConfirmedRevokedRunning,
     RetireRunningPreservingBinding,
-    RetireRunningPreservingBindingArchiveOnly,
     RetireRunningNoBinding,
     RetireStoppedReleasing,
-    RetireStoppedReleasingArchiveOnly,
     RequestPendingSessionIngressDetachForMobDestroyRunning,
     RequestPendingSessionIngressDetachForMobDestroyStopped,
     SessionIngressDetachedForMobDestroyRunning,
@@ -13739,7 +13752,6 @@ pub enum TransitionId {
     RetireRemoteReleasingStopped,
     RetireRemoteConfirmedRevokedStopped,
     RetireStoppedPreservingBinding,
-    RetireStoppedPreservingBindingArchiveOnly,
     RetireStoppedNoBinding,
     RetireAbsentRunning,
     RetireAbsentStopped,
@@ -14011,6 +14023,40 @@ pub enum TransitionId {
     WireMembersPlacedPeerWakeSecondEnd,
     WireMembersWithTrustPlacedPeerWakeFirstEnd,
     WireMembersWithTrustPlacedPeerWakeSecondEnd,
+    ResolveWiringEdgeRealizationRealizedRunning,
+    ResolveWiringEdgeRealizationRealizedStopped,
+    ResolveWiringEdgeRealizationRealizedCompleted,
+    ResolveWiringEdgeRealizationRealizedDestroyed,
+    ResolveWiringEdgeRealizationOwedRunning,
+    ResolveWiringEdgeRealizationOwedStopped,
+    ResolveWiringEdgeRealizationOwedCompleted,
+    ResolveWiringEdgeRealizationOwedDestroyed,
+    ResolveWiringEdgeRealizationStaleRunning,
+    ResolveWiringEdgeRealizationStaleStopped,
+    ResolveWiringEdgeRealizationStaleCompleted,
+    ResolveWiringEdgeRealizationStaleDestroyed,
+    ResolveExternalEdgeRealizationRealizedRunning,
+    ResolveExternalEdgeRealizationRealizedStopped,
+    ResolveExternalEdgeRealizationRealizedCompleted,
+    ResolveExternalEdgeRealizationRealizedDestroyed,
+    ResolveExternalEdgeRealizationOwedRunning,
+    ResolveExternalEdgeRealizationOwedStopped,
+    ResolveExternalEdgeRealizationOwedCompleted,
+    ResolveExternalEdgeRealizationOwedDestroyed,
+    ResolveExternalEdgeRealizationStaleRunning,
+    ResolveExternalEdgeRealizationStaleStopped,
+    ResolveExternalEdgeRealizationStaleCompleted,
+    ResolveExternalEdgeRealizationStaleDestroyed,
+    RetireMemberArchiveOnly,
+    AdmitDestroyMemberRetireArchiveOnlyRunning,
+    AdmitDestroyMemberRetireArchiveOnlyStopped,
+    WireExternalPeerDormantRunning,
+    WireExternalPeerAlreadyWiredDormant,
+    UnwireExternalPeerDormantRunning,
+    RetireRunningReleasingArchiveOnly,
+    RetireRunningPreservingBindingArchiveOnly,
+    RetireStoppedReleasingArchiveOnly,
+    RetireStoppedPreservingBindingArchiveOnly,
 }
 #[allow(non_camel_case_types)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -14380,5 +14426,7 @@ pub fn initial_state() -> State {
         member_rotation_session_ids: Default::default(),
         member_rotation_peer_endpoints: Default::default(),
         runtime_retire_archive_only: Default::default(),
+        owed_edge_repairs: Default::default(),
+        owed_external_edge_repairs: Default::default(),
     }
 }

@@ -303,6 +303,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `member_rotation_session_ids`: `Map<AgentIdentity, SessionId>`
 - `member_rotation_peer_endpoints`: `Map<AgentIdentity, MemberPeerEndpoint>`
 - `runtime_retire_archive_only`: `Set<AgentRuntimeId>`
+- `owed_edge_repairs`: `Set<WiringEdge>`
+- `owed_external_edge_repairs`: `Set<ExternalPeerEdge>`
 
 ## Inputs
 - `RunFlow`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_status: Map<StepId, Option<StepRunStatus>>, output_recorded: Map<StepId, Bool>, step_condition_results: Map<StepId, Option<Bool>>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, step_target_counts: Map<StepId, u64>, step_target_success_counts: Map<StepId, u64>, step_target_terminal_failure_counts: Map<StepId, u64>, escalation_threshold: u64, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
@@ -631,6 +633,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `ResolveMemberRevivalRetryable`(agent_identity: AgentIdentity, attempt: u64, kind: MemberWakeRetryableKind)
 - `AbandonMemberWake`(agent_identity: AgentIdentity, attempt: u64, kind: MemberWakeAbandonKind, reason: String)
 - `ReleaseMemberMaterialization`(agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>, cause: MemberMaterializationLossCause)
+- `ResolveWiringEdgeRealization`(edge: WiringEdge, realized: Bool)
+- `ResolveExternalEdgeRealization`(edge: ExternalPeerEdge, realized: Bool)
 
 ## Effects
 - `HoldMemberRunStarts`
@@ -799,6 +803,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `MemberReleaseClassified`(agent_identity: AgentIdentity, verdict: MemberReleaseVerdict)
 - `RuntimeBindingRefusalStale`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, attempt: Option<u64>)
 - `OwedMemberWakesRecorded`
+- `OwedEdgeRepairsRecorded`
 
 ## Helpers
 - `identity_reconcile_decision`(intent: IdentityAuthorityCondition, lease: IdentityLeaseCondition, replacement: IdentityReplacementCondition, external_binding_required: Bool, initial_delivery_required: Bool, session_creation_receipt: IdentityReceiptCondition, retirement_receipt: IdentityReceiptCondition, session: IdentitySessionCondition, runtime: IdentityResourceCondition, member: IdentityResourceCondition, external_binding_receipt: IdentityReceiptCondition, external_trust: IdentityExternalTrustCondition, external_ceremony: IdentityExternalCeremonyCondition, initial_delivery_receipt: IdentityReceiptCondition, initial_delivery: IdentityInitialDeliveryCondition, wiring: IdentityResourceCondition) -> `IdentityReconcileDecision`
@@ -970,6 +975,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `only_a_running_mob_wakes`
 - `rotation_intent_is_a_retiring_member`
 - `archive_only_retirement_is_retiring`
+- `owed_edge_repairs_join_seated_members`
 - `destroyed_mob_holds_no_member_lifecycle`
 
 ## Transitions
@@ -16617,6 +16623,214 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `second_end_wake_admitted`
 - Emits: `WiringGraphChanged`, `MemberTrustWiringRequested`, `EmitWiringLifecycleNotice`, `MaterializeMember`
 - To: `Running`
+
+### `ResolveWiringEdgeRealizationRealizedRunning`
+- From: `Running`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Running`
+
+### `ResolveWiringEdgeRealizationRealizedStopped`
+- From: `Stopped`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Stopped`
+
+### `ResolveWiringEdgeRealizationRealizedCompleted`
+- From: `Completed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Completed`
+
+### `ResolveWiringEdgeRealizationRealizedDestroyed`
+- From: `Destroyed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Destroyed`
+
+### `ResolveWiringEdgeRealizationOwedRunning`
+- From: `Running`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `ends_seated`
+  - `ends_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Running`
+
+### `ResolveWiringEdgeRealizationOwedStopped`
+- From: `Stopped`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `ends_seated`
+  - `ends_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Stopped`
+
+### `ResolveWiringEdgeRealizationOwedCompleted`
+- From: `Completed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `ends_seated`
+  - `ends_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Completed`
+
+### `ResolveWiringEdgeRealizationOwedDestroyed`
+- From: `Destroyed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `ends_seated`
+  - `ends_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Destroyed`
+
+### `ResolveWiringEdgeRealizationStaleRunning`
+- From: `Running`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Running`
+
+### `ResolveWiringEdgeRealizationStaleStopped`
+- From: `Stopped`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Stopped`
+
+### `ResolveWiringEdgeRealizationStaleCompleted`
+- From: `Completed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Completed`
+
+### `ResolveWiringEdgeRealizationStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveWiringEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Destroyed`
+
+### `ResolveExternalEdgeRealizationRealizedRunning`
+- From: `Running`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Running`
+
+### `ResolveExternalEdgeRealizationRealizedStopped`
+- From: `Stopped`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Stopped`
+
+### `ResolveExternalEdgeRealizationRealizedCompleted`
+- From: `Completed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Completed`
+
+### `ResolveExternalEdgeRealizationRealizedDestroyed`
+- From: `Destroyed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `realized`
+- To: `Destroyed`
+
+### `ResolveExternalEdgeRealizationOwedRunning`
+- From: `Running`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `local_seated`
+  - `local_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Running`
+
+### `ResolveExternalEdgeRealizationOwedStopped`
+- From: `Stopped`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `local_seated`
+  - `local_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Stopped`
+
+### `ResolveExternalEdgeRealizationOwedCompleted`
+- From: `Completed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `local_seated`
+  - `local_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Completed`
+
+### `ResolveExternalEdgeRealizationOwedDestroyed`
+- From: `Destroyed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_wired`
+  - `local_seated`
+  - `local_not_retiring`
+- Emits: `OwedEdgeRepairsRecorded`
+- To: `Destroyed`
+
+### `ResolveExternalEdgeRealizationStaleRunning`
+- From: `Running`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Running`
+
+### `ResolveExternalEdgeRealizationStaleStopped`
+- From: `Stopped`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Stopped`
+
+### `ResolveExternalEdgeRealizationStaleCompleted`
+- From: `Completed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Completed`
+
+### `ResolveExternalEdgeRealizationStaleDestroyed`
+- From: `Destroyed`
+- On: `ResolveExternalEdgeRealization`(edge, realized)
+- Guards:
+  - `unrealized`
+  - `edge_not_repairable`
+- To: `Destroyed`
 
 ## Coverage
 ### Code Anchors
