@@ -485,6 +485,23 @@ them.
   precondition no longer holds) closes the member's wake attempt, leaving the
   member dormant for its next delivery, instead of leaving the attempt open
   until its bound.
+- `meerkat` (governed helper work): a governed helper admission fence and a
+  helper child issuance built from a tool dispatch
+  (`GovernedHelperAdmissionFence::from_dispatch`,
+  `GovernedHelperChildIssuance::from_dispatch`) now answer `Denied`, as their
+  documentation and the prepared path always did, when the dispatch's review
+  settles the step: an R2 or R3 decision at the fence (no review runs under
+  the graph lock), a review already spent, an ended dispatch, or a refused
+  review. Before, they answered `Unavailable`, which tells a host that a
+  later attempt may succeed. The review owner's own unavailability
+  (contention, an unconfirmed store, unreadable review material, a failed
+  reviewer) stays `Unavailable`.
+- `meerkat-core`: the documentation of
+  `GovernedDispatchOperation::issue_child_if_current_within` said that a
+  consented R3 operation refuses there. It does not: a fresh attempt of a
+  consented R3 candidate spends its human consent at this entry and issues
+  the child. The method is the dispatch's single consuming entry, so a second
+  call finds the review spent (`AlreadyConsumed`).
 - `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
   of a stopped mob, a revival or registration reload of a missing live
   materialization, and a Resume-mode spawn such as attaching an existing

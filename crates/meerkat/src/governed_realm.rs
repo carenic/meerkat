@@ -51,6 +51,30 @@ pub(crate) fn effect_leaf_denies(refusal: meerkat_core::authorization::Operation
     )
 }
 
+/// Whether `error`, met at a governed effect leaf on a tool dispatch's own
+/// path, is a review settlement that is final for that dispatch: a review
+/// this entry cannot carry, a review already spent or a dispatch already
+/// ended, or a review that refused. Such a settlement is a denial, as on the
+/// prepared path. Only the review owner's own unavailability (contention,
+/// an unconfirmed store, unreadable material, a failed reviewer) leaves a
+/// later attempt a chance, and is not a denial; neither is any error that is
+/// not a review settlement.
+pub(crate) fn review_settlement_denies(error: &meerkat_core::ToolError) -> bool {
+    use meerkat_core::ReviewUnavailableKind as Unavailable;
+    match error.primary_error() {
+        meerkat_core::ToolError::ReviewUnsatisfied { .. } => true,
+        meerkat_core::ToolError::ReviewUnavailable { kind } => !matches!(
+            kind,
+            Unavailable::OwnerUnavailable
+                | Unavailable::ReviewerFailed
+                | Unavailable::StoreConflict
+                | Unavailable::StoreCommitUnknown
+                | Unavailable::ContextUnavailable
+        ),
+        _ => false,
+    }
+}
+
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 

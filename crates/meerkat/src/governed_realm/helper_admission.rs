@@ -328,6 +328,10 @@ fn refusal_of(error: OperationAuthorizationError) -> HelperAdmissionRefusal {
     }
 }
 
+/// A dispatch-path refusal: a denial, as on the prepared path, for a refused
+/// operation and for a review settlement final for the dispatch (a review
+/// this entry cannot carry: an R2 or R3 decision refuses here, since no
+/// review runs under the graph lock); otherwise unavailable.
 fn tool_refusal_of(error: &meerkat_core::ToolError) -> HelperAdmissionRefusal {
     match error {
         meerkat_core::ToolError::AuthorizationRefused { refusal, .. }
@@ -335,6 +339,7 @@ fn tool_refusal_of(error: &meerkat_core::ToolError) -> HelperAdmissionRefusal {
         {
             HelperAdmissionRefusal::Denied
         }
+        error if super::review_settlement_denies(error) => HelperAdmissionRefusal::Denied,
         _ => HelperAdmissionRefusal::Unavailable,
     }
 }

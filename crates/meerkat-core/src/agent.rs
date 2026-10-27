@@ -1066,9 +1066,12 @@ impl GovernedDispatchOperation {
     /// exclusion (see `WorkAuthorization::issue_child_if_current_within`).
     /// The work owner first validates the typed `further` and `intent`
     /// (before any review is spent); then THIS dispatch's own review custody
-    /// is entered (R1, or the R2 review this dispatch admitted; R3 needs
-    /// human consent, which is not supported here, and refuses) and held
-    /// through the issuance. The returned box carries the grant owner's
+    /// is entered (R1; the R2 review this dispatch admitted; or, in a fresh
+    /// attempt of a consented R3 candidate, its authenticated human consent)
+    /// and held through the issuance. An R3 decision never reaches a
+    /// dispatcher outside such an attempt. This is the dispatch's single
+    /// consuming entry: a second call finds the review spent
+    /// (`AlreadyConsumed`). The returned box carries the grant owner's
     /// typed outcome, which callers must keep: an outer `Ok` is no receipt.
     ///
     /// # Errors

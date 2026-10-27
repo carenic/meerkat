@@ -36,7 +36,9 @@ pub enum HelperChildIssuanceRefusal {
     /// Not permitted now: the setup operation's current decision, an
     /// originating source (cancelled, no longer retained, expired, or its
     /// grant excludes the operation), the independent parent grant or the
-    /// requested bounds refuse it, or the intended id names another grant.
+    /// requested bounds refuse it, the intended id names another grant, or
+    /// the dispatch's review cannot cover it (a review its entry cannot
+    /// carry, one already spent, or a dispatch that ended).
     /// No child was appended.
     Denied,
     /// The owners cannot say now (contention, a refusal to rebuild after an
@@ -169,6 +171,13 @@ impl GovernedHelperChildIssuance {
                     Err(meerkat_core::ToolError::AuthorizationRefused { refusal, .. })
                         if super::effect_leaf_denies(refusal) =>
                     {
+                        Err(HelperChildIssuanceRefusal::Denied)
+                    }
+                    // A review this dispatch cannot spend for the child (one
+                    // already spent, an ended dispatch, or a review this entry
+                    // cannot carry) is final for the dispatch, as on the
+                    // prepared path.
+                    Err(error) if super::review_settlement_denies(&error) => {
                         Err(HelperChildIssuanceRefusal::Denied)
                     }
                     Err(_) => Err(HelperChildIssuanceRefusal::Unavailable),
