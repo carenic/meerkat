@@ -42,15 +42,15 @@
 # endpoint while it owes EndpointPending and can always close Live when it
 # owes no endpoint cause, that the release verdict is Release exactly when the
 # Released arm would honour the member's own registration, that a refused
-# binding request ends a wake only when it belongs to the open attempt, and
-# that a release of another epoch never demotes. The seed run checks that the
-# boot plan never leaves a member that blocks the seal. The retire run checks
-# that no runtime retire is routed for a member with no registration (R27),
-# that a settled retirement can always archive and under an admitted destroy
-# nothing holds it (R124), and that no rotation begins or commits under an
-# admitted destroy (R124). TLC evaluates the module's I5 ASSUME (a present,
-# bound member with a phase is never refused as not a member) and its release
-# verdict ASSUME at the start of every run.
+# binding request applies only to the wake it belongs to, and that a release
+# of another epoch never demotes. The seed run checks that the boot plan never
+# leaves a member that blocks the seal. The retire run checks that no runtime
+# retire is routed for a member with no registration (R27), that a settled
+# retirement can always archive and under an admitted destroy nothing holds it
+# (R124), and that no rotation begins or commits under an admitted destroy
+# (R124). TLC evaluates the module's I5 ASSUME (a present, bound member with a
+# phase is never refused as not a member) and its release verdict ASSUME at
+# the start of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -870,6 +870,12 @@ for fold in folds:
   mutate wake binding_refusal_unfenced \
     "Error: Action property AuditBindingRefusalFenced is violated" \
     'drop_guard("ResolveRuntimeBindingRefusalRunning", "member_wake_attempts")' "$@"
+  # The fence for a wake's request only: a spawn-era refusal (no attempt)
+  # still ends a wake opened after the spawn.
+  mutate wake spawn_refusal_unfenced \
+    "Error: Action property AuditBindingRefusalFenced is violated" \
+    'drop_guard("ResolveRuntimeBindingRefusalRunning", "member_wake_attempts")
+add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (agent_identity \\in DOMAIN member_wake_attempts) THEN Some(member_wake_attempts[agent_identity]) ELSE None) = attempt))")' "$@"
   # The release verdict drifts from the Released arm: it answers Release for
   # a Live member whose registration release would be Stale.
   mutate wake release_verdict_ignores_registration \

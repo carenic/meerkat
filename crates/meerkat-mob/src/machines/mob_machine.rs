@@ -10668,10 +10668,11 @@ mod tests {
         );
     }
 
-    /// The routed binding refusal is fenced by the wake attempt its request
-    /// belongs to: a late refusal of an earlier attempt's request is a typed
-    /// StaleAttempt no-op that never ends the newer wake, and the refusal of
-    /// the open attempt's request records the member Broken.
+    /// The routed binding refusal is fenced by the wake its request belongs
+    /// to: a late refusal of an earlier attempt's request, or a spawn-era one
+    /// (no attempt) while a wake is open, is a typed stale no-op that never
+    /// ends the newer wake, and the refusal of the open attempt's request
+    /// records the member Broken.
     #[test]
     fn a_stale_binding_refusal_never_ends_a_newer_wake() {
         let (mut authority, member) = dormant_member_authority("fenced-refusal");
@@ -10713,29 +10714,31 @@ mod tests {
             session_id: member.session_id.clone(),
             refusal_code: "binding_refused".to_string(),
             reason: "the runtime refused the binding".to_string(),
-            attempt: Some(attempt),
+            attempt,
         };
-        let stale = MobMachineMutator::apply(&mut authority, refusal(first))
-            .expect("a refusal of the earlier attempt's request is answered");
-        assert!(stale.effects().iter().any(|effect| matches!(
-            effect,
-            MobMachineEffect::MemberWakeFeedbackResolved {
-                verdict: MemberWakeFeedbackVerdict::StaleAttempt,
-                ..
-            }
-        )));
-        assert_eq!(
-            authority.state().member_wake_attempts.get(&member.identity),
-            Some(&second),
-            "the late refusal leaves the newer wake open"
-        );
+        let is_stale = |transition: &MobMachineTransition| {
+            transition
+                .effects()
+                .iter()
+                .any(|effect| matches!(effect, MobMachineEffect::RuntimeBindingRefusalStale { .. }))
+        };
+        for late in [Some(first), None] {
+            let stale = MobMachineMutator::apply(&mut authority, refusal(late))
+                .expect("a refusal that belongs to no open wake is answered");
+            assert!(is_stale(&stale), "{late:?} is answered stale");
+            assert_eq!(
+                authority.state().member_wake_attempts.get(&member.identity),
+                Some(&second),
+                "the late {late:?} refusal leaves the newer wake open"
+            );
+        }
         assert!(
             !authority
                 .state()
                 .member_restore_failures
                 .contains_key(&member.identity)
         );
-        MobMachineMutator::apply(&mut authority, refusal(second))
+        MobMachineMutator::apply(&mut authority, refusal(Some(second)))
             .expect("the refusal of the open attempt's request applies");
         assert!(
             authority
