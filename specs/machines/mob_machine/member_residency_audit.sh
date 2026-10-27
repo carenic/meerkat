@@ -74,11 +74,11 @@ fi
 # Each run's distinct-state floor is 90% of the whole space its first green
 # run found, so a guard that silently disables arms fails the lane.
 seed_states=1659
-wake_states=939
+wake_states=987
 retire_states=4096
 terminal_states=238
 resume_states=3438
-edge_states=831
+edge_states=1148
 seat_states=58102
 wake2_states=1425
 
