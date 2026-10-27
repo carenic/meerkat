@@ -118,8 +118,9 @@ impl MobActor {
     }
 
     /// Name, in the resume's progress observation, a member whose post-commit
-    /// work at `stage` is still owed. A stall then names a member the resume
-    /// waits on, not the last member whose work finished.
+    /// work at `stage` is still owed, and how many members are owed in all. A
+    /// stall then names a member the resume waits on, not the last member
+    /// whose work finished, and reports the whole debt.
     fn observe_owed_resume_post_commit_member(
         &self,
         stage: crate::runtime::state::LifecycleProgressStage,
@@ -128,7 +129,11 @@ impl MobActor {
             self.pending_resume_lifecycle.as_ref(),
             self.resume_post_commit_member_tasks.first(),
         ) {
-            pending.progress.awaiting_member(owed, stage);
+            pending.progress.awaiting_owed_members(
+                owed,
+                self.resume_post_commit_member_tasks.len(),
+                stage,
+            );
         }
     }
 

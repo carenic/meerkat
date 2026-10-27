@@ -571,6 +571,9 @@ impl LifecycleProgressStage {
 pub(super) struct LifecycleProgressObservation {
     pub(super) epoch: u64,
     pub(super) member_id: Option<AgentIdentity>,
+    /// How many members a stage that owes work for a set of members still
+    /// owes (`member_id` names one of them); `None` for every other stage.
+    pub(super) members_owed: Option<usize>,
     pub(super) stage: LifecycleProgressStage,
     pub(super) observed_at: meerkat_core::time_compat::Instant,
 }
@@ -588,6 +591,7 @@ impl LifecycleProgressSignal {
         let (sender, receiver) = tokio::sync::watch::channel(LifecycleProgressObservation {
             epoch: 0,
             member_id: None,
+            members_owed: None,
             stage: LifecycleProgressStage::LifecycleAuthorityAdmission,
             observed_at: meerkat_core::time_compat::Instant::now(),
         });
@@ -598,11 +602,36 @@ impl LifecycleProgressSignal {
         let now = meerkat_core::time_compat::Instant::now();
         self.sender.send_modify(|observation| {
             observation.member_id = Some(member_id.clone());
+            observation.members_owed = None;
             observation.stage = stage;
             observation.observed_at = now;
         });
         tracing::debug!(
             agent_identity = %member_id,
+            stage = stage.as_str(),
+            "explicit resume awaiting lifecycle work"
+        );
+    }
+
+    /// [`Self::awaiting_member`] for a stage that owes work for a set of
+    /// members: names one member still owed and how many are owed in all, so
+    /// a stall reports the whole debt, not only one member of it.
+    pub(super) fn awaiting_owed_members(
+        &self,
+        member_id: &AgentIdentity,
+        members_owed: usize,
+        stage: LifecycleProgressStage,
+    ) {
+        let now = meerkat_core::time_compat::Instant::now();
+        self.sender.send_modify(|observation| {
+            observation.member_id = Some(member_id.clone());
+            observation.members_owed = Some(members_owed);
+            observation.stage = stage;
+            observation.observed_at = now;
+        });
+        tracing::debug!(
+            agent_identity = %member_id,
+            members_owed,
             stage = stage.as_str(),
             "explicit resume awaiting lifecycle work"
         );
@@ -615,6 +644,7 @@ impl LifecycleProgressSignal {
             elapsed = now.saturating_duration_since(observation.observed_at);
             observation.epoch = observation.epoch.wrapping_add(1);
             observation.member_id = Some(member_id.clone());
+            observation.members_owed = None;
             observation.stage = stage;
             observation.observed_at = now;
         });
@@ -630,6 +660,7 @@ impl LifecycleProgressSignal {
         let now = meerkat_core::time_compat::Instant::now();
         self.sender.send_modify(|observation| {
             observation.member_id = None;
+            observation.members_owed = None;
             observation.stage = stage;
             observation.observed_at = now;
         });
