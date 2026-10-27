@@ -357,7 +357,7 @@ impl MemberContinuityIndex {
     const PAGE: usize = 256;
 
     /// Fold every journal event after the last cursor seen.
-    async fn refresh(
+    pub(in crate::runtime) async fn refresh(
         &mut self,
         events: &Arc<dyn MobEventStore>,
         mob_id: &MobId,
@@ -400,7 +400,10 @@ impl MemberContinuityIndex {
     }
 
     /// The one-member slice a cold restore reads.
-    fn slice_for(&self, identity: &AgentIdentity) -> super::super::builder::RecordedContinuity {
+    pub(in crate::runtime) fn slice_for(
+        &self,
+        identity: &AgentIdentity,
+    ) -> super::super::builder::RecordedContinuity {
         self.recorded
             .get(identity)
             .map(|recorded| {
@@ -1699,9 +1702,7 @@ impl MobActor {
     }
 
     /// [`Self::classify_peer_notice`], answered as what the caller does with
-    /// the notice. `DeferToWake` (a kickoff to a member that is not live) is
-    /// recorded by the caller that owns the kickoff, with its objective, as
-    /// the member's kickoff obligation (`KickoffMarkPending`).
+    /// the notice.
     pub(in crate::runtime) fn realize_peer_notice_disposition(
         &mut self,
         recipient: &AgentIdentity,
@@ -1712,7 +1713,6 @@ impl MobActor {
             match self.classify_peer_notice(recipient, sender, notice_class)? {
                 mob_dsl::PeerNoticeDisposition::Deliver => PeerNoticeRealization::Deliver,
                 mob_dsl::PeerNoticeDisposition::Suppressed => PeerNoticeRealization::Suppressed,
-                mob_dsl::PeerNoticeDisposition::DeferToWake => PeerNoticeRealization::DeferToWake,
             },
         )
     }
@@ -1739,9 +1739,6 @@ pub(in crate::runtime) enum PeerNoticeRealization {
     /// Do not send it: the recipient's (or the sender's) wake realizes its
     /// content from machine state.
     Suppressed,
-    /// A kickoff to a member that is not live: record it as the member's
-    /// kickoff obligation; its wake runs it.
-    DeferToWake,
 }
 
 /// The runtime owner and session a release closes.
