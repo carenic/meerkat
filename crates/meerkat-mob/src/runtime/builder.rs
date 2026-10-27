@@ -4077,6 +4077,24 @@ fn seed_mob_authority_sync_from_events(
                     },
                     "recover_member_external_rebind_capability",
                 )?;
+                // A seat that created nothing: the member's session is
+                // unborn until its first wake creates it, whose own row
+                // (below) clears the fact durably.
+                if member_spawned.seat_session_unborn() {
+                    apply_seeded_mob_signal(
+                        authority,
+                        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
+                            agent_identity: mob_dsl::AgentIdentity::from_domain(
+                                &member_spawned.agent_identity,
+                            ),
+                            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
+                                &member_spawned.agent_runtime_id,
+                            ),
+                            unborn: true,
+                        },
+                        "recover_member_seat_session_unborn",
+                    )?;
+                }
             }
             MobEventKind::MemberReset {
                 agent_identity,
@@ -4156,6 +4174,24 @@ fn seed_mob_authority_sync_from_events(
                             peer_endpoint: mob_dsl::MemberPeerEndpoint::from(member_peer_endpoint),
                         },
                         "recover_member_session_binding_peer_endpoint",
+                    )?;
+                }
+                // The first wake of a seated member created its session
+                // under this binding: the unborn fact clears durably, so a
+                // session lost later is never recreated empty.
+                if recovered.records_seat_session_born() {
+                    apply_seeded_mob_signal(
+                        authority,
+                        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
+                            agent_identity: mob_dsl::AgentIdentity::from_domain(
+                                &recovered.agent_identity,
+                            ),
+                            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
+                                &recovered.agent_runtime_id,
+                            ),
+                            unborn: false,
+                        },
+                        "recover_member_seat_session_born",
                     )?;
                 }
             }
