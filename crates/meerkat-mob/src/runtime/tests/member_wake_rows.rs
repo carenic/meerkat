@@ -2040,3 +2040,42 @@ async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_co
         .await;
     fixture.finish().await;
 }
+
+/// Every path that keeps a member's live actor instead of rebuilding it (a
+/// Resume-mode spawn, a restore that keeps the actor or a live successor,
+/// and a wake's live successor) calls the one shared binding check, so none
+/// of them keeps an actor that runs another binding than the member's spec.
+/// Read from the shipped source with a lexer pass (comments and literals
+/// blanked, test-only items removed), never a text search.
+#[test]
+fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
+    use super::fail_stop_cause::{function_body, shipped_code, whole_identifier};
+
+    const CHECK: &str = "verify_live_actor_auth_binding";
+    let runtime = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for test processes"),
+    )
+    .join("src")
+    .join("runtime");
+    let paths = [
+        ("actor.rs", "async fn enqueue_spawn_with_origin("),
+        ("builder.rs", "async fn restore_resumed_member("),
+        ("builder.rs", "async fn restore_member_on_successor("),
+        ("actor/member_wake_turn.rs", "async fn plan_member_wake("),
+    ];
+    for (file, signature) in paths {
+        let source = std::fs::read_to_string(runtime.join(file))
+            .unwrap_or_else(|error| panic!("read {file}: {error}"));
+        let code = shipped_code(&source);
+        let body = function_body(&code, signature)
+            .unwrap_or_else(|| panic!("{file} has no shipped `{signature}`"));
+        let calls_check = code[body.clone()]
+            .match_indices(CHECK)
+            .any(|(offset, name)| whole_identifier(&code, body.start + offset, name));
+        assert!(
+            calls_check,
+            "{file} `{signature}` keeps a live actor without calling {CHECK}"
+        );
+    }
+}

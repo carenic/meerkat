@@ -837,6 +837,9 @@ impl MobActor {
         publication: Option<super::super::provisioner::ResumedMemberRollbackAuthority>,
     ) {
         let readiness = self.detached_member_readiness_context();
+        // The drain rule every readiness path shares.
+        let drain_required =
+            super::member_requires_comms_drain(self.dsl_authority.state(), &work.entry);
         let worker_work = Arc::clone(&work);
         self.dispatch_warm_revival(work, "warm_revival_readiness", async move {
             // A reload that published its successor serves only through that
@@ -886,7 +889,11 @@ impl MobActor {
                 }
             }
             let result = readiness
-                .ensure_mob_comms_drain(&worker_work.entry.agent_identity, &worker_work.member_ref)
+                .ensure_member_comms_drain(
+                    &worker_work.entry.agent_identity,
+                    &worker_work.member_ref,
+                    drain_required,
+                )
                 .await;
             RevivalStep::Ready {
                 publication,
