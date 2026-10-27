@@ -13,6 +13,8 @@ mod host_store_boot_reads;
 mod lazy_boot;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lift_binding_rows;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod lift_observation_bound;
 mod member_creation;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_creation_upcall;

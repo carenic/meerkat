@@ -519,6 +519,11 @@ them.
   an open over a store whose reads are slow waits about ceil(K / 16) times
   as long as one session's reads, not K times. Each session's rows are still
   read in order, and a failed read still fails the open with nothing loaded.
+- `meerkat-mob`: a lift of a stopped mob (`MobHandle::resume`) observes the
+  members it rebuilds at most the mob's restore concurrency at a time
+  (`MobBuilder::with_resume_restore_concurrency`, 16 by default), instead of
+  all at once. On a host store each observation may read the member's stored
+  session.
 
 ### Known limitations
 

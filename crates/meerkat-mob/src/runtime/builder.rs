@@ -7916,6 +7916,11 @@ impl MobBuilder {
     /// A resume dropped before it returns drops the restores in flight with
     /// it: up to `concurrency` members are left provisioned, or part way
     /// through their provision, without their release.
+    ///
+    /// The same bound holds for a lift of the mob once stopped
+    /// ([`MobHandle::resume`]): it observes the live and durable sessions of
+    /// the members it rebuilds up to `concurrency` at once, and its
+    /// `OnDemandVerified` pass reads up to that many verdicts at once.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
         self.resume_restore_concurrency = concurrency.max(1);
