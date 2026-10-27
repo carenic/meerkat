@@ -178,7 +178,12 @@ them.
   same call performs further governed steps of the same exact operation
   without a second spend and without running any review:
   `EnteredDispatchOperation::run_if_current_within` and
-  `issue_child_if_current_within`. Each step is decided afresh by the work's
+  `issue_child_if_current_within`. A leaf that keeps the context its entry
+  returned (refreshed when staging re-prepared the decision) takes the
+  operation from that context: every clone of a dispatch context shares the
+  dispatch's one review entry, so it converts the same custody, and the
+  entered tier and window are always those of the decision the entry spent.
+  Each step is decided afresh by the work's
   own owners under their single exclusion, is refused when the current
   decision needs more review than was entered (`entered_tier`), stays within
   the entered decision's validity, and is admitted by the review owner only

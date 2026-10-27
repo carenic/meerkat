@@ -1150,9 +1150,14 @@ impl GovernedDispatchOperation {
     /// already made the dispatch's single consuming entry itself
     /// ([`ToolDispatchContext::enter_reviewed_effect_held`], or
     /// [`ReviewedEntryTicket::enter`] on a worker). `custody` must be the one
-    /// this dispatch's own entry returned; nothing is spent here. An
-    /// unreviewed (R1) dispatch passes the inert custody its entry returned,
-    /// and its entered tier is R1. See [`EnteredDispatchOperation`].
+    /// this dispatch's own entry returned; nothing is spent here. The
+    /// operation may come from the dispatch's context or from the refreshed
+    /// context the entry returned: every clone of a dispatch context shares
+    /// the dispatch's one review entry, so both accept the same custody, and
+    /// the entered tier and window are those of the decision the entry
+    /// actually spent. An unreviewed (R1) dispatch passes the inert custody
+    /// its entry returned, and its entered tier is R1. See
+    /// [`EnteredDispatchOperation`].
     ///
     /// Accepted: this dispatch's own held custody while its entry is entered
     /// (R2 or R3), or an inert custody when this dispatch's entry is

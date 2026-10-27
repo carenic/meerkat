@@ -53,6 +53,18 @@ use crate::generated::approval_lifecycle::ApprovalLifecycleRejectionReason;
 /// review than was entered is refused. A step stays within the entered
 /// decision's validity window, intersected by the owners with the current
 /// decision's own.
+///
+/// Which context and decision: the operation may be taken from the
+/// dispatch's context or from the refreshed context
+/// [`ToolDispatchContext::enter_reviewed_effect_held`] returned when its
+/// staging re-prepared the decision. Every clone of a dispatch context
+/// shares the dispatch's one review entry, so both convert the entry's
+/// custody into the same witness. Each step decides against the exact
+/// operation's current decision (its binding, owned by the dispatch),
+/// checked from the prepared decision of the context the operation was
+/// taken from and re-prepared from current owners when that one is stale.
+/// The entered tier and validity window are always those of the decision
+/// the entry actually spent, whichever context the operation came from.
 #[derive(Clone)]
 pub struct EnteredDispatchOperation(Arc<Entered>);
 
@@ -279,25 +291,39 @@ impl ToolDispatchContext {
     /// (the entered tier is R1); R2 spends the review allow this dispatch
     /// admitted, once; a fresh attempt of a consented candidate (R3, or an
     /// R2 decision a human took over) spends its authenticated human
-    /// consent, once.
+    /// consent, once. It is exactly that entry followed by
+    /// [`Self::governed_operation`] on the context the entry returned (this
+    /// context when staging refreshed nothing) and
+    /// [`GovernedDispatchOperation::into_entered`] with its custody, which a
+    /// leaf may also do itself.
     ///
     /// # Errors
-    /// The operation did not enter. An ungoverned or default context, or
-    /// another call, refuses as `AuthorizationRefused` (`MalformedFacts`); a
-    /// refused or no longer current operation is `AuthorizationRefused` or
+    /// Before the entry, the operation did not enter. An ungoverned or
+    /// default context, or another call, refuses as `AuthorizationRefused`
+    /// (`MalformedFacts`) before anything is spent; a refused or no longer
+    /// current operation is `AuthorizationRefused` or
     /// `OperationAuthorizationUnavailable`; a review that cannot be spent
     /// here is `ReviewUnsatisfied` (for example `AlreadyConsumed` on a
-    /// second entry) or `ReviewUnavailable`.
+    /// second entry) or `ReviewUnavailable`. A conversion refused after the
+    /// entry answers as [`GovernedDispatchOperation::into_entered`] does:
+    /// `AuthorizationRefused` with no not-dispatched certificate.
     pub fn enter_governed_operation(
         &self,
         call: ToolCallView<'_>,
     ) -> Result<EnteredDispatchOperation, crate::ToolError> {
+        // An ungoverned context or another call refuses before any spend.
         let operation = self.governed_operation(call)?;
         let (_, plan) = self
             .prepared_authorization()
             .and_then(|prepared| prepared.tool_dispatch_parts())
             .ok_or_else(governed_malformed)?;
-        let (_, custody) = self.enter_reviewed_effect_held(call, Some(plan))?;
+        let (entering, custody) = self.enter_reviewed_effect_held(call, Some(plan))?;
+        // The context the dispatch continues with: the one staging refreshed,
+        // if it did. Both share the dispatch's one review entry.
+        let operation = match entering {
+            Some(entering) => entering.governed_operation(call)?,
+            None => operation,
+        };
         operation.into_entered(custody)
     }
 }

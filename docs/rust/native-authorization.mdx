@@ -821,7 +821,13 @@ with `ToolDispatchContext::enter_governed_operation(call)`, which returns the
 typed witness `EnteredDispatchOperation`. A leaf that already entered with
 `enter_reviewed_effect_held` or `ReviewedEntryTicket::enter` (for example on a
 worker) mints it with `GovernedDispatchOperation::into_entered(custody)`,
-passing the custody its own entry returned.
+passing the custody its own entry returned. The operation may come from the
+dispatch's context or from the refreshed context the entry returned (when its
+staging re-prepared the decision): every clone of a dispatch context shares
+the dispatch's one review entry, so both convert the same custody, and the
+witness's entered tier and window are those of the decision the entry spent.
+Each step decides against the operation's current decision, re-prepared from
+current owners when the one it starts from is stale.
 
 ```rust
 let entered = context.enter_governed_operation(call)?;
