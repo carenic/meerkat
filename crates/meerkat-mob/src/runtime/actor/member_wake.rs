@@ -627,7 +627,7 @@ impl MobActor {
                 mob_dsl::MobMachineEffect::RetractWakeRoute { agent_identity, .. } => {
                     self.retract_member_wake_route(&AgentIdentity::from(agent_identity.0.as_str()));
                 }
-                mob_dsl::MobMachineEffect::RebuildWakeRoutes { .. } => {
+                mob_dsl::MobMachineEffect::RebuildWakeRoutes => {
                     self.rebuild_member_wake_routes();
                 }
                 // A binding that moved (a successor repoint, a recovered
@@ -681,7 +681,7 @@ impl MobActor {
                         .ingress
                         .push_back(MemberPeerIngressChange::Close);
                 }
-                mob_dsl::MobMachineEffect::ReopenMemberPeerIngress { .. } => {
+                mob_dsl::MobMachineEffect::ReopenMemberPeerIngress => {
                     self.member_wakes
                         .ingress
                         .push_back(MemberPeerIngressChange::Reopen);
@@ -750,7 +750,7 @@ impl MobActor {
         let (phase, running, retiring) = {
             let state = self.dsl_authority.state();
             (
-                state.member_materialization.get(&dsl_identity).cloned(),
+                state.member_materialization.get(&dsl_identity).copied(),
                 matches!(state.lifecycle_phase, mob_dsl::MobPhase::Running),
                 state
                     .identity_to_runtime
@@ -1553,7 +1553,7 @@ impl MobActor {
         let owed_cause = state
             .member_boot_obligation_owed
             .get(&dsl_identity)
-            .cloned();
+            .copied();
         let owed = owed_cause.is_some();
         // The wake carries what it is owed for: a wiring to a placed member
         // its own cause, every other obligation the boot cause.

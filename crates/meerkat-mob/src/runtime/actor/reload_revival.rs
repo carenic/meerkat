@@ -480,7 +480,7 @@ impl MobActor {
                         let rollback = WarmRollback {
                             member_ref: receipt.member_ref.clone(),
                             operation_id: receipt.operation_id.clone(),
-                            session_origin: receipt.session_origin.clone(),
+                            session_origin: receipt.session_origin,
                             rollback_authority: receipt.rollback_authority.clone(),
                         };
                         RevivalPublication {

@@ -82,7 +82,7 @@ impl WakeRollback {
         Some(Self {
             member_ref: receipt.member_ref.clone(),
             operation_id: receipt.operation_id.clone(),
-            session_origin: receipt.session_origin.clone(),
+            session_origin: receipt.session_origin,
             rollback_authority: receipt.rollback_authority.clone(),
         })
     }
@@ -156,7 +156,7 @@ enum WakeStep {
     Topology {
         topology: WakeTopology,
         peer: RespawnTopologyPeerId,
-        edge: MemberWiringEdge,
+        edge: Box<MemberWiringEdge>,
         result: Result<(), MobError>,
     },
     /// A rollback of the wake's provision finished (`false`: it could not be
@@ -401,13 +401,13 @@ impl MobActor {
             WakeStep::Planned(planned) => match *planned {
                 Ok(plan) => {
                     self.commit_member_wake_plan(run, plan, settlement.fence.is_current())
-                        .await
+                        .await;
                 }
                 Err(error) => self.fail_member_wake(&run, None, &error).await,
             },
             WakeStep::Ready(result) => {
                 self.member_wake_ready(run, rollback, settlement.fence.is_current(), result)
-                    .await
+                    .await;
             }
             WakeStep::Topology {
                 mut topology,
@@ -934,7 +934,7 @@ impl MobActor {
                                 WakeStep::Topology {
                                     topology,
                                     peer,
-                                    edge,
+                                    edge: Box::new(edge),
                                     result,
                                 }
                             },

@@ -941,14 +941,14 @@ pub enum MobError {
     /// the resume rebuilds the member on the requested binding.
     #[error(
         "member {member_id} cannot reuse the live actor of session {session_id}: it runs auth binding {}, not the requested {}",
-        display_auth_binding(.recorded.as_ref()),
-        display_auth_binding(Some(.requested))
+        display_auth_binding(.recorded.as_deref()),
+        display_auth_binding(Some(.requested.as_ref()))
     )]
     MemberAuthBindingConflict {
         member_id: AgentIdentity,
         session_id: meerkat_core::SessionId,
-        requested: meerkat_core::AuthBindingRef,
-        recorded: Option<meerkat_core::AuthBindingRef>,
+        requested: Box<meerkat_core::AuthBindingRef>,
+        recorded: Option<Box<meerkat_core::AuthBindingRef>>,
     },
 
     /// The mob's startup recovery could not restore member `member_id`'s

@@ -52,8 +52,8 @@ pub(super) async fn verify_live_actor_auth_binding(
     Err(MobError::MemberAuthBindingConflict {
         member_id: member.clone(),
         session_id: session_id.clone(),
-        requested: requested.clone(),
-        recorded,
+        requested: Box::new(requested.clone()),
+        recorded: recorded.map(Box::new),
     })
 }
 
