@@ -33,8 +33,8 @@ use super::member_effect_lane::{
     MemberEffectRetention, MemberEffectSend, MemberEffectSettlement, MemberFence,
 };
 use super::member_wake::{
-    MemberWakeAttempt, MemberWakeFailure, MemberWakeOutcome, PendingMemberMaterialization,
-    RunningMemberWake,
+    MemberWakeAttempt, MemberWakeFailure, MemberWakeOutcome, MemberWiringEdge,
+    PendingMemberMaterialization, RunningMemberWake,
 };
 use super::*;
 use crate::runtime::builder::{
@@ -141,7 +141,11 @@ enum WakePlan {
 
 /// The topology step's remaining edges.
 struct WakeTopology {
-    remaining: VecDeque<(super::super::handle::PeerTarget, RespawnTopologyPeerId)>,
+    remaining: VecDeque<(
+        super::super::handle::PeerTarget,
+        RespawnTopologyPeerId,
+        MemberWiringEdge,
+    )>,
     failed: Vec<RespawnTopologyPeerId>,
 }
 
@@ -152,6 +156,7 @@ enum WakeStep {
     Topology {
         topology: WakeTopology,
         peer: RespawnTopologyPeerId,
+        edge: MemberWiringEdge,
         result: Result<(), MobError>,
     },
     /// A rollback of the wake's provision finished (`false`: it could not be
@@ -407,6 +412,7 @@ impl MobActor {
             WakeStep::Topology {
                 mut topology,
                 peer,
+                edge,
                 result,
             } => {
                 if !settlement.fence.is_current()
@@ -421,10 +427,11 @@ impl MobActor {
                         agent_identity = %run.identity,
                         peer = %peer,
                         %error,
-                        "a woken member's wiring edge could not be realized"
+                        "a woken member's wiring edge could not be realized; its repair is owed"
                     );
                     topology.failed.push(peer);
                 }
+                self.resolve_member_edge_realization(&edge, result.is_ok());
                 self.advance_member_wake_topology(run, rollback, topology)
                     .await;
             }
@@ -831,19 +838,51 @@ impl MobActor {
                 return;
             }
         };
-        let remaining = plan
+        let local = mob_dsl::AgentIdentity::from_domain(&run.identity);
+        let mut remaining: VecDeque<_> = plan
             .local_peers
             .into_iter()
             .filter(|peer| peer != &run.identity)
             .map(|peer| {
                 let key = RespawnTopologyPeerId::from(peer.as_str());
-                (super::super::handle::PeerTarget::Local(peer), key)
+                let edge = MemberWiringEdge::Member(mob_dsl::WiringEdge::new(
+                    local.clone(),
+                    mob_dsl::AgentIdentity::from_domain(&peer),
+                ));
+                (super::super::handle::PeerTarget::Local(peer), key, edge)
             })
-            .chain(plan.external_peers.into_iter().map(|peer| {
-                let key = RespawnTopologyPeerId::from(peer.peer_id.as_str());
-                (super::super::handle::PeerTarget::External(peer), key)
-            }))
             .collect();
+        // The member's external edges, keyed as MobMachine keys them.
+        let external_edges: Vec<mob_dsl::ExternalPeerEdge> = self
+            .dsl_authority
+            .state()
+            .external_peer_edges_by_key
+            .values()
+            .filter(|edge| edge.local == local)
+            .cloned()
+            .collect();
+        for edge in external_edges {
+            match Self::trusted_peer_descriptor_from_machine_endpoint(&edge.endpoint) {
+                Ok(descriptor) => {
+                    let key = RespawnTopologyPeerId::from(descriptor.peer_id.as_str());
+                    remaining.push_back((
+                        super::super::handle::PeerTarget::External(descriptor),
+                        key,
+                        MemberWiringEdge::External(edge),
+                    ));
+                }
+                Err(error) => {
+                    self.roll_back_member_wake_provision(&run, rollback);
+                    self.abandon_member_wake(
+                        &run,
+                        mob_dsl::MemberWakeAbandonKind::TopologyFailed,
+                        Some(format!("the woken member's wiring plan failed: {error}")),
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
         self.advance_member_wake_topology(
             run,
             rollback,
@@ -863,7 +902,19 @@ impl MobActor {
         rollback: Option<WakeRollback>,
         mut topology: WakeTopology,
     ) {
-        while let Some((target, peer)) = topology.remaining.pop_front() {
+        while let Some((target, peer, edge)) = topology.remaining.pop_front() {
+            #[cfg(test)]
+            if take_wake_edge_failure_for_test(&run.identity) {
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %run.identity,
+                    peer = %peer,
+                    "test seam: a woken member's wiring edge fails; its repair is owed"
+                );
+                topology.failed.push(peer);
+                self.resolve_member_edge_realization(&edge, false);
+                continue;
+            }
             match self.prepare_member_wire(run.identity.clone(), target).await {
                 Ok(prepared) => {
                     if let Some(prepared) = prepared.into_prepared() {
@@ -883,12 +934,15 @@ impl MobActor {
                                 WakeStep::Topology {
                                     topology,
                                     peer,
+                                    edge,
                                     result,
                                 }
                             },
                         );
                         return;
                     }
+                    // Settled inside its preparation: the edge is realized.
+                    self.resolve_member_edge_realization(&edge, true);
                 }
                 Err(error) => {
                     tracing::warn!(
@@ -896,9 +950,10 @@ impl MobActor {
                         agent_identity = %run.identity,
                         peer = %peer,
                         %error,
-                        "a woken member's wiring edge could not be prepared"
+                        "a woken member's wiring edge could not be prepared; its repair is owed"
                     );
                     topology.failed.push(peer);
+                    self.resolve_member_edge_realization(&edge, false);
                 }
             }
         }
@@ -1487,5 +1542,34 @@ async fn live_member_endpoint_for_ref(
     match provisioner.trusted_peer_spec(member_ref, &name, &key).await {
         Ok(spec) => WakeEndpoint::Record(spec),
         Err(_) => WakeEndpoint::Matches,
+    }
+}
+
+/// Test seam: members whose next wake treats one wiring edge as failed (a
+/// transient failure), consumed once per arm.
+#[cfg(test)]
+static WAKE_EDGE_FAILURES_FOR_TEST: std::sync::Mutex<Vec<AgentIdentity>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Make the next wake of `identity` fail one of its wiring edges.
+#[cfg(test)]
+pub(in crate::runtime) fn fail_next_wake_edge_for_test(identity: &AgentIdentity) {
+    WAKE_EDGE_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push(identity.clone());
+}
+
+#[cfg(test)]
+fn take_wake_edge_failure_for_test(identity: &AgentIdentity) -> bool {
+    let mut failures = WAKE_EDGE_FAILURES_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    match failures.iter().position(|armed| armed == identity) {
+        Some(index) => {
+            failures.remove(index);
+            true
+        }
+        None => false,
     }
 }

@@ -2044,7 +2044,8 @@ async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_co
 /// Every path that keeps a member's live actor instead of rebuilding it (a
 /// Resume-mode spawn, a restore that keeps the actor or a live successor, a
 /// wake's live successor, and the explicit resume of a mob stopped in this
-/// process) calls the one shared binding check, so none of them keeps an
+/// process, at its preparation and at its already-live observation) calls
+/// the one shared binding check, so none of them keeps an
 /// actor that runs another binding than the member's spec. Where a restore
 /// or a wake records the member broken on a conflict, it also retires the
 /// live actor, so no surface reaches the old binding. Read from the shipped
@@ -2055,7 +2056,12 @@ fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
     use super::fail_stop_cause::{function_body, shipped_code, whole_identifier};
 
     const CHECK: &str = "verify_live_actor_auth_binding";
-    const RETIRE: &str = "refuse_conflicting_live_actor";
+    // A path that records the member broken on a conflict retires its live
+    // actor through either shared retire.
+    const RETIRES: [&str; 2] = [
+        "refuse_conflicting_live_actor",
+        "retire_conflicting_live_actor",
+    ];
     let runtime = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR is set for test processes"),
@@ -2076,6 +2082,12 @@ fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
             Some("impl ExplicitResumePreparationContext"),
             "async fn prepare(",
             false,
+        ),
+        (
+            "actor.rs",
+            None,
+            "fn spawn_explicit_resume_member_observation(",
+            true,
         ),
         ("builder.rs", None, "async fn restore_resumed_member(", true),
         (
@@ -2113,9 +2125,102 @@ fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
         );
         if retires {
             assert!(
-                calls(RETIRE),
-                "{file} `{signature}` records a binding conflict without retiring the live actor ({RETIRE})"
+                RETIRES.iter().any(|retire| calls(retire)),
+                "{file} `{signature}` records a binding conflict without retiring the live actor"
             );
         }
     }
+}
+
+/// A transient failure of one of a woken member's wiring edges never breaks
+/// or un-wakes the member: the wake closes Live and the member serves, the
+/// edge is owed a repair in MobMachine, and the repair timer re-realizes it,
+/// after which the owed repair is cleared and the member reaches its peer.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_transient_edge_failure_at_a_wake_is_repaired_and_the_member_keeps_serving() {
+    let fixture = WakeFixture::new("wake-edge-repair").await;
+    let member = fixture.spawn("edge-repair-member").await;
+    let peer = fixture.spawn("edge-repair-peer").await;
+    fixture.wire(&member, &peer).await;
+    fixture.release(&member).await;
+    let edge = mob_dsl::WiringEdge::new(
+        mob_dsl::AgentIdentity::from_domain(&member),
+        mob_dsl::AgentIdentity::from_domain(&peer),
+    );
+
+    crate::runtime::actor::member_wake_turn::fail_next_wake_edge_for_test(&member);
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("the wake closes Live although one of its edges failed");
+    let mut state = fixture.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        STEP,
+        state.wait_for(|state| state.owed_edge_repairs.contains(&edge)),
+    )
+    .await
+    .expect("the failed edge is owed a repair")
+    .expect("the machine state stays published");
+
+    let body = token("edge-repair-turn");
+    fixture.host_turn(&member, &body, HandlingMode::Queue).await;
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live),
+        "the member serves while its edge is owed"
+    );
+
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|state| !state.owed_edge_repairs.contains(&edge)),
+    )
+    .await
+    .expect("the repair timer realizes the edge")
+    .expect("the machine state stays published");
+    let peer_body = token("edge-repair-peer-message");
+    fixture
+        .raw_peer_send(&member, &peer, &peer_body)
+        .await
+        .expect("the repaired edge carries the member's message");
+    assert_eq!(fixture.delivered_count(&peer, &peer_body).await, 1);
+    fixture.finish().await;
+}
+
+/// A member woken among Dormant neighbours realizes its own side of each
+/// edge to them (each Dormant end realizes its side at its own wake), so
+/// every edge is reported realized: the member owes no edge repair, no
+/// repair timer is armed (only an owed repair arms one), and the neighbours
+/// stay Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_waking_among_dormant_neighbours_owes_no_edge_repairs() {
+    let fixture = WakeFixture::new("wake-dormant-neighbours").await;
+    let member = fixture.spawn("dormant-neighbours-member").await;
+    let first = fixture.spawn("dormant-neighbour-one").await;
+    let second = fixture.spawn("dormant-neighbour-two").await;
+    fixture.wire(&member, &first).await;
+    fixture.wire(&member, &second).await;
+    fixture.release(&first).await;
+    fixture.release(&second).await;
+    fixture.release(&member).await;
+
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("the member wakes among dormant neighbours");
+    {
+        let state = fixture.handle.machine_state_watch_rx.borrow();
+        assert!(
+            state.owed_edge_repairs.is_empty() && state.owed_external_edge_repairs.is_empty(),
+            "an edge to a dormant neighbour is realized on the live side, never owed: {:?}",
+            state.owed_edge_repairs
+        );
+    }
+    for neighbour in [&first, &second] {
+        assert_eq!(
+            fixture.residency(neighbour),
+            Some(mob_dsl::MemberMaterializationPhase::Dormant),
+            "the member's wake leaves its neighbours dormant"
+        );
+    }
+    fixture.finish().await;
 }

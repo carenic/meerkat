@@ -998,7 +998,7 @@ fn mob_member_session_tool_error(
 
 /// A failed session preparation as a tool error. A session another runtime
 /// owner hosts keeps its typed wire form (session busy, with
-/// `kind = "session_served_elsewhere"`; #1813), as does one whose hosting
+/// `kind = "session_served_elsewhere"`), as does one whose hosting
 /// claim is unavailable (runtime unavailable, with
 /// `kind = "session_hosting_unavailable"`), and one whose durable tail is
 /// withheld from resume (`SESSION_DURABLE_TAIL_HELD_FOR_RECOVERY` and the
