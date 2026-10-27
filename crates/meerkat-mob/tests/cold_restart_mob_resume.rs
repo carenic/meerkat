@@ -11688,10 +11688,14 @@ const LIFT_WHILE_HELD_BOUND: Duration = Duration::from_secs(45);
 /// is held (a long model call or a long gated tool, held well past the
 /// lift): the lift reaches ready within its stall budget while the run is
 /// still in flight, and the run continues afterwards, resumes once and
-/// completes once. RED before the lift binds such a member without the
-/// lanes its run holds: the lift's operation binding of w-1 waited for w-1's
-/// run, so the lift held its readiness for the whole run and reported a
-/// stall at `resume_operation_bindings` on w-1, which the row asserts.
+/// completes once, and the lift bound w-1 through the serving-binding path.
+/// A guard row: the run is held mid-apply, where the session mutation gate
+/// is free, so by code reading the full restore also completes here (the
+/// row likely passes before that path existed, except for its path
+/// assertion). The deterministic RED for the path is
+/// `a_lift_binds_a_member_whose_session_mutation_gate_is_held` in the
+/// runtime tests. A lift that still waits on the held run reports a stall,
+/// and the row then names its stage and member.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continues() {
@@ -11723,6 +11727,8 @@ async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continu
         "the mob starts as it was left, stopped: {status:?}"
     );
 
+    let w1 = AgentIdentity::from("w-1");
+    let served_before = meerkat_mob::explicit_resume_served_bindings_for_test(handle.mob_id(), &w1);
     let lifted = tokio::time::timeout(LIFT_WHILE_HELD_BOUND, handle.resume()).await;
     // Released whatever the lift did, so a RED run ends instead of hanging.
     let held_through_the_lift = !client_2.answered();
@@ -11750,6 +11756,11 @@ async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continu
     assert!(
         held_through_the_lift,
         "the member's resumed run was still in flight when the lift answered"
+    );
+    assert_eq!(
+        meerkat_mob::explicit_resume_served_bindings_for_test(handle.mob_id(), &w1),
+        served_before + 1,
+        "the lift bound w-1 through the serving-binding path, not the full restore"
     );
     let status = handle.status().await;
     assert!(

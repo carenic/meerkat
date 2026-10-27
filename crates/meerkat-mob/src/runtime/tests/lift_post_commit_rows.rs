@@ -61,10 +61,14 @@ async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_c
 
     // Host repair: a reload of the member the Spawn created. The member has
     // no wiring (the definition wires no workers), no kickoff and no
-    // post-commit work of this lift, so the actor can park its reload only
-    // on the resume's fence. Parking is observed structurally, through the
-    // actor's parked-control probe, and one actor round trip after it shows
-    // the reload is still held.
+    // post-commit work of this lift, and the row waits for its spawn
+    // activation to leave the actor's custody, so the actor can park its
+    // reload only on the resume's fence. Parking is observed structurally,
+    // through the actor's parked-control probe, and one actor round trip
+    // after it shows the reload is still held.
+    if matches!(spawned, Ok(Ok(_))) {
+        spawn_activation_released(&mob, &spawned_identity).await;
+    }
     let mut parked = mob
         .handle
         .lifecycle_observations
@@ -150,4 +154,118 @@ async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_c
         .resolve_bridge_session_id(&spawned_identity)
         .await
         .expect("the member spawned during the lift is a member");
+}
+
+/// Wait until no spawn activation of `member` is in the actor's custody,
+/// polling the actor's custody census under a bound.
+async fn spawn_activation_released(mob: &IsolationMob, member: &AgentIdentity) {
+    tokio::time::timeout(STEP, async {
+        loop {
+            let census = mob
+                .handle
+                .enqueue_actor_command_for_test(|reply_tx| {
+                    MobCommand::SpawnActivationCustodyProbe { reply_tx }
+                })
+                .await
+                .expect("custody probe enqueue")
+                .await
+                .expect("custody probe reply");
+            if !census.members.contains(member) {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the spawn activation leaves the actor's custody");
+}
+
+/// The lift of a stopped mob binds a member whose session mutation gate is
+/// held while its binding runs, as a member run's finalization holds that
+/// gate: the member's registration already serves its binding, so the lift
+/// restores its owner context through the serving-binding path and answers
+/// while the gate is still held.
+///
+/// RED at a4d3b5e449: the binding ran the full restore, whose local session
+/// bindings and composition recovery take that gate, so the lift waited at
+/// its binding of w-0 until its observer reported the stall
+/// (`resume_operation_bindings`, member w-0), which the row asserts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lift_binds_a_member_whose_session_mutation_gate_is_held() {
+    let mob = create_isolation_mob(2).await;
+    mob.handle.stop().await.expect("stop the mob");
+    let served_before = crate::runtime::actor::explicit_resume_served_bindings_for_test(
+        mob.handle.mob_id(),
+        mob.member(0),
+    );
+    let (entered, release) = crate::runtime::actor::hold_explicit_resume_member_binding_for_test(
+        mob.handle.mob_id(),
+        mob.member(0),
+    );
+    let lift = tokio::spawn({
+        let handle = mob.handle.clone();
+        async move { handle.resume().await }
+    });
+    tokio::time::timeout(STEP, entered)
+        .await
+        .expect("the lift reaches w-0's binding")
+        .expect("binding hold armed");
+    // Hold w-0's session mutation gate, as its run's finalization would, and
+    // only then let its binding go.
+    let gate = tokio::time::timeout(
+        STEP,
+        mob.adapter
+            .hold_session_mutation_gate_for_test(mob.session(0)),
+    )
+    .await
+    .expect("w-0's session mutation gate is taken")
+    .expect("w-0's session is registered");
+    let _ = release.send(());
+    // The unit build's lift observer reports a stall after two seconds
+    // without progress, and the operation stays joinable. A stall report
+    // while the gate is held is joined once more, the gate still held: a
+    // lift that binds w-0 without the gate answers then; one that waits on
+    // the gate stalls again at w-0's binding.
+    let mut lifted = tokio::time::timeout(STEP, lift)
+        .await
+        .expect("the lift answers or reports a stall")
+        .expect("lift task");
+    if matches!(
+        lifted,
+        Err(MobError::LifecycleOperationProgressStalled { .. })
+    ) {
+        lifted = tokio::time::timeout(STEP, mob.handle.resume())
+            .await
+            .expect("the joined lift answers or reports a stall");
+    }
+    drop(gate);
+    match lifted {
+        Ok(()) => {}
+        Err(MobError::LifecycleOperationProgressStalled {
+            stage, member_id, ..
+        }) => {
+            assert_eq!(
+                (stage, member_id.as_ref().map(AgentIdentity::as_str)),
+                ("resume_operation_bindings", Some("w-0")),
+                "the lift stalled while w-0's session mutation gate was held, outside its binding of w-0"
+            );
+            panic!(
+                "the lift waited at its operation binding of w-0 for w-0's held session mutation gate"
+            );
+        }
+        Err(error) => panic!("the lift failed: {error}"),
+    }
+    assert_eq!(
+        crate::runtime::actor::explicit_resume_served_bindings_for_test(
+            mob.handle.mob_id(),
+            mob.member(0)
+        ),
+        served_before + 1,
+        "the lift bound w-0 through the serving-binding path"
+    );
+    assert_eq!(
+        mob.handle.status().await.expect("status"),
+        MobState::Running,
+        "the lift reached ready"
+    );
 }

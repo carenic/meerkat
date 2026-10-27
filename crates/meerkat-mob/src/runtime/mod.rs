@@ -254,7 +254,7 @@ mod member_wake_config;
 mod read_handle;
 #[cfg(any(test, feature = "test-support"))]
 #[doc(hidden)]
-pub use actor::fail_stop_next_actor_start_for_test;
+pub use actor::{explicit_resume_served_bindings_for_test, fail_stop_next_actor_start_for_test};
 #[cfg(any(test, feature = "test-support"))]
 mod restore_fault_test_support;
 pub(crate) use handle::MemberTurnLlmIdentityAppliedSender;

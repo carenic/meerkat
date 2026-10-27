@@ -5380,6 +5380,37 @@ static STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST: std::sync::Mutex<
     BTreeMap<(MobId, AgentIdentity), u64>,
 > = std::sync::Mutex::new(BTreeMap::new());
 
+/// How many times a lift bound each member through the serving-binding path
+/// (its registration already served the binding, so only its owner context
+/// was restored), per mob.
+#[cfg(any(test, feature = "test-support"))]
+static EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST: std::sync::Mutex<
+    BTreeMap<(MobId, AgentIdentity), u64>,
+> = std::sync::Mutex::new(BTreeMap::new());
+
+#[cfg(all(any(test, feature = "test-support"), feature = "runtime-adapter"))]
+fn record_explicit_resume_served_binding_for_test(mob_id: &MobId, member: &AgentIdentity) {
+    *EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .entry((mob_id.clone(), member.clone()))
+        .or_default() += 1;
+}
+
+/// Test read: how many times a lift of `mob_id` bound `member` through the
+/// serving-binding path, without the lanes a member's run holds. Rows read
+/// it before and after a lift and compare.
+#[cfg(any(test, feature = "test-support"))]
+#[doc(hidden)]
+pub fn explicit_resume_served_bindings_for_test(mob_id: &MobId, member: &AgentIdentity) -> u64 {
+    EXPLICIT_RESUME_SERVED_BINDINGS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(&(mob_id.clone(), member.clone()))
+        .copied()
+        .unwrap_or_default()
+}
+
 #[cfg(all(test, feature = "runtime-adapter"))]
 fn record_startup_registration_takeover_for_test(mob_id: &MobId, member: &AgentIdentity) {
     if let Ok(mut counts) = STARTUP_REGISTRATION_TAKEOVERS_FOR_TEST.lock() {
@@ -33052,6 +33083,8 @@ impl MobActor {
                     ops_registry,
                 )
                 .await?;
+            #[cfg(any(test, feature = "test-support"))]
+            record_explicit_resume_served_binding_for_test(&io.mob_id, &entry.agent_identity);
             return Ok(RestoredOperationBinding::Restored);
         }
         // Operation restoration must not resurrect an absent local session.

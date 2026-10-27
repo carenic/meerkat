@@ -12041,6 +12041,19 @@ impl MeerkatMachine {
         self.lock_session_registration_transaction(session_id).await
     }
 
+    /// Hold `session_id`'s session mutation gate until the guard drops, as a
+    /// run's finalization holds it, so a test can stand work that takes the
+    /// gate behind it. `None` when the session is not registered.
+    #[cfg(any(test, feature = "test-support"))]
+    #[doc(hidden)]
+    pub async fn hold_session_mutation_gate_for_test(
+        &self,
+        session_id: &SessionId,
+    ) -> Option<crate::tokio::sync::OwnedMutexGuard<()>> {
+        let gate = self.session_mutation_gate(session_id).await?;
+        Some(gate.lock_settled(SettledGateWait::TestFixture).await)
+    }
+
     #[cfg(test)]
     pub(crate) fn probe_next_session_registration_transaction_contention_for_test(
         &self,
