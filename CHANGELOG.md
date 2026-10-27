@@ -275,6 +275,14 @@ them.
 
 ### Changed
 
+- Behaviour-only (not measured by the gate): `meerkat-mob`:
+  `MobHandle::resume` no longer fails when the resume notification turn of
+  a turn-driven or placed orchestrator fails. As `MobBuilder::resume`
+  already did, it hands that turn to the mob and answers without waiting
+  for it; a failed notification is recorded as an
+  `OrchestratorResumeNotificationFailed` mob event naming the orchestrator
+  and its session, and the mob keeps running.
+
 - Behaviour-only (not measured by the gate): `meerkat-mob-mcp`: the agent
   tool `mob_spawn_member` reports what `auto_wire_parent` did. Its result
   carries `wired`, true only when the caller and the new member are wired
@@ -411,6 +419,16 @@ them.
 
 ### Fixed
 
+- `meerkat-mob`: resuming a stopped mob (`MobHandle::resume`), as a host
+  does after a graceful restart, no longer stalls while members' runs that
+  the restart suspended are still running. The resume answers once its own
+  work is done, without waiting for any member's resumed run to finish,
+  short or long, or for the orchestrator's resume notification turn. A
+  member run that spawns, wires or retires a member while the resume
+  finishes its last steps is no longer held until the resume ends. Before,
+  such a run and the resume could wait on each other for good, and a
+  resume that waited on long runs could exceed the host's stall budget. A
+  resume that does stall now also logs how many members it still waits on.
 - `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its
   name-collision filter (which hides external tools whose names another of
   the member's tools already uses) now pass each allowed tool's review
