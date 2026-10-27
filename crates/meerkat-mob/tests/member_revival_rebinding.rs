@@ -661,7 +661,7 @@ fn recreated_member_completion_refuses_obsolete_authority_without_effects() {
 
     // An explicit resume reserves the member through this same attempt (it
     // joined or opened it), so the recreation completes its Bound step.
-    let mut resuming = baseline.clone();
+    let mut resuming = baseline;
     resuming.explicit_resume_member_work.insert(
         identity(MEMBER),
         ResumeMemberBinding {
