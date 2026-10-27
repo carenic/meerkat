@@ -29,7 +29,8 @@
 #   Stopped, a host-pending seed, the identity seated again on its first
 #   seat's session, and the mob's destroy;
 # - terminal (AuditTerminalSpec): the Completed and Destroyed phases;
-# - resume (AuditResumeSpec): one identity through an explicit resume;
+# - resume (AuditResumeSpec): one identity through an explicit resume, its
+#   readiness before Resume (while Stopped) included;
 # - edge (AuditEdgeSpec): two identities and one wiring edge and its
 #   trust realization outcomes (an owed edge repair);
 # - seat (AuditSeatSpec): two identities from the spawn ladder's Opened phase
@@ -54,7 +55,12 @@
 # no runtime retire is routed for a member with no registration, that a
 # settled retirement can always archive and under an admitted destroy nothing
 # holds it, that no rotation begins or commits under an admitted destroy, and
-# that a resume seat is unborn exactly when no build created its session.
+# that a resume seat is unborn exactly when no build created its session. The
+# resume run checks that the explicit resume can always join a wake in flight
+# while its readiness is not in flight and its topology has not started,
+# whatever readiness it already settled (AuditResumeJoinable), and that it
+# holds no member work while its readiness is in flight or once its topology
+# started (AuditResumeStagesHoldNoWork).
 # TLC evaluates the module's wake refusal ASSUME (a present, bound member with
 # a phase is never refused as not a member) and its release ASSUMEs (the
 # verdict helper, and no member wired to a placed member is releasable) at the
@@ -82,7 +88,7 @@ seed_states=3078
 wake_states=1608
 retire_states=7974
 terminal_states=238
-resume_states=3438
+resume_states=4004
 edge_states=1148
 seat_states=58102
 wake2_states=1425
@@ -253,6 +259,8 @@ resume_covered_actions=(
   RecoverMemberSessionBindingReplacingRunning
   BeginExplicitResumeStopped
   SettleExplicitResumePreparationStopped
+  BeginExplicitResumeReadinessStopped
+  SettleExplicitResumeReadinessStopped
   AuthorizeExplicitResumeMemberRunning
   AuthorizeExplicitResumeMemberLiveRunning
   AuthorizeExplicitResumeMemberJoinRunning
@@ -414,7 +422,9 @@ write_cfg() {
   AuditResumeRecoverKeepsPhase
   AuditAttemptEndsClosed"
       run_invariants="
-  AuditWakingClosable"
+  AuditWakingClosable
+  AuditResumeJoinable
+  AuditResumeStagesHoldNoWork"
       ;;
     edge)
       spec="AuditEdgeSpec"
@@ -588,7 +598,7 @@ for witness in \
   "retire:Action property:DestroyBeatsRotation" "retire:Action property:DestroyBeatsHostPending" \
   "retire:Action property:RotatedStopped" \
   "resume:Action property:ResumeJoins" "resume:Action property:ResumeReservesLive" \
-  "resume:Action property:ResumeFinishedLive" \
+  "resume:Action property:ResumeFinishedLive" "resume:Action property:ResumeJoinsAfterReadiness" \
   "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
   "wake:Action property:UnbornCreated" "retire:Action property:UnbornArchived" \
   "retire:Action property:ReseatCreated" \
@@ -970,5 +980,20 @@ add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (ag
   mutate retire destroy_keeps_host_pending \
     "Error: Invariant destroyed_mob_holds_no_member_lifecycle is violated" \
     'keep_var("DestroyMob", "member_host_preparation_pending")' "$@"
+  # The join refused once the resume settled a readiness: the lift of a
+  # stopped mob, whose readiness ran before its Resume, could not join the
+  # wakes its member plan opened.
+  mutate resume join_refused_after_readiness \
+    "Error: Invariant AuditResumeJoinable is violated" \
+    'add_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_readiness_settled = FALSE")' "$@"
+  # A join admitted once the topology started: member work the topology
+  # stage never waits for.
+  mutate resume join_during_topology \
+    "Error: Invariant AuditResumeStagesHoldNoWork is violated" \
+    'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_topology_pending")' "$@"
+  # A join admitted while a readiness is in flight.
+  mutate resume join_during_readiness \
+    "Error: Invariant AuditResumeStagesHoldNoWork is violated" \
+    'drop_guard("AuthorizeExplicitResumeMemberJoinRunning", "explicit_resume_readiness_pending")' "$@"
 fi
 echo "member residency audit passed over the whole reachable space of its domains"

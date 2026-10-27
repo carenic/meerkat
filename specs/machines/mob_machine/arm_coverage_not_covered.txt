@@ -200,8 +200,6 @@ RequestPending* session ingress detach request for a mob destroy; no audit drive
 MemberTerminalized* member terminal notice bookkeeping; no audit drives it
 ResolveAutonomous* autonomous member shutdown action classification; no audit drives it
 ClassifyExplicitResumeMemberOutcome* explicit resume outcome classification; member_residency_audit's resume run settles from the wake attempt's outcome instead
-BeginExplicitResumeReadinessStopped explicit resume readiness while Stopped; the resume run drives the Running arms
-SettleExplicitResumeReadinessStopped explicit resume readiness while Stopped; the resume run drives the Running arms
 BeginExplicitResumeCleanup* explicit resume rollback cleanup; the resume run does not cancel
 SettleExplicitResumeCleanup* explicit resume rollback cleanup; the resume run does not cancel
 CancelExplicit* explicit resume cancellation; the resume run does not cancel

@@ -37,10 +37,11 @@
 \*     classification and the release verdict there, and the replayed Retired
 \*     record.
 \*   resume (AuditResumeSpec): one identity through an explicit resume: Stop,
-\*     the resume's preparation and Resume, the three member reservation arms
-\*     (Dormant, Live, Join), the live classification, the settle arms
-\*     (exact and replaced session), readiness, topology and finish, with the
-\*     wake arms and resolutions it meets and a session replacement.
+\*     the resume's preparation, its readiness before Resume (while Stopped)
+\*     and Resume, the three member reservation arms (Dormant, Live, Join),
+\*     the live classification, the settle arms (exact and replaced
+\*     session), readiness, topology and finish, with the wake arms and
+\*     resolutions it meets and a session replacement.
 \*   edge (AuditEdgeSpec): two identities and one wiring edge: both
 \*     recovered, bound and given endpoints, the edge recovered or wired, its
 \*     trust realization outcomes (realized, owed repair, no-op), the seal,
@@ -593,6 +594,8 @@ RReady == ObserveRuntimeReady(Rid1, 1, Epoch1)
 RResumeArms ==
     \/ BeginExplicitResumeStopped(AuditResumeAttempt)
     \/ SettleExplicitResumePreparationStopped(AuditResumeAttempt)
+    \/ BeginExplicitResumeReadinessStopped(AuditResumeAttempt)
+    \/ SettleExplicitResumeReadinessStopped(AuditResumeAttempt)
     \/ AuthorizeExplicitResumeMemberRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
     \/ AuthorizeExplicitResumeMemberLiveRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
     \/ AuthorizeExplicitResumeMemberJoinRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
@@ -873,6 +876,37 @@ AuditWakingClosable ==
         /\ ENABLED ResolveMemberRevivalHostRefusedRunning(id, AuditCode, AuditReason, a)
         /\ ENABLED ResolveMemberRevivalRetryableRunning(id, a, "WakeTimedOut")
 
+\* ENABLED form: the explicit resume can always join a wake in flight while
+\* its readiness is not in flight and its topology has not started, whatever
+\* readiness it already settled. The lift of a stopped mob settles its
+\* readiness before the durable Resume and joins the wakes its member plan
+\* opens after it; a joined member's readiness is its own wake's.
+AuditResumeJoinable ==
+    (/\ phase = "Running"
+     /\ explicit_resume_attempt = Some(AuditResumeAttempt)
+     /\ explicit_resume_cancel_requested = FALSE
+     /\ explicit_resume_preparation_pending = FALSE
+     /\ explicit_resume_readiness_pending = FALSE
+     /\ explicit_resume_topology_pending = FALSE
+     /\ explicit_resume_topology_settled = FALSE
+     /\ Id1 \notin DOMAIN explicit_resume_member_work
+     /\ Phase1 = Some("Waking")
+     /\ definition_epoch = AuditResumeBinding.definition_epoch
+     /\ Id1 \in DOMAIN identity_to_runtime
+     /\ identity_to_runtime[Id1] = AuditResumeBinding.agent_runtime_id
+     /\ Id1 \in DOMAIN identity_runtime_fence_tokens
+     /\ identity_runtime_fence_tokens[Id1] = AuditResumeBinding.fence_token
+     /\ Id1 \in DOMAIN member_session_bindings
+     /\ member_session_bindings[Id1] = AuditResumeBinding.session_id)
+    => ENABLED AuthorizeExplicitResumeMemberJoinRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
+
+\* The resume holds no member work while its readiness is in flight or once
+\* its topology started: every member it reserved or joined settled first.
+AuditResumeStagesHoldNoWork ==
+    /\ explicit_resume_readiness_pending => DOMAIN explicit_resume_member_work = {}
+    /\ explicit_resume_topology_pending => DOMAIN explicit_resume_member_work = {}
+    /\ explicit_resume_topology_settled => DOMAIN explicit_resume_member_work = {}
+
 \* A Lifecycle wake input never opens an attempt, and a peer notice
 \* classification never changes residency.
 AuditLifecycleNeverWakes ==
@@ -1149,6 +1183,11 @@ AuditWitnessRotatedStoppedStep ==
 
 \* Resume run: an explicit resume joins a wake already in flight.
 AuditWitnessResumeJoinsStep == AuthorizeExplicitResumeMemberJoinRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
+\* Resume run: the explicit resume joins a wake after the readiness it ran
+\* before its Resume settled (the lift of a stopped mob).
+AuditWitnessResumeJoinsAfterReadinessStep ==
+    /\ explicit_resume_readiness_settled = TRUE
+    /\ AuthorizeExplicitResumeMemberJoinRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
 \* Resume run: an explicit resume reserves a Live member.
 AuditWitnessResumeReservesLiveStep == AuthorizeExplicitResumeMemberLiveRunning(AuditResumeAttempt, Id1, AuditResumeBinding)
 \* Resume run: the resume finishes with its member Live.
@@ -1240,6 +1279,7 @@ NotAuditWitnessDestroyBeatsHostPending == [][~AuditWitnessDestroyBeatsHostPendin
 NotAuditWitnessRotatedStopped == [][~AuditWitnessRotatedStoppedStep]_vars
 NotAuditWitnessResumeJoins == [][~AuditWitnessResumeJoinsStep]_vars
 NotAuditWitnessResumeReservesLive == [][~AuditWitnessResumeReservesLiveStep]_vars
+NotAuditWitnessResumeJoinsAfterReadiness == [][~AuditWitnessResumeJoinsAfterReadinessStep]_vars
 NotAuditWitnessResumeFinishedLive == [][~AuditWitnessResumeFinishedLiveStep]_vars
 NotAuditWitnessHeldEdge == ~AuditWitnessHeldEdge
 NotAuditWitnessBothSeated == ~AuditWitnessBothSeated
