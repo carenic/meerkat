@@ -678,15 +678,19 @@ impl MobOpsAdapter {
 
     /// Whether `existing` is stale because the runtime unregistered the
     /// registration it names: an unclaimed generic session binding whose
-    /// registry's owner admission, a fact the runtime machine owns, is
-    /// `Retired`. Only the runtime's unregister retires a registry's owner,
-    /// after ending every operation still live in it and before it removes
-    /// the registration, so that registry never serves again and no flow
-    /// rebinds or retires a binding to it: the explicit-resume and reload
-    /// flows act only on a current registration. The registration a
-    /// replacing bind names exists only once that unregister has finished:
-    /// the runtime's binding preparation joins an unregister in flight
-    /// before it registers the session again.
+    /// registry's owner admission is `Retired`. That admission is the
+    /// registry's shell fence, not a generated machine field: it has one
+    /// writer, the runtime's unregister (`retire_owner_for_unregister`),
+    /// which closes it after the generated authority ended every operation
+    /// still live in the registry and before the unregister removes the
+    /// registration, and nothing reopens it. The revival arm already decides
+    /// a parent owner context on the same fence
+    /// (`classify_parent_owner_context`). Such a registry never
+    /// serves again and no flow rebinds or retires a binding to it: the
+    /// explicit-resume and reload flows act only on a current registration.
+    /// The registration a replacing bind names exists only once that
+    /// unregister has finished: the runtime's binding preparation joins an
+    /// unregister in flight before it registers the session again.
     ///
     /// A `Sealed` registry (a durability-reload discard) is not stale here:
     /// the reload moves this exact binding to its cold successor by exact

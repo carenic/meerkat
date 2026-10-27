@@ -83,7 +83,7 @@ async fn a_start_rebinds_a_member_whose_registration_a_failed_run_unregistered()
     paused.release.send(()).expect("release the start");
     let reached = tokio::time::timeout(STEP, readiness_reached).await;
     assert!(
-        reached.is_ok(),
+        matches!(reached, Ok(Ok(()))),
         "the start never passed its binding pass; the mob is {:?}",
         paused.resumed.status().await
     );
