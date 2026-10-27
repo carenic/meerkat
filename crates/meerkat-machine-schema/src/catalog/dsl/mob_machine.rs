@@ -2304,6 +2304,12 @@ macro_rules! mob_catalog_machine_dsl {
             PeerNoticeClassified { recipient: AgentIdentity, sender: AgentIdentity, notice_class: Enum<PeerInputClass>, disposition: Enum<PeerNoticeDisposition> },
             MemberMaterializationReleased { agent_runtime_id: Option<AgentRuntimeId>, cause: Enum<MemberMaterializationLossCause>, outcome: Enum<MemberMaterializationReleaseOutcome> },
             MemberReleaseClassified { agent_identity: AgentIdentity, verdict: Enum<MemberReleaseVerdict> },
+            // A refused binding request that belongs to no open wake of the
+            // member (an earlier attempt's, a spawn-era one while a wake is
+            // open, or one for a session the member no longer binds): the
+            // refusal changes nothing, and the shell consumes the refused
+            // route without recording the member Broken.
+            RuntimeBindingRefusalStale { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, session_id: SessionId, attempt: Option<u64> },
         }
 
         // One total, pure classifier over desired authority, lease ownership,
@@ -3227,6 +3233,7 @@ macro_rules! mob_catalog_machine_dsl {
         disposition PeerNoticeClassified => local seam SurfaceResultAlignment,
         disposition MemberMaterializationReleased => local seam SurfaceResultAlignment,
         disposition MemberReleaseClassified => local seam SurfaceResultAlignment,
+        disposition RuntimeBindingRefusalStale => local seam SurfaceResultAlignment,
 
         // =====================================================================
         // Invariants
@@ -11246,14 +11253,11 @@ macro_rules! mob_catalog_machine_dsl {
         transition ResolveRuntimeBindingRefusalRunning {
             on input ResolveRuntimeBindingRefusal { agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt }
             guard { self.lifecycle_phase == Phase::Running }
-            // The attempt fence: a refused binding request of a wake applies
-            // only while that wake's attempt is open (the spawn's binding
-            // belongs to no attempt); a refusal of any other attempt is the
-            // Stale twin's.
-            guard "refusal_attempt_current" {
-                attempt == None
-                || self.member_wake_attempts.get_copied(agent_identity) == attempt
-            }
+            // The attempt fence: a refused binding request applies only to
+            // the wake it belongs to: a wake's request while that attempt is
+            // open, the spawn's (no attempt) only while no wake is open. Any
+            // other refusal is the Stale twin's.
+            guard "refusal_attempt_current" { self.member_wake_attempts.get_copied(agent_identity) == attempt }
             guard "placement_absent" { self.member_placement.contains_key(agent_identity) == false }
             guard "identity_binding_matches" { self.identity_to_runtime.get_cloned(agent_identity) == Some(agent_runtime_id) }
             guard "current_binding_matches" { self.live_runtime_ids.contains(agent_runtime_id) }
@@ -24590,6 +24594,10 @@ macro_rules! mob_catalog_machine_dsl {
 
         // PlanBootMaterialization: the boot verdict for one Dormant member, on
         // both start paths, from the generated member_boot_materialization.
+        // A member is network-reachable (the helper's network_transport) when
+        // its endpoint's transport is Tcp or Uds, or when a wiring edge joins
+        // it to a placed member: a peer in another process cannot use an
+        // inproc wake route either way.
         transition PlanBootMaterializationWake {
             on input PlanBootMaterialization { agent_identity, obligation, host_required, orchestrator_notified }
             guard { self.lifecycle_phase == Phase::Running }
@@ -24602,8 +24610,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::Wake
@@ -24655,8 +24668,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::VerifyThenDormant
@@ -24683,8 +24701,13 @@ macro_rules! mob_catalog_machine_dsl {
                     self.placed_completion_lifecycle_quiescing == false,
                     obligation,
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
-                    self.member_peer_endpoints.contains_key(agent_identity) == true
-                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc,
+                    (self.member_peer_endpoints.contains_key(agent_identity) == true
+                        && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
+                    || exists(edge in self.wiring_edges,
+                        (mob_machine_wiring_edge_a(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
+                        || (mob_machine_wiring_edge_b(edge) == agent_identity
+                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required) == BootMaterializationKind::StayDormant
@@ -26021,20 +26044,25 @@ macro_rules! mob_catalog_machine_dsl {
             emit EmitKickoffLifecycleNotice { member_id: agent_identity, intent: KickoffIntent::Pending }
         }
 
-        // A refused binding request of a wake attempt that is no longer the
-        // member's open one (it closed, or a newer wake opened): a typed
-        // StaleAttempt no-op in every lifecycle phase, so a late refusal
-        // never ends a newer wake.
+        // A refused binding request that belongs to no open wake of the
+        // member (an earlier attempt's, the spawn's while a wake is open, or
+        // one for a session the member no longer binds): a typed no-op in
+        // every lifecycle phase, so a late refusal never ends a newer wake.
         transition ResolveRuntimeBindingRefusalStale {
             per_phase [Running, Stopped, Completed, Destroyed]
             on input ResolveRuntimeBindingRefusal { agent_identity, agent_runtime_id, session_id, refusal_code, reason, attempt }
-            guard "refusal_attempt_stale" {
-                attempt != None
-                && self.member_wake_attempts.get_copied(agent_identity) != attempt
+            guard "refusal_stale" {
+                self.member_wake_attempts.get_copied(agent_identity) != attempt
+                || self.member_session_bindings.get_cloned(agent_identity) != Some(session_id)
             }
             update {}
             to Running
-            emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt.get("value"), verdict: MemberWakeFeedbackVerdict::StaleAttempt }
+            emit RuntimeBindingRefusalStale {
+                agent_identity: agent_identity,
+                agent_runtime_id: agent_runtime_id,
+                session_id: session_id,
+                attempt: attempt
+            }
         }
     }
         }
