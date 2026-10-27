@@ -152,6 +152,21 @@ them.
   so for several members at once, in no fixed order across members; each
   member's own calls keep their order.
 
+### Known limitations
+
+- A session-keyed live operation (a turn, a live channel, comms sent as the
+  member, a scheduled session target, a session-addressed delivery) whose
+  session belongs to a dormant mob member that cannot be woken has no typed
+  session error yet. A retryable wake refusal is reported as
+  `SessionError::Busy` (retry later); a final one as an internal agent error
+  whose message names the refusal. Do not parse that message: a typed form is
+  planned for the next release.
+- A durable worker woken while its host's durable resume gate stays
+  unavailable still has its interrupted run settled as refused after the
+  runtime's attempts, and that run's own kept inputs are abandoned, as in
+  0.9.6. The delivery that woke the member is a new input and is not
+  abandoned with them.
+
 ## [0.9.6] - 2026-10-27
 
 ### Breaking
