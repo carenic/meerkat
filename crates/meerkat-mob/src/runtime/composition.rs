@@ -172,6 +172,7 @@ impl MobSeamEffect {
                 fence_token,
                 generation,
                 session_id,
+                attempt,
             } => {
                 if id == &seam_facts::fields::agent_identity() {
                     Some(FieldValue::Str(agent_identity.0.as_str()))
@@ -183,6 +184,11 @@ impl MobSeamEffect {
                     generation.map(|generation| FieldValue::U64(generation.0))
                 } else if id == &seam_facts::fields::session_id() {
                     Some(FieldValue::Str(session_id.0.as_str()))
+                } else if id == &seam_facts::fields::attempt() {
+                    // The wake attempt the request belongs to (none for a
+                    // spawn's binding), projected opaque so an absent
+                    // attempt survives to the refusal closure as `None`.
+                    Some(FieldValue::Opaque(Arc::new(*attempt)))
                 } else {
                     None
                 }
@@ -740,6 +746,7 @@ pub(super) fn refusal_feedback_input(
                 agent_identity,
                 agent_runtime_id,
                 session_id,
+                attempt,
                 ..
             },
         ) if input == seam_facts::inputs::resolve_runtime_binding_refusal() => {
@@ -749,6 +756,7 @@ pub(super) fn refusal_feedback_input(
                 session_id: session_id.clone(),
                 refusal_code,
                 reason,
+                attempt: *attempt,
             })
         }
         (
@@ -822,6 +830,7 @@ mod tests {
             fence_token: mob_dsl::FenceToken(7),
             generation: Some(mob_dsl::Generation(3)),
             session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: None,
         };
         assert_eq!(seam(body).variant_id(), ev("RequestRuntimeBinding"));
     }
@@ -834,6 +843,7 @@ mod tests {
             fence_token: mob_dsl::FenceToken(7),
             generation: Some(mob_dsl::Generation(3)),
             session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: None,
         };
         let effect = seam(body);
 
@@ -849,6 +859,14 @@ mod tests {
             effect.field(&fid("generation")).expect("present"),
             FieldValue::U64(3),
         ));
+        // A spawn's binding belongs to no wake attempt; the absent attempt is
+        // still projected, opaque, so it reaches the refusal closure as None.
+        match effect.field(&fid("attempt")).expect("present") {
+            FieldValue::Opaque(value) => {
+                assert_eq!(value.downcast_ref::<Option<u64>>(), Some(&None));
+            }
+            other => panic!("the attempt is projected opaque, got {other:?}"),
+        }
         assert!(effect.field(&fid("unknown_field")).is_none());
     }
 
@@ -864,6 +882,7 @@ mod tests {
                     fence_token: mob_dsl::FenceToken(7),
                     generation: Some(mob_dsl::Generation(3)),
                     session_id: mob_dsl::SessionId::from("session-1"),
+                    attempt: None,
                 }),
                 seam_facts::route_binding_request_reaches_meerkat(),
             ),
@@ -942,14 +961,33 @@ mod tests {
             fence_token: mob_dsl::FenceToken(7),
             generation: Some(mob_dsl::Generation(3)),
             session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: None,
         });
         assert!(matches!(
             refusal_feedback_input(&binding, &error).expect("binding closure"),
             mob_dsl::MobMachineInput::ResolveRuntimeBindingRefusal {
                 refusal_code,
                 reason,
+                attempt: None,
                 ..
             } if refusal_code == "dsl_guard_rejected" && reason == "typed consumer detail"
+        ));
+        // A wake's binding request carries its attempt back to the refusal,
+        // so a late refusal of an earlier attempt is fenced.
+        let woken_binding = seam(mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            agent_identity: mob_dsl::AgentIdentity::from("agent"),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from("rt-1"),
+            fence_token: mob_dsl::FenceToken(7),
+            generation: Some(mob_dsl::Generation(3)),
+            session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: Some(4),
+        });
+        assert!(matches!(
+            refusal_feedback_input(&woken_binding, &error).expect("binding closure"),
+            mob_dsl::MobMachineInput::ResolveRuntimeBindingRefusal {
+                attempt: Some(4),
+                ..
+            }
         ));
 
         let ingress = seam(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
@@ -1043,6 +1081,7 @@ mod tests {
             fence_token: mob_dsl::FenceToken(1),
             generation: Some(mob_dsl::Generation(0)),
             session_id: mob_dsl::SessionId::from("session-1"),
+            attempt: None,
         };
         assert!(matches!(
             lift_routed_effect(&binding_in),
@@ -1094,6 +1133,7 @@ mod tests {
                 fence_token: mob_dsl::FenceToken(7),
                 generation: Some(mob_dsl::Generation(3)),
                 session_id: mob_dsl::SessionId::from("session-1"),
+                attempt: None,
             },
             DslEffect::RequestRuntimeIngress {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from("rt-1"),
@@ -1185,6 +1225,7 @@ mod tests {
                 fence_token: mob_dsl::FenceToken(1),
                 generation: Some(mob_dsl::Generation(0)),
                 session_id: mob_dsl::SessionId::from("session-1"),
+                attempt: None,
             },
             mob_dsl::MobMachineEffect::RequestRuntimeIngress {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from("rt-1"),

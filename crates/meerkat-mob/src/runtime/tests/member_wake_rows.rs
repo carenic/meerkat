@@ -1899,3 +1899,144 @@ async fn a_release_before_the_binding_lands_keeps_the_session_and_a_retry_releas
     fixture.release(&member).await;
     fixture.finish().await;
 }
+
+/// A routed binding refusal of an abandoned wake attempt that lands while a
+/// newer wake of the member is in flight is answered stale: the routed flush
+/// drops it, the newer wake keeps its attempt and finishes, and the mob
+/// stays up. Before the attempt fence, the late refusal broke the member
+/// and closed the newer wake's attempt; with the fence but no stale handling
+/// in the flush, the mob actor would exit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_late_binding_refusal_of_an_abandoned_attempt_leaves_the_newer_wake_running() {
+    let fixture = WakeFixture::new("wake-late-refusal").await;
+    let member = fixture.spawn("late-refusal-member").await;
+    let seated = fixture.entry(&member).await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let open_attempt = || {
+        fixture
+            .handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_wake_attempts
+            .get(&key)
+            .copied()
+    };
+    let wake_in_background = || {
+        let handle = fixture.handle.clone();
+        let member = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&member).await })
+    };
+
+    // The first wake is held in its build preparation, then refused
+    // retryably: its attempt is abandoned and the member is Dormant again.
+    fixture.preparer.close_gate();
+    fixture.preparer.answer_with(PreparerAnswer::Retryable);
+    let first_wake = wake_in_background();
+    fixture.preparer.wait_entered(1).await;
+    let abandoned = open_attempt().expect("the first wake's attempt is open");
+    fixture.preparer.open_gate();
+    let _ = tokio::time::timeout(WAIT, first_wake)
+        .await
+        .expect("the first wake answers")
+        .expect("the first wake task joins");
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Dormant))
+        .await;
+
+    // The newer wake is held in its build preparation.
+    fixture.preparer.close_gate();
+    fixture.preparer.answer_with(PreparerAnswer::Prepared);
+    let newer_wake = wake_in_background();
+    fixture.preparer.wait_entered(2).await;
+    let current = open_attempt().expect("the newer wake's attempt is open");
+    assert_ne!(current, abandoned, "each wake has its own attempt");
+
+    // The abandoned attempt's binding request reaches the runtime late. The
+    // member's session has no registration while the newer wake is held,
+    // so the runtime refuses it.
+    let late = crate::runtime::composition::MobSeamEffect::routed(
+        mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+            agent_identity: key.clone(),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&seated.agent_runtime_id),
+            fence_token: mob_dsl::FenceToken(seated.fence_token.get()),
+            generation: Some(mob_dsl::Generation(seated.generation.get())),
+            session_id: mob_dsl::SessionId::from_domain(&session),
+            attempt: Some(abandoned),
+        },
+    )
+    .expect("a binding request is a routed effect");
+    fixture
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::QueueRoutedEffectForTest {
+            effect: late,
+            reply_tx,
+        })
+        .await
+        .expect("queue the late binding request")
+        .await
+        .expect("the actor answers the queue command")
+        .expect("the actor queues the late binding request");
+    // The boundary flush after the queue command dispatched it; a poll
+    // answered after that flush proves the actor is still running.
+    fixture
+        .handle
+        .poll_events(0, 1)
+        .await
+        .expect("the mob actor survives the late refusal");
+    assert_eq!(
+        open_attempt(),
+        Some(current),
+        "the newer wake keeps its attempt"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Waking)
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, newer_wake)
+        .await
+        .expect("the newer wake answers")
+        .expect("the newer wake task joins")
+        .expect("the newer wake finishes");
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
+    assert_eq!(
+        fixture.handle.status().await.expect("mob status"),
+        MobState::Running
+    );
+    fixture.finish().await;
+}
+
+/// A wake queued from a member-effect completion, not from a command,
+/// starts with no further command: the actor starts the materializations
+/// MobMachine handed off on every loop pass, not only after a command, so a
+/// first touch never waits for an unrelated command.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_command() {
+    let fixture = WakeFixture::new("wake-from-effect").await;
+    let member = fixture.spawn("from-effect-member").await;
+    fixture.release(&member).await;
+
+    fixture
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::WakeMemberFromEffectForTest {
+            agent_identity: member.clone(),
+            reply_tx,
+        })
+        .await
+        .expect("send the effect-completion wake")
+        .await
+        .expect("the actor answers")
+        .expect("the actor dispatched the effect");
+
+    // No further command is sent: the member is woken all the same.
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Live))
+        .await;
+    fixture.finish().await;
+}

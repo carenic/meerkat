@@ -1949,6 +1949,57 @@ async fn release_member_registration(
     }
 }
 
+/// Test seam: a member-effect commit that applies an operator wake, so the
+/// wake is queued from a completion rather than from a command.
+#[cfg(test)]
+struct WakeFromEffectForTest {
+    identity: AgentIdentity,
+}
+
+#[cfg(test)]
+impl super::member_effect_lane::MemberEffectCommit for WakeFromEffectForTest {
+    fn commit(
+        self: Box<Self>,
+        actor: &mut MobActor,
+        _settlement: super::member_effect_lane::MemberEffectSettlement,
+    ) -> super::member_effect_lane::MemberEffectCommitFuture<'_> {
+        Box::pin(async move {
+            let _ = actor
+                .apply_member_wake(
+                    &self.identity,
+                    mob_dsl::MemberWakeCause::Operator,
+                    false,
+                    mob_dsl::PeerInputClass::Content,
+                    false,
+                )
+                .await;
+            super::member_effect_lane::MemberEffectAck::Settled
+        })
+    }
+}
+
+#[cfg(test)]
+impl MobActor {
+    /// Dispatch a member effect whose completion applies an operator wake
+    /// of `identity` (see [`MobCommand::WakeMemberFromEffectForTest`]).
+    pub(in crate::runtime) fn dispatch_wake_member_from_effect_for_test(
+        &mut self,
+        identity: AgentIdentity,
+    ) {
+        let commit_identity = identity.clone();
+        let _ = self.dispatch_member_effect(super::member_effect_lane::MemberEffectRequest {
+            context: "wake_member_from_effect_for_test",
+            members: Vec::new(),
+            effects: Box::pin(async move {
+                Box::new(WakeFromEffectForTest {
+                    identity: commit_identity,
+                }) as Box<dyn super::member_effect_lane::MemberEffectCommit>
+            }),
+            unsettled_commit: Box::new(WakeFromEffectForTest { identity }),
+        });
+    }
+}
+
 #[cfg(test)]
 mod continuity_index_tests {
     use super::*;
