@@ -17,9 +17,10 @@ impl MobActor {
     }
 
     /// Whether the explicit resume is past its topology reconciliation and
-    /// still owns its post-commit work (operation-binding restore and the
-    /// orchestrator's resume notification): MobMachine holds the attempt open
-    /// with its topology settled.
+    /// still owns its post-commit work (the members' operation-binding
+    /// restore, and an AutonomousHost orchestrator's queued resume
+    /// notification): MobMachine holds the attempt open with its topology
+    /// settled.
     pub(super) fn explicit_resume_post_commit_pending(&self) -> bool {
         let state = self.dsl_authority.state();
         state.explicit_resume_attempt.is_some() && state.explicit_resume_topology_settled
@@ -36,13 +37,16 @@ impl MobActor {
         match command {
             // Graph work a member's run can wait on (its spawn, wire or
             // retire tool call): it waits only for the topology
-            // reconciliation. The post-commit work can itself wait on member
-            // runs (the orchestrator's resume notification runs its turn), so
-            // deferring this work behind it would let a run that spawns, wires
-            // or retires hold the resume, and the resume hold the run, forever.
-            // A member whose own post-commit work is in flight still keeps
-            // its retire and respawn behind that work (see
-            // `resume_member_control_is_pending`).
+            // reconciliation. The post-commit work waits on no member run (a
+            // member whose registration already serves its binding is bound
+            // without the lanes a run holds, and a notification that runs the
+            // orchestrator's turn is handed to the lifecycle owner), so this
+            // early fence drop is defence in depth: were post-commit work ever
+            // to wait on a run again, deferring this work behind it would let
+            // a run that spawns, wires or retires hold the resume, and the
+            // resume hold the run, forever. A member whose own post-commit
+            // work is in flight still keeps its retire and respawn behind that
+            // work (see `resume_member_control_is_pending`).
             MobCommand::Spawn { .. }
             | MobCommand::SpawnProvisioned { .. }
             | MobCommand::SpawnAttachedForkedParticipant { .. }

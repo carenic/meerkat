@@ -10,6 +10,7 @@
 //! operation binding at a gated step and observe both sides of that split.
 
 use super::*;
+use std::sync::atomic::AtomicBool;
 
 /// Bound for steps that must happen promptly; it only turns a hang into a
 /// failure.
@@ -17,12 +18,15 @@ const STEP: Duration = Duration::from_secs(10);
 
 /// The lift of a stopped mob whose operation binding of one member is held
 /// (a gated step of its post-commit work): a Spawn is admitted and answered
-/// while the binding is held, and a registration reload of another member
-/// stays deferred until the lift completes and is answered after it.
+/// while the binding is held, and a registration reload of the member that
+/// Spawn created, which the lift owes no post-commit work (so only the
+/// resume's own fence can hold it), is parked until the lift completes and
+/// answered after it.
 ///
-/// RED on the base (8086477277): the lift's topology fence stayed up until
-/// its post-commit work finished, and every Spawn was deferred behind it, so
-/// the bounded Spawn timed out with the binding still held.
+/// RED on the base (8086477277, with the seam and the row applied): the
+/// lift's topology fence stayed up until its post-commit work finished and
+/// deferred every Spawn behind it, so the bounded Spawn times out with the
+/// binding still held.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_completes() {
     let mob = create_isolation_mob(2).await;
@@ -31,37 +35,62 @@ async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_c
         mob.handle.mob_id(),
         mob.member(0),
     );
+    let released = Arc::new(AtomicBool::new(false));
     let lift = tokio::spawn({
         let handle = mob.handle.clone();
-        async move { handle.resume().await }
+        let released = Arc::clone(&released);
+        async move {
+            let lifted = handle.resume().await;
+            (lifted, released.load(Ordering::SeqCst))
+        }
     });
     tokio::time::timeout(STEP, entered)
         .await
         .expect("the lift reaches the held binding")
         .expect("binding hold armed");
 
-    let reload = tokio::spawn({
-        let handle = mob.handle.clone();
-        let member = mob.member(1).clone();
-        async move { handle.reload_member_registration(&member).await }
-    });
+    // Graph work a member run can wait on: admitted while the binding is
+    // held.
+    let spawned_identity = AgentIdentity::from("w-spawned-during-lift");
     let spawned = tokio::time::timeout(
         STEP,
-        mob.handle.spawn(
-            ProfileName::from("worker"),
-            AgentIdentity::from("w-spawned-during-lift"),
-            None,
-        ),
+        mob.handle
+            .spawn(ProfileName::from("worker"), spawned_identity.clone(), None),
     )
     .await;
-    // The reload was sent before the Spawn, and an admitted reload of a
-    // healthy member is a quick no-op: give it time to answer if it was not
-    // deferred.
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    let reload_answered_while_held = reload.is_finished();
-    let lift_answered_while_held = lift.is_finished();
+
+    // Host repair: a reload of the member the Spawn created. The member has
+    // no wiring (the definition wires no workers), no kickoff and no
+    // post-commit work of this lift, so the actor can park its reload only
+    // on the resume's fence. Parking is observed structurally, through the
+    // actor's parked-control probe, and one actor round trip after it shows
+    // the reload is still held.
+    let mut parked = mob
+        .handle
+        .lifecycle_observations
+        .parked_member_controls
+        .subscribe();
+    let reload = matches!(spawned, Ok(Ok(_))).then(|| {
+        tokio::spawn({
+            let handle = mob.handle.clone();
+            let member = spawned_identity.clone();
+            async move { handle.reload_member_registration(&member).await }
+        })
+    });
+    let reload_parked = match reload {
+        Some(_) => tokio::time::timeout(
+            STEP,
+            parked.wait_for(|parked| parked.contains_key(&spawned_identity)),
+        )
+        .await
+        .is_ok_and(|observed| observed.is_ok()),
+        None => false,
+    };
+    let _ = mob.handle.status().await;
+    let reload_answered_while_held = reload.as_ref().is_some_and(|reload| reload.is_finished());
     // Released whatever was observed, so a failing row ends instead of
     // hanging.
+    released.store(true, Ordering::SeqCst);
     let _ = release.send(());
 
     let spawned = spawned
@@ -72,25 +101,45 @@ async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_c
         "the spawned member is session-backed"
     );
     assert!(
-        !lift_answered_while_held,
-        "the lift was still in its post-commit work while the binding was held"
+        reload_parked,
+        "the actor parks the reload while the lift is in its post-commit work"
     );
     assert!(
         !reload_answered_while_held,
         "a registration reload waits for the whole resume"
     );
-    tokio::time::timeout(STEP, lift)
+
+    // The lift answers once its binding is released. In a unit build its
+    // observer reports a stall after two seconds without progress while the
+    // binding is held; the operation itself stays joinable, and is joined.
+    let (lifted, answered_after_release) = tokio::time::timeout(STEP, lift)
         .await
         .expect("the lift answers once the binding is released")
-        .expect("lift task")
-        .expect("the lift succeeds");
-    let reloaded = tokio::time::timeout(STEP, reload)
+        .expect("lift task");
+    match lifted {
+        Ok(()) => assert!(
+            answered_after_release,
+            "the lift did not complete while its binding was held"
+        ),
+        Err(MobError::LifecycleOperationProgressStalled { stage, .. }) => {
+            assert_eq!(
+                stage, "resume_operation_bindings",
+                "the lift waited only on its held binding"
+            );
+            tokio::time::timeout(STEP, mob.handle.resume())
+                .await
+                .expect("the joined lift answers")
+                .expect("the lift succeeds");
+        }
+        Err(error) => panic!("the lift failed: {error}"),
+    }
+    let reloaded = tokio::time::timeout(STEP, reload.expect("the reload was sent"))
         .await
-        .expect("the deferred reload is answered after the lift")
+        .expect("the parked reload is answered after the lift")
         .expect("reload task");
     assert!(
         reloaded.is_ok(),
-        "the deferred reload runs once the lift completed: {reloaded:?}"
+        "the parked reload runs once the lift completed: {reloaded:?}"
     );
     assert_eq!(
         mob.handle.status().await.expect("status"),
@@ -98,7 +147,7 @@ async fn a_held_lift_binding_admits_a_spawn_and_defers_a_reload_until_the_lift_c
         "the lift reached ready"
     );
     mob.handle
-        .resolve_bridge_session_id(&AgentIdentity::from("w-spawned-during-lift"))
+        .resolve_bridge_session_id(&spawned_identity)
         .await
         .expect("the member spawned during the lift is a member");
 }

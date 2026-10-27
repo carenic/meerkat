@@ -5353,9 +5353,10 @@ pub(super) fn hold_explicit_resume_member_binding_for_test(
 ) -> (oneshot::Receiver<()>, oneshot::Sender<()>) {
     let (entered_tx, entered_rx) = oneshot::channel();
     let (release_tx, release_rx) = oneshot::channel();
-    if let Ok(mut armed) = HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST.lock() {
-        armed.insert((mob_id.clone(), member.clone()), (entered_tx, release_rx));
-    }
+    HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert((mob_id.clone(), member.clone()), (entered_tx, release_rx));
     (entered_rx, release_tx)
 }
 
@@ -5368,8 +5369,8 @@ fn take_explicit_resume_member_binding_hold_for_test(
 ) -> Option<ExplicitResumeMemberBindingHold> {
     HOLD_EXPLICIT_RESUME_MEMBER_BINDING_FOR_TEST
         .lock()
-        .ok()
-        .and_then(|mut armed| armed.remove(&(mob_id.clone(), member.clone())))
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(&(mob_id.clone(), member.clone()))
 }
 
 /// How many times a startup restore took each member's stopped registration
@@ -18571,9 +18572,10 @@ impl MobActor {
 
     /// Whether the explicit resume keeps `pending` parked. Work a member's run
     /// can wait on (its submitted work) waits only for the resume's topology
-    /// reconciliation, never for its post-commit work, which can itself wait
-    /// on member runs. A registration reload waits for the resume's whole
-    /// member work.
+    /// reconciliation, never for its post-commit work: that work waits on no
+    /// member run, and keeping run-facing work out of it is defence in depth
+    /// should it ever wait on one again. A registration reload waits for the
+    /// resume's whole member work.
     fn explicit_resume_parks_member_admission(&self, pending: &ParkedMemberTurnAdmission) -> bool {
         #[cfg(feature = "runtime-adapter")]
         {
@@ -33027,6 +33029,31 @@ impl MobActor {
         } = plan;
         let local_member_owner = placed_operation.is_none()
             && entry.member_ref.bridge_session_id() == Some(&generated_owner_session_id);
+        // The lift binds a member whose registration already serves this
+        // exact binding (attached and live, as a member with a run in flight
+        // always is) by restoring its owner context alone. The full restore
+        // below would change nothing else for it, and it queues behind lanes
+        // a member's run holds or serializes (the session's mutation gate,
+        // which the run's finalization holds, the runtime driver and the
+        // registration transaction): a lift must never wait on a member's
+        // run. The check reads MeerkatMachine's registration and binding
+        // state, and the actor's mechanical presence, without taking any of
+        // those lanes.
+        if seam == RestoredOperationBindingSeam::ExplicitResumePostCommit
+            && local_member_owner
+            && let Some(ops_registry) =
+                Self::serving_member_binding_registry(&io, &entry, &generated_owner_session_id)
+                    .await?
+        {
+            io.provisioner
+                .restore_member_owner_context_for_explicit_resume(
+                    &entry.member_ref,
+                    generated_owner_session_id,
+                    ops_registry,
+                )
+                .await?;
+            return Ok(RestoredOperationBinding::Restored);
+        }
         // Operation restoration must not resurrect an absent local session.
         // Broken cleanup and completed archive publication retain their exact
         // MobMachine journal authority without a fabricated runtime residue.
@@ -33271,6 +33298,44 @@ impl MobActor {
             // current: nothing changed, and the ordinary restore decides.
             _ => Ok(None),
         }
+    }
+
+    /// The operation registry of a member whose session actor is registered
+    /// and whose runtime registration already serves the member's exact
+    /// generated binding (`MeerkatMachine::serving_member_binding_ops_registry`),
+    /// for the lift's operation binding. `None` when either does not hold;
+    /// the full restore then runs. Mechanical presence and machine state
+    /// reads alone: never a lane a member's run holds.
+    #[cfg(feature = "runtime-adapter")]
+    async fn serving_member_binding_registry(
+        io: &ResumeOperationBindingIo,
+        entry: &RosterEntry,
+        session_id: &SessionId,
+    ) -> Result<Option<Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>>, MobError> {
+        if !io
+            .session_service
+            .live_session_actor_registered(session_id)
+            .await?
+        {
+            return Ok(None);
+        }
+        let dispatcher = io.provisioner.composition_signal_dispatcher();
+        let registry = io
+            .adapter
+            .serving_member_binding_ops_registry(
+                session_id,
+                &meerkat_runtime::meerkat_machine::dsl::AgentRuntimeId::from(
+                    entry.agent_runtime_id.to_string(),
+                ),
+                meerkat_runtime::meerkat_machine::dsl::FenceToken::from(entry.fence_token.get()),
+                Some(meerkat_runtime::meerkat_machine::dsl::Generation::from(
+                    entry.generation.get(),
+                )),
+                dispatcher.as_ref(),
+            )
+            .await;
+        Ok(registry
+            .map(|registry| registry as Arc<dyn meerkat_core::ops_lifecycle::OpsLifecycleRegistry>))
     }
 
     #[cfg(feature = "runtime-adapter")]

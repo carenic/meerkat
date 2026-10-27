@@ -11674,21 +11674,24 @@ impl meerkat_client::LlmClient for GatedRequestClient {
     }
 }
 
-/// How long a lift may take while a member's run or the orchestrator's turn
-/// is held: the explicit resume's own stall budget
-/// (`EXPLICIT_RESUME_PROGRESS_TIMEOUT`, 30 s), well inside a host's budget of
-/// ten such stalls.
+/// How long a row lets a lift take while a member's run or the
+/// orchestrator's turn is held. A lift that waits on held member work
+/// reports a stall (`LifecycleOperationProgressStalled`) once its own stall
+/// budget (`EXPLICIT_RESUME_PROGRESS_TIMEOUT`, 30 s) passes without
+/// progress; the bound sits above that budget, so a lift that still waits
+/// names the stage and member it waits at instead of only timing out.
 #[cfg(feature = "test-support")]
-const LIFT_WHILE_HELD_BOUND: Duration = Duration::from_secs(30);
+const LIFT_WHILE_HELD_BOUND: Duration = Duration::from_secs(45);
 
 /// A host's graceful shutdown suspends a member's open run; the next start
 /// finds the mob stopped. Its lift resumes the run, whose next model request
 /// is held (a long model call or a long gated tool, held well past the
 /// lift): the lift reaches ready within its stall budget while the run is
 /// still in flight, and the run continues afterwards, resumes once and
-/// completes once. RED before: the lift's operation binding of the member
-/// waited for the member's run to end, so the lift held its readiness for
-/// the whole run (the row's bound expires with the run still held).
+/// completes once. RED before the lift binds such a member without the
+/// lanes its run holds: the lift's operation binding of w-1 waited for w-1's
+/// run, so the lift held its readiness for the whole run and reported a
+/// stall at `resume_operation_bindings` on w-1, which the row asserts.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continues() {
@@ -11724,9 +11727,25 @@ async fn a_lift_with_a_long_resumed_member_run_reaches_ready_and_the_run_continu
     // Released whatever the lift did, so a RED run ends instead of hanging.
     let held_through_the_lift = !client_2.answered();
     client_2.release();
-    lifted
-        .expect("the lift reaches ready while the member's resumed run is still in flight")
-        .expect("the lift succeeds");
+    match lifted {
+        Ok(Ok(())) => {}
+        Ok(Err(meerkat_mob::MobError::LifecycleOperationProgressStalled {
+            stage,
+            member_id,
+            ..
+        })) => {
+            assert_eq!(
+                (stage, member_id.as_ref().map(AgentIdentity::as_str)),
+                ("resume_operation_bindings", Some("w-1")),
+                "the lift stalled while w-1's resumed run was held, outside its binding of w-1"
+            );
+            panic!("the lift waited at its operation binding of w-1 for w-1's held run");
+        }
+        Ok(Err(error)) => panic!("the lift failed: {error}"),
+        Err(_) => panic!(
+            "the lift neither reached ready nor reported a stall while w-1's resumed run was held"
+        ),
+    }
     client_2.wait_until_held("long-resumed-run").await;
     assert!(
         held_through_the_lift,
@@ -11790,6 +11809,8 @@ async fn a_lift_whose_resume_notification_turn_is_long_reaches_ready() {
     let lifted = tokio::time::timeout(LIFT_WHILE_HELD_BOUND, handle.resume()).await;
     let held_through_the_lift = !client_2.answered();
     client_2.release();
+    // The notification stage reports no stall (the turn is the host's own
+    // work), so a lift that awaits the held turn only times out here.
     lifted
         .expect("the lift reaches ready while the notification turn is still in flight")
         .expect("the lift succeeds");
@@ -11825,8 +11846,9 @@ async fn a_lift_whose_resume_notification_turn_is_long_reaches_ready() {
 /// resumed once. RED before: the lift awaited the notification turn, and its
 /// topology fence stayed up until its post-commit work finished and deferred
 /// every spawn until then, so the turn waited on a spawn the lift withheld
-/// while the lift waited on the turn; the lift never answered and the spawn
-/// got no receipt.
+/// while the lift waited on the turn. The spawn got no receipt until the
+/// client's 20 s spawn bound gave up on it; only then did the turn, and the
+/// lift, answer, with the spawn failed.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_lift_whose_resume_notification_turn_spawns_a_member_reaches_ready() {
