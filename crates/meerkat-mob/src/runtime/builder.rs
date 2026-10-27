@@ -11696,10 +11696,12 @@ pub(super) struct MemberRestoreProvision {
 pub(super) enum MemberRestoreProvisionOutcome {
     /// The member's restore failed after its profile was authorized.
     Failed(super::handle::RestoreFailureDiagnostic),
-    /// The host asked to retry the member's build preparation later
-    /// ([`super::MemberBuildPreparationRefusal::Retryable`]): nothing was
+    /// The member's restore is to be retried later (`cause`): nothing was
     /// provisioned, and the member is left dormant.
-    Retryable { reason: String },
+    Retryable {
+        reason: String,
+        cause: RetryableRestoreCause,
+    },
     /// The member's durable session was resumed.
     Durable {
         bridge_session_id: SessionId,
@@ -11715,6 +11717,58 @@ pub(super) enum MemberRestoreProvisionOutcome {
         created_bridge_session_id: SessionId,
         seat_session: bool,
     },
+}
+
+/// Why a member's restore ended retryable, with nothing provisioned.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetryableRestoreCause {
+    /// The host asked to retry the member's build preparation later
+    /// ([`super::MemberBuildPreparationRefusal::Retryable`]).
+    BuildPreparation,
+    /// A seat's first create met a session store, runtime authority or
+    /// hosting claim that is unavailable for now
+    /// ([`seat_create_failure_is_retryable`]): the member stays Dormant
+    /// with its session unborn, and a later delivery wakes it again.
+    SeatCreateUnavailable,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl RetryableRestoreCause {
+    /// The cause as MobMachine's retryable wake feedback names it.
+    pub(super) fn wake_kind(self) -> mob_dsl::MemberWakeRetryableKind {
+        match self {
+            Self::BuildPreparation => mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
+            Self::SeatCreateUnavailable => mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
+        }
+    }
+
+    /// The typed refusal a caller waiting on the wake gets.
+    pub(super) fn wake_refusal(self) -> crate::MemberWakeRefusal {
+        match self {
+            Self::BuildPreparation => crate::MemberWakeRefusal::HostPreparationPending,
+            Self::SeatCreateUnavailable => crate::MemberWakeRefusal::ResumeGateUnavailable,
+        }
+    }
+}
+
+/// Whether a seat's first create failed for a cause that clears on its own:
+/// the session store failed the write, the session was busy, its runtime
+/// authority was unavailable, or another runtime owner held its hosting
+/// claim. Any other cause (a build the host or the factory refuses, an
+/// internal fault) breaks the member.
+#[cfg(feature = "runtime-adapter")]
+fn seat_create_failure_is_retryable(error: &MobError) -> bool {
+    matches!(
+        error,
+        MobError::SessionError(
+            meerkat_core::service::SessionError::Store(_)
+                | meerkat_core::service::SessionError::Busy { .. }
+                | meerkat_core::service::SessionError::RuntimeUnavailable { .. }
+                | meerkat_core::service::SessionError::ServedElsewhere { .. }
+                | meerkat_core::service::SessionError::HostingUnavailable { .. }
+        )
+    )
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -12700,7 +12754,10 @@ async fn prepare_member_build_before_provision(
             Ok(None)
         }
         Err(super::MemberBuildPreparationRefusal::Retryable { reason }) => {
-            Ok(Some(MemberRestoreProvisionOutcome::Retryable { reason }))
+            Ok(Some(MemberRestoreProvisionOutcome::Retryable {
+                reason,
+                cause: RetryableRestoreCause::BuildPreparation,
+            }))
         }
         Err(super::MemberBuildPreparationRefusal::Final { reason }) => Ok(Some(
             MemberRestoreProvisionOutcome::Failed(member_restore_failure(
@@ -13068,16 +13125,26 @@ async fn provision_fresh_member_restore(
     .await
     {
         Ok(outcome) => outcome,
-        // A seat's first create breaks only its own member, whatever refused
-        // it: a start or a wake goes on with every other member.
+        // A seat's first create ends only its own member's restore, whatever
+        // refused it: a start or a wake goes on with every other member. A
+        // cause that clears on its own leaves the member Dormant with its
+        // session unborn, for a later delivery to wake; any other breaks it.
         Err(error) if session == FreshRestoreSession::UnbornSeat => {
-            MemberRestoreProvisionOutcome::Failed(member_restore_failure(
-                bridge_session_id,
-                format!(
-                    "failed to create the session of member '{}': {error}",
-                    entry.agent_identity
-                ),
-            ))
+            let reason = format!(
+                "failed to create the session of member '{}': {error}",
+                entry.agent_identity
+            );
+            if seat_create_failure_is_retryable(&error) {
+                MemberRestoreProvisionOutcome::Retryable {
+                    reason,
+                    cause: RetryableRestoreCause::SeatCreateUnavailable,
+                }
+            } else {
+                MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                    bridge_session_id,
+                    reason,
+                ))
+            }
         }
         Err(error) => return Err(error),
     };
@@ -13560,7 +13627,7 @@ async fn apply_member_restore_provision(
         MemberRestoreProvisionOutcome::Failed(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
         }
-        MemberRestoreProvisionOutcome::Retryable { reason } => {
+        MemberRestoreProvisionOutcome::Retryable { reason, cause } => {
             // Nothing was provisioned: the member's open wake attempt ends
             // retryable (Waking -> Dormant), and a later delivery, or the
             // owed-boot retry, wakes it again.
@@ -13577,15 +13644,16 @@ async fn apply_member_restore_provision(
                     mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
                         agent_identity: dsl_identity,
                         attempt,
-                        kind: mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
+                        kind: cause.wake_kind(),
                     },
-                    "resume_member_build_preparation_retryable",
+                    "resume_member_restore_retryable",
                 )?;
             }
             tracing::info!(
                 member = %entry.agent_identity,
+                ?cause,
                 %reason,
-                "the host asked to retry the member's build preparation; the member stays dormant"
+                "the member's restore is to be retried; the member stays dormant"
             );
         }
         MemberRestoreProvisionOutcome::Durable {

@@ -537,20 +537,21 @@ impl MobActor {
                     self.fail_member_wake_with(&run, diagnostic.clone()).await;
                     return;
                 }
-                MemberRestoreProvisionOutcome::Retryable { reason } => {
+                MemberRestoreProvisionOutcome::Retryable { reason, cause } => {
                     tracing::info!(
                         mob_id = %self.definition.id,
                         agent_identity = %run.identity,
+                        ?cause,
                         %reason,
-                        "the host asked to retry the member's build preparation"
+                        "the member's wake is to be retried"
                     );
                     self.member_wakes.running.remove(&run.attempt);
                     self.resolve_member_wake_retryable(
                         &run.identity,
                         run.attempt,
-                        mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
-                        crate::MemberWakeRefusal::HostPreparationPending,
-                        "member_wake_build_preparation_retryable",
+                        cause.wake_kind(),
+                        cause.wake_refusal(),
+                        "member_wake_restore_retryable",
                     )
                     .await;
                     return;

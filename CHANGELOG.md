@@ -127,8 +127,13 @@ them.
   `MobHandle::seat_dormant_members`), after the host's build preparation, as
   any wake prepares it; a registration the host refuses there
   (`MobError::MemberRegistrationRefused`) is the member's restore failure, as
-  is a create that fails for any other reason: at an eager start it breaks
-  only that member, and the start goes on. A wake that ends retryable after
+  is a create the factory or the host refuses for any other reason. A create
+  that fails for a cause that clears on its own (the session store, the
+  session's runtime authority or its hosting claim unavailable) leaves the
+  member dormant with its session not created, answered
+  `MemberWakeRefusal::ResumeGateUnavailable`, and its next delivery tries
+  again. Either way an eager start ends only that member's restore and goes
+  on with the others. A wake that ends retryable after
   that create keeps the session, and the next wake resumes it instead of
   creating it again. Before that first wake,
   `MobHandle::reload_member_registration` of the member is refused
