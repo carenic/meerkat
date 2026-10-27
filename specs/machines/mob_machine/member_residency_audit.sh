@@ -49,8 +49,9 @@
 # retirement can always archive and under an admitted destroy nothing holds it
 # (R124), and that no rotation begins or commits under an admitted destroy
 # (R124). TLC evaluates the module's I5 ASSUME (a present, bound member with a
-# phase is never refused as not a member) and its release verdict ASSUME at
-# the start of every run.
+# phase is never refused as not a member) and its release ASSUMEs (the verdict
+# helper, and no member wired to a placed member is releasable) at the start
+# of every run.
 # Each run must finish without an error, reach at least its floor of distinct
 # states and fire every action of its covered list (TLC coverage). It then
 # reruns a space once per reachability witness, with that witness's negation
@@ -880,6 +881,12 @@ add_guard("ResolveRuntimeBindingRefusalRunning", "((attempt = None) \\/ ((IF (ag
   mutate wake release_verdict_ignores_registration \
     "Error: Invariant AuditReleaseVerdictMatchesArm is violated" \
     'replace_in_operator("member_release_verdict", "(releasable = TRUE)", "TRUE")' "$@"
+  # The release predicate without its placed-peer pin: a member wired to a
+  # placed member is released (no run places a member; the ASSUME over the
+  # helper's whole domain refuses it).
+  mutate wake release_ignores_placed_pin \
+    "Assumption .* is false" \
+    'replace_in_operator("member_registration_releasable", "(wired_to_placed = FALSE)", "TRUE")' "$@"
   # The boot plan leaves an endpoint-less member Dormant owing nothing, so
   # the seal would refuse the whole start.
   mutate seed stay_dormant_owes_nothing \
