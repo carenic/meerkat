@@ -302,6 +302,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `boot_plan_sealed`: `Bool`
 - `member_rotation_session_ids`: `Map<AgentIdentity, SessionId>`
 - `member_rotation_peer_endpoints`: `Map<AgentIdentity, MemberPeerEndpoint>`
+- `runtime_retire_archive_only`: `Set<AgentRuntimeId>`
 
 ## Inputs
 - `RunFlow`(run_id: RunId, step_ids: Set<StepId>, ordered_steps: Seq<StepId>, step_status: Map<StepId, Option<StepRunStatus>>, output_recorded: Map<StepId, Bool>, step_condition_results: Map<StepId, Option<Bool>>, step_has_conditions: Map<StepId, Bool>, step_dependencies: Map<StepId, Seq<StepId>>, step_dependency_modes: Map<StepId, DependencyMode>, step_branches: Map<StepId, Option<BranchId>>, step_collection_policies: Map<StepId, CollectionPolicyKind>, step_quorum_thresholds: Map<StepId, u32>, step_target_counts: Map<StepId, u64>, step_target_success_counts: Map<StepId, u64>, step_target_terminal_failure_counts: Map<StepId, u64>, escalation_threshold: u64, max_step_retries: u32, max_active_nodes: u64, max_active_frames: u64, max_frame_depth: u64)
@@ -541,10 +542,10 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `PlanBootMaterialization`(agent_identity: AgentIdentity, obligation: MemberRecoveryObligationKind, host_required: Bool, orchestrator_notified: Bool)
 - `SealBootMaterializationPlan`
 - `ClassifyPeerNotice`(recipient: AgentIdentity, sender: AgentIdentity, notice_class: PeerInputClass)
-- `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
+- `CommitDormantSeat`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: Bool, runtime_mode: SpawnPolicyRuntimeMode, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool, kickoff_owed: Bool)
 - `ResolveMemberHostPreparation`(agent_identity: AgentIdentity)
 - `BeginMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: SessionId, peer_endpoint: Option<MemberPeerEndpoint>, session_archived: Bool)
-- `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool)
+- `CommitMemberRotation`(agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, session_id: Option<SessionId>, disposal: MemberSessionDisposal, next_agent_runtime_id: AgentRuntimeId, next_fence_token: FenceToken, next_generation: Generation, runtime_mode: SpawnPolicyRuntimeMode, external_addressable: Bool, kickoff_owed: Bool)
 
 ## Signals
 - `ObserveRuntimeReady`(agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, runtime_epoch_id: Option<RuntimeEpochId>)
@@ -786,6 +787,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `MemberWakeClassified`(agent_identity: AgentIdentity, cause: MemberWakeCause, verdict: MemberWakeVerdictKind, refusal: Option<MemberWakeRefusalKind>, attempt: Option<u64>, session_id: Option<SessionId>)
 - `MemberWakeFeedbackResolved`(agent_identity: AgentIdentity, attempt: u64, verdict: MemberWakeFeedbackVerdict)
 - `MemberWakesAbandoned`(cause: MemberWakeAbandonCause)
+- `RotationSessionsAbandoned`(rotations: Map<AgentIdentity, SessionId>)
 - `CloseMemberPeerIngress`(reason: MemberWakeRefusalKind)
 - `ReopenMemberPeerIngress`
 - `PublishWakeRoute`(agent_identity: AgentIdentity)
@@ -961,6 +963,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `attempt_and_epoch_follow_the_phase`
 - `only_a_running_mob_wakes`
 - `rotation_intent_is_a_retiring_member`
+- `archive_only_retirement_is_retiring`
+- `destroyed_mob_holds_no_member_lifecycle`
 
 ## Transitions
 ### `ClassifyFlowRunTerminalityTerminalRunning`
@@ -6913,7 +6917,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `retire_refusal_absent`
   - `session_present`
   - `session_binding_matches`
+  - `member_not_dormant`
+  - `member_not_waking`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestKickoffQuiesce`
+- To: `Running`
+
+### `RetireMemberArchiveOnly`
+- From: `Running`
+- On: `RetireMember`(agent_identity, agent_runtime_id, fence_token, session_id)
+- Guards:
+  - `placement_absent`
+  - `identity_binding_matches`
+  - `current_binding_matches`
+  - `fence_token_matches`
+  - `member_not_retiring`
+  - `retirement_session_absent`
+  - `retire_refusal_absent`
+  - `session_present`
+  - `session_binding_matches`
+  - `member_dormant_or_waking`
+- Emits: `AppendLifecycleJournal`, `RequestKickoffQuiesce`
 - To: `Running`
 
 ### `RetireMemberRemote`
@@ -7005,6 +7028,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `identity_binding_matches`
   - `member_retiring`
   - `retirement_pending`
+  - `runtime_retire_routable`
 - Emits: `RequestRuntimeRetire`
 - To: `Running`
 
@@ -7015,6 +7039,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `identity_binding_matches`
   - `member_retiring`
   - `retirement_pending`
+  - `runtime_retire_routable`
 - Emits: `RequestRuntimeRetire`
 - To: `Stopped`
 
@@ -7142,7 +7167,29 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `retire_refusal_absent`
   - `session_present`
   - `session_binding_matches`
+  - `member_not_dormant`
+  - `member_not_waking`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
+- To: `Running`
+
+### `AdmitDestroyMemberRetireArchiveOnlyRunning`
+- From: `Running`
+- On: `AdmitDestroyMemberRetire`(mob_id, agent_identity, agent_runtime_id, fence_token, generation, session_id)
+- Guards:
+  - `destroy_admitted`
+  - `placement_absent`
+  - `identity_binding_matches`
+  - `current_binding_matches`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_not_retiring`
+  - `session_ingress_detach_absent`
+  - `retirement_session_absent`
+  - `retire_refusal_absent`
+  - `session_present`
+  - `session_binding_matches`
+  - `member_dormant_or_waking`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
 - To: `Running`
 
 ### `AdmitDestroyMemberRetireLiveStopped`
@@ -7161,7 +7208,29 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `retire_refusal_absent`
   - `session_present`
   - `session_binding_matches`
+  - `member_not_dormant`
+  - `member_not_waking`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
+- To: `Stopped`
+
+### `AdmitDestroyMemberRetireArchiveOnlyStopped`
+- From: `Stopped`
+- On: `AdmitDestroyMemberRetire`(mob_id, agent_identity, agent_runtime_id, fence_token, generation, session_id)
+- Guards:
+  - `destroy_admitted`
+  - `placement_absent`
+  - `identity_binding_matches`
+  - `current_binding_matches`
+  - `fence_token_matches`
+  - `generation_matches`
+  - `member_not_retiring`
+  - `session_ingress_detach_absent`
+  - `retirement_session_absent`
+  - `retire_refusal_absent`
+  - `session_present`
+  - `session_binding_matches`
+  - `member_dormant_or_waking`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `RequestKickoffQuiesce`
 - To: `Stopped`
 
 ### `AdmitDestroyMemberRetireRemoteRunning`
@@ -7456,8 +7525,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7477,8 +7546,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7498,8 +7567,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Stopped`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7519,8 +7588,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7540,8 +7609,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Running`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7561,8 +7630,8 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - From: `Stopped`
 - On: `ObserveMemberRetirementArchived`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology)
 - Guards:
-  - `rotation_not_pending`
-  - `host_preparation_not_pending`
+  - `rotation_settled_or_destroying`
+  - `host_preparation_settled_or_destroying`
   - `topology_not_preserved`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
@@ -7969,6 +8038,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `attempt_open`
   - `member_is_local`
   - `binding_requested`
+  - `endpoint_registered`
 - Emits: `MemberWakeFeedbackResolved`
 - To: `Running`
 
@@ -8015,7 +8085,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `adaptive_lifecycle_drained`
   - `placed_completion_quiesce_started`
   - `placed_completion_destroy_intent`
-- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`, `MemberWakesAbandoned`
+- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`, `RotationSessionsAbandoned`, `MemberWakesAbandoned`
 - To: `Running`
 
 ### `AdmitDestroyStorageFinalizing`
@@ -8459,7 +8529,21 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `external_peer_key_not_already_wired`
   - `external_peer_edge_not_already_wired`
   - `local_member_peer_registered`
+  - `local_member_not_dormant`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustWiringRequested`, `EmitExternalPeerWiringLifecycleNotice`
+- To: `Running`
+
+### `WireExternalPeerDormantRunning`
+- From: `Running`
+- On: `WireExternalPeer`(key, edge)
+- Guards:
+  - `lifecycle_origin_open`
+  - `external_peer_key_matches_edge`
+  - `external_peer_key_not_already_wired`
+  - `external_peer_edge_not_already_wired`
+  - `local_member_peer_registered`
+  - `local_member_dormant`
+- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
 - To: `Running`
 
 ### `WireExternalPeerAlreadyWired`
@@ -8470,7 +8554,19 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `external_peer_key_already_wired`
   - `external_peer_edge_already_wired`
   - `local_member_peer_registered`
+  - `local_member_not_dormant`
 - Emits: `ExternalPeerTrustRepairRequested`
+- To: `Running`
+
+### `WireExternalPeerAlreadyWiredDormant`
+- From: `Running`
+- On: `WireExternalPeer`(key, edge)
+- Guards:
+  - `external_peer_key_matches_edge`
+  - `external_peer_key_already_wired`
+  - `external_peer_edge_already_wired`
+  - `local_member_peer_registered`
+  - `local_member_dormant`
 - To: `Running`
 
 ### `RegisterMemberPeerRunning`
@@ -8760,7 +8856,20 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `external_peer_key_currently_wired`
   - `external_peer_edge_currently_wired`
   - `local_member_peer_registered`
+  - `local_member_not_dormant`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustUnwiringRequested`, `EmitExternalPeerWiringLifecycleNotice`
+- To: `Running`
+
+### `UnwireExternalPeerDormantRunning`
+- From: `Running`
+- On: `UnwireExternalPeer`(key, edge)
+- Guards:
+  - `external_peer_key_matches_edge`
+  - `external_peer_key_currently_wired`
+  - `external_peer_edge_currently_wired`
+  - `local_member_peer_registered`
+  - `local_member_dormant`
+- Emits: `WiringGraphChanged`, `EmitExternalPeerWiringLifecycleNotice`
 - To: `Running`
 
 ### `UnwireExternalPeerAlreadyAbsent`
@@ -8785,6 +8894,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `local_member_peer_registered`
+  - `retiring_runtime_registered`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustUnwiringRequested`
 - To: `Running`
 
@@ -8801,6 +8911,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `local_member_peer_registered`
+  - `retiring_runtime_registered`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustUnwiringRequested`
 - To: `Stopped`
 
@@ -8817,6 +8928,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `local_member_peer_registered`
+  - `retiring_runtime_registered`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustWiringRequested`
 - To: `Running`
 
@@ -8833,6 +8945,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `fence_token_matches`
   - `member_retiring`
   - `local_member_peer_registered`
+  - `retiring_runtime_registered`
 - Emits: `WiringGraphChanged`, `ExternalPeerTrustWiringRequested`
 - To: `Stopped`
 
@@ -13129,7 +13242,27 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `releasing_present`
   - `releasing_matches_current`
   - `session_matches_releasing`
+  - `member_not_dormant`
+  - `member_not_waking`
+  - `runtime_retire_routable`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`, `RequestKickoffQuiesce`
+- To: `Running`
+
+### `RetireRunningReleasingArchiveOnly`
+- From: `Running`
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, generation, releasing, session_id)
+- Guards:
+  - `placement_absent`
+  - `active_members_present`
+  - `runtime_id_present`
+  - `identity_binding_matches`
+  - `generation_matches`
+  - `prior_session_binding_present`
+  - `releasing_present`
+  - `releasing_matches_current`
+  - `session_matches_releasing`
+  - `retire_archive_only`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`, `RequestKickoffQuiesce`
 - To: `Running`
 
 ### `RetireRemoteReleasingRunning`
@@ -13178,7 +13311,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `prior_session_binding_present`
   - `releasing_absent`
   - `session_binding_matches`
+  - `member_not_dormant`
+  - `member_not_waking`
+  - `runtime_retire_routable`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestKickoffQuiesce`
+- To: `Running`
+
+### `RetireRunningPreservingBindingArchiveOnly`
+- From: `Running`
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, generation, releasing, session_id)
+- Guards:
+  - `placement_absent`
+  - `active_members_present`
+  - `runtime_id_present`
+  - `identity_binding_matches`
+  - `generation_matches`
+  - `prior_session_binding_present`
+  - `releasing_absent`
+  - `session_binding_matches`
+  - `retire_archive_only`
+- Emits: `AppendLifecycleJournal`, `RequestKickoffQuiesce`
 - To: `Running`
 
 ### `RetireRunningNoBinding`
@@ -13209,7 +13361,27 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `releasing_present`
   - `releasing_matches_current`
   - `session_matches_releasing`
+  - `member_not_dormant`
+  - `member_not_waking`
+  - `runtime_retire_routable`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`, `RequestKickoffQuiesce`
+- To: `Stopped`
+
+### `RetireStoppedReleasingArchiveOnly`
+- From: `Stopped`
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, generation, releasing, session_id)
+- Guards:
+  - `placement_absent`
+  - `active_members_present`
+  - `runtime_id_present`
+  - `identity_binding_matches`
+  - `generation_matches`
+  - `prior_session_binding_present`
+  - `releasing_present`
+  - `releasing_matches_current`
+  - `session_matches_releasing`
+  - `retire_archive_only`
+- Emits: `AppendLifecycleJournal`, `RequestSessionIngressDetachForMobDestroy`, `MemberSessionBindingChanged`, `RequestKickoffQuiesce`
 - To: `Stopped`
 
 ### `RequestPendingSessionIngressDetachForMobDestroyRunning`
@@ -13302,7 +13474,26 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `prior_session_binding_present`
   - `releasing_absent`
   - `session_binding_matches`
+  - `member_not_dormant`
+  - `member_not_waking`
+  - `runtime_retire_routable`
 - Emits: `AppendLifecycleJournal`, `RequestRuntimeRetire`, `RequestKickoffQuiesce`
+- To: `Stopped`
+
+### `RetireStoppedPreservingBindingArchiveOnly`
+- From: `Stopped`
+- On: `Retire`(mob_id, agent_runtime_id, agent_identity, generation, releasing, session_id)
+- Guards:
+  - `placement_absent`
+  - `active_members_present`
+  - `runtime_id_present`
+  - `identity_binding_matches`
+  - `generation_matches`
+  - `prior_session_binding_present`
+  - `releasing_absent`
+  - `session_binding_matches`
+  - `retire_archive_only`
+- Emits: `AppendLifecycleJournal`, `RequestKickoffQuiesce`
 - To: `Stopped`
 
 ### `RetireStoppedNoBinding`
@@ -13941,7 +14132,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `adaptive_lifecycle_drained`
   - `placed_completion_quiesce_started`
   - `placed_completion_destroy_intent`
-- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`
+- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`, `RotationSessionsAbandoned`
 - To: `Stopped`
 
 ### `AdmitDestroyCleanupCompleted`
@@ -13951,7 +14142,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `adaptive_lifecycle_drained`
   - `placed_completion_quiesce_started`
   - `placed_completion_destroy_intent`
-- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`
+- Emits: `AppendLifecycleJournal`, `RequestPendingSpawnQuiesceForDestroy`, `RotationSessionsAbandoned`
 - To: `Completed`
 
 ### `AuthorizeFlowFrameReducerCommandAdmitNextReadyNodeStopped`
@@ -15642,10 +15833,11 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitDormantSeatRunning`
 - From: `Running`
-- On: `CommitDormantSeat`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived)
+- On: `CommitDormantSeat`(agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed)
 - Guards:
   - `lifecycle_origin_open`
   - `composition_authoritative`
+  - `seat_owes_no_kickoff`
   - `spawn_exec_opened`
   - `no_prior_session_binding`
   - `current_binding_absent`
@@ -15682,6 +15874,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - On: `BeginMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, peer_endpoint, session_archived)
 - Guards:
   - `composition_authoritative`
+  - `destroy_not_admitted`
   - `identity_binding_matches`
   - `fence_token_matches_history`
   - `generation_matches`
@@ -15694,29 +15887,14 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `member_peer_id_is_not_host`
 - To: `Running`
 
-### `BeginMemberRotationStopped`
-- From: `Stopped`
-- On: `BeginMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, peer_endpoint, session_archived)
-- Guards:
-  - `composition_authoritative`
-  - `identity_binding_matches`
-  - `fence_token_matches_history`
-  - `generation_matches`
-  - `member_retiring`
-  - `member_not_placed`
-  - `rotation_not_pending`
-  - `new_session`
-  - `session_not_archived`
-  - `peer_id_available_for_identity`
-  - `member_peer_id_is_not_host`
-- To: `Stopped`
-
 ### `CommitMemberRotationLiveRunning`
 - From: `Running`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
+  - `seat_owes_no_kickoff`
+  - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
   - `placed_carrier_absent`
@@ -15740,10 +15918,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationLiveStopped`
 - From: `Stopped`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
+  - `seat_owes_no_kickoff`
+  - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
   - `placed_carrier_absent`
@@ -15767,10 +15947,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationRetiredRunning`
 - From: `Running`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
+  - `seat_owes_no_kickoff`
+  - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
   - `placed_carrier_absent`
@@ -15794,10 +15976,12 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 
 ### `CommitMemberRotationRetiredStopped`
 - From: `Stopped`
-- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable)
+- On: `CommitMemberRotation`(agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed)
 - Guards:
   - `rotation_pending`
   - `composition_authoritative`
+  - `seat_owes_no_kickoff`
+  - `destroy_not_admitted`
   - `session_ingress_detach_closed`
   - `identity_binding_matches`
   - `placed_carrier_absent`

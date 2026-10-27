@@ -7971,6 +7971,7 @@ pub struct State {
     pub member_rotation_session_ids: std::collections::BTreeMap<AgentIdentity, SessionId>,
     pub member_rotation_peer_endpoints:
         std::collections::BTreeMap<AgentIdentity, MemberPeerEndpoint>,
+    pub runtime_retire_archive_only: std::collections::BTreeSet<AgentRuntimeId>,
 }
 impl Default for State {
     fn default() -> Self {
@@ -9389,6 +9390,7 @@ pub mod inputs {
         pub bridge_session_id: SessionId,
         pub member_peer_endpoint: Option<MemberPeerEndpoint>,
         pub session_archived: bool,
+        pub kickoff_owed: bool,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct ResolveMemberHostPreparation {
@@ -9417,6 +9419,7 @@ pub mod inputs {
         pub next_generation: Generation,
         pub runtime_mode: SpawnPolicyRuntimeMode,
         pub external_addressable: bool,
+        pub kickoff_owed: bool,
     }
 }
 
@@ -11852,6 +11855,10 @@ pub mod effects {
         pub cause: MemberWakeAbandonCause,
     }
     #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+    pub struct RotationSessionsAbandoned {
+        pub rotations: std::collections::BTreeMap<AgentIdentity, SessionId>,
+    }
+    #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     pub struct CloseMemberPeerIngress {
         pub reason: MemberWakeRefusalKind,
     }
@@ -12043,6 +12050,7 @@ pub enum Effect {
     MemberWakeClassified(effects::MemberWakeClassified),
     MemberWakeFeedbackResolved(effects::MemberWakeFeedbackResolved),
     MemberWakesAbandoned(effects::MemberWakesAbandoned),
+    RotationSessionsAbandoned(effects::RotationSessionsAbandoned),
     CloseMemberPeerIngress(effects::CloseMemberPeerIngress),
     ReopenMemberPeerIngress(effects::ReopenMemberPeerIngress),
     PublishWakeRoute(effects::PublishWakeRoute),
@@ -12208,6 +12216,7 @@ pub enum EffectKind {
     MemberWakeClassified,
     MemberWakeFeedbackResolved,
     MemberWakesAbandoned,
+    RotationSessionsAbandoned,
     CloseMemberPeerIngress,
     ReopenMemberPeerIngress,
     PublishWakeRoute,
@@ -13010,6 +13019,7 @@ pub enum TransitionId {
     ResolveSubmitWorkRejectionPeerOnlyNotExternallyAddressable,
     ResolveSubmitWorkRejectionStaleSessionBinding,
     RetireMember,
+    RetireMemberArchiveOnly,
     RetireMemberRemote,
     RetireMemberRemoteConfirmedRevoked,
     RetireMemberPeerOnly,
@@ -13028,7 +13038,9 @@ pub enum TransitionId {
     RecordRemoteMemberSupervisorRevokedAlreadyRecordedRunning,
     RecordRemoteMemberSupervisorRevokedAlreadyRecordedStopped,
     AdmitDestroyMemberRetireLiveRunning,
+    AdmitDestroyMemberRetireArchiveOnlyRunning,
     AdmitDestroyMemberRetireLiveStopped,
+    AdmitDestroyMemberRetireArchiveOnlyStopped,
     AdmitDestroyMemberRetireRemoteRunning,
     AdmitDestroyMemberRetireRemoteStopped,
     AdmitDestroyMemberRetireConfirmedRevokedRunning,
@@ -13127,7 +13139,9 @@ pub enum TransitionId {
     RestoreRetiringMemberWiringRunning,
     RestoreRetiringMemberWiringStopped,
     WireExternalPeerRunning,
+    WireExternalPeerDormantRunning,
     WireExternalPeerAlreadyWired,
+    WireExternalPeerAlreadyWiredDormant,
     RegisterMemberPeerRunning,
     RegisterMemberPeerAlreadyCurrentRunning,
     AuthorizeMemberEndpointMigrationTrustCleanupRunningRunning,
@@ -13150,6 +13164,7 @@ pub enum TransitionId {
     RecoverExternalPeerUnwireRunning,
     RecoverExternalPeerUnwireAlreadyAbsent,
     UnwireExternalPeerRunning,
+    UnwireExternalPeerDormantRunning,
     UnwireExternalPeerAlreadyAbsent,
     CleanupRetiringExternalPeerRunning,
     CleanupRetiringExternalPeerStopped,
@@ -13599,11 +13614,14 @@ pub enum TransitionId {
     ClassifyRetirePendingSpawnDispositionPreserveAbsentRunning,
     ClassifyRetirePendingSpawnDispositionPreserveAbsentStopped,
     RetireRunningReleasing,
+    RetireRunningReleasingArchiveOnly,
     RetireRemoteReleasingRunning,
     RetireRemoteConfirmedRevokedRunning,
     RetireRunningPreservingBinding,
+    RetireRunningPreservingBindingArchiveOnly,
     RetireRunningNoBinding,
     RetireStoppedReleasing,
+    RetireStoppedReleasingArchiveOnly,
     RequestPendingSessionIngressDetachForMobDestroyRunning,
     RequestPendingSessionIngressDetachForMobDestroyStopped,
     SessionIngressDetachedForMobDestroyRunning,
@@ -13613,6 +13631,7 @@ pub enum TransitionId {
     RetireRemoteReleasingStopped,
     RetireRemoteConfirmedRevokedStopped,
     RetireStoppedPreservingBinding,
+    RetireStoppedPreservingBindingArchiveOnly,
     RetireStoppedNoBinding,
     RetireAbsentRunning,
     RetireAbsentStopped,
@@ -13822,7 +13841,6 @@ pub enum TransitionId {
     ResolveMemberHostPreparationStopped,
     ResolveMemberHostPreparationCompleted,
     BeginMemberRotationRunning,
-    BeginMemberRotationStopped,
     CommitMemberRotationLiveRunning,
     CommitMemberRotationLiveStopped,
     CommitMemberRotationRetiredRunning,
@@ -14237,5 +14255,6 @@ pub fn initial_state() -> State {
         boot_plan_sealed: false,
         member_rotation_session_ids: Default::default(),
         member_rotation_peer_endpoints: Default::default(),
+        runtime_retire_archive_only: Default::default(),
     }
 }

@@ -233,6 +233,10 @@ pub mod fields {
         FieldId::parse("refusal_code").expect("field slug")
     }
 
+    pub fn residency_owner() -> FieldId {
+        FieldId::parse("residency_owner").expect("field slug")
+    }
+
     pub fn runtime_epoch_id() -> FieldId {
         FieldId::parse("runtime_epoch_id").expect("field slug")
     }

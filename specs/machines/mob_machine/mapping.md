@@ -1998,6 +1998,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireMember`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
+- `RetireMemberArchiveOnly`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RetireMemberRemote`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -2052,7 +2055,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `AdmitDestroyMemberRetireLiveRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `AdmitDestroyMemberRetireArchiveOnlyRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `AdmitDestroyMemberRetireLiveStopped`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `AdmitDestroyMemberRetireArchiveOnlyStopped`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `AdmitDestroyMemberRetireRemoteRunning`
@@ -2349,7 +2358,13 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `WireExternalPeerRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `WireExternalPeerDormantRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `WireExternalPeerAlreadyWired`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `WireExternalPeerAlreadyWiredDormant`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `RegisterMemberPeerRunning`
@@ -2416,6 +2431,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `UnwireExternalPeerRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `UnwireExternalPeerDormantRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `UnwireExternalPeerAlreadyAbsent`
@@ -3765,6 +3783,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireRunningReleasing`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
+- `RetireRunningReleasingArchiveOnly`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RetireRemoteReleasingRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -3774,12 +3795,18 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireRunningPreservingBinding`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
+- `RetireRunningPreservingBindingArchiveOnly`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RetireRunningNoBinding`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
 - `RetireStoppedReleasing`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
+- `RetireStoppedReleasingArchiveOnly`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RequestPendingSessionIngressDetachForMobDestroyRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -3807,6 +3834,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RetireStoppedPreservingBinding`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
+- `RetireStoppedPreservingBindingArchiveOnly`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `RetireStoppedNoBinding`
   - anchors: `mob_actor_authority`, `mob_membership_classifier_authority`
   - scenarios: `retire-recover-destroy`, `membership-admission-respawn-reconcile-rebind-timeout`
@@ -4434,9 +4464,6 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `BeginMemberRotationRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
-- `BeginMemberRotationStopped`
-  - anchors: (unclaimed)
-  - scenarios: (unclaimed)
 - `CommitMemberRotationLiveRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -5042,6 +5069,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `MemberWakesAbandoned`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `RotationSessionsAbandoned`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 - `CloseMemberPeerIngress`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
@@ -5273,6 +5303,12 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `rotation_intent_is_a_retiring_member`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `archive_only_retirement_is_retiring`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `destroyed_mob_holds_no_member_lifecycle`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 
