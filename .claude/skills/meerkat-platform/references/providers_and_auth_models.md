@@ -284,8 +284,9 @@ Prompt caching uses the `provider_tag` keys above:
   request, so every cache write of a `12h` request costs 2.5x the uncached
   input rate, the conversation tail included, against 1.25x for `30m`.
   Rows without this cache regime (`gpt-5.5`, `gpt-5.5-pro` and earlier)
-  refuse any TTL when the agent is built (a per-turn override, before its
-  request is sent).
+  refuse any TTL on the `openai_api` backend when the agent is built (a
+  per-turn override, before its request is sent); the backends below drop
+  the field instead.
   `prompt_cache_enabled = false` opts out: the request then carries only
   `prompt_cache_options = {"mode": "explicit"}` with no breakpoints, so
   nothing is cached.

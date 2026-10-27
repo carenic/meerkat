@@ -403,10 +403,13 @@ typed `provider_params.provider_tag` envelope for provider-specific fields:
     TTL applies to every breakpoint: a request with `12h` makes every cache
     write of that request a 12-hour write at 2.5x, the conversation tail
     included, not only the stable prefix. Weigh that against rewriting the
-    prefix after 30 minutes. Models without GPT-5.6-and-later prompt caching
-    (`gpt-5.5`, `gpt-5.5-pro` and earlier) refuse a TTL with a typed error
-    when the agent is built (a per-turn override, before its request is
-    sent); they set their lifetime with `prompt_cache_retention` instead.
+    prefix after 30 minutes. On the public OpenAI API, models without
+    GPT-5.6-and-later prompt caching (`gpt-5.5`, `gpt-5.5-pro` and earlier)
+    refuse a TTL with a typed error when the agent is built (a per-turn
+    override, before its request is sent); they set their lifetime with
+    `prompt_cache_retention` instead. The ChatGPT backend, Azure OpenAI and
+    Copilot drop the prompt-cache fields, so a TTL there is not sent and not
+    refused.
 
     Explicit mode marks every input item, so the last input before the
     previous run's output always carries a breakpoint. In `implicit` mode on

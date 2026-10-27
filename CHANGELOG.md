@@ -75,9 +75,12 @@ them.
   reads cost the same. The default stays `30m`; `12h` is only an explicit
   choice. Rows without GPT-5.6-and-later prompt caching (`gpt-5.5`,
   `gpt-5.5-pro` and earlier) refuse a TTL when the agent is built
-  (`BuildAgentError::Config`, like `prompt_cache_retention`); the request
-  lowering keeps the same check, a typed `InvalidRequest` before anything is
-  sent, for a per-turn override. The Python, TypeScript and Web SDK
+  (`BuildAgentError::Config`, like `prompt_cache_retention`) on the public
+  OpenAI API, the only backend that sends it; the ChatGPT backend, Azure
+  OpenAI and Copilot drop the prompt-cache fields, so their agents build as
+  before. The request lowering keeps the same check, a typed
+  `InvalidRequest` before anything is sent, for a per-turn override. The
+  Python, TypeScript and Web SDK
   vocabularies (`WireOpenAiPromptCacheTtl`, `OpenAiPromptCacheTtl`, and the
   fork-cache evidence `ForkCacheTtl`, now with `ForkCacheTtlUnknown`) carry
   the new values. The `prompt_cache_options.ttl` description in the schemas

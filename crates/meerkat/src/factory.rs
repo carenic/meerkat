@@ -1902,16 +1902,31 @@ fn validate_openai_prompt_cache_retention(
 
 /// Refuse a `prompt_cache_options.ttl` the resolved OpenAI catalog row does
 /// not accept when the agent is built, instead of failing its first request.
-/// The request lowering keeps the same check, with the same text, as the
+///
+/// It applies exactly where the request lowering would send the field: on a
+/// Responses client built for a backend that admits the prompt-cache fields
+/// (`OpenAiBackendKind::admits_prompt_cache_fields`, the public OpenAI API).
+/// The ChatGPT backend, Azure OpenAI and Copilot drop the field, so their
+/// agents build as before; a realtime text client sends no prompt-cache
+/// fields, and a client this build did not resolve (an override, a prepared
+/// controller) leaves the decision to its own lowering (`backend` `None`).
+/// The lowering keeps the same check, with the same text, as the
 /// backstop for per-turn overrides. Uncatalogued models keep the
 /// pass-through, and a disabled cache sends no TTL.
 fn validate_openai_prompt_cache_ttl(
     provider: Provider,
     model: &str,
     provider_params: Option<&meerkat_core::lifecycle::run_primitive::ProviderParamsOverride>,
+    backend: Option<meerkat_providers::NormalizedBackendKind>,
 ) -> Result<(), BuildAgentError> {
     use meerkat_core::lifecycle::run_primitive::ProviderTag;
     if provider != Provider::OpenAI {
+        return Ok(());
+    }
+    let Some(meerkat_providers::NormalizedBackendKind::OpenAi(backend)) = backend else {
+        return Ok(());
+    };
+    if !backend.admits_prompt_cache_fields() {
         return Ok(());
     }
     let Some(ProviderTag::OpenAi(tag)) =
@@ -3087,6 +3102,13 @@ struct ResolvedLlmClientPhase {
     credential_identity: Option<meerkat_core::AuthCredentialIdentity>,
     #[cfg(not(target_arch = "wasm32"))]
     auto_image_generation_executor: Option<Arc<dyn meerkat_llm_core::ImageGenerationExecutor>>,
+    /// The backend whose Responses lowering decides which OpenAI prompt-cache
+    /// fields reach the wire: the resolved connection's backend when this
+    /// phase built a Responses text client from it. `None` otherwise: a
+    /// realtime text client (it sends no prompt-cache fields), a client
+    /// override, the test shim, a self-hosted client, a prepared controller,
+    /// a handoff bootstrap.
+    prompt_cache_backend: Option<meerkat_providers::NormalizedBackendKind>,
 }
 
 /// Where a controller's adapters publish run events.
@@ -7554,6 +7576,7 @@ impl AgentFactory {
                     credential_identity: graph.credential_identity.clone(),
                     #[cfg(not(target_arch = "wasm32"))]
                     auto_image_generation_executor: graph.auto_image_generation_executor.clone(),
+                    prompt_cache_backend: None,
                 })
             }
             None => {
@@ -7604,6 +7627,7 @@ impl AgentFactory {
                     llm_client: Some(bootstrap_client),
                     credential_identity: None,
                     auto_image_generation_executor: None,
+                    prompt_cache_backend: None,
                 }
             }
             Err(error) => return Err(error),
@@ -7631,6 +7655,7 @@ impl AgentFactory {
                 .and_then(|client| client.output_token_limit()),
         };
         let resolved_auth_credential_identity = resolved_llm_client_phase.credential_identity;
+        let prompt_cache_backend = resolved_llm_client_phase.prompt_cache_backend;
         #[cfg(not(target_arch = "wasm32"))]
         let auto_image_generation_executor =
             resolved_llm_client_phase.auto_image_generation_executor;
@@ -9359,7 +9384,12 @@ impl AgentFactory {
             &model,
             build_config.provider_params.as_ref(),
         )?;
-        validate_openai_prompt_cache_ttl(provider, &model, build_config.provider_params.as_ref())?;
+        validate_openai_prompt_cache_ttl(
+            provider,
+            &model,
+            build_config.provider_params.as_ref(),
+            prompt_cache_backend,
+        )?;
         validate_anthropic_request_shaping(
             provider,
             &model,
@@ -10362,6 +10392,7 @@ impl AgentFactory {
                 .as_ref()
                 .map(meerkat_core::AuthCredentialIdentity::from_auth_binding)
         };
+        let mut prompt_cache_backend: Option<meerkat_providers::NormalizedBackendKind> = None;
         let llm_client: Option<Arc<dyn LlmClient>> = if build_config
             .agent_llm_client_override
             .is_some()
@@ -10562,6 +10593,10 @@ impl AgentFactory {
                         // composition seam (dogma §9).
                         let realtime_route = matches!(provider, Provider::OpenAI)
                             && is_openai_realtime_capable(&build_config.model);
+                        // The Responses client below lowers the prompt-cache
+                        // fields for this backend; a realtime text client
+                        // sends none.
+                        prompt_cache_backend = (!realtime_route).then_some(connection.backend);
                         let text_identity = SessionLlmIdentity {
                             model: build_config.model.clone(),
                             provider,
@@ -10706,6 +10741,7 @@ impl AgentFactory {
             credential_identity,
             #[cfg(not(target_arch = "wasm32"))]
             auto_image_generation_executor,
+            prompt_cache_backend,
         })
     }
 }
@@ -13170,15 +13206,18 @@ mod tests {
     }
 
     /// A `prompt_cache_options.ttl` the cataloged OpenAI row does not accept
-    /// is refused when the agent is built, with the request lowering's own
-    /// text; accepted TTLs, a disabled cache, uncatalogued models and other
-    /// providers pass.
+    /// is refused when the agent is built on the public OpenAI API, with the
+    /// request lowering's own text; accepted TTLs, a disabled cache,
+    /// uncatalogued models and other providers pass.
     #[test]
     fn unsupported_prompt_cache_ttl_is_refused_at_build() {
         use meerkat_core::lifecycle::run_primitive::{
             OpenAiPromptCacheOptions, OpenAiProviderTag, ProviderParamsOverride, ProviderTag,
         };
         use meerkat_core::model_profile::capabilities::OpenAiPromptCacheTtl;
+        use meerkat_core::provider_matrix::OpenAiBackendKind;
+        use meerkat_providers::NormalizedBackendKind;
+        let api = Some(NormalizedBackendKind::OpenAi(OpenAiBackendKind::OpenAiApi));
         let params = |ttl: OpenAiPromptCacheTtl, enabled: Option<bool>| ProviderParamsOverride {
             provider_tag: Some(ProviderTag::OpenAi(OpenAiProviderTag {
                 prompt_cache_enabled: enabled,
@@ -13195,6 +13234,7 @@ mod tests {
                 Provider::OpenAI,
                 model,
                 Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+                api,
             ) else {
                 panic!("{model} must refuse the 12h prompt-cache TTL at build");
             };
@@ -13207,6 +13247,7 @@ mod tests {
                     Provider::OpenAI,
                     model,
                     Some(&params(OpenAiPromptCacheTtl::TwelveHours, Some(false))),
+                    api,
                 )
                 .is_ok(),
                 "{model}: a disabled cache sends no TTL"
@@ -13222,6 +13263,7 @@ mod tests {
                         Provider::OpenAI,
                         model,
                         Some(&params(ttl, None)),
+                        api,
                     )
                     .is_ok(),
                     "{model} accepts {}",
@@ -13234,6 +13276,7 @@ mod tests {
                 Provider::OpenAI,
                 "gpt-5.9-future",
                 Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+                api,
             )
             .is_ok(),
             "uncatalogued models keep the pass-through"
@@ -13243,10 +13286,64 @@ mod tests {
                 Provider::SelfHosted,
                 "gpt-5.5",
                 Some(&params(OpenAiPromptCacheTtl::TwelveHours, None)),
+                api,
             )
             .is_ok(),
             "only the OpenAI provider is checked"
         );
+    }
+
+    /// The build check applies exactly where the request lowering sends the
+    /// TTL. The ChatGPT backend, Azure OpenAI and Copilot drop the
+    /// prompt-cache fields, so an agent there with any TTL on a model without
+    /// TTL support builds, as it did before the check; so does one with no
+    /// prompt-cache backend (a realtime text client, which sends no
+    /// prompt-cache fields, or a client this build did not resolve).
+    #[test]
+    fn prompt_cache_ttl_build_check_follows_the_backend_that_sends_it() {
+        use meerkat_core::lifecycle::run_primitive::{
+            OpenAiPromptCacheOptions, OpenAiProviderTag, ProviderParamsOverride, ProviderTag,
+        };
+        use meerkat_core::model_profile::capabilities::OpenAiPromptCacheTtl;
+        use meerkat_core::provider_matrix::OpenAiBackendKind;
+        use meerkat_providers::NormalizedBackendKind;
+        for ttl in [
+            OpenAiPromptCacheTtl::ThirtyMinutes,
+            OpenAiPromptCacheTtl::TwelveHours,
+        ] {
+            let params = ProviderParamsOverride {
+                provider_tag: Some(ProviderTag::OpenAi(OpenAiProviderTag {
+                    prompt_cache_options: Some(OpenAiPromptCacheOptions {
+                        mode: None,
+                        ttl: Some(ttl),
+                    }),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            };
+            for kind in OpenAiBackendKind::ALL {
+                let refused = validate_openai_prompt_cache_ttl(
+                    Provider::OpenAI,
+                    "gpt-5.5",
+                    Some(&params),
+                    Some(NormalizedBackendKind::OpenAi(*kind)),
+                )
+                .is_err();
+                assert_eq!(
+                    refused,
+                    kind.admits_prompt_cache_fields(),
+                    "gpt-5.5 with ttl {} on {}: refused only where the field is sent",
+                    ttl.as_wire_str(),
+                    kind.as_str()
+                );
+            }
+            assert!(
+                validate_openai_prompt_cache_ttl(Provider::OpenAI, "gpt-5.5", Some(&params), None)
+                    .is_ok(),
+                "no prompt-cache backend (a realtime client, an override) leaves the \
+                 decision to the client's own lowering"
+            );
+        }
     }
 
     /// A Gemini thinking level the cataloged model refuses is refused when
