@@ -176,8 +176,9 @@ pub(crate) struct MemberResidencyConfig {
     /// owed after its boot wake was refused retryably.
     pub(crate) owed_wake_retry: super::MemberWakeRetryBackoff,
     /// The builder's restore concurrency, on both start paths: how many
-    /// read-only verdicts the `OnDemandVerified` pass reads at once, and how
-    /// many members a clean-stop lift observes at once when it rebuilds them.
+    /// read-only verdicts the `OnDemandVerified` pass reads at once, how many
+    /// of its plan's wakes a clean-stop lift runs at once, and how many
+    /// members it observes at once when it rebuilds them.
     pub(crate) verify_concurrency: usize,
     /// Where a dormant seat takes its member's endpoint from; `None` until
     /// the host names its members' comms transport, and every seat is

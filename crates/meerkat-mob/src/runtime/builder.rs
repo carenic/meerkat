@@ -8297,6 +8297,7 @@ impl MobBuilder {
                 callback_claim_verifier,
                 provenance,
                 // A created mob restores no members; a later lift of it
+                // wakes its plan, observes the members it rebuilds and
                 // verifies at this concurrency.
                 #[cfg(feature = "runtime-adapter")]
                 resume_restore_concurrency,
@@ -8660,7 +8661,8 @@ impl MobBuilder {
             member_residency,
         } = self;
         // The verified pass reads at the restore concurrency on both start
-        // paths: this resume, and a later lift of the mob.
+        // paths: this resume, and a later lift of the mob, which also wakes
+        // its plan and observes the members it rebuilds at that bound.
         #[cfg(feature = "runtime-adapter")]
         let member_residency = super::boot_plan::MemberResidencyConfig {
             verify_concurrency: resume_restore_concurrency,
