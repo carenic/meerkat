@@ -7,10 +7,12 @@
 //!    spawn of a fresh spec that owes a kickoff (such a member is
 //!    embodied exactly as a spawn is), or what the seat needs.
 //! 2. The handle prepares each seat off the actor: the session's archived
-//!    state from the session owner's pinned observation (no body load), a
-//!    fresh seat's empty session through the fresh-spawn create path when it
-//!    does not exist yet (under its name-based id), and the
-//!    endpoint from the session's stored comms key.
+//!    state from the session owner's pinned observation (no body load), and
+//!    the endpoint from the session's stored comms key. A seat builds
+//!    nothing: a fresh seat's session (under its name-based id) does not
+//!    exist yet, and MobMachine records it unborn. The member's first wake
+//!    creates it through the spawn provision path, with the runtime
+//!    registration and the host's registration hook any member build has.
 //! 3. The actor commits the chunk in one step: on one prepared
 //!    authority, per identity `AuthorizeSpawnProfile`, `BeginSpawnExec` and
 //!    `CommitDormantSeat` as one batch (an identity the machine refuses is
@@ -21,10 +23,9 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use meerkat_core::comms::TrustedPeerDescriptor;
-use meerkat_core::service::{CreateSessionRequest, MobIncarnationId};
+use meerkat_core::service::MobIncarnationId;
 use meerkat_core::types::SessionId;
 
 use crate::error::{MobError, SessionResumeUnavailableReason};
@@ -149,7 +150,8 @@ pub(crate) fn fresh_seat_session_id(
 /// How a seat binds its session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::runtime) enum DormantSeatLaunch {
-    /// A new empty session under the fresh seat's name-based id.
+    /// A session under the fresh seat's name-based id, created by the
+    /// member's first wake (unborn until then).
     Fresh,
     /// The existing session the spec names.
     Resume,
@@ -176,7 +178,6 @@ pub(in crate::runtime) enum DormantSeatPlanEntry {
 pub(in crate::runtime) struct DormantSeatPlan {
     pub(in crate::runtime) entries: Vec<DormantSeatPlanEntry>,
     pub(in crate::runtime) endpoint_source: Option<MemberSeatEndpointSource>,
-    pub(in crate::runtime) provisioner: Arc<dyn super::provisioner::MobProvisioner>,
 }
 
 /// What one seat's commit needs, as the actor planned it.
@@ -186,10 +187,12 @@ pub(in crate::runtime) struct DormantSeatCandidate {
     pub(in crate::runtime) launch: DormantSeatLaunch,
     pub(in crate::runtime) session_id: SessionId,
     pub(in crate::runtime) generation: Generation,
-    /// A fresh seat's create request, built as a fresh spawn builds it.
-    /// `None` for a resume, and for a service that keeps no durable member
-    /// sessions (its wake's fresh recreation creates the session there).
-    pub(in crate::runtime) create_session: Option<Box<CreateSessionRequest>>,
+    /// Whether the seat's session does not exist yet: a fresh launch whose
+    /// session the preparation found absent. Nothing is created at the seat;
+    /// MobMachine records the member's session unborn, and the member's
+    /// first wake creates it through the spawn provision path, with the
+    /// host's registration hook. Set by [`prepare_dormant_seat`].
+    pub(in crate::runtime) session_unborn: bool,
     pub(in crate::runtime) runtime_mode: crate::MobRuntimeMode,
     pub(in crate::runtime) labels: BTreeMap<String, String>,
     pub(in crate::runtime) continuity_intent: super::SpawnContinuityIntent,
@@ -227,7 +230,6 @@ pub(in crate::runtime) enum MemberRotationPlan {
         /// rotation is one fresh seat.
         seated: bool,
         endpoint_source: Option<MemberSeatEndpointSource>,
-        provisioner: Arc<dyn super::provisioner::MobProvisioner>,
     },
     /// An identity that is not seated, whose spec owes a kickoff: spawned
     /// through the ordinary spawn path on its name-based session, as a seat
@@ -248,21 +250,21 @@ pub(in crate::runtime) enum DormantSeatCommitEntry {
         agent_identity: AgentIdentity,
         session_id: SessionId,
     },
-    /// A prepared seat: its session exists (or is recreated at its wake),
-    /// and `endpoint` is its stored-key endpoint (`None` under network
-    /// comms).
+    /// A prepared seat: its session exists, or is unborn (created by the
+    /// member's first wake), and `endpoint` is its stored-key endpoint
+    /// (`None` under network comms).
     Seat {
         candidate: Box<DormantSeatCandidate>,
         endpoint: Option<TrustedPeerDescriptor>,
     },
 }
 
-/// Prepare one seat off the actor: its session's archived state, a fresh
-/// seat's empty session, and its endpoint. A spec this refuses is answered
-/// with its typed outcome, and nothing of it is written.
+/// Prepare one seat off the actor: its session's archived state, whether a
+/// fresh seat's session is unborn, and its endpoint. Nothing is built or
+/// created. A spec this refuses is answered with its typed outcome, and
+/// nothing of it is written.
 pub(in crate::runtime) async fn prepare_dormant_seat(
     session_service: &dyn super::session_service::MobSessionService,
-    provisioner: &dyn super::provisioner::MobProvisioner,
     endpoint_source: Option<&MemberSeatEndpointSource>,
     mob_id: &MobId,
     mut candidate: Box<DormantSeatCandidate>,
@@ -288,7 +290,7 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
         .await
         .map_err(|error| refused(MobError::from(error)))?
         .lifecycle();
-    let created_key = match lifecycle {
+    candidate.session_unborn = match lifecycle {
         super::session_service::SessionResumeLifecycle::Archived { .. } => {
             return Err(Box::new(DormantSeatOutcome::SessionArchived {
                 agent_identity: agent_identity.clone(),
@@ -306,20 +308,15 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
                 verdict: None,
             }));
         }
-        // The session exists: a resume's, or the one an earlier attempt of
-        // this fresh seat created.
-        super::session_service::SessionResumeLifecycle::Active { .. } => None,
+        // The session exists: a resume's, or one an earlier build created
+        // under this fresh seat's name-based id. Its wake resumes it.
+        super::session_service::SessionResumeLifecycle::Active { .. } => false,
         super::session_service::SessionResumeLifecycle::NoCurrentDurableAuthority => {
-            match (candidate.launch, candidate.create_session.take()) {
-                (DormantSeatLaunch::Fresh, Some(create_session)) => {
-                    created_dormant_session_key(provisioner, *create_session)
-                        .await
-                        .map_err(&refused)?
-                }
-                // A service with no durable member sessions: the member's
-                // wake recreates its session fresh.
-                (DormantSeatLaunch::Fresh, None) => None,
-                (DormantSeatLaunch::Resume, _) => {
+            match candidate.launch {
+                // Nothing is created here: the member's first wake creates
+                // the session, through the spawn provision path.
+                DormantSeatLaunch::Fresh => true,
+                DormantSeatLaunch::Resume => {
                     return Err(refused(MobError::SessionUnavailableForResume {
                         session_id,
                         reason: SessionResumeUnavailableReason::Absent,
@@ -333,19 +330,11 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
     let endpoint = match endpoint_source {
         MemberSeatEndpointSource::Network => None,
         MemberSeatEndpointSource::SessionScopedInproc { identity_root } => {
+            // The member's first build loads this key; its wake checks that
+            // the endpoint it built is the one recorded here.
             let public_key = stored_member_comms_key(identity_root, &session_id, candidate.launch)
                 .await
                 .map_err(&refused)?;
-            // The key the session's own build loaded must be the stored one:
-            // a different one means the configured root is not the session
-            // service's, and the seat would record an endpoint its wake
-            // disagrees with.
-            if created_key.is_some_and(|created| created != public_key) {
-                return Err(refused(MobError::WiringError(format!(
-                    "the comms identity session '{session_id}' was built with differs from \
-                     the one under the configured member comms identity root"
-                ))));
-            }
             Some(
                 inproc_member_endpoint(
                     mob_id,
@@ -361,28 +350,6 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
         candidate,
         endpoint,
     })
-}
-
-/// Create a fresh seat's empty session; the public key its build used.
-#[cfg(feature = "runtime-adapter")]
-async fn created_dormant_session_key(
-    provisioner: &dyn super::provisioner::MobProvisioner,
-    create_session: CreateSessionRequest,
-) -> Result<Option<[u8; 32]>, MobError> {
-    provisioner
-        .create_dormant_member_session(create_session)
-        .await
-        .map(|created| created.public_key)
-}
-
-#[cfg(not(feature = "runtime-adapter"))]
-async fn created_dormant_session_key(
-    _provisioner: &dyn super::provisioner::MobProvisioner,
-    _create_session: CreateSessionRequest,
-) -> Result<Option<[u8; 32]>, MobError> {
-    Err(MobError::Internal(
-        "a dormant seat's session is created through the runtime adapter".into(),
-    ))
 }
 
 /// The public key of a member session's stored comms identity: one local

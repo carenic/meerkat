@@ -3189,6 +3189,13 @@ impl MobActor {
         // operation binding here.
         let archive_only = continuation.registration_refused
             || self.runtime_retire_archive_only(&continuation.entry.agent_runtime_id);
+        // A seat's unborn session was never created (MobMachine keeps the
+        // fact until this step): an archive that finds no session has
+        // nothing to archive.
+        let session_unborn = crate::runtime::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            &identity,
+        );
         let observation = RetirementArchiveObservationSource {
             service: self.session_service.clone(),
             #[cfg(feature = "runtime-adapter")]
@@ -3223,12 +3230,17 @@ impl MobActor {
                             .retire_member_until(&member, &identity, deadline)
                             .await
                     };
-                    if matches!(
+                    let not_found = matches!(
                         &result,
                         Err(MobError::SessionError(
                             meerkat_core::service::SessionError::NotFound { .. }
                         ))
-                    ) && let Some(session) = member.bridge_session_id()
+                    );
+                    if not_found && session_unborn {
+                        return Ok(mob_dsl::MemberSessionDisposal::Archived);
+                    }
+                    if not_found
+                        && let Some(session) = member.bridge_session_id()
                         && observation.already_complete(session).await?
                     {
                         return Ok(mob_dsl::MemberSessionDisposal::Archived);

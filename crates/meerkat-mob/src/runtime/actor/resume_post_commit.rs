@@ -56,12 +56,16 @@ impl MobActor {
                 {
                     continue;
                 }
-                // A Dormant member has no session actor in this process: the
-                // provision of its wake (the shared cold recipe) binds its
-                // owner context, so its session is neither read nor
-                // registered here, exactly as at startup. MobMachine's
-                // residency decides it.
-                if crate::runtime::boot_plan::domain_member_is_dormant(
+                // A member that is not materialized has no session actor of
+                // its own here: the provision of its wake (the shared cold
+                // recipe) binds its owner context, so its session is neither
+                // read nor registered here. A Dormant member waits for its
+                // first delivery; a Waking one's wake is in flight, and by
+                // now every open wake belongs to someone other than the lift
+                // (the lift's own planned wakes settled before this pass), so
+                // binding it here would race that wake's own binding.
+                // MobMachine's residency decides it.
+                if crate::runtime::boot_plan::domain_member_is_unmaterialized(
                     self.dsl_authority.state(),
                     &entry.agent_identity,
                 ) {

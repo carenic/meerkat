@@ -256,6 +256,20 @@ pub(crate) fn domain_member_is_dormant(
     member_is_dormant(state, &mob_dsl::AgentIdentity::from_domain(identity))
 }
 
+/// Whether MobMachine holds `identity`'s session unborn: a seat (or a
+/// rotation's next incarnation) created nothing, and the member's first wake
+/// creates the session through the spawn provision path. A retirement keeps
+/// the fact until its archive step, which then has nothing to archive when
+/// the session was never created.
+pub(crate) fn domain_member_seat_session_unborn(
+    state: &mob_dsl::MobMachineState,
+    identity: &AgentIdentity,
+) -> bool {
+    state
+        .member_seat_session_unborn
+        .contains(&mob_dsl::AgentIdentity::from_domain(identity))
+}
+
 /// Whether MobMachine holds `identity` seated and not (yet) materialized in
 /// this process: Dormant, or Waking under an open wake attempt whose owner
 /// runs the member's readiness itself.

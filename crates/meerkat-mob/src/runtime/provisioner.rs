@@ -1561,16 +1561,6 @@ enum MemberRunCancel {
     Now,
 }
 
-/// A dormant seat's empty session, created durably
-/// ([`MobProvisioner::create_dormant_member_session`]).
-#[cfg(feature = "runtime-adapter")]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct DormantMemberSessionCreated {
-    /// The public key of the comms identity the session's build used, when
-    /// the build had one.
-    pub(crate) public_key: Option<[u8; 32]>,
-}
-
 #[cfg_attr(target_arch = "wasm32", async_trait(?Send))]
 #[cfg_attr(not(target_arch = "wasm32"), async_trait)]
 pub trait MobProvisioner: Send + Sync {
@@ -1586,24 +1576,6 @@ pub trait MobProvisioner: Send + Sync {
         &self,
         req: ProvisionMemberRequest,
     ) -> Result<MemberSpawnReceipt, MobError>;
-
-    /// Create a fresh member's empty durable session without materializing
-    /// the member: a dormant seat's session. `create_session`
-    /// is the create request a fresh spawn sends, already carrying the
-    /// session's pre-assigned id; the session is persisted by the same
-    /// session-service create a fresh spawn's provision runs, with no
-    /// runtime registration, and its live actor is discarded at once.
-    /// Returns the public key of the comms identity the build used. A
-    /// provisioner that cannot create such a session refuses.
-    #[cfg(feature = "runtime-adapter")]
-    async fn create_dormant_member_session(
-        &self,
-        _create_session: meerkat_core::service::CreateSessionRequest,
-    ) -> Result<DormantMemberSessionCreated, MobError> {
-        Err(MobError::Internal(
-            "this provisioner cannot create a dormant member's session".into(),
-        ))
-    }
 
     /// Provision a fresh member and hold it before its publication: its
     /// agent finished under its host's selection and its built surface
@@ -14975,59 +14947,6 @@ impl MobProvisioner for SessionBackend {
             .await
     }
 
-    async fn create_dormant_member_session(
-        &self,
-        mut create_session: meerkat_core::service::CreateSessionRequest,
-    ) -> Result<DormantMemberSessionCreated, MobError> {
-        // The WorkGraph grant every member build in this mob receives
-        // (`provision_member_until_created`), so the session's build is a
-        // fresh spawn's build.
-        if let (Some(workgraph), Some(build)) = (
-            self.workgraph_service.as_ref(),
-            create_session.build.as_mut(),
-        ) && build.workgraph_tools.is_none()
-        {
-            build.workgraph_namespace_grant = Some(workgraph.namespace_grant().clone());
-            build.workgraph_tools = Some(Arc::new(meerkat::WorkGraphToolSurface::new(
-                workgraph.clone(),
-            )));
-        }
-        let session_id = create_session
-            .build
-            .as_ref()
-            .and_then(|build| build.resume_session.as_ref())
-            .map(|session| session.id().clone())
-            .ok_or_else(|| {
-                MobError::Internal(
-                    "a dormant member's session is created under its pre-assigned id".into(),
-                )
-            })?;
-        // No runtime registration: the build is the standalone one a
-        // provision without a runtime adapter runs, and nothing is
-        // materialized past this call.
-        let created = self
-            .session_service
-            .create_session(create_session)
-            .await
-            .map_err(MobError::from)?;
-        if created.session_id != session_id {
-            return Err(MobError::Internal(format!(
-                "the session service created session '{}' for the dormant member session '{session_id}'",
-                created.session_id
-            )));
-        }
-        let public_key = self
-            .session_service
-            .comms_runtime(&session_id)
-            .await
-            .and_then(|comms| comms.public_key_bytes());
-        self.session_service
-            .discard_live_session(&session_id)
-            .await
-            .map_err(MobError::from)?;
-        Ok(DormantMemberSessionCreated { public_key })
-    }
-
     async fn provision_member_held(
         &self,
         req: ProvisionMemberRequest,
@@ -18213,15 +18132,6 @@ impl MobProvisioner for MultiBackendProvisioner {
         }
         req.direct_member_incarnation = None;
         self.session.provision_member_held(req).await
-    }
-
-    async fn create_dormant_member_session(
-        &self,
-        create_session: meerkat_core::service::CreateSessionRequest,
-    ) -> Result<DormantMemberSessionCreated, MobError> {
-        self.session
-            .create_dormant_member_session(create_session)
-            .await
     }
 
     async fn provision_member(

@@ -14700,6 +14700,14 @@ impl MobActor {
             );
             return None;
         }
+        // A seat's unborn session is not missing: it does not exist yet, and
+        // the member's first wake creates it (MobMachine's fact).
+        if super::boot_plan::domain_member_seat_session_unborn(
+            self.dsl_authority.state(),
+            &domain_identity,
+        ) {
+            return None;
+        }
         if let Some(reason) = self
             .dsl_authority
             .state()
@@ -51208,6 +51216,14 @@ impl MobActor {
                     ..
                 }),
             ) => {
+                // A seat's unborn session was never created: there is
+                // nothing to archive, and nothing will create it now.
+                if super::boot_plan::domain_member_seat_session_unborn(
+                    self.dsl_authority.state(),
+                    &ctx.agent_identity,
+                ) {
+                    return Ok(mob_dsl::MemberSessionDisposal::Archived);
+                }
                 if let Some(session_id) = ctx.entry.member_ref.bridge_session_id()
                     && self.retirement_archive_already_complete(session_id).await?
                 {

@@ -67,17 +67,22 @@ them.
     start).
   - `MobHandle::seat_dormant_members(specs)` with `DormantSeatOutcome`:
     seats members Dormant without materializing them, at most 256 per
-    journal batch, one typed outcome per spec. A fresh spec gets a new
-    empty session under a name-based id, created through the fresh-spawn
-    create path; a resume spec binds its session (never an archived one); a
-    fresh spec that owes a kickoff is spawned instead, as a spawn is.
+    journal batch, one typed outcome per spec. A fresh spec is seated under
+    a name-based session id and builds nothing (no session, tools, MCP
+    connection or runtime registration): the member's first wake creates
+    its session through the spawn provision path, with the runtime
+    registration and the host's registration hook, and its build inputs
+    come from the spawn customizer there. A resume spec binds its session
+    (never an archived one); a fresh spec that owes a kickoff is spawned
+    instead, as a spawn is.
     `MobBuilder::with_member_comms_identity_root` (inproc comms) or
     `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
     a seat's endpoint comes from.
   - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
     reset): its current incarnation is retired and the next one is seated
-    Dormant on a new empty session in the retirement's terminal step, both
-    journal rows in one batch, so the identity is never a non-member. A spec
+    Dormant under a new name-based session id in the retirement's terminal
+    step, both journal rows in one batch, so the identity is never a
+    non-member; nothing is built for it until its first wake. A spec
     that owes a kickoff (an `AutonomousHost` member, or an initial message)
     records it on the new incarnation in the same batch: it wakes the new
     incarnation once and runs exactly once on its new session, also across
@@ -141,6 +146,11 @@ them.
 - Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
   member rotated with `MobHandle::rotate_member`, so a rotated member whose
   owed kickoff has not run yet does not run it after a rollback to 0.9.6.
+
+- Upgrade note, rollback: a fresh dormant seat (`MobHandle::seat_dormant_members`
+  or a `MobHandle::rotate_member` next incarnation) has no session until its
+  first wake. A rollback to 0.9.6 restores such a member that never woke as
+  Broken, with a missing session.
 
 - Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
   (`MobHandle::resume`) keeps a member's live actor only when it runs the auth
