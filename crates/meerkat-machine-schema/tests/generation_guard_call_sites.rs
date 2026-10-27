@@ -63,6 +63,11 @@ fn every_mint_guard_reads_the_minted_generation() {
             "BeginSpawnExecFresh",
             "BeginSpawnExecFreshPeerOnly",
             "BeginSpawnExecRemote",
+            "CommitDormantSeatRunning",
+            "CommitMemberRotationLiveRunning",
+            "CommitMemberRotationLiveStopped",
+            "CommitMemberRotationRetiredRunning",
+            "CommitMemberRotationRetiredStopped",
         ],
         "the mint sites changed: pin each new one here"
     );

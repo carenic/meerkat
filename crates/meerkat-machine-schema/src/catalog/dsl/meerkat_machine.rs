@@ -7302,7 +7302,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         }
 
         effect MeerkatMachineEffect {
-            RuntimeBound { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
+            RuntimeBound { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, runtime_epoch_id: Option<RuntimeEpochId> },
             RuntimeRetired { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             RuntimeDestroyed { agent_runtime_id: AgentRuntimeId, fence_token: FenceToken },
             TurnRunStarted { run_id: RunId },
@@ -8615,6 +8615,12 @@ macro_rules! meerkat_catalog_machine_dsl {
             ResumableRunSettled { run_id: RunId, reason: Enum<InputAbandonReason> },
             // A graceful requeue stop left the in-flight run resumable.
             RunSuspendedForStop { run_id: RunId },
+            // A session's runtime registration was released (G1): every
+            // unregister, the idle-executor teardown included, publishes the
+            // released registration's exact runtime id, fence and epoch. The
+            // composition routes it to the owning mob, which demotes exactly
+            // that live materialization to Dormant (a stale release is a no-op).
+            RuntimeRegistrationReleased { agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId> },
         }
 
         // =====================================================================
@@ -8624,6 +8630,7 @@ macro_rules! meerkat_catalog_machine_dsl {
         disposition RuntimeBound => routed [MobMachine] seam NoOwnerRealization,
         disposition RuntimeRetired => routed [MobMachine] seam NoOwnerRealization,
         disposition RuntimeDestroyed => routed [MobMachine] seam NoOwnerRealization,
+        disposition RuntimeRegistrationReleased => routed [MobMachine] seam NoOwnerRealization,
         disposition TurnRunStarted => local seam NoOwnerRealization,
         disposition TurnBoundaryApplied => local seam NoOwnerRealization,
         disposition LiveBoundaryContextReceiptResolved => local seam NoOwnerRealization,
@@ -12539,6 +12546,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // the generated ops-durability verdict.
             }
             to Idle
+            emit RuntimeRegistrationReleased { agent_runtime_id: agent_runtime_id, fence_token: fence_token, runtime_epoch_id: runtime_epoch_id }
         }
         transition UnregisterSessionAttached {
             on input UnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
@@ -12697,6 +12705,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // removal; the next registration starts on a fresh authority.
             }
             to Idle
+            emit RuntimeRegistrationReleased { agent_runtime_id: agent_runtime_id, fence_token: fence_token, runtime_epoch_id: runtime_epoch_id }
         }
         transition UnregisterSessionRunning {
             on input UnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
@@ -12857,6 +12866,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // removal; the next registration starts on a fresh authority.
             }
             to Idle
+            emit RuntimeRegistrationReleased { agent_runtime_id: agent_runtime_id, fence_token: fence_token, runtime_epoch_id: runtime_epoch_id }
         }
         transition UnregisterSessionRetired {
             on input UnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
@@ -13015,6 +13025,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // removal; the next registration starts on a fresh authority.
             }
             to Retired
+            emit RuntimeRegistrationReleased { agent_runtime_id: agent_runtime_id, fence_token: fence_token, runtime_epoch_id: runtime_epoch_id }
         }
         transition UnregisterSessionStopped {
             on input UnregisterSession { session_id, agent_runtime_id, fence_token, generation, runtime_epoch_id }
@@ -13173,6 +13184,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 // removal; the next registration starts on a fresh authority.
             }
             to Idle
+            emit RuntimeRegistrationReleased { agent_runtime_id: agent_runtime_id, fence_token: fence_token, runtime_epoch_id: runtime_epoch_id }
         }
 
         transition ResolveRuntimeOpsLifecycleDurabilityIdle {
@@ -14699,7 +14711,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_generation = generation;
             }
             to Initializing
-            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Idle → Attached
         transition PrepareBindingsIdle {
@@ -14723,7 +14735,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_generation = generation;
             }
             to Attached
-            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Attached → Attached
         transition PrepareBindingsAttached {
@@ -14747,7 +14759,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_generation = generation;
             }
             to Attached
-            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Running → Running
         transition PrepareBindingsRunning {
@@ -14771,7 +14783,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_generation = generation;
             }
             to Running
-            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
         // Retired → Retired
         transition PrepareBindingsRetired {
@@ -14795,7 +14807,7 @@ macro_rules! meerkat_catalog_machine_dsl {
                 self.active_runtime_generation = generation;
             }
             to Retired
-            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value") }
+            emit RuntimeBound { agent_runtime_id: self.active_runtime_id.get("value"), fence_token: self.active_fence_token.get("value"), runtime_epoch_id: self.active_runtime_epoch_id }
         }
 
         // 8. SetPeerIngressContext: per-phase self-loop, guard session_registered
