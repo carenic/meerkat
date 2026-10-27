@@ -2042,40 +2042,80 @@ async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_co
 }
 
 /// Every path that keeps a member's live actor instead of rebuilding it (a
-/// Resume-mode spawn, a restore that keeps the actor or a live successor,
-/// and a wake's live successor) calls the one shared binding check, so none
-/// of them keeps an actor that runs another binding than the member's spec.
-/// Read from the shipped source with a lexer pass (comments and literals
-/// blanked, test-only items removed), never a text search.
+/// Resume-mode spawn, a restore that keeps the actor or a live successor, a
+/// wake's live successor, and the explicit resume of a mob stopped in this
+/// process) calls the one shared binding check, so none of them keeps an
+/// actor that runs another binding than the member's spec. Where a restore
+/// or a wake records the member broken on a conflict, it also retires the
+/// live actor, so no surface reaches the old binding. Read from the shipped
+/// source with a lexer pass (comments and literals blanked, test-only items
+/// removed), never a text search.
 #[test]
 fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
     use super::fail_stop_cause::{function_body, shipped_code, whole_identifier};
 
     const CHECK: &str = "verify_live_actor_auth_binding";
+    const RETIRE: &str = "refuse_conflicting_live_actor";
     let runtime = std::path::PathBuf::from(
         std::env::var_os("CARGO_MANIFEST_DIR")
             .expect("CARGO_MANIFEST_DIR is set for test processes"),
     )
     .join("src")
     .join("runtime");
+    // (file, the item the function is declared in, its signature, whether a
+    // conflict there retires the live actor)
     let paths = [
-        ("actor.rs", "async fn enqueue_spawn_with_origin("),
-        ("builder.rs", "async fn restore_resumed_member("),
-        ("builder.rs", "async fn restore_member_on_successor("),
-        ("actor/member_wake_turn.rs", "async fn plan_member_wake("),
+        (
+            "actor.rs",
+            None,
+            "async fn enqueue_spawn_with_origin(",
+            false,
+        ),
+        (
+            "actor.rs",
+            Some("impl ExplicitResumePreparationContext"),
+            "async fn prepare(",
+            false,
+        ),
+        ("builder.rs", None, "async fn restore_resumed_member(", true),
+        (
+            "builder.rs",
+            None,
+            "async fn restore_member_on_successor(",
+            true,
+        ),
+        (
+            "actor/member_wake_turn.rs",
+            None,
+            "async fn plan_member_wake(",
+            true,
+        ),
     ];
-    for (file, signature) in paths {
+    for (file, within, signature, retires) in paths {
         let source = std::fs::read_to_string(runtime.join(file))
             .unwrap_or_else(|error| panic!("read {file}: {error}"));
         let code = shipped_code(&source);
-        let body = function_body(&code, signature)
+        let from = within.map_or(0, |item| {
+            code.find(item)
+                .unwrap_or_else(|| panic!("{file} has no shipped `{item}`"))
+        });
+        let body = function_body(&code[from..], signature)
+            .map(|body| from + body.start..from + body.end)
             .unwrap_or_else(|| panic!("{file} has no shipped `{signature}`"));
-        let calls_check = code[body.clone()]
-            .match_indices(CHECK)
-            .any(|(offset, name)| whole_identifier(&code, body.start + offset, name));
+        let calls = |name: &str| {
+            code[body.clone()]
+                .match_indices(name)
+                .any(|(offset, found)| whole_identifier(&code, body.start + offset, found))
+        };
         assert!(
-            calls_check,
+            calls(CHECK),
             "{file} `{signature}` keeps a live actor without calling {CHECK}"
         );
+        if retires {
+            assert!(
+                calls(RETIRE),
+                "{file} `{signature}` records a binding conflict without retiring the live actor ({RETIRE})"
+            );
+        }
     }
 }

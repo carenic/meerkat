@@ -94,8 +94,10 @@ them.
   data kind `member_auth_binding_conflict`), and nothing changes. A restore at
   a mob's start or a wake that would keep a member's live actor, or a live
   successor session, applies the same check: on a conflict the member's
-  restore or wake fails with that typed reason and the member is recorded
-  broken. Before, the live actor was reused on whatever binding it ran.
+  restore or wake fails with that typed reason, the member is recorded
+  broken, and the live actor is retired (its runtime registration closed,
+  work in flight interrupted), so no surface reaches the old binding. Before,
+  the live actor was reused on whatever binding it ran.
 
 ### Added
 

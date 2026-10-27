@@ -1296,8 +1296,8 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
     if successor_live {
         // A successor live in this process keeps serving when it runs the
         // binding the member's spec names (otherwise the wake fails, typed,
-        // and the live actor is not reused): repoint and bind it, nothing is
-        // provisioned.
+        // and the live actor is retired, not reused): repoint and bind it,
+        // nothing is provisioned.
         if let Some(requested) = seated.restore_spec.auth_binding.as_ref()
             && let Err(conflict) = super::super::live_actor_binding::verify_live_actor_auth_binding(
                 session_service.as_ref(),
@@ -1307,11 +1307,14 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
             )
             .await
         {
+            let reason = super::super::live_actor_binding::refuse_conflicting_live_actor(
+                session_service.as_ref(),
+                &successor,
+                &conflict,
+            )
+            .await;
             return Ok(WakePlan::Restore {
-                plan: MemberRestorePlan::Unseated(member_restore_failure(
-                    &successor,
-                    conflict.to_string(),
-                )),
+                plan: MemberRestorePlan::Unseated(member_restore_failure(&successor, reason)),
                 endpoint: WakeEndpoint::Matches,
             });
         }

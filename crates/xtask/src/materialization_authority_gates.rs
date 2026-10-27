@@ -270,6 +270,11 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
 /// seam and the session-service adapters.
 pub(crate) const MOB_MEMBER_SESSION_DISCARDS: &[SiteAllowance] = &[
     settled(
+        "crates/meerkat-mob/src/runtime/live_actor_binding.rs",
+        "retire_conflicting_live_actor",
+        "binding-conflict retire: a restore or a wake found the member's live actor (or live successor) on another auth binding than its spec, so the member is recorded broken (no phase to release, or its own wake attempt, where a release would be Stale); its exact runtime registration is unregistered to terminal first, then its live actor is discarded, so no surface reaches the old binding",
+    ),
+    settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "retire_exact_attachment_for_explicit_resume_owned",
         "explicit-resume lift: the member is Waking under the resume's own attempt, so a release would be Stale; the attempt's resolution decides the phase",
