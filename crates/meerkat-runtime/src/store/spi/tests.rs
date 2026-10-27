@@ -1767,6 +1767,15 @@ const SETTLED_PER_SNAPSHOT: usize = 50;
 /// and nothing else.
 const QUIET_RUNTIMES: usize = 2;
 
+/// The retention rule these rows hold the realm to: a scope's visible rows
+/// stay within `max(REBASE_FACTOR x live bytes, REBASE_FLOOR)` plus its last
+/// commit's rows. The rows pin the values instead of reading the realm's
+/// constants, so a floor that grows back fails them.
+const REBASE_FACTOR: u64 = 4;
+
+/// See [`REBASE_FACTOR`].
+const REBASE_FLOOR: u64 = 256 * 1024;
+
 /// A runtime's ops lifecycle registry settling background operations one
 /// after another: each is registered, runs, completes, and has its
 /// completion injected into its owner, so a snapshot taken between two
@@ -1985,11 +1994,10 @@ fn host_window(host: &TestHost, runtime: &LogicalRuntimeId) -> HostWindow {
 }
 
 /// The retention rule after one commit: the visible rows stay within
-/// `max(CHECKPOINT_FACTOR x the live bytes before the commit,
-/// CHECKPOINT_MIN_BYTES)` plus the rows the commit appended, and a commit
-/// that re-based the scope did it in its one batch, a reset first, with
-/// every row before the image's first row dropped. Answers whether it
-/// re-based.
+/// `max(REBASE_FACTOR x the live bytes before the commit, REBASE_FLOOR)`
+/// plus the rows the commit appended, and a commit that re-based the scope
+/// did it in its one batch, a reset first, with every row before the
+/// image's first row dropped. Answers whether it re-based.
 fn assert_retention(
     host: &TestHost,
     before: &HostWindow,
@@ -2001,11 +2009,11 @@ fn assert_retention(
         .range(before.end..)
         .map(|(_, len)| *len as u64)
         .sum();
-    let bound = (CHECKPOINT_FACTOR * before.live).max(CHECKPOINT_MIN_BYTES) + appended;
+    let bound = (REBASE_FACTOR * before.live).max(REBASE_FLOOR) + appended;
     assert!(
         after.bytes <= bound,
-        "{} holds {} row bytes, over max({CHECKPOINT_FACTOR} x {} live bytes, \
-         {CHECKPOINT_MIN_BYTES}) + {appended} appended",
+        "{} holds {} row bytes, over max({REBASE_FACTOR} x {} live bytes, \
+         {REBASE_FLOOR}) + {appended} appended",
         after.name,
         after.bytes,
         before.live
@@ -2245,6 +2253,11 @@ async fn a_settling_runtime_keeps_its_window_under_the_rebase_bound() {
 
     const SETTLED: usize = 100;
 
+    assert_eq!(
+        (CHECKPOINT_FACTOR, CHECKPOINT_MIN_BYTES),
+        (REBASE_FACTOR, REBASE_FLOOR),
+        "the realm re-bases by the rule these rows hold it to"
+    );
     let host = Arc::new(TestHost::new());
     let opened = open(&host).await;
     let mut session = meerkat_core::Session::new();
