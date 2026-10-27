@@ -9762,6 +9762,28 @@ impl MobHandle {
         )
     }
 
+    /// Whether MobMachine holds `identity` seated and not materialized in
+    /// this process: Dormant, or Waking while its one wake attempt runs.
+    /// Such a member has no session actor, so a subscription to its agent
+    /// events ([`Self::subscribe_agent_events_from`]) is refused
+    /// [`MobError::MemberSessionNotLive`] until its wake ends Live. The
+    /// wake changes the machine state ([`Self::machine_state_changes`]): a
+    /// host that keeps members' agent events attached subscribes a member
+    /// after the change that makes this read `false`, with no command to the
+    /// actor while it reads `true`, and replays from
+    /// [`SessionEventCursor::Earliest`], so the run the wake started is read
+    /// from its first event.
+    ///
+    /// Read from the machine state the actor last published, without a
+    /// command; reading it never wakes the member. `false` for a live member
+    /// and for an identity this mob does not hold seated in this process.
+    pub fn member_unmaterialized(&self, identity: &AgentIdentity) -> bool {
+        super::boot_plan::domain_member_is_unmaterialized(
+            &self.machine_state_watch_rx.borrow(),
+            identity,
+        )
+    }
+
     /// Wait until no explicit-resume lifecycle operation is pending for
     /// `identity`: the operation a `MobError::LifecycleOperationPending`
     /// naming `explicit_resume member <identity>` refers to (the mob's resume

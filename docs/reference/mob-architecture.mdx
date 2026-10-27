@@ -115,6 +115,16 @@ tell whether an identity had a created session before its last binding: a
 member reset seats the next life on a new, unborn session, while the session
 of the life before it stays in that list.
 
+A seated member that is not materialized in this process (dormant, or waking
+while its wake runs) has no session actor, so
+`MobHandle::subscribe_agent_events_from` refuses it
+`MobError::MemberSessionNotLive`. `MobHandle::member_unmaterialized(identity)`
+reads that fact from the published machine state, with no command and without
+waking the member. A host that keeps members' agent events attached waits on
+`machine_state_changes()` and subscribes a member once it reads materialized,
+replaying from `SessionEventCursor::Earliest`, so the run its wake started is
+read from its first event.
+
 ### One-shot durable role migration
 
 Role is durable context, but it is not member identity. `MemberLaunchMode::Resume`
