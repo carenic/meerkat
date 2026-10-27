@@ -3476,6 +3476,9 @@ const RESUME_MEMBER_READINESS_BOUND: Duration = Duration::from_secs(5);
 struct MemberReadinessTarget {
     entry: RosterEntry,
     stage: super::state::LifecycleProgressStage,
+    /// [`member_requires_comms_drain`], read from the machine when the
+    /// target was planned.
+    drain_required: bool,
 }
 
 /// Drain a readiness fan-out. A task that cannot be joined (the readiness
@@ -3503,7 +3506,7 @@ async fn collect_member_readiness_outcomes(
             }
         }
     }
-    for (agent_identity, MemberReadinessTarget { entry, stage }) in expected {
+    for (agent_identity, MemberReadinessTarget { entry, stage, .. }) in expected {
         outcomes.push(MemberReadinessOutcome {
             entry,
             stage,
@@ -3543,6 +3546,7 @@ async fn run_member_readiness_step(
     agent_identity: &AgentIdentity,
     member_ref: &MemberRef,
     stage: super::state::LifecycleProgressStage,
+    drain_required: bool,
 ) -> Result<(), MobError> {
     let work = async {
         match stage {
@@ -3557,7 +3561,7 @@ async fn run_member_readiness_step(
                     .ensure_runtime_session_state(member_ref)
                     .await?;
                 context
-                    .ensure_mob_comms_drain(agent_identity, member_ref)
+                    .ensure_member_comms_drain(agent_identity, member_ref, drain_required)
                     .await
             }
         }
@@ -3584,6 +3588,38 @@ async fn run_member_readiness_step(
             })
         }
     }
+}
+
+/// Whether a member's readiness requires its comms drain, failing closed
+/// without one, as a spawn requires it: an autonomous member, and a member
+/// MobMachine holds a wiring edge of (to another member or to an external
+/// peer). An unwired turn-driven member binds its drain only when its
+/// runtime has comms, as a turn-driven spawn does. Every readiness path (a
+/// wake, a warm reload, a start's restore) asks this one rule, so they never
+/// disagree.
+pub(super) fn member_requires_comms_drain(
+    state: &mob_dsl::MobMachineState,
+    entry: &RosterEntry,
+) -> bool {
+    entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost
+        || member_has_machine_wiring(state, &entry.agent_identity)
+}
+
+/// Whether MobMachine holds a wiring edge of `identity`, to another member or
+/// to an external peer.
+pub(super) fn member_has_machine_wiring(
+    state: &mob_dsl::MobMachineState,
+    identity: &AgentIdentity,
+) -> bool {
+    let local = mob_dsl::AgentIdentity::from_domain(identity);
+    state
+        .wiring_edges
+        .iter()
+        .any(|edge| edge.a == local || edge.b == local)
+        || state
+            .external_peer_edges_by_key
+            .values()
+            .any(|edge| edge.local == local)
 }
 
 impl DetachedMemberReadinessContext {
@@ -3641,6 +3677,29 @@ impl DetachedMemberReadinessContext {
         }
 
         Ok(())
+    }
+
+    /// The member's comms drain as [`member_requires_comms_drain`] decides
+    /// it: when `required`, as [`Self::ensure_mob_comms_drain`]; otherwise
+    /// bound only when the member's runtime has comms, and nothing when it
+    /// has none.
+    pub(super) async fn ensure_member_comms_drain(
+        &self,
+        agent_identity: &AgentIdentity,
+        member_ref: &MemberRef,
+        required: bool,
+    ) -> Result<(), MobError> {
+        #[cfg(feature = "runtime-adapter")]
+        if !required
+            && (self.runtime_adapter.is_none()
+                || self.provisioner.comms_runtime(member_ref).await.is_none())
+        {
+            return Ok(());
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        let _ = required;
+        self.ensure_mob_comms_drain(agent_identity, member_ref)
+            .await
     }
 
     /// Comms drain plus injector capability for a local AutonomousHost member.
@@ -22020,6 +22079,7 @@ impl MobActor {
             .map(|entry| MemberReadinessTarget {
                 entry: entry.clone(),
                 stage: member_readiness_stage(entry),
+                drain_required: member_requires_comms_drain(self.dsl_authority.state(), entry),
             })
             .collect::<Vec<_>>();
         Ok(Some(targets))
@@ -22039,7 +22099,12 @@ impl MobActor {
     ) -> tokio::task::JoinSet<MemberReadinessOutcome> {
         let mut readiness = tokio::task::JoinSet::new();
         let context = self.detached_member_readiness_context();
-        for MemberReadinessTarget { entry, stage } in targets {
+        for MemberReadinessTarget {
+            entry,
+            stage,
+            drain_required,
+        } in targets
+        {
             let context = context.clone();
             let progress = progress.clone();
             readiness.spawn(async move {
@@ -22048,8 +22113,14 @@ impl MobActor {
                 }
                 let agent_identity = entry.agent_identity.clone();
                 let member_ref = entry.member_ref.clone();
-                let result =
-                    run_member_readiness_step(&context, &agent_identity, &member_ref, stage).await;
+                let result = run_member_readiness_step(
+                    &context,
+                    &agent_identity,
+                    &member_ref,
+                    stage,
+                    drain_required,
+                )
+                .await;
                 if let Some(progress) = &progress {
                     progress.member_progress(&agent_identity, stage);
                 }
@@ -33755,6 +33826,7 @@ impl MobActor {
             };
             let command_tx = self.command_tx.clone();
             let context = self.detached_member_readiness_context();
+            let drain_required = member_requires_comms_drain(self.dsl_authority.state(), &entry);
             self.actor_io_tasks.spawn(async move {
                 let stage = member_readiness_stage(&entry);
                 let cause = recovery.cause;
@@ -33765,6 +33837,7 @@ impl MobActor {
                     &recovery,
                     reload,
                     stage,
+                    drain_required,
                 )
                 .await
                 else {
@@ -33798,6 +33871,7 @@ impl MobActor {
         recovery: &StartupMemberRecovery,
         reload: Option<oneshot::Receiver<Result<super::handle::MemberReloadOutcome, MobError>>>,
         stage: super::state::LifecycleProgressStage,
+        drain_required: bool,
     ) -> Option<Result<(), MobError>> {
         if let Some(reload) = reload {
             // The reload bounds its own observation
@@ -33838,8 +33912,14 @@ impl MobActor {
             Err(error) => return Some(Err(error)),
         }
         Some(
-            run_member_readiness_step(context, &entry.agent_identity, &entry.member_ref, stage)
-                .await,
+            run_member_readiness_step(
+                context,
+                &entry.agent_identity,
+                &entry.member_ref,
+                stage,
+                drain_required,
+            )
+            .await,
         )
     }
 

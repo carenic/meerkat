@@ -71,9 +71,12 @@ them.
   mob member's session that no mob in their own process owns
   (`SESSION_UNSUPPORTED`, the message names the member and its mob): deliver
   to the member through its mob, which wakes it. Before, they rebuilt the
-  member's session outside its mob, without its wiring and tools. A session
-  whose mob runs in the same process is woken through the mob instead, as
-  every other session-keyed live operation is.
+  member's session outside its mob, without its wiring and tools. The
+  refusal covers every session built as a mob member's, a retired member's
+  session included: neither command reads the mob's store to tell a retired
+  member from a seated one. A session whose mob runs in the same process is
+  woken through the mob instead, as every other session-keyed live operation
+  is.
 - `meerkat-runtime`: `meerkat_machine::composition::MeerkatSeamSignal::RuntimeBound`
   gains `runtime_epoch_id`, and the enum gains `RuntimeRegistrationReleased {
   agent_runtime_id, fence_token, runtime_epoch_id }`. Every final unregister of
@@ -357,6 +360,12 @@ them.
   a held create once activated, a respawn), not only about woken and
   restored members, so a host records the tool surface of every member Core
   built.
+- `meerkat-mob`: every readiness path (a wake, a registration reload, a
+  restore at a mob's start or resume) binds a member's comms drain by the
+  rule a spawn uses: an autonomous member and a wired member need it, and an
+  unwired turn-driven member binds it only when its runtime has comms. Before,
+  a restore or a reload of an unwired turn-driven member whose session
+  builder makes no comms failed its readiness, although its spawn succeeded.
 
 ### Fixed
 

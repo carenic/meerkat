@@ -1291,6 +1291,37 @@ async fn readiness_failure_rolls_the_reload_back_and_leaves_the_member_dormant()
     peer_progresses(&mob).await;
 }
 
+/// A durability reload of an unwired turn-driven member whose runtime has
+/// no comms binds no comms drain, as its spawn bound none and as its wake
+/// would (one drain rule for every readiness path), so the reload repairs
+/// the registration instead of failing its readiness. A wired member still
+/// requires its drain: see
+/// `readiness_failure_rolls_the_reload_back_and_leaves_the_member_dormant`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_reload_of_an_unwired_member_without_comms_repairs_its_registration() {
+    let mob = create_isolation_mob(1).await;
+    mob.service.set_missing_comms_runtime(mob.session(0)).await;
+    mob.degrade_member(0).await;
+    mob.store.fail_commit(mob.session(0), false);
+    let reloaded = tokio::time::timeout(
+        Duration::from_secs(5),
+        mob.handle.reload_member_registration(mob.member(0)),
+    )
+    .await
+    .expect("the reload settles")
+    .expect("the reload repairs the registration without a comms drain");
+    assert_eq!(reloaded.disposition, MemberReloadDisposition::Discarded);
+    assert_eq!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
+            .cloned(),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
     let mob = create_isolation_mob(2).await;
