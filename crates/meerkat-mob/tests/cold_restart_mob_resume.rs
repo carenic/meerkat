@@ -1644,6 +1644,249 @@ async fn mob_cold_restart_explicit_resume_revives_archived_session_over_reopened
     handle_2.shutdown().await.expect("final shutdown");
 }
 
+/// The ops lifecycle snapshot of a runtime whose session `owner` ran one
+/// background tool operation to completion, its completion taken by no
+/// consumer: work the runtime still owes the session.
+#[cfg(feature = "test-support")]
+fn undelivered_background_completion(
+    owner: &meerkat::SessionId,
+) -> meerkat_runtime::PersistedOpsSnapshot {
+    use meerkat_core::ops_lifecycle::{
+        OperationId, OperationKind, OperationResult, OperationSpec, OpsLifecycleRegistry as _,
+    };
+
+    let registry = meerkat_runtime::RuntimeOpsLifecycleRegistry::new();
+    let operation_id = OperationId::new();
+    registry
+        .register_operation(OperationSpec {
+            id: operation_id.clone(),
+            kind: OperationKind::BackgroundToolOp,
+            owner_session_id: owner.clone(),
+            display_name: "background operation".into(),
+            source_label: "cold-restart-mob-resume".into(),
+            operation_source: None,
+            child_session_id: None,
+            expect_peer_channel: false,
+        })
+        .expect("register the operation");
+    registry
+        .provisioning_succeeded(&operation_id)
+        .expect("start the operation");
+    registry
+        .complete_operation(
+            &operation_id,
+            OperationResult {
+                id: operation_id.clone(),
+                content: "done".into(),
+                is_error: false,
+                duration_ms: 1,
+                tokens_used: 0,
+            },
+        )
+        .expect("complete the operation");
+    registry
+        .capture_persistence_snapshot(
+            meerkat_core::RuntimeEpochId::new(),
+            &meerkat_core::EpochCursorState::new(),
+        )
+        .expect("the ops lifecycle snapshot")
+}
+
+/// How many assistant messages the history of `session_id` holds.
+#[cfg(feature = "test-support")]
+async fn assistant_message_count(
+    service: &dyn MobSessionService,
+    session_id: &meerkat::SessionId,
+) -> usize {
+    service
+        .read_history(
+            session_id,
+            SessionHistoryQuery {
+                offset: 0,
+                limit: None,
+            },
+        )
+        .await
+        .expect("read history")
+        .messages
+        .iter()
+        .filter(|message| matches!(message, meerkat_core::Message::BlockAssistant(_)))
+        .count()
+}
+
+/// A member's runtime retired outside the mob (`RuntimeControlPlane::retire`
+/// on the session service's machine) while the member stays seated: the
+/// session owner reads a retired runtime as archived. A crash-path start
+/// then leaves the member Dormant and does not revive its session, although
+/// the runtime's kept state still owes a background operation completion;
+/// the store's recovery scan does not list an archived runtime. The
+/// member's next wake revives the session and runs that work as a turn.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(feature = "test-support")]
+async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_next_wake() {
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let open_runtime_store = || -> Arc<dyn meerkat_runtime::RuntimeStore> {
+        Arc::new(
+            meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+                .expect("open durable runtime store"),
+        )
+    };
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+
+    // ---------------- Lifetime 1: a turn, then a retire outside the mob ----
+    let runtime_store_1 = open_runtime_store();
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store_1.clone());
+    let handle_1 = MobBuilder::new(
+        definition,
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service_1.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create persistent mob");
+    let worker = AgentIdentity::from("w-1");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("spawn the worker");
+    let session_id = handle_1
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("the worker's session");
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "BEFORE_OUTSIDE_RETIRE_TOKEN",
+        "before-outside-retire",
+    )
+    .await;
+    // The turn's answer is in the history too before the count is taken.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let answered_before = loop {
+        let answered = assistant_message_count(service_1.as_ref(), &session_id).await;
+        if answered > 0 {
+            break answered;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the first turn's answer reaches the history"
+        );
+        sleep(Duration::from_millis(200)).await;
+    };
+
+    let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
+    let adapter = service_1
+        .acquire_runtime_adapter(None)
+        .expect("acquire runtime authority")
+        .expect("real session runtime");
+    meerkat_runtime::RuntimeControlPlane::retire(adapter.as_ref(), &runtime_id)
+        .await
+        .expect("retire the worker's runtime outside the mob");
+    assert_eq!(
+        meerkat_runtime::store::load_runtime_state(runtime_store_1.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state after the retire"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "the retire is durable"
+    );
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before cold restart");
+    drop(adapter);
+    drop(handle_1);
+    drop(service_1);
+    drop(runtime_store_1);
+
+    // ---------------- Lifetime 2: the kept state owes a completion ----------
+    let runtime_store_2 = open_runtime_store();
+    meerkat_runtime::RuntimeStore::persist_ops_lifecycle(
+        runtime_store_2.as_ref(),
+        &runtime_id,
+        &undelivered_background_completion(&session_id),
+    )
+    .await
+    .expect("the owed completion is durable");
+    let scanned =
+        meerkat_runtime::RuntimeStore::list_runtimes_with_recovery_work(runtime_store_2.as_ref())
+            .await
+            .expect("the reopened store's recovery scan");
+    assert!(
+        !scanned.contains(&runtime_id),
+        "a retired runtime holds no recovery work, whatever it owes: {scanned:?}"
+    );
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_2.clone());
+    let handle_2 = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("resume mob after cold restart");
+    assert_eq!(
+        handle_2.member_materialization_for_test(&worker),
+        Some(MemberMaterializationPhase::Dormant),
+        "the start leaves the member Dormant"
+    );
+    assert_eq!(
+        meerkat_runtime::store::load_runtime_state(runtime_store_2.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state after the start"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "the start does not revive the archived session"
+    );
+
+    // ---------------- The next wake revives it and runs the work ------------
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        handle_2.ensure_member_live(&worker),
+    )
+    .await
+    .expect("the wake answers")
+    .expect("the wake revives the member's session");
+    assert_eq!(
+        handle_2.member_materialization_for_test(&worker),
+        Some(MemberMaterializationPhase::Live),
+        "the wake leaves the member Live"
+    );
+    assert_ne!(
+        meerkat_runtime::store::load_runtime_state(runtime_store_2.as_ref(), &runtime_id)
+            .await
+            .expect("load runtime state after the wake"),
+        Some(meerkat_runtime::RuntimeState::Retired),
+        "the wake revives the runtime"
+    );
+    // No prompt reached the member since its first turn: a new answer is the
+    // turn its runtime ran to deliver the owed completion.
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let answered = assistant_message_count(service_2.as_ref(), &session_id).await;
+        if answered > answered_before {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the revived runtime runs the owed completion as a turn ({answered} answers, \
+             {answered_before} before the retire)"
+        );
+        sleep(Duration::from_millis(200)).await;
+    }
+
+    handle_2.shutdown().await.expect("final shutdown");
+}
+
 /// Destruction must fit the same worker stack as ordinary mob operation.
 /// The parent-owned child operations make archive disposal inspect the real
 /// operation registry beneath the actor's complete destroy call chain.

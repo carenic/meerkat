@@ -372,7 +372,8 @@ reads:
   run (a lifecycle record Core cannot decode counts as one). Core reads its
   visible rows from the first visible row, 16 rows per `read_rows` call, then
   the chunks its rows and live entries refer to. An archived runtime is never
-  read at open.
+  read at open: one whose session was archived, or whose runtime was retired
+  or destroyed (a retired mob member's, for example).
 
 No other row is read at open.
 

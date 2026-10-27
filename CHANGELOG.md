@@ -469,13 +469,22 @@ them.
   set, as the SPI already requires; a store that sets `next` only after a
   full page of `limit` heads ends the listing early, and the realm opens
   without the scopes it was not given.
-- `meerkat-runtime`: the SQLite runtime store's recovery scan, which a mob
-  start reads, no longer decodes the ops lifecycle snapshot of an archived
-  runtime. A runtime retired before it unregisters keeps that snapshot, so
-  the scan decoded one more snapshot for each such session ever archived; it
-  now reads the runtime's catalog entry first. The scan answers the same (an
-  archived runtime never holds recovery work), and an archived session still
-  revives on a resume that names it.
+- Behaviour-only (not measured by the gate): `meerkat-runtime`: the
+  recovery scan a mob start reads
+  (`RuntimeStore::list_runtimes_with_recovery_work`) and the host store
+  adapter's open read a runtime as archived by the rule the session owner
+  applies: its catalog entry carries the Archived terminal, or its machine
+  lifecycle record names a Retired or Destroyed runtime. A retire records
+  the archive only in the lifecycle record, so before, a retired runtime
+  was read as live: every SQLite scan decoded the ops lifecycle snapshot
+  each retired runtime keeps, the host store adapter's open loaded the body
+  of each one whose snapshot still owed work, and the scan listed it. An
+  archived runtime now holds no recovery work, and none of that is read.
+  A mob member still seated on a session whose runtime was retired or
+  destroyed outside the mob (through `RuntimeControlPlane`) now stays
+  Dormant at a start instead of having that session revived, and its owed
+  work runs at its next wake or at a resume that names the session. An
+  archived session still revives on a resume that names it.
 
 ### Fixed
 

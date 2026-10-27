@@ -1715,6 +1715,62 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
     );
 }
 
+// Unrun until the candidate's validation. A retired runtime is archived: its
+// lifecycle names Retired (a retire never writes the catalog terminal). So a
+// head of it whose boot facts lost the folded form's marker is not listed
+// fail closed: an archived runtime holds no recovery work, whatever its
+// facts might leave out.
+#[tokio::test]
+async fn boot_obligation_scan_spi_store_does_not_fail_closed_on_a_retired_runtimes_head() {
+    use crate::store::recovery_obligation::scan_contract;
+
+    let host = Arc::new(TestHost::new());
+    let opened = open(&host).await;
+    let retired = LogicalRuntimeId::new("retired");
+    opened
+        .1
+        .commit_machine_lifecycle(
+            &retired,
+            scan_contract::ended_lifecycle(RuntimeState::Retired),
+            &[],
+        )
+        .await
+        .expect("the retired lifecycle");
+
+    // The facts as a JSON normaliser rewrites them: the marker is gone.
+    let id = ScopeId::new(super::RUNTIME_FAMILY, retired.0.clone());
+    let folded = {
+        let cell = opened.0.cell(&id);
+        let state = cell.lock().await;
+        let pinned = opened
+            .0
+            .pinned_values(&state)
+            .await
+            .expect("the pinned head");
+        Arc::clone(pinned.get("boot").expect("the boot facts are pinned"))
+    };
+    let normalised =
+        serde_json::to_vec(&serde_json::from_slice::<serde_json::Value>(&folded).unwrap()).unwrap();
+    commit_one(
+        &opened.0,
+        &id,
+        ScopeDelta::Changes(vec![("boot".into(), Some(Arc::new(normalised)))]),
+    )
+    .await
+    .expect("a head that lost the marker");
+
+    let reopened = reopen(&host, opened).await;
+    assert!(
+        !reopened
+            .1
+            .list_runtimes_with_recovery_work()
+            .await
+            .expect("the scan answers")
+            .contains(&retired),
+        "a retired runtime's head is not listed, though its facts predate the fold"
+    );
+}
+
 // Unrun until the candidate's validation. The open's body-load decision
 // over a runtime's pinned head and the scan answer the same predicate.
 #[tokio::test]

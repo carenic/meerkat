@@ -10038,9 +10038,14 @@ pub trait RuntimeStore: Send + Sync {
     /// machine lifecycle record that names a current run or does not decode,
     /// input rows with no lifecycle record, or an ops lifecycle snapshot
     /// that owes work (a background operation completion its session was not
-    /// woken for, or a detached job wait still running). A runtime whose
-    /// session catalog entry is archived holds none. The host store
-    /// adapter's open loads exactly the bodies of such runtimes, by the same
+    /// woken for, or a detached job wait still running). An archived runtime
+    /// holds none, by the rule the session owner applies: its session
+    /// catalog entry carries the Archived terminal, or its machine lifecycle
+    /// record names a Retired or Destroyed runtime (a retire records the
+    /// archive only there). Its work stays durable and runs once its session
+    /// is revived: by a resume that names it, or by the next wake of a mob
+    /// member still seated on it. The host store adapter's open
+    /// loads exactly the bodies of runtimes that hold work, by the same
     /// predicate.
     ///
     /// A mob boot reads this to decide which members it materializes: a
