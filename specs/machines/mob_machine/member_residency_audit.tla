@@ -2,8 +2,8 @@
 \* Hand-written audit of MobMachine member residency (Dormant, Waking, Live).
 \*
 \* The generated ci profile has no identities, so the residency arms and the
-\* residency invariants (I1-I14) hold there only vacuously. This audit keeps
-\* the generated model unchanged and drives the residency arms in eight runs,
+\* residency invariants hold there only vacuously. This audit keeps the
+\* generated model unchanged and drives the residency arms in eight runs,
 \* each over a small, fixed domain, so every run fits the canonical lane's
 \* per-run cap:
 \*
@@ -22,12 +22,12 @@
 \*     stale), the spawned-endpoint recovery, the release verdict, Stop and
 \*     Resume.
 \*   retire (AuditRetireSpec): one identity woken, released and retired: the
-\*     routed and the archive-only retirement starts (R27), the routed retire
+\*     routed and the archive-only retirement starts, the routed retire
 \*     retry, the runtime retire observation, the session ingress detach, the
 \*     plain archives, the replayed retirement starts, a rotation with its
 \*     terminal in Running and Stopped, a host-pending seed and its
 \*     carry-out, and the mob's destroy: its admission, its member retirement
-\*     and archive arms and DestroyMob (R124).
+\*     and archive arms and DestroyMob.
 \*   terminal (AuditTerminalSpec): one identity in the Completed and
 \*     Destroyed phases: Complete, MarkCompleted, the destroy, Shutdown, the
 \*     late feedback, the release, the wake refusal, the notice
@@ -38,16 +38,16 @@
 \*     (Dormant, Live, Join), the live classification, the settle arms
 \*     (exact and replaced session), readiness, topology and finish, with the
 \*     wake arms and resolutions it meets and a session replacement.
-\*   edge (AuditEdgeSpec): two identities and one wiring edge (I8): both
+\*   edge (AuditEdgeSpec): two identities and one wiring edge: both
 \*     recovered, bound and given endpoints, the edge recovered or wired, its
 \*     trust realization outcomes (realized, owed repair, no-op), the seal,
 \*     one member retired and archived with and without its respawn topology
 \*     preserved, and its next incarnation recovered.
 \*   seat (AuditSeatSpec): two identities from the spawn ladder's Opened
 \*     phase: the dormant seat with an endpoint, with another member's peer id
-\*     (R5) or with none (EndpointPending), the embodied spawn commit, the
-\*     runtime-ready observation and the release that clears the startup ladder
-\*     (R12), the boot plan and seal, the endpoint registration, and the
+\*     or with none (EndpointPending), the embodied spawn commit, the
+\*     runtime-ready observation and the release that clears the startup ladder,
+\*     the boot plan and seal, the endpoint registration, and the
 \*     rotation (retirement start, intent, terminal over a live or a retired
 \*     runtime) with and without an endpoint.
 \*   wake2 (AuditWake2Spec): two identities, each woken, released and
@@ -62,20 +62,21 @@
 \* guard reads.
 \*
 \* Properties, in every run:
-\*   every generated invariant of ci.cfg (kept), I1-I14 among them;
-\*   AuditAttemptEndsClosed (AP2, action property, safety form): an open wake
+\*   every generated invariant of ci.cfg (kept), the residency ones among them;
+\*   AuditAttemptEndsClosed (action property, safety form): an open wake
 \*     attempt is never replaced, and it disappears only in a step that leaves
 \*     its member Live, Dormant or without a phase (Broken, retiring, unseated);
-\*   AuditWakingClosable (invariant, the ENABLED form of AP2): every
+\*   AuditWakingClosable (invariant, the ENABLED form of the same): every
 \*     Waking member has an enabled closing arm for every closing kind
 \*     (Unsettled and ReadinessFailed abandons, Failed, HostRefused,
 \*     Retryable), whatever its other feedback preconditions.
 \* Per run also:
-\*   AP1 (action property): no recovery or seat arm overwrites an existing
-\*     residency phase (seed, wake, resume, edge, seat, terminal);
+\*   the RecoverKeepsPhase action properties: no recovery or seat arm
+\*     overwrites an existing residency phase (seed, wake, resume, edge, seat,
+\*     terminal);
 \*   seed: AuditPlanLeavesSealable (after its boot plan a member has a durable
 \*     endpoint or owes EndpointPending, so the seal never refuses it);
-\*   wake: AuditLifecycleNeverWakes (AP3), AuditWakeNeverSkipsWaking,
+\*   wake: AuditLifecycleNeverWakes, AuditWakeNeverSkipsWaking,
 \*     AuditWakeExactlyOne (exactly one WakeMember arm answers every input
 \*     shape), AuditSucceededLeavesEndpoint (a local wake never closes Live
 \*     without an endpoint while it owes EndpointPending),
@@ -87,16 +88,16 @@
 \*     AuditBindingRefusalFenced (a refused binding request applies only to
 \*     the wake it belongs to: its open attempt, or with no attempt only while
 \*     no wake is open);
-\*   retire: AuditRetireRoutesOnlyRegistered (R27: no runtime retire is routed
-\*     for a member with no registration), AuditRetirementArchivable (R124: a
+\*   retire: AuditRetireRoutesOnlyRegistered (no runtime retire is routed
+\*     for a member with no registration), AuditRetirementArchivable (a
 \*     retiring member whose ingress detach closed has an enabled archive
 \*     terminal, and under an admitted destroy no rotation and no host
-\*     carry-out holds it) and AuditDestroyFencesRotation (R124: no rotation
+\*     carry-out holds it) and AuditDestroyFencesRotation (no rotation
 \*     begins or commits under an admitted destroy);
 \*   seat: AuditSeatLeavesDormant (a dormant seat leaves its identity
 \*     Dormant, with its endpoint or owed EndpointPending, and requests no
 \*     runtime binding).
-\* I5 is an ASSUME over the generated wake refusal helper's whole input domain:
+\* An ASSUME over the generated wake refusal helper's whole input domain:
 \* a present, session-bound member with a phase is never refused as not a
 \* member. A second ASSUME pins the release verdict helper: Release,
 \* PinnedByPlacedPeer or NotYetReleasable exactly for a seated, local, Live
@@ -105,11 +106,11 @@
 \* shared release predicate: a member wired to a placed member is never
 \* releasable.
 \*
-\* Not covered: I3 (a Dormant member is local) needs a placed member, which
-\* only the placement arms create; the placed revival arm, the placed-peer
-\* pin on a release and the wiring arms that wake a Dormant member wired to
-\* a placed one likewise. The machine debug invariants and the meerkat-mob
-\* placed tests pin them.
+\* Not covered: dormant_is_local (a Dormant member is local) needs a placed
+\* member, which only the placement arms create; the placed revival arm, the
+\* placed-peer pin on a release and the wiring arms that wake a Dormant member
+\* wired to a placed one likewise. The machine debug invariants and the
+\* meerkat-mob placed tests pin them.
 \*
 \* The TLC configs are DERIVED from the generated ci.cfg on every run by
 \* member_residency_audit.sh.
@@ -146,7 +147,7 @@ AuditWakeCauses == {"Boot", "HostDelivery", "PeerDelivery", "Operator"}
 
 \* The wake run's input shapes <<cause, observed_missing, input_class,
 \* sender_waking>>: a plain delivery, an observed miss (the drift path of a
-\* Live member), a lifecycle notice (never wakes, AP3), a delivery from a
+\* Live member), a lifecycle notice (never wakes), a delivery from a
 \* waking sender (SenderWaking), and the operator's and the boot's own wakes.
 AuditWakeShapes ==
     { <<"HostDelivery", FALSE, "Content", FALSE>>,
@@ -316,7 +317,7 @@ WBindCurrent == RecoverMemberSessionBindingAlreadyCurrentRunning(Id1, Rid1, Sess
 WEndpoint == RecoverMemberPeerEndpointFreshRunning(Id1, Rid1, Sess1, E1Inproc)
 WRegisterPeer == RegisterMemberPeerRunning(Id1, Rid1, 0, 1, E1Inproc)
 WRecoverRetired == \E p \in BOOLEAN, started \in BOOLEAN : RecoverRosterMemberRetiredRunning(Id1, Rid1, 0, p, started)
-\* The replayed restore failures (Broken setters, R2).
+\* The replayed restore failures (Broken setters).
 WRestoreFailure ==
     \/ RecoverMemberRestoreFailureRunning(Id1, AuditReason)
     \/ RecoverMemberRestoreHostRefusedRunning(Id1, AuditCode, AuditReason)
@@ -374,7 +375,7 @@ AuditSeedSpec == Init /\ [][AuditSeedNext]_vars
 (* The wake run: one identity, one incarnation, the default seed.          *)
 (***************************************************************************)
 
-\* The recovery and seat arms of the wake run (AP1).
+\* The recovery and seat arms of the wake run (AuditRecoverKeepsPhase).
 WRecoverArms == WRecover \/ WBind \/ WBindCurrent \/ WEndpoint \/ WSpawnedEndpoint \/ WRestoreFailure
 
 AuditWakeNext ==
@@ -404,7 +405,7 @@ AuditWakeSpec == Init /\ [][AuditWakeNext]_vars
 
 (***************************************************************************)
 (* The retire run: one identity woken, released, retired, rotated and      *)
-(* destroyed (R27, R124).                                                  *)
+(* destroyed.                                                              *)
 (***************************************************************************)
 
 \* The routed retirement starts (a Live member) and their archive-only twins
@@ -421,7 +422,7 @@ RetireArms ==
     \/ RetireMember(Id1, Rid1, 1, Some(Sess1))
     \/ RetireMemberArchiveOnly(Id1, Rid1, 1, Some(Sess1))
 
-\* Every arm that routes a runtime retire (R27: never for a member with no
+\* Every arm that routes a runtime retire (never for a member with no
 \* registration).
 RoutingRetire ==
     \/ RetireRunningReleasing(AuditMob, Rid1, Id1, 0, Some(Sess1), Some(Sess1))
@@ -590,7 +591,7 @@ AuditResumeNext ==
 AuditResumeSpec == Init /\ [][AuditResumeNext]_vars
 
 (***************************************************************************)
-(* The edge run: two identities and one wiring edge (I8).                  *)
+(* The edge run: two identities and one wiring edge.                       *)
 (***************************************************************************)
 
 \* Member 1: Rid1, fence 1, session 1, endpoint 1; its next incarnation Rid3,
@@ -664,8 +665,8 @@ SIncarnation(id) ==
 SOpenArm == \E id \in {Id1, Id2} : SOpen(id, SIncarnation(id).rid, SIncarnation(id).fence, SIncarnation(id).session)
 
 \* A seat with member 1's endpoint (member 2 then offers a duplicate peer id,
-\* which R5 refuses), member 2's own endpoint, or none (EndpointPending). A
-\* seat owes no kickoff (R13).
+\* which the peer-id guards refuse), member 2's own endpoint, or none
+\* (EndpointPending). A seat owes no kickoff.
 SSeat ==
     \E id \in {Id1, Id2}, ep \in {Some(E1Inproc), Some(E2Inproc), None} :
         CommitDormantSeatRunning(id, SIncarnation(id).rid, SIncarnation(id).fence, 0, FALSE, AuditMode,
@@ -797,7 +798,7 @@ AuditView == [vars EXCEPT ![AuditStepIndex] = 0, ![AuditEpochIndex] = 0]
 (* Properties.                                                             *)
 (***************************************************************************)
 
-\* AP1: a recovery or seat step leaves every existing phase as it was (a
+\* A recovery or seat step leaves every existing phase as it was (a
 \* phase may only be added, by the one seating arm, or removed, by an unseat).
 PhaseKept ==
     \A id \in DOMAIN member_materialization \cap DOMAIN member_materialization' :
@@ -810,7 +811,7 @@ AuditResumeRecoverKeepsPhase == [][RRecoverArms => PhaseKept]_vars
 AuditEdgeRecoverKeepsPhase == [][ERecoverArms => PhaseKept]_vars
 AuditSeatRecoverKeepsPhase == [][SRecoverArms => PhaseKept]_vars
 
-\* AP2 (safety form): an open attempt is never replaced, and it disappears
+\* Safety form: an open attempt is never replaced, and it disappears
 \* only in a step that leaves its member Live, Dormant or without a phase.
 AuditAttemptEndsClosed ==
     [][\A id \in DOMAIN member_wake_attempts :
@@ -821,7 +822,7 @@ AuditAttemptEndsClosed ==
                \/ member_materialization'[id] \in {"Live", "Dormant"}
       ]_vars
 
-\* AP2 (ENABLED form): every Waking member has an enabled closing arm
+\* ENABLED form: every Waking member has an enabled closing arm
 \* for every closing kind, whatever the preconditions of its other feedback,
 \* so the shell can always close an attempt whose Bound or Succeeded step has
 \* no arm.
@@ -834,7 +835,7 @@ AuditWakingClosable ==
         /\ ENABLED ResolveMemberRevivalHostRefusedRunning(id, AuditCode, AuditReason, a)
         /\ ENABLED ResolveMemberRevivalRetryableRunning(id, a, "WakeTimedOut")
 
-\* AP3: a Lifecycle wake input never opens an attempt, and a peer notice
+\* A Lifecycle wake input never opens an attempt, and a peer notice
 \* classification never changes residency.
 AuditLifecycleNeverWakes ==
     [][/\ (\E s \in AuditWakeShapes : s[3] = "Lifecycle" /\ WakeArm(Id1, s[1], s[2], s[3], s[4]))
@@ -956,7 +957,7 @@ AuditReleaseEpochFence ==
            => Phase1Next = Phase1
       ]_vars
 
-\* R27: no arm routes a runtime retire for a member with no registration (a
+\* No arm routes a runtime retire for a member with no registration (a
 \* Dormant or Waking member, or an archive-only retirement).
 AuditRetireRoutesOnlyRegistered ==
     [][RoutingRetire
@@ -982,7 +983,7 @@ ArchiveEnabled ==
     \/ ENABLED ObserveMemberRetirementArchivedLiveStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, FALSE)
     \/ ENABLED ObserveMemberRetirementArchivedRetiredStopped(Id1, Rid1, 1, 0, Some(Sess1), AuditDisposal, FALSE)
 
-\* R124 (and R27): a settled retirement can always archive. Outside a destroy
+\* A settled retirement can always archive. Outside a destroy
 \* a rotation or a pending host carry-out may hold the plain terminal (the
 \* rotation's own terminal re-seats the identity); under an admitted destroy
 \* nothing holds it: the destroy beats the rotation and the host carry-out.
@@ -993,10 +994,10 @@ AuditRetirementArchivable ==
            /\ Id1 \notin member_host_preparation_pending)
         => ArchiveEnabled
 
-\* R124: no rotation begins or commits under an admitted destroy.
+\* No rotation begins or commits under an admitted destroy.
 AuditDestroyFencesRotation == [][destroy_admitted => ~RotationArms]_vars
 
-\* I5: over the wake refusal helper's whole input domain, a present,
+\* Over the wake refusal helper's whole input domain, a present,
 \* session-bound member with a phase is never refused as not a member.
 ASSUME \A present, bound, placed, broken, retiring, admitting, authoritative, origin_open,
           host_pending, sender_waking, observed_missing \in BOOLEAN,
@@ -1123,7 +1124,7 @@ AuditWitnessSeatEndpointPending ==
 \* Seat run: a rotation re-seats the next incarnation Dormant.
 AuditWitnessRotatedStep == SCommitRotation
 \* Seat run: a release returns a spawned (Live) member to Dormant and clears
-\* its startup ladder (R12).
+\* its startup ladder.
 AuditWitnessReleasedSpawnStep ==
     /\ SRelease
     /\ \E rid \in {Rid1, Rid2} :

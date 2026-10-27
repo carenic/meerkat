@@ -224,7 +224,7 @@ AuditProgressStale ==
         ObserveMemberProgressStaleRunning(AuditIdentity, open, w, tok, t)
 
 \* A recovered member is seated Dormant (it holds no registration), so its
-\* retirement takes the archive-only twin (R27); the routed arms need a Live
+\* retirement takes the archive-only twin; the routed arms need a Live
 \* member, which member_residency_audit's retire run drives.
 AuditRetireReleasing ==
     \E rid \in AuditRuntimes, g \in AuditGenerations, s \in AuditSessions :

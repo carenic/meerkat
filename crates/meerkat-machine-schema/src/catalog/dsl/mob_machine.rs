@@ -528,7 +528,7 @@ macro_rules! mob_catalog_machine_dsl {
             // The open materialization attempt of every Waking member, minted
             // by the machine from member_wake_attempt_sequence. Late wake
             // feedback names its attempt; a feedback for any other attempt is
-            // a typed StaleAttempt no-op (I10, I13, I14).
+            // a typed StaleAttempt no-op.
             member_wake_attempts: Map<AgentIdentity, u64>,
             member_wake_attempt_sequence: u64,
             // A Waking member whose runtime binding was requested
@@ -538,17 +538,17 @@ macro_rules! mob_catalog_machine_dsl {
             // recorded by ObserveRuntimeReady from the epoch-carrying
             // RuntimeBound route. A registration release is honoured only
             // for this exact epoch, so a stale release after a newer wake
-            // is refused (G2).
+            // is refused.
             member_materialization_epoch: Map<AgentIdentity, Option<RuntimeEpochId>>,
-            // Counted fault path (G1): a Live member found unmaterialized by
+            // Counted fault path: a Live member found unmaterialized by
             // a probe or a routing miss instead of through a release.
             member_materialization_drift_count: u64,
             // A member the boot plan woke for an obligation whose wake has not
             // reached Live yet. A retryable wake keeps it, so the owner's
             // timer wakes the member again (cause Boot). EndpointPending: the
             // member has no durable endpoint yet (a legacy journal); the seal
-            // does not wait for its retry, and I6 makes exactly this typed
-            // exception until an endpoint is registered.
+            // does not wait for its retry, and dormant_member_has_durable_endpoint
+            // makes exactly this typed exception until an endpoint is registered.
             member_boot_obligation_owed: Map<AgentIdentity, Enum<MemberBootObligationCause>>,
             // Seeded once at build (SeedMemberResidency), never journaled.
             member_restore_policy: Enum<MemberRestorePolicyKind>,
@@ -556,13 +556,14 @@ macro_rules! mob_catalog_machine_dsl {
             // Identities whose host preparation (a first-boot row) has not
             // been carried out: their wakes are refused, retryable.
             member_host_preparation_pending: Set<AgentIdentity>,
-            // Set once the boot plan settled; I6 and I8 hold from here on.
+            // Set once the boot plan settled; dormant_member_has_durable_endpoint and
+            // wiring_edges_connect_seated_members hold from here on.
             boot_plan_sealed: bool,
             // Rotation intent (reset, delete): the new session and endpoint
-            // the retiring incarnation's terminal seats Dormant (F6).
+            // the retiring incarnation's terminal seats Dormant.
             member_rotation_session_ids: Map<AgentIdentity, SessionId>,
             member_rotation_peer_endpoints: Map<AgentIdentity, MemberPeerEndpoint>,
-            // R27: Retiring runtimes that hold no runtime registration in this
+            // Retiring runtimes that hold no runtime registration in this
             // process (the member was Dormant or Waking when its retirement
             // started, or the retirement was recovered at build, where no
             // retiring member is ever woken). Their retirement routes no
@@ -1787,20 +1788,20 @@ macro_rules! mob_catalog_machine_dsl {
             // transport kind are machine state.
             PlanBootMaterialization { agent_identity: AgentIdentity, obligation: Enum<MemberRecoveryObligationKind>, host_required: bool, orchestrator_notified: bool },
             // Closes the boot plan once the boot set settled: from here every
-            // Dormant or Waking member has a durable endpoint (I6) and every
-            // wiring edge joins seated members (I8).
+            // Dormant or Waking member has a durable endpoint and every
+            // wiring edge joins seated members.
             SealBootMaterializationPlan,
-            // The machine verdict for one peer notice (R4): Lifecycle notices
+            // The machine verdict for one peer notice: Lifecycle notices
             // to or from a member that is not Live are suppressed, a kickoff
             // notice to such a member is deferred to its wake, the rest are
             // delivered. Both phases are read from machine state.
             ClassifyPeerNotice { recipient: AgentIdentity, sender: AgentIdentity, notice_class: Enum<PeerInputClass> },
             // A seat: membership without materialization (import and new
-            // roster identities, D3). Walks the spawn admission ladder
+            // roster identities). Walks the spawn admission ladder
             // (BeginSpawnExec + AuthorizeSpawnProfile) and commits Dormant.
             CommitDormantSeat { agent_identity: AgentIdentity, agent_runtime_id: AgentRuntimeId, fence_token: FenceToken, generation: Generation, external_addressable: bool, runtime_mode: Enum<SpawnPolicyRuntimeMode>, bridge_session_id: SessionId, member_peer_endpoint: Option<MemberPeerEndpoint>, session_archived: bool, kickoff_owed: bool },
             // The host carried out an identity's pending preparation on an
-            // identity already seated on that session (B9).
+            // identity already seated on that session.
             ResolveMemberHostPreparation { agent_identity: AgentIdentity },
             // A rotation (reset, delete): the exact Retiring incarnation will
             // be re-seated Dormant on a NEW session in its terminal step. A
@@ -1924,17 +1925,17 @@ macro_rules! mob_catalog_machine_dsl {
             // --- Member residency: attempt-fenced wake feedback ---
             // Every feedback names the attempt it resolves. A feedback for an
             // attempt that is not the member's open one, in any lifecycle
-            // phase, is a typed StaleAttempt no-op (F4).
+            // phase, is a typed StaleAttempt no-op.
             // The provision registered the runtime: request its binding; the
-            // member stays Waking (F11, step 1).
+            // member stays Waking (step 1 of a local wake).
             ResolveMemberRevivalBound { agent_identity: AgentIdentity, attempt: u64 },
             // A retryable wake failure: Waking -> Dormant, not Broken.
             ResolveMemberRevivalRetryable { agent_identity: AgentIdentity, attempt: u64, kind: Enum<MemberWakeRetryableKind> },
             // A shell path that ends a wake without a resolution.
             AbandonMemberWake { agent_identity: AgentIdentity, attempt: u64, kind: Enum<MemberWakeAbandonKind>, reason: String },
             // A runtime registration was released while the member stays
-            // seated (G1): the route's fields; the identity is resolved
-            // through identity_to_runtime. Total, stale-tolerant (F5).
+            // seated: the route's fields; the identity is resolved
+            // through identity_to_runtime. Total, stale-tolerant.
             ReleaseMemberMaterialization { agent_runtime_id: Option<AgentRuntimeId>, fence_token: Option<FenceToken>, runtime_epoch_id: Option<RuntimeEpochId>, cause: Enum<MemberMaterializationLossCause> },
             // The outcome of realizing one edge's trust (a wake's topology
             // step, a respawn's topology restore, an owed repair): a realized
@@ -2304,15 +2305,15 @@ macro_rules! mob_catalog_machine_dsl {
             // Every Waking member was moved to Dormant by a mob-wide stop,
             // completion or destroy admission: every open attempt is closed.
             MemberWakesAbandoned { cause: Enum<MemberWakeAbandonCause> },
-            // R124: the destroy admission beats every in-flight rotation. The
+            // The destroy admission beats every in-flight rotation. The
             // next sessions they recorded are never bound; the shell archives
             // each (empty) session. An empty map asks for nothing.
             RotationSessionsAbandoned { rotations: Map<AgentIdentity, SessionId> },
-            // Mob-wide peer ingress closure for every Live member (R9), and
+            // Mob-wide peer ingress closure for every Live member at a Stop, and
             // its reopening at Resume.
             CloseMemberPeerIngress { reason: Enum<MemberWakeRefusalKind> },
             ReopenMemberPeerIngress,
-            // Wake-route projection triggers (G7). The realizer reads the
+            // Wake-route projection triggers. The realizer reads the
             // route's source truth (membership, endpoint, session binding)
             // from machine state.
             PublishWakeRoute { agent_identity: AgentIdentity },
@@ -2870,7 +2871,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // The wake refusal for one member, over MEMBER facts only: no
-        // lifecycle phase is passed (R11); every lifecycle phase has its own
+        // lifecycle phase is passed; every lifecycle phase has its own
         // WakeMember arm. None means not refused: the member's phase then
         // decides Authorized (Dormant), Joined (Waking) or AlreadyLive (Live).
         // A Live member that the router did not observe missing is
@@ -2934,8 +2935,8 @@ macro_rules! mob_catalog_machine_dsl {
             }}}}}}}}}}}}}
         }
 
-        // The boot verdict for one Dormant local member (section 5 and
-        // 4.3h). A candidate composition, a pending host preparation and a
+        // The boot verdict for one Dormant local member. A candidate
+        // composition, a pending host preparation and a
         // lifecycle cleanup that owns the mob (no new work origin) keep every
         // member Dormant, obligated ones included; otherwise a member
         // wakes for the Eager policy, a recovery obligation (Unobserved counts:
@@ -2992,7 +2993,7 @@ macro_rules! mob_catalog_machine_dsl {
             }}}}}}}}}}}
         }
 
-        // The machine verdict for one peer notice, in both directions (R4).
+        // The machine verdict for one peer notice, in both directions.
         // A Lifecycle notice to or from a member that is not Live is
         // suppressed: it is silent control-plane at a live recipient, and the
         // recipient's wake-time topology carries its content. Everything else
@@ -4039,14 +4040,14 @@ macro_rules! mob_catalog_machine_dsl {
         // Member residency invariants (Dormant / Waking / Live)
         // =====================================================================
 
-        // I1: a residency phase exists only for a seated, session-bound member.
+        // A residency phase exists only for a seated, session-bound member.
         invariant materialization_domain_is_session_bound_membership {
             for_all(id in self.member_materialization.keys(),
                 self.identity_to_runtime.contains_key(id)
                 && self.member_session_bindings.contains_key(id))
         }
 
-        // I2: every roster member is either live or wakeable: a seated,
+        // Every roster member is either live or wakeable: a seated,
         // session-bound, local member that is neither Broken nor Retiring has
         // a phase.
         invariant local_session_bound_member_is_live_or_wakeable {
@@ -4058,20 +4059,20 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_materialization.contains_key(id) == true)
         }
 
-        // I3: a placed member's liveness is host-owned; it is never Dormant.
+        // A placed member's liveness is host-owned; it is never Dormant.
         invariant dormant_is_local {
             for_all(id in self.member_materialization.keys(),
                 self.member_materialization.get_cloned(id) != Some(MemberMaterializationPhase::Dormant)
                 || self.member_placement.contains_key(id) == false)
         }
 
-        // I4: a Broken member has no phase (nor any wake bookkeeping).
+        // A Broken member has no phase (nor any wake bookkeeping).
         invariant broken_member_has_no_phase {
             for_all(id in self.member_restore_failures.keys(),
                 self.member_materialization.contains_key(id) == false)
         }
 
-        // I6: once the boot plan is sealed, every Dormant or Waking member has
+        // Once the boot plan is sealed, every Dormant or Waking member has
         // a durable endpoint, so it is peer-wakeable.
         invariant dormant_member_has_durable_endpoint {
             self.boot_plan_sealed == false
@@ -4081,16 +4082,16 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_boot_obligation_owed.get_cloned(id) == Some(MemberBootObligationCause::EndpointPending))
         }
 
-        // The I6 exception is exact: a member owed EndpointPending has no
-        // durable endpoint (registering one downgrades the cause), so it has
-        // no wake route either.
+        // The exception to dormant_member_has_durable_endpoint is exact: a
+        // member owed EndpointPending has no durable endpoint (registering one
+        // downgrades the cause), so it has no wake route either.
         invariant endpoint_pending_member_has_no_endpoint {
             for_all(id in self.member_boot_obligation_owed.keys(),
                 self.member_boot_obligation_owed.get_cloned(id) != Some(MemberBootObligationCause::EndpointPending)
                 || self.member_peer_endpoints.contains_key(id) == false)
         }
 
-        // I7: a Dormant member requests no runtime binding; only a wake's
+        // A Dormant member requests no runtime binding; only a wake's
         // Bound step (or a spawn commit, Live) opens the binding ladder.
         invariant dormant_member_requests_no_runtime_binding {
             for_all(id in self.member_materialization.keys(),
@@ -4098,7 +4099,7 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_startup_binding_requested.contains(self.identity_to_runtime.get_cloned(id).get("value")) == false)
         }
 
-        // I8: once the boot plan is sealed (replay may carry an edge to an
+        // Once the boot plan is sealed (replay may carry an edge to an
         // identity that leaves later in the stream), every wiring edge joins
         // two seated members or a member held by a respawn's preserved
         // topology, until the mob's destroy is admitted (the destroy archives
@@ -4113,7 +4114,7 @@ macro_rules! mob_catalog_machine_dsl {
                     || self.pending_respawn_topology.contains(mob_machine_wiring_edge_b(edge))))
         }
 
-        // I9: a Live local member whose runtime binding was confirmed
+        // A Live local member whose runtime binding was confirmed
         // (member_startup_runtime_ready) records the binding's epoch; a
         // release is honoured only for that exact epoch.
         invariant live_member_records_its_epoch {
@@ -4124,14 +4125,14 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_materialization_epoch.contains_key(id) == true)
         }
 
-        // I10: a Waking member has exactly one open attempt.
+        // A Waking member has exactly one open attempt.
         invariant waking_is_one_attempt {
             for_all(id in self.member_materialization.keys(),
                 self.member_materialization.get_cloned(id) != Some(MemberMaterializationPhase::Waking)
                 || self.member_wake_attempts.contains_key(id) == true)
         }
 
-        // I11: a Retiring incarnation is never Waking (a retirement start
+        // A Retiring incarnation is never Waking (a retirement start
         // closes any open attempt).
         invariant retiring_incarnation_never_waking {
             for_all(id in self.member_materialization.keys(),
@@ -4139,13 +4140,13 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.member_state_markers.get_cloned(self.identity_to_runtime.get_cloned(id).get("value")) != Some(MobMemberState::Retiring))
         }
 
-        // I12: a candidate (NonAuthoritative) composition never wakes a member.
+        // A candidate (NonAuthoritative) composition never wakes a member.
         invariant candidate_composition_never_wakes {
             self.composition_authority == CompositionAuthorityKind::Authoritative
             || self.member_wake_attempts == EmptyMap
         }
 
-        // I13: every open attempt is one the machine minted, so feedback for a
+        // Every open attempt is one the machine minted, so feedback for a
         // later attempt cannot be forged ahead of the mint.
         invariant waking_has_an_open_attempt {
             for_all(id in self.member_wake_attempts.keys(),
@@ -4153,7 +4154,7 @@ macro_rules! mob_catalog_machine_dsl {
                 && self.member_wake_attempts.get_copied(id).get("value") <= self.member_wake_attempt_sequence)
         }
 
-        // I14 (F3): the wake bookkeeping follows the phase. Attempts and
+        // The wake bookkeeping follows the phase. Attempts and
         // binding marks exist only for Waking members, an epoch only for a
         // member with a phase, a boot obligation only for a Dormant or Waking
         // member. Every phase removal clears them all.
@@ -4188,7 +4189,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_rotation_session_ids.contains_key(id))
         }
 
-        // R27: an archive-only retirement is a Retiring runtime; its
+        // An archive-only retirement is a Retiring runtime; its
         // retirement routes no runtime retire.
         invariant archive_only_retirement_is_retiring {
             for_all(rid in self.runtime_retire_archive_only,
@@ -4208,7 +4209,7 @@ macro_rules! mob_catalog_machine_dsl {
                 && self.identity_to_runtime.contains_key(mob_machine_external_peer_edge_local(edge)))
         }
 
-        // R124: the destroy beats every member lifecycle. A destroyed mob holds
+        // The destroy beats every member lifecycle. A destroyed mob holds
         // no residency, rotation intent, pending host preparation or
         // archive-only retirement, so nothing waits on a rotation or a host
         // carry-out after it.
@@ -8384,7 +8385,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "no_prior_session_binding" { self.member_session_bindings.contains_key(agent_identity) == false }
             guard "replacing_absent" { replacing == None }
             // After the seal a seated Dormant member always has a durable
-            // endpoint (I6), so a first binding then needs one.
+            // endpoint, so a first binding then needs one.
             guard "endpoint_present_after_seal" {
                 self.boot_plan_sealed == false
                 || self.member_peer_endpoints.contains_key(agent_identity) == true
@@ -8392,7 +8393,7 @@ macro_rules! mob_catalog_machine_dsl {
             update {
                 self.member_session_bindings.insert(agent_identity, bridge_session_id);
                 self.topology_epoch += 1;
-                // R1: the ONE seating arm. A recovered local member's first
+                // The ONE seating arm. A recovered local member's first
                 // binding seats it Dormant (a fresh process has no
                 // materialization), only when it has no phase, is not Broken
                 // and is not Retiring. Every other Recover arm keeps the phase.
@@ -8635,7 +8636,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             // A roster reset is replay: every recovered member is Dormant and
             // the boot plan is not sealed yet. The next incarnation keeps the
-            // phase (R1: no Recover arm overwrites a phase).
+            // phase (no Recover arm overwrites a phase).
             guard "replay_not_sealed" { self.boot_plan_sealed == false }
             guard "member_not_materialized" {
                 self.member_materialization.get_cloned(agent_identity) != Some(MemberMaterializationPhase::Live)
@@ -8671,7 +8672,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_peer_endpoints.remove(agent_identity);
                 self.member_prior_peer_endpoints.remove(agent_identity);
                 // The replaced incarnation's Broken record is dropped, so a
-                // bound local member is seated Dormant again (I2); a Dormant
+                // bound local member is seated Dormant again; a Dormant
                 // member stays Dormant. The new runtime opens no binding
                 // ladder and has no epoch yet.
                 if self.member_restore_failures.contains_key(agent_identity)
@@ -8718,7 +8719,7 @@ macro_rules! mob_catalog_machine_dsl {
         // completed roster removal. Replay keeps the member live-but-Retiring
         // and restores the exact session correlation its archive needs. No
         // retiring member is woken after a restart, so a recovered local
-        // retirement is archive-only (R27): it routes no runtime retire. The
+        // retirement is archive-only: it routes no runtime retire. The
         // three arms mirror the releasing, preserving, and
         // peer-only admission shapes without emitting live side effects during
         // recovery.
@@ -9645,14 +9646,15 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_startup_binding_requested.remove(agent_runtime_id);
                 self.member_startup_runtime_ready.insert(agent_runtime_id);
                 self.member_startup_ready.remove(agent_runtime_id);
-                // G2/F2: the routed RuntimeBound carries the registration's
+                // The routed RuntimeBound carries the registration's
                 // epoch; the member bound to this runtime records it, so a
                 // later release is honoured only for exactly this
                 // registration. A release needs a Live member, and a wake's
                 // own bind overwrites the record (an idempotent re-bind of a
                 // kept registration keeps it), so a late bind observed while
                 // the member is Dormant never matches a later release; it
-                // keeps I9 (the runtime is ready, so the epoch is known).
+                // keeps live_member_records_its_epoch (the runtime is ready, so the
+                // epoch is known).
                 for member_id in self.identity_to_runtime.keys() {
                     if self.identity_to_runtime.get_cloned(member_id) == Some(agent_runtime_id)
                         && self.member_materialization.contains_key(member_id) == true
@@ -11138,8 +11140,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt). It mirrors
         // RetireMember but routes no runtime retire: the runtime is recorded
         // archive-only and the session archive alone terminates the member.
@@ -11588,8 +11590,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt). It mirrors
         // AdmitDestroyMemberRetireLiveRunning but routes no runtime retire: the
         // runtime is recorded archive-only and the session archive alone
@@ -11694,8 +11696,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt). It mirrors
         // AdmitDestroyMemberRetireLiveStopped but routes no runtime retire: the
         // runtime is recorded archive-only and the session archive alone
@@ -12314,7 +12316,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedLive {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Running }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12322,7 +12324,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -12407,7 +12409,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedLivePreservingTopology {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Running }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12415,7 +12417,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -12496,7 +12498,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedLiveStopped {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Stopped }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12504,7 +12506,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -12585,7 +12587,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedRetired {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Running }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12593,7 +12595,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -12667,7 +12669,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedRetiredPreservingTopology {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Running }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12675,7 +12677,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -12749,7 +12751,7 @@ macro_rules! mob_catalog_machine_dsl {
         transition ObserveMemberRetirementArchivedRetiredStopped {
             on signal ObserveMemberRetirementArchived { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, preserve_machine_topology }
             guard { self.lifecycle_phase == Phase::Stopped }
-            // A rotating identity's terminal is CommitMemberRotation (F6). A
+            // A rotating identity's terminal is CommitMemberRotation. A
             // rotation lost in a crash is re-driven by the host, which marks
             // the identity host-pending at build: its plain terminal waits for
             // the host's carry-out (BeginMemberRotation or
@@ -12757,7 +12759,7 @@ macro_rules! mob_catalog_machine_dsl {
             // leaves a non-member window.
             // Once the mob's destroy is admitted the destroy beats both: this
             // terminal archives the identity and drops its intent, with no
-            // host-pending wait (R124).
+            // host-pending wait.
             guard "rotation_settled_or_destroying" {
                 self.member_rotation_session_ids.contains_key(agent_identity) == false
                 || self.destroy_admitted == true
@@ -13728,11 +13730,11 @@ macro_rules! mob_catalog_machine_dsl {
             guard "session_binding_present" { self.member_session_bindings.contains_key(agent_identity) == true }
             // The drift arm: the machine believed the member Live and a probe
             // or a routing miss observed its materialization gone. It is a
-            // counted fault path, never the release mechanism (G1).
+            // counted fault path, never the release mechanism.
             guard "member_live" { self.member_materialization.get_cloned(agent_identity) == Some(MemberMaterializationPhase::Live) }
             guard "no_explicit_resume_work" { self.explicit_resume_member_work.contains_key(agent_identity) == false }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // After the seal every Waking member has a durable endpoint (I6).
+            // After the seal every Waking member has a durable endpoint.
             guard "endpoint_present_after_seal" {
                 self.boot_plan_sealed == false
                 || self.member_peer_endpoints.contains_key(agent_identity) == true
@@ -13743,7 +13745,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_materialization.insert(agent_identity, MemberMaterializationPhase::Waking);
                 self.member_wake_attempts.insert(agent_identity, self.member_wake_attempt_sequence);
                 self.member_wake_bound.remove(agent_identity);
-                // The binding ladder goes (R12): the wake binds anew. The
+                // The binding ladder goes: the wake binds anew. The
                 // registration's epoch stays, as an explicit resume keeps it:
                 // a wake that registers anew overwrites it with the new
                 // registration's (the routed binding), and a wake that finds
@@ -13797,7 +13799,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // Wake resolution, step 2 of a local wake (F11, R7): the attempt's
+        // Wake resolution, step 2 of a local wake: the attempt's
         // runtime binding was requested (ResolveMemberRevivalBound, which
         // emits RequestRuntimeBinding, so the consumer binds the member's
         // PLACEMENT tuple before its drain admits any work) and its readiness
@@ -13829,7 +13831,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // An explicitly nonpersistent service recreated a missing actor with a
-        // fresh session during a wake (F7). Successful provisioning is an
+        // fresh session during a wake. Successful provisioning is an
         // observation, not durable snapshot revival: like the Bound step, only
         // the exact current local incarnation's open attempt may ask the
         // consumer to bind its already-prepared resources, and the attempt
@@ -13927,7 +13929,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "placed_completion_destroy_intent" { self.placed_completion_lifecycle_intent == Some(PlacedCompletionLifecycleIntentKind::Destroy) }
             update {
                 self.destroy_admitted = true;
-                // R3/F4: every open wake attempt closes here. Each Waking member
+                // Every open wake attempt closes here. Each Waking member
                 // returns to Dormant (its boot obligation, if any, is kept), its
                 // binding ladder and epoch go, and MemberWakesAbandoned tells the
                 // shell to answer every waiter and roll back every in-flight
@@ -13988,7 +13990,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "placed_completion_cancel_requested_drained" { self.cancel_requested_placed_completion_outcomes == EmptySet }
             guard "placed_completion_resolved_drained" { self.resolved_placed_completion_outcomes == EmptySet }
             update {
-                // R3/F4: every open wake attempt closes when the mob leaves
+                // Every open wake attempt closes when the mob leaves
                 // Running (see StopRunning).
                 for member_id in self.member_wake_attempts.keys() {
                     self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
@@ -14092,7 +14094,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_boot_obligation_owed = EmptyMap;
                 self.member_rotation_session_ids = EmptyMap;
                 self.member_rotation_peer_endpoints = EmptyMap;
-                // R124: nothing waits on a host carry-out after the destroy.
+                // Nothing waits on a host carry-out after the destroy.
                 self.member_host_preparation_pending = EmptySet;
                 // Spawn-exec phase ladder: total teardown — clear the whole phase
                 // map so no in-flight spawn-exec survives into Destroyed (every
@@ -14390,7 +14392,7 @@ macro_rules! mob_catalog_machine_dsl {
             update {
                 self.coordinator_bound = false;
                 self.active_run_count = 0;
-                // R3/F4: every open wake attempt closes here. Each Waking member
+                // Every open wake attempt closes here. Each Waking member
                 // returns to Dormant (its boot obligation, if any, is kept), its
                 // binding ladder and epoch go, and MemberWakesAbandoned tells the
                 // shell to answer every waiter and roll back every in-flight
@@ -14416,7 +14418,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             emit EmitRunLifecycleNotice
             emit MemberWakesAbandoned { cause: MemberWakeAbandonCause::MobStopping }
-            // R9: a stopped mob gives one outcome to peers, Live or Dormant.
+            // A stopped mob gives one outcome to peers, Live or Dormant.
             emit CloseMemberPeerIngress { reason: MemberWakeRefusalKind::MobNotRunning }
         }
 
@@ -14469,7 +14471,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "placed_completion_resolved_drained" { self.resolved_placed_completion_outcomes == EmptySet }
             update {
                 self.active_run_count = 0;
-                // R3/F4: every open wake attempt closes here. Each Waking member
+                // Every open wake attempt closes here. Each Waking member
                 // returns to Dormant (its boot obligation, if any, is kept), its
                 // binding ladder and epoch go, and MemberWakesAbandoned tells the
                 // shell to answer every waiter and roll back every in-flight
@@ -14579,7 +14581,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
-            // I8: a wiring edge joins seated members (or a member held by a
+            // A wiring edge joins seated members (or a member held by a
             // respawn's preserved topology); pending edges exist nowhere.
             guard "edge_endpoints_seated_or_held" {
                 (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
@@ -14646,7 +14648,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "edge_not_already_wired" { self.wiring_edges.contains(edge) == false }
             guard "edge_matches_members" { mob_machine_wiring_edge_matches_members(edge, a_identity, b_identity) }
-            // I8: a wiring edge joins seated members (or a member held by a
+            // A wiring edge joins seated members (or a member held by a
             // respawn's preserved topology); pending edges exist nowhere.
             guard "edge_endpoints_seated_or_held" {
                 (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
@@ -14744,7 +14746,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "edge_not_already_recovered" { self.wiring_edges.contains(edge) == false }
             // Replay may carry an edge to an identity that leaves later in the
             // stream (pruned by ConvergeRecoveredRosterTopology); after the
-            // seal an edge joins seated or held members only (I8).
+            // seal an edge joins seated or held members only.
             guard "edge_endpoints_seated_or_held_after_seal" {
                 self.boot_plan_sealed == false
                 || ((self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
@@ -14921,7 +14923,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "generation_matches" { self.identity_runtime_generations.get_copied(agent_identity) == Some(generation) }
             guard "fence_token_matches" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(fence_token) }
             guard "member_retiring" { self.member_state_markers.get_cloned(agent_runtime_id) == Some(MobMemberState::Retiring) }
-            // I8: a wiring edge joins seated members (or a member held by a
+            // A wiring edge joins seated members (or a member held by a
             // respawn's preserved topology); pending edges exist nowhere.
             guard "edge_endpoints_seated_or_held" {
                 (self.identity_to_runtime.contains_key(mob_machine_wiring_edge_a(edge)) == true
@@ -14991,7 +14993,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit EmitExternalPeerWiringLifecycleNotice { kind: WiringLifecycleKind::Wired, edge: edge }
         }
 
-        // R125: a Dormant local member holds no comms runtime. Its edge
+        // A Dormant local member holds no comms runtime. Its edge
         // commits with no trust obligation; its wake realizes the trust from
         // external_peer_edges. A Waking or Live member takes the arm above.
         transition WireExternalPeerDormantRunning {
@@ -15031,7 +15033,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // R125: a Dormant local member holds no comms runtime, so its wired
+        // A Dormant local member holds no comms runtime, so its wired
         // edge needs no trust repair: its wake realizes the trust from
         // external_peer_edges. A Waking or Live member takes the arm above.
         transition WireExternalPeerAlreadyWiredDormant {
@@ -15470,7 +15472,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit EmitExternalPeerWiringLifecycleNotice { kind: WiringLifecycleKind::Unwired, edge: edge }
         }
 
-        // R125: a Dormant local member holds no comms runtime, so its edge is
+        // A Dormant local member holds no comms runtime, so its edge is
         // removed with no trust obligation: its next wake realizes the
         // topology without it. A Waking or Live member takes the arm above.
         transition UnwireExternalPeerDormantRunning {
@@ -17152,7 +17154,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             update {
                 self.active_run_count = 0;
-                // R3/F4: every open wake attempt closes when the mob leaves
+                // Every open wake attempt closes when the mob leaves
                 // Running (see StopRunning).
                 for member_id in self.member_wake_attempts.keys() {
                     self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
@@ -18639,7 +18641,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_run_starts_held = true;
                 self.coordinator_bound = false;
                 self.active_run_count = 0;
-                // R3/F4: every open wake attempt closes when the mob leaves
+                // Every open wake attempt closes when the mob leaves
                 // Running (see StopRunning).
                 for member_id in self.member_wake_attempts.keys() {
                     self.member_materialization.insert(member_id, MemberMaterializationPhase::Dormant);
@@ -20552,8 +20554,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt), or a re-drive of
         // an archive-only retirement. It mirrors RetireRunningReleasing but
         // routes no runtime retire: the runtime is recorded archive-only and
@@ -20601,7 +20603,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
             emit RequestSessionIngressDetachForMobDestroy { mob_id: mob_id, agent_runtime_id: agent_runtime_id }
             emit MemberSessionBindingChanged { epoch: self.topology_epoch, agent_identity: agent_identity, old_session_id: Some(releasing.get("value")), new_session_id: None }
-            // 0.7.2 L5: member retire opens the kickoff-waiter drain
+            // A member retire opens the kickoff-waiter drain
             // obligation; archival is guarded on its closure.
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
@@ -20739,8 +20741,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt), or a re-drive of
         // an archive-only retirement. It mirrors RetireRunningPreservingBinding
         // but routes no runtime retire: the runtime is recorded archive-only
@@ -20873,8 +20875,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt), or a re-drive of
         // an archive-only retirement. It mirrors RetireStoppedReleasing but
         // routes no runtime retire: the runtime is recorded archive-only and
@@ -21109,8 +21111,8 @@ macro_rules! mob_catalog_machine_dsl {
             emit RequestKickoffQuiesce { member_id: agent_identity }
         }
 
-        // R27: the retirement of a member with no runtime registration in this
-        // process (Dormant, or Waking: its open attempt closes here, F3, and
+        // The retirement of a member with no runtime registration in this
+        // process (Dormant, or Waking: its open attempt closes here, and
         // the in-flight provision rolls back on StaleAttempt), or a re-drive of
         // an archive-only retirement. It mirrors RetireStoppedPreservingBinding
         // but routes no runtime retire: the runtime is recorded archive-only
@@ -21380,7 +21382,7 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.lifecycle_phase == Phase::Stopped
                 || self.lifecycle_phase == Phase::Completed
             }
-            // R124: a rotation in flight at a destroy is abandoned at the
+            // A rotation in flight at a destroy is abandoned at the
             // destroy's admission, whose RotationSessionsAbandoned names each
             // rotation's next session for the shell to archive (no rotation
             // begins after it). The destroy that drops the intents therefore
@@ -21447,7 +21449,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_peer_ids = EmptyMap;
                 self.member_peer_endpoints = EmptyMap;
                 self.member_prior_peer_endpoints = EmptyMap;
-                // R2: the destroy drops every member, so every residency
+                // The destroy drops every member, so every residency
                 // phase, attempt, epoch and obligation goes with them.
                 self.member_materialization = EmptyMap;
                 self.member_wake_attempts = EmptyMap;
@@ -21456,7 +21458,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_boot_obligation_owed = EmptyMap;
                 self.member_rotation_session_ids = EmptyMap;
                 self.member_rotation_peer_endpoints = EmptyMap;
-                // R124: nothing waits on a host carry-out after the destroy.
+                // Nothing waits on a host carry-out after the destroy.
                 self.member_host_preparation_pending = EmptySet;
                 self.runtime_retire_archive_only = EmptySet;
                 self.runtime_retire_refusal_codes = EmptyMap;
@@ -22026,7 +22028,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "current_runtime" { self.identity_to_runtime.get_cloned(agent_identity) == Some(binding.agent_runtime_id) }
             guard "current_fence" { self.identity_runtime_fence_tokens.get_copied(agent_identity) == Some(binding.fence_token) }
             guard "current_session" { self.member_session_bindings.get_cloned(agent_identity) == Some(binding.session_id) }
-            // R3: the explicit resume reserves a Dormant member by opening its
+            // The explicit resume reserves a Dormant member by opening its
             // wake attempt, so a peer or host wake during the resume Joins it
             // and one session is never materialized twice. The resume's own
             // rebuild realizes the attempt (no MaterializeMember effect).
@@ -22061,7 +22063,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "current_session" { self.member_session_bindings.get_cloned(agent_identity) == Some(binding.session_id) }
             // The resume reserved the member (it is Waking under an open
             // attempt, its own or a joined one); a present durable snapshot
-            // keeps that attempt (F7).
+            // keeps that attempt.
             guard "member_waking" { self.member_wake_attempts.contains_key(agent_identity) == true }
             guard "durable_snapshot_present" { observation == MemberLiveMaterializationObservationKind::DurableSnapshotPresent }
             update {}
@@ -22088,7 +22090,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "member_waking" { self.member_wake_attempts.contains_key(agent_identity) == true }
             guard "durable_snapshot_missing" { observation == MemberLiveMaterializationObservationKind::DurableSnapshotMissing }
             update {
-                // R2: a Broken setter removes the phase and every wake record.
+                // A Broken setter removes the phase and every wake record.
                 self.member_materialization.remove(agent_identity);
                 self.member_wake_attempts.remove(agent_identity);
                 self.member_wake_bound.remove(agent_identity);
@@ -22164,7 +22166,7 @@ macro_rules! mob_catalog_machine_dsl {
             guard "current_session" { self.member_session_bindings.get_cloned(agent_identity) == Some(binding.session_id) }
             // The resume settles from its attempt's outcome: the attempt was
             // resolved (Live, Broken) or abandoned (Dormant) first, so the
-            // settle never leaves a Waking member without an owner (R3).
+            // settle never leaves a Waking member without an owner.
             guard "attempt_closed" { self.member_wake_attempts.contains_key(agent_identity) == false }
             update {
                 self.explicit_resume_member_work.remove(agent_identity);
@@ -22185,7 +22187,7 @@ macro_rules! mob_catalog_machine_dsl {
             // A replaced incarnation's attempt was closed by its retirement
             // (any open attempt is the successor's own wake); when only the
             // session changed, the resume's attempt is still this member's and
-            // the settle waits for its outcome, as the exact arm does (R3).
+            // the settle waits for its outcome, as the exact arm does.
             guard "attempt_closed_or_incarnation_replaced" {
                 self.member_wake_attempts.contains_key(agent_identity) == false
                 || self.identity_to_runtime.get_cloned(agent_identity) != Some(binding.agent_runtime_id)
@@ -24657,8 +24659,8 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // WakeMember: one arm per member phase in Running, decided by the
-        // generated member_wake_refusal over member facts only (R11), and one
-        // refusal per other lifecycle phase (R3). A read is never a cause.
+        // generated member_wake_refusal over member facts only, and one
+        // refusal per other lifecycle phase. A read is never a cause.
         transition WakeMemberAuthorizedRunning {
             on input WakeMember { agent_identity, cause, observed_missing, input_class, sender_waking }
             guard { self.lifecycle_phase == Phase::Running }
@@ -24832,7 +24834,7 @@ macro_rules! mob_catalog_machine_dsl {
         }
 
         // A mob that is not Running materializes nothing: one typed answer for
-        // every member (R3, R9).
+        // every member.
         transition WakeMemberRefused {
             per_phase [Stopped, Completed, Destroyed]
             on input WakeMember { agent_identity, cause, observed_missing, input_class, sender_waking }
@@ -24892,7 +24894,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // The obligation stays owed until the wake reaches Live: a
                 // retryable wake keeps it, so the owner's timer wakes the
                 // member again. A member with no durable endpoint is owed
-                // EndpointPending, the seal's one typed exception (I6).
+                // EndpointPending, the seal's one typed exception.
                 if self.member_peer_endpoints.contains_key(agent_identity) == true {
                     self.member_boot_obligation_owed.insert(agent_identity, MemberBootObligationCause::Obligation);
                 } else {
@@ -24972,7 +24974,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // A member left Dormant with no durable endpoint (a candidate
                 // composition, a pending host preparation or a lifecycle
                 // cleanup holds it) is owed EndpointPending, the seal's typed
-                // exception (I6): the seal never refuses it, and its first
+                // exception: the seal never refuses it, and its first
                 // wake registers the endpoint.
                 if self.member_peer_endpoints.contains_key(agent_identity) == false {
                     self.member_boot_obligation_owed.insert(agent_identity, MemberBootObligationCause::EndpointPending);
@@ -25012,7 +25014,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit RebuildWakeRoutes
         }
 
-        // R4: the disposition of one peer notice, read from both members'
+        // The disposition of one peer notice, read from both members'
         // phases. The shell realizes exactly the disposition.
         transition ClassifyPeerNotice {
             per_phase [Running, Stopped, Completed, Destroyed]
@@ -25030,21 +25032,21 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // A seat (D3): membership without materialization. The spawn admission
+        // A seat: membership without materialization. The spawn admission
         // ladder opened it (BeginSpawnExec + AuthorizeSpawnProfile); the
         // commit writes the CommitSpawnMembershipFresh membership facts, the
-        // durable endpoint (R5 guards) and Dormant, requests no runtime
+        // durable endpoint (under the peer-id guards) and Dormant, requests no runtime
         // binding and closes the ladder. Its MemberSpawned row is journaled
         // before the commit (append_batch). A network-comms member's keys
         // exist only once it materializes, so its seat carries no endpoint:
-        // it is seated owed EndpointPending (the typed I6 exception), its boot
+        // it is seated owed EndpointPending (the seal's typed exception), its boot
         // verdict wakes it, and the wake registers the real endpoint.
         transition CommitDormantSeatRunning {
             on input CommitDormantSeat { agent_identity, agent_runtime_id, fence_token, generation, external_addressable, runtime_mode, bridge_session_id, member_peer_endpoint, session_archived, kickoff_owed }
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13: a seat owes no kickoff; a spec that owes one spawns
+            // A seat owes no kickoff; a spec that owes one spawns
             // embodied. The caller states whether the spec owes one.
             guard "seat_owes_no_kickoff" { kickoff_owed == false }
             guard "spawn_exec_opened" { self.spawn_exec_phase.get_cloned(agent_identity) == Some(SpawnExecPhase::Opened) }
@@ -25055,9 +25057,9 @@ macro_rules! mob_catalog_machine_dsl {
             guard "runtime_not_live" { self.live_runtime_ids.contains(agent_runtime_id) == false }
             guard "spawn_profile_name_authorized" { self.spawn_profile_authority_profile_names.contains_key(agent_identity) == true }
             guard "spawn_profile_addressability_authorized" { self.spawn_profile_authority_external_addressable.get_cloned(agent_identity) == Some(external_addressable) }
-            // R6: never bind an archived session.
+            // Never bind an archived session.
             guard "session_not_archived" { session_archived == false }
-            // R5: RegisterMemberPeerRunning's peer-registration guards, for a
+            // RegisterMemberPeerRunning's peer-registration guards, for a
             // seat that carries its endpoint.
             guard "peer_id_available_for_identity" {
                 member_peer_endpoint == None
@@ -25092,7 +25094,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.identity_runtime_fence_tokens.insert(agent_identity, fence_token);
                 self.member_profile_names.insert(agent_identity, self.spawn_profile_authority_profile_names.get_cloned(agent_identity).get("value"));
                 self.member_runtime_modes.insert(agent_identity, runtime_mode);
-                // A seat requests no runtime binding (I7): only a wake's Bound
+                // A seat requests no runtime binding: only a wake's Bound
                 // step opens the binding ladder.
                 self.member_startup_binding_requested.remove(agent_runtime_id);
                 self.member_startup_runtime_ready.remove(agent_runtime_id);
@@ -25116,7 +25118,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_host_preparation_pending.remove(agent_identity);
                 // A seat clears kickoff residue, as the fresh spawn commit does,
                 // and owes no kickoff: a spec that owes one is spawned embodied
-                // through the ordinary spawn path, never seated (R13).
+                // through the ordinary spawn path, never seated.
                 self.member_kickoff_pending.remove(agent_identity);
                 self.member_kickoff_starting.remove(agent_identity);
                 self.member_kickoff_callback_pending.remove(agent_identity);
@@ -25182,7 +25184,7 @@ macro_rules! mob_catalog_machine_dsl {
 
         // A rotation (reset, delete) of the exact Retiring incarnation: its
         // archive terminal is CommitMemberRotation, which seats the next
-        // incarnation Dormant on the recorded NEW session and endpoint (F6).
+        // incarnation Dormant on the recorded NEW session and endpoint.
         // Running only: the shell applies Retire, AuthorizeSpawnProfile
         // (Running-only) and this intent in ONE prepared step, so a Stopped
         // mob refuses the rotation before its retirement starts. A Stop that
@@ -25192,7 +25194,7 @@ macro_rules! mob_catalog_machine_dsl {
             per_phase [Running]
             on input BeginMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, peer_endpoint, session_archived }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R124: the destroy beats the rotation. Once it is admitted the
+            // The destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
             guard "destroy_not_admitted" { self.destroy_admitted == false }
@@ -25231,7 +25233,7 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
         }
 
-        // The rotation's archive terminal (F6): the exact Retiring incarnation
+        // The rotation's archive terminal: the exact Retiring incarnation
         // is archived and the next one is seated Dormant at the next
         // generation on the recorded NEW session in ONE transition, so the
         // identity is never a non-member. Its MemberRetired and MemberSpawned
@@ -25243,10 +25245,10 @@ macro_rules! mob_catalog_machine_dsl {
             on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13: the re-seat owes no kickoff here; a rotation whose spec owes
+            // The re-seat owes no kickoff here; a rotation whose spec owes
             // one takes the Kickoff twin below. The caller states which.
             guard "rotation_owes_no_kickoff" { kickoff_owed == false }
-            // R124: the destroy beats the rotation. Once it is admitted the
+            // The destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
             guard "destroy_not_admitted" { self.destroy_admitted == false }
@@ -25273,7 +25275,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.resolved_placed_kickoff_outcomes,
                     agent_identity)
             }
-            // The next incarnation's seat guards (R5, and the spawn mint).
+            // The next incarnation's seat guards (peer ids, and the spawn mint).
             guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
@@ -25413,10 +25415,10 @@ macro_rules! mob_catalog_machine_dsl {
             on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13: the re-seat owes no kickoff here; a rotation whose spec owes
+            // The re-seat owes no kickoff here; a rotation whose spec owes
             // one takes the Kickoff twin below. The caller states which.
             guard "rotation_owes_no_kickoff" { kickoff_owed == false }
-            // R124: the destroy beats the rotation. Once it is admitted the
+            // The destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
             guard "destroy_not_admitted" { self.destroy_admitted == false }
@@ -25443,7 +25445,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.resolved_placed_kickoff_outcomes,
                     agent_identity)
             }
-            // The next incarnation's seat guards (R5, and the spawn mint).
+            // The next incarnation's seat guards (peer ids, and the spawn mint).
             guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
@@ -25578,7 +25580,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit PublishWakeRoute { agent_identity: agent_identity }
         }
 
-        // Wake resolution, step 1 of a local wake (F11): the provision
+        // Wake resolution, step 1 of a local wake: the provision
         // registered the runtime; request its binding so the consumer binds
         // the member's PLACEMENT tuple before the drain admits. The attempt
         // stays open. The startup binding ladder opens only when the runtime
@@ -25626,7 +25628,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_wake_attempts.remove(agent_identity);
                 self.member_wake_bound.remove(agent_identity);
                 self.member_materialization_epoch.remove(agent_identity);
-                // A Dormant member requests no runtime binding (I7): the
+                // A Dormant member requests no runtime binding: the
                 // rolled-back provision's binding ladder goes with it.
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
@@ -25636,7 +25638,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::Applied }
         }
 
-        // A shell path that ends a wake without a resolution (R3): NotCurrent,
+        // A shell path that ends a wake without a resolution: NotCurrent,
         // ReloadRefused and Unsettled return the member to Dormant; a
         // readiness or topology failure after the provision records Broken.
         transition AbandonMemberWakeDormantRunning {
@@ -25652,7 +25654,7 @@ macro_rules! mob_catalog_machine_dsl {
                 self.member_wake_attempts.remove(agent_identity);
                 self.member_wake_bound.remove(agent_identity);
                 self.member_materialization_epoch.remove(agent_identity);
-                // A Dormant member requests no runtime binding (I7): the
+                // A Dormant member requests no runtime binding: the
                 // rolled-back provision's binding ladder goes with it.
                 self.member_startup_binding_requested.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
                 self.member_startup_runtime_ready.remove(self.identity_to_runtime.get_cloned(agent_identity).get("value"));
@@ -25688,7 +25690,7 @@ macro_rules! mob_catalog_machine_dsl {
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::Applied }
         }
 
-        // F4: late or stale wake feedback is a total, typed machine verdict.
+        // Late or stale wake feedback is a total, typed machine verdict.
         // In every lifecycle phase, feedback for an attempt that is not the
         // member's open attempt (closed by a resolution, a Stop, a Complete,
         // a destroy admission, a retirement or an unseat; or never minted)
@@ -25757,12 +25759,12 @@ macro_rules! mob_catalog_machine_dsl {
             emit MemberWakeFeedbackResolved { agent_identity: agent_identity, attempt: attempt, verdict: MemberWakeFeedbackVerdict::StaleAttempt }
         }
 
-        // G1/F5: a runtime registration was released while its member stays seated
+        // A runtime registration was released while its member stays seated
         // (the composition route from MeerkatMachine's RuntimeRegistrationReleased,
         // or the mob-owned discard seam). Only the exact registration of a Live,
-        // local member (with a durable endpoint once the boot plan is sealed, N3,
+        // local member (with a durable endpoint once the boot plan is sealed,
         // and no wiring edge to a placed member) is released: Live -> Dormant, its
-        // epoch and binding ladder cleared (R12). The member facts come from
+        // epoch and binding ladder cleared. The member facts come from
         // member_registration_releasable, which the release verdict shares.
         // Anything else (an older epoch after a newer wake, a Waking member, a
         // member pinned Live by a placed peer, a wake's own claim rollback, a
@@ -25840,9 +25842,9 @@ macro_rules! mob_catalog_machine_dsl {
             emit MemberMaterializationReleased { agent_runtime_id: agent_runtime_id, cause: cause, outcome: MemberMaterializationReleaseOutcome::Stale }
         }
 
-        // OnDemandVerified (4.3h2): the read-only boot verdict found the
+        // OnDemandVerified: the read-only boot verdict found the
         // Dormant member's durable session absent with no successor: the
-        // machine's missing-snapshot verdict records it Broken (I4) without
+        // machine's missing-snapshot verdict records it Broken without
         // materializing it.
         transition ClassifyMemberLiveMaterializationTerminalDormant {
             on signal ClassifyMemberLiveMaterialization { agent_identity, observation, reason }
@@ -25876,7 +25878,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // R3: an explicit resume reserves a Live member (an in-process stop
+        // An explicit resume reserves a Live member (an in-process stop
         // and resume) by opening a wake attempt over it, keeping its epoch and
         // binding ladder (a kept session re-binds idempotently). The resume's
         // own rebuild realizes the attempt (no MaterializeMember).
@@ -25911,7 +25913,7 @@ macro_rules! mob_catalog_machine_dsl {
             to Running
         }
 
-        // R3: a member already Waking (a boot-plan, peer or host wake in
+        // A member already Waking (a boot-plan, peer or host wake in
         // flight) is not rebuilt: the explicit resume Joins its open attempt
         // and settles from its outcome.
         transition AuthorizeExplicitResumeMemberJoinRunning {
@@ -25968,7 +25970,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // The rotation terminal of a spec that owes a kickoff (R13, R62): as
+        // The rotation terminal of a spec that owes a kickoff: as
         // its kickoff-free twin, and the next incarnation is seated with the
         // kickoff recorded pending.
         transition CommitMemberRotationLiveKickoff {
@@ -25976,11 +25978,11 @@ macro_rules! mob_catalog_machine_dsl {
             on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13 / R62: a rotation whose spec owes a kickoff re-seats the
+            // A rotation whose spec owes a kickoff re-seats the
             // next incarnation with the kickoff recorded pending, so it is
             // never lost across the rotation (a fresh seat still refuses one).
             guard "rotation_owes_kickoff" { kickoff_owed == true }
-            // R124: the destroy beats the rotation. Once it is admitted the
+            // The destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
             guard "destroy_not_admitted" { self.destroy_admitted == false }
@@ -26007,7 +26009,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.resolved_placed_kickoff_outcomes,
                     agent_identity)
             }
-            // The next incarnation's seat guards (R5, and the spawn mint).
+            // The next incarnation's seat guards (peer ids, and the spawn mint).
             guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
@@ -26157,11 +26159,11 @@ macro_rules! mob_catalog_machine_dsl {
             on input CommitMemberRotation { agent_identity, agent_runtime_id, fence_token, generation, session_id, disposal, next_agent_runtime_id, next_fence_token, next_generation, runtime_mode, external_addressable, kickoff_owed, kickoff_objective_id }
             guard "rotation_pending" { self.member_rotation_session_ids.contains_key(agent_identity) == true }
             guard "composition_authoritative" { self.composition_authority == CompositionAuthorityKind::Authoritative }
-            // R13 / R62: a rotation whose spec owes a kickoff re-seats the
+            // A rotation whose spec owes a kickoff re-seats the
             // next incarnation with the kickoff recorded pending, so it is
             // never lost across the rotation (a fresh seat still refuses one).
             guard "rotation_owes_kickoff" { kickoff_owed == true }
-            // R124: the destroy beats the rotation. Once it is admitted the
+            // The destroy beats the rotation. Once it is admitted the
             // identity's retirement ends through the destroy, which drops the
             // intent; no rotation begins or re-seats a member under it.
             guard "destroy_not_admitted" { self.destroy_admitted == false }
@@ -26188,7 +26190,7 @@ macro_rules! mob_catalog_machine_dsl {
                     self.resolved_placed_kickoff_outcomes,
                     agent_identity)
             }
-            // The next incarnation's seat guards (R5, and the spawn mint).
+            // The next incarnation's seat guards (peer ids, and the spawn mint).
             guard "generation_is_next" { Some(next_generation) == mob_machine_next_minted_generation(self.identity_runtime_generations, self.identity_generation_highwater, agent_identity) }
             guard "next_runtime_fresh" {
                 self.live_runtime_ids.contains(next_agent_runtime_id) == false
@@ -26354,7 +26356,7 @@ macro_rules! mob_catalog_machine_dsl {
             }
         }
 
-        // F2 at wiring: an edge that joins a Dormant local member to a placed
+        // At wiring, an edge that joins a Dormant local member to a placed
         // member wakes the Dormant end (one arm per end and wiring input), so
         // the member is not left Dormant behind an inproc wake route that the
         // placed peer, in another process, cannot use. The member's own wake
@@ -26411,7 +26413,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // Owed until Live (PlacedPeerWired), as a boot wake is: a
                 // retryable failure leaves the member Dormant and owed, so
                 // the owner wakes it again. A member with no durable endpoint
-                // owes EndpointPending (I6).
+                // owes EndpointPending.
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
@@ -26478,7 +26480,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // Owed until Live (PlacedPeerWired), as a boot wake is: a
                 // retryable failure leaves the member Dormant and owed, so
                 // the owner wakes it again. A member with no durable endpoint
-                // owes EndpointPending (I6).
+                // owes EndpointPending.
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
@@ -26550,7 +26552,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // Owed until Live (PlacedPeerWired), as a boot wake is: a
                 // retryable failure leaves the member Dormant and owed, so
                 // the owner wakes it again. A member with no durable endpoint
-                // owes EndpointPending (I6).
+                // owes EndpointPending.
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_a(edge)) == true {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_a(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
@@ -26630,7 +26632,7 @@ macro_rules! mob_catalog_machine_dsl {
                 // Owed until Live (PlacedPeerWired), as a boot wake is: a
                 // retryable failure leaves the member Dormant and owed, so
                 // the owner wakes it again. A member with no durable endpoint
-                // owes EndpointPending (I6).
+                // owes EndpointPending.
                 if self.member_peer_endpoints.contains_key(mob_machine_wiring_edge_b(edge)) == true {
                     self.member_boot_obligation_owed.insert(mob_machine_wiring_edge_b(edge), MemberBootObligationCause::PlacedPeerWired);
                 } else {
@@ -28953,7 +28955,7 @@ pub enum MemberRevivalVerdictKind {
     BrokenRecorded,
 }
 
-/// Member residency in this process (B6). Dormant: seated, not materialized.
+/// Member residency in this process. Dormant: seated, not materialized.
 /// Waking: exactly one materialization attempt is open. Live: materialized.
 /// Internal machine state only: no consumer surface reports it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]

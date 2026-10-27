@@ -6,7 +6,7 @@
 //!
 //! - `PeerNotFoundConstructionOutsideAllowlist`: `InprocSendError::PeerNotFound`
 //!   and `SendError::PeerNotFound` mean "not a member". They are constructed
-//!   only at the registered sites, each with its own design row: the inproc
+//!   only at the registered sites, each with its own reason: the inproc
 //!   registry misses (reached only after a wake-route miss or for a
 //!   non-member), the router's trust miss (unreachable for a seated, wired
 //!   member) and the two mappings. A new construction site fails until it is
@@ -105,48 +105,48 @@ const fn pending(
     }
 }
 
-/// Every registered `PeerNotFound` construction site, each with its design
-/// row (R91). An entry that matches nothing only warns.
+/// Every registered `PeerNotFound` construction site, each with the reason
+/// it may construct one. An entry that matches nothing only warns.
 pub(crate) const PEER_NOT_FOUND_CONSTRUCTIONS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-comms/src/inproc.rs",
         "send_resolving_wake",
-        "R91, R3, R13: neither a live nor a wake route: a non-member, or a member of another namespace",
+        "neither a live nor a wake route: a non-member, or a member of another namespace",
     ),
     settled(
         "crates/meerkat-comms/src/inproc.rs",
         "await_wake",
-        "R91: a stale wake route whose owner denies membership (the NotAMember wake denial)",
+        "a stale wake route whose owner denies membership (the NotAMember wake denial)",
     ),
     settled(
         "crates/meerkat-comms/src/router.rs",
         "map_inproc_send_error",
-        "R91: maps the inproc PeerNotFound above to the router error, nothing else",
+        "maps the inproc PeerNotFound above to the router error, nothing else",
     ),
     settled(
         "crates/meerkat-comms/src/router.rs",
         "send_with_id",
-        "R91: trust miss, unreachable for a seated, wired member with an endpoint. R122: a seated member with no durable endpoint has no key and no trust row yet; the owed boot retry records its endpoint and publishes its wake route, and until then a peer cannot address it",
+        "trust miss, unreachable for a seated, wired member with an endpoint. A seated member with no durable endpoint has no key and no trust row yet; the owed boot retry records its endpoint and publishes its wake route, and until then a peer cannot address it",
     ),
     settled(
         "crates/meerkat-comms/src/runtime/comms_runtime.rs",
         "send_peer_command_with_id",
-        "R91: maps the router PeerNotFound to the public SendError, nothing else",
+        "maps the router PeerNotFound to the public SendError, nothing else",
     ),
     settled(
         "crates/meerkat-comms/src/mcp/tools.rs",
         "ensure_peer_id_is_trusted",
-        "R122: the tool-boundary trust miss; a seated member with no durable endpoint has no key and no trust row until the owed boot retry records its endpoint",
+        "the tool-boundary trust miss; a seated member with no durable endpoint has no key and no trust row until the owed boot retry records its endpoint",
     ),
     settled(
         "crates/meerkat-comms/src/mcp/tools.rs",
         "dispatch",
-        "R91: maps the runtime PeerNotFound to the tool text, nothing else",
+        "maps the runtime PeerNotFound to the tool text, nothing else",
     ),
     settled(
         "crates/meerkat-comms/src/mcp/tools.rs",
         "format_router_send_error",
-        "R91: maps the router PeerNotFound to the tool text, nothing else",
+        "maps the router PeerNotFound to the tool text, nothing else",
     ),
 ];
 
@@ -177,12 +177,12 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-mob/src/runtime/actor/reload_revival.rs",
         "begin_member_live_revival",
-        "the wake path's own live observation (review N8)",
+        "the wake path's own live observation",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/actor/reload_revival.rs",
         "commit_warm_revival",
-        "the wake path's own live observation (review N8)",
+        "the wake path's own live observation",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/actor.rs",
@@ -217,22 +217,22 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-mob/src/runtime/host_materialize.rs",
         "acquire_vacant_materialization_boundary",
-        "member-host materialization mechanics: a placed member's liveness is host-owned (G14)",
+        "member-host materialization mechanics: a placed member's liveness is host-owned",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/host_materialize.rs",
         "session_live",
-        "member-host materialization mechanics: a placed member's liveness is host-owned (G14)",
+        "member-host materialization mechanics: a placed member's liveness is host-owned",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/host_materialize.rs",
         "quiesce_nonserving_incarnation_until",
-        "member-host materialization mechanics: a placed member's liveness is host-owned (G14)",
+        "member-host materialization mechanics: a placed member's liveness is host-owned",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/host_materialize.rs",
         "materialize",
-        "member-host materialization mechanics: a placed member's liveness is host-owned (G14)",
+        "member-host materialization mechanics: a placed member's liveness is host-owned",
     ),
     settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
@@ -302,7 +302,7 @@ pub(crate) const MOB_MEMBER_SESSION_DISCARDS: &[SiteAllowance] = &[
     settled(
         "crates/meerkat-mob/src/runtime/provisioner.rs",
         "create_dormant_member_session",
-        "fresh-seat create (R14, D2): the empty session's agent is built standalone, with no runtime registration, and discarded at once; it never was a member materialization (the identity is not seated yet, or a rotation seats it on this session later), so a release has nothing to release; the seat or rotation commit seats it Dormant",
+        "fresh-seat create: the empty session's agent is built standalone, with no runtime registration, and discarded at once; it never was a member materialization (the identity is not seated yet, or a rotation seats it on this session later), so a release has nothing to release; the seat or rotation commit seats it Dormant",
     ),
 ];
 
@@ -478,7 +478,7 @@ impl SiteKind {
     fn unregistered_message(self, callee: &str, enclosing: &str, line: usize) -> String {
         match self {
             Self::PeerNotFound => format!(
-                "`{callee}` is constructed in `{enclosing}` (line {line}), which is not a registered PeerNotFound site. PeerNotFound means \"not a member\"; a seated member's miss takes the wake route. Register the site with its design row in materialization_authority_gates.rs, or return the typed wake refusal"
+                "`{callee}` is constructed in `{enclosing}` (line {line}), which is not a registered PeerNotFound site. PeerNotFound means \"not a member\"; a seated member's miss takes the wake route. Register the site with its reason in materialization_authority_gates.rs, or return the typed wake refusal"
             ),
             Self::LiveSessionObservation => format!(
                 "`{callee}` is read in `{enclosing}` (line {line}), which is not a registered live-session observation. Member residency is MobMachine state (member_materialization); read the phase or apply WakeMember instead"
