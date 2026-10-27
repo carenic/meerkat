@@ -5,6 +5,8 @@ mod before_activation;
 mod existing_live_delegation;
 mod historical_metadata;
 mod host_human_input;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod lazy_boot;
 mod member_creation;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_creation_upcall;

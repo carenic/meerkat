@@ -41,7 +41,70 @@ them.
   how many members `MobBuilder::resume` restores at once. The default is 16;
   `1` restores one member at a time, as before; `0` counts as `1`.
 
+- `meerkat-mob`: member residency. A seated member is Dormant (a member, not
+  materialized), Waking or Live, and MobMachine decides every change of it.
+  - `MobBuilder::with_member_restore_policy(MemberRestorePolicy)`:
+    `OnDemand` (the default) materializes at start only the members that
+    must run (see Changed), `OnDemandVerified` also reads each member it
+    leaves Dormant once, read-only, and records one whose durable session
+    cannot be resumed as Broken, and `Eager` materializes every member, as
+    before.
+  - `MobBuilder::with_host_required_members` (members the host needs live at
+    start), `MobBuilder::with_host_pending_members` (members whose host
+    preparation is still pending: never materialized, and every wake of one
+    is refused retryable until the host's seat step clears it), and
+    `MobBuilder::with_composition_authority(MobCompositionAuthority)` (a
+    `NonAuthoritative` composition materializes and seats nothing).
+  - `MobBuilder::with_member_wake_timeout` and
+    `MobBuilder::with_member_wake_retry_backoff` bound a member's wake and
+    the retry of a member whose start-up work is still owed after a
+    retryable refusal.
+  - `MobHandle::boot_set_basis` with `MobBootSetBasis` and
+    `MobBootSetUnobservedCause`: whether the latest start could tell which
+    members hold durable work; a start that could not materialized every
+    member, and the cause names the read the store could not make.
+  - `MobHandle::seat_dormant_members(specs)` with `DormantSeatOutcome`:
+    seats members Dormant without materializing them, at most 256 per
+    journal batch, one typed outcome per spec. A fresh spec gets a new
+    empty session under a name-based id, created through the fresh-spawn
+    create path; a resume spec binds its session (never an archived one); a
+    fresh spec that owes a kickoff is spawned instead, as a spawn is.
+    `MobBuilder::with_member_comms_identity_root` (inproc comms) or
+    `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
+    a seat's endpoint comes from.
+  - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
+    reset): its current incarnation is retired and the next one is seated
+    Dormant on a new empty session in the retirement's terminal step, both
+    journal rows in one batch, so the identity is never a non-member. The
+    new incarnation owes no kickoff and keeps no wiring.
+
+- `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the
+  runtimes whose durable state holds recovery work, from the head summary
+  each runtime already pins (no body load), implemented by the SQLite,
+  memory and host stores; the default answers `Unsupported`, and a store
+  decorator must forward it. `MeerkatMachine::boot_recovery_obligations`
+  with `RuntimeBootObligations`, `RuntimeRecoveryWork` and
+  `RuntimeRecoveryWorkUnobserved` reads it with the pending-delivery scan.
+  `SessionLlmCapabilitySurface::from_model_profile`.
+
 ### Changed
+
+- Behaviour-only (not measured by the gate): `meerkat-mob`:
+  `MobBuilder::resume` and the lift of a stopped mob (`MobHandle::resume`)
+  no longer materialize every member. Under the default `OnDemand` policy a
+  start materializes the members that hold durable work (an open or
+  suspended run, queued inputs, a provisional tail, a pending delivery), a
+  member whose endpoint is a network transport or that has no durable
+  endpoint, an orchestrator the resume notifies, and the members the host
+  requires; every other member stays Dormant and is materialized by its
+  first delivery, on its own session. Reads (member lists, status, history,
+  console projections) never materialize a member: a Dormant member's
+  status reports its peer connectivity from MobMachine's membership and its
+  capabilities from its durable session and profile. Wiring and unwiring
+  with a Dormant member commit the edge without waking it, and lifecycle
+  notices to or from a member that is not materialized are not sent (its
+  wake installs the trust they carry). `MemberRestorePolicy::Eager` restores
+  the previous start.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
