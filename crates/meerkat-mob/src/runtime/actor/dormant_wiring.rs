@@ -8,7 +8,11 @@
 //! runtime (a live member trusts the durable endpoint; a peer-only member's
 //! overlay is pushed through its bridge); the dormant side's own trust is
 //! realized by its wake's topology step, from machine state. No wiring verb
-//! wakes a member.
+//! wakes a member, with one exception MobMachine decides: a new edge that
+//! joins a Dormant member to a placed member wakes it (the placed member, in
+//! another process, cannot use its in-process wake route). That wire's
+//! transition carries the member's materialization, realized with every
+//! other residency effect of the apply (see `wire_new_edge_with_placement`).
 //!
 //! The lifecycle notices such an edge change would exchange are MobMachine's
 //! verdict (`ClassifyPeerNotice`): a member that is not materialized can

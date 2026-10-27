@@ -22674,16 +22674,9 @@ impl MobActor {
         // Re-enable checkpointer gates a host may have cancelled. The mob
         // itself leaves them armed while it is Stopped.
         self.provisioner.rearm_all_checkpointers().await;
-        // Resume is what releases the run starts its Stop held (#1500). The
-        // member rebuild below needs each member's runtime to make progress,
-        // so the release comes first.
-        if let Err(error) = self.release_all_member_run_starts().await {
-            tracing::warn!(
-                mob_id = %self.definition.id,
-                error = %error,
-                "resume could not release every member's run-start hold"
-            );
-        }
+        // The run starts its Stop held stay held through the preparation:
+        // they are released once every member's attachment and binding
+        // check settled (`resume_lifecycle_preparation_resolved`).
 
         let candidates = match self.explicit_resume_candidates().await {
             Ok(candidates) => candidates,
@@ -22795,6 +22788,20 @@ impl MobActor {
             self.hold_member_run_starts_while_stopped().await;
             let _ = reply_tx.send(result);
             return;
+        }
+        // Resume is what releases the run starts its Stop held, and only
+        // now: every member's binding check, and any retirement of an
+        // actor that runs another binding, completed in the preparation. So a
+        // run queued while the mob was stopped never starts on an actor the
+        // lift does not keep. The member rebuild and readiness below need
+        // each member's runtime to make progress, so the release comes before
+        // them.
+        if let Err(error) = self.release_all_member_run_starts().await {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                error = %error,
+                "resume could not release every member's run-start hold"
+            );
         }
         if !rebuild.is_empty() {
             // A reconstructed handle cannot become ready until its foreign
@@ -24643,8 +24650,9 @@ impl MobActor {
             ))));
         }
         // The mob runs again: release the run starts its Stop held (#1500),
-        // so input admitted before the stop runs now. The release at resume
-        // begin did the same; this covers members materialized by the resume.
+        // so input admitted before the stop runs now. The release after the
+        // resume's preparation did the same; this covers members materialized
+        // by the resume.
         // A member that cannot be released yet (a peer-only member not bound
         // again yet) is logged per member; the committed resume stands.
         if let Err(error) = self.release_all_member_run_starts().await {
@@ -45691,6 +45699,10 @@ impl MobActor {
             // A local member that is not materialized installs no trust now:
             // its wake's topology step trusts the placed member from machine
             // state; the placed side rides the obligations recorded below.
+            // The wire itself wakes it: a placed member cannot use its
+            // in-process wake route, so MobMachine's wire opens the member's
+            // wake (cause PlacedPeerWired), and the apply below realizes that
+            // materialization with the transition's other residency effects.
             (WiringEndpoint::LocalDormant { .. }, WiringEndpoint::Placed { .. })
             | (WiringEndpoint::Placed { .. }, WiringEndpoint::LocalDormant { .. }) => None,
             (WiringEndpoint::PeerOnly { .. }, _) | (_, WiringEndpoint::PeerOnly { .. }) => {
@@ -63136,7 +63148,7 @@ impl MobActor {
                     &entry,
                     &self.sender_notice_spec(&entry).await?,
                 )?;
-                let (reply_tx, _reply_rx) = tokio::sync::oneshot::channel();
+                let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
                 self.spawn_peer_message_delivery(
                     PeerMessageDeliveryPlan {
                         from: agent_identity.clone(),
@@ -63146,6 +63158,26 @@ impl MobActor {
                     },
                     reply_tx,
                 );
+                // The delivery settles off the actor: a notice that was not
+                // delivered is reported, as a failed send to a live recipient
+                // is.
+                let mob_id = self.definition.id.clone();
+                let from = agent_identity.clone();
+                let to = recipient_entry.agent_identity.clone();
+                tokio::spawn(async move {
+                    let failure = match reply_rx.await {
+                        Ok(Ok(_)) => return,
+                        Ok(Err(error)) => error.to_string(),
+                        Err(_) => "the delivery ended without an outcome".to_string(),
+                    };
+                    tracing::warn!(
+                        %mob_id,
+                        from = %from,
+                        to = %to,
+                        error = %failure,
+                        "a kickoff notice to a peer that was not materialized was not delivered"
+                    );
+                });
                 continue;
             }
             self.notify_peer_event(

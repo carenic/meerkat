@@ -161,10 +161,11 @@ impl PersistedOpsSnapshot {
     /// work.
     ///
     /// The cursors are the ones the snapshot captured. A snapshot persists on
-    /// terminal transitions and when a completion is delivered (the injected
-    /// or agent-applied cursor advances), so a delivered completion reads as
-    /// delivered here; one whose cursor write failed reads as owed, exactly
-    /// as the recovered runtime reads it.
+    /// terminal transitions and when the runtime injects a completion (the
+    /// injected cursor advances), so an injected completion reads as
+    /// delivered here. One the agent applied, or whose cursor write failed,
+    /// reads as owed until a later snapshot carries its cursor, exactly as
+    /// the recovered runtime reads it.
     pub(crate) fn holds_recovery_work(&self) -> bool {
         let delivered_through = self
             .cursors
@@ -3665,19 +3666,21 @@ impl OpsLifecycleRegistry for RuntimeOpsLifecycleRegistry {
         if let Some(projection) = projection {
             projection.project_authorized_completion_cursor(consumer, advanced);
         }
-        // A completion delivered to its owner (injected as a continuation, or
-        // applied by the agent) is recorded durably with the snapshot, so a
-        // restart does not read it as owed recovery work and wake the owner
-        // for it. The cursor moves only after the delivery itself is durable,
-        // so a crash before this write re-presents the completion, never
-        // loses it. A failed write leaves the stored cursor behind, which at
-        // worst wakes the owner at its next start: it does not fail the
-        // advance.
+        // A completion the runtime injected as a continuation is recorded
+        // durably with the snapshot, so a restart does not read it as owed
+        // recovery work and wake its owner for it. The injected cursor moves
+        // only after the continuation input itself is durable, so a crash
+        // before this write re-presents the completion, never loses it. The
+        // agent-applied cursor is not written here: it moves at the agent's
+        // model-call boundary, before the notice it applied is committed
+        // with the round, so a durable advance there could lose the
+        // completion to a crash during the model call. Until a later
+        // snapshot carries it, such a completion reads as owed at the next
+        // start: one extra wake and one repeated notice, never a loss. A
+        // failed write leaves the stored cursor behind, which at worst wakes
+        // the owner at its next start: it does not fail the advance.
         if advanced > previous
-            && matches!(
-                consumer,
-                CompletionCursorConsumer::RuntimeInjected | CompletionCursorConsumer::AgentApplied
-            )
+            && consumer == CompletionCursorConsumer::RuntimeInjected
             && let Err(error) = state.maybe_persist()
         {
             tracing::warn!(
@@ -4508,6 +4511,83 @@ mod tests {
         let batch = feed.list_since(0);
         assert_eq!(batch.entries.len(), 1);
         assert_eq!(batch.entries[0].operation_id, op_id);
+    }
+
+    /// Only the runtime-injected completion cursor's advance is written
+    /// durably. An injected continuation is durable before its cursor moves;
+    /// the agent-applied cursor moves at the agent's model-call boundary,
+    /// before the notice it applied is committed with its round, so a crash
+    /// after that boundary must present the completion again: its advance
+    /// writes no snapshot, and the injected advance writes one carrying its
+    /// cursor.
+    #[tokio::test]
+    async fn only_the_injected_completion_cursor_advance_is_persisted() {
+        let registry = RuntimeOpsLifecycleRegistry::new();
+        let (tx, mut rx) = crate::tokio::sync::mpsc::unbounded_channel();
+        registry.set_persistence_channel(
+            tx,
+            meerkat_core::RuntimeEpochId::new(),
+            Arc::new(meerkat_core::EpochCursorState::new()),
+        );
+        let persisted = Arc::new(std::sync::Mutex::new(Vec::<PersistedOpsSnapshot>::new()));
+        let recorded = Arc::clone(&persisted);
+        // Answers every persistence request; it ends when the registry's
+        // sender is dropped.
+        std::thread::spawn(move || {
+            while let Some(request) = rx.blocking_recv() {
+                recorded
+                    .lock()
+                    .expect("recorded snapshots")
+                    .push(request.snapshot().clone());
+                request.complete(Ok(()));
+            }
+        });
+
+        let spec = background_spec("cursor-persistence");
+        let op_id = spec.id.clone();
+        registry.register_operation(spec).unwrap();
+        registry.provisioning_succeeded(&op_id).unwrap();
+        registry
+            .complete_operation(
+                &op_id,
+                OperationResult {
+                    id: op_id.clone(),
+                    content: "done".into(),
+                    is_error: false,
+                    duration_ms: 1,
+                    tokens_used: 0,
+                },
+            )
+            .expect("the completion is durable");
+        let seq = registry.completion_feed_handle().list_since(0).entries[0].seq;
+        let written = || persisted.lock().expect("recorded snapshots").len();
+        let before = written();
+
+        registry
+            .advance_completion_cursor(CompletionCursorConsumer::AgentApplied, seq, None)
+            .expect("the agent-applied cursor advances");
+        assert_eq!(
+            written(),
+            before,
+            "the agent-applied advance writes no snapshot"
+        );
+
+        registry
+            .advance_completion_cursor(CompletionCursorConsumer::RuntimeInjected, seq, None)
+            .expect("the injected cursor advances");
+        let snapshots = persisted.lock().expect("recorded snapshots").clone();
+        assert_eq!(
+            snapshots.len(),
+            before + 1,
+            "the injected advance writes one snapshot"
+        );
+        assert_eq!(
+            snapshots
+                .last()
+                .map(|snapshot| snapshot.cursors.runtime_last_injected_seq),
+            Some(seq),
+            "the written snapshot carries the injected cursor"
+        );
     }
 
     #[test]

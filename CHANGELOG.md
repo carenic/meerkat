@@ -292,14 +292,16 @@ them.
   suspended run, queued inputs, a provisional tail, a pending delivery, a
   background operation completion not yet delivered), a
   member whose endpoint is a network transport or that has no durable
-  endpoint, an orchestrator the resume notifies, and the members the host
-  requires; every other member stays Dormant and is materialized by its
+  endpoint, a member wired to a placed member, an orchestrator the resume
+  notifies, and the members the host requires; every other member stays Dormant and is materialized by its
   first delivery, on its own session. Reads (member lists, status, history,
   console projections) never materialize a member: a Dormant member's
   status reports its peer connectivity from MobMachine's membership and its
   capabilities from the catalog model its wake binds (its profile with its
   model override). Wiring and unwiring
-  with a Dormant member commit the edge without waking it, and lifecycle
+  with a Dormant member commit the edge without waking it (except a new edge
+  to a placed member, which wakes it: the placed member, in another process,
+  cannot use its in-process wake route), and lifecycle
   notices to or from a member that is not materialized are not sent (its
   wake installs the trust they carry). A kickoff status notice is content,
   not a lifecycle notice: it wakes a Dormant recipient and is delivered. This holds for an edge to an external
@@ -310,11 +312,13 @@ them.
   registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
   restores the previous start.
 
-- `meerkat-runtime`: a background operation completion delivered to its
-  owner (injected as a continuation, or applied by the agent) is recorded
-  durably with the ops lifecycle snapshot. A restart no longer reads it as
-  owed, so the owner is not woken for it and does not run its continuation
-  a second time.
+- `meerkat-runtime`: a background operation completion the runtime injected
+  into its owner as a continuation is recorded durably with the ops
+  lifecycle snapshot. A restart no longer reads it as owed, so the owner is
+  not woken for it and does not run its continuation a second time. A
+  completion the agent applied in a model call is recorded with the next
+  snapshot: until then a restart presents it again (one more wake and one
+  repeated notice, never a lost completion).
 
 - Upgrade note, behaviour-only: the first start after upgrading a host-store
   deployment restores members whose runtime heads predate 0.9.7. Such a
@@ -323,6 +327,10 @@ them.
   its member, once: the runtime's next commit records its facts in full, and
   a release before 0.9.7 still reads them.
 
+- Upgrade note, rollback: 0.9.6 ignores the kickoff prompt 0.9.7 stores for a
+  member rotated with `MobHandle::rotate_member`, so a rotated member whose
+  owed kickoff has not run yet does not run it after a rollback to 0.9.6.
+
 - Behaviour-only: `meerkat-mob`: the lift of a mob stopped in this process
   (`MobHandle::resume`) keeps a member's live actor only when it runs the auth
   binding the member's resume request names (the spawn member customizer's
@@ -330,8 +338,11 @@ them.
   member's runtime attachment is retired and the member is rebuilt on that
   binding, on its own session. A backend with no runtime attachment to retire
   refuses the member instead: it is recorded broken with
-  `MobError::MemberAuthBindingConflict`, and its live actor is retired. Before,
-  the lift kept every live actor on whatever binding it ran.
+  `MobError::MemberAuthBindingConflict`, and its live actor is retired. The
+  lift releases the run starts the stop held only after every member's check
+  (and any retirement) completed, so a run queued while the mob was stopped
+  never starts on the old binding. Before, the lift released them first and
+  kept every live actor on whatever binding it ran.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
@@ -424,17 +435,6 @@ them.
   build. A host that changed a member's binding between launches no longer
   gets the member back on the old account, or broken when the old credential
   is gone.
-- `meerkat-mob`: a mob member's MCP source filter (`tools.mcp`) and its
-  name-collision filter (which hides external tools whose names another of
-  the member's tools already uses) now pass each allowed tool's review
-  support and mutation class (`review_entry_support`,
-  `tool_mutation_class`) through, so a tool that requires operation review
-  reaches consent and a read-only member can use tools declared read-only.
-  Filtered-out tools stay refused. Before, both filters answered
-  `Unsupported` and `Unknown` for every tool behind them: a call that
-  required review settled as `ReviewUnavailable { UnsupportedEntry }`
-  before any reviewer or consent, and a read-only member was refused every
-  tool behind them.
 
 ### Known limitations
 

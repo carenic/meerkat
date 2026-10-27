@@ -41,10 +41,11 @@ pub enum MemberRestorePolicy {
     /// Materialize at start only the members that must be live: members
     /// with recovery work (an open or suspended run, queued inputs, a
     /// provisional tail, a pending delivery, an undelivered background
-    /// operation completion), a kickoff owed, a network
-    /// transport endpoint, an orchestrator the mob notifies on resume, no
-    /// durable endpoint, or a host requirement. Every other member is
-    /// materialized by its first delivery.
+    /// operation completion), a kickoff owed, a network transport endpoint,
+    /// a wiring edge to a placed member (a peer in another process cannot
+    /// use an in-process wake route), an orchestrator the mob notifies on
+    /// resume, no durable endpoint, or a host requirement. Every other
+    /// member is materialized by its first delivery.
     #[default]
     OnDemand,
     /// As [`Self::OnDemand`], plus one read-only durable verdict per member

@@ -14,19 +14,28 @@
 //! resolves the kickoff as a spawn's kickoff outcome does. The key makes the
 //! admission idempotent, so the kickoff runs exactly once on the
 //! incarnation's session.
+//!
+//! A kickoff a crash left starting (its starting row was journaled, then its
+//! admission, its run or its waiter was lost) is owed too, in both runtime
+//! modes, and the machine's boot verdict wakes its member for it as well. It
+//! is not marked again: its input is admitted under the same key, which
+//! re-attaches to the input the runtime still holds (in flight, or terminal
+//! with its receipt) and admits it only when there is none.
 
 use super::*;
 
 impl MobActor {
     /// Start the kickoff of every member that owes one and is live (see the
-    /// module docs). A member whose kickoff cannot start yet (a stopped or
-    /// quiescing mob, a member still waking, retiring or spawning) keeps it
-    /// owed for a later turn of the loop.
+    /// module docs): a kickoff still pending, and one a crash left starting
+    /// with no waiter (its journal row was written, its admission or its
+    /// waiter was lost). A member whose kickoff cannot start yet (a stopped
+    /// or quiescing mob, a member still waking, retiring or spawning) keeps
+    /// it owed for a later turn of the loop.
     #[cfg(feature = "runtime-adapter")]
     pub(super) async fn start_owed_kickoffs(&mut self) {
-        let owed = {
+        let candidates = {
             let state = self.dsl_authority.state();
-            if state.member_kickoff_pending.is_empty()
+            if (state.member_kickoff_pending.is_empty() && state.member_kickoff_starting.is_empty())
                 || state.lifecycle_phase != mob_dsl::MobPhase::Running
                 || state.placed_completion_lifecycle_quiescing
                 || self.admission_closed.is_some()
@@ -36,6 +45,7 @@ impl MobActor {
             state
                 .member_kickoff_pending
                 .iter()
+                .chain(state.member_kickoff_starting.iter())
                 .filter(|member| {
                     matches!(
                         state.member_materialization.get(*member),
@@ -43,6 +53,17 @@ impl MobActor {
                     )
                 })
                 .map(|member| AgentIdentity::from(member.0.as_str()))
+                .collect::<Vec<_>>()
+        };
+        if candidates.is_empty() {
+            return;
+        }
+        // A kickoff whose waiter runs is in hand: its outcome resolves it.
+        let owed = {
+            let waiters = self.autonomous_initial_turns.lock().await;
+            candidates
+                .into_iter()
+                .filter(|identity| !waiters.contains_key(identity))
                 .collect::<Vec<_>>()
         };
         for identity in owed {
@@ -61,9 +82,22 @@ impl MobActor {
     /// lane holds the member now: a placed member's kickoff rides its host's
     /// lane, a retiring member's kickoff is cancelled by its retirement, a
     /// spawn activation (or its cleanup) in flight owns its own kickoff, and
-    /// a kickoff waiter already runs.
+    /// a host that holds the member's run starts re-arms it at its release.
+    ///
+    /// A pending kickoff is marked starting first (record before send). A
+    /// starting one (a crash came between that row and the admission, or
+    /// during the kickoff's run) is not marked again: its input is admitted
+    /// under the same incarnation key, which re-attaches to the input the
+    /// runtime already holds (in flight, or terminal with its receipt) and
+    /// admits it only when there is none. Either way it runs once.
     #[cfg(feature = "runtime-adapter")]
     async fn start_owed_kickoff(&mut self, identity: &AgentIdentity) -> Result<(), MobError> {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        let pending = self
+            .dsl_authority
+            .state()
+            .member_kickoff_pending
+            .contains(&dsl_identity);
         if super::super::member_runtime_is_host_owned(self.dsl_authority.state(), identity)
             || self.retirements.contains_key(identity)
             || !self.spawn_cleanup_settled_for(identity)
@@ -95,19 +129,30 @@ impl MobActor {
                     "the member '{identity}' that owes a kickoff is not session-backed"
                 ))
             })?;
+        // The re-attach after a hold is the hold's release's (as for a
+        // kickoff a Shutdown kept): an admission now would be live work the
+        // hold's Shutdown could not keep.
+        if super::super::stop_report::HostRunStartHoldReason::ALL
+            .into_iter()
+            .any(|reason| adapter.registration_run_start_hold_staged(&session_id, reason.runtime()))
+        {
+            return Ok(());
+        }
         let prompt = prompt.unwrap_or_else(|| {
             ContentInput::from(self.fallback_spawn_prompt(&entry.role, identity))
         });
-        // Record before send: the kickoff is starting before its input is
-        // admitted, so a restart never admits it a second time.
-        self.apply_kickoff_input(
-            identity,
-            mob_dsl::MobMachineInput::KickoffMarkStarting {
-                member_id: mob_dsl::AgentIdentity::from_domain(identity),
-            },
-            "owed_kickoff_mark_starting",
-        )
-        .await?;
+        if pending {
+            // Record before send: the kickoff is starting before its input
+            // is admitted, so a restart never admits it a second time.
+            self.apply_kickoff_input(
+                identity,
+                mob_dsl::MobMachineInput::KickoffMarkStarting {
+                    member_id: dsl_identity,
+                },
+                "owed_kickoff_mark_starting",
+            )
+            .await?;
+        }
         let completion = match machine_kickoff_turn_metadata(self.dsl_authority.state(), identity) {
             Ok(turn_metadata) => {
                 let input = owed_kickoff_input(&entry.agent_runtime_id, prompt, turn_metadata);
@@ -134,6 +179,7 @@ impl MobActor {
         tracing::debug!(
             mob_id = %self.definition.id,
             agent_identity = %identity,
+            resumed = !pending,
             "started the member's owed kickoff"
         );
         Ok(())
