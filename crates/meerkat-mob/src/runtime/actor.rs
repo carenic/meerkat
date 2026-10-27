@@ -13875,6 +13875,22 @@ impl MobActor {
                         feedback,
                         "close_routed_effect_consumer_refusal",
                     )?;
+                    if refusal_answered_stale_wake_attempt(&transition) {
+                        // The refused binding request belonged to a wake
+                        // attempt that is no longer the member's open one:
+                        // MobMachine answered StaleAttempt and changed
+                        // nothing. That attempt's wake rolls its provision
+                        // back at its next step (its attempt is closed), and
+                        // a newer wake is left alone.
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            effect = ?effect.body(),
+                            refusal_code = %error.error_code(),
+                            "a refused binding request of an earlier wake attempt was answered stale"
+                        );
+                        self.pending_routed_effects.remove(0);
+                        continue;
+                    }
                     let closed = closed_runtime_effect_refusal_from_transition(&transition)?;
                     self.pending_routed_effects.remove(0);
 
@@ -62521,6 +62537,22 @@ impl ClosedRuntimeEffectRefusal {
 /// generated refusal-feedback input. Absence or multiplicity is a composition
 /// contract break; the shell never infers a fallback class from the original
 /// dispatch error.
+/// Whether a routed refusal's feedback was answered as a stale wake attempt
+/// (`MemberWakeFeedbackResolved { StaleAttempt }`, no refusal
+/// classification): the refused binding request belonged to a wake attempt
+/// that is no longer open.
+fn refusal_answered_stale_wake_attempt(transition: &mob_dsl::MobMachineTransition) -> bool {
+    transition.effects().iter().any(|effect| {
+        matches!(
+            effect,
+            mob_dsl::MobMachineEffect::MemberWakeFeedbackResolved {
+                verdict: mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt,
+                ..
+            }
+        )
+    })
+}
+
 fn closed_runtime_effect_refusal_from_transition(
     transition: &mob_dsl::MobMachineTransition,
 ) -> Result<ClosedRuntimeEffectRefusal, MobError> {
@@ -65015,6 +65047,7 @@ mod routed_effect_containment_tests {
             agent_runtime_id: runtime_id.clone(),
             fence_token: mob_dsl::FenceToken(1),
             generation: None,
+            attempt: None,
         });
         let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
             session_id: session.clone(),
@@ -65065,6 +65098,7 @@ mod routed_effect_containment_tests {
             agent_runtime_id: runtime_id.clone(),
             fence_token: mob_dsl::FenceToken(1),
             generation: None,
+            attempt: None,
         });
         let ingress = routed(mob_dsl::MobMachineEffect::RequestRuntimeIngress {
             session_id: session.clone(),
@@ -65201,6 +65235,7 @@ mod routed_effect_containment_tests {
                 agent_runtime_id: runtime_id.clone(),
                 fence_token: mob_dsl::FenceToken(1),
                 generation: None,
+                attempt: None,
             },
             mob_dsl::MobMachineEffect::RequestRuntimeRetire {
                 agent_identity: mob_dsl::AgentIdentity::from("worker-1"),
