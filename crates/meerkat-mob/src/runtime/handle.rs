@@ -9746,11 +9746,13 @@ impl MobHandle {
     ///
     /// This is MobMachine's unborn-seat fact (`unborn_seat_sessions`), read
     /// from the machine state the actor last published, without a command.
-    /// A session read answers an unborn session as one with no history yet,
-    /// and never wakes its member to read it: a delivery wakes it. Core's
-    /// member history read does so ([`Self::member_history`]); a host that
-    /// serves its own reads of member sessions checks this first. The same
-    /// fact is read offline, with no running mob, through
+    /// Core's member history read ([`Self::member_history`]) answers a member
+    /// whose session is unborn as one with no history yet, and no read wakes
+    /// the member (a delivery does). Core's reads by session id (RPC
+    /// `session/history`, REST `GET /sessions/{id}/history`) answer not
+    /// found, since no store holds the session; a host that serves its own
+    /// reads of member sessions by id checks this first. The same fact is
+    /// read offline, with no running mob, through
     /// [`crate::MemberBindingHistory::session_unborn`]. `false` for every
     /// session a build created and for a session this mob never named.
     pub fn session_unborn(&self, session_id: &SessionId) -> bool {

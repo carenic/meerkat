@@ -715,6 +715,8 @@ struct JournalFold {
     /// seat's or a rotation's row adds its session and the row of the
     /// session's creation removes it.
     unborn_sessions: BTreeSet<SessionId>,
+    /// The sessions a binding named since the latest mob reset.
+    epoch_sessions: BTreeSet<SessionId>,
 }
 
 impl JournalFold {
@@ -768,6 +770,7 @@ impl JournalFold {
                         session_id.clone(),
                         (spawned.agent_identity.clone(), incarnation.clone()),
                     );
+                    self.epoch_sessions.insert(session_id.clone());
                 }
                 self.heads.insert(
                     spawned.agent_identity.clone(),
@@ -792,6 +795,7 @@ impl JournalFold {
                             session_id.clone(),
                             (agent_identity.clone(), head.incarnation.clone()),
                         );
+                        self.epoch_sessions.insert(session_id.clone());
                     }
                 }
             }
@@ -811,6 +815,7 @@ impl JournalFold {
                         session_id.clone(),
                         (recovered.agent_identity.clone(), head.incarnation.clone()),
                     );
+                    self.epoch_sessions.insert(session_id.clone());
                 }
             }
             // Retiring the exact incarnation ends its membership; a late
@@ -833,6 +838,7 @@ impl JournalFold {
             MobEventKind::MobReset => {
                 self.heads.clear();
                 self.unborn_sessions.clear();
+                self.epoch_sessions.clear();
             }
             _ => {}
         }
@@ -903,6 +909,7 @@ impl JournalFold {
             session_bindings,
             intent_rows,
             unborn_sessions: self.unborn_sessions,
+            epoch_sessions: self.epoch_sessions,
         }
     }
 }
@@ -945,6 +952,8 @@ pub struct MemberBindingHistory {
     /// The sessions MobMachine holds unborn, as its replay of the same
     /// journal restores them.
     unborn_sessions: BTreeSet<SessionId>,
+    /// The sessions a binding named since the latest mob reset.
+    epoch_sessions: BTreeSet<SessionId>,
 }
 
 impl MemberBindingHistory {
@@ -974,7 +983,8 @@ impl MemberBindingHistory {
     /// without a session names no session and is skipped), and `intent_rows`
     /// how the identities Core holds an identity intent row for read
     /// (every other identity reads command-driven). The bindings are kept
-    /// exactly as given.
+    /// exactly as given; every session binding reads as bound since the
+    /// latest mob reset ([`Self::session_bindings_since_reset`]).
     #[cfg(any(test, feature = "test-support"))]
     pub fn for_test(
         last_bindings: impl IntoIterator<Item = MemberBinding>,
@@ -982,16 +992,18 @@ impl MemberBindingHistory {
         intent_rows: impl IntoIterator<Item = (AgentIdentity, MemberIdentityManagement)>,
         journal_cursor: u64,
     ) -> Self {
+        let session_bindings: BTreeMap<SessionId, MemberBinding> = session_bindings
+            .into_iter()
+            .filter_map(|binding| Some((binding.session_id.clone()?, binding)))
+            .collect();
         Self {
             journal_cursor,
             last_bindings: last_bindings
                 .into_iter()
                 .map(|binding| (binding.identity.clone(), binding))
                 .collect(),
-            session_bindings: session_bindings
-                .into_iter()
-                .filter_map(|binding| Some((binding.session_id.clone()?, binding)))
-                .collect(),
+            epoch_sessions: session_bindings.keys().cloned().collect(),
+            session_bindings,
             intent_rows: intent_rows.into_iter().collect(),
             unborn_sessions: BTreeSet::new(),
         }
@@ -1080,9 +1092,26 @@ impl MemberBindingHistory {
     /// a mob reset clears the fact. A running mob answers the same fact live
     /// through [`MobHandle::session_unborn`]. `false` for a session the
     /// journal does not name unborn, including every session a build
-    /// created.
+    /// created. One journal reads otherwise: one whose destroy is finalizing
+    /// keeps its never-created sessions unborn here, while the machine clears
+    /// them at the destroy.
     pub fn session_unborn(&self, session_id: &SessionId) -> bool {
         self.unborn_sessions.contains(session_id)
+    }
+
+    /// The latest binding of each session a binding named since the latest
+    /// mob reset, in session order: what [`Self::binding_for_session`]
+    /// answers for each of them, live, moved or retired. It reaches past
+    /// each identity's last binding: a member reset (a rotation) seats the
+    /// next life on a new session, unborn until its first wake, while the
+    /// session of the life before it, created and then archived, stays in
+    /// this list. With [`Self::session_unborn`] a host tells whether an
+    /// identity had a session that was created since the latest mob reset.
+    pub fn session_bindings_since_reset(&self) -> impl Iterator<Item = &MemberBinding> {
+        self.session_bindings
+            .iter()
+            .filter(|(session_id, _)| self.epoch_sessions.contains(*session_id))
+            .map(|(_, binding)| binding)
     }
 }
 

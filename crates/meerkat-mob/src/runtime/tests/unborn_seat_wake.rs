@@ -554,13 +554,46 @@ async fn an_eager_start_with_one_failing_seat_create_leaves_only_that_member_dor
 
 /// The member binding history reads MobMachine's unborn-seat fact from the
 /// journal rows the machine's own replay restores it from, folded the same
-/// way. For every session a seat, a first wake, a rotation and a retirement
-/// before a first wake leave, the history's `session_unborn` equals the live
-/// machine's (`MobHandle::session_unborn`), and both equal what each step
-/// leaves: before a restart, and after the restart rebuilt the machine from
-/// the same journal.
+/// way. For every session a seat, a first wake, a rotation, a retirement
+/// before a first wake and a mob reset leave, the history's `session_unborn`
+/// equals the live machine's (`MobHandle::session_unborn`), and both equal
+/// what each step leaves: before a restart, and after a restart rebuilt the
+/// machine from the same journal. The history's sessions since the latest
+/// mob reset keep the woken identity's created session after its rotation
+/// seated the next life unborn, and a mob reset empties them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds_it() {
+    /// Crash the mob and resume it over the same stores, as a restart does.
+    async fn restart(
+        handle: MobHandle,
+        service: &MockSessionService,
+        events: &Arc<dyn MobEventStore>,
+        runtime_metadata: &Arc<dyn MobRuntimeMetadataStore>,
+        keys: &std::path::Path,
+    ) -> (MobHandle, Arc<MockSessionService>) {
+        crash_stop_and_release_routes(handle).await;
+        let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+        let _ = restarted.enable_runtime_adapter();
+        let handle = tokio::time::timeout(
+            STEP,
+            Box::pin(
+                MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                    events.clone(),
+                    runtime_metadata.clone(),
+                ))
+                .with_session_service(restarted.clone())
+                .with_member_comms_identity_root(keys)
+                .with_member_restore_policy(MemberRestorePolicy::OnDemand)
+                .notify_orchestrator_on_resume(false)
+                .resume(),
+            ),
+        )
+        .await
+        .expect("the restart answers")
+        .expect("the restart succeeds");
+        (handle, restarted)
+    }
+
     let keys = tempfile::tempdir().expect("a comms identity root");
     let definition = with_unique_mob_id(sample_definition(), "unborn-history");
     let service = Arc::new(MockSessionService::new());
@@ -579,6 +612,10 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
         spec
     };
+    let seated_session = |outcome: &DormantSeatOutcome| match outcome {
+        DormantSeatOutcome::Seated { session_id, .. } => session_id.clone(),
+        other => panic!("every fresh spec is seated: {other:?}"),
+    };
     let woken = AgentIdentity::from("unborn-history-woken");
     let dormant = AgentIdentity::from("unborn-history-dormant");
     let retired = AgentIdentity::from("unborn-history-retired");
@@ -586,13 +623,7 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         .seat_dormant_members(vec![spec(&woken), spec(&dormant), spec(&retired)])
         .await
         .expect("the seat batch answers");
-    let sessions = outcomes
-        .iter()
-        .map(|outcome| match outcome {
-            DormantSeatOutcome::Seated { session_id, .. } => session_id.clone(),
-            other => panic!("every fresh spec is seated: {other:?}"),
-        })
-        .collect::<Vec<_>>();
+    let sessions = outcomes.iter().map(seated_session).collect::<Vec<_>>();
     handle
         .ensure_member_live(&woken)
         .await
@@ -606,13 +637,6 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         .expect("the retirement answers")
         .expect("a member retired before its first wake");
 
-    let expected = [
-        (sessions[0].clone(), false, "created by the first wake"),
-        (rotated, true, "the rotation's next session"),
-        (sessions[1].clone(), true, "never woken"),
-        (sessions[2].clone(), true, "retired before its first wake"),
-        (SessionId::new(), false, "never named"),
-    ];
     let history_of = |journal: &[MobEvent], handle: &MobHandle| {
         crate::runtime::MemberBindingHistory::from_journal(
             journal,
@@ -620,6 +644,25 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
             Some(handle.mob_id()),
         )
     };
+    let since_reset = |history: &crate::runtime::MemberBindingHistory| {
+        history
+            .session_bindings_since_reset()
+            .filter_map(|binding| binding.session_id().cloned())
+            .collect::<BTreeSet<_>>()
+    };
+    let expected = [
+        (sessions[0].clone(), false, "created by the first wake"),
+        (rotated.clone(), true, "the rotation's next session"),
+        (sessions[1].clone(), true, "never woken"),
+        (sessions[2].clone(), true, "retired before its first wake"),
+        (SessionId::new(), false, "never named"),
+    ];
+    let named = BTreeSet::from([
+        sessions[0].clone(),
+        rotated.clone(),
+        sessions[1].clone(),
+        sessions[2].clone(),
+    ]);
     let journal = events.replay_all().await.expect("read the journal");
     let history = history_of(&journal, &handle);
     let read = handle
@@ -631,27 +674,25 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         assert_eq!(read.session_unborn(session), *unborn, "read: {shape}");
         assert_eq!(handle.session_unborn(session), *unborn, "machine: {shape}");
     }
+    assert_eq!(since_reset(&history), named);
+    assert_eq!(since_reset(&read), named);
+    assert_eq!(
+        history
+            .last_binding(&woken)
+            .and_then(|binding| binding.session_id().cloned()),
+        Some(rotated.clone()),
+        "the woken identity's last binding is its next, unborn life"
+    );
+    assert_eq!(
+        history
+            .binding_for_session(&sessions[0])
+            .map(|binding| binding.identity().clone()),
+        Some(woken.clone()),
+        "its created session stays among the sessions since the latest reset"
+    );
 
-    crash_stop_and_release_routes(handle).await;
-    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
-    let _ = restarted.enable_runtime_adapter();
-    let handle = tokio::time::timeout(
-        STEP,
-        Box::pin(
-            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-                events.clone(),
-                runtime_metadata.clone(),
-            ))
-            .with_session_service(restarted.clone())
-            .with_member_comms_identity_root(keys.path())
-            .with_member_restore_policy(MemberRestorePolicy::OnDemand)
-            .notify_orchestrator_on_resume(false)
-            .resume(),
-        ),
-    )
-    .await
-    .expect("the restart answers")
-    .expect("the restart succeeds");
+    let (handle, service) =
+        restart(handle, &service, &events, &runtime_metadata, keys.path()).await;
     let journal = events.replay_all().await.expect("read the journal");
     let history = history_of(&journal, &handle);
     for (session, unborn, shape) in &expected {
@@ -666,6 +707,69 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
             "replayed machine: {shape}"
         );
     }
+    assert_eq!(since_reset(&history), named);
+
+    // A mob reset ends every membership and clears the fact; a seat after it
+    // is unborn again, and only its session is named since the reset.
+    tokio::time::timeout(STEP, handle.reset())
+        .await
+        .expect("the mob reset answers")
+        .expect("reset the mob");
+    let after_reset = AgentIdentity::from("unborn-history-after-reset");
+    let outcomes = handle
+        .seat_dormant_members(vec![spec(&after_reset)])
+        .await
+        .expect("the seat after the reset answers");
+    let reseated = seated_session(&outcomes[0]);
+    let mut after = expected
+        .iter()
+        .map(|(session, _, shape)| (session.clone(), false, *shape))
+        .collect::<Vec<_>>();
+    after.push((reseated.clone(), true, "seated after the reset"));
+    let journal = events.replay_all().await.expect("read the journal");
+    let history = history_of(&journal, &handle);
+    let read = handle
+        .member_binding_history()
+        .await
+        .expect("the running mob reads its binding history");
+    for (session, unborn, shape) in &after {
+        assert_eq!(
+            history.session_unborn(session),
+            *unborn,
+            "history after the mob reset: {shape}"
+        );
+        assert_eq!(
+            read.session_unborn(session),
+            *unborn,
+            "read after the mob reset: {shape}"
+        );
+        assert_eq!(
+            handle.session_unborn(session),
+            *unborn,
+            "machine after the mob reset: {shape}"
+        );
+    }
+    let only_reseated = BTreeSet::from([reseated.clone()]);
+    assert_eq!(since_reset(&history), only_reseated);
+    assert_eq!(since_reset(&read), only_reseated);
+
+    let (handle, _service) =
+        restart(handle, &service, &events, &runtime_metadata, keys.path()).await;
+    let journal = events.replay_all().await.expect("read the journal");
+    let history = history_of(&journal, &handle);
+    for (session, unborn, shape) in &after {
+        assert_eq!(
+            history.session_unborn(session),
+            *unborn,
+            "history after the mob reset and a restart: {shape}"
+        );
+        assert_eq!(
+            handle.session_unborn(session),
+            *unborn,
+            "replayed machine after the mob reset: {shape}"
+        );
+    }
+    assert_eq!(since_reset(&history), only_reseated);
 }
 
 /// A member whose session is unborn has no history yet: its member history

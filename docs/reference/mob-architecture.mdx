@@ -106,6 +106,14 @@ answers it on a running mob. A host that checks a stopped store for bindings
 whose sessions are missing leaves unborn sessions out. A member retired before
 its first wake leaves its session unborn. `MobHandle::member_history` of a
 member whose session is unborn answers an empty page and does not wake it.
+Core's reads by session id (RPC `session/history`, REST
+`GET /sessions/{id}/history`) answer not found for an unborn session, since no
+store holds it; a host that serves its own reads of member sessions by id
+checks `session_unborn` first. `session_bindings_since_reset()` lists the
+latest binding of each session named since the latest mob reset, so a host can
+tell whether an identity had a created session before its last binding: a
+member reset seats the next life on a new, unborn session, while the session
+of the life before it stays in that list.
 
 ### One-shot durable role migration
 

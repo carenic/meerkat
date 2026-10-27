@@ -285,7 +285,12 @@ them.
   `MemberBindingHistory::with_unborn_sessions` (`test-support`) gives a host's
   test double of these reads its unborn sessions. `MobHandle::member_history`
   of a member whose session is unborn answers an empty page, and the read
-  does not wake the member.
+  does not wake the member; Core's reads by session id (RPC `session/history`,
+  REST `GET /sessions/{id}/history`) answer not found for it, since no store
+  holds it. `MemberBindingHistory::session_bindings_since_reset` lists the
+  latest binding of each session named since the latest mob reset, so a host
+  can tell whether an identity had a created session before its last binding
+  (a member reset seats the next life on a new, unborn session).
 
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
