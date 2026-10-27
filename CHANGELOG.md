@@ -107,6 +107,12 @@ them.
   `ProviderCacheTtl::TwelveHours` (wire `twelve_hours`), appended last.
   The three enums are exhaustive, so a downstream exhaustive match needs an
   arm.
+- Behaviour: `meerkat` governed helper work built from a tool dispatch
+  (`GovernedHelperAdmissionFence::from_dispatch`,
+  `GovernedHelperChildIssuance::from_dispatch`) answers `Denied` instead of
+  `Unavailable` when the dispatch's review settles the step (see Fixed). A
+  host that retried on `Unavailable` now stops there: the refusal is final for
+  that dispatch, and a new call is reviewed anew.
 
 - Python and TypeScript SDKs (not measured by the gate): the fork-cache
   evidence lifetime `ForkAuthoredCacheBreakpoint.ttl` is now
@@ -493,15 +499,17 @@ them.
   settles the step: an R2 or R3 decision at the fence (no review runs under
   the graph lock), a review already spent, an ended dispatch, or a refused
   review. Before, they answered `Unavailable`, which tells a host that a
-  later attempt may succeed. The review owner's own unavailability
+  later attempt may succeed. Such a refusal is final for that dispatch only:
+  a new call is reviewed anew. The review owner's own unavailability
   (contention, an unconfirmed store, unreadable review material, a failed
-  reviewer) stays `Unavailable`.
+  reviewer) stays `Unavailable`. See the Behaviour entry under Breaking.
 - `meerkat-core`: the documentation of
   `GovernedDispatchOperation::issue_child_if_current_within` said that a
   consented R3 operation refuses there. It does not: a fresh attempt of a
-  consented R3 candidate spends its human consent at this entry and issues
-  the child. The method is the dispatch's single consuming entry, so a second
-  call finds the review spent (`AlreadyConsumed`).
+  consented candidate (R3, or an R2 decision a human took over) spends its
+  human consent at this entry and issues the child. For R2 and R3 the method
+  is the dispatch's single consuming entry, so a second call finds the review
+  spent (`AlreadyConsumed`); an R1 entry spends nothing and can issue again.
 - `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
   of a stopped mob, a revival or registration reload of a missing live
   materialization, and a Resume-mode spawn such as attaching an existing

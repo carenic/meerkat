@@ -1067,12 +1067,14 @@ impl GovernedDispatchOperation {
     /// The work owner first validates the typed `further` and `intent`
     /// (before any review is spent); then THIS dispatch's own review custody
     /// is entered (R1; the R2 review this dispatch admitted; or, in a fresh
-    /// attempt of a consented R3 candidate, its authenticated human consent)
-    /// and held through the issuance. An R3 decision never reaches a
-    /// dispatcher outside such an attempt. This is the dispatch's single
-    /// consuming entry: a second call finds the review spent
-    /// (`AlreadyConsumed`). The returned box carries the grant owner's
-    /// typed outcome, which callers must keep: an outer `Ok` is no receipt.
+    /// attempt of a consented candidate, R3 or an R2 decision a human took
+    /// over, its authenticated human consent) and held through the issuance.
+    /// An R3 decision never reaches a dispatcher outside such an attempt.
+    /// This is the dispatch's single consuming entry: for R2 and R3 a second
+    /// call finds the review spent (`AlreadyConsumed`), while an R1 entry
+    /// spends nothing and can issue again. The returned box carries the grant
+    /// owner's typed outcome, which callers must keep: an outer `Ok` is no
+    /// receipt.
     ///
     /// # Errors
     /// A refused, unavailable or no longer current operation, or an entry

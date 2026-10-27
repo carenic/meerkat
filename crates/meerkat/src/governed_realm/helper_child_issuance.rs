@@ -38,8 +38,9 @@ pub enum HelperChildIssuanceRefusal {
     /// grant excludes the operation), the independent parent grant or the
     /// requested bounds refuse it, the intended id names another grant, or
     /// the dispatch's review cannot cover it (a review its entry cannot
-    /// carry, one already spent, or a dispatch that ended).
-    /// No child was appended.
+    /// carry, one already spent, refused or retired, or a dispatch that
+    /// ended). A refusal by the dispatch's review is final for that dispatch
+    /// only: a new call is reviewed anew. No child was appended.
     Denied,
     /// The owners cannot say now (contention, a refusal to rebuild after an
     /// owner change, clock or custody). No child was appended.

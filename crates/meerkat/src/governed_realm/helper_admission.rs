@@ -47,7 +47,9 @@ pub enum HelperAdmissionRefusal {
     /// Not permitted now: another admission than the one the fence was bound
     /// to, the setup operation's current decision refused it or requires a
     /// review this entry cannot carry, or a relevant original is cancelled,
-    /// no longer retained or does not allow the operation.
+    /// no longer retained or does not allow the operation. A refusal by a
+    /// dispatch's review is final for that dispatch only: a new call is
+    /// reviewed anew.
     Denied,
     /// The owners cannot say now (contention, a refusal to rebuild after an
     /// owner change, clock or custody unavailable). The store operation did
