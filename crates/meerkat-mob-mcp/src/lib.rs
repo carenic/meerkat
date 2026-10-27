@@ -5425,16 +5425,17 @@ impl MobMcpState {
     /// report, the caller it was admitted for, and the storage cleanup it
     /// owes, on a task the state owns: a caller cancelled at any point loses
     /// none of them. The mob's files are removed only after its actor task
-    /// ended, no handle in this process still owns its database observer,
-    /// that observer drained, and the database at the path is still the
-    /// mob's. Until then the destroy answers `Incomplete` with a copy of the
-    /// report that names what is outstanding, an id under it is not created
-    /// again, and a retry by the same caller continues the cleanup and
-    /// answers the canonical report, also while another mob is managed under
-    /// the id, which the retry never destroys; another caller is refused.
-    /// This settles the observer and the files only: reads already entered,
-    /// openers that attach later and other processes stay outside it, so it
-    /// is no statement that deleting the storage was safe.
+    /// ended, no handle in this process and no store operation still running
+    /// on the database (also one whose caller was cancelled) owns its
+    /// observer, that observer drained, and the database at the path is
+    /// still the mob's. Until then the destroy answers `Incomplete` with a
+    /// copy of the report that names what is outstanding, an id under it is
+    /// not created again, and a retry by the same caller continues the
+    /// cleanup and answers the canonical report, also while another mob is
+    /// managed under the id, which the retry never destroys; another caller
+    /// is refused. This settles the observer and the files only: openers
+    /// that attach later and other processes stay outside it, so it is no
+    /// statement that deleting the storage was safe.
     pub async fn mob_destroy(
         &self,
         mob_id: &MobId,
