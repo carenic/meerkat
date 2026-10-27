@@ -15,6 +15,8 @@ mod lazy_boot;
 mod lift_binding_rows;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod lift_observation_bound;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod lift_plan_bound;
 mod member_creation;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod member_creation_upcall;

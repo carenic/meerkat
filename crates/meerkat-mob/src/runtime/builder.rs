@@ -7918,9 +7918,12 @@ impl MobBuilder {
     /// through their provision, without their release.
     ///
     /// The same bound holds for a lift of the mob once stopped
-    /// ([`MobHandle::resume`]): it observes the live and durable sessions of
-    /// the members it rebuilds up to `concurrency` at once, and its
-    /// `OnDemandVerified` pass reads up to that many verdicts at once.
+    /// ([`MobHandle::resume`]): it starts the wakes of the dormant members
+    /// its plan materializes up to `concurrency` at once, the next one as an
+    /// earlier one finishes (a member it has not reached stays dormant, and a
+    /// delivery to it wakes it at once); it observes the live and durable
+    /// sessions of the members it rebuilds up to `concurrency` at once; and
+    /// its `OnDemandVerified` pass reads up to that many verdicts at once.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
         self.resume_restore_concurrency = concurrency.max(1);
@@ -11086,6 +11089,7 @@ impl MobBuilder {
                 lifecycle_observations,
                 inline_step_watchdog: super::actor::ActorInlineStepWatchdog::new(),
                 pending_resume_lifecycle: None,
+                explicit_resume_boot_dispatch: None,
                 pending_resume_controls: std::collections::VecDeque::new(),
                 retained_resume_cleanup: Vec::new(),
                 unproven_resume_cleanup: Vec::new(),

@@ -9208,6 +9208,9 @@ pub(super) struct MobActor {
     /// Explicit Resume whose per-member readiness fan-out is running detached;
     /// the loop keeps draining commands until the outcomes re-enter.
     pub(super) pending_resume_lifecycle: Option<PendingResumeLifecycle>,
+    /// The lift's member plan while it still has members to reach: they are
+    /// dispatched at most the restore concurrency at a time (`boot_lift`).
+    pub(super) explicit_resume_boot_dispatch: Option<boot_lift::ExplicitResumeBootDispatch>,
     pub(super) pending_resume_controls: VecDeque<RoutedMobCommand>,
     pub(super) retained_resume_cleanup: Vec<RetainedExplicitResumeCleanup>,
     pub(super) unproven_resume_cleanup: Vec<UnprovenExplicitResumeCleanup>,
@@ -22855,6 +22858,8 @@ impl MobActor {
         &mut self,
         result: Result<(), MobError>,
     ) -> Result<(), MobError> {
+        // The lift's plan dispatches nothing after its attempt ends.
+        self.explicit_resume_boot_dispatch = None;
         if result.is_err() {
             self.apply_explicit_resume_input(
                 |attempt| mob_dsl::MobMachineInput::CancelExplicitResume { attempt },
@@ -23317,8 +23322,10 @@ impl MobActor {
         // The members this lift materializes, planned now that the mob is
         // Running again: one `PlanBootMaterialization` per Dormant member,
         // with this start's policy and host inputs and a fresh obligation
-        // scan. Each planned member is woken through the one cold recipe;
-        // the resume joins its wake and settles it once the wake closes.
+        // scan, applied while fewer than the restore concurrency of the
+        // plan's wakes are open (the rest as they close, `boot_lift`). Each
+        // planned member is woken through the one cold recipe; the resume
+        // joins its wake and settles it once the wake closes.
         let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set().await {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),
