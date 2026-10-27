@@ -7473,7 +7473,7 @@ WireOpenAiPromptCacheMode = Literal['implicit', 'explicit']
 WireOpenAiPromptCacheRetention = Literal['in_memory', '24h']
 
 # Mob RPC helper wire type for WireOpenAiPromptCacheTtl.
-WireOpenAiPromptCacheTtl = Literal['30m']
+WireOpenAiPromptCacheTtl = Literal['30m', '12h']
 
 # Mob RPC helper wire type for WireOpenAiReasoningContext.
 WireOpenAiReasoningContext = Literal['auto', 'current_turn', 'all_turns']

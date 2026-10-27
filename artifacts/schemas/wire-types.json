@@ -4682,7 +4682,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -4705,7 +4705,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -16731,7 +16732,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -25050,7 +25052,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -30586,7 +30589,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -30609,7 +30612,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -47373,7 +47377,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -47396,7 +47400,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -67103,7 +67108,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -67126,7 +67131,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -73015,7 +73021,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -79634,7 +79641,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -88183,7 +88191,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -88206,7 +88214,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -95256,7 +95265,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -95279,7 +95288,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -101645,7 +101655,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -101668,7 +101678,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -120508,7 +120519,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -124054,7 +124066,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -132605,7 +132618,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -133799,7 +133813,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -139222,7 +139237,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -140641,7 +140657,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -145284,7 +145301,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -145307,7 +145324,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -147804,7 +147822,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -147827,7 +147845,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -150605,7 +150624,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -150628,7 +150647,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -152913,7 +152933,8 @@
           "one_hour",
           "thirty_minutes",
           "twenty_four_hours",
-          "provider_default"
+          "provider_default",
+          "twelve_hours"
         ],
         "type": "string"
       }
@@ -166445,7 +166466,7 @@
                 "type": "null"
               }
             ],
-            "description": "Minimum cache lifetime. GPT-5.6 currently accepts only `30m`."
+            "description": "Minimum cache lifetime: `30m` (default) or `12h` on GPT-5.6 and later."
           }
         },
         "type": "object"
@@ -166468,7 +166489,8 @@
       "OpenAiPromptCacheTtl": {
         "description": "Minimum lifetime for GPT-5.6 prompt-cache entries.",
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
@@ -185244,7 +185266,8 @@
       },
       "WireOpenAiPromptCacheTtl": {
         "enum": [
-          "30m"
+          "30m",
+          "12h"
         ],
         "type": "string"
       },
