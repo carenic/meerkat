@@ -128,7 +128,9 @@ them.
   quiescent, and keeps it seated at the same session, generation and fence;
   its next delivery wakes it. A member being woken, one whose runtime binding
   has not landed yet (right after a spawn), or one with work in flight is
-  refused retryably (`MobError::LifecycleOperationPending`).
+  refused retryably (`MobError::LifecycleOperationPending`). A member wired
+  to a placed member stays live while that wiring exists
+  (`MobError::UnsupportedForMode`, as for a placed member itself).
 - `meerkat-mob`: `MemberBuildPreparer` (with `MemberBuildPreparation`,
   `MemberBuildPrepared`, `MemberBuildPreparationRefusal` and
   `MemberBuildReport`): a host's preparation of each member build, asked once
