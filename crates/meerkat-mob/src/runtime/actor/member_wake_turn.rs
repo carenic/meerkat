@@ -635,16 +635,14 @@ impl MobActor {
                 return;
             }
         }
-        // Record the woken member's endpoint where none was durable yet.
+        // Register the woken member's endpoint where none was durable yet,
+        // before its Ready verdict: a member owed EndpointPending is never
+        // Live without one. A registration MobMachine refuses fails the wake.
         if let WakeEndpoint::Record(spec) = endpoint
             && let Err(error) = self.record_woken_member_endpoint(&run.identity, spec).await
         {
-            tracing::warn!(
-                mob_id = %self.definition.id,
-                agent_identity = %run.identity,
-                %error,
-                "the woken member's endpoint could not be recorded"
-            );
+            self.fail_member_wake(&run, plan_rollback, &error).await;
+            return;
         }
         self.dispatch_member_wake_readiness(run, plan_rollback)
             .await;
@@ -702,9 +700,15 @@ impl MobActor {
         apply_member_restore_plan(&ctx, &mut commit, &mut successors, entry, plan).await
     }
 
-    /// Record the woken member's endpoint where none was durable: journal
+    /// Register the woken member's endpoint where none was durable: journal
     /// first, then authority and rosters, exactly as a boot upgrades a
-    /// recovered binding without one.
+    /// recovered binding without one. A wired member's recovered endpoint is
+    /// refused there (its wiring predates any durable endpoint), so it is
+    /// registered on its spawned incarnation instead
+    /// (`RecoverSpawnedMemberPeerEndpoint`, which ends its EndpointPending
+    /// exception); that registration lives in this process, and a later
+    /// start wakes the member again to register it. Both refused is an
+    /// error: the member cannot be Live without an endpoint.
     async fn record_woken_member_endpoint(
         &mut self,
         identity: &AgentIdentity,
@@ -716,17 +720,39 @@ impl MobActor {
         let Some(bridge_session_id) = entry.member_ref.bridge_session_id().cloned() else {
             return Ok(());
         };
-        let event = append_recovered_session_binding(
+        match append_recovered_session_binding(
             &mut self.dsl_authority,
             &self.events,
             &self.definition.id,
             &entry,
             &bridge_session_id,
-            Some(spec),
+            Some(spec.clone()),
             "member_wake_record_member_peer_endpoint",
         )
-        .await?;
-        self.roster.write().await.apply_event(&event);
+        .await
+        {
+            Ok(event) => self.roster.write().await.apply_event(&event),
+            Err(recovered_error) => {
+                self.apply_dsl_signal(
+                    mob_dsl::MobMachineSignal::RecoverSpawnedMemberPeerEndpoint {
+                        agent_identity: mob_dsl::AgentIdentity::from_domain(identity),
+                        agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
+                            &entry.agent_runtime_id,
+                        ),
+                        fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
+                        generation: mob_dsl::Generation::from_domain(entry.generation),
+                        peer_endpoint: mob_dsl::MemberPeerEndpoint::from(&spec),
+                    },
+                    "member_wake_register_spawned_member_peer_endpoint",
+                )
+                .map_err(|spawned_error| {
+                    MobError::Internal(format!(
+                        "the woken member '{identity}' could not register its endpoint: \
+                         {recovered_error}; on its spawned incarnation: {spawned_error}"
+                    ))
+                })?;
+            }
+        }
         self.publish_machine_state_projection();
         self.publish_member_wake_route(identity);
         Ok(())

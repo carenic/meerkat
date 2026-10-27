@@ -98,7 +98,9 @@ them.
   wake verdict, and the delivery then proceeds as to a live member: a host
   delivery (`MobHandle::start_work_*`, steer included), a peer message, a mob
   peer message it sends, a continuation's address resolution, a session-keyed
-  live operation on its session, and `MobHandle::ensure_member_live`. Every
+  live operation on its session, an instruction activation
+  (`MobHandle::activate_member_instruction`), and
+  `MobHandle::ensure_member_live`. Every
   cause of one member joins one wake. A refused wake is typed:
   `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
   (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
@@ -158,6 +160,18 @@ them.
   The member runtime registration hook runs inside each member's provision,
   so for several members at once, in no fixed order across members; each
   member's own calls keep their order.
+
+### Fixed
+
+- `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
+  of a stopped mob, a revival or registration reload of a missing live
+  materialization, and a Resume-mode spawn such as attaching an existing
+  session, respawning or waking an identity) now runs on the auth binding its
+  current spec names (the host customizer's), as a restore at a mob's start
+  always did, instead of the binding the session recorded at an earlier
+  build. A host that changed a member's binding between launches no longer
+  gets the member back on the old account, or broken when the old credential
+  is gone.
 
 ### Known limitations
 

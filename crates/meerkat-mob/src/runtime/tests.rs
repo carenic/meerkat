@@ -66148,6 +66148,28 @@ fn resume_launch_spec_for_test(
     )
 }
 
+/// R127: attaching an existing session as a member (a Resume-mode spawn of a
+/// session with no live actor) builds the member on the auth binding its spec
+/// names, never on the binding the session recorded at an earlier build.
+#[tokio::test]
+async fn an_attached_session_builds_on_the_specs_binding_not_the_recorded_one() {
+    let (handle, service) = create_test_mob(sample_definition()).await;
+    let identity = AgentIdentity::from("adopted-bound");
+    let session = standalone_resume_session_for_test(&service, &identity).await;
+    let mut spec = resume_launch_spec_for_test(&identity, &session);
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    spec.auth_binding = Some(scoped_auth_binding());
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("attach the existing session");
+    assert_eq!(
+        last_member_build(&service, &identity).await.auth_binding,
+        Some(scoped_auth_binding()),
+        "the attached session builds on the spec's binding, not the recorded one"
+    );
+}
+
 /// #1249: the heavy part of a local Spawn (here the resume-session activity
 /// read, which for a persistent service can decode a whole document or wait
 /// behind a busy session task) runs off the actor loop. While that read is

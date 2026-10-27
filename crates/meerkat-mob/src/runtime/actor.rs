@@ -6659,6 +6659,11 @@ struct DeferredResumeProvision {
     direct_member_incarnation: Option<super::bridge_protocol::BridgeDirectMemberIncarnation>,
     /// The incarnation's continuity intent, for the provision request.
     continuity_intent: super::handle::SpawnContinuityIntent,
+    /// The auth binding the member's current spec names (the host
+    /// customizer's, for an ordinary member). The rebuild runs on it, as a
+    /// boot restore does, never on the binding the session recorded at an
+    /// earlier build; `None` keeps the recorded one.
+    auth_binding: Option<meerkat_core::AuthBindingRef>,
 }
 
 impl SpawnProvisionInput {
@@ -6760,6 +6765,7 @@ impl DeferredResumeProvision {
             generated_self_owned_operation_owner,
             direct_member_incarnation,
             continuity_intent,
+            auth_binding,
         } = *self;
 
         let authorized_resume = session_service
@@ -6802,6 +6808,12 @@ impl DeferredResumeProvision {
         build::apply_application_tool_policy_choice(&mut config, application_tool_policy);
         config.tool_consequence_policy_registry = tool_consequence_policy_registry;
         config.fork_source = fork_source;
+        // The spec's binding wins over the one the session recorded, exactly
+        // as a boot restore applies it: a host that changed a member's
+        // binding gets the member back on the new one.
+        if let Some(auth_binding) = auth_binding {
+            config.auth_binding = Some(auth_binding);
+        }
         if let Some(client) = default_llm_client {
             config.llm_client_override = Some(client);
         }
@@ -34832,6 +34844,10 @@ impl MobActor {
                             generated_self_owned_operation_owner: None,
                             direct_member_incarnation: None,
                             continuity_intent: continuity_intent.clone(),
+                            // The spec's binding, as the fresh path applies
+                            // it below: a resumed session never keeps the
+                            // binding it recorded under an earlier build.
+                            auth_binding: auth_binding.clone(),
                         };
                         return Ok((
                             profile_name,

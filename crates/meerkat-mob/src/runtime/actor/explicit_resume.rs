@@ -424,6 +424,9 @@ impl MobActor {
             generated_self_owned_operation_owner: Some(work.rebuild.bridge_session_id.clone()),
             direct_member_incarnation: None,
             continuity_intent,
+            // The customized restore spec's binding, as a boot restore
+            // applies it; `None` keeps the one the session recorded.
+            auth_binding: work.rebuild.restore_spec.auth_binding.clone(),
         }))
     }
 

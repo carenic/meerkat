@@ -1038,6 +1038,14 @@ impl MobActor {
         }
         let bundle_tools =
             super::super::tools::resolve_profile_bundle_tools(&profile, &self.tool_bundles);
+        // The rebuild runs on the binding the host's customizer gives the
+        // member now (its resume hook, which every rebuild asks), never on the
+        // binding its session recorded: a reload can rebuild a member built
+        // under an earlier launch (a start's recovery of a member it left
+        // out). A fork-derived member keeps its own records.
+        let auth_binding = self
+            .warm_revival_auth_binding(&work.entry, &work.session_id)
+            .await?;
         Ok(Some(Box::new(DeferredResumeProvision {
             definition: Arc::clone(&self.definition),
             mob_incarnation: self.incarnation,
@@ -1084,7 +1092,35 @@ impl MobActor {
             generated_self_owned_operation_owner: Some(work.session_id.clone()),
             direct_member_incarnation: None,
             continuity_intent,
+            auth_binding,
         })))
+    }
+
+    /// The auth binding the host's spawn customizer gives `entry` for a
+    /// rebuild on `session_id` now (`customize_resume`, with what the session
+    /// holds), or `None` when no customizer is configured, the member is
+    /// fork-derived, or the customizer names none: the session's recorded
+    /// binding then stays.
+    async fn warm_revival_auth_binding(
+        &self,
+        entry: &RosterEntry,
+        session_id: &SessionId,
+    ) -> Result<Option<meerkat_core::AuthBindingRef>, MobError> {
+        if entry.fork_source.is_some() || self.spawn_member_customizer.is_none() {
+            return Ok(None);
+        }
+        let durable = super::super::fork_build::load_resumed_member_view(
+            self.session_service.as_ref(),
+            session_id,
+        )
+        .await?;
+        let spec = super::super::fork_build::rebuild_resume_spec(
+            &self.definition.id,
+            self.spawn_member_customizer.as_ref(),
+            entry,
+            &durable,
+        )?;
+        Ok(spec.auth_binding)
     }
 
     fn cleanup_warm_claim(
