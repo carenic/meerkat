@@ -34489,13 +34489,33 @@ impl MobActor {
     /// Settle the recovery of a member this incarnation's startup restore
     /// left out: apply its readiness exactly as the startup pass would have
     /// (an autonomous member's `StartupMarkReady` included), and record the
-    /// member Broken, with the typed reason, on any failure. An outcome for
-    /// an incarnation the roster no longer holds is dropped.
+    /// member Broken, with the typed reason, on any failure but a retryable
+    /// one. A revival whose wake was refused retryably (the host asked to
+    /// retry its build preparation, an unavailable resume gate, the wake
+    /// bound) left the member as every retryable wake leaves it: Dormant, so
+    /// it stays retryable and is never recorded Broken. The owed retry is
+    /// armed only for a member that still owes its boot obligation (a
+    /// taken-over member, not a reload-required one, whose Live settle
+    /// cleared it) and whose wake attempt opened before the refusal; any
+    /// other such member waits Dormant for its next delivery or start. An
+    /// outcome for an incarnation the roster no longer holds is dropped.
     async fn startup_member_recovered(
         &mut self,
         cause: StartupMemberRecoveryCause,
         outcome: MemberReadinessOutcome,
     ) {
+        if let Err(MobError::MemberWakeRefused { refusal, .. }) = &outcome.result
+            && refusal.is_retryable()
+        {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                member = %outcome.entry.agent_identity,
+                ?cause,
+                refusal = refusal.as_str(),
+                "the wake of a member the mob start left out was refused retryably; the member stays dormant and its owed wake is retried"
+            );
+            return;
+        }
         let entry = outcome.entry.clone();
         if let Err(error) = self.apply_member_readiness_outcomes(vec![outcome]).await {
             self.record_startup_recovery_failure(cause, &entry, &error)

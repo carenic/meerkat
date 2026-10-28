@@ -39366,11 +39366,15 @@ async fn wait_for_member_served_again(
     .expect("the member taken over at startup is served again");
 }
 
-/// Records every member build a restarted mob reports to its host.
+/// Records every member build a restarted mob reports to its host, and
+/// answers its build preparations: prepared, or retryable while
+/// `refuse_retryably` is set.
 #[cfg(feature = "runtime-adapter")]
 #[derive(Default)]
 struct StartupBuildReports {
     built: std::sync::Mutex<Vec<crate::runtime::MemberBuildReport>>,
+    preparations: std::sync::atomic::AtomicUsize,
+    refuse_retryably: std::sync::atomic::AtomicBool,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -39383,6 +39387,15 @@ impl StartupBuildReports {
             .filter(|report| &report.agent_identity == identity)
             .count()
     }
+
+    fn preparations(&self) -> usize {
+        self.preparations.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    fn refuse_retryably(&self, refuse: bool) {
+        self.refuse_retryably
+            .store(refuse, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -39393,6 +39406,16 @@ impl crate::runtime::MemberBuildPreparer for StartupBuildReports {
         _request: crate::runtime::MemberBuildPreparation,
     ) -> Result<crate::runtime::MemberBuildPrepared, crate::runtime::MemberBuildPreparationRefusal>
     {
+        let refuse = self
+            .refuse_retryably
+            .load(std::sync::atomic::Ordering::SeqCst);
+        self.preparations
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if refuse {
+            return Err(crate::runtime::MemberBuildPreparationRefusal::Retryable {
+                reason: "the host is not ready for this member yet".to_string(),
+            });
+        }
         Ok(crate::runtime::MemberBuildPrepared::Prepared)
     }
 
@@ -39472,6 +39495,113 @@ async fn a_member_taken_over_at_a_running_start_is_woken_from_dormant_and_report
         1,
         "the start takes the stopped registration over exactly once"
     );
+}
+
+/// A member taken over at a Running start whose recovery's wake is refused
+/// retryably (the host asks to retry its build preparation) stays
+/// retryable: it is Dormant, not Broken, its boot obligation still owed,
+/// and the owed retry wakes it Live once the host prepares it.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_taken_over_members_recovery_refused_retryably_stays_dormant_until_its_retry() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("taken-over-and-refused-retryably");
+    let preparer = Arc::new(StartupBuildReports::default());
+    let paused = paused_running_start_with(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+        |builder| {
+            builder
+                .with_member_build_preparer(preparer.clone())
+                .with_member_wake_retry_backoff(
+                    Duration::from_millis(100),
+                    Duration::from_millis(500),
+                )
+        },
+    )
+    .await;
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the member before the start restores it",
+            )
+            .await
+            .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    // The boot restore was prepared; the recovery's wake is refused.
+    let prepared_at_boot = preparer.preparations();
+    preparer.refuse_retryably(true);
+    paused.release.send(()).expect("release the start");
+
+    let key = crate::machines::mob_machine::AgentIdentity::from_domain(&identity);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while preparer.preparations() == prepared_at_boot {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the recovery's wake asks the host to prepare the member");
+    // The refused wake leaves the member Dormant; its recovery settles after.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let state = paused
+        .resumed
+        .query_machine_state()
+        .await
+        .expect("MobMachine state");
+    assert!(
+        !state.member_restore_failures.contains_key(&key),
+        "a retryable refusal records no restore failure: {:?}",
+        state.member_restore_failures.get(&key)
+    );
+    assert!(
+        state.member_boot_obligation_owed.contains_key(&key),
+        "the member's boot obligation stays owed"
+    );
+    assert_ne!(
+        paused
+            .resumed
+            .member_status(&identity)
+            .await
+            .expect("member status")
+            .status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "the member is not Broken"
+    );
+
+    preparer.refuse_retryably(false);
+    tokio::time::timeout(Duration::from_secs(10), async {
+        loop {
+            let live = paused
+                .resumed
+                .query_machine_state()
+                .await
+                .expect("MobMachine state")
+                .member_materialization
+                .get(&key)
+                .copied()
+                == Some(crate::machines::mob_machine::MemberMaterializationPhase::Live);
+            if live {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the owed retry wakes the member Live");
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its owed retry")
+        .await
+        .expect("the member serves a turn");
 }
 
 /// A host stops a member's runtime in the window between the builder's
