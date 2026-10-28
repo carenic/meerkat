@@ -3828,6 +3828,42 @@ impl PreparedRuntimeExecutorAttachmentRetirement {
         Ok(completion)
     }
 
+    /// [`Self::commit`], beginning the retirement's unregister with
+    /// `queued_inputs`, its disposition for the inputs queued on the
+    /// registration ([`UnregisterQueuedInputs`]). [`Self::commit`] ends them
+    /// as stopped; a requeue keeps the eligible ones durably queued for the
+    /// registration that replaces this one, as a graceful process shutdown
+    /// does. A retirement whose unregister already began keeps the
+    /// disposition it began with.
+    ///
+    /// # Errors
+    /// `QueuedInputsRefused` for a disposition [`UnregisterQueuedInputs::check`]
+    /// refuses: nothing is started, and the lease stays armed, so dropping it
+    /// retires the attachment as [`Self::commit`] does.
+    pub fn commit_with_queued_inputs(
+        mut self,
+        queued_inputs: UnregisterQueuedInputs,
+    ) -> Result<RuntimeExecutorAttachmentRetirementCompletion, RuntimeDriverError> {
+        let queued_inputs = queued_inputs
+            .recorded()
+            .map_err(RuntimeDriverError::QueuedInputsRefused)?;
+        let guard = self.mutation_guard.take().ok_or_else(|| {
+            RuntimeDriverError::Internal(
+                "prepared exact attachment retirement lost its mutation fence".to_string(),
+            )
+        })?;
+        let completion = self
+            .machine
+            .spawn_executor_attachment_retirement_with_guard(
+                self.witness.clone(),
+                guard,
+                self.cleanup_spawner.clone(),
+                queued_inputs,
+            );
+        self.armed = false;
+        Ok(completion)
+    }
+
     /// Complete exact attachment retirement while the caller retains the
     /// service turn-finalization boundary that preceded this lease's M guard.
     /// The attachment-local actor cleanup therefore runs in B -> M -> R order;

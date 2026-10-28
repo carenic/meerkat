@@ -2677,7 +2677,11 @@ async fn an_owed_kickoff_runs_once_with_its_prompt_after_a_restart() {
     let mut mob = DormantMemberMob::new("owed-kickoff-restart").await;
     let identity = mob.identity.clone();
     let next = mob.session_at(1);
-    mob.service.set_missing_comms_runtime(&next).await;
+    // The next incarnation's wake cannot create its seat session (the store
+    // cannot serve the write now): the wake ends retryable, the seat stays
+    // unborn and the kickoff owed, and nothing is created to roll back. The
+    // restarted service creates it.
+    mob.service.set_create_session_failure(&next).await;
     let new = tokio::time::timeout(
         LAZY_STEP,
         mob.handle
@@ -2808,7 +2812,11 @@ async fn a_kickoff_journaled_starting_but_never_admitted_runs_once_after_a_resta
     let identity = mob.identity.clone();
     let prompt = "a kickoff starting at the crash";
     let next = mob.session_at(1);
-    mob.service.set_missing_comms_runtime(&next).await;
+    // The next incarnation's wake cannot create its seat session (the store
+    // cannot serve the write now): the wake ends retryable, the seat stays
+    // unborn and the kickoff owed, and nothing is created to roll back. The
+    // restarted service creates it.
+    mob.service.set_create_session_failure(&next).await;
     let new = tokio::time::timeout(
         LAZY_STEP,
         mob.handle
@@ -3056,51 +3064,6 @@ async fn a_rotation_in_a_stopped_mob_is_refused_and_retires_nothing() {
         )),
         "no retirement started"
     );
-}
-
-/// A kickoff status notice is content, so a
-/// live member's kickoff notices to a wired Dormant peer wake that peer
-/// once and are delivered, never dropped.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn kickoff_notices_to_a_dormant_peer_wake_it_once() {
-    let mob = CrashedMob::with_definition(
-        sample_definition_with_role_wiring(),
-        "kickoff-notice",
-        1,
-        false,
-        false,
-    )
-    .await;
-    let handle = mob.resume(mob.builder()).await;
-    mob.service.set_keep_alive_turns_complete_immediately(true);
-    let dormant = worker(0);
-    assert_eq!(
-        phase_of(&handle, &dormant),
-        Some(dsl::MemberMaterializationPhase::Dormant)
-    );
-    // A new autonomous worker is wired to the dormant one by the role rule
-    // before its kickoff starts, so its kickoff notices go to the peer.
-    let live = AgentIdentity::from("live");
-    handle
-        .spawn_spec(autonomous(&live, None))
-        .await
-        .expect("spawn the live member");
-    handle
-        .wait_for_members_kickoff_complete(std::slice::from_ref(&live), Some(LAZY_STEP))
-        .await
-        .expect("the live member's kickoff resolves");
-    wait_for("the notices to wake the dormant peer", || async {
-        phase_of(&handle, &dormant) == Some(dsl::MemberMaterializationPhase::Live)
-    })
-    .await;
-    let dormant_session = mob.session(0);
-    let builds = mob
-        .materialized()
-        .await
-        .into_iter()
-        .filter(|session| session == &dormant_session)
-        .count();
-    assert_eq!(builds, 1, "the peer was woken once");
 }
 
 /// Retiring a member while its wake is still provisioning is

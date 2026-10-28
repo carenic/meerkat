@@ -40,10 +40,14 @@ fn key_pair_path(root: &std::path::Path, session: &SessionId) -> std::path::Path
 
 /// An imported session (its transcript and metadata exist; its key pair and
 /// any record of its endpoint do not) is seated by a resume seat Dormant,
-/// with a fresh key pair where its builds load it. A peer message to the
-/// member then wakes it on that session and is delivered.
+/// with a fresh key pair where its builds load it. The member's wake then
+/// builds it on that session with that key (the wake refuses a live endpoint
+/// other than the one the seat recorded), and a wired peer's message to the
+/// woken member is handed to it. A peer message's own wake of a dormant
+/// member needs real comms (its wake route), and is covered on that stack
+/// (`member_wake_rows`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn an_imported_session_without_a_key_pair_is_seated_with_a_fresh_one_and_woken_by_a_peer() {
+async fn an_imported_session_without_a_key_pair_is_seated_with_a_fresh_one_and_wakes_on_it() {
     let definition = with_unique_mob_id(sample_definition(), "seat-imported-key");
     let member = AgentIdentity::from("imported");
 
@@ -108,6 +112,21 @@ async fn an_imported_session_without_a_key_pair_is_seated_with_a_fresh_one_and_w
         .wire(sender.clone(), member.clone())
         .await
         .expect("wire the sender to the imported member");
+
+    tokio::time::timeout(STEP, handle.ensure_member_live(&member))
+        .await
+        .expect("the wake answers")
+        .expect("the imported member wakes with the key pair the seat minted");
+    assert_eq!(
+        phase_of(&handle, &member),
+        Some(dsl::MemberMaterializationPhase::Live),
+        "the wake made the member Live"
+    );
+    assert_eq!(
+        handle.resolve_bridge_session_id(&member).await,
+        Some(session.clone()),
+        "the member is woken on its imported session"
+    );
     let receipt = tokio::time::timeout(
         STEP,
         handle.send_peer_message(
@@ -119,13 +138,8 @@ async fn an_imported_session_without_a_key_pair_is_seated_with_a_fresh_one_and_w
     )
     .await
     .expect("the send answers")
-    .expect("the imported member is woken and the message handed off");
+    .expect("the message is handed to the woken member");
     assert_eq!(receipt.to, member);
-    assert_eq!(
-        phase_of(&handle, &member),
-        Some(dsl::MemberMaterializationPhase::Live),
-        "the peer message woke the member"
-    );
 }
 
 /// A resume seat of a built session whose endpoint this mob recorded (its
