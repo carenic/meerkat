@@ -1716,6 +1716,10 @@ struct SeatCostRun {
     seat: Duration,
     chunks: Vec<crate::runtime::handle::seat_chunk_timing::SeatChunkTiming>,
     restart: Duration,
+    /// Under [`SeatCostWiring::LiveOrchestrator`]: the orchestrator's first
+    /// wake after the restart, whose topology step realizes its edge to every
+    /// seated member.
+    orchestrator_wake: Option<Duration>,
 }
 
 /// Microseconds per seat of `elapsed` over `seats` seats.
@@ -1781,6 +1785,12 @@ impl SeatCostRun {
             );
         }
         eprintln!("  restart: {:?}", self.restart);
+        if let Some(wake) = self.orchestrator_wake {
+            eprintln!(
+                "  the orchestrator's wake over {} edges: {wake:?}",
+                self.members
+            );
+        }
     }
 }
 
@@ -1948,6 +1958,46 @@ async fn seat_cost_run(members: usize, wiring: SeatCostWiring) -> SeatCostRun {
         0,
         "the restart materializes no seated member"
     );
+    // The orchestrator's first wake after the restart realizes its edge to
+    // every seated member in its topology step: it then trusts every seated
+    // member's recorded endpoint.
+    let orchestrator_wake = if wiring == SeatCostWiring::LiveOrchestrator {
+        let started = std::time::Instant::now();
+        let woken = resumed.ensure_member_live(&orchestrator).await;
+        let wake = started.elapsed();
+        if let Err(error) = woken {
+            panic!("the orchestrator's wake over {members} edges failed after {wake:?}: {error}");
+        }
+        let dsl_orchestrator = dsl::AgentIdentity::from_domain(&orchestrator);
+        let peer_ids = resumed
+            .machine_state_watch_rx
+            .borrow()
+            .member_peer_ids
+            .iter()
+            .filter(|(identity, _)| **identity != dsl_orchestrator)
+            .map(|(_, peer_id)| peer_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let session = resumed
+            .resolve_bridge_session_id(&orchestrator)
+            .await
+            .expect("the orchestrator's session");
+        let trusted = restarted
+            .comms_runtime(&session)
+            .await
+            .expect("the woken orchestrator's comms runtime")
+            .peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.peer_id.to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            peer_ids.is_subset(&trusted),
+            "the woken orchestrator trusts every seated member's recorded endpoint"
+        );
+        Some(wake)
+    } else {
+        None
+    };
     crash_stop_and_release_routes(resumed).await;
     SeatCostRun {
         members,
@@ -1956,6 +2006,7 @@ async fn seat_cost_run(members: usize, wiring: SeatCostWiring) -> SeatCostRun {
         seat,
         chunks,
         restart,
+        orchestrator_wake,
     }
 }
 
@@ -2012,14 +2063,16 @@ async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
 /// under `auto_wire_orchestrator` spawns its orchestrator live, then seats
 /// 10,000 identities, each wired to the orchestrator as a spawn of it would
 /// be (the machine edge, its MembersWired row, and the live orchestrator's
-/// trust in the seated member's recorded endpoint), and restarts. Each
-/// chunk's edges are one prepared machine step and one journal batch, so the
-/// wiring adds a fixed number of machine state copies per chunk and a few
-/// map reads, one row and one trust install per seat: the 10,000 seats stay
-/// under the same 10 s bound as seats with no declared edge, and the restart
-/// under 60 s. A wire per edge would copy the whole machine state several
-/// times per seat, quadratic in the roster. Run explicitly, in the release
-/// profile, with the output shown (nextest `--no-capture`).
+/// trust in the seated member's recorded endpoint), restarts, and wakes the
+/// orchestrator, whose topology step realizes its 10,000 edges. Each chunk's
+/// edges are one prepared machine step and one journal batch, so the wiring
+/// adds a fixed number of machine state copies per chunk and a few map
+/// reads, one row and one trust install per seat: the 10,000 seats stay
+/// under the same 10 s bound as seats with no declared edge, the restart
+/// under 60 s, and the orchestrator's wake under 60 s. A wire per edge would
+/// copy the whole machine state several times per seat, quadratic in the
+/// roster. Run explicitly, in the release profile, with the output shown
+/// (nextest `--no-capture`).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "scale row: run explicitly in the release profile"]
 async fn seating_ten_thousand_identities_wired_to_a_live_orchestrator_stays_under_the_bound() {
@@ -2036,6 +2089,14 @@ async fn seating_ten_thousand_identities_wired_to_a_live_orchestrator_stays_unde
         "the restart over {} seated, wired identities took {:?}",
         run.members,
         run.restart
+    );
+    let wake = run
+        .orchestrator_wake
+        .expect("the run woke the orchestrator after the restart");
+    assert!(
+        wake < Duration::from_secs(60),
+        "the orchestrator's wake over {} edges took {wake:?}, over the 60 s bound",
+        run.members
     );
 }
 
