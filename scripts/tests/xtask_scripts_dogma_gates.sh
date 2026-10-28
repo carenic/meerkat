@@ -670,43 +670,49 @@ else
 fi
 
 # The lane runs as parts (Bazel runs each as its own target): every hand
-# audit runs in exactly one audit shard, the machine-verify part runs none,
-# and the shards together run exactly the audits of the whole lane. Every
-# part runs and keeps its output whatever the others do: a failed part fails
-# this check by name, and no later check reads an output its failure left
-# unset (one such read ended in "a_out: unbound variable").
+# audit runs in exactly one audit shard, each shard runs at least one, the
+# machine-verify part runs none, and the shards together run exactly the
+# audits of the whole lane (the member audits and the MobMachine arm
+# coverage gate included). Every part runs and keeps its output whatever the
+# others do: a failed part fails this check by name, and no later check
+# reads an output its failure left unset (one such read ended in "a_out:
+# unbound variable").
 lane_part_output() {
   PATH="$tlc_env_tmp:$PATH" \
     TLC_JAVA_OPTIONS_CAPTURE="$capture" \
     TLC_JDK_JAVA_OPTIONS_CAPTURE="$jdk_capture" \
     bash crates/xtask/tests/machine_verify_all_tlc_test.sh "$true_bin" "$@" 2>&1
 }
-audit_lines() { grep -E '^running bounded .* TLC audit$' | sort; }
+audit_lines() {
+  grep -E '^running (bounded .* TLC audit|member [a-z]+ TLC audit|MobMachine arm coverage gate)$' | sort
+}
+audit_shards="audits-a audits-b audits-c audits-d audits-e audits-f audits-g"
+shard_outputs="$(mktemp -d)"
 failed_parts=""
+idle_shards=""
 all_out="$(lane_part_output)" || failed_parts+=" all"
-a_out="$(lane_part_output --part audits-a)" || failed_parts+=" audits-a"
-b_out="$(lane_part_output --part audits-b)" || failed_parts+=" audits-b"
-c_out="$(lane_part_output --part audits-c)" || failed_parts+=" audits-c"
+for shard in $audit_shards; do
+  lane_part_output --part "$shard" > "$shard_outputs/$shard" || failed_parts+=" $shard"
+  [ -n "$(audit_lines < "$shard_outputs/$shard")" ] || idle_shards+=" $shard"
+done
 mv_out="$(lane_part_output --part machine-verify)" || failed_parts+=" machine-verify"
-if [ -z "$failed_parts" ] \
-  && [ -n "$(printf '%s\n' "$a_out" | audit_lines)" ] \
-  && [ -n "$(printf '%s\n' "$b_out" | audit_lines)" ] \
-  && [ -n "$(printf '%s\n' "$c_out" | audit_lines)" ] \
+# A shard without an audit is reported above, so its empty grep must not end
+# the script here.
+shard_audits="$(for shard in $audit_shards; do audit_lines < "$shard_outputs/$shard" || true; done | sort)"
+if [ -z "$failed_parts" ] && [ -z "$idle_shards" ] \
   && [ -z "$(printf '%s\n' "$mv_out" | audit_lines)" ] \
   && printf '%s\n' "$mv_out" | grep -Fq 'running bounded adaptive_mob_bundle layer_terminal_feedback TLC witness' \
-  && ! printf '%s\n' "$a_out" "$b_out" "$c_out" | grep -Fq 'running bounded adaptive_mob_bundle' \
-  && [ -z "$( (printf '%s\n' "$a_out" | audit_lines; printf '%s\n' "$b_out" | audit_lines; printf '%s\n' "$c_out" | audit_lines) | sort | uniq -d)" ] \
-  && [ "$( (printf '%s\n' "$a_out"; printf '%s\n' "$b_out"; printf '%s\n' "$c_out") | audit_lines)" = "$(printf '%s\n' "$all_out" | audit_lines)" ]; then
-  ok "TLC lane parts: each hand audit runs in exactly one shard, machine-verify runs none, and the shards cover the whole lane"
+  && ! (for shard in $audit_shards; do cat "$shard_outputs/$shard"; done) | grep -Fq 'running bounded adaptive_mob_bundle' \
+  && [ -z "$(printf '%s\n' "$shard_audits" | uniq -d)" ] \
+  && [ "$shard_audits" = "$(printf '%s\n' "$all_out" | audit_lines)" ]; then
+  ok "TLC lane parts: each hand audit runs in exactly one shard, every shard runs one, machine-verify runs none, and the shards cover the whole lane"
 else
-  bad "TLC lane parts drop, duplicate, or misplace a hand audit, or the machine-verify part runs one${failed_parts:+ (failed parts:${failed_parts})}"
+  bad "TLC lane parts drop, duplicate, or misplace a hand audit, leave a shard without one, or the machine-verify part runs one${failed_parts:+ (failed parts:${failed_parts})}${idle_shards:+ (shards without an audit:${idle_shards})}"
   for part in $failed_parts; do
     case "$part" in
       all) show_tail all "$all_out" ;;
-      audits-a) show_tail audits-a "$a_out" ;;
-      audits-b) show_tail audits-b "$b_out" ;;
-      audits-c) show_tail audits-c "$c_out" ;;
       machine-verify) show_tail machine-verify "$mv_out" ;;
+      *) show_tail "$part" "$(cat "$shard_outputs/$part")" ;;
     esac
   done
 fi
@@ -846,12 +852,13 @@ if noxtask_a="$(PATH="$tlc_env_tmp:$PATH" \
       TLC_JAVA_OPTIONS_CAPTURE="$capture" \
       TLC_JDK_JAVA_OPTIONS_CAPTURE="$jdk_capture" \
       bash crates/xtask/tests/machine_verify_all_tlc_test.sh --part audits-a 2>&1)" \
-  && [ "$(printf '%s\n' "$noxtask_a" | audit_lines)" = "$(printf '%s\n' "$a_out" | audit_lines)" ] \
+  && [ "$(printf '%s\n' "$noxtask_a" | audit_lines)" = "$(audit_lines < "$shard_outputs/audits-a")" ] \
   && ! PATH="$tlc_env_tmp:$PATH" bash crates/xtask/tests/machine_verify_all_tlc_test.sh --part machine-verify >/dev/null 2>&1; then
   ok "TLC lane: audit shards run without an xtask argument; machine-verify still requires one"
 else
   bad "TLC lane: an audit shard needs an xtask argument, or machine-verify runs without one"
 fi
+rm -rf "$shard_outputs"
 
 # setup-tlc-ci is the one TLC install: the repository's immutable mirror of
 # the tlaplus v1.8.0 build (tlaplus rebuilds that pre-release in place),
