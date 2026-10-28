@@ -21,7 +21,8 @@
 //! readiness failure, which records it Broken; a Live member whose comms
 //! runtime is gone is woken again through the drift arm; any other Live
 //! member failure records that member Broken. The mob keeps serving every
-//! other member.
+//! other member. An explicit resume's post-commit readiness pass resolves
+//! its members' failures the same way, and the resume does not answer them.
 
 use super::*;
 
@@ -62,7 +63,7 @@ impl MobActor {
         let mut settled = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
             if let Err(error) = &outcome.result {
-                self.resolve_startup_live_member_failure(&outcome.entry, error)
+                self.resolve_live_member_readiness_failure(&outcome.entry, error, "at startup")
                     .await;
                 continue;
             }
@@ -363,11 +364,86 @@ impl MobActor {
         }
     }
 
-    /// A Live member's startup readiness failed. A member whose comms runtime
+    /// The Live members' readiness failures of an explicit resume's
+    /// post-commit readiness pass, resolved as the startup pass resolves
+    /// them: each is that member's outcome, never the lift's. The pass ran
+    /// while the mob served, so a failure is resolved only while it still
+    /// describes the member: the roster holds the incarnation it observed,
+    /// and MobMachine holds the member materialized, neither Broken nor
+    /// retiring. The failure of a member retired, respawned, released or
+    /// recorded Broken while its readiness ran is dropped: that path owns
+    /// the member's outcome. Returns the outcomes left to apply (the
+    /// successes).
+    pub(super) async fn resolve_live_member_readiness_failures(
+        &mut self,
+        outcomes: Vec<MemberReadinessOutcome>,
+    ) -> Vec<MemberReadinessOutcome> {
+        let mut rest = Vec::with_capacity(outcomes.len());
+        for outcome in outcomes {
+            if outcome.result.is_ok() {
+                rest.push(outcome);
+                continue;
+            }
+            if !self.live_readiness_target_is_current(&outcome.entry).await {
+                tracing::info!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %outcome.entry.agent_identity,
+                    "a member changed while its readiness ran; its readiness failure is dropped"
+                );
+                continue;
+            }
+            if let Err(error) = &outcome.result {
+                self.resolve_live_member_readiness_failure(
+                    &outcome.entry,
+                    error,
+                    "at the explicit resume",
+                )
+                .await;
+            }
+        }
+        rest
+    }
+
+    /// Whether the member a readiness target observed is still that Live
+    /// target: the same incarnation in the roster, materialized, neither
+    /// Broken nor retiring.
+    async fn live_readiness_target_is_current(&self, observed: &RosterEntry) -> bool {
+        let same_incarnation = self
+            .roster
+            .read()
+            .await
+            .get(&observed.agent_identity)
+            .is_some_and(|entry| {
+                entry.agent_runtime_id == observed.agent_runtime_id
+                    && entry.fence_token == observed.fence_token
+            });
+        let state = self.dsl_authority.state();
+        same_incarnation
+            && !state
+                .member_restore_failures
+                .contains_key(&mob_dsl::AgentIdentity::from_domain(
+                    &observed.agent_identity,
+                ))
+            && !super::super::boot_plan::domain_member_is_unmaterialized(
+                state,
+                &observed.agent_identity,
+            )
+            && !state.runtime_retire_pending_sessions.contains_key(
+                &mob_dsl::AgentRuntimeId::from_domain(&observed.agent_runtime_id),
+            )
+    }
+
+    /// A Live member's readiness failed, observed by the readiness pass
+    /// `pass` names (its diagnostic says where). A member whose comms runtime
     /// is gone is not materialized any more: the drift arm makes it Waking and
     /// the wake path materializes it again. Any other failure records the
     /// member Broken. Neither stops the mob.
-    async fn resolve_startup_live_member_failure(&mut self, entry: &RosterEntry, error: &MobError) {
+    async fn resolve_live_member_readiness_failure(
+        &mut self,
+        entry: &RosterEntry,
+        error: &MobError,
+        pass: &'static str,
+    ) {
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         let lost_materialization = matches!(
             error,
@@ -381,7 +457,8 @@ impl MobActor {
             agent_identity = %entry.agent_identity,
             %error,
             lost_materialization,
-            "member readiness failed at startup; the outcome is the member's, the mob keeps running"
+            pass,
+            "member readiness failed; the outcome is the member's, the mob keeps running"
         );
         if lost_materialization {
             let transition = match self.apply_dsl_signal_collect_transition(
@@ -389,7 +466,7 @@ impl MobActor {
                     agent_identity: identity.clone(),
                     observation:
                         mob_dsl::MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
-                    reason: format!("the member's comms runtime is missing at startup: {error}"),
+                    reason: format!("the member's comms runtime is missing {pass}: {error}"),
                 },
                 "startup_member_materialization_lost",
             ) {
@@ -435,7 +512,7 @@ impl MobActor {
             return;
         }
         let reason = format!(
-            "member '{}' readiness failed at startup: {error}",
+            "member '{}' readiness failed {pass}: {error}",
             entry.agent_identity
         );
         if let Err(recover_error) = self.apply_dsl_signal(

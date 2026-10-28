@@ -172,10 +172,11 @@ impl MobActor {
     /// End a rebuilt member's open wake attempt retryable for a restore
     /// error that clears on its own
     /// ([`crate::runtime::builder::restore_error_is_retryable`]): the member
-    /// is Dormant again, a boot obligation it owes stays owed with its retry
-    /// armed, and the explicit resume answers the typed error. A refused
-    /// resolution is what the resume answers instead (the attempt is then
-    /// abandoned before the member's work settles).
+    /// is Dormant again and a boot obligation it owes stays owed with its
+    /// retry armed. That is the member's own outcome: the explicit resume
+    /// answers Ok for it. A refused resolution is what the resume answers
+    /// instead (the attempt is then abandoned before the member's work
+    /// settles).
     fn resolve_explicit_resume_member_retryable(
         &mut self,
         identity: &mob_dsl::AgentIdentity,
@@ -191,8 +192,13 @@ impl MobActor {
             "resolve_retryable_explicit_resume_member",
         ) {
             Ok(_) => {
+                tracing::info!(
+                    mob_id = %self.definition.id,
+                    agent_identity = %identity.0,
+                    %error,
+                    "an explicitly resumed member's restore waits on work in flight or an unavailable store; its owed retry is armed"
+                );
                 self.schedule_owed_member_wake_retry(&AgentIdentity::from(identity.0.as_str()));
-                self.retain_explicit_resume_error(error);
             }
             Err(refused) => self.retain_explicit_resume_error(refused),
         }
@@ -874,21 +880,18 @@ impl MobActor {
 
     /// An accepted member's own readiness resolved: MobMachine holds it Live
     /// (Live means ready), or Broken with its readiness failure (the
-    /// member's own outcome, which the resume reports as a held member's
-    /// failure); then its work settles and the resume goes on.
+    /// member's own outcome, recorded with the member: the resume answers Ok
+    /// for it); then its work settles and the resume goes on.
     pub(super) async fn explicit_resume_member_readiness_resolved(
         &mut self,
         work: Arc<ExplicitResumeMemberWork>,
         outcomes: Vec<MemberReadinessOutcome>,
     ) {
-        let (outcomes, held_failure) = self
+        let (outcomes, _member_failure) = self
             .settle_held_member_readiness_of(&work.rebuild.entry.agent_identity, outcomes)
             .await;
         if let Err(error) = self.apply_member_readiness_outcomes(outcomes).await {
             self.retain_explicit_resume_member_failure(error);
-        }
-        if let Some(failure) = held_failure {
-            self.retain_explicit_resume_member_failure(failure);
         }
         self.settle_explicit_resume_member_work(work).await;
     }

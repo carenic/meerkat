@@ -24,6 +24,8 @@ impl MobActor {
             |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeTopology { attempt },
             "settle_explicit_resume_topology",
         ) {
+            // A committed lift leaves its mob settled whatever it answers.
+            let _ = self.settle_committed_explicit_resume();
             let _ = pending.reply_tx.send(Err(error));
             return;
         }
@@ -433,12 +435,9 @@ impl MobActor {
             post_commit_error.map_or(Ok(()), Err)
         };
         // The topology settled when its reconciliation did
-        // (`begin_resume_post_topology_members`).
+        // (`begin_resume_post_topology_members`). The attempt's end seals the
+        // plan and queues the stuck-retirement re-drives, whatever the answer.
         let result = self.finish_explicit_resume_attempt(result);
-        if result.is_ok() {
-            // A resume re-drives every retirement this actor owns as stuck.
-            self.enqueue_stuck_retirement_redrives();
-        }
         let _ = pending.reply_tx.send(result);
     }
 }

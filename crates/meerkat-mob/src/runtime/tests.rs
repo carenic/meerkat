@@ -3618,6 +3618,14 @@ impl MockSessionService {
             .insert(session_id);
     }
 
+    /// Serve `session_id`'s metadata-only reads again.
+    fn serve_persisted_session_metadata_reads_for(&self, session_id: &SessionId) {
+        self.metadata_read_failures_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(session_id);
+    }
+
     /// Make every metadata-only read of `session_id` find its persisted
     /// state malformed: a deterministic store failure, as a durable record
     /// that fails its typed decode is.
@@ -34014,9 +34022,17 @@ async fn unreadable_resume_view_fails_the_member_restore_not_the_mob() {
     );
 }
 
+/// A store that cannot serve a lifted member's resume view now (an I/O
+/// failure) leaves that member Dormant with its owed retry, never Broken.
+/// That is the member's own outcome: the lift answers Ok with the mob
+/// Running, and once the store serves the view again the member's retry
+/// materializes it. This replaces the 0.9.6 row that expected the explicit
+/// resume to answer the store error: a read that clears on its own no longer
+/// fails the lift (a malformed persisted state still does, see
+/// `retryable_restore_rows`).
 #[tokio::test]
-async fn unreadable_resume_view_fails_an_explicit_resume_typed() {
-    let (service, storage, _member, session) =
+async fn a_transient_resume_view_failure_leaves_the_member_dormant_and_the_lift_ok() {
+    let (service, storage, member, session) =
         seat_member_with_provider_params_then_crash(true).await;
     let resumed = MobBuilder::for_resume(storage)
         .with_session_service(service.clone())
@@ -34026,20 +34042,45 @@ async fn unreadable_resume_view_fails_an_explicit_resume_typed() {
         .resume()
         .await
         .expect("resume the stopped mob");
-    service.fail_persisted_session_metadata_reads_for(session);
-    let error = resumed
+    service.fail_persisted_session_metadata_reads_for(session.clone());
+    resumed
         .resume()
         .await
-        .expect_err("the explicit resume cannot read the member's view");
-    // The explicit resume is a shared lifecycle operation: its failure
-    // reaches every caller inside the shared envelope.
-    let cause = match &error {
-        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
-        other => other,
-    };
+        .expect("a view the store cannot serve now does not fail the lift");
+    assert_eq!(
+        resumed.status().await.expect("the mob answers"),
+        MobState::Running
+    );
+    let status = resumed
+        .member_status(&member)
+        .await
+        .expect("the member's status");
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a store that cannot serve the view now never breaks the member: {status:?}"
+    );
+    assert_ne!(
+        resumed.member_materialization_for_test(&member),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "the member waits for its retry"
+    );
+
+    service.serve_persisted_session_metadata_reads_for(&session);
+    let mut published = resumed.machine_state_watch_rx.clone();
+    let member_id = crate::machines::mob_machine::AgentIdentity::from_domain(&member);
+    let retried = tokio::time::timeout(
+        Duration::from_secs(30),
+        published.wait_for(|state| {
+            state.member_materialization.get(&member_id)
+                == Some(&crate::machines::mob_machine::MemberMaterializationPhase::Live)
+        }),
+    )
+    .await
+    .is_ok_and(|seen| seen.is_ok());
     assert!(
-        matches!(cause, MobError::SessionError(SessionError::Store(_))),
-        "a typed session error, got {error:?}"
+        retried,
+        "the member's owed retry materializes it once the store serves the view"
     );
 }
 

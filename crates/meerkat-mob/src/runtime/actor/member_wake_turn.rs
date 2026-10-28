@@ -1422,8 +1422,8 @@ impl MobActor {
     /// own ([`restore_error_is_retryable`]): nothing was provisioned, the
     /// member is Dormant again with its boot obligation owed (its retry joins
     /// the work still in flight), and its callers get the typed retryable
-    /// refusal. An explicit resume that waits on the member answers the
-    /// typed error.
+    /// refusal. An explicit resume that waits on the member takes that as
+    /// the member's own outcome.
     async fn end_member_wake_retryable(&mut self, run: &WakeRun, error: MobError) {
         tracing::info!(
             mob_id = %self.definition.id,
@@ -1434,7 +1434,7 @@ impl MobActor {
         );
         let cause = RetryableRestoreCause::RestoreUnavailable;
         self.member_wakes.running.remove(&run.attempt);
-        match self
+        if self
             .resolve_member_wake_retryable(
                 &run.identity,
                 run.attempt,
@@ -1443,35 +1443,10 @@ impl MobActor {
                 "member_wake_restore_unavailable",
             )
             .await
+            == mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt
         {
-            mob_dsl::MemberWakeFeedbackVerdict::Applied => {
-                self.retain_explicit_resume_member_error(&run.identity, error);
-            }
-            mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt => {
-                self.finish_closed_member_wake(&run.identity, run.attempt)
-                    .await;
-            }
-        }
-    }
-
-    /// Hand a member's typed retryable restore error to the explicit resume
-    /// that waits on the member (its resume work is pending), which answers
-    /// it once every member settled. A wake no explicit resume waits on
-    /// answers its own callers only.
-    fn retain_explicit_resume_member_error(&mut self, identity: &AgentIdentity, error: MobError) {
-        let awaited = self
-            .dsl_authority
-            .state()
-            .explicit_resume_member_work
-            .contains_key(&mob_dsl::AgentIdentity::from_domain(identity));
-        let rebuilding = matches!(
-            self.pending_resume_lifecycle
-                .as_ref()
-                .map(|pending| &pending.phase),
-            Some(ResumeLifecyclePhase::RebuildingMembers { .. })
-        );
-        if awaited && rebuilding {
-            self.retain_explicit_resume_error(error);
+            self.finish_closed_member_wake(&run.identity, run.attempt)
+                .await;
         }
     }
 

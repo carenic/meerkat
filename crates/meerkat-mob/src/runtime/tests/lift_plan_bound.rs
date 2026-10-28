@@ -841,8 +841,9 @@ async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
 /// preparation is held, a caller that joins its attempt is answered
 /// `WakeTimedOut` at the bound, and the member is Dormant again, never
 /// Broken. The other member of its round is prepared and rebuilt on its
-/// own, not behind it, every other member is Live, and the lift answers the
-/// typed timeout. The member's owed retry then wakes it.
+/// own, not behind it, and every other member is Live. The timeout is the
+/// member's own outcome: the lift answers Ok. The member's owed retry then
+/// wakes it.
 ///
 /// RED before the fix: the attempt had no bound, so the caller waited for
 /// good (the row's bound ends the wait), and a round's preparations were
@@ -912,20 +913,9 @@ async fn a_rebuilt_member_whose_preparation_hangs_times_out_alone_at_the_wake_bo
         "a caller of the held member is answered at the wake bound: {joined:?}"
     );
     assert!(others_live, "every other member is Live");
-    let cause = match &lifted {
-        Err(MobError::SharedLifecycleFailure(inner)) => Some(inner.as_ref()),
-        Err(other) => Some(other),
-        Ok(()) => None,
-    };
     assert!(
-        matches!(
-            cause,
-            Some(MobError::MemberWakeRefused {
-                refusal: crate::MemberWakeRefusal::WakeTimedOut,
-                ..
-            })
-        ),
-        "the lift answers the typed timeout: {lifted:?}"
+        lifted.is_ok(),
+        "the member's timeout is its own outcome: the lift answers Ok: {lifted:?}"
     );
     assert_ne!(
         status.status,
