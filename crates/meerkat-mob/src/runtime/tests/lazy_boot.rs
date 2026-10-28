@@ -3611,3 +3611,85 @@ async fn a_never_woken_seats_status_reads_like_an_idle_member_with_an_empty_sess
     );
     assert!(seat_session_unborn(&handle, &identity));
 }
+
+/// A mob whose admission closed owns none of its members' sessions for the
+/// session-owner wake registry: it wakes no member again, so a session-keyed
+/// live operation on a Dormant member's session is answered `NotOwned` and
+/// proceeds as for an unowned session, as in a process that never held the
+/// mob. The answer wakes nothing and builds nothing.
+async fn assert_a_closed_mob_answers_not_owned(
+    mob: &CrashedMob,
+    handle: &MobHandle,
+    reason: crate::MobAdmissionCloseReason,
+) {
+    use meerkat_core::session_owner_wake::{SessionOwnerWakeOutcome, SessionOwnerWakeRegistry};
+
+    assert_eq!(*handle.admission_closed().borrow(), Some(reason));
+    let registry = SessionOwnerWakeRegistry::global();
+    for (member, session) in &mob.sessions {
+        let answer = registry.wake(session).await;
+        assert!(
+            matches!(answer, Some(Ok(SessionOwnerWakeOutcome::NotOwned))),
+            "{member}: {answer:?}"
+        );
+        assert_eq!(
+            phase_of(handle, member),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{member}: the answer woke nothing"
+        );
+    }
+    assert!(
+        mob.materialized().await.is_empty(),
+        "nothing was built: {:?}",
+        mob.materialized().await
+    );
+}
+
+/// A stood-down mob (its admission closed unconditionally, as a host's
+/// stand-down closes it) answers `NotOwned` for its Dormant members'
+/// sessions and wakes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stood_down_mob_answers_not_owned_for_its_dormant_members_sessions() {
+    let mob = CrashedMob::new("closed-owner-stand-down", 2, false, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    let registry = meerkat_core::session_owner_wake::SessionOwnerWakeRegistry::global();
+    for (member, session) in &mob.sessions {
+        assert_eq!(
+            phase_of(&handle, member),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{member}"
+        );
+        assert!(
+            registry.owned(session),
+            "{member}: the running mob routes its Dormant member's session"
+        );
+    }
+    handle
+        .close_admission(crate::MobAdmissionCloseReason::StandDown)
+        .await
+        .expect("stand the mob down");
+    assert_a_closed_mob_answers_not_owned(&mob, &handle, crate::MobAdmissionCloseReason::StandDown)
+        .await;
+}
+
+/// A mob whose last public owner left closes admission the same way, and
+/// answers `NotOwned` for its Dormant members' sessions too.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_mob_whose_last_owner_left_answers_not_owned_for_its_dormant_members_sessions() {
+    let mob = CrashedMob::new("closed-owner-released", 2, false, false).await;
+    let handle = mob.resume(mob.builder()).await;
+    assert!(handle.is_public_owner());
+    let observer = handle.observer();
+    let mut closed = observer.admission_closed();
+    drop(handle);
+    tokio::time::timeout(LAZY_STEP, closed.wait_for(Option::is_some))
+        .await
+        .expect("the last owner's release closes admission")
+        .expect("the admission watch stays open");
+    assert_a_closed_mob_answers_not_owned(
+        &mob,
+        &observer,
+        crate::MobAdmissionCloseReason::LastOwnerReleased,
+    )
+    .await;
+}
