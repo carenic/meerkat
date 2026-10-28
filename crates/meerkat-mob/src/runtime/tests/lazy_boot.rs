@@ -21,6 +21,22 @@ fn turn_driven(identity: &AgentIdentity) -> SpawnMemberSpec {
     spec
 }
 
+/// `sample_definition` with an externally addressable worker. A delivery
+/// through a member handle (`MemberHandle::send`) is External-origin work,
+/// which MobMachine refuses for a member whose profile is not externally
+/// addressable, Dormant or Live.
+fn addressable_worker_definition() -> MobDefinition {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .expect("inline worker profile")
+        .external_addressable = true;
+    definition
+}
+
 fn phase_of(
     handle: &MobHandle,
     identity: &AgentIdentity,
@@ -136,7 +152,16 @@ impl CrashedMob {
 /// exactly that member, on its own session.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_crash_path_start_materializes_no_member_and_one_delivery_wakes_one() {
-    let mob = CrashedMob::new("lazy-crash-start", 6, false, false).await;
+    // The host delivery below goes through a member handle: the worker is
+    // externally addressable.
+    let mob = CrashedMob::with_definition(
+        addressable_worker_definition(),
+        "lazy-crash-start",
+        6,
+        false,
+        false,
+    )
+    .await;
     let handle = mob.resume(mob.builder()).await;
     assert!(
         mob.materialized().await.is_empty(),
@@ -456,6 +481,10 @@ async fn the_eager_policy_materializes_every_member() {
                 .with_member_restore_policy(MemberRestorePolicy::Eager),
         )
         .await;
+    // The boot set's readiness settles its Waking members Live before the
+    // actor serves its first command: one round trip reads the phases after
+    // it.
+    assert_eq!(handle.status().await.unwrap(), MobState::Running);
     let mut materialized = mob.materialized().await;
     materialized.sort();
     let mut expected = mob
@@ -661,13 +690,12 @@ async fn external_peer_wiring_of_a_dormant_member_wakes_nothing() {
         .count();
     assert_eq!((wired, unwired), (2, 1), "each verb is journaled once");
 
-    handle
-        .member(&member)
+    // Wake the member (its first touch is the wake alone: the worker is not
+    // externally addressable, so a member-handle delivery would be refused).
+    tokio::time::timeout(LAZY_STEP, handle.ensure_member_live(&member))
         .await
-        .expect("a member handle")
-        .send("first touch", HandlingMode::Queue)
-        .await
-        .expect("the delivery wakes the member and is accepted");
+        .expect("the wake answers")
+        .expect("the wake makes the member live");
     assert_eq!(
         phase_of(&handle, &member),
         Some(dsl::MemberMaterializationPhase::Live)
@@ -1534,8 +1562,11 @@ async fn a_fresh_seat_on_a_service_without_durable_sessions_is_created_at_its_fi
     let service = Arc::new(MockSessionService::new());
     let _adapter = service.enable_runtime_adapter();
     service.keep_no_durable_sessions();
+    // A mob over a service without the persistent-session contract is
+    // created only on the ephemeral-sessions opt-in.
     let handle = MobBuilder::new(definition, MobStorage::in_memory())
         .with_session_service(service.clone())
+        .allow_ephemeral_sessions(true)
         .with_member_comms_identity_root(keys.path())
         .create()
         .await
@@ -2306,10 +2337,12 @@ async fn a_rotation_interrupted_after_its_retirement_started_completes_on_redriv
 /// A member whose comms runtime is missing at start fails alone; the mob
 /// starts Running and every other member is live. The failed member's
 /// outcome is its own, typed: Broken with the readiness failure as its
-/// error, not live.
+/// error, not live. The failing member is wired (to worker 0), so its start
+/// needs its comms runtime: an unwired turn-driven member needs no comms
+/// drain, and its missing runtime would not matter.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_member_whose_comms_runtime_is_missing_at_start_fails_alone() {
-    let mob = CrashedMob::new("missing-comms", 3, false, false).await;
+    let mob = CrashedMob::new("missing-comms", 3, true, false).await;
     mob.service.set_missing_comms_runtime(&mob.session(1)).await;
     let handle = mob
         .resume(
@@ -3270,6 +3303,10 @@ async fn a_boot_restore_hands_the_build_preparer_the_mobs_own_read_view() {
         vec![Ok(crate::MemberIdentityManagement::CommandDriven)],
         "the boot restore's one preparation read who manages the member's identity, answered"
     );
+    // The boot restore leaves the member Waking; its readiness settles it
+    // Live before the actor serves its first command: one round trip reads
+    // the phase after it.
+    assert_eq!(resumed.status().await.unwrap(), MobState::Running);
     assert_eq!(
         phase_of(&resumed, &member),
         Some(dsl::MemberMaterializationPhase::Live)
