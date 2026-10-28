@@ -264,8 +264,9 @@ impl Keypair {
     /// place as `identity.key`, which fails when a key is there already;
     /// where the file system cannot hard-link, `identity.key` is created
     /// exclusively instead. A call that finds a key stored first loads that
-    /// key instead of its own. The key file is readable by its owner only on
-    /// Unix (mode `0600`), as [`Self::save`] writes it.
+    /// key instead of its own, waiting a moment for one another call is
+    /// still writing. The key file is readable by its owner only on Unix
+    /// (mode `0600`), as [`Self::save`] writes it.
     #[cfg(not(target_arch = "wasm32"))]
     pub async fn load_or_generate(dir: &Path) -> Result<Self, IdentityError> {
         let key_path = dir.join("identity.key");
@@ -326,14 +327,16 @@ enum KeyFileCreation {
 
 /// Store `secret` as `dir`'s `identity.key` unless a key is stored there
 /// already. A stored key is never replaced, and never read half written:
-/// the key is written and synced to a temporary file in `dir`, which is
-/// hard-linked to `identity.key` (a link fails when that name exists) and
-/// then removed, on every path. Where the file system cannot hard-link (FAT
-/// and exFAT volumes, some network shares), `identity.key` is created
-/// exclusively (`create_new`) and written instead, with the same outcome:
-/// the first key stays and every later store is told so. The key file is
-/// readable by its owner only on Unix (mode `0600`), as [`Keypair::save`]
-/// writes it.
+/// the key is written to a temporary file in `dir`, which is hard-linked to
+/// `identity.key` (a link fails when that name exists) and then removed, on
+/// every path. Where the file system cannot hard-link (FAT and exFAT
+/// volumes, some network shares), `identity.key` is created exclusively
+/// (`create_new`) and written instead, with the same outcome: the first key
+/// stays and every later store is told so. The files are created readable by
+/// their owner only on Unix (mode `0600`, which the umask can only narrow),
+/// and the stored key is then set to exactly `0600`, as [`Keypair::save`]
+/// sets it; a failure to set it is reported and the key stays stored, as
+/// with `save`. Nothing is synced, as `save` syncs nothing.
 #[cfg(not(target_arch = "wasm32"))]
 fn store_new_key(
     dir: &Path,
@@ -350,19 +353,25 @@ fn store_new_key(
     let linked = link(&temporary.0, &key_path);
     drop(temporary);
     match linked {
-        Ok(()) => Ok(KeyFileCreation::Created),
+        Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            Ok(KeyFileCreation::AlreadyStored)
+            return Ok(KeyFileCreation::AlreadyStored);
         }
         // No hard link here: create the key file exclusively.
         Err(_) => match write_new_private_file(&key_path, secret) {
-            Ok(()) => Ok(KeyFileCreation::Created),
+            Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                Ok(KeyFileCreation::AlreadyStored)
+                return Ok(KeyFileCreation::AlreadyStored);
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         },
     }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(KeyFileCreation::Created)
 }
 
 /// The hard link [`store_new_key`] stores a key with.
@@ -371,9 +380,10 @@ fn hard_link_key(temporary: &Path, key: &Path) -> std::io::Result<()> {
     std::fs::hard_link(temporary, key)
 }
 
-/// Create `path`, never an existing file, holding `bytes`, synced, and
-/// readable by its owner only on Unix (mode `0600`). A file this created but
-/// could not write is removed.
+/// Create `path`, never an existing file, holding `bytes`, readable by its
+/// owner only on Unix (mode `0600`, which the umask can only narrow). A file
+/// this created but could not write whole is removed: its bytes are short,
+/// so no reader took them as a key. Once they are written it stays.
 #[cfg(not(target_arch = "wasm32"))]
 fn write_new_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
@@ -382,20 +392,12 @@ fn write_new_private_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     #[cfg(unix)]
     std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
     let mut file = options.open(path)?;
-    let written = file.write_all(bytes).and_then(|()| {
-        // Exactly 0600 whatever the umask, as `Keypair::save` sets it.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
-        }
-        file.sync_all()
-    });
-    if written.is_err() {
+    if let Err(error) = file.write_all(bytes) {
         drop(file);
         remove_key_file(path);
+        return Err(error);
     }
-    written
+    Ok(())
 }
 
 /// A temporary key file of [`store_new_key`], removed when dropped.
@@ -672,6 +674,38 @@ mod tests {
                 assert_eq!(key_dir_entries(&dir), ["identity.key"]);
             }
         }
+    }
+
+    /// A key file that exists before its bytes do (where the file system
+    /// cannot hard-link, the exclusive create makes it empty first) is
+    /// waited for: written whole a moment later, it is the key loaded. One
+    /// that stays empty fails with its short length once the bounded wait
+    /// is over, and is not replaced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn test_keypair_load_or_generate_waits_for_a_key_still_being_written() {
+        let tmp = TempDir::new().unwrap();
+        let key_path = tmp.path().join("identity.key");
+        std::fs::File::create(&key_path).unwrap();
+        let secret = Keypair::generate().secret_bytes();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+            std::fs::write(&key_path, secret).unwrap();
+        });
+        let loaded = Keypair::load_or_generate(tmp.path()).await.unwrap();
+        writer.join().unwrap();
+        assert_eq!(loaded.secret_bytes(), secret);
+
+        let empty = TempDir::new().unwrap();
+        std::fs::File::create(empty.path().join("identity.key")).unwrap();
+        let error = Keypair::load_or_generate(empty.path()).await.unwrap_err();
+        assert!(
+            matches!(error, IdentityError::InvalidKeyLength { actual: 0, .. }),
+            "{error:?}"
+        );
+        assert_eq!(
+            std::fs::read(empty.path().join("identity.key")).unwrap(),
+            Vec::<u8>::new()
+        );
     }
 
     // Phase 1: Security tests

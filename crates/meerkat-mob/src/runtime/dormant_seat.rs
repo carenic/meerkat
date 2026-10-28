@@ -625,11 +625,13 @@ pub(in crate::runtime) async fn prepare_dormant_seat(
 /// The public key of a member session's stored comms identity, and whether
 /// this read minted it: one local key-store read, no session load. With
 /// `mint`, an identity that does not exist yet is generated where the
-/// session's builds load it, as a build does (`load_or_generate`). Without it
-/// the identity must exist: this mob recorded the session's endpoint, peers
-/// trust that key, and a missing one means the configured root is not the
-/// session service's or the key was lost, so the seat is refused typed
-/// instead of minting a key those peers would not know.
+/// session's builds load it, as a build does, and one that exists is loaded
+/// the same way (`load_or_generate`, which waits a moment for a key another
+/// seat of the session is still writing). Without it the identity must
+/// exist: this mob recorded the session's endpoint, peers trust that key,
+/// and a missing one means the configured root is not the session service's
+/// or the key was lost, so the seat is refused typed instead of minting a
+/// key those peers would not know.
 #[cfg(not(target_arch = "wasm32"))]
 async fn stored_member_comms_key(
     identity_root: &std::path::Path,
@@ -644,10 +646,10 @@ async fn stored_member_comms_key(
                 "the comms identity of session '{session_id}' could not be read: {error}"
             ))
         })?;
-    let loaded = if exists {
-        meerkat_comms::Keypair::load(&dir).await
-    } else if mint {
+    let loaded = if mint {
         meerkat_comms::Keypair::load_or_generate(&dir).await
+    } else if exists {
+        meerkat_comms::Keypair::load(&dir).await
     } else {
         return Err(MobError::WiringError(format!(
             "session '{session_id}' has no comms identity under the configured member \
