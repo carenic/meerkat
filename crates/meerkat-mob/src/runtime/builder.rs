@@ -11795,7 +11795,11 @@ pub(super) enum MemberRestoreProvisionOutcome {
     /// this provision built it (the build answered the session identity
     /// already active, and the session is live): nothing was provisioned,
     /// and the member is kept on the registration that live session holds,
-    /// as a warm revival keeps it.
+    /// as a warm revival keeps it. Defensive: unreachable while each member
+    /// has one open wake attempt and its effect lane holds a new restore
+    /// behind the member's earlier wake, reload and retirement steps; kept
+    /// so that a session live on its own registration is adopted, not
+    /// rebuilt, should that change.
     AlreadyLive { bridge_session_id: SessionId },
     /// The member's session was created fresh: a nonpersistent service
     /// recreated it, or (`seat_session`) the member's first materialization
