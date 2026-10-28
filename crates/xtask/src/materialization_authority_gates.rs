@@ -254,6 +254,16 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
         "plan_member_wake",
         "the wake path's own live observation (as begin_member_live_revival): inside the authorized attempt, a session actor or successor still live in this process is kept, never built twice",
     ),
+    settled(
+        "crates/meerkat-mob/src/runtime/actor/member_wake.rs",
+        "member_materialization_served",
+        "the drift observation, taken again on the actor: a member MobMachine holds Live is answered ready while its registration serves it (an executor and a live session actor); otherwise the miss goes to the drift arm (ClassifyMemberLiveMaterialization), whose verdict decides",
+    ),
+    settled(
+        "crates/meerkat-mob/src/runtime/actor.rs",
+        "serving_member_binding_registry",
+        "explicit-resume lift mechanics: the operation registry of a registration that already serves the member's exact binding is reused only while its session actor is present, else the full restore runs; no residency is decided",
+    ),
     pending(
         "crates/meerkat-mob/src/runtime/actor.rs",
         "realize_restored_member_operation_binding",
