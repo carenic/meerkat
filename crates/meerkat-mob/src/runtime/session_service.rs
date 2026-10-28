@@ -1304,6 +1304,15 @@ pub(crate) fn provisional_tail_stands_unforwarded(
 pub trait MobSessionService:
     SessionServiceCommsExt + SessionServiceControlExt + SessionServiceHistoryExt
 {
+    /// Test seam: the root of the members' session-scoped comms identities
+    /// the mob seats with ([`super::MobBuilder::with_member_comms_identity_root`]).
+    /// A test double that builds members' comms runtimes keys each one from
+    /// its session's key pair there, as the agent factory does, so a seat's
+    /// recorded endpoint and its member's first build agree. Every other
+    /// service ignores it.
+    #[cfg(test)]
+    fn bind_member_comms_identity_root_for_test(&self, _identity_root: &std::path::Path) {}
+
     /// Wait until every actor removed for `session_id` has exited. An
     /// ordinary removed-actor exit joins the release of what its agent owned
     /// (its MCP router's own surface lineages); an aborted or panicked one
