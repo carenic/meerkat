@@ -235,6 +235,16 @@ impl StepOriginals {
     fn release(&self) {
         drop(self.release.lock().expect("step gate").take());
     }
+
+    /// Report the step in flight and hold it here until released.
+    fn hold(&self) {
+        self.in_flight.notify_one();
+        let gate = self.gate.lock().expect("step gate").take();
+        if let Some(gate) = gate {
+            // Released, or the sender dropped: `recv` returns either way.
+            let _ = gate.recv();
+        }
+    }
 }
 impl AuthenticatedOriginalSource for StepOriginals {
     fn authenticated_original(
@@ -260,12 +270,7 @@ impl AuthenticatedOriginalSource for StepOriginals {
         _: &OriginalWorkRef,
     ) -> Result<OriginalDisposition, ControllerReadinessFailure> {
         if self.armed.swap(false, Ordering::SeqCst) {
-            self.in_flight.notify_one();
-            let gate = self.gate.lock().expect("step gate").take();
-            if let Some(gate) = gate {
-                // Released, or the sender dropped: `recv` returns either way.
-                let _ = gate.recv();
-            }
+            self.hold();
         }
         Ok(OriginalDisposition::Active)
     }
@@ -313,6 +318,23 @@ struct HelperSteps {
     retried: Result<ChildGrantOutcome, HelperChildIssuanceRefusal>,
 }
 
+/// What a held helper worker answered once it was released.
+#[derive(Debug, PartialEq)]
+enum HeldStepAnswer {
+    /// The helper fence's commit: whether it created the item, and the
+    /// fence's own refusal.
+    Fence {
+        created: bool,
+        refusal: Option<HelperAdmissionRefusal>,
+    },
+    /// A core step whose operation is the item's commit: whether it created
+    /// the item, and the step's own answer.
+    Step {
+        created: bool,
+        answer: Result<(), ToolError>,
+    },
+}
+
 /// What the consented leaf does after its single consuming entry.
 enum LeafMode {
     /// Admit the helper item, issue every intent's child, then retry the
@@ -321,6 +343,13 @@ enum LeafMode {
     /// Admit the helper item from a worker thread, whose step the test holds
     /// in flight, and wait for that worker.
     Blocked,
+    /// Commit the helper item from a worker thread as the operation of one
+    /// core step of the entered operation, which is the helper fence's own
+    /// commit path, and wait for that worker. The test holds the step: armed,
+    /// on its first original read inside the work owners' exclusion, before
+    /// their in-exclusion re-check; otherwise at the start of its operation,
+    /// past that re-check.
+    CommitStep,
 }
 
 /// The consented tool's effect leaf: it consumes review at its entry, makes
@@ -333,7 +362,7 @@ struct EnteredLeaf {
     bodies: AtomicUsize,
     steps: Mutex<Vec<HelperSteps>>,
     witness: Mutex<Option<EnteredDispatchOperation>>,
-    worker: Mutex<Option<std::thread::JoinHandle<(bool, Option<HelperAdmissionRefusal>)>>>,
+    worker: Mutex<Option<std::thread::JoinHandle<HeldStepAnswer>>>,
 }
 
 impl EnteredLeaf {
@@ -441,11 +470,44 @@ impl AgentToolDispatcher for EnteredLeaf {
                     let refusal = fence.refusal();
                     drop(fence);
                     let _ = done.send(());
-                    (created, refusal)
+                    HeldStepAnswer::Fence { created, refusal }
                 });
                 *self.worker.lock().expect("helper worker") = Some(worker);
                 // The dispatch waits for its helper publication; the host
                 // cancels the dispatch here, while that step is held.
+                let _ = finished.await;
+            }
+            LeafMode::CommitStep => {
+                *self.witness.lock().expect("witness") = Some(entered.clone());
+                let (key, _) = self.helper_admission();
+                let (done, finished) = tokio::sync::oneshot::channel();
+                let graph = self.graph.clone();
+                let originals = Arc::clone(&self.originals);
+                let runtime = tokio::runtime::Handle::current();
+                let worker = std::thread::spawn(move || {
+                    let further = FurtherOriginals {
+                        originals: no_contributors(),
+                        source: Arc::new(SourceOriginalBasis::new(originals.clone())),
+                    };
+                    let mut created = false;
+                    // The step's operation is the item's commit, as in the
+                    // fence: it runs past the work owners' in-exclusion
+                    // re-check, and the test may hold it there.
+                    let answer = entered.run_if_current_within(&further, &mut || {
+                        originals.hold();
+                        created = matches!(
+                            runtime
+                                .block_on(graph.create_idempotent(key.clone(), helper_request())),
+                            Ok(meerkat::WorkAdmissionOutcome::Created(_))
+                        );
+                    });
+                    drop(entered);
+                    let _ = done.send(());
+                    HeldStepAnswer::Step { created, answer }
+                });
+                *self.worker.lock().expect("helper worker") = Some(worker);
+                // The dispatch waits for its helper commit; the host cancels
+                // the dispatch here, while that commit is held.
                 let _ = finished.await;
             }
         }
@@ -892,7 +954,7 @@ async fn a_cancelled_consented_dispatch_keeps_its_review_in_use_until_its_held_s
         .expect("helper worker")
         .take()
         .expect("the entry started its helper worker");
-    let (created, refusal) = tokio::time::timeout(
+    let answer = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::task::spawn_blocking(move || worker.join()),
     )
@@ -900,8 +962,14 @@ async fn a_cancelled_consented_dispatch_keeps_its_review_in_use_until_its_held_s
     .expect("the helper worker finishes")
     .expect("join task")
     .expect("helper worker");
-    assert!(created, "the in-flight step committed its helper item");
-    assert_eq!(refusal, None);
+    assert_eq!(
+        answer,
+        HeldStepAnswer::Fence {
+            created: true,
+            refusal: None,
+        },
+        "the in-flight step committed its helper item"
+    );
 
     // Released at its last step's finish, the attempt admits no step either.
     let mut ran_after_release = false;
@@ -1057,18 +1125,47 @@ impl LlmClient for ReviewedReadProvider {
     }
 }
 
+/// Where the held step of the reviewed run waits. Its operation is the
+/// helper item's commit, as in the helper fence.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum HeldAt {
+    /// On its first original read inside the work owners' exclusion: before
+    /// their in-exclusion re-check, which reads the run's native
+    /// accepted-work custody again.
+    BeforeTheRecheck,
+    /// At the start of its operation, the item's commit: past that re-check.
+    InsideItsCommit,
+}
+
 /// A model-reviewed (R2) call in a real native run enters with
-/// `enter_governed_operation` and hands its helper WorkGraph admission to a
-/// worker, whose step is held in flight. The run is cancelled meanwhile.
-/// While the step is still held: the run reaches its cancelled terminal
-/// within a bound; a step started after the cancellation is refused and
-/// commits nothing (MalformedFacts at core once the runtime applied the
-/// cancellation, with no not-dispatched certificate; Denied at the helpers);
-/// and no Used is reported. Once the gate opens, the held commit lands and
+/// `enter_governed_operation` and hands a helper step to a worker, whose step
+/// is held in flight before the work owners' in-exclusion re-check. The run
+/// is cancelled meanwhile. While the step is still held: the run reaches its
+/// cancelled terminal within a bound; a step started after the cancellation
+/// is refused and commits nothing (MalformedFacts at core once the runtime
+/// applied the cancellation, with no not-dispatched certificate; Denied at
+/// the helpers); and no Used is reported. Once the gate opens, the held step
+/// re-reads the run's custody inside the exclusion and is refused too
+/// (MalformedFacts, with no not-dispatched certificate): it commits nothing.
 /// Used is reported exactly once, after the worker's last witness clone
 /// drops.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
+    cancelled_reviewed_run_with_a_held_step(HeldAt::BeforeTheRecheck).await;
+}
+
+/// The same run, with the held step past its in-exclusion re-check, at the
+/// start of its operation, the item's commit: the cancelled terminal still
+/// arrives within the bound, later steps are refused and no Used is reported
+/// while it is held; once the gate opens the held commit answers Created,
+/// and Used is reported exactly once, after the worker's last witness clone
+/// drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_reviewed_run_keeps_the_commit_of_a_step_past_its_recheck() {
+    cancelled_reviewed_run_with_a_held_step(HeldAt::InsideItsCommit).await;
+}
+
+async fn cancelled_reviewed_run_with_a_held_step(held: HeldAt) {
     let grants = Arc::new(
         LocalGrantAuthority::new(
             LocalGrantConfiguration {
@@ -1148,7 +1245,7 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
     let originals = Arc::new(StepOriginals::new());
     let _release = ReleaseOnDrop(Arc::clone(&originals));
     let leaf = Arc::new(EnteredLeaf {
-        mode: LeafMode::Blocked,
+        mode: LeafMode::CommitStep,
         graph: meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new())),
         originals: Arc::clone(&originals),
         bodies: AtomicUsize::new(0),
@@ -1235,8 +1332,12 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
         .expect("exact finalized input binding");
 
     // The helper step the leaf hands to its worker is held inside the work
-    // owners' exclusion, after the review owner admitted it.
-    originals.armed.store(true, Ordering::SeqCst);
+    // owners' exclusion, after the review owner admitted it: on its first
+    // original read (before the in-exclusion re-check), or inside its commit
+    // (past it).
+    if held == HeldAt::BeforeTheRecheck {
+        originals.armed.store(true, Ordering::SeqCst);
+    }
     let (_, completion) = machine
         .accept_input_with_completion(&session_id, input)
         .await
@@ -1296,8 +1397,8 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
     assert!(!ran, "the refused step ran nothing");
     let error = refused.expect_err("refused");
     assert_eq!(error.to_error_payload()["data"]["tool_invoked"], "unknown");
-    // The held step keeps its own graph's write lock: the late admission
-    // goes to a graph of its own.
+    // The late admission goes to a graph of its own: the leaf's graph is the
+    // held step's alone.
     let late_graph = meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
     let late_key = meerkat::WorkAdmissionKey::new("helper-after-the-cancellation").expect("key");
     let late_admission = late_graph
@@ -1358,8 +1459,8 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
         "the held worker keeps the entered custody"
     );
 
-    // The gate opens: the held step completes and commits its item, and the
-    // worker's last witness clone releases the entered custody.
+    // The gate opens: the held step goes on, and the worker's last witness
+    // clone releases the entered custody.
     originals.release();
     let worker = leaf
         .worker
@@ -1367,7 +1468,7 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
         .expect("helper worker")
         .take()
         .expect("the entry started its helper worker");
-    let (committed, refusal) = tokio::time::timeout(
+    let answer = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::task::spawn_blocking(move || worker.join()),
     )
@@ -1375,20 +1476,55 @@ async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
     .expect("the helper worker finishes")
     .expect("join task")
     .expect("helper worker");
-    assert!(committed, "the held commit answers Created");
-    assert_eq!(refusal, None);
-    assert_eq!(
-        leaf.graph
-            .list(meerkat::WorkItemFilter {
-                include_terminal: true,
-                ..Default::default()
-            })
-            .await
-            .expect("list")
-            .len(),
-        1,
-        "exactly the held step's item"
-    );
+    let items = leaf
+        .graph
+        .list(meerkat::WorkItemFilter {
+            include_terminal: true,
+            ..Default::default()
+        })
+        .await
+        .expect("list")
+        .len();
+    match held {
+        HeldAt::BeforeTheRecheck => {
+            // Held before its in-exclusion re-check: the work owners then
+            // read the run's native accepted-work custody again, which the
+            // cancellation ended, and refuse (MalformedFacts; the helper
+            // fence answers Denied for it, as the late admission above). The
+            // step commits nothing.
+            let (committed, answer) = match answer {
+                HeldStepAnswer::Step { created, answer } => (created, answer),
+                other => panic!("the held worker runs a core step: {other:?}"),
+            };
+            match &answer {
+                Err(ToolError::AuthorizationRefused { refusal }) => {
+                    assert_eq!(
+                        refusal.kind(),
+                        OperationRefusalKind::MalformedFacts,
+                        "the re-check inside the exclusion refuses the ended run"
+                    );
+                    assert_eq!(refusal.dispatch(), RefusalDispatch::Unknown);
+                }
+                other => panic!("the held step is refused at its re-check: {other:?}"),
+            }
+            let error = answer.expect_err("refused");
+            assert_eq!(error.to_error_payload()["data"]["tool_invoked"], "unknown");
+            assert!(!committed, "the refused step committed nothing");
+            assert_eq!(items, 0, "the leaf's graph is empty");
+        }
+        HeldAt::InsideItsCommit => {
+            // Past its re-check, the held commit keeps its effect.
+            assert_eq!(
+                answer,
+                HeldStepAnswer::Step {
+                    created: true,
+                    answer: Ok(()),
+                },
+                "the held commit answers Created"
+            );
+            assert_eq!(items, 1, "exactly the held step's item");
+        }
+    }
     assert_eq!(
         observer.used(REVIEWED_CALL),
         1,
