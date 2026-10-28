@@ -32078,6 +32078,194 @@ async fn assert_restored_child_built_as_its_source(
     );
 }
 
+/// The lift of a stopped mob that materializes one member at a time reaches a
+/// fork child's source before the child, though the child's identity sorts
+/// first: the child is built with the overlay its source is rebuilt with.
+///
+/// RED before the fix: the plan reached the child first, alone in its round,
+/// and the child's rebuild found no overlay held for its source, so it was
+/// built with none.
+#[tokio::test]
+async fn fork_child_lifted_one_member_at_a_time_is_built_as_its_source() {
+    let (service, storage, source_identity, child_identity, first, expected_source) =
+        seat_fork_child_then_crash(true).await;
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
+        .with_resume_restore_concurrency(1)
+        .resume()
+        .await
+        .expect("resume");
+    resumed
+        .resume()
+        .await
+        .expect("the lift rebuilds the stopped members one at a time");
+    assert_restored_child_built_as_its_source(
+        &service,
+        &resumed,
+        &source_identity,
+        &child_identity,
+        &first,
+        &expected_source,
+    )
+    .await;
+}
+
+/// A grandchild (forked from a fork child, its identity sorting before both
+/// the child's and the root source's) that the lift of a stopped mob reaches
+/// one member at a time is built with its root source's overlay, as the
+/// child is.
+///
+/// RED before the fix: the plan reached the grandchild first, alone in its
+/// round, and its rebuild found no overlay held for the child, so it was
+/// built with none.
+#[tokio::test]
+async fn grandchild_lifted_one_member_at_a_time_is_built_as_its_root_source() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let restart_storage = MobStorage::with_events_and_runtime_metadata(
+        storage.events.clone(),
+        storage.runtime_metadata.clone(),
+    );
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let source_identity = AgentIdentity::from("zz-lift-root-source");
+    let source_session = spawn_fork_source_with_build_inputs(&handle, &source_identity).await;
+    let child_identity = AgentIdentity::from("mm-lift-child");
+    let mut child = SpawnMemberSpec::new(ProfileName::from("worker"), child_identity.clone());
+    child.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let child_fork = handle
+        .fork_member(&source_identity, child, None)
+        .await
+        .expect("fork the child");
+    wait_for_fork_source_settled(&handle, &child_fork.session_id).await;
+    let grandchild_identity = AgentIdentity::from("aa-lift-grandchild");
+    let mut grandchild =
+        SpawnMemberSpec::new(ProfileName::from("worker"), grandchild_identity.clone());
+    grandchild.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let grandchild_fork = handle
+        .fork_member(&child_identity, grandchild, None)
+        .await
+        .expect("fork the grandchild from the child");
+    handle.stop().await.expect("stop");
+    for session in [
+        &source_session,
+        &child_fork.session_id,
+        &grandchild_fork.session_id,
+    ] {
+        MobSessionService::discard_live_session(service.as_ref(), session)
+            .await
+            .expect("discard live session");
+    }
+    crash_stop_and_release_routes(handle).await;
+    let resumed = MobBuilder::for_resume(restart_storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
+        .with_resume_restore_concurrency(1)
+        .resume()
+        .await
+        .expect("resume");
+    resumed
+        .resume()
+        .await
+        .expect("the lift rebuilds the stopped members one at a time");
+
+    let source_build = last_member_build(&service, &source_identity).await;
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            source_build
+                .external_tool_names
+                .iter()
+                .any(|name| name == tool),
+            "the restored source carries its re-supplied overlay tool '{tool}'"
+        );
+    }
+    assert_eq!(
+        last_member_build(&service, &child_identity)
+            .await
+            .external_tool_names,
+        source_build.external_tool_names,
+        "the child is rebuilt with its source's tools"
+    );
+    assert_eq!(
+        last_member_build(&service, &grandchild_identity)
+            .await
+            .external_tool_names,
+        source_build.external_tool_names,
+        "the grandchild is rebuilt with its root source's tools"
+    );
+}
+
+/// A fork child the lift of a stopped mob rebuilds while its source stays
+/// Dormant (the host requires only the child) follows the overlay its source
+/// would be rebuilt with: the lift resolves it from the source's own rebuild
+/// request, and the source is neither rebuilt nor woken for it.
+///
+/// RED before the fix: the child's rebuild found no overlay held for its
+/// source and was built with none.
+#[tokio::test]
+async fn fork_child_lifted_while_its_source_stays_dormant_is_built_as_its_source() {
+    let (service, storage, source_identity, child_identity, first, expected_source) =
+        seat_fork_child_then_crash(true).await;
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .with_member_restore_policy(MemberRestorePolicy::OnDemand)
+        .with_host_required_members([child_identity.clone()])
+        .resume()
+        .await
+        .expect("resume");
+    let source_builds = member_build_count(&service, &source_identity).await;
+    resumed
+        .resume()
+        .await
+        .expect("the lift rebuilds the child the host requires");
+    assert_eq!(
+        resumed.member_materialization_for_test(&child_identity),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "the lift rebuilt the child"
+    );
+    assert_eq!(
+        resumed.member_materialization_for_test(&source_identity),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant),
+        "the source stays Dormant"
+    );
+    assert_eq!(
+        member_build_count(&service, &source_identity).await,
+        source_builds,
+        "the source is not rebuilt for its fork"
+    );
+    let rebuilt = last_member_build(&service, &child_identity).await;
+    assert_rebuilt_as_first_build(&first, &rebuilt, &expected_source);
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            rebuilt.external_tool_names.iter().any(|name| name == tool),
+            "the child carries the overlay its source would be rebuilt with ('{tool}'): {:?}",
+            rebuilt.external_tool_names
+        );
+    }
+    assert!(
+        !rebuilt
+            .external_tool_names
+            .iter()
+            .any(|name| name == GENERIC_RESUME_OVERLAY_TOOL),
+        "the child is not given the host's overlay for its own identity: {:?}",
+        rebuilt.external_tool_names
+    );
+}
+
 /// Regression (inheritance lost on rebuild), explicit resume: a stopped mob
 /// restored after a restart rebuilt a seated fork child with no fork source,
 /// no context and the customizer's overlay for the child's own identity.

@@ -701,3 +701,72 @@ async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lif
         "the member's owed retry materializes it once the host prepares its build"
     );
 }
+
+/// A fork child the lift rebuilds in the same round as its source, whose
+/// source the host asks to prepare later, is still built with the overlay
+/// its source would be rebuilt with: the lift resolved it from the source's
+/// own rebuild request while preparing the child, so the source's deferral
+/// does not leave the child without it. The lift answers the source's typed
+/// retryable refusal.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_fork_child_whose_source_the_host_defers_is_built_as_its_source() {
+    let (service, storage, source_identity, child_identity, first, expected_source) =
+        seat_fork_child_then_crash(true).await;
+    let preparer = Arc::new(PreparesLaterOnce {
+        member: source_identity.clone(),
+        asked: AtomicBool::new(false),
+    });
+    let resumed = tokio::time::timeout(
+        ROW_STEP,
+        Box::pin(
+            MobBuilder::for_resume(storage)
+                .with_session_service(service.clone())
+                .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+                    source: source_identity.clone(),
+                }))
+                .with_member_restore_policy(MemberRestorePolicy::Eager)
+                .with_member_build_preparer(preparer)
+                .resume(),
+        ),
+    )
+    .await
+    .expect("the reconstruction answers")
+    .expect("the reconstruction succeeds");
+
+    let error = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers")
+        .expect_err("the lift answers the source's deferral");
+    assert!(
+        matches!(
+            shared_cause(&error),
+            MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::HostPreparationPending,
+                ..
+            }
+        ),
+        "the typed retryable refusal: {error:?}"
+    );
+    assert_eq!(
+        phase_of(&resumed, &child_identity),
+        Some(dsl::MemberMaterializationPhase::Live),
+        "the child is rebuilt in its source's round"
+    );
+    let rebuilt = last_member_build(&service, &child_identity).await;
+    assert_rebuilt_as_first_build(&first, &rebuilt, &expected_source);
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            rebuilt.external_tool_names.iter().any(|name| name == tool),
+            "the child carries the overlay its source would be rebuilt with ('{tool}'): {:?}",
+            rebuilt.external_tool_names
+        );
+    }
+    assert!(
+        !rebuilt
+            .external_tool_names
+            .iter()
+            .any(|name| name == GENERIC_RESUME_OVERLAY_TOOL),
+        "the child is not given the host's overlay for its own identity: {:?}",
+        rebuilt.external_tool_names
+    );
+}

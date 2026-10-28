@@ -8732,6 +8732,11 @@ pub(super) struct ExplicitResumeMemberRebuild {
     /// next registration (`HoldUntilReleased`): a rebuild that is not
     /// accepted removes it, as no registration will apply it.
     build_hold_staged: bool,
+    /// For a fork the lift rebuilds that follows its source, the overlay the
+    /// lift's preparation resolved from the source's chain, which the fork
+    /// takes when its source holds no overlay in this process by then
+    /// (`None` for every other rebuild).
+    followed_overlay: Option<super::fork_build::PreparedFollowedOverlay>,
 }
 
 struct ExplicitResumePreparationContext {
@@ -21935,6 +21940,7 @@ impl ExplicitResumePreparationContext {
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
                     build_hold_staged: false,
+                    followed_overlay: None,
                 });
                 continue;
             }
@@ -21998,6 +22004,7 @@ impl ExplicitResumePreparationContext {
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
                     build_hold_staged: false,
+                    followed_overlay: None,
                 });
                 continue;
             };
@@ -22103,6 +22110,7 @@ impl ExplicitResumePreparationContext {
                 superseded_session_id: Some(session_id),
                 recovered_peer_endpoint,
                 build_hold_staged: false,
+                followed_overlay: None,
             });
         }
         Ok(rebuild)
@@ -22231,6 +22239,7 @@ impl MobActor {
                 superseded_session_id,
                 recovered_peer_endpoint,
                 build_hold_staged,
+                followed_overlay,
             } = rebuild;
             let dsl_identity = mob_dsl::AgentIdentity::from_domain(
                 &crate::ids::AgentIdentity::from(entry.agent_identity.as_str()),
@@ -22332,7 +22341,12 @@ impl MobActor {
             // rebuilt with) rides the rebuild request and is retained: a later
             // warm revival recomposes it and a fork of the member inherits it.
             let overlay_origin = match self
-                .recustomized_rebuild_overlay(&entry, &bridge_session_id, &restore_spec)
+                .recustomized_rebuild_overlay(
+                    &entry,
+                    &bridge_session_id,
+                    &restore_spec,
+                    followed_overlay.as_ref(),
+                )
                 .await
             {
                 Ok((overlay, origin)) => {
@@ -22406,6 +22420,7 @@ impl MobActor {
                         superseded_session_id,
                         recovered_peer_endpoint,
                         build_hold_staged,
+                        followed_overlay,
                     },
                     attempt,
                     binding,

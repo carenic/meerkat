@@ -136,8 +136,8 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     obligations: super::super::boot_plan::BootObligations,
     /// The orchestrators the lift notifies.
     notified: BTreeSet<AgentIdentity>,
-    /// The members Dormant when the plan started, in identity order, that it
-    /// has not reached yet.
+    /// The members Dormant when the plan started, in identity order with each
+    /// fork after the member it was forked from, that it has not reached yet.
     queue: VecDeque<mob_dsl::AgentIdentity>,
     /// The wakes the plan counts against its bound, by member, with their
     /// attempts: its own, and the ones it watches (`watched`).
@@ -249,8 +249,30 @@ impl MobActor {
             self.notify_orchestrator_on_resume,
             self.dsl_authority.state(),
         );
-        let queue: VecDeque<mob_dsl::AgentIdentity> =
-            super::super::boot_plan::dormant_members(self.dsl_authority.state()).into();
+        // A fork is reached after the member it was forked from, so when the
+        // plan materializes both the source is rebuilt first and the fork
+        // follows the overlay its source is rebuilt with.
+        let queue: VecDeque<mob_dsl::AgentIdentity> = {
+            let roster = self.roster.read().await;
+            let mut seated = Vec::new();
+            let mut unseated = Vec::new();
+            for identity in super::super::boot_plan::dormant_members(self.dsl_authority.state()) {
+                match roster.get(&AgentIdentity::from(identity.0.as_str())) {
+                    Some(entry) => seated.push((identity, entry.clone())),
+                    None => unseated.push(identity),
+                }
+            }
+            super::super::fork_build::order_fork_sources_first(
+                &mut seated,
+                &self.definition.id,
+                |member| &member.1,
+            );
+            seated
+                .into_iter()
+                .map(|(identity, _)| identity)
+                .chain(unseated)
+                .collect()
+        };
         let bound = self.member_residency.verify_concurrency.max(1);
         self.explicit_resume_boot_dispatch = Some(ExplicitResumeBootDispatch {
             resume_attempt,
@@ -913,6 +935,18 @@ impl MobActor {
                 .or_default()
                 .push(candidate);
         }
+        // A fork follows the overlay its source (or the in-mob ancestor its
+        // overlay comes through) holds in this process, or else the one the
+        // rebuild of the member its chain carries the overlay from would
+        // compose, resolved off the actor below: the source is neither rebuilt
+        // nor woken for it. A source rebuilt before the fork, in its round or
+        // earlier, gives the overlay it was rebuilt with instead; the resolved
+        // one covers a source that is not rebuilt (its preparation deferred
+        // or failed, or its rebuild failed before its overlay was composed).
+        let mut followed = BTreeMap::new();
+        for (fork, source) in &sources {
+            followed.insert(fork.clone(), self.followed_source_overlay(source).await);
+        }
         let context = Arc::new(self.explicit_resume_preparation_context());
         // The host's build preparer is a runtime adapter input.
         #[cfg(feature = "runtime-adapter")]
@@ -944,6 +978,7 @@ impl MobActor {
             let rebuilds = unit
                 .into_iter()
                 .map(|(attempt, candidate, wired_peers)| {
+                    let followed = followed.remove(&candidate.0.agent_identity);
                     let context = Arc::clone(&context);
                     let preparer = preparer.clone();
                     let read_handle = read_handle.clone();
@@ -994,6 +1029,22 @@ impl MobActor {
                                 })
                             })
                             .map_err(ExplicitResumeBootMemberUnprepared::Failed);
+                        let rebuild = match (rebuild, followed) {
+                            (Ok(mut rebuild), Some(followed)) => {
+                                rebuild.followed_overlay = Some(
+                                    super::super::fork_build::resolve_followed_source_overlay(
+                                        &context.definition.id,
+                                        context.session_service.as_ref(),
+                                        context.spawn_member_customizer.as_ref(),
+                                        &identity,
+                                        followed,
+                                    )
+                                    .await,
+                                );
+                                Ok(rebuild)
+                            }
+                            (rebuild, _) => rebuild,
+                        };
                         progress.awaiting_member(
                             &identity,
                             super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
