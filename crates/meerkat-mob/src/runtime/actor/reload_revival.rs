@@ -345,7 +345,7 @@ impl MobActor {
         F: std::future::Future<Output = RevivalStep> + MemberEffectSend + 'static,
     {
         let worker_work = Arc::clone(&work);
-        self.dispatch_member_effect(MemberEffectRequest {
+        self.dispatch_member_wake_effect(MemberEffectRequest {
             context,
             members: vec![MemberFence::exact(&work.entry)],
             effects: Box::pin(async move {
@@ -625,7 +625,7 @@ impl MobActor {
                     .await;
                     return;
                 }
-                if !settlement.fence.is_current() {
+                if !settlement.fence.is_current() || !self.warm_revival_attempt_is_open(&work) {
                     self.roll_back_committed_warm_build(work, WarmRollbackThen::NotCurrent)
                         .await;
                     return;
@@ -672,7 +672,7 @@ impl MobActor {
                 peer,
                 result,
             } => {
-                if !settlement.fence.is_current() {
+                if !settlement.fence.is_current() || !self.warm_revival_attempt_is_open(&work) {
                     self.roll_back_committed_warm_build(work, WarmRollbackThen::NotCurrent)
                         .await;
                     return;
@@ -767,6 +767,17 @@ impl MobActor {
                 work.reply(Err(error));
             }
         }
+    }
+
+    /// Whether the revival's attempt is still the member's open attempt. A
+    /// Stop, a Complete or a retirement start closes it; a step that
+    /// returns after that rolls the revival's provision back (as the stale
+    /// verdict of its Ready resolution would) without touching the member's
+    /// topology. A revival that minted no attempt has none to lose.
+    fn warm_revival_attempt_is_open(&self, work: &RevivalWork) -> bool {
+        work.attempt().is_none_or(|attempt| {
+            self.member_wake_attempt_is_open(&work.entry.agent_identity, attempt)
+        })
     }
 
     /// Apply `ResolveMemberRevivalBound` for the revival's attempt (its

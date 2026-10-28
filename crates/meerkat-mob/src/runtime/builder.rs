@@ -11083,6 +11083,7 @@ impl MobBuilder {
                 member_effect_inflight: super::actor::member_effect_lane::ActorCustody::new(
                     BTreeMap::new(),
                 ),
+                member_wake_effects: tokio::sync::watch::Sender::new(BTreeSet::new()),
                 next_member_effect_ticket: 0,
                 retirements: BTreeMap::new(),
                 stuck_retirements: BTreeMap::new(),

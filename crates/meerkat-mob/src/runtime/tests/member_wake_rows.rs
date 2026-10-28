@@ -1467,6 +1467,340 @@ async fn a_stop_during_a_wake_abandons_the_wake_without_fail_stop() {
     fixture.finish().await;
 }
 
+/// A destroy during a wake waits for the wake's in-flight step: it tears
+/// down the storage and runtime that step works on, so it does not preempt
+/// it as a stop does. Once the held wake finishes, the destroy runs and
+/// leaves no session behind: no live session actor, and no resumable
+/// durable session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destroy_during_a_wake_waits_for_it_and_leaves_no_session_behind() {
+    let fixture = WakeFixture::new("wake-destroy").await;
+    let member = fixture.spawn("destroy-member").await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+
+    let mut destroy = fixture
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Destroy { reply_tx })
+        .await
+        .expect("enqueue the destroy");
+    // The actor reads its commands in order: a status read sent after the
+    // destroy is answered Running only if the destroy was deferred (an
+    // admitted destroy runs first and leaves the mob Destroyed).
+    let status = tokio::time::timeout(STEP, fixture.handle.status())
+        .await
+        .expect("the status answers while the destroy waits")
+        .expect("read the mob's status");
+    assert_eq!(
+        status,
+        MobState::Running,
+        "the destroy waits for the held wake"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Waking),
+        "the wake's attempt is still open"
+    );
+    assert!(
+        matches!(
+            destroy.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the destroy has not answered while the wake is held"
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task joins")
+        .expect("the wake the destroy waited for completes");
+    tokio::time::timeout(WAIT, destroy)
+        .await
+        .expect("the destroy answers once the wake settled")
+        .expect("the destroy's reply")
+        .expect("the mob is destroyed");
+    assert!(
+        !MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .unwrap_or(false),
+        "the destroy leaves no live session actor"
+    );
+    let authority =
+        MobSessionService::observe_session_resume_authority(&*fixture.service, &session)
+            .await
+            .expect("read the session's durable authority");
+    let lifecycle = authority.lifecycle();
+    assert!(
+        !matches!(
+            lifecycle,
+            crate::runtime::session_service::SessionResumeLifecycle::Active { .. }
+        ),
+        "the destroy leaves no resumable session: {lifecycle:?}"
+    );
+    fixture.finish().await;
+}
+
+/// A wake that starts while a stop left an earlier wake's step in flight
+/// waits for that step: one effect of a member at a time. The earlier step
+/// returns after the resume, fails its attempt fence and rolls back; only
+/// then does the new wake restore the member, which ends Live on that one
+/// restore (its build is reported once) with its session actor kept.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_wake_after_a_stop_and_resume_waits_for_the_preempted_wakes_step() {
+    let fixture = WakeFixture::new("wake-after-preempted-step").await;
+    let member = fixture.spawn("preempted-step-member").await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let first = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+    tokio::time::timeout(WAIT, fixture.handle.stop())
+        .await
+        .expect("the stop answers")
+        .expect("the stop lands while the first wake is held");
+    let first = tokio::time::timeout(WAIT, first)
+        .await
+        .expect("the first wake answers")
+        .expect("the first wake task joins");
+    assert!(
+        matches!(
+            first,
+            Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::MobNotRunning,
+                ..
+            })
+        ),
+        "the stop ended the first wake: {first:?}"
+    );
+
+    // The resume finishes once the member lane is empty; the mob runs again
+    // before that.
+    let resume = {
+        let handle = fixture.handle.clone();
+        tokio::spawn(async move { handle.resume().await })
+    };
+    tokio::time::timeout(STEP, async {
+        while !matches!(fixture.handle.status().await, Ok(MobState::Running)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the mob runs again");
+    let built_before = fixture.preparer.built().len();
+    let second = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+    // The second wake's restore does not start beside the first wake's step.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        fixture.preparer.prepared_count(),
+        entered + 1,
+        "the second wake's restore waits for the first wake's step"
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, second)
+        .await
+        .expect("the second wake answers")
+        .expect("the second wake task joins")
+        .expect("the second wake makes the member live");
+    tokio::time::timeout(WAIT, resume)
+        .await
+        .expect("the resume answers")
+        .expect("the resume task joins")
+        .expect("the mob resumes");
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Live)
+    );
+    assert!(
+        MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .expect("live session read"),
+        "the member keeps the session actor its wake built"
+    );
+    fixture.preparer.wait_built(built_before + 1).await;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        fixture
+            .preparer
+            .built()
+            .iter()
+            .filter(|report| report.agent_identity == member)
+            .count(),
+        1,
+        "one restore materialized the member and reported its build"
+    );
+    fixture.finish().await;
+}
+
+/// A stop after a cold wake's Bound step (its plan applied, its readiness
+/// held) closes the attempt: the readiness step's late commit fails its
+/// attempt fence and rolls the provision back. The mob stops without a
+/// fail-stop, the member is Dormant, and no live session actor is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_stop_after_a_cold_wakes_bound_step_rolls_its_provision_back() {
+    let fixture = WakeFixture::new("wake-stop-after-bound").await;
+    let member = fixture.spawn("stop-after-bound-member").await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+
+    let release = crate::runtime::actor::member_wake_turn::hold_wake_readiness_for_test(&member);
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    // The plan applied: the member's binding is requested (Bound).
+    let key = mob_dsl::AgentIdentity::from_domain(&member);
+    let mut state = fixture.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        WAIT,
+        state.wait_for(|state| state.member_wake_bound.contains(&key)),
+    )
+    .await
+    .expect("the wake reaches its Bound step")
+    .expect("the machine state stays published");
+
+    let stop = {
+        let handle = fixture.handle.clone();
+        tokio::spawn(async move { handle.stop().await })
+    };
+    tokio::time::timeout(STEP, async {
+        while !matches!(fixture.handle.status().await, Ok(MobState::Stopped)) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the stop lands while the wake's readiness is held");
+    let _ = release.send(true);
+    let woken = tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task joins");
+    assert!(
+        matches!(
+            woken,
+            Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::MobNotRunning,
+                ..
+            })
+        ),
+        "the stop ended the wake: {woken:?}"
+    );
+    tokio::time::timeout(WAIT, stop)
+        .await
+        .expect("the stop answers")
+        .expect("the stop task joins")
+        .expect("the stop succeeds: no fail-stop");
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Dormant),
+        "the stop left the member dormant"
+    );
+    tokio::time::timeout(WAIT, async {
+        while MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .unwrap_or(false)
+        {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the wake's provision is rolled back: no live session actor is left");
+    fixture.finish().await;
+}
+
+/// A complete during a wake is admitted at once: it retires the waking
+/// member, whose retirement start closes the wake (its callers are answered
+/// as retiring, or as a mob that is not running) and whose own steps wait
+/// for the held wake step, which rolls back. The complete then finishes,
+/// and no live session actor is left.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_complete_during_a_wake_retires_the_member_after_its_wake_step() {
+    let fixture = WakeFixture::new("wake-complete").await;
+    let member = fixture.spawn("complete-member").await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+
+    let complete = {
+        let handle = fixture.handle.clone();
+        tokio::spawn(async move { handle.complete().await })
+    };
+    let woken = tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake's callers are answered while its step is held")
+        .expect("the wake task joins");
+    assert!(
+        matches!(
+            &woken,
+            Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::Retiring
+                    | crate::MemberWakeRefusal::MobNotRunning,
+                ..
+            })
+        ),
+        "the complete ended the wake: {woken:?}"
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, complete)
+        .await
+        .expect("the complete answers once the wake step settled")
+        .expect("the complete task joins")
+        .expect("the mob completes");
+    assert_eq!(
+        fixture.handle.status().await.expect("mob status"),
+        MobState::Completed
+    );
+    assert!(
+        !MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .unwrap_or(false),
+        "the complete leaves no live session actor"
+    );
+    fixture.finish().await;
+}
+
 /// A wake rebuilds the member through the customizer's resume hook,
 /// with what the customizer answers now, never a previous build's spec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

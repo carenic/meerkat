@@ -9112,6 +9112,9 @@ pub(super) struct MobActor {
     pub(super) member_effect_inflight: member_effect_lane::ActorCustody<
         BTreeMap<member_effect_lane::MemberEffectTicket, member_effect_lane::MemberEffectInflight>,
     >,
+    /// The members whose wake or warm-reload step the lane owns, published
+    /// for the steps that run after them (a started retirement's own).
+    pub(super) member_wake_effects: tokio::sync::watch::Sender<BTreeSet<AgentIdentity>>,
     pub(super) next_member_effect_ticket: u64,
     pub(super) retirements: BTreeMap<AgentIdentity, retirement_io::RetirementContinuation>,
     /// Retirements that durably started and then stopped at a stage. Each
@@ -12791,18 +12794,26 @@ impl MobActor {
         if self.pending_shutdown_teardown.is_some() && waits_on_shutdown_teardown {
             return true;
         }
-        if matches!(
-            command,
-            MobCommand::Stop { .. }
-                | MobCommand::Complete { .. }
-                | MobCommand::Reset { .. }
-                | MobCommand::Destroy { .. }
-                | MobCommand::RetireAll { .. }
-                | MobCommand::Shutdown { .. }
-        ) && (!self.member_effect_tasks.is_empty()
-            || !self.wiring_io_tasks.is_empty()
-            || (self.dsl_authority.state().explicit_resume_attempt.is_none()
-                && !self.pending_spawn_activations.is_empty()))
+        // A Stop and a Complete do not wait for a running wake or
+        // warm-reload step: their commit closes every open wake attempt, and
+        // the step's late commit fails its attempt fence and rolls its
+        // provision back. Destroy, Reset, RetireAll and Shutdown tear down
+        // the storage and runtime the step works on, so they wait for it.
+        let member_effects = match command {
+            MobCommand::Stop { .. } | MobCommand::Complete { .. } => {
+                Some(member_effect_lane::MemberEffectBarrier::BesideWakes)
+            }
+            MobCommand::Reset { .. }
+            | MobCommand::Destroy { .. }
+            | MobCommand::RetireAll { .. }
+            | MobCommand::Shutdown { .. } => Some(member_effect_lane::MemberEffectBarrier::All),
+            _ => None,
+        };
+        if let Some(barrier) = member_effects
+            && (self.member_effects_running(barrier)
+                || !self.wiring_io_tasks.is_empty()
+                || (self.dsl_authority.state().explicit_resume_attempt.is_none()
+                    && !self.pending_spawn_activations.is_empty()))
         {
             return true;
         }
@@ -24895,8 +24906,13 @@ impl MobActor {
         // fence rather than completing through it.
         self.drain_wiring_io_for_lifecycle().await;
         // Typed: retained or still-dispatching custody must NOT read as a
-        // completed barrier.
-        self.drain_member_effects_for_lifecycle().await?;
+        // completed barrier. A Stop and a Complete leave a running wake or
+        // warm-reload step to its late commit (their own commit closes its
+        // attempt); every other intent was deferred until none ran.
+        self.drain_member_effects_for_lifecycle(
+            member_effect_lane::MemberEffectBarrier::of_intent(intent),
+        )
+        .await?;
         self.drain_member_live_mutations_for_lifecycle().await?;
         self.close_all_member_live_channels_for_lifecycle(
             "begin placed completion lifecycle quiesce",
@@ -31810,7 +31826,10 @@ impl MobActor {
                         &mob_id,
                         Box::pin(async {
                             self.drain_wiring_io_for_lifecycle().await;
-                            self.drain_member_effects_for_lifecycle().await?;
+                            self.drain_member_effects_for_lifecycle(
+                                member_effect_lane::MemberEffectBarrier::All,
+                            )
+                            .await?;
                             self.drain_member_live_mutations_for_lifecycle().await
                         }),
                     )
