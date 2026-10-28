@@ -464,7 +464,10 @@ pub(in crate::runtime) struct MemberWakes {
     pub(in crate::runtime) running: BTreeMap<MemberWakeAttempt, RunningMemberWake>,
     /// Peer-ingress changes to realize at the next loop boundary.
     ingress: VecDeque<MemberPeerIngressChange>,
-    /// The concrete provisioner the cold restore recipe runs on.
+    /// The concrete provisioner the cold restore recipe runs on. Without the
+    /// runtime adapter there is no cold restore (a handed-off
+    /// materialization ends Broken), so there is no provisioner either.
+    #[cfg(feature = "runtime-adapter")]
     pub(in crate::runtime) provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
     pub(in crate::runtime) continuity: MemberContinuityIndex,
     /// The read-only view of the mob the host's build preparer receives on
@@ -495,7 +498,9 @@ impl MemberWakes {
     /// index starts caught up to it. `host_read_handle` is the launch's own
     /// read-only view, which the host's build preparer receives.
     pub(in crate::runtime) fn new(
-        provisioner: Arc<super::super::provisioner::MultiBackendProvisioner>,
+        #[cfg(feature = "runtime-adapter")] provisioner: Arc<
+            super::super::provisioner::MultiBackendProvisioner,
+        >,
         mob_id: &MobId,
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
@@ -520,6 +525,7 @@ impl MemberWakes {
             pending: VecDeque::new(),
             running: BTreeMap::new(),
             ingress: VecDeque::new(),
+            #[cfg(feature = "runtime-adapter")]
             provisioner,
             continuity: MemberContinuityIndex::seeded(replayed, mob_id),
             host_read_handle,

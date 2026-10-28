@@ -3045,7 +3045,9 @@ impl MobActor {
         // The host's preparer learns every member Core builds live here, as
         // it learns a woken one: a fresh spawn (an embodied seat included), a
         // held create once it is activated, a respawn. A placed member is
-        // built by its host, not here.
+        // built by its host, not here. A host preparer exists only with the
+        // runtime adapter.
+        #[cfg(feature = "runtime-adapter")]
         if state.remote.is_none()
             && let Some(session_id) = state.member_ref.bridge_session_id().cloned()
         {
