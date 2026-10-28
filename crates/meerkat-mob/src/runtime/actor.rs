@@ -34,6 +34,7 @@ mod resume_topology_control;
 mod retirement_io;
 #[cfg(test)]
 pub(crate) use retirement_io::retirement_stage_test_hooks;
+mod seat_wiring;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
 #[cfg(all(test, feature = "runtime-adapter"))]
@@ -40438,22 +40439,45 @@ impl MobActor {
         profile_name: &ProfileName,
         agent_identity: &AgentIdentity,
     ) -> Vec<AgentIdentity> {
-        let mut targets = Vec::new();
+        Self::declared_wiring_targets(&self.definition, profile_name, |target_profile| {
+            self.active_machine_member_ids_for_profile(target_profile, agent_identity)
+        })
+    }
 
-        if self.definition.wiring.auto_wire_orchestrator
-            && let Some(orchestrator) = &self.definition.orchestrator
+    /// Whether `definition` declares any edge between its profiles' members:
+    /// the orchestrator's auto-wire, or a role wiring rule.
+    pub(super) fn definition_declares_wiring(definition: &MobDefinition) -> bool {
+        (definition.wiring.auto_wire_orchestrator && definition.orchestrator.is_some())
+            || !definition.wiring.role_wiring.is_empty()
+    }
+
+    /// The members a member of `profile_name` is wired to by the edges its
+    /// definition declares, in order: the orchestrator's members (when the
+    /// definition auto-wires the orchestrator and the member is not one), then
+    /// the members of every profile a role wiring rule pairs with
+    /// `profile_name`, each once. `active_members_of` answers a profile's
+    /// active members other than the member itself. One rule for a spawn and a
+    /// seat alike.
+    pub(super) fn declared_wiring_targets(
+        definition: &MobDefinition,
+        profile_name: &ProfileName,
+        mut active_members_of: impl FnMut(&ProfileName) -> Vec<AgentIdentity>,
+    ) -> Vec<AgentIdentity> {
+        let mut targets = Vec::new();
+        let mut named = BTreeSet::new();
+
+        if definition.wiring.auto_wire_orchestrator
+            && let Some(orchestrator) = &definition.orchestrator
             && profile_name != &orchestrator.profile
         {
-            let orchestrator_ids =
-                self.active_machine_member_ids_for_profile(&orchestrator.profile, agent_identity);
-            for orchestrator_id in orchestrator_ids {
-                if orchestrator_id != *agent_identity && !targets.contains(&orchestrator_id) {
+            for orchestrator_id in active_members_of(&orchestrator.profile) {
+                if named.insert(orchestrator_id.clone()) {
                     targets.push(orchestrator_id);
                 }
             }
         }
 
-        for rule in &self.definition.wiring.role_wiring {
+        for rule in &definition.wiring.role_wiring {
             let target_profile = if &rule.a == profile_name {
                 Some(&rule.b)
             } else if &rule.b == profile_name {
@@ -40462,10 +40486,8 @@ impl MobActor {
                 None
             };
             if let Some(target_profile) = target_profile {
-                let target_ids =
-                    self.active_machine_member_ids_for_profile(target_profile, agent_identity);
-                for target_id in target_ids {
-                    if !targets.contains(&target_id) {
+                for target_id in active_members_of(target_profile) {
+                    if named.insert(target_id.clone()) {
                         targets.push(target_id);
                     }
                 }
