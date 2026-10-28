@@ -44,6 +44,19 @@ fn phase_of(
     handle.member_materialization_for_test(identity)
 }
 
+/// A member's kickoff phase, as its status reads it.
+async fn kickoff_phase_of(
+    handle: &MobHandle,
+    identity: &AgentIdentity,
+) -> Option<crate::roster::MobMemberKickoffPhase> {
+    handle
+        .member_status(identity)
+        .await
+        .expect("the member's status")
+        .kickoff
+        .map(|kickoff| kickoff.phase)
+}
+
 /// A mob whose turn-driven workers were spawned on a mock durable session
 /// service and crash-stopped, with the durable state a restart finds.
 struct CrashedMob {
@@ -2774,13 +2787,26 @@ async fn a_crash_during_a_rotated_kickoff_turn_runs_the_kickoff_once_after_the_r
         turns_with(&mob.service, &new, prompt).await > 0
     })
     .await;
-    let resolved = mob
-        .handle
+    mob.handle
         .wait_for_members_kickoff_complete(std::slice::from_ref(&identity), Some(LAZY_STEP))
         .await
         .expect("the kickoff resolves");
+    // That wait covers autonomous members only, and the mock counts the
+    // kickoff's turn when it starts: this turn-driven member's kickoff can
+    // still be Starting here. Read its phase once it settled.
+    wait_for("the kickoff to settle after the restart", || async {
+        !matches!(
+            kickoff_phase_of(&mob.handle, &identity).await,
+            Some(
+                crate::roster::MobMemberKickoffPhase::Pending
+                    | crate::roster::MobMemberKickoffPhase::Starting
+                    | crate::roster::MobMemberKickoffPhase::CallbackPending
+            )
+        )
+    })
+    .await;
     assert_eq!(
-        resolved[0].1.kickoff.as_ref().map(|kickoff| kickoff.phase),
+        kickoff_phase_of(&mob.handle, &identity).await,
         Some(crate::roster::MobMemberKickoffPhase::Started)
     );
     assert_eq!(
