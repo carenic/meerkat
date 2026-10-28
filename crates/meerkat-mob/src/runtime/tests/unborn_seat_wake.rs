@@ -395,7 +395,16 @@ async fn a_first_wake_that_ends_retryable_after_the_born_row_leaves_the_session_
         );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(!mob.unborn(), "the created session is born");
+    // The born row is journaled first, inside the wake's plan step, and
+    // MobMachine's state is published once that step returns: the
+    // projection is waited for, not read in the same instant.
+    while mob.unborn() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the created session is born"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 
     let handle = mob.handle.clone();
     let stop = tokio::spawn(async move { handle.stop().await });
