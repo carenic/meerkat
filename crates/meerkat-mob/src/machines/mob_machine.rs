@@ -6816,10 +6816,14 @@ mod tests {
         // Control: a delayed final of an older generation, for an identity
         // that maps to no runtime, still takes the stale-incarnation arm. It
         // prunes the stale runtime's bookkeeping and keeps the identity's
-        // history.
+        // history. The later incarnation's own retirement replay removed its
+        // membership and, with it, its residency (the materialization phase
+        // and its epoch), as RecoverRosterMemberRetiredRunning does.
         let mut retired = seeded.state().clone();
         retired.identity_to_runtime.remove(&identity);
         retired.member_session_bindings.remove(&identity);
+        retired.member_materialization.remove(&identity);
+        retired.member_materialization_epoch.remove(&identity);
         retired
             .identity_runtime_generations
             .insert(identity.clone(), Generation(1));

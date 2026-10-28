@@ -38061,11 +38061,15 @@ async fn test_cold_resume_notification_failure_is_recorded_once_after_its_bounde
 
 /// An explicit resume reports its orchestrator notification's outcome, not a
 /// failed attempt the runtime retries: when the retry delivers the
-/// notification, the resume succeeds.
+/// notification, the resume succeeds. The lift hands the notification turn
+/// to the actor's lifecycle owner (as a cold resume does), so its attempts
+/// run after the resume answers: the row waits, bounded, for the failed
+/// attempt and the retry that delivered it, then pins that the delivered
+/// notification recorded no failure.
 #[tokio::test]
 async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notification() {
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    let runtime = service.enable_runtime_adapter();
     let mut def = sample_definition();
     for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
@@ -38105,10 +38109,35 @@ async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notific
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
+    let cursor = resumed
+        .events()
+        .latest_cursor()
+        .await
+        .expect("event cursor before the lift");
     resumed
         .resume()
         .await
         .expect("the explicit resume succeeds once the runtime's retry delivers the notification");
+
+    // The first attempt fails and the runtime's retry of the same input
+    // enters its turn; then that input settles.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.recorded_start_turn_prompts().await.len() < prompts_before + 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime retries the failed notification input");
+    wait_for_session_runtime_inputs_settled(&runtime, &orchestrator_session).await;
+    // A failure event, if any, is appended once the notification's outcome
+    // is known; give it room to land before asserting there is none.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        orchestrator_resume_notification_failures(&resumed, cursor).await,
+        Vec::new(),
+        "a notification the runtime's retry delivered records no failure"
+    );
     assert_eq!(
         resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await,
         2,
@@ -38361,6 +38390,29 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
     );
 }
 
+/// Whether `reason` is the restore diagnostic of a member whose durable
+/// session snapshot is gone, naming exactly `session_id`. A wake's and a
+/// start's restore word it "missing durable session snapshot"; the explicit
+/// resume's own rebuild and the warm revival word it "missing bridge session
+/// snapshot". The rows pin the typed Broken outcome and the session the
+/// reason names, not which restore recipe classified the member.
+fn is_missing_session_snapshot_reason(reason: &str, session_id: &SessionId) -> bool {
+    reason == format!("missing durable session snapshot for '{session_id}'")
+        || reason == format!("missing bridge session snapshot for '{session_id}'")
+}
+
+/// Whether `reason` is the restore diagnostic of a failed revival of exactly
+/// `session_id`. A wake's cold recipe words it "failed to restore durable
+/// session '<id>': <cause>"; the warm revival "machine-authorized revival of
+/// bridge session '<id>' failed: <cause>". The rows pin the typed terminal
+/// outcome, the session and the cause, not which recipe rebuilt the member.
+fn is_failed_revival_reason(reason: &str, session_id: &SessionId) -> bool {
+    let cold_restore = format!("failed to restore durable session '{session_id}': ");
+    let warm_revival =
+        format!("machine-authorized revival of bridge session '{session_id}' failed: ");
+    reason.starts_with(&cold_restore) || reason.starts_with(&warm_revival)
+}
+
 #[tokio::test]
 async fn test_resume_marks_missing_persisted_session_as_broken() {
     let service = Arc::new(MockSessionService::new());
@@ -38432,8 +38484,9 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         snapshot
             .error
             .as_deref()
-            .is_some_and(|message| message.contains("missing bridge session snapshot")),
-        "broken member should surface restore failure reason"
+            .is_some_and(|message| is_missing_session_snapshot_reason(message, &old_sid)),
+        "broken member should surface restore failure reason: {:?}",
+        snapshot.error
     );
 
     let machine_state = resumed
@@ -38442,14 +38495,21 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         .expect("query MobMachine state after restore failure");
     let machine_identity =
         crate::machines::mob_machine::AgentIdentity::from_domain(&AgentIdentity::from("w-1"));
+    let lifecycle = machine_state.member_lifecycle_for_identity(&machine_identity);
     assert_eq!(
-        machine_state.member_lifecycle_for_identity(&machine_identity),
-        crate::machines::mob_machine::MobMemberLifecycleMaterial {
-            status: crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
-            terminal_class: crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
-            error: Some(format!("missing bridge session snapshot for '{old_sid}'")),
-        },
+        (lifecycle.status, lifecycle.terminal_class),
+        (
+            crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
+            crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
+        ),
         "restore-failure member status must be owned by MobMachine, not reconstructed by projection code"
+    );
+    assert!(
+        lifecycle
+            .error
+            .as_deref()
+            .is_some_and(|reason| is_missing_session_snapshot_reason(reason, &old_sid)),
+        "MobMachine owns the missing-snapshot classification of the member's session: {lifecycle:?}"
     );
 
     let members = resumed.list_members().await;
@@ -38462,13 +38522,14 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         crate::runtime::handle::MobMemberStatus::Broken
     );
     assert!(broken.is_final);
-    assert_eq!(broken.current_session_id, Some(old_sid));
+    assert_eq!(broken.current_session_id, Some(old_sid.clone()));
     assert!(
         broken
             .error
             .as_deref()
-            .is_some_and(|message| message.contains("missing bridge session snapshot")),
-        "projected member listing should carry the restore failure"
+            .is_some_and(|message| is_missing_session_snapshot_reason(message, &old_sid)),
+        "projected member listing should carry the restore failure: {:?}",
+        broken.error
     );
 
     let including_retiring = resumed.list_members_including_retiring().await;
@@ -77868,7 +77929,7 @@ async fn test_submit_work_marks_missing_bridge_session_broken_without_prior_stat
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("missing bridge session"),
+                is_missing_session_snapshot_reason(&reason, &bridge_session_id),
                 "unexpected restore failure reason: {reason}"
             );
         }
@@ -78576,8 +78637,12 @@ async fn test_revival_failure_is_typed_terminal_without_retry_loop() {
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("machine-authorized revival"),
+                is_failed_revival_reason(&reason, &bridge_session_id),
                 "failure reason must carry the typed revival outcome: {reason}"
+            );
+            assert!(
+                reason.contains("mock create_session failure"),
+                "failure reason must carry the re-materialization's own cause: {reason}"
             );
         }
         other => panic!("expected MemberRestoreFailed, got {other:?}"),
@@ -78709,7 +78774,7 @@ async fn test_revival_already_active_without_live_session_is_typed_terminal() {
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("machine-authorized revival"),
+                is_failed_revival_reason(&reason, &bridge_session_id),
                 "failure reason must carry the typed revival outcome: {reason}"
             );
             assert!(
