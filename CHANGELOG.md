@@ -948,7 +948,7 @@ them.
   consent presentation) is bounded at 64 KiB instead of 4 KiB
   (`authorization::MAX_REVIEW_OPERATION_CONTEXT_BYTES`). A mandate composed
   with the bounds its contributing originals narrow it to, or the listing of
-  every input's own mandate for a multi-input work, no longer passes the
+  every input's own mandate for a multi-input work, no longer exceeds the
   bound at realistic sizes; past the old bound the call settled as
   `review_unavailable` (`context_unavailable`) and was neither reviewed nor
   presented for consent. A field over the new bound is still unavailable,
