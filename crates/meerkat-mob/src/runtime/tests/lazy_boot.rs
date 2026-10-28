@@ -3571,6 +3571,9 @@ async fn a_never_woken_seats_status_reads_like_an_idle_member_with_an_empty_sess
         "{outcomes:?}"
     );
     assert!(seat_session_unborn(&handle, &identity));
+    // The seat itself observed the session's resume authority once (the
+    // observation that recorded it unborn); the status read adds nothing.
+    let durable_before = service.durable_reads_of(&session);
     let reads_before = service.session_reads_of(&session).calls;
     let snapshots_before = service.execution_snapshot_calls();
 
@@ -3592,8 +3595,8 @@ async fn a_never_woken_seats_status_reads_like_an_idle_member_with_an_empty_sess
 
     assert_eq!(
         service.durable_reads_of(&session),
-        DurableSessionReadCounts::default(),
-        "nothing of the unborn session is read, its resume authority included"
+        durable_before,
+        "the status read reads nothing of the unborn session, its resume authority included"
     );
     assert_eq!(service.session_reads_of(&session).calls, reads_before);
     assert_eq!(service.execution_snapshot_calls(), snapshots_before);
