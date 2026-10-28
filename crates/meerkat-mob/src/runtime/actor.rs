@@ -49829,6 +49829,9 @@ impl MobActor {
                     .get(&dsl_runtime_id),
                 Some(mob_dsl::MobMemberState::Retiring)
             );
+            // The successor keeps the creation of the incarnation it
+            // replaces, read from that incarnation's own session record.
+            let creation_witness = roster.successor_creation_witness(&entry);
             RespawnSnapshot {
                 profile_name: entry.role.clone(),
                 runtime_mode: entry.runtime_mode,
@@ -49840,24 +49843,9 @@ impl MobActor {
                 effective_profile_override: entry.effective_profile_override,
                 effective_model_override: entry.effective_model_override,
                 spawned_by: entry.spawned_by,
-                creation_origin: crate::member_creation::MemberCreationOrigin::Source(match entry.member_ref.bridge_session_id() {
-                    Some(session_id) => match roster.member_creation_for_session(session_id).ok().flatten() {
-                        Some(crate::MemberCreationSnapshot {
-                            creation: crate::MemberCreationRecord { creation_id: Some(creation_id), .. },
-                            member_binding,
-                            ..
-                        }) => crate::MemberCreationSourceWitness {
-                            successor: true,
-                            source: Some(crate::MemberCreationSource {
-                                session_id: session_id.clone(),
-                                member_binding,
-                                creation_id,
-                            }),
-                        },
-                        _ => crate::MemberCreationSourceWitness::unavailable(),
-                    },
-                    None => crate::MemberCreationSourceWitness::unavailable(),
-                }),
+                creation_origin: crate::member_creation::MemberCreationOrigin::Source(
+                    creation_witness,
+                ),
                 fork_job: entry.fork_job,
                 cleanup_retry,
             }

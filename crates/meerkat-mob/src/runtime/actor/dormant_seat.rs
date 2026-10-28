@@ -1134,7 +1134,16 @@ impl MobActor {
             effects,
             phase_changed,
         };
-        let creation = self.seat_creation_record(candidate).await;
+        // The next incarnation is the same member's runtime successor, as a
+        // respawn's is: it keeps the creation the retiring incarnation's own
+        // session recorded (the same creation id, Successor provenance). The
+        // rotation spec's origin names a fresh member, which it is not.
+        let creation = self
+            .roster
+            .read()
+            .await
+            .successor_creation_witness(entry)
+            .successor_record(&candidate.session_id);
         let mut spawned = crate::event::MemberSpawnedEvent::new(
             identity.clone(),
             next_generation,
