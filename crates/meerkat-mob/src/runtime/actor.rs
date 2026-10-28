@@ -8670,6 +8670,10 @@ pub(super) struct ExplicitResumeMemberRebuild {
     /// successor). `None` when the member keeps its bound session.
     superseded_session_id: Option<SessionId>,
     recovered_peer_endpoint: Option<TrustedPeerDescriptor>,
+    /// The host's build preparation staged a run-start hold for the member's
+    /// next registration (`HoldUntilReleased`): a rebuild that is not
+    /// accepted removes it, as no registration will apply it.
+    build_hold_staged: bool,
 }
 
 struct ExplicitResumePreparationContext {
@@ -21853,6 +21857,7 @@ impl ExplicitResumePreparationContext {
                     requires_materialization,
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
+                    build_hold_staged: false,
                 });
                 continue;
             }
@@ -21915,6 +21920,7 @@ impl ExplicitResumePreparationContext {
                     requires_materialization,
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
+                    build_hold_staged: false,
                 });
                 continue;
             };
@@ -22019,6 +22025,7 @@ impl ExplicitResumePreparationContext {
                 requires_materialization: replacement_requires_materialization,
                 superseded_session_id: Some(session_id),
                 recovered_peer_endpoint,
+                build_hold_staged: false,
             });
         }
         Ok(rebuild)
@@ -22142,6 +22149,7 @@ impl MobActor {
                 requires_materialization,
                 superseded_session_id,
                 recovered_peer_endpoint,
+                build_hold_staged,
             } = rebuild;
             let dsl_identity = mob_dsl::AgentIdentity::from_domain(
                 &crate::ids::AgentIdentity::from(entry.agent_identity.as_str()),
@@ -22304,6 +22312,7 @@ impl MobActor {
                         requires_materialization,
                         superseded_session_id,
                         recovered_peer_endpoint,
+                        build_hold_staged,
                     },
                     attempt,
                     binding,

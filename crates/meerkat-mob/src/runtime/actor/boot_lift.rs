@@ -151,7 +151,17 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
 pub(in crate::runtime) struct ExplicitResumeBootMemberPrepared {
     identity: AgentIdentity,
     attempt: u64,
-    result: Result<ExplicitResumeMemberRebuild, MobError>,
+    result: Result<ExplicitResumeMemberRebuild, ExplicitResumeBootMemberUnprepared>,
+}
+
+/// Why the lift could not prepare a planned member's rebuild.
+pub(in crate::runtime) enum ExplicitResumeBootMemberUnprepared {
+    /// The rebuild's own reads or checks failed.
+    Failed(MobError),
+    /// The host asked to prepare the member's build later.
+    HostRetry(String),
+    /// The host refused to prepare the member's build.
+    HostRefused(String),
 }
 
 /// Whether the lift realizes `identity`'s planned attempt through the
@@ -791,11 +801,19 @@ impl MobActor {
                     ))
                 });
                 match candidate {
-                    Some(candidate) => candidates.push((attempt, candidate)),
+                    Some(candidate) => {
+                        let wired_peers =
+                            super::super::member_build_preparer::member_build_wired_peers(
+                                state, &domain,
+                            );
+                        candidates.push((attempt, candidate, wired_peers));
+                    }
                     None => prepared.push(ExplicitResumeBootMemberPrepared {
-                        result: Err(MobError::Internal(format!(
-                            "the lift cannot rebuild '{domain}': it has no roster entry or session binding"
-                        ))),
+                        result: Err(ExplicitResumeBootMemberUnprepared::Failed(
+                            MobError::Internal(format!(
+                                "the lift cannot rebuild '{domain}': it has no roster entry or session binding"
+                            )),
+                        )),
                         identity: domain,
                         attempt,
                     }),
@@ -803,6 +821,9 @@ impl MobActor {
             }
         }
         let context = Arc::new(self.explicit_resume_preparation_context());
+        let preparer = self.member_residency.build_preparer.clone();
+        let read_handle = self.member_wakes.host_read_handle.clone();
+        let provisioner = Arc::clone(&self.provisioner);
         let admission = admission.clone();
         let progress = progress.clone();
         let resume_attempt = resume_attempt.clone();
@@ -810,9 +831,12 @@ impl MobActor {
         #[cfg(all(test, feature = "runtime-adapter"))]
         let probe_mob = self.definition.id.clone();
         self.actor_io_tasks.spawn(async move {
-            let rebuilds =
-                futures::future::join_all(candidates.into_iter().map(|(attempt, candidate)| {
+            let rebuilds = futures::future::join_all(candidates.into_iter().map(
+                |(attempt, candidate, wired_peers)| {
                     let context = Arc::clone(&context);
+                    let preparer = preparer.clone();
+                    let read_handle = read_handle.clone();
+                    let provisioner = Arc::clone(&provisioner);
                     let admission = admission.clone();
                     let progress = progress.clone();
                     #[cfg(all(test, feature = "runtime-adapter"))]
@@ -832,13 +856,15 @@ impl MobActor {
                             return ExplicitResumeBootMemberPrepared {
                                 identity,
                                 attempt,
-                                result: Err(MobError::Internal(
-                                    "the test probe ended this member restore at its start"
-                                        .to_string(),
+                                result: Err(ExplicitResumeBootMemberUnprepared::Failed(
+                                    MobError::Internal(
+                                        "the test probe ended this member restore at its start"
+                                            .to_string(),
+                                    ),
                                 )),
                             };
                         }
-                        let result = context
+                        let rebuild = context
                             .prepare(vec![candidate], admission, &progress)
                             .await
                             .and_then(|mut rebuild| {
@@ -847,7 +873,24 @@ impl MobActor {
                                         "the explicit resume prepared no rebuild of '{identity}'"
                                     ))
                                 })
-                            });
+                            })
+                            .map_err(ExplicitResumeBootMemberUnprepared::Failed);
+                        // The host prepares the member's build before its
+                        // provision, as it prepares every wake's and every
+                        // boot restore's.
+                        let result = match (rebuild, preparer) {
+                            (Ok(rebuild), Some(preparer)) => {
+                                prepare_explicit_resume_member_build(
+                                    preparer.as_ref(),
+                                    provisioner.as_ref(),
+                                    read_handle,
+                                    wired_peers,
+                                    rebuild,
+                                )
+                                .await
+                            }
+                            (rebuild, _) => rebuild,
+                        };
                         #[cfg(all(test, feature = "runtime-adapter"))]
                         drop(probed);
                         ExplicitResumeBootMemberPrepared {
@@ -856,8 +899,9 @@ impl MobActor {
                             result,
                         }
                     })
-                }))
-                .await;
+                },
+            ))
+            .await;
             prepared.extend(rebuilds);
             let _ = command_tx
                 .send(RoutedMobCommand::internal(
@@ -908,21 +952,49 @@ impl MobActor {
         } in prepared
         {
             if !self.member_wake_attempt_is_open(&identity, attempt) {
+                if let Ok(member) = &result {
+                    self.unstage_explicit_resume_member_build_hold(member).await;
+                }
                 continue;
             }
             match result {
                 Ok(member) if lift_current => {
-                    reserving.push((identity, attempt));
+                    reserving.push((
+                        identity,
+                        attempt,
+                        member
+                            .build_hold_staged
+                            .then(|| member.bridge_session_id.clone()),
+                    ));
                     rebuild.push(member);
                 }
-                Ok(_) => self.abandon_explicit_resume_boot_member(
-                    &identity,
-                    attempt,
-                    "the lift that planned the member ended before its rebuild".to_string(),
-                ),
-                Err(error) => {
+                Ok(member) => {
+                    self.unstage_explicit_resume_member_build_hold(&member)
+                        .await;
+                    self.abandon_explicit_resume_boot_member(
+                        &identity,
+                        attempt,
+                        "the lift that planned the member ended before its rebuild".to_string(),
+                    );
+                }
+                Err(ExplicitResumeBootMemberUnprepared::Failed(error)) => {
                     self.end_explicit_resume_boot_member(&identity, attempt, error)
                         .await;
+                }
+                Err(ExplicitResumeBootMemberUnprepared::HostRetry(reason)) => {
+                    self.end_explicit_resume_boot_member_for_host_retry(
+                        &identity, attempt, &reason,
+                    );
+                }
+                Err(ExplicitResumeBootMemberUnprepared::HostRefused(reason)) => {
+                    self.fail_explicit_resume_boot_member(
+                        &identity,
+                        attempt,
+                        format!("the host refused to prepare the member's build: {reason}"),
+                        None,
+                        None,
+                    )
+                    .await;
                 }
             }
         }
@@ -945,26 +1017,31 @@ impl MobActor {
                 None => Some("the lift lost its explicit resume".to_string()),
             };
             // A member the explicit resume did not reserve still holds its
-            // plan attempt, which nothing would realize: it ends here.
-            for (identity, attempt) in reserving {
+            // plan attempt, which nothing would realize: it ends here, and a
+            // run-start hold its build preparation staged is removed.
+            for (identity, attempt, staged_hold) in reserving {
                 let reserved = self
                     .dsl_authority
                     .state()
                     .explicit_resume_member_work
                     .contains_key(&mob_dsl::AgentIdentity::from_domain(&identity));
-                if !reserved && self.member_wake_attempt_is_open(&identity, attempt) {
-                    let reason = refusal
-                        .clone()
-                        .unwrap_or_else(|| "the explicit resume did not reserve it".to_string());
-                    self.end_explicit_resume_boot_member(
-                        &identity,
-                        attempt,
-                        MobError::Internal(format!(
-                            "the explicit resume could not rebuild '{identity}': {reason}"
-                        )),
-                    )
-                    .await;
+                if reserved || !self.member_wake_attempt_is_open(&identity, attempt) {
+                    continue;
                 }
+                if let Some(session_id) = staged_hold {
+                    self.unstage_member_build_hold(&session_id).await;
+                }
+                let reason = refusal
+                    .clone()
+                    .unwrap_or_else(|| "the explicit resume did not reserve it".to_string());
+                self.end_explicit_resume_boot_member(
+                    &identity,
+                    attempt,
+                    MobError::Internal(format!(
+                        "the explicit resume could not rebuild '{identity}': {reason}"
+                    )),
+                )
+                .await;
             }
         }
         // The lift goes on only while it still waits on its members: one a
@@ -981,6 +1058,69 @@ impl MobActor {
         }
     }
 
+    /// Remove the run-start hold the host's build preparation staged for a
+    /// prepared rebuild that will not be provisioned.
+    pub(super) async fn unstage_explicit_resume_member_build_hold(
+        &mut self,
+        rebuild: &ExplicitResumeMemberRebuild,
+    ) {
+        if rebuild.build_hold_staged {
+            self.unstage_member_build_hold(&rebuild.bridge_session_id)
+                .await;
+        }
+    }
+
+    /// Remove the run-start hold staged for `session_id`'s next registration
+    /// (`HoldUntilReleased`): no registration will apply it, and the
+    /// member's next build is prepared again.
+    pub(super) async fn unstage_member_build_hold(&mut self, session_id: &SessionId) {
+        if let Err(error) = self
+            .provisioner
+            .unstage_member_registration_run_start_hold(
+                &MemberRef::from_bridge_session_id(session_id.clone()),
+                meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+            )
+            .await
+        {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                %session_id,
+                %error,
+                "a rebuild's staged run-start hold could not be removed"
+            );
+        }
+    }
+
+    /// A planned member's build the host asked to prepare later: its attempt
+    /// ends retryable (Dormant, its boot obligation owed and its retry
+    /// armed), as a wake's does.
+    fn end_explicit_resume_boot_member_for_host_retry(
+        &mut self,
+        identity: &AgentIdentity,
+        attempt: u64,
+        reason: &str,
+    ) {
+        tracing::info!(
+            mob_id = %self.definition.id,
+            agent_identity = %identity,
+            %reason,
+            "the host asked to prepare the member's build later; its wake is to be retried"
+        );
+        match self.apply_dsl_signal_collect_transition(
+            mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(identity),
+                attempt,
+                kind: mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
+            },
+            "resolve_host_retry_explicit_resume_boot_member",
+        ) {
+            Ok(_) => self.schedule_owed_member_wake_retry(identity),
+            Err(refused) => {
+                self.abandon_explicit_resume_boot_member(identity, attempt, refused.to_string());
+            }
+        }
+    }
+
     /// End a planned member's open attempt that the lift could not rebuild,
     /// as a wake ends one: retryable for a cause that clears on its own
     /// ([`crate::runtime::builder::restore_error_is_retryable`]; the member
@@ -993,11 +1133,10 @@ impl MobActor {
         attempt: u64,
         error: MobError,
     ) {
-        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         if crate::runtime::builder::restore_error_is_retryable(&error) {
             match self.apply_dsl_signal_collect_transition(
                 mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
-                    agent_identity: dsl_identity,
+                    agent_identity: mob_dsl::AgentIdentity::from_domain(identity),
                     attempt,
                     kind: mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
                 },
@@ -1017,17 +1156,38 @@ impl MobActor {
             }
             return;
         }
+        let registration_refusal = match &error {
+            MobError::MemberRegistrationRefused { call, .. } => Some(*call),
+            _ => None,
+        };
+        self.fail_explicit_resume_boot_member(
+            identity,
+            attempt,
+            error.to_string(),
+            error.durable_resume_hold(),
+            registration_refusal,
+        )
+        .await;
+    }
+
+    /// Resolve a planned member's open attempt Broken with `reason` (a host
+    /// refusal of its registration keeps its typed code), and record the
+    /// member's restore failure: that member's own outcome.
+    async fn fail_explicit_resume_boot_member(
+        &mut self,
+        identity: &AgentIdentity,
+        attempt: u64,
+        reason: String,
+        hold: Option<meerkat_core::service::DurableResumeHold>,
+        registration_refusal: Option<crate::MemberRegistrationHookCall>,
+    ) {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
         let session_id = self
             .dsl_authority
             .state()
             .member_session_bindings
             .get(&dsl_identity)
             .and_then(|session| SessionId::parse(&session.0).ok());
-        let reason = error.to_string();
-        let registration_refusal = match &error {
-            MobError::MemberRegistrationRefused { call, .. } => Some(*call),
-            _ => None,
-        };
         let signal = match registration_refusal {
             Some(call) => mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
                 agent_identity: dsl_identity.clone(),
@@ -1057,7 +1217,7 @@ impl MobActor {
                     super::super::handle::RestoreFailureDiagnostic {
                         bridge_session_id: session_id,
                         reason,
-                        hold: error.durable_resume_hold(),
+                        hold,
                         registration_refusal,
                     },
                 )
@@ -1094,6 +1254,45 @@ impl MobActor {
                 %error,
                 "a planned member's attempt the lift does not realize could not be closed"
             );
+        }
+    }
+}
+
+/// Ask the host's build preparer about a planned member's rebuild before its
+/// provision: proceed (a requested hold is staged on the member's next
+/// registration first, and the rebuild records it), or the host's retry or
+/// refusal.
+async fn prepare_explicit_resume_member_build(
+    preparer: &dyn super::super::MemberBuildPreparer,
+    provisioner: &dyn MobProvisioner,
+    handle: crate::runtime::MobReadHandle,
+    wired_peers: BTreeSet<AgentIdentity>,
+    mut rebuild: ExplicitResumeMemberRebuild,
+) -> Result<ExplicitResumeMemberRebuild, ExplicitResumeBootMemberUnprepared> {
+    let request = super::super::member_build_preparer::MemberBuildPreparation {
+        agent_identity: rebuild.entry.agent_identity.clone(),
+        session_id: rebuild.bridge_session_id.clone(),
+        handle,
+        wired_peers,
+    };
+    match preparer.prepare_member_build(request).await {
+        Ok(super::super::MemberBuildPrepared::Prepared) => Ok(rebuild),
+        Ok(super::super::MemberBuildPrepared::HoldUntilReleased) => {
+            provisioner
+                .stage_member_registration_run_start_hold_only(
+                    &MemberRef::from_bridge_session_id(rebuild.bridge_session_id.clone()),
+                    meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+                )
+                .await
+                .map_err(ExplicitResumeBootMemberUnprepared::Failed)?;
+            rebuild.build_hold_staged = true;
+            Ok(rebuild)
+        }
+        Err(super::super::MemberBuildPreparationRefusal::Retryable { reason }) => {
+            Err(ExplicitResumeBootMemberUnprepared::HostRetry(reason))
+        }
+        Err(super::super::MemberBuildPreparationRefusal::Final { reason }) => {
+            Err(ExplicitResumeBootMemberUnprepared::HostRefused(reason))
         }
     }
 }

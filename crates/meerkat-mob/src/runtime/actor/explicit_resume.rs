@@ -648,6 +648,14 @@ impl MobActor {
             self.spawn_explicit_resume_member_readiness(work).await;
             return;
         }
+        // A rebuild that was not accepted leaves no registration to apply the
+        // run-start hold its host's build preparation staged.
+        if !matches!(completion, ExplicitResumeMemberCompletion::Accepted)
+            && work.rebuild.build_hold_staged
+        {
+            self.unstage_member_build_hold(&work.rebuild.bridge_session_id)
+                .await;
+        }
         let identity = mob_dsl::AgentIdentity::from_domain(&work.rebuild.entry.agent_identity);
         if let ExplicitResumeMemberCompletion::Failed(error) = completion {
             if matches!(
