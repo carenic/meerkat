@@ -295,9 +295,9 @@ stack exactly. When it is unset they take the 8 MiB budget, or
 size, so Rust itself would never apply `RUST_MIN_STACK` to them; this way an
 embedding whose debug build needs deeper stacks raises these threads with the
 same `RUST_MIN_STACK` it gives its own. An invalid `RKAT_WORKER_STACK_BYTES`
-fails the first operation that needs one of these runtimes, with the refusal
-a host binary gives at startup. `RKAT_RPC_WORKER_STACK_BYTES` does not reach
-them.
+fails every operation that needs one of these runtimes until it is corrected,
+with the refusal a host binary gives at startup. `RKAT_RPC_WORKER_STACK_BYTES`
+does not reach them.
 
 ## Worker Threads
 
