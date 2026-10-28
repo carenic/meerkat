@@ -6,10 +6,15 @@
 //! this pass runs their readiness with the readiness of every other member
 //! materialized in this process, then applies each boot member's
 //! `ResolveMemberRevivalSucceeded` under its open attempt. A boot member
-//! the start left to be recovered right after it (its stopped registration
-//! taken over, or its registration needing a durability reload) gets no
-//! readiness run here: it is settled Live, and its recovery revives or
-//! reloads it and runs its readiness then.
+//! the start left to be recovered right after it gets no readiness run
+//! here. One whose stopped registration the start took over has no
+//! registration left: its attempt closes as NotCurrent, so MobMachine holds
+//! it Dormant, and its recovery wakes it through the ordinary wake (the
+//! host's build preparer, readiness, topology) to Live. One whose
+//! registration needs a durability reload is settled Live, because its
+//! session is still materialized and the warm reload that recovers it
+//! starts from a Live member (the drift arm), as an operator reload of a
+//! degraded Live member does; the reload then runs its readiness.
 //!
 //! A member's readiness failure is that member's outcome, never the
 //! mob's: a boot member's attempt is abandoned with the typed
@@ -76,9 +81,10 @@ impl MobActor {
     /// stopped registration taken over, or its registration needing a
     /// durability reload) is left out as the Live-only target set leaves it
     /// out: it has no registration to make ready now, and its recovery runs
-    /// its readiness on the registration it revives or reloads
-    /// (`recover_startup_members`). The settlement settles it Live with no
-    /// readiness run, as the recovery expects.
+    /// its readiness on the registration it wakes or reloads
+    /// (`recover_startup_members`). The settlement returns a taken-over
+    /// member to Dormant and settles a reload-required one Live (see the
+    /// module docs).
     pub(super) async fn held_member_readiness_targets(&self) -> Vec<MemberReadinessTarget> {
         let roster = self.roster.read().await;
         let state = self.dsl_authority.state();
@@ -102,10 +108,11 @@ impl MobActor {
     /// failure. A held member the pass ran no readiness for (none runs while
     /// a lifecycle cleanup owns the mob, the pass was not dispatched, or the
     /// start left the member to be recovered right after it) is settled Live
-    /// as every other member is then. Returns the outcomes
-    /// left to apply (every other member's, and each held member's
-    /// success) and the first held member's readiness failure, which a
-    /// caller may report.
+    /// as every other member is then, except one whose stopped registration
+    /// the start took over: it goes back to Dormant, and its recovery wakes
+    /// it. Returns the outcomes left to apply (every other member's, and each
+    /// held member's success) and the first held member's readiness failure,
+    /// which a caller may report.
     pub(super) async fn settle_held_member_readiness(
         &mut self,
         outcomes: Vec<MemberReadinessOutcome>,
@@ -149,10 +156,64 @@ impl MobActor {
                     self.abandon_startup_boot_member(&entry, attempt, &error)
                         .await;
                 }
+                None if self.taken_over_at_start(&identity) => {
+                    self.return_taken_over_boot_member_to_dormant(&entry, attempt);
+                }
                 None => self.settle_startup_boot_member_live(&entry, attempt).await,
             }
         }
         (rest, first_failure)
+    }
+
+    /// Whether this start took over `agent_identity`'s stopped runtime
+    /// registration (`StartupMemberRecoveryCause::StoppedResidue`): the
+    /// member has no registration left until its recovery wakes it.
+    fn taken_over_at_start(&self, agent_identity: &AgentIdentity) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        {
+            self.startup_member_recoveries
+                .get(agent_identity)
+                .is_some_and(|recovery| {
+                    recovery.cause == super::StartupMemberRecoveryCause::StoppedResidue
+                })
+        }
+        #[cfg(not(feature = "runtime-adapter"))]
+        {
+            let _ = agent_identity;
+            false
+        }
+    }
+
+    /// A boot member whose stopped registration this start took over: its
+    /// attempt closes as NotCurrent, so MobMachine holds it Dormant (its
+    /// boot obligation kept) instead of Live with no registration and no
+    /// readiness. Its recovery, dispatched right after the start, wakes it
+    /// from Dormant (`WakeMember`, the host's build preparer, readiness and
+    /// topology), and that wake settles it Live once it is ready and reports
+    /// its build. A stale attempt is the machine's no-op.
+    fn return_taken_over_boot_member_to_dormant(&mut self, entry: &RosterEntry, attempt: u64) {
+        let verdict = self.apply_member_wake_feedback(
+            &entry.agent_identity,
+            attempt,
+            mob_dsl::MobMachineSignal::AbandonMemberWake {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
+                attempt,
+                kind: mob_dsl::MemberWakeAbandonKind::NotCurrent,
+                reason: format!(
+                    "the start took over the stopped runtime registration of member '{}'; its recovery wakes it",
+                    entry.agent_identity
+                ),
+            },
+            "startup_taken_over_member_dormant",
+        );
+        if verdict != mob_dsl::MemberWakeFeedbackVerdict::Applied {
+            tracing::info!(
+                mob_id = %self.definition.id,
+                agent_identity = %entry.agent_identity,
+                attempt,
+                "a taken-over boot member's attempt closed before the start returned it to Dormant"
+            );
+        }
     }
 
     /// A boot member's readiness settled: MobMachine holds it Live under the

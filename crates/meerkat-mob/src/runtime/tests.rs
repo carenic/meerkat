@@ -39164,6 +39164,23 @@ async fn paused_running_start(
     runtime_mode: crate::MobRuntimeMode,
     peers: &[AgentIdentity],
 ) -> PausedRunningStart {
+    paused_running_start_with(service, adapter, identity, runtime_mode, peers, |builder| {
+        builder
+    })
+    .await
+}
+
+/// [`paused_running_start`] with `configure` applied to the restart's
+/// builder.
+#[cfg(feature = "runtime-adapter")]
+async fn paused_running_start_with(
+    service: &Arc<MockSessionService>,
+    adapter: &Arc<meerkat_runtime::MeerkatMachine>,
+    identity: &AgentIdentity,
+    runtime_mode: crate::MobRuntimeMode,
+    peers: &[AgentIdentity],
+    configure: impl FnOnce(MobBuilder) -> MobBuilder,
+) -> PausedRunningStart {
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
     let runtime_metadata = storage.runtime_metadata.clone();
@@ -39201,14 +39218,16 @@ async fn paused_running_start(
     crash_stop_and_release_routes(handle).await;
 
     let (entered, release) = super::actor::pause_before_startup_binding_restore_for_test(&mob_id);
-    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-        events,
-        runtime_metadata,
-    ))
-    .with_session_service(service.clone())
-    .notify_orchestrator_on_resume(false)
-    // The rows act on a member the start restores before its binding restore.
-    .with_member_restore_policy(MemberRestorePolicy::Eager)
+    let resumed = configure(
+        MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+            events,
+            runtime_metadata,
+        ))
+        .with_session_service(service.clone())
+        .notify_orchestrator_on_resume(false)
+        // The rows act on a member the start restores before its binding restore.
+        .with_member_restore_policy(MemberRestorePolicy::Eager),
+    )
     .resume()
     .await
     .expect("restart the Running mob");
@@ -39268,6 +39287,114 @@ async fn wait_for_member_served_again(
     })
     .await
     .expect("the member taken over at startup is served again");
+}
+
+/// Records every member build a restarted mob reports to its host.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Default)]
+struct StartupBuildReports {
+    built: std::sync::Mutex<Vec<crate::runtime::MemberBuildReport>>,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl StartupBuildReports {
+    fn built_for(&self, identity: &AgentIdentity) -> usize {
+        self.built
+            .lock()
+            .expect("build reports")
+            .iter()
+            .filter(|report| &report.agent_identity == identity)
+            .count()
+    }
+}
+
+#[cfg(feature = "runtime-adapter")]
+#[async_trait]
+impl crate::runtime::MemberBuildPreparer for StartupBuildReports {
+    async fn prepare_member_build(
+        &self,
+        _request: crate::runtime::MemberBuildPreparation,
+    ) -> Result<crate::runtime::MemberBuildPrepared, crate::runtime::MemberBuildPreparationRefusal>
+    {
+        Ok(crate::runtime::MemberBuildPrepared::Prepared)
+    }
+
+    async fn member_built(&self, report: crate::runtime::MemberBuildReport) {
+        self.built.lock().expect("build reports").push(report);
+    }
+}
+
+/// A member taken over at a Running start is never held Live before it is
+/// ready: the start returns it to Dormant, and its recovery wakes it from
+/// Dormant through the ordinary wake. MobMachine counts no materialization
+/// drift for it, and the host's build preparer is told of its build once, by
+/// that wake, never for the registration the start took over.
+#[cfg(feature = "runtime-adapter")]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_member_taken_over_at_a_running_start_is_woken_from_dormant_and_reported_built_once() {
+    let service = Arc::new(MockSessionService::new());
+    let adapter = service.enable_runtime_adapter();
+    let identity = AgentIdentity::from("taken-over-and-woken-from-dormant");
+    let reports = Arc::new(StartupBuildReports::default());
+    let paused = paused_running_start_with(
+        &service,
+        &adapter,
+        &identity,
+        crate::MobRuntimeMode::TurnDriven,
+        &[],
+        |builder| builder.with_member_build_preparer(reports.clone()),
+    )
+    .await;
+    assert!(
+        adapter
+            .stop_runtime_executor_until_terminal_if_current(
+                &paused.registration,
+                "a host stops the member before the start restores it",
+            )
+            .await
+            .expect("stop the member's runtime to terminal"),
+        "the rebuilt registration is current when the host stops it"
+    );
+    paused.release.send(()).expect("release the start");
+
+    wait_for_member_served_again(&service, &adapter, &paused.session_id, &paused.registration)
+        .await;
+    paused
+        .resumed
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn("served after its wake")
+        .await
+        .expect("the woken member serves a turn");
+    // The wake reports the member's build off the actor.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while reports.built_for(&identity) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the wake reports the member's build");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert_eq!(
+        reports.built_for(&identity),
+        1,
+        "the member's build is reported once, by its wake"
+    );
+    let state = paused
+        .resumed
+        .query_machine_state()
+        .await
+        .expect("MobMachine state");
+    assert_eq!(
+        state.member_materialization_drift_count, 0,
+        "the recovery wakes a Dormant member: no counted drift"
+    );
+    assert_eq!(
+        super::actor::startup_registration_takeovers_for_test(&paused.mob_id, &identity),
+        1,
+        "the start takes the stopped registration over exactly once"
+    );
 }
 
 /// A host stops a member's runtime in the window between the builder's
