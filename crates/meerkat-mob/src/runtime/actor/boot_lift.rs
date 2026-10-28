@@ -821,7 +821,11 @@ impl MobActor {
             }
         }
         let context = Arc::new(self.explicit_resume_preparation_context());
+        // The host's build preparer is a runtime adapter input.
+        #[cfg(feature = "runtime-adapter")]
         let preparer = self.member_residency.build_preparer.clone();
+        #[cfg(not(feature = "runtime-adapter"))]
+        let preparer: Option<Arc<dyn super::super::MemberBuildPreparer>> = None;
         let read_handle = self.member_wakes.host_read_handle.clone();
         let provisioner = Arc::clone(&self.provisioner);
         let admission = admission.clone();
