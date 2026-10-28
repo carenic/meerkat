@@ -935,16 +935,17 @@ impl MobActor {
                 .or_default()
                 .push(candidate);
         }
-        // A fork whose source is not rebuilt in this round follows the
-        // overlay its source (or the in-mob ancestor its overlay comes
-        // through) holds in this process, or else the one the rebuild of the
-        // member its chain carries the overlay from would compose, resolved
-        // off the actor below: the source is neither rebuilt nor woken for it.
+        // A fork follows the overlay its source (or the in-mob ancestor its
+        // overlay comes through) holds in this process, or else the one the
+        // rebuild of the member its chain carries the overlay from would
+        // compose, resolved off the actor below: the source is neither rebuilt
+        // nor woken for it. A source rebuilt before the fork, in its round or
+        // earlier, gives the overlay it was rebuilt with instead; the resolved
+        // one covers a source that is not rebuilt (its preparation deferred
+        // or failed, or its rebuild failed before its overlay was composed).
         let mut followed = BTreeMap::new();
         for (fork, source) in &sources {
-            if !in_round.contains(source) {
-                followed.insert(fork.clone(), self.followed_source_overlay(source).await);
-            }
+            followed.insert(fork.clone(), self.followed_source_overlay(source).await);
         }
         let context = Arc::new(self.explicit_resume_preparation_context());
         // The host's build preparer is a runtime adapter input.

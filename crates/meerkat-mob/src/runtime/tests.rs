@@ -31997,6 +31997,98 @@ async fn fork_child_lifted_one_member_at_a_time_is_built_as_its_source() {
     .await;
 }
 
+/// A grandchild (forked from a fork child, its identity sorting before both
+/// the child's and the root source's) that the lift of a stopped mob reaches
+/// one member at a time is built with its root source's overlay, as the
+/// child is.
+///
+/// RED before the fix: the plan reached the grandchild first, alone in its
+/// round, and its rebuild found no overlay held for the child, so it was
+/// built with none.
+#[tokio::test]
+async fn grandchild_lifted_one_member_at_a_time_is_built_as_its_root_source() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let restart_storage = MobStorage::with_events_and_runtime_metadata(
+        storage.events.clone(),
+        storage.runtime_metadata.clone(),
+    );
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let source_identity = AgentIdentity::from("zz-lift-root-source");
+    let source_session = spawn_fork_source_with_build_inputs(&handle, &source_identity).await;
+    let child_identity = AgentIdentity::from("mm-lift-child");
+    let mut child = SpawnMemberSpec::new(ProfileName::from("worker"), child_identity.clone());
+    child.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let child_fork = handle
+        .fork_member(&source_identity, child, None)
+        .await
+        .expect("fork the child");
+    wait_for_fork_source_settled(&handle, &child_fork.session_id).await;
+    let grandchild_identity = AgentIdentity::from("aa-lift-grandchild");
+    let mut grandchild =
+        SpawnMemberSpec::new(ProfileName::from("worker"), grandchild_identity.clone());
+    grandchild.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    let grandchild_fork = handle
+        .fork_member(&child_identity, grandchild, None)
+        .await
+        .expect("fork the grandchild from the child");
+    handle.stop().await.expect("stop");
+    for session in [
+        &source_session,
+        &child_fork.session_id,
+        &grandchild_fork.session_id,
+    ] {
+        MobSessionService::discard_live_session(service.as_ref(), session)
+            .await
+            .expect("discard live session");
+    }
+    crash_stop_and_release_routes(handle).await;
+    let resumed = MobBuilder::for_resume(restart_storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
+        .with_resume_restore_concurrency(1)
+        .resume()
+        .await
+        .expect("resume");
+    resumed
+        .resume()
+        .await
+        .expect("the lift rebuilds the stopped members one at a time");
+
+    let source_build = last_member_build(&service, &source_identity).await;
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            source_build
+                .external_tool_names
+                .iter()
+                .any(|name| name == tool),
+            "the restored source carries its re-supplied overlay tool '{tool}'"
+        );
+    }
+    assert_eq!(
+        last_member_build(&service, &child_identity)
+            .await
+            .external_tool_names,
+        source_build.external_tool_names,
+        "the child is rebuilt with its source's tools"
+    );
+    assert_eq!(
+        last_member_build(&service, &grandchild_identity)
+            .await
+            .external_tool_names,
+        source_build.external_tool_names,
+        "the grandchild is rebuilt with its root source's tools"
+    );
+}
+
 /// A fork child the lift of a stopped mob rebuilds while its source stays
 /// Dormant (the host requires only the child) follows the overlay its source
 /// would be rebuilt with: the lift resolves it from the source's own rebuild

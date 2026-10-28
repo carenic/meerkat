@@ -8732,9 +8732,10 @@ pub(super) struct ExplicitResumeMemberRebuild {
     /// next registration (`HoldUntilReleased`): a rebuild that is not
     /// accepted removes it, as no registration will apply it.
     build_hold_staged: bool,
-    /// For a fork that follows a source this process did not build and that
-    /// is not rebuilt before it, the overlay the lift's preparation resolved
-    /// from the source's chain (`None` for every other rebuild).
+    /// For a fork the lift rebuilds that follows its source, the overlay the
+    /// lift's preparation resolved from the source's chain, which the fork
+    /// takes when its source holds no overlay in this process by then
+    /// (`None` for every other rebuild).
     followed_overlay: Option<super::fork_build::PreparedFollowedOverlay>,
 }
 

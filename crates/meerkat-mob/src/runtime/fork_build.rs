@@ -233,8 +233,8 @@ pub(crate) enum FollowedSourceOverlay {
 }
 
 /// What a lift's preparation resolved, off the actor, for the rebuild of a
-/// fork that follows a source this process did not build and that is not
-/// rebuilt before it ([`resolve_followed_source_overlay`]).
+/// fork that follows its source ([`resolve_followed_source_overlay`]): what
+/// the fork takes when its source holds no overlay in this process by then.
 pub(crate) enum PreparedFollowedOverlay {
     /// The overlay the source (or the in-mob ancestor its overlay comes
     /// through) holds in this process, or the one its rebuild would compose.
@@ -921,9 +921,9 @@ impl super::actor::MobActor {
     /// `session_id` composes, given `spec`, its rebuild request
     /// ([`rebuild_resume_spec`]), and where it comes from. Sources are rebuilt
     /// before their forks in the same pass, so a source's retained overlay is
-    /// the one it is rebuilt with. A fork whose source this process did not
-    /// build (and that is not rebuilt before it) takes `followed`, what the
-    /// lift's preparation resolved from its source's chain.
+    /// the one it is rebuilt with. A fork whose source holds no overlay in
+    /// this process takes `followed`, what the lift's preparation resolved
+    /// from its source's chain.
     pub(super) async fn recustomized_rebuild_overlay(
         &self,
         entry: &RosterEntry,
@@ -972,9 +972,9 @@ impl super::actor::MobActor {
                         );
                         own
                     }
-                    // Nothing was resolved for it: it follows what its source
-                    // holds in this process, which is none (a source this pass
-                    // rebuilt with no overlay holds none).
+                    // Nothing was prepared for it (a rebuild of the explicit
+                    // resume's own live members): it follows what its source
+                    // holds in this process, which is none.
                     None => return Ok((None, RetainedOverlayOrigin::Inherited)),
                 }
             }
