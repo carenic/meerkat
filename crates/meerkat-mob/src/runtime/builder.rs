@@ -8254,7 +8254,27 @@ impl MobBuilder {
     /// Create the mob: emit MobCreated event, start the actor, return handle.
     #[cfg(feature = "runtime-adapter")]
     pub async fn create(self) -> Result<MobHandle, MobError> {
+        #[cfg(test)]
+        self.bind_member_comms_identity_root_for_test();
         Self::create_boxed(self).await
+    }
+
+    /// Test seam: hand the members' session-scoped comms identity root to
+    /// the session service before anything is built, so a test double keys
+    /// its members' comms runtimes where the seats read their keys.
+    #[cfg(test)]
+    fn bind_member_comms_identity_root_for_test(&self) {
+        if let (
+            Some(session_service),
+            Some(super::dormant_seat::MemberSeatEndpointSource::SessionScopedInproc {
+                identity_root,
+            }),
+        ) = (
+            self.session_service.as_ref(),
+            self.member_residency.seat_endpoints.as_ref(),
+        ) {
+            session_service.bind_member_comms_identity_root_for_test(identity_root);
+        }
     }
 
     // Keep the concrete create future out of callers such as agent-tool
@@ -8626,6 +8646,8 @@ impl MobBuilder {
     /// startup task.
     #[cfg(feature = "runtime-adapter")]
     pub async fn resume(self) -> Result<MobHandle, MobError> {
+        #[cfg(test)]
+        self.bind_member_comms_identity_root_for_test();
         let MobBuilder {
             mode,
             before_activation,

@@ -972,6 +972,17 @@ impl MockCommsRuntime {
             use sha2::Digest as _;
             sha2::Sha256::digest(name.as_bytes()).into()
         };
+        Self::with_public_key_bytes(name, key_bytes, behavior, session_id, runtime_adapter)
+    }
+
+    /// A runtime named `name` whose identity is `key_bytes`.
+    fn with_public_key_bytes(
+        name: &str,
+        key_bytes: [u8; 32],
+        behavior: MockCommsBehavior,
+        session_id: SessionId,
+        runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
+    ) -> Self {
         let public_key = meerkat_comms::PubKey::new(key_bytes);
         Self {
             session_id,
@@ -2080,6 +2091,11 @@ struct MockSessionService {
     /// an exact replacement actor without asking the runtime to adopt an
     /// unattached, surface-inserted actor.
     comms_identity_seeds: RwLock<HashMap<SessionId, String>>,
+    /// The members' session-scoped comms identity root the mob seats with
+    /// (bound by its builder). When set, a session's comms runtime is keyed
+    /// from its key pair there, as the agent factory keys it, unless a seed
+    /// above overrides it.
+    member_comms_identity_root: std::sync::Mutex<Option<PathBuf>>,
     runtime_adapter: Mutex<Option<Arc<meerkat_runtime::MeerkatMachine>>>,
     session_counter: AtomicU64,
     /// Records (session_id, prompt) for each create_session call.
@@ -2402,6 +2418,7 @@ impl MockSessionService {
             keep_alive_turns_entered: tokio::sync::watch::Sender::new(HashSet::new()),
             session_comms_names: RwLock::new(HashMap::new()),
             comms_identity_seeds: RwLock::new(HashMap::new()),
+            member_comms_identity_root: std::sync::Mutex::new(None),
             runtime_adapter: Mutex::new(None),
             session_counter: AtomicU64::new(0),
             prompts: RwLock::new(Vec::new()),
@@ -2652,6 +2669,17 @@ impl MockSessionService {
     /// from durable owners rather than inheriting warm in-memory evidence.
     async fn cold_restart_preserving_durable_state(&self) -> Self {
         let restarted = Self::new();
+        // The key pairs under the identity root are files: they survive the
+        // restart, and the restarted service keys its sessions from them.
+        let member_comms_identity_root = self
+            .member_comms_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        *restarted
+            .member_comms_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = member_comms_identity_root;
         let _authority_guard = self.resume_authority_gate.lock().await;
         let persisted_sessions = self.persisted_sessions.read().await.clone();
         let persisted_ids = persisted_sessions.keys().cloned().collect::<HashSet<_>>();
@@ -4018,18 +4046,49 @@ impl MockSessionService {
             .lock()
             .expect("runtime_adapter mutex")
             .clone();
-        let comms_identity_seed = self
-            .comms_identity_seeds
-            .write()
-            .await
-            .remove(&session_id)
-            .unwrap_or_else(|| comms_name.clone());
-        let mut comms = MockCommsRuntime::new(
-            &comms_identity_seed,
-            behavior,
-            session_id.clone(),
-            runtime_adapter,
-        );
+        let comms_identity_seed = self.comms_identity_seeds.write().await.remove(&session_id);
+        let member_comms_identity_root = self
+            .member_comms_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        let mut comms = match (comms_identity_seed, member_comms_identity_root) {
+            // A seed overrides the session's key (a lost identity store).
+            (Some(seed), _) => {
+                MockCommsRuntime::new(&seed, behavior, session_id.clone(), runtime_adapter)
+            }
+            // The session's key pair under the members' identity root, loaded
+            // or minted as the agent factory does: the key a dormant seat
+            // recorded for the session.
+            (None, Some(identity_root)) => {
+                let keypair = match meerkat_comms::Keypair::load_or_generate(
+                    &identity_root.join(session_id.to_string()),
+                )
+                .await
+                {
+                    Ok(keypair) => keypair,
+                    Err(error) => {
+                        self.create_session_in_flight
+                            .fetch_sub(1, Ordering::Relaxed);
+                        return Err(SessionError::Agent(
+                            meerkat_core::error::AgentError::InternalError(format!(
+                                "the mock could not load the comms identity of session {session_id}: {error}"
+                            )),
+                        ));
+                    }
+                };
+                MockCommsRuntime::with_public_key_bytes(
+                    &comms_name,
+                    *keypair.public_key().as_bytes(),
+                    behavior,
+                    session_id.clone(),
+                    runtime_adapter,
+                )
+            }
+            (None, None) => {
+                MockCommsRuntime::new(&comms_name, behavior, session_id.clone(), runtime_adapter)
+            }
+        };
         comms.default_name.clone_from(&comms_name);
         comms.default_address = format!("inproc://{comms_name}");
         let comms = Arc::new(comms);
@@ -5364,6 +5423,13 @@ impl MockSessionService {
 
 #[async_trait]
 impl MobSessionService for MockSessionService {
+    fn bind_member_comms_identity_root_for_test(&self, identity_root: &std::path::Path) {
+        *self
+            .member_comms_identity_root
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(identity_root.to_path_buf());
+    }
+
     async fn recorded_auth_binding(
         &self,
         auth_binding: &meerkat_core::AuthBindingRef,

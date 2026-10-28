@@ -45,8 +45,8 @@ use crate::runtime::builder::{
     MemberRestoreCommit, MemberRestorePlan, MemberRestoreProvisionOutcome, MemberSuccessorSearch,
     PersistedMemberSessionIndex, RecordedContinuity, ResumeMemberRestoreContext,
     ResumeRestoreCandidate, SeatedMemberRestoreOutcome, append_recovered_session_binding,
-    apply_member_restore_plan, member_endpoint_mismatch_detail, member_restore_failure,
-    provision_durable_member_restore, restore_resumed_member,
+    apply_member_restore_plan, member_endpoint_broken_reason, member_endpoint_mismatch_detail,
+    member_restore_failure, provision_durable_member_restore, restore_resumed_member,
 };
 
 /// The wake one turn runs.
@@ -1821,9 +1821,12 @@ async fn check_woken_member_endpoint(
     };
     let candidate = mob_dsl::MemberPeerEndpoint::from(&spec);
     match durable {
-        Some(durable) if durable != &candidate => {
-            Err(member_endpoint_mismatch_detail(&candidate, durable))
-        }
+        // The same typed reason a boot or a resume records for a changed
+        // endpoint: the mismatch and its repair.
+        Some(durable) if durable != &candidate => Err(member_endpoint_broken_reason(
+            &entry.agent_identity,
+            &member_endpoint_mismatch_detail(&candidate, durable),
+        )),
         Some(_) => Ok(WakeEndpoint::Matches),
         None => Ok(WakeEndpoint::Record(spec)),
     }
