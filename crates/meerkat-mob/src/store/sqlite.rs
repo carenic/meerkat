@@ -3892,6 +3892,8 @@ impl SqliteIdentityRuntimeWriteFence {
         // endlessly retried Backoff instead of a typed error, and the fence
         // probe's SQL fails typed on a restructured file anyway.
         #[cfg(test)]
+        identity_fence_test_hooks::before_fence_attempt(&self.path, !wait.is_zero());
+        #[cfg(test)]
         let started = std::time::Instant::now();
         let mut conn = match meerkat_sqlite::open_with(
             &self.path,
@@ -3980,7 +3982,9 @@ impl SqliteIdentityRuntimeWriteFence {
 
 /// Test hooks of the identity runtime write fence, keyed by mob database
 /// path: a fault-injection hold of convergence-status commits (a commit
-/// through a slow fsync) and a record of fence attempts. Unit tests only.
+/// through a slow fsync), a writer that holds the database across the start
+/// of a bounded-wait fence attempt, and a record of fence attempts. Unit
+/// tests only.
 #[cfg(all(test, feature = "runtime-adapter"))]
 pub(crate) mod identity_fence_test_hooks {
     use std::collections::HashMap;
@@ -4011,6 +4015,11 @@ pub(crate) mod identity_fence_test_hooks {
     struct Hooks {
         status_commit_holds: HashMap<PathBuf, StatusCommitHold>,
         fence_attempts: HashMap<PathBuf, Vec<FenceAttempt>>,
+        /// How long a writer holds the database's write lock across the
+        /// start of the next bounded-wait fence attempt, until it does.
+        contended_waits: HashMap<PathBuf, Duration>,
+        /// What that writer did, once it ran.
+        contending_writers: HashMap<PathBuf, String>,
     }
 
     /// How long a convergence-status commit holds its write transaction
@@ -4053,6 +4062,23 @@ pub(crate) mod identity_fence_test_hooks {
         hooks().fence_attempts.entry(key(path)).or_default();
     }
 
+    /// The next bounded-wait fence attempt on the database at `path` starts
+    /// while a writer holds the database's write lock, and the writer keeps
+    /// it for `hold` more, as a convergence-status commit through a slow
+    /// fsync holds it: the attempt waits about `hold` for the lock inside the
+    /// fence, whatever the other writers' timing. The writer takes the lock
+    /// on a connection of its own right before the attempt starts, after any
+    /// commit that holds it then.
+    pub(crate) fn contend_next_waiting_attempt(path: &Path, hold: Duration) {
+        hooks().contended_waits.insert(key(path), hold);
+    }
+
+    /// What the writer of [`contend_next_waiting_attempt`] did on the
+    /// database at `path`; `None` until a bounded-wait attempt started.
+    pub(crate) fn contending_writer(path: &Path) -> Option<String> {
+        hooks().contending_writers.get(&key(path)).cloned()
+    }
+
     /// The fence attempts recorded on the database at `path`.
     pub(crate) fn fence_attempts(path: &Path) -> Vec<FenceAttempt> {
         hooks()
@@ -4068,6 +4094,8 @@ pub(crate) mod identity_fence_test_hooks {
         let mut hooks = hooks();
         hooks.status_commit_holds.remove(&key);
         hooks.fence_attempts.remove(&key);
+        hooks.contended_waits.remove(&key);
+        hooks.contending_writers.remove(&key);
     }
 
     pub(super) fn before_status_commit(path: &Path, decision: Option<IdentityReconcileDecision>) {
@@ -4077,6 +4105,48 @@ pub(crate) mod identity_fence_test_hooks {
         {
             std::thread::sleep(hold);
         }
+    }
+
+    /// Runs the writer [`contend_next_waiting_attempt`] armed, right before
+    /// a bounded-wait fence attempt on the database at `path` starts.
+    pub(super) fn before_fence_attempt(path: &Path, blocking: bool) {
+        if !blocking {
+            return;
+        }
+        // Taken and released in one statement: the hooks lock is never held
+        // across SQLite.
+        let Some(hold) = hooks().contended_waits.remove(path) else {
+            return;
+        };
+        let outcome = hold_write_lock(path, hold);
+        hooks()
+            .contending_writers
+            .insert(path.to_path_buf(), outcome);
+    }
+
+    /// Take the write lock of the database at `path` (after any writer that
+    /// holds it now) and hold it from a thread of its own for `hold`.
+    fn hold_write_lock(path: &Path, hold: Duration) -> String {
+        let conn = match meerkat_sqlite::open_with(
+            path,
+            meerkat_sqlite::ConnectionProfile::Maintenance { write: true },
+            meerkat_sqlite::OpenOptions {
+                busy_timeout: Some(Duration::from_secs(10)),
+                ..meerkat_sqlite::OpenOptions::default()
+            },
+        ) {
+            Ok(conn) => conn,
+            Err(error) => return format!("could not open the database: {error}"),
+        };
+        if let Err(error) = conn.execute_batch("BEGIN IMMEDIATE") {
+            return format!("could not take the write lock: {error}");
+        }
+        std::thread::spawn(move || {
+            std::thread::sleep(hold);
+            // The open transaction ends with the connection either way.
+            let _ = conn.execute_batch("ROLLBACK");
+        });
+        format!("held the write lock for {hold:?} across the attempt's start")
     }
 
     pub(super) fn fence_attempt(path: &Path, attempt: impl FnOnce() -> FenceAttempt) {
