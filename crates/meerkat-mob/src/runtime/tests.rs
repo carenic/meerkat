@@ -32106,8 +32106,60 @@ async fn fork_child_restored_after_a_crash_is_built_as_its_source() {
     .await;
 }
 
-/// Resume the crashed mob over `storage` with the per-identity customizer, and
-/// hand back a storage over the same durable truth for the next restart.
+/// Under the lazy default a restart leaves the fork source and its child
+/// Dormant, and a wake rebuilds one member. The child woken while its source
+/// stays Dormant is built with the overlay its source would be rebuilt with
+/// (the host's overlay for the source), computed without waking the source,
+/// never with the host's overlay for the child's own identity.
+#[tokio::test]
+async fn fork_child_woken_while_its_source_is_dormant_is_built_as_its_source() {
+    let (service, storage, source_identity, child_identity, first, expected_source) =
+        seat_fork_child_then_crash(false).await;
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .resume()
+        .await
+        .expect("resume");
+    let dormant = Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant);
+    assert_eq!(
+        resumed.member_materialization_for_test(&source_identity),
+        dormant
+    );
+    assert_eq!(
+        resumed.member_materialization_for_test(&child_identity),
+        dormant
+    );
+
+    resumed
+        .ensure_member_live(&child_identity)
+        .await
+        .expect("the child wakes");
+    assert_eq!(
+        resumed.member_materialization_for_test(&source_identity),
+        dormant,
+        "the source is not woken for its child"
+    );
+    let rebuilt = last_member_build(&service, &child_identity).await;
+    assert_rebuilt_as_first_build(&first, &rebuilt, &expected_source);
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            rebuilt.external_tool_names.iter().any(|name| name == tool),
+            "the woken child carries the overlay its source would be rebuilt with ('{tool}'): {:?}",
+            rebuilt.external_tool_names
+        );
+    }
+    assert!(
+        !rebuilt
+            .external_tool_names
+            .iter()
+            .any(|name| name == GENERIC_RESUME_OVERLAY_TOOL),
+        "the woken child is not given the host's overlay for its own identity: {:?}",
+        rebuilt.external_tool_names
+    );
+}
 async fn restart_with_identity_overlays(
     service: &Arc<MockSessionService>,
     storage: MobStorage,

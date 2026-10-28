@@ -12095,6 +12095,7 @@ async fn restore_resumed_members(
                         base,
                         super::fork_build::ForkOverlayRule::Own,
                         no_restored_overlays,
+                        None,
                     )
                     .await
                     .map(MemberRestoreStep::Planned)
@@ -12457,6 +12458,7 @@ async fn apply_member_restore_step(
                 commit.authority,
                 fork_rule,
                 commit.restored_overlays,
+                None,
             ))
             .await?
         }
@@ -12470,7 +12472,11 @@ async fn apply_member_restore_step(
 ///
 /// `fork_rule` is the member's overlay rule, and `restored_overlays` the
 /// overlays the members restored before it in this pass were restored with,
-/// which a rule that follows the member's source reads.
+/// which a rule that follows the member's source reads. `retained` is the
+/// overlay this process last built the member with (a wake of a member it
+/// built before), which the member keeps, as its warm revival does, unless
+/// its source is gone; a restore of members this process never built passes
+/// `None`.
 #[cfg(feature = "runtime-adapter")]
 pub(super) async fn restore_resumed_member(
     ctx: &ResumeMemberRestoreContext<'_>,
@@ -12478,6 +12484,7 @@ pub(super) async fn restore_resumed_member(
     base: &crate::machines::mob_machine::MobMachineAuthority,
     fork_rule: super::fork_build::ForkOverlayRule,
     restored_overlays: &BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    retained: Option<&super::fork_build::RetainedMemberOverlay>,
 ) -> Result<MemberRestorePlan, MobError> {
     let entry = &candidate.entry;
     let definition = ctx.definition;
@@ -12630,42 +12637,59 @@ pub(super) async fn restore_resumed_member(
         )
     };
     let mut restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Own;
-    let restore_overlay = match fork_rule {
-        super::fork_build::ForkOverlayRule::Own => own_overlay()?,
-        super::fork_build::ForkOverlayRule::Caller => {
-            let own = own_overlay()?;
-            if own.is_none() {
-                super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
-            }
-            own
-        }
-        super::fork_build::ForkOverlayRule::FollowSource(source) => {
-            match restored_overlays.get(&source).cloned() {
-                Some(source_overlay) => {
-                    restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Inherited;
-                    source_overlay
+    // A member this process built before keeps the overlay it was built
+    // with, as its warm revival does (`fork_build`): the customizer is asked
+    // only for a member nothing is retained for. A fork whose source is gone
+    // or replaced is the exception: it takes the overlay for its own
+    // identity, below.
+    let retained = retained.filter(|_| {
+        !matches!(
+            fork_rule,
+            super::fork_build::ForkOverlayRule::SourceUnavailable(_)
+        )
+    });
+    let restore_overlay = if let Some(retained) = retained {
+        restore_overlay_origin = retained.origin;
+        Some(Arc::clone(&retained.overlay))
+    } else {
+        match fork_rule {
+            super::fork_build::ForkOverlayRule::Own => own_overlay()?,
+            super::fork_build::ForkOverlayRule::Caller => {
+                let own = own_overlay()?;
+                if own.is_none() {
+                    super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
                 }
-                None => {
-                    let own = own_overlay()?;
-                    super::fork_build::warn_fork_source_unavailable(
-                        &definition.id,
-                        entry,
-                        &super::fork_build::ForkSourceUnavailable::NotRebuilt,
-                        own.is_some(),
-                    );
-                    own
+                own
+            }
+            super::fork_build::ForkOverlayRule::FollowSource(source) => {
+                match restored_overlays.get(&source).cloned() {
+                    Some(source_overlay) => {
+                        restore_overlay_origin =
+                            super::fork_build::RetainedOverlayOrigin::Inherited;
+                        source_overlay
+                    }
+                    None => {
+                        let own = own_overlay()?;
+                        super::fork_build::warn_fork_source_unavailable(
+                            &definition.id,
+                            entry,
+                            &super::fork_build::ForkSourceUnavailable::NotRebuilt,
+                            own.is_some(),
+                        );
+                        own
+                    }
                 }
             }
-        }
-        super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
-            let own = own_overlay()?;
-            super::fork_build::warn_fork_source_unavailable(
-                &definition.id,
-                entry,
-                &reason,
-                own.is_some(),
-            );
-            own
+            super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
+                let own = own_overlay()?;
+                super::fork_build::warn_fork_source_unavailable(
+                    &definition.id,
+                    entry,
+                    &reason,
+                    own.is_some(),
+                );
+                own
+            }
         }
     };
     // The member's turn seeds the actor's retention map with the overlay

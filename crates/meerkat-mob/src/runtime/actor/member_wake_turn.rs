@@ -6,7 +6,9 @@
 //!
 //! - Step A (on the actor, [`MobActor::start_member_materialization`]): the
 //!   attempt MobMachine authorized is still open; take the member's own fork
-//!   of the authority, its overlay rule and the overlays it may follow, its
+//!   of the authority, its overlay rule, the overlay this process last built
+//!   it with (kept, as a warm revival keeps it), where a fork that follows
+//!   its source takes that source's overlay from (see `fork_build`), its
 //!   continuity intent, and dispatch the restore.
 //! - Step B (off the actor, [`plan_member_wake`]): the cold restore recipe
 //!   (`restore_resumed_member`) plans the member's restore on its own fork,
@@ -227,7 +229,14 @@ struct WakeRestoreInput {
     candidate: ResumeRestoreCandidate,
     base: mob_dsl::MobMachineAuthority,
     fork_rule: super::super::fork_build::ForkOverlayRule,
-    overlays: BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    /// The overlay this process last built the member with, if any.
+    retained: Option<super::super::fork_build::RetainedMemberOverlay>,
+    /// For a fork that follows its source and that this process did not
+    /// build: the source, and where its overlay comes from.
+    followed: Option<(
+        AgentIdentity,
+        super::super::fork_build::FollowedSourceOverlay,
+    )>,
     durable_endpoint: Option<mob_dsl::MemberPeerEndpoint>,
     member_bound_sessions: HashSet<SessionId>,
 }
@@ -505,22 +514,27 @@ impl MobActor {
         }
         let continuity = self.member_wakes.continuity.slice_for(&identity);
         let fork_rule = self.fork_overlay_rule(&entry).await;
-        // The overlay a fork follows: its in-mob source's retained overlay,
-        // when that source was built in this process (it is Live); a dormant
-        // source was not rebuilt, so the fork takes its own rule.
-        let mut overlays = BTreeMap::new();
-        if let super::super::fork_build::ForkOverlayRule::FollowSource(source) = &fork_rule
-            && matches!(
-                self.dsl_authority
-                    .state()
-                    .member_materialization
-                    .get(&mob_dsl::AgentIdentity::from_domain(source)),
-                Some(mob_dsl::MemberMaterializationPhase::Live)
-            )
-        {
-            let retained = self.per_spawn_external_tools.read().await;
-            overlays.insert(source.clone(), retained.get(source).cloned());
-        }
+        // The overlay this process last built the member with, which the
+        // member keeps (a released member, or a revival through its wake), as
+        // its warm revival does. A fork that follows its source and that this
+        // process did not build takes the overlay its source holds here, or
+        // the one its source would be rebuilt with, computed in the restore
+        // without waking the source (see `fork_build`).
+        let retained = self
+            .per_spawn_external_tools
+            .read()
+            .await
+            .retained(&identity);
+        let followed = match &fork_rule {
+            super::super::fork_build::ForkOverlayRule::FollowSource(source)
+                if retained.is_none() =>
+            {
+                self.followed_source_overlay(source)
+                    .await
+                    .map(|followed| (source.clone(), followed))
+            }
+            _ => None,
+        };
         let input = WakeRestoreInput {
             definition: Arc::clone(&self.definition),
             session_service: Arc::clone(&self.session_service),
@@ -544,7 +558,8 @@ impl MobActor {
             },
             base: self.dsl_authority.fork(),
             fork_rule,
-            overlays,
+            retained,
+            followed,
             durable_endpoint,
             member_bound_sessions,
         };
@@ -1577,7 +1592,8 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         candidate,
         base,
         fork_rule,
-        overlays,
+        retained,
+        followed,
         durable_endpoint,
         member_bound_sessions,
     } = input;
@@ -1613,7 +1629,53 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         member_build_preparer: member_build_preparer.as_ref(),
         host_read_handle: &host_read_handle,
     };
-    let plan = restore_resumed_member(&ctx, &candidate, &base, fork_rule, &overlays).await?;
+    // The overlay the followed source holds in this process, or the one its
+    // rebuild would compose, computed here, off the actor, without waking it.
+    // A source whose rebuild would fail leaves the fork to its own rule,
+    // warned, as when its source is not rebuilt beside it.
+    let mut overlays = BTreeMap::new();
+    if let Some((source, followed)) = followed {
+        match followed {
+            super::super::fork_build::FollowedSourceOverlay::Retained(overlay) => {
+                overlays.insert(source, overlay);
+            }
+            super::super::fork_build::FollowedSourceOverlay::Rebuild {
+                entry: source_entry,
+                session_id,
+                seat_build,
+            } => match super::super::fork_build::rebuilt_own_overlay(
+                &definition.id,
+                session_service.as_ref(),
+                spawn_member_customizer.as_ref(),
+                &source_entry,
+                &session_id,
+                seat_build.as_deref(),
+            )
+            .await
+            {
+                Ok(overlay) => {
+                    overlays.insert(source, overlay);
+                }
+                Err(error) => tracing::warn!(
+                    mob_id = %definition.id,
+                    agent_identity = %candidate.entry.agent_identity,
+                    source = %source,
+                    overlay_member = %source_entry.agent_identity,
+                    %error,
+                    "the overlay a woken fork follows could not be computed from its source's rebuild"
+                ),
+            },
+        }
+    }
+    let plan = restore_resumed_member(
+        &ctx,
+        &candidate,
+        &base,
+        fork_rule,
+        &overlays,
+        retained.as_ref(),
+    )
+    .await?;
     let entry = &candidate.entry;
     let (seating, missing, mut seated) = match plan {
         MemberRestorePlan::Seated {

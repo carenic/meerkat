@@ -238,7 +238,11 @@ them.
   cause of one member joins one wake. A refused wake is typed:
   `MobError::MemberWakeRefused { member_id, refusal: MemberWakeRefusal }`
   (`MemberWakeRefusal::is_retryable`), or the member's restore failure as a
-  boot restore records it. Reads never wake. The first wake of a member whose
+  boot restore records it. Reads never wake. A woken member is built with the
+  per-spawn tool overlay this process last built it with, as a warm revival
+  is; a fork child this process did not build follows the overlay its source
+  holds here, or else the one its source would be rebuilt with, and the
+  source is not woken for it. The first wake of a member whose
   seat built nothing creates its session under the id the seat named (see
   `MobHandle::seat_dormant_members`), after the host's build preparation, as
   any wake prepares it; a registration the host refuses there
