@@ -132,6 +132,17 @@ pub struct SessionResumeRejection {
 }
 
 impl SessionResumeRejection {
+    /// meerkat's typed durable resume hold this rejection reports: an
+    /// unprovable committed boundary withholds the durable tail from resume
+    /// (held for, or refused by, its recovery) and keeps it intact, as
+    /// [`MobError::durable_resume_hold`] reports it for the error this
+    /// rejection becomes.
+    #[must_use]
+    pub fn durable_resume_hold(&self) -> Option<meerkat_core::service::DurableResumeHold> {
+        (self.kind == ResumeRejectionKind::CommittedBoundaryUnprovable)
+            .then_some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery)
+    }
+
     #[must_use]
     pub fn into_mob_error(self) -> MobError {
         let reason = match self.kind {

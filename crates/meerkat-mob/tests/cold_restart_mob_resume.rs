@@ -1720,7 +1720,11 @@ async fn assistant_message_count(
 /// then leaves the member Dormant and does not revive its session, although
 /// the runtime's kept state still owes a background operation completion;
 /// the store's recovery scan does not list an archived runtime. The
-/// member's next wake revives the session and runs that work as a turn.
+/// member's next wake revives the session and delivers that work: the
+/// revived runtime injects the completion as a continuation and records its
+/// injected cursor durably. The transcript ends with the first turn's
+/// answer, so the continuation has no pending boundary and asks the model
+/// nothing; the model sees the completion at the member's next turn.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
 async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_next_wake() {
@@ -1770,19 +1774,15 @@ async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_nex
         "before-outside-retire",
     )
     .await;
-    // The turn's answer is in the history too before the count is taken.
+    // The turn's answer is in the history too before the runtime is retired.
     let deadline = Instant::now() + Duration::from_secs(20);
-    let answered_before = loop {
-        let answered = assistant_message_count(service_1.as_ref(), &session_id).await;
-        if answered > 0 {
-            break answered;
-        }
+    while assistant_message_count(service_1.as_ref(), &session_id).await == 0 {
         assert!(
             Instant::now() < deadline,
             "the first turn's answer reaches the history"
         );
         sleep(Duration::from_millis(200)).await;
-    };
+    }
 
     let runtime_id = meerkat_runtime::LogicalRuntimeId::for_session(&session_id);
     let adapter = service_1
@@ -1810,10 +1810,17 @@ async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_nex
 
     // ---------------- Lifetime 2: the kept state owes a completion ----------
     let runtime_store_2 = open_runtime_store();
+    let owed = undelivered_background_completion(&session_id);
+    let owed_seq = owed
+        .completion_entries
+        .iter()
+        .map(|entry| entry.seq)
+        .max()
+        .expect("the owed completion's sequence");
     meerkat_runtime::RuntimeStore::persist_ops_lifecycle(
         runtime_store_2.as_ref(),
         &runtime_id,
-        &undelivered_background_completion(&session_id),
+        &owed,
     )
     .await
     .expect("the owed completion is durable");
@@ -1868,18 +1875,24 @@ async fn a_member_retired_outside_the_mob_stays_dormant_at_a_start_until_its_nex
         Some(meerkat_runtime::RuntimeState::Retired),
         "the wake revives the runtime"
     );
-    // No prompt reached the member since its first turn: a new answer is the
-    // turn its runtime ran to deliver the owed completion.
+    // The revived runtime delivers the owed completion: it injects it as a
+    // continuation, and records the injected cursor with its ops lifecycle.
     let deadline = Instant::now() + Duration::from_secs(20);
     loop {
-        let answered = assistant_message_count(service_2.as_ref(), &session_id).await;
-        if answered > answered_before {
+        let injected = meerkat_runtime::RuntimeStore::load_ops_lifecycle(
+            runtime_store_2.as_ref(),
+            &runtime_id,
+        )
+        .await
+        .expect("load the revived runtime's ops lifecycle")
+        .map(|snapshot| snapshot.cursors.runtime_last_injected_seq);
+        if injected.is_some_and(|seq| seq >= owed_seq) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the revived runtime runs the owed completion as a turn ({answered} answers, \
-             {answered_before} before the retire)"
+            "the revived runtime delivers the owed completion (injected through {injected:?}, \
+             owed {owed_seq})"
         );
         sleep(Duration::from_millis(200)).await;
     }
@@ -12650,65 +12663,69 @@ async fn a_mob_start_after_a_graceful_stop_resumes_a_members_open_run_whole_blob
     let _ = handle.shutdown().await;
 }
 
-/// The typed refusal a start that cannot prove a member's tail fails with,
-/// through any shared-failure wrapper.
-#[cfg(feature = "test-support")]
-fn is_unprovable_tail_start_failure(
-    error: &meerkat_mob::MobError,
-    member: &AgentIdentity,
-    session: &meerkat_core::types::SessionId,
-) -> bool {
-    match error {
-        meerkat_mob::MobError::SharedLifecycleFailure(inner) => {
-            is_unprovable_tail_start_failure(inner, member, session)
-        }
-        meerkat_mob::MobError::MemberStartupRecoveryFailed {
-            member_id,
-            session_id,
-            cause,
-        } => {
-            member_id == member
-                && session_id == session
-                && matches!(
-                    cause.as_ref(),
-                    meerkat_mob::MobError::MemberDurableTailUnprovable { member_id, session_id }
-                        if member_id == member && session_id == session
-                )
-        }
-        _ => false,
-    }
-}
-
 /// Unprovable still means unprovable: over the same suspended run, a store
 /// whose durable-tail recovery HOLDS the tail (it cannot produce exact
-/// recovery evidence) gives the settle no continuation to report, so the
-/// start still refuses, typed, and leaves the tail as it was.
+/// recovery evidence) never lets the member resume over it, and the tail
+/// stays as it was. The start of the stopped mob reads no member session, so
+/// it starts the mob Stopped with the member Dormant. The lift wakes the
+/// member for the work its tail owes; the store refuses its resume at the
+/// unprovable boundary, so the member is Broken and the lift answers Ok (a
+/// member's restore failure is its own outcome). A wake of the member then
+/// answers its typed restore failure, carrying the durable resume hold a host
+/// reads (`TailHeldForRecovery`, as the start's refusal reported it before
+/// the start read no member session), and nothing resumes the run.
 #[cfg(feature = "test-support")]
 #[tokio::test(flavor = "multi_thread")]
-async fn a_mob_start_over_a_held_member_tail_still_refuses_typed() {
+async fn a_held_member_tail_is_refused_typed_at_the_members_wake() {
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
     let temp = tempfile::tempdir().expect("temp dir");
     let paths = Paths::new(temp.path());
     let power_store = Arc::new(PowerCutRuntimeStore::new(&paths.realm_db_path));
     let runtime_store: Arc<dyn meerkat_runtime::RuntimeStore> = power_store.clone();
     let run = stop_gracefully_over_an_open_member_run(&paths, runtime_store.clone(), true).await;
+    let member = AgentIdentity::from("w-1");
 
     power_store.hold_durable_tail_recovery(true);
     let client_2 = Arc::new(HoldingToolLoopClient::new(0));
     let service_2 = requeue_service(&paths, runtime_store.clone(), true, client_2.clone());
-    // The start fails in the mob's actor before it admits a command: the
-    // builder may hand back the handle, whose status then carries the
-    // fail-stop.
-    let error = match start_again(&paths, service_2.clone(), client_2.clone()).await {
-        Err(error) => error,
-        Ok(handle) => handle
-            .status()
-            .await
-            .expect_err("a start over a held tail fail-stops the mob"),
-    };
-    assert!(
-        is_unprovable_tail_start_failure(&error, &AgentIdentity::from("w-1"), &run.w1_sid),
-        "the start refuses with the member's typed unprovable tail: {error:?}"
+    let handle = start_again(&paths, service_2.clone(), client_2.clone())
+        .await
+        .expect("the start of a stopped mob reads no member session");
+    assert_eq!(
+        handle.status().await.expect("the started mob answers"),
+        meerkat_mob::MobState::Stopped,
+        "the start keeps the mob Stopped"
     );
+    assert_eq!(
+        handle.member_materialization_for_test(&member),
+        Some(MemberMaterializationPhase::Dormant),
+        "the start leaves the member Dormant"
+    );
+    assert_eq!(
+        provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true).await,
+        Some(run.run_id.clone()),
+        "the start leaves the held tail as the shutdown left it"
+    );
+
+    tokio::time::timeout(Duration::from_secs(60), handle.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift resumes the mob: the member's refused restore is its own outcome");
+    let refused = tokio::time::timeout(Duration::from_secs(30), handle.ensure_member_live(&member))
+        .await
+        .expect("the wake answers");
+    match &refused {
+        Err(error @ meerkat_mob::MobError::MemberRestoreFailed { member_id, .. }) => {
+            assert_eq!(member_id, &member);
+            assert_eq!(
+                error.durable_resume_hold(),
+                Some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery),
+                "the Broken member carries the typed hold: {error:?}"
+            );
+        }
+        other => panic!("the member's wake answers its typed restore failure: {other:?}"),
+    }
     assert_eq!(
         provisional_tail_run(runtime_store.as_ref(), &run.w1_sid, true).await,
         Some(run.run_id.clone()),
@@ -12721,6 +12738,7 @@ async fn a_mob_start_over_a_held_member_tail_still_refuses_typed() {
         0,
         "nothing resumed the run"
     );
+    let _ = handle.shutdown().await;
 }
 
 // ---------------------------------------------------------------------------

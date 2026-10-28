@@ -537,6 +537,19 @@ them.
   persisted state, a held durable tail and every other cause still record the
   member Broken with the typed reason.
 
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a member whose
+  durable tail its store's recovery holds (the session owner cannot prove its
+  committed boundary) no longer fails the start of a stopped mob, which reads
+  no member session: the mob starts Stopped with the member Dormant, and the
+  tail is kept. The member's first materialization (the lift's plan, or a
+  wake) records it Broken, and its callers get `MobError::MemberRestoreFailed`
+  whose `durable_resume_hold()` answers `TailHeldForRecovery` (also on the
+  wire, under `durable_resume_hold`), as the start's
+  `MemberStartupRecoveryFailed` did in 0.9.6. `MobError::durable_resume_hold`
+  answers `TailHeldForRecovery` for `SessionUnavailableForResume` with
+  `CommittedBoundaryUnprovable` too, and so does the new
+  `SessionResumeRejection::durable_resume_hold`.
+
 - Behaviour-only (not measured by the gate): `meerkat-mob`: the lift of a
   stopped mob (`MobHandle::resume`) answers a typed error only for a member
   it rebuilds whose restore failed terminally before its provision (its
@@ -687,8 +700,9 @@ them.
   archived runtime now holds no recovery work, and none of that is read.
   A mob member still seated on a session whose runtime was retired outside
   the mob (through `RuntimeControlPlane`) now stays Dormant at a start
-  instead of having that session revived, and its owed work runs at its
-  next wake or at a resume that names the session. A destroyed runtime's
+  instead of having that session revived, and its owed work is delivered at
+  its next wake or at a resume that names the session; the model sees it at
+  the member's next turn. A destroyed runtime's
   session is never revived: for a member seated on one, the refused
   restore moves from the start to its next wake. A session archived by a
   retire still revives on a resume that names it.

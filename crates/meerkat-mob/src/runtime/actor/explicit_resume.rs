@@ -749,7 +749,7 @@ impl MobActor {
                                 crate::runtime::handle::RestoreFailureDiagnostic {
                                     bridge_session_id: Some(work.rebuild.bridge_session_id.clone()),
                                     reason,
-                                    hold: None,
+                                    hold: error.durable_resume_hold(),
                                     registration_refusal: None,
                                 },
                             )
