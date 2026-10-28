@@ -225,10 +225,12 @@ async fn an_explicit_resume_retires_a_dormant_members_retained_attachment_and_ke
 /// `count` turn-driven workers built on a session service, their mob stopped
 /// and its process gone: a fresh service holds their durable sessions only,
 /// and the stopped mob is reconstructed from its storage under the Eager
-/// policy, every member Dormant.
+/// policy, every member Dormant, with the host's build `preparer` and an
+/// owed retry that runs within a few [`RETRY_STEP`]s.
 async fn built_stopped_mob(
     label: &str,
     count: usize,
+    preparer: Option<Arc<dyn crate::runtime::MemberBuildPreparer>>,
 ) -> (
     MobHandle,
     Arc<MockSessionService>,
@@ -264,13 +266,20 @@ async fn built_stopped_mob(
     let resumed = tokio::time::timeout(
         ROW_STEP,
         Box::pin(
-            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-                events,
-                runtime_metadata,
-            ))
-            .with_session_service(restarted.clone())
-            .notify_orchestrator_on_resume(false)
-            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            {
+                let builder = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                    events,
+                    runtime_metadata,
+                ))
+                .with_session_service(restarted.clone())
+                .notify_orchestrator_on_resume(false)
+                .with_member_restore_policy(MemberRestorePolicy::Eager)
+                .with_member_wake_retry_backoff(RETRY_STEP, RETRY_STEP * 2);
+                match preparer {
+                    Some(preparer) => builder.with_member_build_preparer(preparer),
+                    None => builder,
+                }
+            }
             .resume(),
         ),
     )
@@ -296,7 +305,8 @@ async fn built_stopped_mob(
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift_answers_the_store_error()
  {
-    let (resumed, service, members) = built_stopped_mob("lift-observation-store-failure", 3).await;
+    let (resumed, service, members) =
+        built_stopped_mob("lift-observation-store-failure", 3, None).await;
     let (failing, failing_session) = members[1].clone();
     service.fail_next_resume_authority_observes_for(&failing_session, 1);
 
@@ -453,8 +463,9 @@ async fn a_wake_whose_view_read_finds_the_state_malformed_breaks_the_member() {
 }
 
 /// The lift of a stopped mob whose planned member's view read finds its
-/// persisted state malformed breaks that member with the typed reason, and
-/// no owed retry reads the session again.
+/// persisted state malformed breaks that member with the typed reason, the
+/// explicit resume answers that typed error, and no owed retry reads the
+/// session again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
     let (service, storage, member, session) =
@@ -470,9 +481,17 @@ async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
     );
     service.find_persisted_session_metadata_malformed_for(session.clone());
 
-    let _lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
+    let error = tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
-        .expect("the explicit resume answers");
+        .expect("the explicit resume answers")
+        .expect_err("the explicit resume answers the member's typed restore failure");
+    assert!(
+        matches!(
+            shared_cause(&error),
+            MobError::SessionError(SessionError::Store(_))
+        ),
+        "a typed store error: {error:?}"
+    );
     assert_eq!(
         resumed.status().await.expect("the mob answers"),
         MobState::Running
@@ -573,5 +592,99 @@ async fn a_lifted_member_whose_repoint_fails_ends_alone_with_its_own_error() {
         status.current_session_id.as_ref(),
         Some(&successor),
         "a member whose repoint failed is not bound to its successor"
+    );
+}
+
+/// The cause an explicit resume answered: a shared lifecycle operation's
+/// failure reaches every caller inside the shared envelope.
+fn shared_cause(error: &MobError) -> &MobError {
+    match error {
+        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
+        other => other,
+    }
+}
+
+/// A host that asks to prepare one member's build later, once, and prepares
+/// every other build.
+struct PreparesLaterOnce {
+    member: AgentIdentity,
+    asked: AtomicBool,
+}
+
+#[async_trait]
+impl crate::runtime::MemberBuildPreparer for PreparesLaterOnce {
+    async fn prepare_member_build(
+        &self,
+        request: crate::runtime::MemberBuildPreparation,
+    ) -> Result<crate::runtime::MemberBuildPrepared, crate::runtime::MemberBuildPreparationRefusal>
+    {
+        if request.agent_identity == self.member && !self.asked.swap(true, Ordering::SeqCst) {
+            return Err(crate::runtime::MemberBuildPreparationRefusal::Retryable {
+                reason: "the host is not ready for this member yet".to_string(),
+            });
+        }
+        Ok(crate::runtime::MemberBuildPrepared::Prepared)
+    }
+}
+
+/// The lift of a stopped mob whose host asks to prepare a planned member's
+/// build later ends that member retryable: Dormant, never Broken, its owed
+/// retry armed. The explicit resume answers the typed retryable refusal a
+/// wake's caller gets, every other member is Live, and the owed retry
+/// materializes the member once the host prepares its build.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lift_answers_typed() {
+    let deferred = AgentIdentity::from("lifted-1");
+    let preparer = Arc::new(PreparesLaterOnce {
+        member: deferred.clone(),
+        asked: AtomicBool::new(false),
+    });
+    let (resumed, _service, members) =
+        built_stopped_mob("lift-host-prepares-later", 3, Some(preparer)).await;
+
+    let error = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers")
+        .expect_err("the lift answers the member's typed retryable refusal");
+    assert!(
+        matches!(
+            shared_cause(&error),
+            MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::HostPreparationPending,
+                ..
+            }
+        ),
+        "the typed retryable refusal: {error:?}"
+    );
+    let status = resumed
+        .member_status(&deferred)
+        .await
+        .expect("the member's status");
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a host that asks to prepare later never breaks the member: {status:?}"
+    );
+    for (identity, _) in members.iter().filter(|(identity, _)| identity != &deferred) {
+        assert_eq!(
+            phase_of(&resumed, identity),
+            Some(dsl::MemberMaterializationPhase::Live),
+            "{identity} is Live"
+        );
+    }
+    let mut published = resumed.machine_state_watch_rx.clone();
+    let deferred_id = dsl::AgentIdentity::from_domain(&deferred);
+    let retried = tokio::time::timeout(
+        ROW_STEP,
+        published.wait_for(|state| {
+            state.member_materialization.get(&deferred_id)
+                == Some(&dsl::MemberMaterializationPhase::Live)
+        }),
+    )
+    .await
+    .is_ok_and(|seen| seen.is_ok());
+    assert!(
+        retried,
+        "the member's owed retry materializes it once the host prepares its build"
     );
 }

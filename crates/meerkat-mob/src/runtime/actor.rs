@@ -8808,7 +8808,13 @@ pub(super) enum UnprovenResumeCustodyStage {
 
 pub(super) enum ExplicitResumeMemberCompletion {
     Accepted,
+    /// The member's rebuild failed once MobMachine had authorized its
+    /// revival: its recipe, provision or custody. The member's own outcome.
     Failed(MobError),
+    /// The member's live and durable observation, or its classification,
+    /// failed before MobMachine authorized its revival: the explicit resume
+    /// answers it, as it answers a member it could not prepare.
+    ObservationFailed(MobError),
     Superseded,
 }
 
@@ -29073,8 +29079,8 @@ impl MobActor {
                 } => {
                     Box::pin(self.explicit_resume_member_unproven(work, failure, stage)).await;
                 }
-                MobCommand::ResumeLifecycleBootMemberSettled { member, joined } => {
-                    Box::pin(self.explicit_resume_boot_member_settled(member, joined)).await;
+                MobCommand::ResumeLifecycleBootMemberSettled { member, failure } => {
+                    Box::pin(self.explicit_resume_boot_member_settled(member, failure)).await;
                 }
                 MobCommand::ResumeLifecycleBootMembersPrepared {
                     resume_attempt,

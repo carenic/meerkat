@@ -18,6 +18,16 @@
 //! by the actor's wake path instead (the cold recipe creates the session,
 //! or registers the endpoint), and the explicit resume joins that wake. The
 //! lift answers its caller only after the members it materializes settled.
+//! It answers Ok unless a member it waited on did not end Live for a failure
+//! the resume itself answers; then it answers the first such member's typed
+//! error: a member that ended retryable (Dormant, its owed retry armed), a
+//! member whose restore failed before its provision (a read or the
+//! observation, the customizer, the host's build preparation, a successor
+//! repoint, its reservation), a member whose readiness failed, and a member
+//! the cold recipe left Broken (its typed failure does not tell the stage).
+//! A member whose recipe, provision or custody failed once MobMachine
+//! authorized its revival, or whose durable session is missing, is Broken as
+//! that member's own outcome, and the lift answers Ok for it.
 //! A member is never materialized twice: one attempt per member, and every
 //! other wake of it joins that attempt. Every other member stays Dormant and
 //! is materialized by its first delivery.
@@ -613,7 +623,8 @@ impl MobActor {
     }
 
     /// Watch `member`'s wake attempt (`wake_attempt`) until it closes, then
-    /// hand the close to the actor (`ResumeLifecycleBootMemberSettled`).
+    /// hand the close to the actor (`ResumeLifecycleBootMemberSettled`), with
+    /// the wake's typed answer when it did not end Live.
     ///
     /// The lift waits for this wake, to settle the member or to free its slot
     /// of the plan, and the member's materialization is the host's to finish
@@ -635,7 +646,15 @@ impl MobActor {
             &member.agent_identity,
         );
         self.actor_io_tasks.spawn(async move {
-            let joined = outcome_rx.await.is_ok_and(|outcome| outcome.is_ok());
+            let failure = match outcome_rx.await {
+                Ok(Ok(_)) => None,
+                Ok(Err(failure)) => Some(failure.into_mob_error(&member.agent_identity)),
+                // The actor exited with the wake in flight.
+                Err(_) => Some(MobError::MemberWakeRefused {
+                    member_id: member.agent_identity.clone(),
+                    refusal: crate::MemberWakeRefusal::MobUnavailable,
+                }),
+            };
             #[cfg(test)]
             if let Some((entered, release)) = settle_hold {
                 let _ = entered.send(());
@@ -645,7 +664,7 @@ impl MobActor {
                 .send(RoutedMobCommand::internal(
                     MobCommand::ResumeLifecycleBootMemberSettled {
                         member: Box::new(member),
-                        joined,
+                        failure,
                     },
                 ))
                 .await;
@@ -672,22 +691,37 @@ impl MobActor {
 
     /// One planned member's wake closed. The wake path resolved the member
     /// through the machine (Live; Broken with its typed reason; or Dormant
-    /// again for a retryable cause, its obligation owed and retried), so the
-    /// lift reports none of those as its own failure: it settles the
-    /// member's resume work and goes on once every member settled. The
-    /// closed wake frees its slot of the plan first, so the plan dispatches
-    /// the members it has not reached yet, up to its bound.
+    /// again for a retryable cause, its obligation owed and retried). The
+    /// lift settles the member's resume work and goes on once every member
+    /// settled, and a member that did not end Live gives the lift its
+    /// `failure`, the wake's typed answer, which the lift answers once every
+    /// member settled. A wake the plan only watches gives it only when it
+    /// left the member Broken: a member it left Dormant is reached by the
+    /// plan again. The closed wake frees its slot of the plan first, so the
+    /// plan dispatches the members it has not reached yet, up to its bound.
     pub(super) async fn explicit_resume_boot_member_settled(
         &mut self,
         member: Box<ExplicitResumeBootMember>,
-        joined: bool,
+        mut failure: Option<MobError>,
     ) {
-        if !joined && !member.watched {
+        if failure.is_some() && !member.watched {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 agent_identity = %member.agent_identity,
                 "a member the lift materializes did not become live; MobMachine holds its outcome"
             );
+        }
+        if !member.authorized
+            && self
+                .dsl_authority
+                .state()
+                .member_restore_failures
+                .contains_key(&mob_dsl::AgentIdentity::from_domain(&member.agent_identity))
+            && let Some(failure) = failure.take()
+        {
+            // A watched wake that left the member Broken: the plan does not
+            // reach it again.
+            self.retain_explicit_resume_member_failure(failure);
         }
         let dispatched = self.advance_explicit_resume_boot_plan().await;
         if !member.authorized {
@@ -738,6 +772,9 @@ impl MobActor {
             }
             tracing::warn!(%error, "stale resume boot-member settlement left current authority unchanged");
             return;
+        }
+        if let Some(failure) = failure {
+            self.retain_explicit_resume_member_failure(failure);
         }
         if let Some(pending) = self.pending_resume_lifecycle.as_ref() {
             pending.progress.member_progress(
@@ -1003,14 +1040,30 @@ impl MobActor {
                     );
                 }
                 Err(ExplicitResumeBootMemberUnprepared::HostRefused(reason)) => {
+                    let reason =
+                        format!("the host refused to prepare the member's build: {reason}");
                     self.fail_explicit_resume_boot_member(
                         &identity,
                         attempt,
-                        format!("the host refused to prepare the member's build: {reason}"),
+                        reason.clone(),
                         None,
                         None,
                     )
                     .await;
+                    // The explicit resume answers a member whose build the
+                    // host refused, as a member it could not prepare.
+                    let session_id = self
+                        .dsl_authority
+                        .state()
+                        .member_session_bindings
+                        .get(&mob_dsl::AgentIdentity::from_domain(&identity))
+                        .and_then(|session| SessionId::parse(&session.0).ok());
+                    self.retain_explicit_resume_member_failure(MobError::MemberRestoreFailed {
+                        member_id: identity.clone(),
+                        session_id,
+                        reason,
+                        hold: None,
+                    });
                 }
             }
         }
@@ -1115,7 +1168,8 @@ impl MobActor {
 
     /// A planned member's build the host asked to prepare later: its attempt
     /// ends retryable (Dormant, its boot obligation owed and its retry
-    /// armed), as a wake's does.
+    /// armed), as a wake's does, and the explicit resume answers the typed
+    /// retryable refusal a wake's caller gets.
     fn end_explicit_resume_boot_member_for_host_retry(
         &mut self,
         identity: &AgentIdentity,
@@ -1136,19 +1190,26 @@ impl MobActor {
             },
             "resolve_host_retry_explicit_resume_boot_member",
         ) {
-            Ok(_) => self.schedule_owed_member_wake_retry(identity),
+            Ok(_) => {
+                self.schedule_owed_member_wake_retry(identity);
+                self.retain_explicit_resume_member_failure(MobError::MemberWakeRefused {
+                    member_id: identity.clone(),
+                    refusal: crate::MemberWakeRefusal::HostPreparationPending,
+                });
+            }
             Err(refused) => {
                 self.abandon_explicit_resume_boot_member(identity, attempt, refused.to_string());
             }
         }
     }
 
-    /// End a planned member's open attempt that the lift could not rebuild,
-    /// as a wake ends one: retryable for a cause that clears on its own
+    /// End a planned member's open attempt that the lift could not rebuild
+    /// (its restore failed before its provision), as a wake ends one:
+    /// retryable for a cause that clears on its own
     /// ([`crate::runtime::builder::restore_error_is_retryable`]; the member
-    /// is Dormant with its boot obligation owed and its retry armed, and the
-    /// explicit resume answers the typed error), otherwise Broken with the
-    /// error, that member's own outcome.
+    /// is Dormant with its boot obligation owed and its retry armed),
+    /// otherwise Broken with the error. Either way the explicit resume
+    /// answers the typed error once every member settled.
     async fn end_explicit_resume_boot_member(
         &mut self,
         identity: &AgentIdentity,
@@ -1190,6 +1251,7 @@ impl MobActor {
             registration_refusal,
         )
         .await;
+        self.retain_explicit_resume_member_failure(error);
     }
 
     /// Resolve a planned member's open attempt Broken with `reason` (a host

@@ -1047,11 +1047,12 @@ pub(super) enum MobCommand {
         stage: super::actor::UnprovenResumeCustodyStage,
     },
     /// A member the clean-stop lift's plan materializes closed its wake
-    /// attempt (`joined`: it went Live); the lift dispatches the next members
-    /// of its plan and settles the member's resume work.
+    /// attempt (`failure`: the wake's typed answer when it did not end Live);
+    /// the lift dispatches the next members of its plan and settles the
+    /// member's resume work.
     ResumeLifecycleBootMemberSettled {
         member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
-        joined: bool,
+        failure: Option<MobError>,
     },
     /// The rebuilds of members the clean-stop lift's plan materializes
     /// through the explicit-resume work path were prepared off the actor

@@ -221,7 +221,7 @@ impl MobActor {
             Err(error) => {
                 self.explicit_resume_member_settled(
                     work,
-                    ExplicitResumeMemberCompletion::Failed(error),
+                    ExplicitResumeMemberCompletion::ObservationFailed(error),
                 )
                 .await;
                 return;
@@ -276,7 +276,7 @@ impl MobActor {
             Err(error) => {
                 self.explicit_resume_member_settled(
                     work,
-                    ExplicitResumeMemberCompletion::Failed(error),
+                    ExplicitResumeMemberCompletion::ObservationFailed(error),
                 )
                 .await;
                 return;
@@ -657,7 +657,13 @@ impl MobActor {
                 .await;
         }
         let identity = mob_dsl::AgentIdentity::from_domain(&work.rebuild.entry.agent_identity);
-        if let ExplicitResumeMemberCompletion::Failed(error) = completion {
+        let (failure, answered) = match completion {
+            ExplicitResumeMemberCompletion::Failed(error) => (Some(error), false),
+            ExplicitResumeMemberCompletion::ObservationFailed(error) => (Some(error), true),
+            ExplicitResumeMemberCompletion::Accepted
+            | ExplicitResumeMemberCompletion::Superseded => (None, false),
+        };
+        if let Some(error) = failure {
             if matches!(
                 self.classify_explicit_resume_work(&work),
                 Ok(mob_dsl::ResumeMemberOutcomeDisposition::Current)
@@ -716,6 +722,15 @@ impl MobActor {
                         // The attempt closed meanwhile: the machine kept the
                         // member's state, and nothing is recorded here.
                         Ok(false) => {}
+                    }
+                    // A member whose observation failed, before MobMachine
+                    // authorized its revival, is the resume's typed answer,
+                    // as a member it could not prepare is. A failure after
+                    // that authorization (the member's recipe, provision or
+                    // custody) is the member's own outcome, and the resume
+                    // answers Ok for it.
+                    if answered {
+                        self.retain_explicit_resume_member_failure(error);
                     }
                 } else {
                     self.retain_explicit_resume_error(error);
