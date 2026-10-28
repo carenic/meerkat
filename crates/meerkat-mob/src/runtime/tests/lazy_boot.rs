@@ -2644,7 +2644,11 @@ async fn an_owed_kickoff_runs_once_with_its_prompt_after_a_restart() {
     let mut mob = DormantMemberMob::new("owed-kickoff-restart").await;
     let identity = mob.identity.clone();
     let next = mob.session_at(1);
-    mob.service.set_missing_comms_runtime(&next).await;
+    // The next incarnation's wake cannot create its seat session (the store
+    // cannot serve the write now): the wake ends retryable, the seat stays
+    // unborn and the kickoff owed, and nothing is created to roll back. The
+    // restarted service creates it.
+    mob.service.set_create_session_failure(&next).await;
     let new = tokio::time::timeout(
         LAZY_STEP,
         mob.handle
@@ -2775,7 +2779,11 @@ async fn a_kickoff_journaled_starting_but_never_admitted_runs_once_after_a_resta
     let identity = mob.identity.clone();
     let prompt = "a kickoff starting at the crash";
     let next = mob.session_at(1);
-    mob.service.set_missing_comms_runtime(&next).await;
+    // The next incarnation's wake cannot create its seat session (the store
+    // cannot serve the write now): the wake ends retryable, the seat stays
+    // unborn and the kickoff owed, and nothing is created to roll back. The
+    // restarted service creates it.
+    mob.service.set_create_session_failure(&next).await;
     let new = tokio::time::timeout(
         LAZY_STEP,
         mob.handle
