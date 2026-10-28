@@ -92,11 +92,51 @@ impl SeatedMob {
     }
 
     /// What an earlier wake's create leaves when the process crashes before
-    /// its born row: the seat's session exists, and no row names it born.
+    /// its born row: the seat's session exists, minted under the seat's id
+    /// with the durable metadata a member's create writes (through the
+    /// service's own create), its live actor gone with the process, and no
+    /// row names it born.
     async fn create_the_session_without_its_born_row(&self) {
-        self.service
-            .replace_live_session(Session::with_id(self.session.clone()))
-            .await;
+        let created = self
+            .service
+            .create_session(CreateSessionRequest {
+                injected_context: Vec::new(),
+                model: "claude-sonnet-4-5".to_string(),
+                prompt: "created before its born row".to_string().into(),
+                system_prompt: meerkat_core::SystemPromptOverride::Inherit,
+                max_tokens: None,
+                event_tx: None,
+                build: Some(meerkat_core::service::SessionBuildOptions {
+                    resume_session: Some(Session::with_id(self.session.clone())),
+                    resume_session_intent: meerkat_core::SessionBuildIntent::Mint,
+                    comms_name: Some(
+                        super::actor::render_member_comms_name(
+                            self.handle.mob_id().as_str(),
+                            "worker",
+                            self.identity.as_str(),
+                        )
+                        .expect("comms name"),
+                    ),
+                    mob_member_binding: Some(meerkat_core::MobMemberBinding {
+                        mob_id: self.handle.mob_id().to_string(),
+                        role: "worker".to_string(),
+                        member: self.identity.to_string(),
+                    }),
+                    ..Default::default()
+                }),
+                initial_turn: meerkat_core::service::InitialTurnPolicy::Defer,
+                deferred_prompt_policy: meerkat_core::service::DeferredPromptPolicy::Discard,
+                labels: None,
+            })
+            .await
+            .expect("create the seat's session");
+        assert_eq!(
+            created.session_id, self.session,
+            "the session is minted under the seat's id"
+        );
+        MobSessionService::discard_live_session(self.service.as_ref(), &self.session)
+            .await
+            .expect("the crash ends the creating actor");
     }
 
     /// Crash the mob, restart its session service and resume it under
@@ -143,25 +183,27 @@ impl SeatedMob {
             .count()
     }
 
-    /// The creates of the seat's session the current service recorded.
+    /// The creates of the seat's session the current service recorded: the
+    /// builds that minted it. A build that resumes the session (an adoption
+    /// of a session an earlier wake created, a revival) creates nothing.
     async fn creates_of_the_session(&self) -> usize {
         self.service
             .recorded_create_requests()
             .await
             .iter()
-            .filter(|record| record.session_id == self.session)
+            .filter(|record| {
+                record.session_id == self.session
+                    && record.session_build_intent == meerkat_core::SessionBuildIntent::Mint
+            })
             .count()
     }
 
-    /// After the adoption: the member is live on the seat's session, resumed
-    /// rather than created again, its session born, and one born row
-    /// journaled.
+    /// After the adoption: the member is live on the seat's session (an
+    /// eager start's member becomes Live once the actor's startup readiness
+    /// ran), resumed rather than created again, its session born, and one
+    /// born row journaled.
     async fn assert_adopted(&self) {
-        assert_eq!(
-            self.phase(),
-            Some(dsl::MemberMaterializationPhase::Live),
-            "the member is live"
-        );
+        self.wait_phase(dsl::MemberMaterializationPhase::Live).await;
         assert_eq!(
             self.handle.resolve_bridge_session_id(&self.identity).await,
             Some(self.session.clone()),
@@ -216,17 +258,14 @@ async fn an_eager_start_adopts_a_seat_session_created_before_its_born_row() {
 }
 
 /// An eager start of a seat whose session was never created creates it
-/// there, under the id the seat named, and resolves it born.
+/// there, under the id the seat named, and resolves it born. The member is
+/// Live once the actor's startup readiness ran after the start returned.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn an_eager_start_creates_a_never_created_seat_session_under_its_seat_id() {
     let mut mob = SeatedMob::new("unborn-eager-create").await;
     mob.restart(MemberRestorePolicy::Eager).await;
 
-    assert_eq!(
-        mob.phase(),
-        Some(dsl::MemberMaterializationPhase::Live),
-        "the eager start materialized the member"
-    );
+    mob.wait_phase(dsl::MemberMaterializationPhase::Live).await;
     assert_eq!(
         mob.creates_of_the_session().await,
         1,

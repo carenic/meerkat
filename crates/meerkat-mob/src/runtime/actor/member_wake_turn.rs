@@ -1603,8 +1603,14 @@ impl MobActor {
             );
             return;
         }
-        let provision = rollback.pending(&run.identity, Arc::clone(&self.provisioner));
+        // The guard is built in the step that rolls it back (as a warm
+        // revival's committed rollback builds it): a teardown that aborts the
+        // step before it ran drops no guard, and one that aborts it during
+        // the rollback drops a guard whose rollback is in flight.
+        let identity = run.identity.clone();
+        let provisioner = Arc::clone(&self.provisioner);
         self.dispatch_member_wake_step(run, fence, None, "member_wake_rollback", async move {
+            let provision = rollback.pending(&identity, provisioner);
             match provision.rollback_retaining_custody().await {
                 Ok(()) => WakeStep::RolledBack { settled: true },
                 Err(retained) => {
@@ -1621,10 +1627,12 @@ impl MobActor {
         let Some(rollback) = rollback else {
             return;
         };
-        let provision = rollback.pending(&run.identity, Arc::clone(&self.provisioner));
+        let provisioner = Arc::clone(&self.provisioner);
         let identity = run.identity.clone();
         let mob_id = self.definition.id.clone();
+        // Built in the task, for the reason `roll_back_member_wake` gives.
         self.actor_io_tasks.spawn(async move {
+            let provision = rollback.pending(&identity, provisioner);
             if let Err(retained) = provision.rollback_retaining_custody().await {
                 let _ = retained.abandon("member wake rollback could not settle");
                 tracing::error!(
