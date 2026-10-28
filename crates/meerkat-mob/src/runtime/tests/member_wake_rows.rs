@@ -849,6 +849,102 @@ async fn reads_of_a_released_member_never_wake_it() {
     fixture.finish().await;
 }
 
+/// `MobHandle::member_unmaterialized` reads the member's residency from the
+/// machine state the actor publishes, with no command: a released member
+/// reads unmaterialized, and a subscription to its agent events is refused
+/// not live meanwhile; neither read wakes it. While its wake is held at the
+/// build preparer's gate the member is Waking and still reads
+/// unmaterialized. The end of the wake changes the machine state, after
+/// which it reads materialized and its agent events subscribe, replaying the
+/// woken actor's events from the first, so the turn it then runs is read
+/// from its `RunStarted`. An identity the mob does not seat reads
+/// materialized: there is no wake to wait for.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_after_it() {
+    let fixture = WakeFixture::new("wake-unmaterialized").await;
+    let member = fixture.spawn("unmaterialized-member").await;
+    assert!(
+        !fixture.handle.member_unmaterialized(&member),
+        "a live member"
+    );
+    fixture.release(&member).await;
+    assert!(
+        fixture.handle.member_unmaterialized(&member),
+        "a released member"
+    );
+    let refused = fixture
+        .handle
+        .subscribe_agent_events_from(&member, meerkat_core::comms::SessionEventCursor::Earliest)
+        .await
+        .err();
+    assert!(
+        matches!(refused, Some(MobError::MemberSessionNotLive { .. })),
+        "{refused:?}"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Dormant),
+        "neither read woke the member"
+    );
+    assert!(
+        !fixture
+            .handle
+            .member_unmaterialized(&AgentIdentity::from("never-seated")),
+        "an identity the mob does not seat"
+    );
+
+    let mut changes = fixture.handle.machine_state_changes();
+    fixture.preparer.close_gate();
+    let wake = tokio::spawn({
+        let handle = fixture.handle.clone();
+        let member = member.clone();
+        async move { handle.ensure_member_live(&member).await }
+    });
+    fixture.preparer.wait_entered(1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+    assert!(
+        fixture.handle.member_unmaterialized(&member),
+        "a waking member"
+    );
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task")
+        .expect("the wake ends live");
+    tokio::time::timeout(WAIT, changes.changed())
+        .await
+        .expect("the wake changes the machine state")
+        .expect("the mob runs");
+    assert!(
+        !fixture.handle.member_unmaterialized(&member),
+        "the woken member"
+    );
+    let body = token("unmaterialized");
+    fixture.host_turn(&member, &body, HandlingMode::Queue).await;
+    let mut events = fixture
+        .handle
+        .subscribe_agent_events_from(&member, meerkat_core::comms::SessionEventCursor::Earliest)
+        .await
+        .expect("the woken member's agent events subscribe")
+        .stream;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let event = futures::StreamExt::next(&mut events)
+                .await
+                .expect("the replay reaches the turn's start");
+            if matches!(event.payload, AgentEvent::RunStarted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the replay holds the turn the woken member ran");
+    fixture.finish().await;
+}
+
 /// A steer to a released member wakes it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_steer_to_a_released_member_wakes_it() {

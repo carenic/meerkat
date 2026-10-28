@@ -9719,7 +9719,8 @@ impl MobHandle {
     /// The materialization phase MobMachine holds for `identity` in this
     /// process, read from the published machine state without an actor round
     /// trip: test support for rows that prove a read never wakes a member.
-    /// The phase is internal; no public surface reports it.
+    /// No public surface reports the phase itself; a host reads whether a
+    /// member is unmaterialized through [`Self::member_unmaterialized`].
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn member_materialization_for_test(
@@ -9831,6 +9832,37 @@ impl MobHandle {
         super::boot_plan::domain_seat_session_never_born(
             &self.machine_state_watch_rx.borrow(),
             session_id,
+        )
+    }
+
+    /// Whether MobMachine holds `identity` seated and not materialized in
+    /// this process: Dormant, or Waking while its one wake attempt runs. A
+    /// Dormant member has no session actor; a Waking one may already have
+    /// one (the wake builds it before its readiness settles) or may not, so
+    /// a subscription to its agent events
+    /// ([`Self::subscribe_agent_events_from`]) may be refused
+    /// [`MobError::MemberSessionNotLive`] until its wake ends Live, and this
+    /// read stays `true` until then. The end of the wake changes the machine
+    /// state ([`Self::machine_state_changes`]): a
+    /// host that keeps members' agent events attached subscribes a member
+    /// after the change that makes this read `false`, with no command to the
+    /// actor while it reads `true`, and replays from
+    /// [`SessionEventCursor::Earliest`], so the run the wake started is read
+    /// from its first event.
+    ///
+    /// Read from the machine state the actor last published, without a
+    /// command; reading it never wakes the member. The answer can be stale
+    /// by the time the caller acts on it (the actor may publish the next
+    /// state right after the read), so a caller treats a refusal of what it
+    /// then asks as the answer that counts. It is an observation, never a
+    /// write path: only MobMachine's transitions move the member's
+    /// residency, and a host that needs the member live wakes it with a
+    /// delivery or [`Self::ensure_member_live`]. `false` for a live member
+    /// and for an identity this mob does not hold seated in this process.
+    pub fn member_unmaterialized(&self, identity: &AgentIdentity) -> bool {
+        super::boot_plan::domain_member_is_unmaterialized(
+            &self.machine_state_watch_rx.borrow(),
+            identity,
         )
     }
 

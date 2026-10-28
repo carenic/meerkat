@@ -394,6 +394,15 @@ them.
   latest binding of each session named since the latest mob reset, so a host
   can tell whether an identity had a created session before its last binding
   (a member reset seats the next life on a new, unborn session).
+  `MobHandle::member_unmaterialized(identity)` answers whether a seated member
+  is not materialized in this process (dormant, or waking while its wake
+  runs), from the published machine state and without waking it: until its
+  wake ends, a subscription to its agent events may be refused not live
+  (the read stays true until then), so a host that keeps members' agent
+  events attached subscribes it after the machine state change that ends the
+  wake, with no command while it waits.
+  The answer can be stale by the time the host acts on it, and the read is
+  never a write path.
 
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates

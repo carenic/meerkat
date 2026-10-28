@@ -29179,7 +29179,12 @@ pub enum MemberRevivalVerdictKind {
 
 /// Member residency in this process. Dormant: seated, not materialized.
 /// Waking: exactly one materialization attempt is open. Live: materialized.
-/// Internal machine state only: no consumer surface reports it.
+/// No consumer surface reports the phase itself. A host reads one fact of
+/// it, whether a member is seated and not materialized (Dormant or Waking),
+/// through `MobHandle::member_unmaterialized`, from the state the actor last
+/// published: the answer can be stale by the time the host acts on it, and
+/// the read is never a write path. Only this machine's transitions move the
+/// phase (a delivery or an operator wake, a release, a retirement).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
 pub enum MemberMaterializationPhase {
     #[default]
