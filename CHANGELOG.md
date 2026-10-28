@@ -675,6 +675,20 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a WholeBlob session whose run a restart continued from
+  its provisional tail compacts again. The continued run's session is now
+  decoded from the tail's bytes exactly as a committed body is, so it keeps
+  the row lineage of those bytes. Before, every compaction of that session
+  made its summary call and then failed with "live transcript has no exact
+  row-lineage authority", so the transcript did not compact until the
+  session was next loaded from a committed body.
+- `meerkat-core`: a loaded WholeBlob session keeps compacting after an
+  inline image reaches its transcript. The in-place scan that moves inline
+  images to the blob store, which a checkpoint and a compaction run, dropped
+  the session's row lineage when it changed a row, and every later
+  compaction then failed with the same "live transcript has no exact
+  row-lineage authority" until the session was next loaded. The scan now
+  keeps the lineage.
 - `meerkat-mob`: a mob's start no longer stops when the runtime
   unregistered a member's session registration after the start restored
   the member, for example when a run on that session failed and the
