@@ -79,6 +79,43 @@ impl RosterAuthority {
         self.roster.creation_history.get(session_id)
     }
 
+    /// The creation witness of the incarnation the runtime puts in place of
+    /// `entry`'s (a respawn, a rotation): the creation `entry`'s own session
+    /// recorded, so the successor keeps the member's creation id, with
+    /// Successor provenance naming that session. A caller's spec cannot
+    /// author it. Without a session, or a creation token of this member
+    /// recorded for it, the witness is unavailable and the successor is
+    /// recorded unproven, never as a new root.
+    pub(crate) fn successor_creation_witness(
+        &self,
+        entry: &RosterEntry,
+    ) -> crate::MemberCreationSourceWitness {
+        let Some(session_id) = entry.member_ref.bridge_session_id() else {
+            return crate::MemberCreationSourceWitness::unavailable();
+        };
+        match self.member_creation_for_session(session_id) {
+            Ok(Some(crate::MemberCreationSnapshot {
+                creation:
+                    crate::MemberCreationRecord {
+                        creation_id: Some(creation_id),
+                        ..
+                    },
+                member_binding,
+                ..
+            })) if member_binding.member == entry.agent_identity.as_str() => {
+                crate::MemberCreationSourceWitness {
+                    successor: true,
+                    source: Some(crate::MemberCreationSource {
+                        session_id: session_id.clone(),
+                        member_binding,
+                        creation_id,
+                    }),
+                }
+            }
+            _ => crate::MemberCreationSourceWitness::unavailable(),
+        }
+    }
+
     /// Snapshot the current roster for read-only surfaces.
     pub(crate) fn snapshot(&self) -> Roster {
         self.roster.clone()

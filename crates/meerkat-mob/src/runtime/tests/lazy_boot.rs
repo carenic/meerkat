@@ -2617,6 +2617,96 @@ async fn a_rotation_of_a_retired_identity_spawns_it_and_runs_its_kickoff_once() 
     assert_eq!(turns_with(&service, &session, "a new life").await, 1);
 }
 
+/// The creation `handle` reads for the rotated member's `session`: the
+/// first life's creation id, with Successor provenance naming the first
+/// life's session, and the first life's birth.
+async fn assert_creation_kept_by_rotation(
+    handle: &MobHandle,
+    session: &SessionId,
+    first_life: &crate::MemberCreationSnapshot,
+    when: &str,
+) {
+    let next = handle
+        .member_creation_for_session(session)
+        .await
+        .unwrap_or_else(|error| panic!("read the next incarnation's creation {when}: {error}"))
+        .unwrap_or_else(|| panic!("the next incarnation's creation is recorded {when}"));
+    assert_eq!(
+        next.creation.creation_id, first_life.creation.creation_id,
+        "the rotation keeps the member's creation id {when}"
+    );
+    assert!(
+        matches!(
+            &next.creation.provenance,
+            crate::MemberCreationProvenance::Successor {
+                predecessor_session_id,
+                predecessor_creation_id,
+                ..
+            } if predecessor_session_id == &first_life.session_id
+                && Some(*predecessor_creation_id) == first_life.creation.creation_id
+        ),
+        "the next incarnation is the first life's successor {when}: {:?}",
+        next.creation.provenance
+    );
+    assert_eq!(
+        next.birth_cursor, first_life.birth_cursor,
+        "the member keeps its birth {when}"
+    );
+}
+
+/// A rotation (a host's reset of a seated identity) keeps the member's
+/// creation, as a respawn does: the next incarnation records the creation id
+/// of the retired incarnation's session, with Successor provenance naming
+/// that session, although the host's spec names a host-root origin. The
+/// record stands after the next incarnation's first wake creates its session
+/// and after a restart.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_keeps_the_members_creation_through_its_first_wake_and_a_restart() {
+    let host_root = |identity: &AgentIdentity| {
+        let mut spec = SpawnMemberSpec::host_root("worker", identity.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        spec
+    };
+    let identity = worker(0);
+    let mut mob = DormantMemberMob::with_spec("rotation-creation", host_root(&identity)).await;
+    let first_life = mob
+        .handle
+        .member_creation_for_session(&mob.session)
+        .await
+        .expect("read the first life's creation")
+        .expect("the first life recorded its creation");
+    assert_eq!(
+        first_life.creation.provenance,
+        crate::MemberCreationProvenance::Root,
+        "a host-root spawn is a root creation"
+    );
+    assert!(first_life.creation.creation_id.is_some());
+
+    let next = tokio::time::timeout(LAZY_STEP, mob.handle.rotate_member(host_root(&identity)))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation succeeds");
+    assert_eq!(next, mob.session_at(1));
+    assert_creation_kept_by_rotation(&mob.handle, &next, &first_life, "after the rotation").await;
+
+    tokio::time::timeout(LAZY_STEP, mob.handle.ensure_member_live(&identity))
+        .await
+        .expect("the first wake answers")
+        .expect("the first wake materializes the next incarnation");
+    assert!(
+        mob.service
+            .recorded_create_requests()
+            .await
+            .iter()
+            .any(|record| record.session_id == next),
+        "the first wake created the next incarnation's session"
+    );
+    assert_creation_kept_by_rotation(&mob.handle, &next, &first_life, "after its first wake").await;
+
+    mob.restart().await;
+    assert_creation_kept_by_rotation(&mob.handle, &next, &first_life, "after a restart").await;
+}
+
 /// A rotation in a Stopped mob is refused typed before anything of it
 /// starts: the identity stays seated on its session at its generation, and
 /// nothing is retired or archived.
