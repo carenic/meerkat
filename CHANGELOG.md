@@ -84,6 +84,33 @@ them.
   that owns the session, once the unregister committed; the mob demotes exactly
   that materialization of its member to dormant, and a release for any other
   registration changes nothing.
+- `meerkat-core` (`generated::approval_lifecycle`), `meerkat-machine-schema`
+  (`catalog::dsl::approval_lifecycle`) and `meerkat-machine-kernels`
+  (`generated::approval_lifecycle`): the approval lifecycle machine
+  (`ApprovalLifecycleMachine`, version 6) gains the inputs
+  `AdmitEnteredStep { review_id }` and `FinishEnteredStep { review_id }`,
+  which admit and finish a later step of an entered reviewed effect (see
+  Added, the entered state of a reviewed effect).
+  `ApprovalLifecycleInput` (meerkat-core and meerkat-machine-schema),
+  `ApprovalLifecycleInputVariant` (meerkat-machine-schema) and the kernel
+  `Input` and `InputKind` gain `AdmitEnteredStep` and `FinishEnteredStep`,
+  appended last. The kernel `TransitionId` gains
+  `AdmitEnteredStepRejectedMissing`, `AdmitEnteredStepRejectedConsentLinked`,
+  `AdmitEnteredStepRejectedRetired`, `AdmitEnteredStepRejectedNotEntered`,
+  `AdmitEnteredStep`, `AdmitEnteredStepRejectedClosing`,
+  `ReleaseReviewUsedClosing`, `ReleaseReviewRejectedClosing`,
+  `FinishEnteredStepRejectedMissing`, `FinishEnteredStepRejectedNotInFlight`,
+  `FinishEnteredStepOpen`, `FinishEnteredStepClosing` and
+  `FinishEnteredStepReleases`, appended last, so no existing implicit
+  discriminant changes. The enums are exhaustive: a `match` outside the
+  crates needs the new arms.
+- `meerkat-machine-schema` (`catalog::dsl::approval_lifecycle`) and
+  `meerkat-machine-kernels` (`generated::approval_lifecycle`):
+  `ApprovalLifecycleMachineState` and the kernel `State` gain
+  `review_entered_phase` and `review_entered_steps`, the entered phase and
+  the admitted steps in flight of each spent attempt. Code that builds
+  either with a struct literal must set them (empty maps for a state with no
+  entered attempt).
 - Behaviour: a Resume-mode spawn (attaching an existing session, an idempotent
   `ensure_member` that resumes a session) whose session has a live actor
   reuses that actor only when it runs the auth binding the spec names: the
@@ -107,6 +134,12 @@ them.
   `ProviderCacheTtl::TwelveHours` (wire `twelve_hours`), appended last.
   The three enums are exhaustive, so a downstream exhaustive match needs an
   arm.
+- Behaviour: `meerkat` governed helper work built from a tool dispatch
+  (`GovernedHelperAdmissionFence::from_dispatch`,
+  `GovernedHelperChildIssuance::from_dispatch`) answers `Denied` instead of
+  `Unavailable` when the dispatch's review settles the step (see Fixed). A
+  host that retried on `Unavailable` now stops there: the refusal is final for
+  that dispatch, and a new call is reviewed anew.
 
 - Python and TypeScript SDKs (not measured by the gate): the fork-cache
   evidence lifetime `ForkAuthoredCacheBreakpoint.ttl` is now
@@ -118,6 +151,70 @@ them.
 
 ### Added
 
+- `meerkat-core`, `meerkat-machine-schema`, `meerkat-machine-kernels`: the
+  entered state of a reviewed effect is machine-owned
+  (`ApprovalLifecycleMachine` version 6). A spend at an effect's entry (a
+  model review's allow, or a consented candidate's human consent) now leaves
+  its attempt registered as `Used`, with an entered phase (the new public
+  enum `EnteredEffectPhase`: `Open`, `Closing`) and a count of admitted
+  steps in flight. `AdmitEnteredStep` admits a later step of that effect
+  only while it is `Open`, and `FinishEnteredStep` ends one; neither spends.
+  The admitting dispatch's end releases the attempt when no admitted step is
+  in flight, and otherwise closes the effect: no new step is admitted, and
+  the last admitted step's finish releases the attempt. The generated
+  authority `ApprovalLifecycleMachineAuthority` (meerkat-core) gains
+  `admit_entered_step` and `finish_entered_step`, and the kernel gains the
+  input structs `inputs::AdmitEnteredStep` and `inputs::FinishEnteredStep`.
+  A bounded TLC audit in the canonical TLC lane
+  (`specs/machines/approval_lifecycle/entered_step_audit.sh`) checks the
+  entered state against the spends, steps and dispatch end it records.
+- `meerkat-core`: entered governed operations. A governed tool call whose
+  operation requires review (R2, or R3 human consent) spends it once, at
+  its effect's entry. `ToolDispatchContext::enter_governed_operation(call)`
+  makes that entry and returns `EnteredDispatchOperation`, the typed witness
+  of the entered operation; `GovernedDispatchOperation::into_entered(custody)`
+  mints it from the custody a leaf's own entry returned
+  (`enter_reviewed_effect_held`, `ReviewedEntryTicket::enter`). With it the
+  same call performs further governed steps of the same exact operation
+  without a second spend and without running any review:
+  `EnteredDispatchOperation::run_if_current_within` and
+  `issue_child_if_current_within`. A leaf that keeps the context its entry
+  returned (refreshed when staging re-prepared the decision) takes the
+  operation from that context: every clone of a dispatch context shares the
+  dispatch's one review entry, so it converts the same custody, and the
+  entered tier and window are always those of the decision the entry spent.
+  Each step is decided afresh by the work's
+  own owners under their single exclusion, is refused when the current
+  decision needs more review than was entered (`entered_tier`), stays within
+  the entered decision's validity, and is admitted by the review owner only
+  while the admitting dispatch is live: a step admitted before the dispatch
+  ended runs to completion, and the review stays in use until the last such
+  step has finished. A step answers `AuthorizationRefused` (with no
+  not-dispatched certificate) or `OperationAuthorizationUnavailable`, never a
+  review settlement, and speaks only for itself. An unreviewed (R1) entry's
+  witness spends nothing and, like the plain R1 path, is bounded by its run.
+  `WorkAuthorization` gains the provided method
+  `run_entered_if_current_within`, whose default is unavailable (fail
+  closed).
+- `meerkat-authorization`, `meerkat-runtime`, `meerkat`: entered governed
+  operations run on the native owners. The native work owner implements
+  `run_entered_if_current_within` with the issuance's tier rule (the current
+  decision may require no more review than was entered), and both production
+  wrappers forward it (the audited work authorization, and the runtime's
+  run-custody wrapper, which checks run custody first).
+  `GovernedHelperAdmissionFence::from_entered` and
+  `GovernedHelperChildIssuance::from_entered` build the governed helper
+  WorkGraph admission and the helper child issuance as further steps of a
+  call's `EnteredDispatchOperation`: one witness serves the fence and every
+  issuance of the call, each decided afresh, none spending again, so a
+  reviewed call can admit its helper item and issue several children with one
+  review spend (retrying an issued intent answers `Recovered`). A refused step
+  answers `Denied` (an ended dispatch, a source cancelled, revoked or no
+  longer retained, a decision needing more review than was entered, an
+  expired window) or `Unavailable` (contention, a rebuild request, owners
+  that cannot answer now), and speaks only for its own step. See
+  docs/rust/native-authorization.mdx, "Continue a reviewed call with governed
+  helper steps".
 - `meerkat-comms`: in-process wake routes. `InprocRegistry::publish_wake_route`
   and `retract_wake_route` keep, per seated member, a route to the owner that
   can wake it (`InprocPeerWaker`, asked with a `PeerWakeRequest`); a wake route
@@ -548,6 +645,25 @@ them.
   precondition no longer holds) closes the member's wake attempt, leaving the
   member dormant for its next delivery, instead of leaving the attempt open
   until its bound.
+- `meerkat` (governed helper work): a governed helper admission fence and a
+  helper child issuance built from a tool dispatch
+  (`GovernedHelperAdmissionFence::from_dispatch`,
+  `GovernedHelperChildIssuance::from_dispatch`) now answer `Denied`, as their
+  documentation and the prepared path always did, when the dispatch's review
+  settles the step: an R2 or R3 decision at the fence (no review runs under
+  the graph lock), a review already spent, an ended dispatch, or a refused
+  review. Before, they answered `Unavailable`, which tells a host that a
+  later attempt may succeed. Such a refusal is final for that dispatch only:
+  a new call is reviewed anew. The review owner's own unavailability
+  (contention, an unconfirmed store, unreadable review material, a failed
+  reviewer) stays `Unavailable`. See the Behaviour entry under Breaking.
+- `meerkat-core`: the documentation of
+  `GovernedDispatchOperation::issue_child_if_current_within` said that a
+  consented R3 operation refuses there. It does not: a fresh attempt of a
+  consented candidate (R3, or an R2 decision a human took over) spends its
+  human consent at this entry and issues the child. For R2 and R3 the method
+  is the dispatch's single consuming entry, so a second call finds the review
+  spent (`AlreadyConsumed`); an R1 entry spends nothing and can issue again.
 - `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
   of a stopped mob, a revival or registration reload of a missing live
   materialization, and a Resume-mode spawn such as attaching an existing

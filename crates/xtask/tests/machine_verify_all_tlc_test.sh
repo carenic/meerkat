@@ -637,6 +637,33 @@ if run_part audits-a; then
   TLC_WORKERS="${tlc_workers}" "${durable_tail_recovery_ownership_audit}" --mutants
 fi
 
+# The ApprovalLifecycleMachine entered state of a reviewed effect (a spent
+# attempt stays Used while its admitting dispatch is live or a step admitted
+# under it is in flight; AdmitEnteredStep and FinishEnteredStep never spend;
+# the dispatch end releases the attempt, or closes its effect until the last
+# admitted step finishes) needs two attempts, a step count and a dispatch
+# end with steps in flight, which the ci sweep (one id, six steps) never
+# reaches. A hand-written audit over the same generated model drives a
+# model-reviewed and a consented attempt through their spends, step
+# admissions and finishes requested at any time, and the dispatch end with
+# zero, one or more steps in flight, under every generated invariant plus six
+# history invariants and one action property. It requires every new arm to
+# fire (TLC coverage), three scenario witnesses reached (the dispatch
+# cancelled while a step is in flight, a step refused after the release, the
+# helper graph admission and two children under one consent spend) and
+# refuses ten seeded defects (--mutants). 16 steps reach both attempts
+# entered with two steps each and both dispatches ending with steps in
+# flight.
+entered_step_audit="${workspace_root}/specs/machines/approval_lifecycle/entered_step_audit.sh"
+if [[ ! -x "${entered_step_audit}" ]]; then
+  echo "error: approval entered-step audit runner is missing from workspace runfiles: ${entered_step_audit}" >&2
+  exit 1
+fi
+if run_part audits-a; then
+  echo "running bounded approval entered-step TLC audit"
+  TLC_WORKERS="${tlc_workers}" "${entered_step_audit}" "${ENTERED_STEP_AUDIT_MAX_STEPS:-16}" --mutants
+fi
+
 # Broad composition full-TLC skips are CI-time/memory-budget exceptions, NOT
 # codegen defects. `machine-verify` still validates drift and the generated
 # ci.cfg structural-invariant contract before honoring these skips. The earlier
@@ -703,7 +730,12 @@ run_machine_verify() {
 # the lightest shard and is not measured on hosted runners yet. The
 # empty-resume residency audit with --mutants (seven small TLC runs over the
 # meerkat_machine model) joined audits-b and is not measured on hosted
-# runners yet either.
+# runners yet either. The approval entered-step audit with --mutants
+# (fourteen small TLC runs over the approval_lifecycle model, 11 s locally
+# with 4 workers) joined audits-a, the lightest by the hosted job times of
+# seven CI runs on 2026-10-26/27 (audits-a 598-1011 s, mean 823; audits-b
+# 814-1023 s, mean 952; audits-c 751-963 s, mean 893), and is not measured
+# on hosted runners yet.
 # With the durable-tail recovery ownership and materialization-rollback keep
 # audits both in audits-b, that shard ran 1143 s on the pull request, past
 # the 1080 s execution budget, and hit the 20-minute job timeout on the

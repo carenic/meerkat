@@ -793,6 +793,7 @@ pub fn approval_lifecycle_schema_metadata() -> MachineSchemaMetadata {
                     "RunEnded",
                 ],
             ),
+            NamedTypeBinding::string_enum("EnteredEffectPhase", &["Open", "Closing"]),
         ],
         Vec::new(),
     )
