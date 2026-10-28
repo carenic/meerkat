@@ -598,7 +598,7 @@ impl MobActor {
             .collect::<Vec<_>>();
         let declared_edges = self
             .stage_seated_declared_edges(&mut authority, &seated_ends, &mut effects, &mut journal)
-            .await;
+            .await?;
         let prepared = PreparedDslInput {
             authority,
             effects,
@@ -1168,7 +1168,7 @@ impl MobActor {
                 &mut effects,
                 &mut wired_rows,
             )
-            .await;
+            .await?;
         let prepared = PreparedDslInput {
             authority,
             effects,

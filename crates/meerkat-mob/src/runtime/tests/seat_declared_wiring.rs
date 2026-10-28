@@ -764,3 +764,83 @@ async fn a_member_the_verified_pass_breaks_leaves_the_healthy_seats_of_its_chunk
         "no repair is owed for the new workers' edges"
     );
 }
+
+/// A declared edge whose live end the seat step cannot resolve (the live
+/// orchestrator's comms runtime reports no public key) is still MobMachine's
+/// edge, staged in the step with its row, and its failed realization is owed
+/// a repair in MobMachine rather than only logged. Once the orchestrator's
+/// end resolves again, the repair realizes the edge: the orchestrator trusts
+/// the seated worker's recorded endpoint, and nothing more is journaled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_edge_whose_realization_fails_at_its_seat_is_owed_a_repair() {
+    let mob = WiringMob::new(
+        "seat-wiring-owed-repair",
+        sample_definition_with_auto_wire(),
+        false,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let seated = AgentIdentity::from("seat-worker");
+    mob.handle
+        .spawn_spec(spec("lead", &lead))
+        .await
+        .expect("spawn the orchestrator");
+    let lead_comms = test_comms_name_for(mob.handle.mob_id(), "lead", lead.as_str());
+    mob.service
+        .set_comms_behavior(
+            &lead_comms,
+            MockCommsBehavior {
+                missing_public_key: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    mob.seat(vec![spec("worker", &seated)]).await;
+    let edge = dsl::WiringEdge::new(
+        dsl::AgentIdentity::from_domain(&seated),
+        dsl::AgentIdentity::from_domain(&lead),
+    );
+    assert_eq!(
+        mob.edges(),
+        BTreeSet::from([pair(&seated, &lead)]),
+        "the declared edge is MobMachine's"
+    );
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&seated, &lead)],
+        "the edge is journaled with its seat"
+    );
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .owed_edge_repairs
+            .contains(&edge),
+        "the edge whose realization failed is owed a repair"
+    );
+    let seated_peer = mob
+        .recorded_peer_id(&seated)
+        .expect("the seat recorded the worker's endpoint");
+
+    mob.service
+        .set_comms_behavior(&lead_comms, MockCommsBehavior::default())
+        .await;
+    let mut state = mob.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        STEP,
+        state.wait_for(|state| !state.owed_edge_repairs.contains(&edge)),
+    )
+    .await
+    .expect("the repair realizes the edge")
+    .expect("the machine state stays published");
+    assert!(
+        mob.trusted(&lead).await.contains(&seated_peer),
+        "the orchestrator trusts the seated worker's recorded endpoint"
+    );
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&seated, &lead)],
+        "the repair journals nothing more"
+    );
+}

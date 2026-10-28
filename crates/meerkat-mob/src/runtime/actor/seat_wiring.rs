@@ -19,21 +19,26 @@
 //! together. The step stays linear in the chunk's edges: the new edges come
 //! from one pass over MobMachine's active members, and a refused batch of
 //! edges leaves the prepared authority as it was and is applied again one
-//! edge at a time, so an edge MobMachine refuses is left out alone.
+//! edge at a time. A declared edge MobMachine refuses refuses the step
+//! typed, as does a wire whose transition MobMachine answers with neither a
+//! new edge nor a repair: no seat is committed without an edge it declares,
+//! and no edge without its row.
 //!
 //! Every such edge joins a member that is not materialized (the seated
 //! member, whose wake can only start after this step), so MobMachine
-//! suppresses its lifecycle notices, and trust is installed only on a live
-//! end, toward the other member's durable endpoint, once the step committed.
-//! A member that is not materialized gets its own trust from its wake's
+//! suppresses its lifecycle notices, and trust is installed only once the
+//! step committed. A live end trusts the other member's durable endpoint. A
+//! member that is not materialized gets its own trust from its wake's
 //! topology step, from the machine's edges. A member seated with its endpoint
 //! owed (`EndpointPending`, on network comms) is joined by the machine edge and
 //! its row alone, with no trust on either end: its boot wake registers the
 //! endpoint and its topology step realizes the trust of both ends, as for the
-//! edges a restart replays. A live end that cannot install its trust leaves
-//! the edge owed a repair, which the owner retries. An edge with a placed or
-//! peer-only member takes the single-edge wire path (`MobActor::handle_wire`)
-//! once the step committed, as a spawn's edges do.
+//! edges a restart replays. The trust of an edge with a placed or peer-only
+//! member, or with a member this process cannot resolve, is realized by the
+//! repair path of the edge MobMachine now holds (`MobActor::handle_wire`):
+//! the live end's trust, the placed member's route installs, the peer-only
+//! member's bridge. A realization that fails leaves the edge owed a repair,
+//! which the owner retries.
 
 use super::member_wake::MemberWiringEdge;
 use super::*;
@@ -51,8 +56,9 @@ enum DeclaredEdgeEnd {
     /// Not materialized, its endpoint owed (`EndpointPending`): the machine
     /// edge alone, whose trust its boot wake realizes.
     EndpointPending,
-    /// Placed, peer-only, or not resolvable here: the single-edge path.
-    Single,
+    /// Placed, peer-only, or not resolvable here: the edge's repair path
+    /// realizes its trust once the step committed.
+    Other,
 }
 
 /// The trust a live end of a declared edge installs toward its counterpart
@@ -63,13 +69,23 @@ struct LiveEndTrust {
     counterpart_spec: TrustedPeerDescriptor,
 }
 
+/// How a staged declared edge is realized once its step committed.
+enum DeclaredEdgeRealization {
+    /// The machine edge and its row alone: no end installs trust now.
+    MachineEdge,
+    /// A live end trusts its counterpart's durable endpoint.
+    LiveEnd(LiveEndTrust),
+    /// The repair path of the edge MobMachine holds realizes its trust.
+    Repair,
+}
+
 /// One declared edge of a seat's batch.
 struct BatchedDeclaredEdge {
     edge: mob_dsl::WiringEdge,
     /// The seated member, as a spawn of it is the local end of its edges.
     local: AgentIdentity,
     peer: AgentIdentity,
-    trust: Option<LiveEndTrust>,
+    realization: DeclaredEdgeRealization,
 }
 
 /// A declared edge applied on the prepared authority, waiting for the
@@ -77,7 +93,17 @@ struct BatchedDeclaredEdge {
 /// has a live end.
 struct AppliedDeclaredEdge {
     batched: BatchedDeclaredEdge,
-    wired: Option<mob_dsl::MobMachineTransition>,
+    wired: mob_dsl::MobMachineTransition,
+    authorized: Option<mob_dsl::MobMachineTransition>,
+}
+
+/// A staged edge whose live end trusts its counterpart once the step
+/// committed, with the trust authorization the step applied for it.
+struct StagedLiveEnd {
+    edge: mob_dsl::WiringEdge,
+    local: AgentIdentity,
+    peer: AgentIdentity,
+    trust: LiveEndTrust,
     authorized: Option<mob_dsl::MobMachineTransition>,
 }
 
@@ -86,10 +112,14 @@ struct AppliedDeclaredEdge {
 pub(super) struct StagedDeclaredEdges {
     /// Whether a staged transition moved MobMachine's lifecycle phase.
     pub(super) phase_changed: bool,
-    /// Each staged edge with a live end, with the trust authorization the
-    /// step applied for it.
-    trust: Vec<(BatchedDeclaredEdge, Option<mob_dsl::MobMachineTransition>)>,
-    /// The edges the single-edge wire path wires once the step committed.
+    /// The staged edges with a live end.
+    trust: Vec<StagedLiveEnd>,
+    /// The staged edges the repair path realizes: (seated member, peer,
+    /// edge).
+    repair: Vec<(AgentIdentity, AgentIdentity, mob_dsl::WiringEdge)>,
+    /// The edges whose lifecycle notices MobMachine does not suppress (two
+    /// live ends, which a seat never joins): the single-edge wire path wires
+    /// them once the step committed.
     single: Vec<(AgentIdentity, AgentIdentity)>,
 }
 
@@ -98,6 +128,7 @@ impl StagedDeclaredEdges {
         Self {
             phase_changed: false,
             trust: Vec::new(),
+            repair: Vec::new(),
             single: Vec::new(),
         }
     }
@@ -109,24 +140,25 @@ impl MobActor {
     /// `None` when it is owed) on the step's prepared `authority`, after its
     /// seats (see the module docs). Their effects go to `effects` and their
     /// `MembersWired` rows to `journal`, which the step commits and appends
-    /// with its seats. Nothing here fails the step: an edge MobMachine
-    /// refuses is logged and left out.
+    /// with its seats. A declared edge MobMachine refuses, or a wire it
+    /// answers with neither a new edge nor a repair, refuses the step typed:
+    /// the caller then commits nothing of it.
     pub(super) async fn stage_seated_declared_edges(
         &self,
         authority: &mut mob_dsl::MobMachinePreparedAuthority,
         seated: &[(AgentIdentity, Option<TrustedPeerDescriptor>)],
         effects: &mut Vec<mob_dsl::MobMachineEffect>,
         journal: &mut Vec<NewMobEvent>,
-    ) -> StagedDeclaredEdges {
+    ) -> Result<StagedDeclaredEdges, MobError> {
         if seated.is_empty() || !Self::definition_declares_wiring(&self.definition) {
-            return StagedDeclaredEdges::none();
+            return Ok(StagedDeclaredEdges::none());
         }
         if authority.state().lifecycle_phase != mob_dsl::MobPhase::Running {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 "the declared edges of newly seated members are not wired: the mob is not running"
             );
-            return StagedDeclaredEdges::none();
+            return Ok(StagedDeclaredEdges::none());
         }
         let members = seated
             .iter()
@@ -134,7 +166,7 @@ impl MobActor {
             .collect::<Vec<_>>();
         let pairs = self.seated_declared_pairs(authority.state(), &members);
         if pairs.is_empty() {
-            return StagedDeclaredEdges::none();
+            return Ok(StagedDeclaredEdges::none());
         }
         // A member this step seats joins from the endpoint its seat records:
         // it is not committed yet, so neither the roster nor the committed
@@ -167,47 +199,51 @@ impl MobActor {
                 None => single.push((local, peer)),
             }
         }
-        let mut staged = self.stage_batched_declared_edges(authority, batched, effects, journal);
+        let mut staged = self.stage_batched_declared_edges(authority, batched, effects, journal)?;
         staged.single.extend(single);
-        staged
+        Ok(staged)
     }
 
     /// Realize the declared edges a seat step staged, once the step
     /// committed: each live end trusts its counterpart's durable endpoint,
     /// under the authority the step minted for the topology it committed
-    /// (every authority is derived before any trust is installed), and the
-    /// edges the batch left out take the single-edge wire path. A failure
-    /// leaves the edge owed a repair, or unwired, logged: the step is
-    /// committed already.
+    /// (every authority is derived before any trust is installed), and each
+    /// edge with a placed, peer-only or unresolved end takes the repair path
+    /// of the edge MobMachine holds. A realization that fails leaves the edge
+    /// owed a repair: the step is committed already.
     pub(super) async fn realize_staged_declared_edges(&mut self, staged: StagedDeclaredEdges) {
-        let StagedDeclaredEdges { trust, single, .. } = staged;
+        let StagedDeclaredEdges {
+            trust,
+            repair,
+            single,
+            ..
+        } = staged;
         let mut installs = Vec::new();
-        for (batched, authorized) in trust {
-            let Some(trust) = batched.trust else {
-                continue;
-            };
+        for StagedLiveEnd {
+            edge,
+            local,
+            peer,
+            trust,
+            authorized,
+        } in trust
+        {
             let authority = match &authorized {
-                Some(authorized) => {
-                    self.declared_edge_trust_authority(authorized, &batched.edge, &trust)
-                }
+                Some(authorized) => self.declared_edge_trust_authority(authorized, &edge, &trust),
                 None => Err(MobError::WiringError(
                     "MobMachine authorized no trust for the edge".to_string(),
                 )),
             };
             match authority {
-                Ok(authority) => installs.push((batched.edge, trust, authority)),
+                Ok(authority) => installs.push((edge, trust, authority)),
                 Err(error) => {
                     tracing::warn!(
                         mob_id = %self.definition.id,
-                        member = %batched.local,
-                        peer = %batched.peer,
+                        member = %local,
+                        peer = %peer,
                         %error,
                         "the live end of a declared edge has no trust authority; its repair is owed"
                     );
-                    self.resolve_member_edge_realization(
-                        &MemberWiringEdge::Member(batched.edge),
-                        false,
-                    );
+                    self.resolve_member_edge_realization(&MemberWiringEdge::Member(edge), false);
                 }
             }
         }
@@ -229,7 +265,8 @@ impl MobActor {
                 self.resolve_member_edge_realization(&MemberWiringEdge::Member(edge), false);
             }
         }
-        for (local, peer) in single {
+        // The edge is MobMachine's already: the wire is its repair path.
+        for (local, peer, edge) in repair {
             if let Err(error) = Box::pin(self.handle_wire(
                 local.clone(),
                 super::super::handle::PeerTarget::Local(peer.clone()),
@@ -241,8 +278,34 @@ impl MobActor {
                     member = %local,
                     peer = %peer,
                     %error,
+                    "a declared edge of a newly seated member could not be realized; its repair is owed"
+                );
+                self.resolve_member_edge_realization(&MemberWiringEdge::Member(edge), false);
+            }
+        }
+        for (local, peer) in single {
+            if let Err(error) = Box::pin(self.handle_wire(
+                local.clone(),
+                super::super::handle::PeerTarget::Local(peer.clone()),
+            ))
+            .await
+            {
+                let edge = mob_dsl::WiringEdge::new(
+                    mob_dsl::AgentIdentity::from_domain(&local),
+                    mob_dsl::AgentIdentity::from_domain(&peer),
+                );
+                let held = self.dsl_authority.state().wiring_edges.contains(&edge);
+                tracing::warn!(
+                    mob_id = %self.definition.id,
+                    member = %local,
+                    peer = %peer,
+                    held,
+                    %error,
                     "a declared edge of a newly seated member could not be wired"
                 );
+                if held {
+                    self.resolve_member_edge_realization(&MemberWiringEdge::Member(edge), false);
+                }
             }
         }
     }
@@ -341,7 +404,7 @@ impl MobActor {
 
     /// How `identity`, a member committed before the seat step, joins the
     /// step's declared edges. MobMachine's facts decide first: a placed
-    /// member takes the single-edge path, and a Dormant one joins from its
+    /// member's edge takes its repair path, and a Dormant one joins from its
     /// durable endpoint, or with its endpoint owed. Any other member is
     /// resolved as every wire resolves it.
     async fn declared_edge_end(&self, identity: &AgentIdentity) -> DeclaredEdgeEnd {
@@ -357,13 +420,13 @@ impl MobActor {
             )
         };
         if placed {
-            return DeclaredEdgeEnd::Single;
+            return DeclaredEdgeEnd::Other;
         }
         let Some(entry) = self.roster.read().await.get(identity).cloned() else {
-            return DeclaredEdgeEnd::Single;
+            return DeclaredEdgeEnd::Other;
         };
         if !matches!(entry.member_ref, MemberRef::Session { .. }) {
-            return DeclaredEdgeEnd::Single;
+            return DeclaredEdgeEnd::Other;
         }
         if dormant && !endpoint_recorded {
             return DeclaredEdgeEnd::EndpointPending;
@@ -373,33 +436,37 @@ impl MobActor {
             Ok(WiringEndpoint::LocalDormant { spec, .. }) => DeclaredEdgeEnd::Dormant(spec),
             Err(_) if unmaterialized && !endpoint_recorded => DeclaredEdgeEnd::EndpointPending,
             Ok(WiringEndpoint::PeerOnly { .. } | WiringEndpoint::Placed { .. }) | Err(_) => {
-                DeclaredEdgeEnd::Single
+                DeclaredEdgeEnd::Other
             }
         }
     }
 
     /// The batched form of the declared edge `local` - `peer`, or `None`
-    /// when it takes the single-edge path: an end that is placed, peer-only
-    /// or unresolved, or two live ends.
+    /// when it takes the single-edge path (two live ends).
     fn batched_declared_edge(
         local: &AgentIdentity,
         peer: &AgentIdentity,
         ends: &BTreeMap<AgentIdentity, DeclaredEdgeEnd>,
     ) -> Option<BatchedDeclaredEdge> {
-        let trust = match (ends.get(local)?, ends.get(peer)?) {
-            (DeclaredEdgeEnd::Single, _)
-            | (_, DeclaredEdgeEnd::Single)
-            | (DeclaredEdgeEnd::Live(_), DeclaredEdgeEnd::Live(_)) => return None,
-            (DeclaredEdgeEnd::Live(comms), DeclaredEdgeEnd::Dormant(spec)) => Some(LiveEndTrust {
-                comms: Arc::clone(comms),
-                counterpart: peer.clone(),
-                counterpart_spec: spec.clone(),
-            }),
-            (DeclaredEdgeEnd::Dormant(spec), DeclaredEdgeEnd::Live(comms)) => Some(LiveEndTrust {
-                comms: Arc::clone(comms),
-                counterpart: local.clone(),
-                counterpart_spec: spec.clone(),
-            }),
+        let realization = match (ends.get(local)?, ends.get(peer)?) {
+            (DeclaredEdgeEnd::Live(_), DeclaredEdgeEnd::Live(_)) => return None,
+            (DeclaredEdgeEnd::Other, _) | (_, DeclaredEdgeEnd::Other) => {
+                DeclaredEdgeRealization::Repair
+            }
+            (DeclaredEdgeEnd::Live(comms), DeclaredEdgeEnd::Dormant(spec)) => {
+                DeclaredEdgeRealization::LiveEnd(LiveEndTrust {
+                    comms: Arc::clone(comms),
+                    counterpart: peer.clone(),
+                    counterpart_spec: spec.clone(),
+                })
+            }
+            (DeclaredEdgeEnd::Dormant(spec), DeclaredEdgeEnd::Live(comms)) => {
+                DeclaredEdgeRealization::LiveEnd(LiveEndTrust {
+                    comms: Arc::clone(comms),
+                    counterpart: local.clone(),
+                    counterpart_spec: spec.clone(),
+                })
+            }
             // No live end, or an end whose endpoint is owed: the machine edge
             // alone.
             (
@@ -407,7 +474,9 @@ impl MobActor {
                 DeclaredEdgeEnd::Dormant(_) | DeclaredEdgeEnd::EndpointPending,
             )
             | (DeclaredEdgeEnd::Live(_), DeclaredEdgeEnd::EndpointPending)
-            | (DeclaredEdgeEnd::EndpointPending, DeclaredEdgeEnd::Live(_)) => None,
+            | (DeclaredEdgeEnd::EndpointPending, DeclaredEdgeEnd::Live(_)) => {
+                DeclaredEdgeRealization::MachineEdge
+            }
         };
         Some(BatchedDeclaredEdge {
             edge: mob_dsl::WiringEdge::new(
@@ -416,26 +485,27 @@ impl MobActor {
             ),
             local: local.clone(),
             peer: peer.clone(),
-            trust,
+            realization,
         })
     }
 
     /// Stage the batched declared edges on the seat step's prepared
     /// `authority` (see the module docs): their effects to `effects`, a
     /// `MembersWired` row per new edge to `journal`. Returns what is realized
-    /// once the step committed: the live ends' trust, and as its single-edge
-    /// edges the ones whose lifecycle notices MobMachine does not suppress,
-    /// which that path classifies and realizes.
+    /// once the step committed: the live ends' trust, the edges the repair
+    /// path realizes, and as its single-edge edges the ones whose lifecycle
+    /// notices MobMachine does not suppress, which that path classifies and
+    /// realizes.
     fn stage_batched_declared_edges(
         &self,
         authority: &mut mob_dsl::MobMachinePreparedAuthority,
         edges: Vec<BatchedDeclaredEdge>,
         effects: &mut Vec<mob_dsl::MobMachineEffect>,
         journal: &mut Vec<NewMobEvent>,
-    ) -> StagedDeclaredEdges {
+    ) -> Result<StagedDeclaredEdges, MobError> {
         let mut staged = StagedDeclaredEdges::none();
         if edges.is_empty() {
-            return staged;
+            return Ok(staged);
         }
 
         // The lifecycle notices each edge would exchange, MobMachine's pure
@@ -455,21 +525,14 @@ impl MobActor {
                 },
             ]
         });
-        let verdicts = match authority.apply_batch(verdict_inputs) {
-            Ok(verdicts) => verdicts,
-            Err(error) => {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    %error,
-                    "MobMachine classified no notice of the declared edges of newly seated members"
-                );
-                staged.single = edges
-                    .into_iter()
-                    .map(|batched| (batched.local, batched.peer))
-                    .collect();
-                return staged;
+        let verdicts = authority.apply_batch(verdict_inputs).map_err(|error| {
+            MobError::MobMachineRejected {
+                context: SEAT_WIRING,
+                reason: format!(
+                    "MobMachine classified no lifecycle notice of the declared edges: {error}"
+                ),
             }
-        };
+        })?;
         let mut kept = Vec::with_capacity(edges.len());
         let mut verdicts = verdicts.into_iter();
         for batched in edges {
@@ -503,63 +566,67 @@ impl MobActor {
             batched,
             wired,
             authorized,
-        } in self.apply_declared_edges(authority, kept)
+        } in self.apply_declared_edges(authority, kept)?
         {
-            let Some(wired) = wired else {
-                continue;
-            };
+            // A wire MobMachine answers with neither a new edge nor a repair
+            // refuses the step: its edge would be committed without its row.
             let added = Self::wire_members_disposition_from_effects(
                 wired.effects(),
                 &batched.edge,
                 SEAT_WIRING,
-            );
+            )?;
             staged.phase_changed |= wired.from_phase != wired.to_phase;
             effects.extend(wired.into_effects());
             if let Some(authorized) = &authorized {
                 staged.phase_changed |= authorized.from_phase != authorized.to_phase;
                 effects.extend(authorized.effects().iter().cloned());
             }
-            match added {
-                Ok(true) => {
-                    // Journal before commit: MobMachine never holds an edge
-                    // before its MembersWired row is durable, which the
-                    // step's one append makes it with the seats' rows.
-                    journal.push(NewMobEvent {
-                        mob_id: self.definition.id.clone(),
-                        timestamp: None,
-                        kind: MobEventKind::MembersWired {
-                            a: AgentIdentity::from(batched.edge.a.0.as_str()),
-                            b: AgentIdentity::from(batched.edge.b.0.as_str()),
-                        },
-                    });
-                    if batched.trust.is_some() {
-                        staged.trust.push((batched, authorized));
-                    }
+            // The pass leaves out the edges MobMachine holds: an edge it held
+            // already has its row, and nothing of it is realized here.
+            if !added {
+                continue;
+            }
+            // Journal before commit: MobMachine never holds an edge before its
+            // MembersWired row is durable, which the step's one append makes
+            // it with the seats' rows.
+            journal.push(NewMobEvent {
+                mob_id: self.definition.id.clone(),
+                timestamp: None,
+                kind: MobEventKind::MembersWired {
+                    a: AgentIdentity::from(batched.edge.a.0.as_str()),
+                    b: AgentIdentity::from(batched.edge.b.0.as_str()),
+                },
+            });
+            match batched.realization {
+                DeclaredEdgeRealization::MachineEdge => {}
+                DeclaredEdgeRealization::LiveEnd(trust) => staged.trust.push(StagedLiveEnd {
+                    edge: batched.edge,
+                    local: batched.local,
+                    peer: batched.peer,
+                    trust,
+                    authorized,
+                }),
+                DeclaredEdgeRealization::Repair => {
+                    staged
+                        .repair
+                        .push((batched.local, batched.peer, batched.edge));
                 }
-                // The pass leaves out the edges MobMachine holds, so none is
-                // only repaired here.
-                Ok(false) => {}
-                Err(error) => tracing::warn!(
-                    mob_id = %self.definition.id,
-                    member = %batched.local,
-                    peer = %batched.peer,
-                    %error,
-                    "a declared edge of a newly seated member was not wired"
-                ),
             }
         }
-        staged
+        Ok(staged)
     }
 
     /// Apply `edges` on the prepared `authority`: every `WireMembers`, then
     /// every live end's `AuthorizeMemberTrustWiring`, as one batch. A refused
-    /// batch left the authority as it was: each edge is then applied alone,
-    /// in order, and an edge MobMachine refuses is left out, logged.
+    /// batch left the authority as it was: each edge's wire is then applied
+    /// alone, in order, and one MobMachine refuses refuses the step typed;
+    /// then each live end's authorization alone, and a refused one leaves
+    /// the edge owed a repair once the step committed.
     fn apply_declared_edges(
         &self,
         authority: &mut mob_dsl::MobMachinePreparedAuthority,
         edges: Vec<BatchedDeclaredEdge>,
-    ) -> Vec<AppliedDeclaredEdge> {
+    ) -> Result<Vec<AppliedDeclaredEdge>, MobError> {
         let wire = |batched: &BatchedDeclaredEdge| mob_dsl::MobMachineInput::WireMembers {
             edge: batched.edge.clone(),
         };
@@ -569,13 +636,22 @@ impl MobActor {
                 a_identity: batched.edge.a.clone(),
                 b_identity: batched.edge.b.clone(),
             };
+        let live_end = |batched: &BatchedDeclaredEdge| {
+            matches!(batched.realization, DeclaredEdgeRealization::LiveEnd(_))
+        };
+        let no_transition = |batched: &BatchedDeclaredEdge| {
+            MobError::Internal(format!(
+                "{SEAT_WIRING}: MobMachine applied no transition for the declared edge {} - {}",
+                batched.local, batched.peer
+            ))
+        };
         let inputs = edges
             .iter()
             .map(wire)
             .chain(
                 edges
                     .iter()
-                    .filter(|batched| batched.trust.is_some())
+                    .filter(|batched| live_end(batched))
                     .map(authorize),
             )
             .collect::<Vec<_>>();
@@ -586,37 +662,36 @@ impl MobActor {
                 .into_iter()
                 .zip(wired)
                 .map(|(batched, wired)| {
-                    let authorized = if batched.trust.is_some() {
+                    let wired = wired.ok_or_else(|| no_transition(&batched))?;
+                    let authorized = if live_end(&batched) {
                         transitions.next()
                     } else {
                         None
                     };
-                    AppliedDeclaredEdge {
+                    Ok(AppliedDeclaredEdge {
                         batched,
                         wired,
                         authorized,
-                    }
+                    })
                 })
                 .collect();
         }
 
-        // One edge's refusal: each edge alone, in order, then each live
+        // One input's refusal: each edge alone, in order, then each live
         // end's authorization over the topology all of them leave.
         let mut applied = Vec::with_capacity(edges.len());
         for batched in edges {
-            let wired = match authority.apply_batch([wire(&batched)]) {
-                Ok(mut transitions) => transitions.pop(),
-                Err(error) => {
-                    tracing::warn!(
-                        mob_id = %self.definition.id,
-                        member = %batched.local,
-                        peer = %batched.peer,
-                        %error,
-                        "MobMachine refused a declared edge of a newly seated member"
-                    );
-                    None
-                }
-            };
+            let wired = authority
+                .apply_batch([wire(&batched)])
+                .map_err(|error| MobError::MobMachineRejected {
+                    context: SEAT_WIRING,
+                    reason: format!(
+                        "MobMachine refused the declared edge {} - {}: {error}",
+                        batched.local, batched.peer
+                    ),
+                })?
+                .pop()
+                .ok_or_else(|| no_transition(&batched))?;
             applied.push(AppliedDeclaredEdge {
                 batched,
                 wired,
@@ -624,7 +699,7 @@ impl MobActor {
             });
         }
         for entry in &mut applied {
-            if entry.wired.is_none() || entry.batched.trust.is_none() {
+            if !live_end(&entry.batched) {
                 continue;
             }
             entry.authorized = match authority.apply_batch([authorize(&entry.batched)]) {
@@ -641,7 +716,7 @@ impl MobActor {
                 }
             };
         }
-        applied
+        Ok(applied)
     }
 
     /// The authority a live end installs its trust toward its counterpart
