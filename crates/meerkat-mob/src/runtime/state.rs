@@ -1054,10 +1054,11 @@ pub(super) enum MobCommand {
         member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
         failure: Option<MobError>,
     },
-    /// The rebuilds of members the clean-stop lift's plan materializes
-    /// through the explicit-resume work path were prepared off the actor
-    /// (`resume_attempt` is the lift's); the explicit resume reserves and
-    /// rebuilds each, and the plan goes on.
+    /// The rebuild of a member the clean-stop lift's plan materializes
+    /// through the explicit-resume work path (with the forks of its round
+    /// that follow its overlay) was prepared off the actor (`resume_attempt`
+    /// is the lift's); the explicit resume reserves and rebuilds each, and
+    /// the plan goes on.
     ResumeLifecycleBootMembersPrepared {
         resume_attempt: mob_dsl::ResumeAttemptId,
         prepared: Vec<super::actor::boot_lift::ExplicitResumeBootMemberPrepared>,

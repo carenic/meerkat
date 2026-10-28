@@ -1040,9 +1040,10 @@ impl MobActor {
         }
     }
 
-    /// The rebuilds of a dispatch round's members are prepared. The explicit
-    /// resume reserves each prepared member (Join: the plan's attempt is
-    /// open) and the work path materializes it. A member whose rebuild could
+    /// The rebuild of a planned member is prepared (with the forks of its
+    /// round that follow its overlay, sources first). The explicit resume
+    /// reserves each prepared member (Join: the plan's attempt is open) and
+    /// the work path materializes it. A member whose rebuild could
     /// not be prepared, or that the explicit resume could not reserve, ends
     /// its plan attempt as a wake would ([`Self::end_explicit_resume_boot_member`]).
     /// A member whose attempt closed meanwhile (a stop, a retire) was not
