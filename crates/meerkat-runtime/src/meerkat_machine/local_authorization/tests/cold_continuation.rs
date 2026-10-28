@@ -367,15 +367,30 @@ impl AuthenticatedOriginalSource for Custody {
 }
 
 /// The controller owner: reacquires the actual client for a retained
-/// selection; every reacquisition is observable.
+/// selection; every reacquisition is observable. Once its clients are
+/// withdrawn (the second field) it has no client for any selection, as an
+/// owner whose session moved to another controller.
 #[derive(Default)]
-struct Controllers(std::sync::Mutex<Vec<ControllerModelClient>>);
+struct Controllers(
+    std::sync::Mutex<Vec<ControllerModelClient>>,
+    std::sync::atomic::AtomicBool,
+);
+
+impl Controllers {
+    /// From now on, no client for any selection.
+    fn withdraw_clients(&self) {
+        self.1.store(true, Ordering::SeqCst);
+    }
+}
 
 impl RetainedControllerOwner for Controllers {
     fn reacquire_controller(
         &self,
         selection: &ControllerModelSelection,
     ) -> Result<Option<ControllerModelClient>, ControllerReadinessFailure> {
+        if self.1.load(Ordering::SeqCst) {
+            return Ok(None);
+        }
         let client = ControllerModelClient::new(
             selection.clone(),
             Arc::new(SelectedClient(selection.clone())),
@@ -1239,6 +1254,123 @@ async fn a_resume_waits_while_its_destination_is_not_bound_yet() {
         "resumed"
     );
     assert_eq!(effects.load(Ordering::SeqCst), 1, "the resume ran once");
+}
+
+/// A resume whose destination moved on is refused for good before any
+/// owner is asked. Here the controller owner no longer has a client for the
+/// run's selection (the session moved to another controller), an answer
+/// that leaves a resume not ready, retryable, on every round. The runtime
+/// refuses it first, `NoAdmissibleWorkBinding`, and nothing runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_moved_resume_is_refused_before_an_owner_without_its_controller_is_asked() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let owners = owners_of(&configuration, &template);
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let machine = open(&store, &blobs, &owners).await;
+    let (destination, effects, _applied) = settle_original_with_continuation(
+        &machine,
+        &store,
+        &session,
+        &template,
+        &owners,
+        "the original's result",
+    )
+    .await;
+
+    owners.controllers.withdraw_clients();
+    let mut moved = destination;
+    moved.context_generation += 1;
+    bind_when_settled(&machine, &session, &moved).await;
+
+    let resume = continuation();
+    let resume_id = resume.id().clone();
+    let refused = machine
+        .accept_retained_resume(
+            &session,
+            resume,
+            head_request(&store, &runtime, DELIVERY, 1).await,
+        )
+        .await
+        .map(|(outcome, _)| outcome);
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeDriverError::RetainedResumeRefused {
+                reason: crate::retained_work::RetainedResumeRefusal::NoAdmissibleWorkBinding
+            })
+        ),
+        "a resume whose destination moved on is refused before its owners are asked; the \
+         owner's not-ready answer would leave its delivery pending forever: {refused:?}"
+    );
+    assert!(
+        machine
+            .input_state(&session, &resume_id)
+            .await
+            .expect("row read")
+            .is_none(),
+        "nothing was admitted for the resume"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 1, "only the original ran");
+}
+
+/// Control: the same owner, without a client for the run's selection, at
+/// the destination the run was admitted under answers the resume not
+/// ready. The refusal stays retryable, never final, and nothing is
+/// admitted.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_without_its_controller_at_its_own_destination_stays_retryable() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let owners = owners_of(&configuration, &template);
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let machine = open(&store, &blobs, &owners).await;
+    let (_destination, effects, _applied) = settle_original_with_continuation(
+        &machine,
+        &store,
+        &session,
+        &template,
+        &owners,
+        "the original's result",
+    )
+    .await;
+
+    owners.controllers.withdraw_clients();
+    let resume = continuation();
+    let resume_id = resume.id().clone();
+    let waiting = machine
+        .accept_retained_resume(
+            &session,
+            resume,
+            head_request(&store, &runtime, DELIVERY, 1).await,
+        )
+        .await
+        .map(|(outcome, _)| outcome);
+    assert!(
+        matches!(
+            waiting,
+            Err(RuntimeDriverError::ControllerReadinessUnavailable {
+                reason: ControllerReadinessFailure::UnsupportedScope
+            })
+        ),
+        "at its own destination an owner without the run's controller leaves the resume \
+         retryable, never refused for good: {waiting:?}"
+    );
+    assert!(
+        machine
+            .input_state(&session, &resume_id)
+            .await
+            .expect("row read")
+            .is_none(),
+        "nothing was admitted while the owner had no client"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 1, "only the original ran");
 }
 
 /// A continuation produced by a resumed run, delivered after another reopen.

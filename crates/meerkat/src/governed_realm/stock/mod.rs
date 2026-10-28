@@ -44,14 +44,18 @@
 //! consent parked at that run's close, or a host producer's completion) is
 //! admitted while this process's ledger still holds the run's originals, the
 //! stock requester rule still admits their requester, the restored grant
-//! owner still resolves their grants, and the session's latest pinned
-//! controller has the run's exact selection. The originals ledger is process
-//! memory: work admitted by an earlier process is not held by it, so its
-//! resume is refused, never re-submitted as if it were recovered. Every
-//! governed binding of a session advances its destination, and a resume is
-//! admitted only at the destination its run was admitted under: after a
-//! later prompt in the same session, the earlier run's resume is refused for
-//! good.
+//! owner still resolves their grants, and the session keeps the registration
+//! that ran it, whose newest pinned controller has the run's exact
+//! selection. The originals ledger is process memory: work admitted by an
+//! earlier process is not held by it, so its resume is refused, never
+//! re-submitted as if it were recovered. Every governed binding of a session
+//! advances its destination, and a resume is admitted only at the
+//! destination its run was admitted under: after a later prompt in the same
+//! session, whichever controller that prompt used, the earlier run's resume
+//! is refused for good. After the session is closed and reopened in the
+//! same process, the earlier run's resume is not ready (its new registration
+//! has no pin for it) until the session's next governed prompt, and is then
+//! refused for good.
 
 pub mod caller;
 pub mod consent;
@@ -345,7 +349,7 @@ pub struct StockGovernance {
     /// them when the realm last opened: the current installation a resumed
     /// session's attachment restore resolves.
     installed_mcp: std::sync::Mutex<Vec<meerkat_core::McpServerConfig>>,
-    /// Each session runtime's controller pin from its latest governed
+    /// Each session runtime's controller pin from its newest governed
     /// binding, which only the composition's retained-resume check reads: a
     /// capability cache of live clients, not lifecycle state (see
     /// `StockResumePins`).
@@ -768,7 +772,7 @@ impl StockGovernance {
     /// that admitted the work, the restored grant owner `grants`, this
     /// composition's ingress domain and originals ledger and the stock
     /// requester rule `invocation`, with, as its controller owner, the pin of
-    /// the resumed session's own latest governed binding.
+    /// the resumed session's own newest governed binding.
     fn retained_resume_check(
         &self,
         grants: Arc<LocalGrantAuthority>,
@@ -1023,8 +1027,10 @@ impl StockGovernance {
             )
             .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
         // The session's pin for a retained resume of its work: the client
-        // this binding was made with, replacing the earlier binding's.
+        // this binding was made with, replacing the pin of an older binding
+        // (a lower destination generation) only.
         let pinned = controller.clone();
+        let generation = destination.target().context_generation;
         let input = bind_scoped_original(
             input,
             claims.association,
@@ -1036,7 +1042,7 @@ impl StockGovernance {
             controller,
         )
         .map_err(|error| StockGovernanceError::Binding(error.to_string()))?;
-        self.resume_pins.record(registration, pinned);
+        self.resume_pins.record(registration, generation, pinned);
         Ok((input, pending))
     }
 

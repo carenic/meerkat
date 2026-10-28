@@ -27,10 +27,12 @@
 //! composition (`RealmGovernance::Stock`) installs one; a custom composition
 //! supplies its own, for example with
 //! `ScopedGrantComposition::with_retained_resume`. Without one the notice's
-//! admission is never ready (`UnsupportedScope`) and the notice stays owed.
+//! admission is never ready (`UnsupportedScope`) and the notice stays owed,
+//! unless its run's destination is superseded (below).
 //! A resume whose run's destination its session has since superseded (as a
-//! later prompt of a stock session supersedes it) is refused for good, so
-//! the notice records `Failed` and approved parked consent is withdrawn.
+//! later prompt of a stock session supersedes it) is refused for good before
+//! any owner is asked, so the notice records `Failed` and approved parked
+//! consent is withdrawn.
 //!
 //! The same rounds watch the issuing owner's parked consent whose approved
 //! notice was admitted as an input of one of this domain's sessions: when

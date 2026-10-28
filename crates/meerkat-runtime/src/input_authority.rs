@@ -731,11 +731,8 @@ pub(crate) fn input_context_target(input: &Input) -> Result<Option<String>, Runt
 }
 
 /// Whether `input` resumes retained work whose original destination the
-/// session document has since superseded: its canonical original's target
-/// names the document's current stable scope `current_scope` at a generation
-/// strictly older than the current binding's `current_generation`. A
-/// document's generations only advance, so such a resume can never be
-/// admitted on it. Any other input, and any other mismatch, proves nothing.
+/// session document has since superseded: `destination_superseded` for its
+/// canonical original's target. Any other input proves nothing.
 pub(crate) fn retained_resume_destination_superseded(
     input: &Input,
     current_scope: Option<&str>,
@@ -749,7 +746,25 @@ pub(crate) fn retained_resume_destination_superseded(
         .contributors
         .first()
         .ok_or_else(unavailable)?;
-    let target = &canonical.association().candidate().target;
+    destination_superseded(
+        &canonical.association().candidate().target,
+        current_scope,
+        current_generation,
+    )
+}
+
+/// Whether a session document bound under the stable scope `current_scope`
+/// at `current_generation` has superseded the destination `target`: it
+/// names that same scope at a generation strictly older than the current
+/// binding's. A document's generations only advance, so work naming
+/// `target` can never be admitted on it again. Any other difference proves
+/// nothing. The one rule for a superseded retained resume: the runtime reads
+/// it before any owner is asked, and the driver again at admission.
+pub(crate) fn destination_superseded(
+    target: &meerkat_authorization_contracts::work_association::NativeWorkTarget,
+    current_scope: Option<&str>,
+    current_generation: u64,
+) -> Result<bool, RuntimeDriverError> {
     if target.context_generation >= current_generation {
         return Ok(false);
     }

@@ -558,14 +558,18 @@ Withdrawn notice is admitted as a resume of the run that issued the consent,
 and the approval records its receipt: `Admitted` for the input that carries
 it, or `Failed` for a notice that can never be admitted. Approved consent
 parked at that run's close moves into the resumed run its notice starts, and
-that run spends it once; a `Failed` notice withdraws it. The governed
+that run can spend it once; a `Failed` notice withdraws it. The governed
 composition admits a resume only through its retained-resume owner: the stock
 governed composition installs one, and a custom composition supplies its own
-(`ScopedGrantComposition::with_retained_resume`). Without one, every notice
-stays owed. On a stock governed realm, an approval resumes the parked run only
-while no later governed prompt has moved that session's destination; after
-one, its notice fails visibly. The stock servers compose no notice delivery of
-their own.
+(`ScopedGrantComposition::with_retained_resume`). Without one, no notice is
+admitted: each stays owed, or fails once a later binding of its session has
+moved its run's destination. On a stock governed realm, an approval resumes the parked run only
+while the session keeps the registration that ran it and no later governed
+prompt has moved that session's destination. After such a prompt, whichever
+controller it used, the notice fails visibly. After the session is closed and
+reopened in the same process, the notice stays owed until the session's next
+governed prompt, and then fails visibly. The stock servers compose no notice
+delivery of their own.
 
 Reusable consent applies only to a requirement that owner policy explicitly
 makes reusable, with a defined scope, use limits where bounded, expiry or an

@@ -195,8 +195,9 @@ impl<S> SessionServiceDeliveryHost<S> {
     /// now. A governed runtime admits a notice as a resume of the consent's
     /// origin run, so its composition needs a retained-resume owner: the
     /// stock composition installs one, and a custom composition supplies its
-    /// own (`NativeGrantWorkConfiguration::retained_resume`); without one
-    /// every notice stays owed.
+    /// own (`NativeGrantWorkConfiguration::retained_resume`); without one no
+    /// notice is admitted (each stays owed, or fails once its run's
+    /// destination is superseded).
     #[must_use]
     pub fn with_consent_notices(mut self, projector: Arc<crate::ConsentNoticeProjector>) -> Self {
         self.consent_notices = Some(projector);

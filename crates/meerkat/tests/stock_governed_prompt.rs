@@ -3054,3 +3054,229 @@ async fn a_consent_notice_after_a_later_prompt_fails_visibly() {
     drop(delivery);
     realm.close(vec![session]).await;
 }
+
+/// A controller client of another selection, for a later prompt that is
+/// bound and never submitted: it reports its selection and answers no
+/// request.
+struct OtherController(ControllerModelSelection);
+
+#[async_trait]
+impl meerkat_core::AgentLlmClient for OtherController {
+    fn controller_model_selection(&self) -> Option<ControllerModelSelection> {
+        Some(self.0.clone())
+    }
+    async fn stream_response(
+        &self,
+        _: &[Message],
+        _: &[Arc<meerkat_core::ToolDef>],
+        _: u32,
+        _: Option<f32>,
+        _: Option<&meerkat_core::ProviderParamsOverride>,
+    ) -> Result<meerkat_core::LlmStreamResult, meerkat_core::AgentError> {
+        Err(meerkat_core::AgentError::ConfigError(
+            "the other controller is never asked".into(),
+        ))
+    }
+    fn provider(&self) -> Provider {
+        self.0.provider()
+    }
+    fn model(&self) -> &str {
+        self.0.model()
+    }
+}
+
+/// Row (v) with the later prompt bound under another controller selection
+/// (the host switched the session's model or credential). The session's
+/// pin then holds that selection's client and none for the earlier run's,
+/// so the resume's owners would answer it not ready on every round. The
+/// runtime refuses a resume whose destination its session has since moved
+/// before it asks any owner, so the notice still settles: refused
+/// (`NoAdmissibleWorkBinding`), its receipt `Failed`, the parked consent
+/// withdrawn, and no model request for it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_consent_notice_after_a_later_prompt_with_another_controller_fails_visibly() {
+    let _turn = CONTROLLER_CREDENTIAL.lock().await;
+    let root = tempfile::tempdir().expect("state root");
+    let log = root.path().join("records.log");
+    provision_producer(root.path(), &log, "controller-switched-resume").await;
+    let producer = Arc::new(Producer::default());
+    let model = ScriptedModel::new("controller-switched-resume", dispatching_script(&[]));
+    let realm = open_as(root.path(), DEFAULT_STOCK_AGENT, model.clone()).await;
+    let session = realm
+        .session_with(Vec::new(), Some(registered_producer(&producer)))
+        .await;
+    let (_, text) = realm
+        .prompt(&session, "Dispatch the job")
+        .await
+        .expect("the operator's prompt is bound");
+    assert_eq!(text, FINAL);
+    let work = producer.retained();
+
+    let approvals = Arc::new(ApprovalService::new());
+    let domain = hosting_domain(root.path());
+    let consent = ParkedRoutedConsent::park(
+        &approvals,
+        ApprovalConsentScope {
+            domain: domain.clone(),
+            session_id: session.session_id.clone(),
+        },
+        work,
+    )
+    .await
+    .expect("consent of the run's work, approved and parked at its close");
+    let approval_id = consent.approval_id().clone();
+    let approved = ApprovalConsentTransition::Approved;
+
+    // A later prompt of the same session is bound with a client of another
+    // selection: the binding moves the session's destination and pins that
+    // client. It is never submitted.
+    let switched = selection("controller-switched-elsewhere");
+    let (_later, unsubmitted) = realm
+        .stock
+        .bind_prompt(
+            &realm.machine,
+            &session.session_id,
+            Input::Prompt(PromptInput::new("Anything else?", None)),
+            ControllerModelClient::new(switched.clone(), Arc::new(OtherController(switched))),
+        )
+        .await
+        .expect("the later prompt binds under another controller selection");
+    drop(unsubmitted);
+
+    let mut delivery = HostDelivery::arm(&realm, Some((Arc::clone(&approvals), domain)));
+    let status = delivery
+        .status_until(
+            &session.session_id,
+            &consent_key(&approval_id, approved),
+            "the approved notice settles after a later prompt under another controller",
+            settled,
+        )
+        .await;
+    assert!(
+        matches!(
+            status,
+            ContinuationStatus::Refused {
+                reason: meerkat_runtime::RuntimeDeliveryRefusalReason::NoAdmissibleWorkBinding,
+                ..
+            }
+        ),
+        "{status:?}"
+    );
+    match delivery
+        .receipt_until(&approvals, &approval_id, approved, "the notice's receipt")
+        .await
+    {
+        ApprovalConsentDeliveryState::Failed { reason } => {
+            assert!(reason.contains("NoAdmissibleWorkBinding"), "{reason}");
+        }
+        other => panic!("the approved notice was not receipted as failed: {other:?}"),
+    }
+    assert_eq!(
+        withdrawal_reason(&approvals, &approval_id),
+        Some(ApprovalConsentWithdrawalReason::RunEnded),
+        "the undeliverable notice withdrew the parked consent"
+    );
+    assert_eq!(
+        model.requests().len(),
+        2,
+        "the model got no request for the notice"
+    );
+    drop(delivery);
+    realm.close(vec![session]).await;
+}
+
+/// A host-authenticated caller's work resumes only while the caller's login
+/// is current. The completion of a job the caller's run dispatched is
+/// admitted as a resume of that run while the login is current; once the
+/// login's deadline has passed, a completion of the same run is refused for
+/// good (`AuthorityDenied`) before anything runs, though the host still
+/// answers that it admits the caller.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_callers_resume_after_its_login_expired_is_refused() {
+    let _turn = CONTROLLER_CREDENTIAL.lock().await;
+    let root = tempfile::tempdir().expect("state root");
+    let log = root.path().join("records.log");
+    provision_producer(root.path(), &log, "controller-expired-login-resume").await;
+    let producer = Arc::new(Producer::default());
+    let model = ScriptedModel::new(
+        "controller-expired-login-resume",
+        dispatching_script(&[RESUMED]),
+    );
+    let access = HostAccess::answering(Ok(()));
+    let realm = open_for_host(
+        root.path(),
+        model.clone(),
+        host_ingress(),
+        Arc::clone(&access) as Arc<dyn StockCallerAccess>,
+    )
+    .await;
+    let session = realm
+        .session_with(Vec::new(), Some(registered_producer(&producer)))
+        .await;
+    let caller = host_caller();
+    let (_, text) = realm
+        .caller_prompt(&session, "Dispatch the job", &caller)
+        .await
+        .expect("the allowed caller's input binds");
+    assert_eq!(text, FINAL);
+    let work = producer.retained();
+    let jobs = Arc::new(HostJobs::default());
+    jobs.commit("job-1", &session.session_id, &work);
+    jobs.commit("job-2", &session.session_id, &work);
+
+    let mut delivery = HostDelivery::arm(&realm, None);
+    let _binding = delivery
+        .bindings
+        .bind(
+            Arc::new(SessionAddressResolver),
+            Arc::clone(&jobs) as Arc<dyn RetainedJobSource>,
+        )
+        .expect("bind the host's job source");
+    let first = submit_job(&delivery.continuations, &jobs, &session.session_id, "job-1").await;
+    let resumed_input = match delivery
+        .status_until(
+            &session.session_id,
+            &first,
+            "the resume while the caller's login is current",
+            settled,
+        )
+        .await
+    {
+        ContinuationStatus::Applied { input, .. } => input,
+        other => panic!("the resume was not admitted: {other:?}"),
+    };
+    let resumed = terminal_of(&realm, &session, &resumed_input, "the resumed run").await;
+    assert!(
+        matches!(&resumed, CompletionOutcome::Completed(result) if result.text == RESUMED),
+        "{resumed:?}"
+    );
+
+    // The login's deadline has passed; the host's answer is unchanged.
+    access.login(StockLoginLifetime::ExpiresAt { unix_ms: 1 });
+    let second = submit_job(&delivery.continuations, &jobs, &session.session_id, "job-2").await;
+    let refused = delivery
+        .status_until(
+            &session.session_id,
+            &second,
+            "the resume once the caller's login expired",
+            settled,
+        )
+        .await;
+    assert!(
+        matches!(
+            refused,
+            ContinuationStatus::Refused {
+                reason: meerkat_runtime::RuntimeDeliveryRefusalReason::AuthorityDenied,
+                ..
+            }
+        ),
+        "{refused:?}"
+    );
+    assert_eq!(
+        model.requests().len(),
+        3,
+        "nothing ran for the refused resume"
+    );
+    drop(delivery);
+    realm.close(vec![session]).await;
+}

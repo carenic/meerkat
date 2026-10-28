@@ -1511,7 +1511,9 @@ impl EphemeralRuntimeDriver {
     /// document has since bound a later generation of that same destination,
     /// the resume can never be admitted here (a document's generations only
     /// advance): it is refused for good, so the delivery carrying it settles
-    /// instead of retrying forever. Every other mismatch stays retryable.
+    /// instead of retrying forever. Every other mismatch stays retryable. The
+    /// runtime reads the same rule before it asks any owner
+    /// (`scoped_destination_superseded`); this is its check under custody.
     fn check_scoped_context(&self, input: &Input) -> Result<(), RuntimeDriverError> {
         let (current, current_scope, current_generation, ever_bound) =
             self.with_dsl_state(|state| {
@@ -1546,6 +1548,31 @@ impl EphemeralRuntimeDriver {
             }
             _ => Ok(()),
         }
+    }
+
+    /// Whether this session document has superseded the destination
+    /// `target`: it is bound, under `target`'s stable scope, at a generation
+    /// strictly newer than `target`'s
+    /// (`input_authority::destination_superseded`). Work naming `target` can
+    /// never be admitted here again. A retained resume reads it before any
+    /// owner is asked, so an owner that is not ready for that work (no
+    /// client for its controller any more) cannot keep it owed; admission
+    /// applies the same rule again (`check_scoped_context`).
+    pub(crate) fn scoped_destination_superseded(
+        &self,
+        target: &meerkat_authorization_contracts::work_association::NativeWorkTarget,
+    ) -> Result<bool, RuntimeDriverError> {
+        let (bound, scope, generation) = self.with_dsl_state(|state| {
+            (
+                state.scoped_context_binding.is_some(),
+                state.scoped_context_scope.clone(),
+                state.scoped_context_generation,
+            )
+        });
+        if !bound {
+            return Ok(false);
+        }
+        crate::input_authority::destination_superseded(target, scope.as_deref(), generation)
     }
 
     fn requires_scoped_destination(&self) -> bool {
