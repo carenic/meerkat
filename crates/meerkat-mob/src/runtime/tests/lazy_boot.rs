@@ -1050,15 +1050,19 @@ async fn seat_journal_rows(
 
 /// The commit applies a seat chunk's inputs as one batch and its boot plans
 /// as another, and applies a batch the machine refuses again one identity
-/// at a time: either way each entry is answered exactly as seating its spec
-/// alone answers it. Two mobs seat the same specs, one a chunk per call and
-/// the other one spec per call: first a chunk the machine accepts whole,
-/// then a mixed one (a fresh seat, resume seats, an identity seated already,
-/// and an identity whose peer id another seat of the chunk holds, which the
-/// machine refuses at the commit). The outcomes, the refusal, the journal
-/// rows (fence tokens included) and each identity's machine facts are the
-/// same. The sessions' key pairs exist before the seats, so both seats of
-/// the shared session carry its one key.
+/// at a time. Two mobs seat the same specs, one a chunk per call and the
+/// other one spec per call: first a chunk the machine accepts whole, then a
+/// mixed one (a fresh seat, resume seats, an identity seated already, and
+/// an identity whose peer id another seat of the chunk holds, which the
+/// machine refuses at the commit). For these chunks (distinct identities,
+/// no spec that owes a kickoff, and every resume session's key pair stored
+/// before the seats, so both seats of the shared session carry its one key)
+/// the outcomes, the refusal, the journal rows (fence tokens included) and
+/// each identity's machine facts are the same. Other chunks can still differ
+/// from one spec per call, as they did before the batch: a chunk refuses a
+/// name given twice, plans every spec before any of its seats commits, and
+/// an embodied spec's spawn takes its fence token between the plan and the
+/// commit.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_seat_chunk_answers_each_entry_as_seating_its_spec_alone_does() {
     let own = SessionId::new();
@@ -1775,18 +1779,20 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
 /// wall time of each phase and of each seat chunk's plan (on the actor),
 /// preparation (off it) and commit (on the actor), so the per-seat cost can
 /// be read against how many members are seated already. Deterministic
-/// counters are the assertions, with three bounds on the 10,000 run:
+/// counters are the assertions, with two bounds on the 10,000 run:
 /// - seating takes under 10 s. Before the plan probed each chunk on one
 ///   fork and the commit applied each chunk as one batch, every seat copied
 ///   the whole machine state about five times, and the 10,000 seats took
 ///   about four minutes: quadratic in the roster. The bound sits well above
-///   the few seconds that remain and far below anything quadratic;
-/// - the per-seat cost of the last full chunk is at most 6x the first
-///   chunk's. Some cost still grows with the roster: each chunk copies the
-///   machine state a few times as a whole (its prepared commit and the state
-///   it publishes), and the seat's peer-id guard reads every member's
-///   endpoint. A per-seat copy of the state would put the ratio in the tens;
+///   the few seconds that remain and far below anything quadratic: a single
+///   copy of the state per seat again costs tens of seconds at 10,000;
 /// - the restart takes under 60 s, the restart bound.
+///
+/// The per-seat cost of the last full chunk over the first chunk's is
+/// printed with the chunk timings, as a diagnostic, not asserted: it divides
+/// one chunk's time by another's, so one slow file read in either moves it
+/// by several times, and the regression it would show, a copy of the state
+/// per seat, already fails the 10 s bound.
 ///
 /// The session service is a mock: a store's own read per seat comes on top.
 /// Run explicitly, in the release profile, with the output shown (nextest
@@ -1806,14 +1812,6 @@ async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
         "seating {} identities took {:?}, over the 10 s bound",
         largest.members,
         largest.seat
-    );
-    let (growth, commit_growth) = largest
-        .per_seat_growth()
-        .expect("the 10,000-identity run has full chunks");
-    assert!(
-        growth <= 6.0,
-        "the per-seat cost of the last full chunk is {growth:.1}x the first chunk's \
-         (commit alone {commit_growth:.1}x), over the 6x bound"
     );
     assert!(
         largest.restart < Duration::from_secs(60),

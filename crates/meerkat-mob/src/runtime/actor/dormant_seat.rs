@@ -9,8 +9,10 @@
 //! base-checked commit. An identity the machine refuses is answered alone,
 //! typed: a refused batch leaves the prepared authority as it was, and the
 //! chunk's inputs are applied again one identity at a time. Only a store
-//! failure fails the chunk, before anything of it is committed. Nothing in
-//! a chunk copies the machine state once per identity.
+//! failure fails the chunk, before anything of it is committed. A chunk the
+//! machine accepts whole copies the machine state a fixed number of times,
+//! not once per identity; a refused batch's replay copies it once per
+//! identity, as every chunk did before the batch.
 
 use super::super::dormant_seat::{
     DormantSeatCandidate, DormantSeatCommitEntry, DormantSeatLaunch, DormantSeatOutcome,
@@ -409,12 +411,13 @@ impl MobActor {
     /// copy of the machine state per batch, not one per identity. When a
     /// batch is refused, it leaves the prepared authority as it was, and
     /// its inputs are applied again one identity at a time, exactly as
-    /// before: an identity the machine refuses is answered alone. A batch
-    /// the machine accepts applied the same inputs in the same order, each
-    /// on the state the earlier ones left, so both ways answer every entry
-    /// the same. Entries of one chunk name distinct identities, so an
-    /// already-seated entry's check, which reads only its own identity,
-    /// reads the same before the chunk's inputs as between them.
+    /// before (one copy of the state per identity): an identity the machine
+    /// refuses is answered alone. A batch the machine accepts applied the
+    /// same inputs in the same order, each on the state the earlier ones
+    /// left, so both ways answer every entry the same. Entries of one chunk
+    /// name distinct identities, so an already-seated entry's check, which
+    /// reads only its own identity, reads the same before the chunk's inputs
+    /// as between them.
     pub(super) async fn commit_dormant_seats(
         &mut self,
         entries: Vec<DormantSeatCommitEntry>,
