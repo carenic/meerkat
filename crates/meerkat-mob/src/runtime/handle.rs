@@ -9445,9 +9445,11 @@ impl MobHandle {
     ///
     /// A seated member is wired to the edges the definition declares
     /// (`auto_wire_orchestrator` and `role_wiring`), as a spawn of it would
-    /// be, once its chunk is committed: the members seated in one call see
-    /// each other, and a member seated later sees the ones seated before.
-    /// The edges are MobMachine's and journaled, and none wakes a member
+    /// be, in its chunk's own commit, whose one journal append carries the
+    /// seats and their edges: the members seated in one call see each other,
+    /// and a member seated later sees the ones seated before (an orchestrator
+    /// member seated after the members that auto-wire to it is wired to
+    /// them). The edges are MobMachine's and journaled, and none wakes a member
     /// (except as MobMachine wakes a Dormant member an edge joins to a placed
     /// one): a live member trusts a seated one's recorded endpoint at once,
     /// and the seated member's own trust is installed by its wake. A member on

@@ -35,6 +35,8 @@ mod retirement_io;
 #[cfg(test)]
 pub(crate) use retirement_io::retirement_stage_test_hooks;
 mod seat_wiring;
+#[cfg(test)]
+pub(super) use seat_wiring::seat_step_appends_for_test;
 mod shutdown_teardown;
 pub(in crate::runtime) use shutdown_teardown::ShutdownUnregisterOutcome;
 #[cfg(all(test, feature = "runtime-adapter"))]
@@ -40459,12 +40461,15 @@ impl MobActor {
     }
 
     /// The members a member of `profile_name` is wired to by the edges its
-    /// definition declares, in order: the orchestrator's members (when the
-    /// definition auto-wires the orchestrator and the member is not one), then
+    /// definition declares, in order: under `auto_wire_orchestrator`, the
+    /// orchestrator's members for any other member, and for an orchestrator
+    /// member every member that auto-wires to it (the active members of
+    /// every other profile, flow members aside, which take no declared
+    /// wiring), so the edge is the same whichever of the two came first; then
     /// the members of every profile a role wiring rule pairs with
     /// `profile_name`, each once. `active_members_of` answers a profile's
-    /// active members other than the member itself. One rule for a spawn and a
-    /// seat alike.
+    /// active members other than the member itself. One rule for a spawn, a
+    /// seat and a rotation alike.
     pub(super) fn declared_wiring_targets(
         definition: &MobDefinition,
         profile_name: &ProfileName,
@@ -40475,11 +40480,23 @@ impl MobActor {
 
         if definition.wiring.auto_wire_orchestrator
             && let Some(orchestrator) = &definition.orchestrator
-            && profile_name != &orchestrator.profile
         {
-            for orchestrator_id in active_members_of(&orchestrator.profile) {
-                if named.insert(orchestrator_id.clone()) {
-                    targets.push(orchestrator_id);
+            if profile_name == &orchestrator.profile {
+                for profile in definition.profiles.keys() {
+                    if profile == &orchestrator.profile {
+                        continue;
+                    }
+                    for member in active_members_of(profile) {
+                        if !member.is_flow_member_namespace() && named.insert(member.clone()) {
+                            targets.push(member);
+                        }
+                    }
+                }
+            } else {
+                for orchestrator_id in active_members_of(&orchestrator.profile) {
+                    if named.insert(orchestrator_id.clone()) {
+                        targets.push(orchestrator_id);
+                    }
                 }
             }
         }

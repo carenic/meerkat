@@ -467,3 +467,194 @@ async fn a_rotated_member_is_wired_again_to_its_declared_edges() {
         "the live helper trusts the next incarnation's recorded endpoint"
     );
 }
+
+/// Under `auto_wire_orchestrator`, workers seated in one call and the
+/// orchestrator seated in a later one end fully wired: the orchestrator's
+/// seat wires it to every member that auto-wires to it, as each worker's own
+/// seat would have wired it to an orchestrator seated first. Nothing wakes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn workers_seated_before_the_orchestrator_are_wired_to_it_at_its_seat() {
+    let mob = WiringMob::new(
+        "seat-wiring-orchestrator-later",
+        sample_definition_with_auto_wire(),
+        false,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let first = AgentIdentity::from("seat-worker-1");
+    let second = AgentIdentity::from("seat-worker-2");
+    mob.seat(vec![spec("worker", &first), spec("worker", &second)])
+        .await;
+    assert!(mob.edges().is_empty(), "no orchestrator is seated yet");
+
+    mob.seat(vec![spec("lead", &lead)]).await;
+    let expected = BTreeSet::from([pair(&first, &lead), pair(&second, &lead)]);
+    assert_eq!(
+        mob.edges(),
+        expected,
+        "the orchestrator's seat wires every worker seated before it"
+    );
+    let rows = mob.wired_rows().await;
+    assert_eq!(rows.len(), 2, "one MembersWired row per edge: {rows:?}");
+    assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), expected);
+    assert_eq!(
+        mob.wired_to(&lead).await,
+        BTreeSet::from([first.clone(), second.clone()])
+    );
+    for identity in [&lead, &first, &second] {
+        assert_eq!(
+            mob.phase(identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity} stays Dormant"
+        );
+    }
+    assert!(
+        mob.service.recorded_create_requests().await.is_empty(),
+        "the wiring builds nothing"
+    );
+}
+
+/// Rotating the orchestrator (a host's reset of it) re-wires every worker
+/// to its next incarnation: CommitMemberRotation ends the retired
+/// incarnation's edges, and the next one is wired to every member that
+/// auto-wires to it, journaled again, with each live worker trusting the
+/// next incarnation's recorded endpoint while it stays Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rotating_the_orchestrator_rewires_every_worker_to_its_next_incarnation() {
+    let mob = WiringMob::new(
+        "seat-wiring-orchestrator-rotation",
+        sample_definition_with_auto_wire(),
+        false,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let first = AgentIdentity::from("seat-worker-1");
+    let second = AgentIdentity::from("seat-worker-2");
+    for (profile, identity) in [("lead", &lead), ("worker", &first), ("worker", &second)] {
+        mob.handle
+            .spawn_spec(spec(profile, identity))
+            .await
+            .expect("spawn a member");
+    }
+    let expected = BTreeSet::from([pair(&first, &lead), pair(&second, &lead)]);
+    assert_eq!(mob.edges(), expected, "the spawned workers auto-wire");
+    let old_peer = mob
+        .recorded_peer_id(&lead)
+        .expect("the orchestrator's endpoint");
+
+    tokio::time::timeout(STEP, mob.handle.rotate_member(spec("lead", &lead)))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation succeeds");
+    assert_eq!(
+        mob.edges(),
+        expected,
+        "every worker is wired to the orchestrator's next incarnation"
+    );
+    assert_eq!(
+        mob.wired_rows().await.len(),
+        4,
+        "the rotation journals both edges again"
+    );
+    assert_eq!(
+        mob.wired_to(&lead).await,
+        BTreeSet::from([first.clone(), second.clone()])
+    );
+    assert_eq!(
+        mob.phase(&lead),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+    let new_peer = mob
+        .recorded_peer_id(&lead)
+        .expect("the rotation recorded the next incarnation's endpoint");
+    assert_ne!(new_peer, old_peer, "the next incarnation has its own key");
+    for worker in [&first, &second] {
+        assert!(
+            mob.trusted(worker).await.contains(&new_peer),
+            "the live {worker} trusts the next incarnation's recorded endpoint"
+        );
+    }
+}
+
+/// A spawned orchestrator is wired to the workers spawned before it, as each
+/// of them would have been wired to it had it been spawned first: the edges,
+/// their rows, and the trust of both live ends.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_spawned_orchestrator_is_wired_to_the_workers_spawned_before_it() {
+    let mob = WiringMob::new(
+        "spawn-wiring-orchestrator-later",
+        sample_definition_with_auto_wire(),
+        false,
+    )
+    .await;
+    let lead = AgentIdentity::from("spawn-lead");
+    let first = AgentIdentity::from("spawn-worker-1");
+    let second = AgentIdentity::from("spawn-worker-2");
+    for worker in [&first, &second] {
+        mob.handle
+            .spawn_spec(spec("worker", worker))
+            .await
+            .expect("spawn a worker");
+    }
+    assert!(mob.edges().is_empty(), "no orchestrator is spawned yet");
+
+    mob.handle
+        .spawn_spec(spec("lead", &lead))
+        .await
+        .expect("spawn the orchestrator");
+    let expected = BTreeSet::from([pair(&first, &lead), pair(&second, &lead)]);
+    assert_eq!(
+        mob.edges(),
+        expected,
+        "the orchestrator's spawn wires every worker spawned before it"
+    );
+    let rows = mob.wired_rows().await;
+    assert_eq!(rows.len(), 2, "one MembersWired row per edge: {rows:?}");
+    assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), expected);
+    let lead_peer = mob
+        .recorded_peer_id(&lead)
+        .expect("the orchestrator's endpoint");
+    for worker in [&first, &second] {
+        let worker_peer = mob.recorded_peer_id(worker).expect("the worker's endpoint");
+        assert!(
+            mob.trusted(worker).await.contains(&lead_peer),
+            "{worker} trusts the orchestrator"
+        );
+        assert!(
+            mob.trusted(&lead).await.contains(&worker_peer),
+            "the orchestrator trusts {worker}"
+        );
+    }
+}
+
+/// A seat chunk journals its seats and their declared edges in one append,
+/// and so does a rotation its next incarnation and its edges: a seat is
+/// never durable without the edges its definition declares. (No fault seam
+/// reaches between two appends of one step on an atomic store, so this row
+/// reads the appends' row kinds.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_seat_step_journals_its_members_and_their_declared_edges_in_one_append() {
+    let mob = WiringMob::new("seat-wiring-one-append", member_helper_definition(), false).await;
+    let member = AgentIdentity::from("seat-member");
+    let helper = AgentIdentity::from("seat-helper");
+    mob.seat(vec![spec("member", &member), spec("helper", &helper)])
+        .await;
+    assert_eq!(
+        crate::runtime::actor::seat_step_appends_for_test(mob.handle.mob_id()),
+        vec![vec!["MemberSpawned", "MemberSpawned", "MembersWired"]],
+        "the chunk's one append carries both seats and their declared edge"
+    );
+
+    tokio::time::timeout(STEP, mob.handle.rotate_member(spec("member", &member)))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation succeeds");
+    assert_eq!(
+        crate::runtime::actor::seat_step_appends_for_test(mob.handle.mob_id())
+            .last()
+            .cloned(),
+        Some(vec!["MemberRetired", "MemberSpawned", "MembersWired"]),
+        "the rotation's one append carries the next incarnation and its declared edge"
+    );
+    assert_eq!(mob.edges(), BTreeSet::from([pair(&member, &helper)]));
+}

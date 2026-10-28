@@ -352,14 +352,16 @@ them.
     `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
     a seat's endpoint comes from. A seated member is wired to the edges the
     definition declares (`auto_wire_orchestrator` and `role_wiring`), as a
-    spawn of it would be, once its chunk is committed, so the members seated
-    together see each other: one machine step and one journal batch of
-    `MembersWired` rows per chunk, waking no member (as for any wire, but
-    for an edge to a placed member). A live member trusts a seated member's
-    recorded endpoint at once; a member on network comms, which has no
-    endpoint until its boot wake registers one, gets the trust of both ends
-    at that wake. An identity answered `AlreadySeated` keeps the edges it
-    holds.
+    spawn of it would be, in its chunk's own step, so the members seated
+    together see each other, and an orchestrator member is wired to the
+    members seated before it that auto-wire to it: the chunk's `MembersWired`
+    rows go in its one journal batch with its seats, so a seat is never
+    durable without its declared edges, waking no member (as for any wire,
+    but for an edge to a placed member). A live member trusts a seated
+    member's recorded endpoint at once; a member on network comms, which has
+    no endpoint until its boot wake registers one, gets the trust of both
+    ends at that wake. An identity answered `AlreadySeated` keeps the edges
+    it holds.
   - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
     reset): its current incarnation is retired and the next one is seated
     Dormant under a new name-based session id in the retirement's terminal
@@ -373,7 +375,9 @@ them.
     records it on the new incarnation in the same batch: it wakes the new
     incarnation once and runs exactly once on its new session, also across
     a restart. The new incarnation keeps none of the old one's edges and is
-    wired to the edges the definition declares, as a seat is. A rotation is
+    wired to the edges the definition declares, as a seat is, in the
+    rotation's own journal batch (a rotated orchestrator member is wired to
+    every member that auto-wires to it again). A rotation is
     refused typed unless the mob is Running, and a refused rotation retires
     nothing.
 
@@ -742,6 +746,13 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
+- `meerkat-mob`: under `auto_wire_orchestrator`, an orchestrator member
+  spawned after members of the mob's other profiles is now wired to them,
+  as each of them is wired to an orchestrator member spawned before it.
+  The rule ran only from the side of the member being spawned, so an
+  orchestrator spawned after its workers was never wired to them, and the
+  edges depended on the order the members were brought up in. A flow member
+  still takes no declared wiring.
 - `meerkat-mob`: reading a mob's member binding history
   (`MobHandle::member_binding_history`, and `last_member_binding`,
   `member_binding_for_session`, `durable_identity_members` and
