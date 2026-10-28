@@ -1443,9 +1443,20 @@ async fn resume_readiness_fanout_keeps_the_loop_responsive() {
     const READINESS_LATENCY: Duration = Duration::from_millis(500);
     let mob = create_isolation_mob(17).await;
     mob.handle.stop().await.expect("stop mob");
+    // The Stop closes the live members' peer ingress at the loop boundary
+    // after its reply: one comms read per member, on the loop. One actor
+    // round trip lets that boundary finish first, so none of the slow reads
+    // armed below is spent on it.
+    assert_eq!(
+        mob.handle.status().await.expect("phase after the stop"),
+        MobState::Stopped
+    );
     // Exactly the 17 pre-commit readiness reads are slow. The post-commit
-    // topology reconciliation still runs inline (a #1102 follow-on), so it
-    // must not inherit the latency or the progress watchdog trips on it.
+    // work still runs inline: the topology reconciliation (a #1102
+    // follow-on) and the reopening of the members' peer ingress the
+    // durable Resume emits (one comms read per member). Both come after the
+    // readiness fan-out, so they must not inherit the latency or the
+    // progress watchdog trips on it.
     mob.service.set_comms_runtime_delay_for_next_calls(
         17,
         u64::try_from(READINESS_LATENCY.as_millis()).expect("latency fits"),
@@ -1540,6 +1551,14 @@ async fn reconstructed_stopped_resume_preparation_keeps_query_phase_responsive()
 
     let query = tokio::time::timeout(Duration::from_millis(250), resumed.status()).await;
     let replied_early = resume.is_finished();
+    // The lift commits the durable Resume first and then materializes its
+    // members through their wakes (`boot_lift`): the held preparation is a
+    // member wake the resume joined, so its work of the member is pending.
+    let member_work_pending = !resumed
+        .machine_state_watch_rx
+        .borrow()
+        .explicit_resume_member_work
+        .is_empty();
     drop(held_gate);
     let completion = tokio::time::timeout(Duration::from_secs(10), resume)
         .await
@@ -1554,11 +1573,17 @@ async fn reconstructed_stopped_resume_preparation_keeps_query_phase_responsive()
         !replied_early,
         "Resume must remain pending behind the owner boundary"
     );
+    assert!(
+        member_work_pending,
+        "the held preparation belongs to a member wake the resume waits for"
+    );
+    // The query answers while the preparation is held, with the phase the
+    // durable Resume already committed.
     assert_eq!(
         query
             .expect("QueryPhase must not wait for member attachment preparation")
             .expect("QueryPhase"),
-        MobState::Stopped,
+        MobState::Running,
     );
     assert_eq!(final_phase, MobState::Running);
 }
@@ -1649,17 +1674,38 @@ impl Drop for ReleaseConstructionGate {
     }
 }
 
-async fn held_reconstructed_resume_topology() -> (
+/// A reconstructed stopped mob of `member_count` mutually wired workers,
+/// whose explicit resume is held in the trust install member 0's wake makes
+/// on member 1's runtime.
+///
+/// The lift commits the durable Resume first (the mob is Running) and then
+/// materializes its members through their wakes (`boot_lift`); each wake
+/// restores its member's wiring over the machine's edges in its own topology
+/// step, and the resume joins every wake and goes on only once each closed.
+/// Member 0's construction is held until every other member is Live (its
+/// wake, topology step included, settled) and the resume's work of it
+/// settled. Member 1's runtime then parks the mob's member-trust installs and
+/// the construction is released: member 0's wake realizes its edge to member
+/// 1 off the actor loop, as one owned wiring effect over both members, and
+/// parks in the install on member 1's runtime.
+async fn held_reconstructed_resume_topology(
+    member_count: usize,
+) -> (
     IsolationMob,
     tokio::task::JoinHandle<Result<(), MobError>>,
     ReleaseConstructionGate,
 ) {
+    use crate::machines::mob_machine as mob_dsl;
+    assert!(
+        member_count >= 2,
+        "member 0's wake parks its install on member 1's runtime"
+    );
     let mut definition = turn_driven_definition();
     definition.wiring.role_wiring = vec![RoleWiringRule {
         a: ProfileName::from("worker"),
         b: ProfileName::from("worker"),
     }];
-    let mob = reconstructed_isolation_mob_with_definition(2, definition).await;
+    let mob = reconstructed_isolation_mob_with_definition(member_count, definition).await;
     let construction = mob
         .service
         .park_session_creation(mob.session(0).clone())
@@ -1670,7 +1716,7 @@ async fn held_reconstructed_resume_topology() -> (
         async move { handle.resume().await }
     });
     wait_until(
-        "cold constructor entered before topology",
+        "member 0's wake entered its held construction",
         Duration::from_secs(5),
         || {
             let gate = Arc::clone(&construction);
@@ -1678,16 +1724,26 @@ async fn held_reconstructed_resume_topology() -> (
         },
     )
     .await;
-    wait_until(
-        "other runtime available before topology",
-        Duration::from_secs(5),
-        || {
-            let service = Arc::clone(&mob.service);
-            let id = mob.session(1).clone();
-            async move { service.sessions.read().await.contains_key(&id) }
-        },
-    )
-    .await;
+    // Every other member's wake settles first, its own topology step (its
+    // trust toward member 0's durable endpoint) included: Live means ready.
+    // Its install toward member 0 is then not the one parked below.
+    for index in 1..member_count {
+        let member = mob_dsl::AgentIdentity::from_domain(mob.member(index));
+        let mut state = mob.handle.machine_state_watch_rx.clone();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            state.wait_for(|state| {
+                state.member_materialization.get(&member)
+                    == Some(&mob_dsl::MemberMaterializationPhase::Live)
+                    && !state.explicit_resume_member_work.contains_key(&member)
+            }),
+        )
+        .await
+        .unwrap_or_else(|_| {
+            panic!("member {index}'s wake settles Live while member 0's construction is held")
+        })
+        .expect("the mob actor publishes its machine state");
+    }
     let runtime = mob
         .service
         .sessions
@@ -1695,22 +1751,19 @@ async fn held_reconstructed_resume_topology() -> (
         .await
         .get(mob.session(1))
         .cloned()
-        .expect("runtime");
+        .expect("member 1's live runtime");
     let gate = Arc::new(TestRuntimeControlBarrier::new());
     let release_topology = ReleaseConstructionGate(Arc::clone(&gate));
-    // Park ONLY the resume topology worker's trust installs. The reconstructed
-    // member's own supervisor publish also installs trust on this runtime and
-    // must stay unparked: it is not a mob topology mutation. A gate that
-    // counted it let the tests proceed before the topology phase owned the
-    // wiring graph, and on a starved 4 vCPU runner Stop and Retire then
-    // legitimately finished inside their early windows.
+    // Park ONLY the mob's member-trust installs. The member's own supervisor
+    // publish also installs trust on this runtime and must stay unparked: it
+    // is not a mob topology mutation.
     runtime.park_trust_mutations_from(
         Arc::clone(&gate),
         [meerkat_core::comms::GeneratedCommsTrustAuthoritySourceKind::MobMachineMemberTrustWiring],
     );
     drop(release_construction);
     wait_until(
-        "resume topology trust mutation entered",
+        "member 0's wake parked in its trust install on member 1",
         Duration::from_secs(5),
         || {
             let gate = Arc::clone(&gate);
@@ -1718,32 +1771,48 @@ async fn held_reconstructed_resume_topology() -> (
         },
     )
     .await;
-    // The parked install was minted by the topology worker, which the actor
-    // spawns only after `BeginExplicitResumeTopology`: the machine must say
-    // so before any lifecycle control is issued against it.
-    assert!(
-        mob.handle
-            .machine_state_watch_rx
-            .borrow()
-            .explicit_resume_topology_pending,
-        "the parked trust install must belong to the explicit resume topology phase"
-    );
+    // The parked install is member 0's wake's own topology step: the member
+    // is still Waking under its attempt, the resume waits on that wake, and
+    // the resume's own topology phase has not begun. The machine must say so
+    // before any lifecycle control is issued against it.
+    {
+        let member_0 = mob_dsl::AgentIdentity::from_domain(mob.member(0));
+        let state = mob.handle.machine_state_watch_rx.borrow();
+        assert_eq!(
+            state.member_materialization.get(&member_0).copied(),
+            Some(mob_dsl::MemberMaterializationPhase::Waking),
+            "the parked trust install must belong to member 0's wake"
+        );
+        assert!(
+            state.member_wake_attempts.contains_key(&member_0),
+            "member 0's wake attempt is open while its install is parked"
+        );
+        assert!(
+            state.explicit_resume_member_work.contains_key(&member_0),
+            "the resume waits on member 0's wake"
+        );
+        assert!(
+            !state.explicit_resume_topology_pending,
+            "the wake realizes the edge before the resume's own topology phase"
+        );
+    }
     (mob, resume, release_topology)
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconstructed_resume_topology_mutation_keeps_queries_responsive_and_stop_pending() {
-    let (mob, resume, release_topology) = held_reconstructed_resume_topology().await;
+    let (mob, resume, release_topology) = held_reconstructed_resume_topology(2).await;
     let phase = tokio::time::timeout(Duration::from_secs(1), mob.handle.status()).await;
     let resume_finished_early = resume.is_finished();
     let mut stop = tokio::spawn({
         let handle = mob.handle.clone();
         async move { handle.stop().await }
     });
-    // This window must ELAPSE: while the topology worker is parked the resume
-    // attempt cannot finish (`FinishExplicitResume` requires the topology to
-    // be settled), so the deferred Stop cannot run. A slow host only makes
-    // the wait longer; it can never make Stop complete early.
+    // This window must ELAPSE: while member 0's wake is parked in its trust
+    // install the resume attempt cannot finish (it waits on that wake), and
+    // the Stop is deferred behind the owned wiring and member effects, then
+    // behind the resume it cancels. A slow host only makes the wait longer;
+    // it can never make Stop complete early.
     let stop_early = tokio::time::timeout(Duration::from_millis(250), &mut stop).await;
     let stopped_early = stop_early.is_ok();
     let early_stop_result = stop_early.as_ref().ok().map(|result| format!("{result:?}"));
@@ -1774,20 +1843,24 @@ async fn reconstructed_resume_topology_mutation_keeps_queries_responsive_and_sto
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn reconstructed_resume_retire_waits_for_granted_topology_without_blocking_peer_turn() {
-    let (mob, resume, release_topology) = held_reconstructed_resume_topology().await;
+    // Member 0's wake holds a granted trust install on member 1; member 2 is
+    // Live and its resume work settled. A turn to member 0 joins its wake,
+    // so the ordinary peer work is member 2's.
+    let (mob, resume, release_topology) = held_reconstructed_resume_topology(3).await;
     let mut retire = tokio::spawn({
         let handle = mob.handle.clone();
         let identity = mob.member(1).clone();
         async move { handle.retire(identity).await }
     });
-    // Must elapse: Retire is a topology control and stays deferred while the
-    // resume topology worker owns the wiring graph (it is parked above).
+    // Must elapse: Retire is a topology control and stays deferred while an
+    // owned wiring effect over member 1 is in flight (member 0's wake
+    // realizing their edge, parked above).
     let early = tokio::time::timeout(Duration::from_millis(250), &mut retire).await;
     let retired_early = early.is_ok();
     let phase = tokio::time::timeout(Duration::from_secs(1), mob.handle.status()).await;
     let mut peer = internal_turn_task(
         &mob.handle,
-        mob.member(0),
+        mob.member(2),
         "peer turn while granted topology is held".to_string(),
     );
     let early_peer = tokio::time::timeout(Duration::from_secs(5), &mut peer).await;
@@ -2387,6 +2460,14 @@ async fn full_member_lane_rejects_before_any_machine_transition() {
 async fn resume_survives_a_member_retired_during_the_readiness_fanout() {
     let mob = create_isolation_mob(17).await;
     mob.handle.stop().await.expect("stop mob");
+    // The Stop closes the live members' peer ingress at the loop boundary
+    // after its reply, one comms read per member on the loop. One actor
+    // round trip lets that boundary finish, so the slow reads armed below
+    // are the readiness fan-out's.
+    assert_eq!(
+        mob.handle.status().await.expect("phase after the stop"),
+        MobState::Stopped
+    );
     mob.service.set_comms_runtime_delay_for_next_calls(17, 500);
 
     let resume = {
@@ -2702,10 +2783,14 @@ async fn bounded_submit_timeout_does_not_cancel_inflight_admission_but_skips_par
     );
 }
 
-/// A member revival deferred by the mob's explicit resume
-/// (`LifecycleOperationPending { "explicit_resume member .." }`) settles on
-/// that operation's own typed completion: the member's explicit-resume work
-/// leaving the actor-published machine state. Nothing is timed.
+/// A member revival requested while the mob's explicit resume still owns
+/// that member's materialization waits for it and settles with it, on that
+/// operation's own typed completion: the member's explicit-resume work
+/// leaving the actor-published machine state. The lift commits the durable
+/// Resume first and then materializes the member through its wake, which
+/// the resume joins (`boot_lift`); `ensure_member_live` joins the same wake
+/// in flight instead of answering. Nothing is timed but the window that
+/// proves the revival waits.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_revival_deferred_by_explicit_resume_settles_on_its_typed_completion() {
     use crate::machines::mob_machine as mob_dsl;
@@ -2722,22 +2807,33 @@ async fn a_revival_deferred_by_explicit_resume_settles_on_its_typed_completion()
     let member = mob.member(0).clone();
     let dsl_member = mob_dsl::AgentIdentity::from_domain(&member);
     let mut state = mob.handle.machine_state_watch_rx.clone();
-    state
-        .wait_for(|state| state.explicit_resume_member_work.contains_key(&dsl_member))
-        .await
-        .expect("the resume stages member zero's explicit-resume work");
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        state.wait_for(|state| state.explicit_resume_member_work.contains_key(&dsl_member)),
+    )
+    .await
+    .expect("the resume stages member zero's explicit-resume work in time")
+    .expect("the resume stages member zero's explicit-resume work");
 
-    // The held construction keeps the work pending: revival is deferred.
-    assert!(matches!(
-        mob.handle.ensure_member_live(&member).await,
-        Err(MobError::LifecycleOperationPending { intent })
-            if intent == format!("explicit_resume member {member}")
-    ));
+    // The held construction keeps the member's wake, and with it the
+    // resume's work of the member, pending: the revival joins that wake.
+    let mut revival = tokio::spawn({
+        let handle = mob.handle.clone();
+        let member = member.clone();
+        async move { handle.ensure_member_live(&member).await }
+    });
     let settled = tokio::spawn({
         let handle = mob.handle.clone();
         let member = member.clone();
         async move { handle.explicit_resume_member_work_settled(&member).await }
     });
+    // Must elapse: the revival waits for the held wake instead of answering.
+    // A slow host only makes the wait longer.
+    let revived_early = tokio::time::timeout(Duration::from_millis(250), &mut revival).await;
+    assert!(
+        revived_early.is_err(),
+        "the revival waits for the wake the resume owns: {revived_early:?}"
+    );
     assert!(
         mob.handle
             .machine_state_watch_rx
@@ -2749,7 +2845,10 @@ async fn a_revival_deferred_by_explicit_resume_settles_on_its_typed_completion()
 
     drop(release_construction);
     assert!(
-        settled.await.expect("settled waiter joins"),
+        tokio::time::timeout(Duration::from_secs(10), settled)
+            .await
+            .expect("the explicit-resume work settles once the construction is released")
+            .expect("settled waiter joins"),
         "the waiter completes when the explicit-resume work ends"
     );
     assert!(
@@ -2759,8 +2858,14 @@ async fn a_revival_deferred_by_explicit_resume_settles_on_its_typed_completion()
             .explicit_resume_member_work
             .contains_key(&dsl_member)
     );
-    resume
+    tokio::time::timeout(Duration::from_secs(10), revival)
         .await
+        .expect("the revival settles with the wake it joined")
+        .expect("revival task joins")
+        .expect("the joined wake made the member live");
+    tokio::time::timeout(Duration::from_secs(10), resume)
+        .await
+        .expect("resume settles once the construction is released")
         .expect("resume task joins")
         .expect("resume completes once the construction is released");
     // Level-triggered: a waiter that arrives after the operation ended
