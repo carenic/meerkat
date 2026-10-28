@@ -350,7 +350,10 @@ them.
     reset): its current incarnation is retired and the next one is seated
     Dormant under a new name-based session id in the retirement's terminal
     step, both journal rows in one batch, so the identity is never a
-    non-member; nothing is built for it until its first wake, which applies
+    non-member, and the next incarnation keeps the member's creation id (a
+    `Successor` of the retired incarnation's session; `Unproven` with a new
+    id, never a new root, when that one recorded no creation token); nothing
+    is built for it until its first wake, which applies
     the spec's build inputs as a fresh seat's first wake does. A spec
     that owes a kickoff (an `AutonomousHost` member, or an initial message)
     records it on the new incarnation in the same batch: it wakes the new

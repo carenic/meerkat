@@ -263,3 +263,88 @@ impl RosterMutator for RosterAuthority {
         self.roster.set_kickoff(agent_identity, kickoff)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        MemberCreationId, MemberCreationProvenance, MemberCreationRecord, MobEventKind, MobId,
+    };
+    use meerkat_core::SessionId;
+
+    /// The roster of one seated `worker` whose spawn on `session` recorded
+    /// `creation`.
+    fn seated(session: &SessionId, creation: MemberCreationRecord) -> RosterAuthority {
+        let identity = AgentIdentity::from("worker");
+        let mut spawned = crate::event::MemberSpawnedEvent::new(
+            identity.clone(),
+            Generation::INITIAL,
+            crate::FenceToken::new(1),
+            crate::AgentRuntimeId::initial(identity),
+            ProfileName::from("worker"),
+        )
+        .with_bridge_member_ref(Some(crate::event::MemberRef::from_bridge_session_id(
+            session.clone(),
+        )));
+        spawned.creation = creation;
+        RosterAuthority::from_roster(Roster::project(&[MobEvent {
+            cursor: 1,
+            timestamp: chrono::Utc::now(),
+            mob_id: MobId::from("test"),
+            kind: MobEventKind::MemberSpawned(spawned),
+        }]))
+    }
+
+    /// The creation record the runtime gives the incarnation that replaces
+    /// the seated `worker` on `next`.
+    fn successor_record(roster: &RosterAuthority, next: &SessionId) -> MemberCreationRecord {
+        let entry = roster
+            .get(&AgentIdentity::from("worker"))
+            .expect("the worker is seated");
+        roster
+            .successor_creation_witness(entry)
+            .successor_record(next)
+    }
+
+    #[test]
+    fn a_successor_keeps_the_members_creation_and_is_unproven_without_a_recorded_token() {
+        let retired = SessionId::new();
+        let next = SessionId::new();
+        let id = MemberCreationId::new();
+        let roster = seated(
+            &retired,
+            MemberCreationRecord {
+                creation_id: Some(id),
+                provenance: MemberCreationProvenance::Root,
+            },
+        );
+
+        // The next incarnation keeps the creation id and names the retired
+        // incarnation's session and binding as its predecessor.
+        let kept = successor_record(&roster, &next);
+        assert_eq!(kept.creation_id, Some(id));
+        assert!(matches!(
+            &kept.provenance,
+            MemberCreationProvenance::Successor {
+                predecessor_session_id,
+                predecessor_member_binding,
+                predecessor_creation_id,
+            } if *predecessor_session_id == retired
+                && predecessor_member_binding.member == "worker"
+                && *predecessor_creation_id == id
+        ));
+
+        // An incarnation is never its own predecessor.
+        let same_session = successor_record(&roster, &retired);
+        assert_eq!(same_session.provenance, MemberCreationProvenance::Unproven);
+        assert!(same_session.creation_id.is_some_and(|fresh| fresh != id));
+
+        // A spawn that recorded no creation token (an older journal) leaves
+        // nothing to keep: the next incarnation is unproven with a new id,
+        // never a new root.
+        let legacy = seated(&retired, MemberCreationRecord::default());
+        let unproven = successor_record(&legacy, &next);
+        assert_eq!(unproven.provenance, MemberCreationProvenance::Unproven);
+        assert!(unproven.creation_id.is_some());
+    }
+}
