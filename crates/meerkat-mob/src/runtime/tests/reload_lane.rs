@@ -1322,8 +1322,15 @@ async fn a_reload_of_an_unwired_member_without_comms_repairs_its_registration() 
     );
 }
 
+/// A Stop during a warm reload's held construction is admitted at once: the
+/// reload's steps are wake steps, which a Stop does not wait for. It lands
+/// while the construction is parked and the actor keeps answering queries.
+/// Once the construction is released, the reload's late step fails its
+/// attempt fence (the Stop closed the attempt) and rolls its provision back:
+/// the reload answers NotCurrent or its typed error, the member is Dormant,
+/// and no live actor of its session is left.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
+async fn a_stop_lands_during_a_held_warm_construction_without_blocking_query_progress() {
     let mob = create_isolation_mob(2).await;
     mob.degrade_member(0).await;
     mob.store.fail_commit(mob.session(0), false);
@@ -1348,7 +1355,7 @@ async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
     )
     .await;
     peer_progresses(&mob).await;
-    let mut stop = mob
+    let stop = mob
         .handle
         .enqueue_actor_command_for_test(|reply_tx| MobCommand::Stop {
             leave_runs_running: false,
@@ -1358,21 +1365,51 @@ async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
         .expect("enqueue Stop");
     mob.probe(Duration::from_secs(1))
         .await
-        .expect("lifecycle wait does not own the actor loop");
-    assert!(matches!(
-        stop.try_recv(),
-        Err(oneshot::error::TryRecvError::Empty)
-    ));
-    drop(release);
+        .expect("the actor answers queries while the construction is held");
     tokio::time::timeout(Duration::from_secs(10), stop)
         .await
-        .expect("Stop settles after construction")
+        .expect("the Stop lands while the warm construction is still parked")
         .expect("Stop reply")
         .expect("Stop");
-    let _ = tokio::time::timeout(Duration::from_secs(5), reload)
+    assert_eq!(
+        mob.handle.status().await.expect("mob status"),
+        MobState::Stopped
+    );
+    mob.probe(Duration::from_secs(1))
         .await
-        .expect("reload observation settles")
+        .expect("the actor answers queries after the Stop");
+
+    drop(release);
+    let answered = tokio::time::timeout(Duration::from_secs(10), reload)
+        .await
+        .expect("the reload answers once its construction is released")
         .expect("reload reply");
+    if let Ok(outcome) = &answered {
+        assert_eq!(
+            outcome.disposition,
+            MemberReloadDisposition::NotCurrent,
+            "a reload the Stop preempted is not current"
+        );
+    }
+    wait_until(
+        "the preempted reload's provision is rolled back",
+        Duration::from_secs(5),
+        || async { mob.service.actor_registry.current(mob.session(0)).is_none() },
+    )
+    .await;
+    assert_eq!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
+            .copied(),
+        Some(mob_dsl::MemberMaterializationPhase::Dormant),
+        "the Stop left the reloaded member dormant"
+    );
+    mob.probe(Duration::from_secs(1))
+        .await
+        .expect("the actor answers queries after the rollback");
 }
 
 /// The 2026-09-22 production wedge on the reload path: the member's committed
