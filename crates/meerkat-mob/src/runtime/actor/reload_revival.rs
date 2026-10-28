@@ -734,6 +734,7 @@ impl MobActor {
             self.finish_after_warm_rollback(&work, then).await;
             return;
         };
+        self.withdraw_warm_revival_binding_request(&work);
         let identity = work.entry.agent_identity.clone();
         let provisioner = Arc::clone(&self.provisioner);
         self.dispatch_warm_revival(work, "warm_revival_committed_rollback", async move {
@@ -749,6 +750,31 @@ impl MobActor {
                 }
             };
             RevivalStep::RolledBack { settled, then }
+        });
+    }
+
+    /// Withdraw the runtime binding request the revival's Bound step queued
+    /// for the provision its rollback is about to remove, when it is still
+    /// waiting for its dispatch. A revival's steps commit off any command
+    /// boundary, so that request can still be queued here; dispatched after
+    /// the rollback removed the registration it names, the runtime would
+    /// refuse it, and a refusal of the attempt that is still open records
+    /// the member Broken where the attempt's end leaves it Dormant. The
+    /// attempt's end clears the request in MobMachine.
+    fn withdraw_warm_revival_binding_request(&mut self, work: &RevivalWork) {
+        let Some(attempt) = work.attempt() else {
+            return;
+        };
+        let identity = mob_dsl::AgentIdentity::from_domain(&work.entry.agent_identity);
+        self.pending_routed_effects.retain(|effect| {
+            !matches!(
+                effect.body(),
+                mob_dsl::MobMachineEffect::RequestRuntimeBinding {
+                    agent_identity,
+                    attempt: Some(requested),
+                    ..
+                } if agent_identity == &identity && *requested == attempt
+            )
         });
     }
 
