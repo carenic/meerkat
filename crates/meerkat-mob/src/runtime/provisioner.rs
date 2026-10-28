@@ -443,8 +443,11 @@ pub(crate) enum RuntimeRevivalIntent {
     MissingLiveMaterialization,
     /// `MobBuilder::resume` restoring a member at boot: on its durable session,
     /// or on a fresh one (as when the session service keeps no durable
-    /// sessions).
-    /// It provisions as `None` does; a host refusal of the registration it
+    /// sessions). A member's wake restores it the same way.
+    /// It provisions as `None` does, except that a durable session that still
+    /// holds a parent-owned operation binding in this process (the wake of a
+    /// coordinator-owned worker) is rebound under that owner context, as a
+    /// missing-live revival rebinds it. A host refusal of the registration it
     /// prepared comes back typed (`MobError::MemberRegistrationRefused`), and
     /// the transaction's own rollback removes that registration.
     ColdRestore,
@@ -13864,16 +13867,35 @@ impl SessionBackend {
         // committed the member-owned AgentRuntimeId and fence.
         // A missing-live revival replaces a runtime incarnation that is gone;
         // observe its ops binding now so the stale one can be released by
-        // exact compare before the new registration is bound.
-        let superseded_ops_binding = if missing_live_revival {
-            admitted_bridge_session_id.as_ref().and_then(|session_id| {
-                backend
-                    .ops_adapter
-                    .capture_session_binding_witness(session_id)
-            })
-        } else {
-            None
+        // exact compare before the new registration is bound. A cold restore
+        // whose session still holds a parent-owned binding in this process
+        // (the wake of a coordinator-owned worker that was released, or whose
+        // runtime tore its idle executor down, here: its binding stays with
+        // the coordinator's still-open registry) is rebound the same way,
+        // under the owner context that binding preserves. A cold restore in a
+        // process that never bound the session (a boot) observes none, and a
+        // member's own binding left by its retired registration is replaced
+        // by the ordinary bind.
+        let superseded_ops_binding = match req.runtime_revival_intent {
+            RuntimeRevivalIntent::MissingLiveMaterialization => {
+                admitted_bridge_session_id.as_ref().and_then(|session_id| {
+                    backend
+                        .ops_adapter
+                        .capture_session_binding_witness(session_id)
+                })
+            }
+            RuntimeRevivalIntent::ColdRestore => {
+                admitted_bridge_session_id.as_ref().and_then(|session_id| {
+                    backend
+                        .ops_adapter
+                        .capture_session_binding_witness(session_id)
+                        .filter(|witness| witness.is_parent_owned(session_id))
+                })
+            }
+            RuntimeRevivalIntent::None => None,
         };
+        let rebind_superseded_ops_binding =
+            missing_live_revival || superseded_ops_binding.is_some();
         // Only a restored member's revival or boot restore settles a host
         // refusal of its registration itself; spawns keep the transaction's
         // own rollback and the host's own error.
@@ -14377,6 +14399,7 @@ impl SessionBackend {
             generated_self_owned_operation_owner: req.generated_self_owned_operation_owner,
             prepared_ops_binding,
             superseded_ops_binding,
+            rebind_superseded_ops_binding,
             missing_live_revival,
             peer_name: req.peer_name,
             recovered_attached_state,
@@ -14426,6 +14449,11 @@ struct ProvisionFinish {
     generated_self_owned_operation_owner: Option<SessionId>,
     prepared_ops_binding: Option<(SessionId, Arc<dyn OpsLifecycleRegistry>)>,
     superseded_ops_binding: Option<super::ops_adapter::SessionOpsBindingWitness>,
+    /// The new registration is bound by the revival rebind, under the
+    /// owner context of the binding the session held (a missing-live
+    /// revival, or a cold restore whose session still held a parent-owned
+    /// binding in this process).
+    rebind_superseded_ops_binding: bool,
     missing_live_revival: bool,
     peer_name: String,
     recovered_attached_state: Option<Arc<RuntimeSessionState>>,
@@ -14452,6 +14480,7 @@ impl ProvisionFinish {
             generated_self_owned_operation_owner,
             prepared_ops_binding,
             superseded_ops_binding,
+            rebind_superseded_ops_binding,
             missing_live_revival,
             peer_name,
             mut recovered_attached_state,
@@ -14496,7 +14525,7 @@ impl ProvisionFinish {
                     bridge_session_id = %created_bridge_session_id,
                     "SessionBackend::provision_member binding owner session registry"
                 );
-                if missing_live_revival {
+                if rebind_superseded_ops_binding {
                     backend.ops_adapter.release_superseded_session_binding_for_revival(
                         &created_bridge_session_id,
                         superseded_ops_binding.as_ref(),
@@ -14530,7 +14559,7 @@ impl ProvisionFinish {
                     bridge_session_id = %created_bridge_session_id,
                     "SessionBackend::provision_member binding generated owner session registry"
                 );
-                if missing_live_revival {
+                if rebind_superseded_ops_binding {
                     // Rebind under the owner context observed before the
                     // revival: a parent-owned member keeps its coordinator
                     // owner and registry while that context is live, and
