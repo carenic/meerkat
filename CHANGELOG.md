@@ -545,6 +545,20 @@ them.
   until it finishes, even when its caller was cancelled, and the destroy
   removes the files only after that (`SqliteMobStores::drain_observers`
   refuses while one runs).
+- `meerkat-runtime`: the threads of the runtime's two process-wide runtimes
+  (`meerkat-machine-cleanup` and `meerkat-runtime-serving`) now follow the
+  host stack knobs: `RKAT_WORKER_STACK_BYTES` sets their stack exactly, and
+  without it they take the 8 MiB budget, or `RUST_MIN_STACK` when that asks
+  for more. Before, they always ran on 8 MiB: their explicit size kept
+  `RUST_MIN_STACK` out, and `RKAT_WORKER_STACK_BYTES` reached only a host's
+  own runtime. These runtimes run session and mob work for the whole
+  process, so an embedding whose debug build needed deeper stacks aborted
+  with a stack overflow on a `meerkat-machine-cleanup` thread whatever it
+  set, and the documented `RKAT_WORKER_STACK_BYTES` sweep could not tell a
+  large frame from recursion there. Nothing changes when neither variable
+  is set. An invalid `RKAT_WORKER_STACK_BYTES` now also fails the first
+  operation that needs one of these runtimes, with the refusal a host
+  binary gives it at startup.
 - Host-store realms: a session no longer keeps up to 4 MiB of superseded
   copies of its runtime's registry of background operations. Core rewrites
   that registry whole each time an operation finishes or its result is
