@@ -10,9 +10,10 @@
 //! it), and a delivery wakes it at once through a wake of its own. When the
 //! plan reaches a member a delivery woke first, it watches that wake and
 //! applies its input once the wake leaves the member Dormant again. The rows
-//! hold the members' cold restores at the wake restore probe and read each
-//! member's phase and wake attempt from the machine state the actor
-//! publishes.
+//! hold the members' restores at the wake restore probe (a wake's cold
+//! restore, and the lift's rebuild preparation of a member it rebuilds
+//! through the explicit-resume work path) and read each member's phase and
+//! wake attempt from the machine state the actor publishes.
 //!
 //! Unrun until the candidate's validation.
 
@@ -50,6 +51,11 @@ const WAKE_BOUND: Duration = Duration::from_secs(10);
 /// that the later wake, released within milliseconds, never meets it.
 const SUPERSEDED_WAKE_BOUND: Duration = Duration::from_secs(5);
 
+/// The wake bound of the row whose rebuilt member's preparation is held:
+/// long enough that every other member, prepared and rebuilt on its own, is
+/// Live well within it even on a loaded runner.
+const REBUILD_WAKE_BOUND: Duration = Duration::from_secs(5);
+
 fn worker(index: usize) -> AgentIdentity {
     AgentIdentity::from(format!("plan-bound-{index}"))
 }
@@ -62,6 +68,8 @@ struct StoppedMob {
     service: Arc<MockSessionService>,
     /// Each worker and its session, in identity order (the plan's order).
     sessions: Vec<(AgentIdentity, SessionId)>,
+    /// The members' comms identity root, for members that were seated.
+    _keys: Option<tempfile::TempDir>,
 }
 
 impl StoppedMob {
@@ -70,29 +78,62 @@ impl StoppedMob {
         Self::configured(label, BOUND, None).await
     }
 
+    /// Members that were built before the stop: the lift rebuilds each
+    /// through the explicit-resume work path.
     async fn configured(label: &str, bound: usize, wake_bound: Option<Duration>) -> Self {
+        Self::built(label, bound, wake_bound, false).await
+    }
+
+    /// Members seated Dormant and never built (their sessions are unborn):
+    /// the lift's plan wakes each through the actor's wake path, whose cold
+    /// restore creates the session, under the wake bound.
+    async fn configured_seated(label: &str, bound: usize, wake_bound: Option<Duration>) -> Self {
+        Self::built(label, bound, wake_bound, true).await
+    }
+
+    async fn built(label: &str, bound: usize, wake_bound: Option<Duration>, seated: bool) -> Self {
+        let keys = seated.then(|| tempfile::tempdir().expect("a comms identity root"));
         let definition = with_unique_mob_id(sample_definition(), label);
         let service = Arc::new(MockSessionService::new());
         let _ = service.enable_runtime_adapter();
         let storage = MobStorage::in_memory();
         let events = storage.events.clone();
         let runtime_metadata = storage.runtime_metadata.clone();
-        let handle = MobBuilder::new(definition, storage)
-            .with_session_service(service.clone())
-            .create()
-            .await
-            .expect("create the mob");
+        let mut builder =
+            MobBuilder::new(definition, storage).with_session_service(service.clone());
+        if let Some(keys) = keys.as_ref() {
+            builder = builder.with_member_comms_identity_root(keys.path());
+        }
+        let handle = builder.create().await.expect("create the mob");
+        let specs: Vec<SpawnMemberSpec> = (0..MEMBERS)
+            .map(|index| {
+                let mut spec = SpawnMemberSpec::new("worker", worker(index));
+                spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+                spec
+            })
+            .collect();
         let mut sessions = Vec::with_capacity(MEMBERS);
-        for index in 0..MEMBERS {
-            let identity = worker(index);
-            let mut spec = SpawnMemberSpec::new("worker", identity.clone());
-            spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
-            handle.spawn_spec(spec).await.expect("spawn a worker");
-            let session = handle
-                .resolve_bridge_session_id(&identity)
+        if seated {
+            let outcomes = handle
+                .seat_dormant_members(specs)
                 .await
-                .expect("a session-backed worker");
-            sessions.push((identity, session));
+                .expect("the seat batch answers");
+            for (index, outcome) in outcomes.iter().enumerate() {
+                let crate::runtime::DormantSeatOutcome::Seated { session_id, .. } = outcome else {
+                    panic!("every fresh spec is seated: {outcome:?}");
+                };
+                sessions.push((worker(index), session_id.clone()));
+            }
+        } else {
+            for spec in specs {
+                let identity = spec.identity.clone();
+                handle.spawn_spec(spec).await.expect("spawn a worker");
+                let session = handle
+                    .resolve_bridge_session_id(&identity)
+                    .await
+                    .expect("a session-backed worker");
+                sessions.push((identity, session));
+            }
         }
         handle.stop().await.expect("stop the mob");
         let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
@@ -107,6 +148,9 @@ impl StoppedMob {
         .notify_orchestrator_on_resume(false)
         .with_member_restore_policy(MemberRestorePolicy::Eager)
         .with_resume_restore_concurrency(bound);
+        if let Some(keys) = keys.as_ref() {
+            builder = builder.with_member_comms_identity_root(keys.path());
+        }
         if let Some(wake_bound) = wake_bound {
             builder = builder.with_member_wake_timeout(wake_bound);
         }
@@ -130,6 +174,7 @@ impl StoppedMob {
             handle,
             service: restarted,
             sessions,
+            _keys: keys,
         }
     }
 
@@ -666,7 +711,9 @@ async fn a_member_a_delivery_woke_first_is_planned_once_that_wake_leaves_it_dorm
     assert!(lifted.is_ok(), "the lift succeeds: {lifted:?}");
 }
 
-/// At restore concurrency 1 the plan's wake of the first member times out at
+/// At restore concurrency 1, over members seated Dormant and never built (so
+/// the plan's wakes are the actor's cold wakes, under the wake bound), the
+/// plan's wake of the first member times out at
 /// its held restore, so the member is Dormant again for a retryable cause,
 /// and a later wake of the member (a peer wake, or the owed retry) opens a
 /// new attempt, held at its restore, before the lift handles the plan wake's
@@ -681,7 +728,11 @@ async fn a_member_a_delivery_woke_first_is_planned_once_that_wake_leaves_it_dorm
 /// bound ends the wait); a Stop would have been parked behind it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
-    let mob = StoppedMob::configured("lift-plan-superseded", 1, Some(SUPERSEDED_WAKE_BOUND)).await;
+    // Seated members: the plan's wakes are the actor's, under the wake bound
+    // (a member the lift rebuilds through the explicit-resume work path holds
+    // its attempt until that path settles it).
+    let mob =
+        StoppedMob::configured_seated("lift-plan-superseded", 1, Some(SUPERSEDED_WAKE_BOUND)).await;
     let member = worker(0);
     let next = worker(1);
     let probe = probe_member_wake_restores_for_test(mob.handle.mob_id(), [member.clone()]);
@@ -783,4 +834,103 @@ async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
         matches!(stopped, Ok(Ok(_))),
         "a Stop after the lift is served: {stopped:?}"
     );
+}
+
+/// A member the lift rebuilds through the explicit-resume work path is
+/// bounded by the mob's wake bound, as a wake is. While its rebuild
+/// preparation is held, a caller that joins its attempt is answered
+/// `WakeTimedOut` at the bound, and the member is Dormant again, never
+/// Broken. The other member of its round is prepared and rebuilt on its
+/// own, not behind it, every other member is Live, and the lift answers the
+/// typed timeout. The member's owed retry then wakes it.
+///
+/// RED before the fix: the attempt had no bound, so the caller waited for
+/// good (the row's bound ends the wait), and a round's preparations were
+/// handed back together, so the other member of the round stayed Waking
+/// behind the held one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebuilt_member_whose_preparation_hangs_times_out_alone_at_the_wake_bound() {
+    let mob = StoppedMob::configured("lift-rebuild-bound", BOUND, Some(REBUILD_WAKE_BOUND)).await;
+    let held = worker(0);
+    let probe = probe_member_wake_restores_for_test(mob.handle.mob_id(), [held.clone()]);
+    let lift = mob.lift();
+    let started = tokio::time::timeout(STEP, async {
+        while !probe.started().contains(&held) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    // The other member of the round is rebuilt while the held one waits.
+    let other = dsl::AgentIdentity::from_domain(&worker(1));
+    let other_live = mob
+        .wait_for_state(|state| {
+            state.member_materialization.get(&other) == Some(&dsl::MemberMaterializationPhase::Live)
+        })
+        .await;
+    let joined = tokio::time::timeout(STEP, mob.handle.ensure_member_live(&held)).await;
+    let others: Vec<dsl::AgentIdentity> = (1..MEMBERS)
+        .map(|index| dsl::AgentIdentity::from_domain(&worker(index)))
+        .collect();
+    let others_live = mob
+        .wait_for_state(|state| {
+            others.iter().all(|id| {
+                state.member_materialization.get(id) == Some(&dsl::MemberMaterializationPhase::Live)
+            })
+        })
+        .await;
+    let lifted = mob.join_lift(lift).await;
+    let status = mob
+        .handle
+        .member_status(&held)
+        .await
+        .expect("the held member's status");
+    // Its stale preparation ends; the owed retry wakes the member.
+    probe.release(&held);
+    let held_id = dsl::AgentIdentity::from_domain(&held);
+    let retried = mob
+        .wait_for_state(|state| {
+            state.member_materialization.get(&held_id)
+                == Some(&dsl::MemberMaterializationPhase::Live)
+        })
+        .await;
+
+    assert!(started, "the held member's rebuild preparation started");
+    assert!(
+        other_live,
+        "the other member of the round is rebuilt and Live while the held one waits"
+    );
+    assert!(
+        matches!(
+            joined,
+            Ok(Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::WakeTimedOut,
+                ..
+            }))
+        ),
+        "a caller of the held member is answered at the wake bound: {joined:?}"
+    );
+    assert!(others_live, "every other member is Live");
+    let cause = match &lifted {
+        Err(MobError::SharedLifecycleFailure(inner)) => Some(inner.as_ref()),
+        Err(other) => Some(other),
+        Ok(()) => None,
+    };
+    assert!(
+        matches!(
+            cause,
+            Some(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::WakeTimedOut,
+                ..
+            })
+        ),
+        "the lift answers the typed timeout: {lifted:?}"
+    );
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a timed-out rebuild never breaks the member: {status:?}"
+    );
+    assert!(retried, "the member's owed retry wakes it");
 }

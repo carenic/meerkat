@@ -25,6 +25,8 @@ mod member_wake_rows;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod parallel_resume_restore;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod retryable_restore_rows;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_build_inputs;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_comms_key;
@@ -2107,6 +2109,9 @@ struct MockSessionService {
     session_read_max_in_flight: AtomicU64,
     session_read_not_found_remaining: AtomicU64,
     resume_authority_absent_remaining: AtomicU64,
+    /// Sessions whose next resume-authority observations fail with a
+    /// transient store error, with how many are left.
+    resume_authority_observe_failures_for: std::sync::Mutex<HashMap<SessionId, u64>>,
     create_requests: RwLock<Vec<CreateSessionRecord>>,
     /// Records whether each create_session had external_tools configured.
     create_with_external_tools: RwLock<Vec<bool>>,
@@ -2281,6 +2286,9 @@ struct MockSessionService {
     durable_reads_for: std::sync::Mutex<HashMap<SessionId, DurableSessionReadCounts>>,
     /// Sessions whose metadata-only read fails with a store error.
     metadata_read_failures_for: std::sync::Mutex<HashSet<SessionId>>,
+    /// Sessions whose metadata-only read finds the persisted state malformed
+    /// (a typed `SessionStoreError::Serialization`).
+    malformed_metadata_reads_for: std::sync::Mutex<HashSet<SessionId>>,
     load_persisted_session_in_flight: AtomicU64,
     load_persisted_session_max_in_flight: AtomicU64,
     create_session_in_flight: AtomicU64,
@@ -2429,6 +2437,7 @@ impl MockSessionService {
             session_read_max_in_flight: AtomicU64::new(0),
             session_read_not_found_remaining: AtomicU64::new(0),
             resume_authority_absent_remaining: AtomicU64::new(0),
+            resume_authority_observe_failures_for: std::sync::Mutex::new(HashMap::new()),
             create_requests: RwLock::new(Vec::new()),
             create_with_external_tools: RwLock::new(Vec::new()),
             create_with_compaction_curators: RwLock::new(Vec::new()),
@@ -2521,6 +2530,7 @@ impl MockSessionService {
             metadata_reads_for: Default::default(),
             durable_reads_for: Default::default(),
             metadata_read_failures_for: Default::default(),
+            malformed_metadata_reads_for: Default::default(),
             load_persisted_session_in_flight: AtomicU64::new(0),
             load_persisted_session_max_in_flight: AtomicU64::new(0),
             create_session_in_flight: AtomicU64::new(0),
@@ -3547,6 +3557,15 @@ impl MockSessionService {
             .store(count, Ordering::Release);
     }
 
+    /// Make the next `count` resume-authority observations of `session_id`
+    /// fail with a transient store error.
+    fn fail_next_resume_authority_observes_for(&self, session_id: &SessionId, count: u64) {
+        self.resume_authority_observe_failures_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), count);
+    }
+
     fn fail_next_session_read_as_absent(&self) {
         self.session_read_not_found_remaining
             .store(1, Ordering::Release);
@@ -3594,6 +3613,16 @@ impl MockSessionService {
 
     fn fail_persisted_session_metadata_reads_for(&self, session_id: SessionId) {
         self.metadata_read_failures_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id);
+    }
+
+    /// Make every metadata-only read of `session_id` find its persisted
+    /// state malformed: a deterministic store failure, as a durable record
+    /// that fails its typed decode is.
+    fn find_persisted_session_metadata_malformed_for(&self, session_id: SessionId) {
+        self.malformed_metadata_reads_for
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id);
@@ -5404,6 +5433,18 @@ impl MockSessionService {
                 "mock metadata read failure",
             ))));
         }
+        if self
+            .malformed_metadata_reads_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+        {
+            return Err(SessionError::Store(Box::new(
+                meerkat_core::SessionStoreError::Serialization(
+                    "mock malformed session metadata".to_string(),
+                ),
+            )));
+        }
         let _authority_guard = self.resume_authority_gate.lock().await;
         let persisted =
             if hide_archived && self.archived_session_ids.read().await.contains(session_id) {
@@ -5697,6 +5738,24 @@ impl MobSessionService for MockSessionService {
             .is_ok()
         {
             return Ok(SessionResumeAuthority::default());
+        }
+        let observe_fails = {
+            let mut failures = self
+                .resume_authority_observe_failures_for
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match failures.get_mut(session_id) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if observe_fails {
+            return Err(SessionError::Store(Box::new(std::io::Error::other(
+                "mock resume authority observation failure",
+            ))));
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
         let session = self

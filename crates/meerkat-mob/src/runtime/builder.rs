@@ -10177,6 +10177,7 @@ impl MobBuilder {
             tool_consequence_policy_registry,
             member_build_preparer: member_residency.build_preparer.as_ref(),
             host_read_handle: &host_read_handle,
+            unreadable_view_is_retryable: false,
         };
         restore_resumed_members(
             &restore_context,
@@ -11690,6 +11691,11 @@ pub(super) struct ResumeMemberRestoreContext<'a> {
     /// authority is the member tools' agent lane: the preparer is the host's
     /// callback, and a read handle issues no actor command.
     pub(super) host_read_handle: &'a super::MobReadHandle,
+    /// Whether a member view the store cannot serve now ends the restore
+    /// with its typed error ([`restore_error_is_retryable`]): a wake, which
+    /// then ends retryable. A start's restore pass fails only that member
+    /// with the read failure as its diagnostic (the boot rule).
+    pub(super) unreadable_view_is_retryable: bool,
 }
 
 /// Everything a member's restore writes, applied in the member's turn.
@@ -11821,6 +11827,11 @@ pub(super) enum RetryableRestoreCause {
     /// ([`seat_create_failure_is_retryable`]): the member stays Dormant
     /// with its session unborn, and a later delivery wakes it again.
     SeatCreateUnavailable,
+    /// The restore met work still in flight on the member's session, or a
+    /// store that could not serve it now ([`restore_error_is_retryable`]):
+    /// the member stays Dormant with its boot obligation owed, and its retry
+    /// joins the work still in flight.
+    RestoreUnavailable,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -11829,7 +11840,9 @@ impl RetryableRestoreCause {
     pub(super) fn wake_kind(self) -> mob_dsl::MemberWakeRetryableKind {
         match self {
             Self::BuildPreparation => mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
-            Self::SeatCreateUnavailable => mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable
+            }
         }
     }
 
@@ -11837,28 +11850,82 @@ impl RetryableRestoreCause {
     pub(super) fn wake_refusal(self) -> crate::MemberWakeRefusal {
         match self {
             Self::BuildPreparation => crate::MemberWakeRefusal::HostPreparationPending,
-            Self::SeatCreateUnavailable => crate::MemberWakeRefusal::ResumeGateUnavailable,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                crate::MemberWakeRefusal::ResumeGateUnavailable
+            }
         }
     }
 }
 
-/// Whether a seat's first create failed for a cause that clears on its own:
-/// the session store failed the write, the session was busy, its runtime
-/// authority was unavailable, or another runtime owner held its hosting
-/// claim. Any other cause (a build the host or the factory refuses, an
+/// Whether a member's restore failed for a cause that clears on its own,
+/// with its authority kept: a lifecycle operation on the member's session
+/// (the takeover of its exact attachment) still in flight past the caller's
+/// budget or not yet admitted, whose retry joins it, or a session service
+/// that cannot serve the member now ([`session_error_is_retryable`]). Such a
+/// restore never breaks the member: it ends retryable, and the member stays
+/// Dormant with its boot obligation owed. Any other cause breaks only that
+/// member, with its typed reason.
+pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
+    match error {
+        MobError::LifecycleOperationPending { .. }
+        | MobError::LifecycleOperationAdmissionPending { .. } => true,
+        MobError::SharedLifecycleFailure(inner) => restore_error_is_retryable(inner),
+        MobError::SessionError(error) => session_error_is_retryable(error),
+        _ => false,
+    }
+}
+
+/// Whether a session service failure clears on its own: the store could not
+/// serve the request now
+/// ([`super::actor::SessionStoreFailureClass::Unavailable`]), the session was
+/// busy, its runtime authority was unavailable, another runtime owner holds
+/// its hosting claim (or the claim cannot be taken now), or its external
+/// write authority could not be checked without waiting. A malformed or
+/// refusing persisted state, a durable tail held for or refused by its
+/// recovery (a hold is reported with the member Broken, so its host sees it),
+/// quarantined or diverged durable evidence (which needs its sanctioned
+/// repair), an agent fault and every other typed cause are terminal. The
+/// settlement diagnostics a failure carries never change its class.
+pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionError) -> bool {
+    use meerkat_core::service::SessionError;
+
+    match error {
+        SessionError::WithSettlementFailures { error, .. } => session_error_is_retryable(error),
+        SessionError::Store(source) => {
+            super::actor::session_store_failure_class(source.as_ref())
+                == super::actor::SessionStoreFailureClass::Unavailable
+        }
+        SessionError::RuntimeUnavailable { .. }
+        | SessionError::Busy { .. }
+        | SessionError::ServedElsewhere { .. }
+        | SessionError::HostingUnavailable { .. }
+        | SessionError::ExternalWriteFenceBackoff { .. } => true,
+        SessionError::NotFound { .. }
+        | SessionError::PersistenceDisabled
+        | SessionError::CompactionDisabled
+        | SessionError::NotRunning { .. }
+        | SessionError::DurableTailHeldForRecovery { .. }
+        | SessionError::DurableTailRecoveryRefused { .. }
+        | SessionError::DurableEvidenceQuarantined { .. }
+        | SessionError::WholeBlobAuditedEndpointDivergence { .. }
+        | SessionError::Agent(_)
+        | SessionError::FailedWithData { .. }
+        | SessionError::CapabilityUnavailable(_)
+        | SessionError::Unsupported(_)
+        | SessionError::ExternalWriteFenceConflict { .. }
+        | SessionError::ForkInstructionRefused(_) => false,
+    }
+}
+
+/// Whether a seat's first create failed for a cause that clears on its own
+/// ([`session_error_is_retryable`]): the store could not serve the write
+/// now, the session was busy, its runtime authority was unavailable, or
+/// another runtime owner held its hosting claim. Any other cause (a build the
+/// host or the factory refuses, a malformed or refusing persisted state, an
 /// internal fault) breaks the member.
 #[cfg(feature = "runtime-adapter")]
 fn seat_create_failure_is_retryable(error: &MobError) -> bool {
-    matches!(
-        error,
-        MobError::SessionError(
-            meerkat_core::service::SessionError::Store(_)
-                | meerkat_core::service::SessionError::Busy { .. }
-                | meerkat_core::service::SessionError::RuntimeUnavailable { .. }
-                | meerkat_core::service::SessionError::ServedElsewhere { .. }
-                | meerkat_core::service::SessionError::HostingUnavailable { .. }
-        )
-    )
+    matches!(error, MobError::SessionError(error) if session_error_is_retryable(error))
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -12538,7 +12605,9 @@ pub(super) async fn restore_resumed_member(
     // first build (see `fork_build`). What the bound session holds, read
     // once, for the customizer's resume view (an ordinary member only; a
     // fork-derived member's rebuild is not customized). A failed read fails
-    // this member's restore, like any other per-member restore failure.
+    // this member's restore, like any other per-member restore failure; on a
+    // wake, a read the store cannot serve now ends the restore with its typed
+    // error instead, and the wake ends retryable.
     let restore_view = if entry.fork_source.is_none() && spawn_member_customizer.is_some() {
         match super::fork_build::load_resumed_member_view(
             session_service.as_ref(),
@@ -12547,6 +12616,11 @@ pub(super) async fn restore_resumed_member(
         .await
         {
             Ok(view) => view,
+            Err(error)
+                if ctx.unreadable_view_is_retryable && restore_error_is_retryable(&error) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 return Ok(MemberRestorePlan::Unseated(member_restore_failure(
                     &bridge_session_id,

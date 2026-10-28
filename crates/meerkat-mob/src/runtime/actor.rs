@@ -500,16 +500,65 @@ async fn member_session_present(
     }
 }
 
+/// What a session store failure says about the session's persisted state, by
+/// its typed cause. Display text is diagnostic only. Every classifier of a
+/// session read or restore failure reads a store failure through this one
+/// split ([`session_store_failure_class`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SessionStoreFailureClass {
+    /// The persisted state cannot be decoded or verified (`Serialization`,
+    /// `Corrupted`). `Corrupted` is deterministic for the same persisted state
+    /// and request by the `SessionStoreError::Corrupted` contract, never a
+    /// race with a concurrent writer.
+    Malformed,
+    /// The persisted state does not hold what the request needs, or refuses
+    /// it: the session is missing, or a save or rewrite breaks its
+    /// monotonicity, its transcript continuity or the rewrite rules. The same
+    /// state answers the same request the same way.
+    Refused,
+    /// The store could not serve the request now: I/O, a race with a
+    /// concurrent writer (a transcript revision conflict), a projection known
+    /// degraded, an internal store fault, or a source that is not a session
+    /// store error.
+    Unavailable,
+}
+
+/// Classify the source of a [`meerkat_core::service::SessionError::Store`]
+/// ([`SessionStoreFailureClass`]).
+pub(super) fn session_store_failure_class(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> SessionStoreFailureClass {
+    use meerkat_core::SessionStoreError;
+
+    match source.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::Serialization(_) | SessionStoreError::Corrupted(_)) => {
+            SessionStoreFailureClass::Malformed
+        }
+        Some(
+            SessionStoreError::NotFound(_)
+            | SessionStoreError::MonotonicityViolation { .. }
+            | SessionStoreError::TranscriptContinuityViolation { .. }
+            | SessionStoreError::InvalidTranscriptRewrite { .. },
+        ) => SessionStoreFailureClass::Refused,
+        Some(
+            SessionStoreError::Io(_)
+            | SessionStoreError::TranscriptRevisionConflict { .. }
+            | SessionStoreError::ProjectionReadRefused { .. }
+            | SessionStoreError::Internal(_),
+        )
+        | None => SessionStoreFailureClass::Unavailable,
+    }
+}
+
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
-/// unknown failures remain retryable. Display text is diagnostic only.
-/// `Corrupted` is permanent because the `SessionStoreError::Corrupted`
-/// contract makes it deterministic for the same persisted state and request,
-/// never a race with a concurrent writer.
+/// unknown failures remain retryable. Display text is diagnostic only. A store
+/// failure is read through [`session_store_failure_class`]: only a malformed
+/// persisted state is permanent here, and the identity machine reads a
+/// missing or refusing one again on its retry.
 fn identity_session_load_error_class(
     error: &meerkat_core::service::SessionError,
 ) -> IdentitySessionLoadErrorClass {
-    use meerkat_core::SessionStoreError;
     use meerkat_core::service::SessionError;
 
     match error {
@@ -519,21 +568,11 @@ fn identity_session_load_error_class(
         SessionError::PersistenceDisabled
         | SessionError::CapabilityUnavailable(_)
         | SessionError::Unsupported(_) => IdentitySessionLoadErrorClass::Malformed,
-        SessionError::Store(source) => match source.downcast_ref::<SessionStoreError>() {
-            Some(SessionStoreError::Serialization(_) | SessionStoreError::Corrupted(_)) => {
-                IdentitySessionLoadErrorClass::Malformed
+        SessionError::Store(source) => match session_store_failure_class(source.as_ref()) {
+            SessionStoreFailureClass::Malformed => IdentitySessionLoadErrorClass::Malformed,
+            SessionStoreFailureClass::Refused | SessionStoreFailureClass::Unavailable => {
+                IdentitySessionLoadErrorClass::Unavailable
             }
-            Some(
-                SessionStoreError::Io(_)
-                | SessionStoreError::NotFound(_)
-                | SessionStoreError::MonotonicityViolation { .. }
-                | SessionStoreError::TranscriptContinuityViolation { .. }
-                | SessionStoreError::TranscriptRevisionConflict { .. }
-                | SessionStoreError::InvalidTranscriptRewrite { .. }
-                | SessionStoreError::ProjectionReadRefused { .. }
-                | SessionStoreError::Internal(_),
-            )
-            | None => IdentitySessionLoadErrorClass::Unavailable,
         },
         // Forked/unverifiable durable evidence is a permanent corruption
         // verdict; a tail held for reconciliation — or a recovery refused by
@@ -8689,6 +8728,10 @@ pub(super) struct ExplicitResumeMemberRebuild {
     /// successor). `None` when the member keeps its bound session.
     superseded_session_id: Option<SessionId>,
     recovered_peer_endpoint: Option<TrustedPeerDescriptor>,
+    /// The host's build preparation staged a run-start hold for the member's
+    /// next registration (`HoldUntilReleased`): a rebuild that is not
+    /// accepted removes it, as no registration will apply it.
+    build_hold_staged: bool,
 }
 
 struct ExplicitResumePreparationContext {
@@ -8697,6 +8740,30 @@ struct ExplicitResumePreparationContext {
     session_service: Arc<dyn MobSessionService>,
     spawn_member_customizer: Option<Arc<dyn super::SpawnMemberCustomizer>>,
 }
+
+/// What the explicit resume's preparation does for one member, before the
+/// durable Resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitResumePreparation {
+    /// A member materialized in this process: its exact attachment is taken
+    /// over (kept when this handle owns it, retired otherwise) and its
+    /// rebuild is planned.
+    Live,
+    /// A Dormant member whose session still has a materialization of this
+    /// process (an attachment or a live actor an earlier handle of the mob
+    /// left): the seam retires it, as it retires every foreign attachment,
+    /// and the member stays Dormant for the lift's plan.
+    RetireRetained,
+    /// A member the lift's plan materializes after the durable Resume (its
+    /// wake attempt is open): no takeover (the seam retired any
+    /// materialization of this process before the Resume), only its rebuild
+    /// is planned, for the explicit-resume work path.
+    Planned,
+}
+
+/// One member of the explicit resume's preparation: its roster entry, its
+/// projected member ref, its bound session and what the preparation does.
+type ExplicitResumeCandidate = (RosterEntry, MemberRef, SessionId, ExplicitResumePreparation);
 
 pub(super) struct ExplicitResumeMemberWork {
     rebuild: ExplicitResumeMemberRebuild,
@@ -8760,7 +8827,13 @@ pub(super) enum UnprovenResumeCustodyStage {
 
 pub(super) enum ExplicitResumeMemberCompletion {
     Accepted,
+    /// The member's rebuild failed once MobMachine had authorized its
+    /// revival: its recipe, provision or custody. The member's own outcome.
     Failed(MobError),
+    /// The member's live and durable observation, or its classification,
+    /// failed before MobMachine authorized its revival: the explicit resume
+    /// answers it, as it answers a member it could not prepare.
+    ObservationFailed(MobError),
     Superseded,
 }
 
@@ -21665,7 +21738,7 @@ impl MobActor {
 impl ExplicitResumePreparationContext {
     async fn prepare(
         &self,
-        candidates: Vec<(RosterEntry, MemberRef, SessionId)>,
+        candidates: Vec<ExplicitResumeCandidate>,
         admission: super::state::LifecycleAdmissionSignal,
         progress: &super::state::LifecycleProgressSignal,
     ) -> Result<Vec<ExplicitResumeMemberRebuild>, MobError> {
@@ -21675,9 +21748,11 @@ impl ExplicitResumePreparationContext {
         let mut successor_index = None;
         let member_bound_sessions = candidates
             .iter()
-            .map(|(_, _, session_id)| session_id.clone())
+            .map(|(_, _, session_id, _)| session_id.clone())
             .collect::<std::collections::HashSet<_>>();
-        for (member_index, (entry, member_ref, session_id)) in candidates.into_iter().enumerate() {
+        for (member_index, (entry, member_ref, session_id, preparation)) in
+            candidates.into_iter().enumerate()
+        {
             let member_position = member_index + 1;
             progress.awaiting_member(
                 &entry.agent_identity,
@@ -21692,14 +21767,22 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation started"
             );
-            let mut requires_materialization = self
-                .provisioner
-                .prepare_member_session_for_explicit_resume(
-                    &session_id,
-                    Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
-                    Some(admission.clone()),
-                )
-                .await?;
+            // Each member's takeover gets its own retirement budget, from its
+            // own turn of this serial pass: a slow member never spends a later
+            // member's budget. A member the lift's plan materializes has no
+            // takeover of its own here.
+            let mut requires_materialization = if preparation == ExplicitResumePreparation::Planned
+            {
+                true
+            } else {
+                self.provisioner
+                    .prepare_member_session_for_explicit_resume(
+                        &session_id,
+                        Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                        Some(admission.clone()),
+                    )
+                    .await?
+            };
             progress.member_progress(
                 &entry.agent_identity,
                 super::state::LifecycleProgressStage::MemberAttachmentSessionPreparation,
@@ -21714,6 +21797,11 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation completed"
             );
+            // A Dormant member's retained materialization is retired; the
+            // member itself is the lift's plan's to materialize, or not.
+            if preparation == ExplicitResumePreparation::RetireRetained {
+                continue;
+            }
             // A fork-derived member's request is its own durable records, not
             // customized, like its first build (see `fork_build`), and names
             // no auth binding of its own.
@@ -21846,6 +21934,7 @@ impl ExplicitResumePreparationContext {
                     requires_materialization,
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
+                    build_hold_staged: false,
                 });
                 continue;
             }
@@ -21908,6 +21997,7 @@ impl ExplicitResumePreparationContext {
                     requires_materialization,
                     superseded_session_id: None,
                     recovered_peer_endpoint: None,
+                    build_hold_staged: false,
                 });
                 continue;
             };
@@ -22012,6 +22102,7 @@ impl ExplicitResumePreparationContext {
                 requires_materialization: replacement_requires_materialization,
                 superseded_session_id: Some(session_id),
                 recovered_peer_endpoint,
+                build_hold_staged: false,
             });
         }
         Ok(rebuild)
@@ -22019,53 +22110,87 @@ impl ExplicitResumePreparationContext {
 }
 
 impl MobActor {
-    async fn explicit_resume_candidates(
-        &self,
-    ) -> Result<Vec<(RosterEntry, MemberRef, SessionId)>, MobError> {
-        let roster = self.roster.read().await;
-        let machine = self.dsl_authority.state();
-        roster
-            .list()
-            .filter_map(|entry| {
-                if !matches!(&entry.member_ref, MemberRef::Session { .. }) {
-                    return None;
-                }
-                let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
-                if machine.member_placement.contains_key(&identity) {
-                    return None;
-                }
-                // A member that is not materialized in this process is not a
-                // candidate: there is no attachment of it to prepare. The
-                // lift's member plan decides, after the durable Resume, which
-                // Dormant members it materializes (see `boot_lift`).
-                if super::boot_plan::member_is_dormant(machine, &identity) {
-                    return None;
-                }
-                let binding = machine.member_session_bindings.get(&identity)?;
-                Some(
-                    SessionId::parse(&binding.0)
-                        .map_err(|error| {
-                            MobError::Internal(format!(
-                                "MobMachine has invalid explicit-resume session binding '{}' for '{}': {error}",
-                                binding.0, entry.agent_identity
-                            ))
-                        })
-                        .and_then(|session_id| {
-                            Self::project_member_ref_session_binding(
-                                &entry.member_ref,
-                                Some(session_id.clone()),
-                            )
-                            .map(|member_ref| (entry.clone(), member_ref, session_id))
-                            .ok_or_else(|| {
+    async fn explicit_resume_candidates(&self) -> Result<Vec<ExplicitResumeCandidate>, MobError> {
+        let listed = {
+            let roster = self.roster.read().await;
+            let machine = self.dsl_authority.state();
+            roster
+                .list()
+                .filter_map(|entry| {
+                    if !matches!(&entry.member_ref, MemberRef::Session { .. }) {
+                        return None;
+                    }
+                    let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+                    if machine.member_placement.contains_key(&identity) {
+                        return None;
+                    }
+                    let dormant = super::boot_plan::member_is_dormant(machine, &identity);
+                    let binding = machine.member_session_bindings.get(&identity)?;
+                    Some(
+                        SessionId::parse(&binding.0)
+                            .map_err(|error| {
                                 MobError::Internal(format!(
-                                    "explicit resume cannot project the current session binding for '{}'",
-                                    entry.agent_identity
+                                    "MobMachine has invalid explicit-resume session binding '{}' for '{}': {error}",
+                                    binding.0, entry.agent_identity
                                 ))
                             })
-                        }),
-                )
-            })
-            .collect()
+                            .and_then(|session_id| {
+                                Self::project_member_ref_session_binding(
+                                    &entry.member_ref,
+                                    Some(session_id.clone()),
+                                )
+                                .map(|member_ref| {
+                                    (entry.clone(), member_ref, session_id, dormant)
+                                })
+                                .ok_or_else(|| {
+                                    MobError::Internal(format!(
+                                        "explicit resume cannot project the current session binding for '{}'",
+                                        entry.agent_identity
+                                    ))
+                                })
+                            }),
+                    )
+                })
+                .collect::<Result<Vec<_>, MobError>>()?
+        };
+        let mut candidates = Vec::with_capacity(listed.len());
+        for (entry, member_ref, session_id, dormant) in listed {
+            // A Dormant member is a candidate only while its session still
+            // has a materialization of this process, which the seam retires
+            // (an earlier handle of this mob left it; a fresh provisioner
+            // never adopts it). One with nothing of this process stays lazy:
+            // the lift's member plan decides, after the durable Resume, which
+            // Dormant members it materializes (see `boot_lift`).
+            let preparation = if !dormant {
+                ExplicitResumePreparation::Live
+            } else if self.session_has_retained_materialization(&session_id).await {
+                ExplicitResumePreparation::RetireRetained
+            } else {
+                continue;
+            };
+            candidates.push((entry, member_ref, session_id, preparation));
+        }
+        Ok(candidates)
+    }
+
+    /// Whether `session_id` still has a materialization of this process: an
+    /// executor attachment the runtime serves it with, or a live session
+    /// actor. In-memory reads only: no store is read, so a lazy resume stays
+    /// lazy.
+    async fn session_has_retained_materialization(&self, session_id: &SessionId) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(adapter) = self.runtime_adapter.as_ref()
+            && adapter
+                .current_executor_attachment_witness(session_id)
+                .await
+                .is_some()
+        {
+            return true;
+        }
+        self.session_service
+            .live_session_actor_registered(session_id)
+            .await
+            .unwrap_or(false)
     }
 
     /// Schedule rebuilding only the sessions whose prior exact attachment was retired by
@@ -22073,11 +22198,15 @@ impl MobActor {
     /// Running, so the existing machine-owned classify -> materialize ->
     /// resolve seam is authoritative. Results return through the member
     /// continuation; returning here does not certify construction completion.
+    ///
+    /// One member's failure is that member's: every other member is still
+    /// rebuilt. Returns each member whose rebuild failed before its work was
+    /// reserved, with its own typed error.
     async fn rebuild_explicit_resume_member_sessions(
         &mut self,
         mut rebuild: Vec<ExplicitResumeMemberRebuild>,
         progress: &super::state::LifecycleProgressSignal,
-    ) -> Result<(), MobError> {
+    ) -> Vec<(AgentIdentity, MobError)> {
         // A fork-derived member seated with its source's overlay is rebuilt
         // with the overlay its source is rebuilt with, so every source's
         // overlay is retained before its forks are rebuilt.
@@ -22091,7 +22220,7 @@ impl MobActor {
         let observation_permits = Arc::new(tokio::sync::Semaphore::new(
             self.member_residency.verify_concurrency.max(1),
         ));
-        let mut first_infrastructure_error = None;
+        let mut failed = Vec::new();
         for rebuild in rebuild {
             let ExplicitResumeMemberRebuild {
                 mut entry,
@@ -22101,6 +22230,7 @@ impl MobActor {
                 requires_materialization,
                 superseded_session_id,
                 recovered_peer_endpoint,
+                build_hold_staged,
             } = rebuild;
             let dsl_identity = mob_dsl::AgentIdentity::from_domain(
                 &crate::ids::AgentIdentity::from(entry.agent_identity.as_str()),
@@ -22119,7 +22249,7 @@ impl MobActor {
                 // detached authority, appends the replay-authority event, and
                 // publishes the machine only after that write succeeds. Apply
                 // the same event to the live roster projection afterward.
-                let event = super::builder::append_recovered_session_binding(
+                let event = match super::builder::append_recovered_session_binding(
                     &mut self.dsl_authority,
                     &self.events,
                     &self.definition.id,
@@ -22128,7 +22258,14 @@ impl MobActor {
                     recovered_peer_endpoint.clone(),
                     "explicit_resume_repoint_missing_member_session_binding",
                 )
-                .await?;
+                .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        failed.push((entry.agent_identity.clone(), error));
+                        continue;
+                    }
+                };
                 self.roster.write().await.apply_event(&event);
                 let _ = self
                     .machine_state_watch_tx
@@ -22147,7 +22284,7 @@ impl MobActor {
                     )
                     .await
                 {
-                    first_infrastructure_error.get_or_insert(error);
+                    failed.push((entry.agent_identity.clone(), error));
                     continue;
                 }
             }
@@ -22165,16 +22302,20 @@ impl MobActor {
                 ..
             } = &restore_spec.launch_mode
             else {
-                return Err(MobError::Internal(format!(
+                let error = MobError::Internal(format!(
                     "explicit-resume rebuild lost its Resume launch for '{}'",
                     entry.agent_identity
-                )));
+                ));
+                failed.push((entry.agent_identity.clone(), error));
+                continue;
             };
             if customized_session_id != &bridge_session_id {
-                return Err(MobError::Internal(format!(
+                let error = MobError::Internal(format!(
                     "explicit-resume rebuild session drifted for '{}': request='{}' selected='{}'",
                     entry.agent_identity, customized_session_id, bridge_session_id
-                )));
+                ));
+                failed.push((entry.agent_identity.clone(), error));
+                continue;
             }
             entry.effective_profile_override = restore_spec.override_profile.clone();
             entry.effective_model_override = restore_spec.model_override.clone();
@@ -22199,7 +22340,7 @@ impl MobActor {
                     origin
                 }
                 Err(error) => {
-                    first_infrastructure_error.get_or_insert(error);
+                    failed.push((entry.agent_identity.clone(), error));
                     continue;
                 }
             };
@@ -22219,12 +22360,13 @@ impl MobActor {
                 }
                 *roster = super::roster_authority::RosterAuthority::from_roster(snapshot);
             }
-            let attempt = self
-                .dsl_authority
-                .state()
-                .explicit_resume_attempt
-                .clone()
-                .ok_or_else(|| MobError::Internal("resume work lost its attempt".to_string()))?;
+            let Some(attempt) = self.dsl_authority.state().explicit_resume_attempt.clone() else {
+                failed.push((
+                    entry.agent_identity.clone(),
+                    MobError::Internal("resume work lost its attempt".to_string()),
+                ));
+                continue;
+            };
             let binding = mob_dsl::ResumeMemberBinding {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
@@ -22239,7 +22381,7 @@ impl MobActor {
                 },
                 "authorize_explicit_resume_member",
             ) {
-                first_infrastructure_error.get_or_insert(error);
+                failed.push((entry.agent_identity.clone(), error));
                 continue;
             }
             // The reservation left the member Waking under one wake attempt
@@ -22263,6 +22405,7 @@ impl MobActor {
                         requires_materialization,
                         superseded_session_id,
                         recovered_peer_endpoint,
+                        build_hold_staged,
                     },
                     attempt,
                     binding,
@@ -22272,10 +22415,7 @@ impl MobActor {
                 Arc::clone(&observation_permits),
             );
         }
-        if let Some(error) = first_infrastructure_error {
-            return Err(error);
-        }
-        Ok(())
+        failed
     }
 
     /// Observe one rebuilt member's live and durable session off the actor,
@@ -23311,8 +23451,10 @@ impl MobActor {
             progress,
             reply_tx,
         } = pending;
-        // The members this resume rebuilt are held Waking: their readiness
-        // settles each Live, or Broken with its failure (the member's own
+        // A member held Waking for this pass (each rebuilt member already
+        // ran its own readiness and settled before the pass began, so none
+        // is left once every member's work settled) is settled from its
+        // outcome: Live, or Broken with its failure (the member's own
         // outcome), before anything else of the resume continues.
         let (outcomes, held_failure) = self.settle_held_member_readiness(outcomes).await;
         if let Err(error) = self.apply_explicit_resume_input(
@@ -23432,10 +23574,16 @@ impl MobActor {
         // Running again: one `PlanBootMaterialization` per Dormant member,
         // with this start's policy and host inputs and a fresh obligation
         // scan, applied while fewer than the restore concurrency of the
-        // plan's wakes are open (the rest as they close, `boot_lift`). Each
-        // planned member is woken through the one cold recipe; the resume
-        // joins its wake and settles it once the wake closes.
-        let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set(&progress).await {
+        // plan's wakes are open (the rest as they close, `boot_lift`). A
+        // planned member with a born session and a durable endpoint is
+        // rebuilt through the explicit-resume work path once its rebuild is
+        // prepared; any other planned member is woken through the cold
+        // recipe, and the resume joins its wake and settles it once the wake
+        // closes.
+        let (boot_members, plan_error) = match self
+            .plan_explicit_resume_boot_set(&admission, &progress)
+            .await
+        {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -23449,12 +23597,21 @@ impl MobActor {
                 progress: progress.clone(),
                 reply_tx,
             });
-            if rebuilt_attachment
-                && let Err(error) = self
+            if rebuilt_attachment {
+                // A member that could not be rebuilt is answered as the
+                // resume's typed error; every other member is rebuilt.
+                for (identity, error) in self
                     .rebuild_explicit_resume_member_sessions(rebuild, &progress)
                     .await
-            {
-                self.retain_explicit_resume_error(error);
+                {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %identity,
+                        %error,
+                        "the explicit resume could not rebuild a member"
+                    );
+                    self.retain_explicit_resume_error(error);
+                }
             }
             if let Err(error) = self.join_explicit_resume_boot_members(boot_members) {
                 self.retain_explicit_resume_error(error);
@@ -28935,6 +29092,9 @@ impl MobActor {
                 MobCommand::ResumeLifecycleMemberSettled { work, completion } => {
                     Box::pin(self.explicit_resume_member_settled(work, completion)).await;
                 }
+                MobCommand::ResumeLifecycleMemberReadinessResolved { work, outcomes } => {
+                    Box::pin(self.explicit_resume_member_readiness_resolved(work, outcomes)).await;
+                }
                 MobCommand::ResumeLifecycleMemberCleanupHeld {
                     work,
                     retry_tx,
@@ -28958,8 +29118,15 @@ impl MobActor {
                 } => {
                     Box::pin(self.explicit_resume_member_unproven(work, failure, stage)).await;
                 }
-                MobCommand::ResumeLifecycleBootMemberSettled { member, joined } => {
-                    Box::pin(self.explicit_resume_boot_member_settled(member, joined)).await;
+                MobCommand::ResumeLifecycleBootMemberSettled { member, failure } => {
+                    Box::pin(self.explicit_resume_boot_member_settled(member, failure)).await;
+                }
+                MobCommand::ResumeLifecycleBootMembersPrepared {
+                    resume_attempt,
+                    prepared,
+                } => {
+                    Box::pin(self.explicit_resume_boot_members_prepared(resume_attempt, prepared))
+                        .await;
                 }
                 MobCommand::ResumeLifecycleRollbackStep { attempt } => {
                     Box::pin(self.drive_explicit_resume_rollback(attempt)).await;

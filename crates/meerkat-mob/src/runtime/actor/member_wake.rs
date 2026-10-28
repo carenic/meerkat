@@ -1381,20 +1381,39 @@ impl MobActor {
         });
     }
 
-    /// The wake bound of `attempt` ended.
+    /// The wake bound of `attempt` ended. A member an explicit resume
+    /// accepted is held Waking for its own readiness, whose steps are
+    /// bounded: the wake bound has ended for it. An attempt no cold-recipe
+    /// wake runs is one the lift realizes through the explicit-resume work
+    /// path: the lift no longer waits on it either
+    /// ([`Self::explicit_resume_work_path_wake_timed_out`]).
     pub(in crate::runtime) async fn member_wake_timed_out(
         &mut self,
         identity: AgentIdentity,
         attempt: MemberWakeAttempt,
     ) {
-        self.resolve_member_wake_retryable(
-            &identity,
-            attempt,
-            mob_dsl::MemberWakeRetryableKind::WakeTimedOut,
-            crate::MemberWakeRefusal::WakeTimedOut,
-            "member_wake_bound",
-        )
-        .await;
+        if self.startup_boot_attempts.get(&identity) == Some(&attempt) {
+            return;
+        }
+        let work_path = !self.member_wakes.running.contains_key(&attempt)
+            && !self
+                .member_wakes
+                .pending
+                .iter()
+                .any(|pending| pending.attempt == attempt);
+        let verdict = self
+            .resolve_member_wake_retryable(
+                &identity,
+                attempt,
+                mob_dsl::MemberWakeRetryableKind::WakeTimedOut,
+                crate::MemberWakeRefusal::WakeTimedOut,
+                "member_wake_bound",
+            )
+            .await;
+        if work_path && verdict == mob_dsl::MemberWakeFeedbackVerdict::Applied {
+            self.explicit_resume_work_path_wake_timed_out(&identity)
+                .await;
+        }
     }
 
     /// Resolve `attempt` retryable (Waking -> Dormant) and answer its
