@@ -631,6 +631,14 @@ impl MobActor {
                 }
             }
         }
+        // The chunk's declared edges are committed with its seats: the live
+        // ends trust their counterparts now, and any edge with a placed or
+        // peer-only end takes the single-edge wire path. This comes before
+        // the verified pass below: a member that pass records Broken moves
+        // the topology epoch, which would leave every trust permission the
+        // step minted stale. A member the pass breaks keeps its edges and its
+        // live peers' trust, as a spawned member that breaks later does.
+        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         for seat in seated {
             tracing::debug!(
                 mob_id = %self.definition.id,
@@ -660,10 +668,6 @@ impl MobActor {
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = verify;
-        // The chunk's declared edges are committed with its seats: the live
-        // ends trust their counterparts now, and any edge with a placed or
-        // peer-only end takes the single-edge wire path.
-        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         outcomes
             .into_iter()
             .map(|outcome| {

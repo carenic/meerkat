@@ -9,8 +9,8 @@
 
 use super::*;
 use crate::machines::mob_machine as dsl;
-use crate::runtime::DormantSeatOutcome;
 use crate::runtime::actor::member_wake_turn::probe_member_wake_restores_for_test;
+use crate::runtime::{DormantSeatOutcome, MemberRestorePolicy};
 
 const STEP: Duration = Duration::from_secs(60);
 
@@ -61,6 +61,24 @@ struct WiringMob {
 
 impl WiringMob {
     async fn new(label: &str, definition: MobDefinition, network_comms: bool) -> Self {
+        Self::build(label, definition, network_comms, None).await
+    }
+
+    /// A mob on session-scoped comms keys under the restore `policy`.
+    async fn with_restore_policy(
+        label: &str,
+        definition: MobDefinition,
+        policy: MemberRestorePolicy,
+    ) -> Self {
+        Self::build(label, definition, false, Some(policy)).await
+    }
+
+    async fn build(
+        label: &str,
+        definition: MobDefinition,
+        network_comms: bool,
+        policy: Option<MemberRestorePolicy>,
+    ) -> Self {
         let keys = tempfile::tempdir().expect("a comms identity root");
         let definition = with_unique_mob_id(definition, label);
         let service = Arc::new(MockSessionService::new());
@@ -72,6 +90,10 @@ impl WiringMob {
             builder.with_network_member_comms()
         } else {
             builder.with_member_comms_identity_root(keys.path())
+        };
+        let builder = match policy {
+            Some(policy) => builder.with_member_restore_policy(policy),
+            None => builder,
         };
         let handle = builder.create().await.expect("create the mob");
         Self {
@@ -657,4 +679,88 @@ async fn a_seat_step_journals_its_members_and_their_declared_edges_in_one_append
         "the rotation's one append carries the next incarnation and its declared edge"
     );
     assert_eq!(mob.edges(), BTreeSet::from([pair(&member, &helper)]));
+}
+
+/// A member the verified pass of a seat chunk records Broken moves the
+/// topology epoch, so the chunk's live ends trust their counterparts before
+/// that pass, under the permissions the chunk minted. Here a live
+/// orchestrator, a worker seated earlier on a session that is then lost, and
+/// a chunk that re-sends that worker (already seated) with two new workers:
+/// the pass records the lost worker Broken, and the orchestrator trusts both
+/// new workers at once, with no repair owed for their edges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_the_verified_pass_breaks_leaves_the_healthy_seats_of_its_chunk_trusted() {
+    let mob = WiringMob::with_restore_policy(
+        "seat-wiring-verified-pass",
+        sample_definition_with_auto_wire(),
+        MemberRestorePolicy::OnDemandVerified,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let lost = AgentIdentity::from("seat-lost");
+    let first = AgentIdentity::from("seat-worker-1");
+    let second = AgentIdentity::from("seat-worker-2");
+    mob.handle
+        .spawn_spec(spec("lead", &lead))
+        .await
+        .expect("spawn the orchestrator");
+    let lost_session = SessionId::new();
+    mob.service
+        .replace_live_session(Session::with_id(lost_session.clone()))
+        .await;
+    let resume_lost = || {
+        let mut spec = spec("worker", &lost);
+        spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: lost_session.clone(),
+            resume_from_role: None,
+        };
+        spec
+    };
+    mob.seat(vec![resume_lost()]).await;
+    mob.service.delete_persisted_session(&lost_session).await;
+
+    let outcomes = tokio::time::timeout(
+        STEP,
+        mob.handle.seat_dormant_members(vec![
+            resume_lost(),
+            spec("worker", &first),
+            spec("worker", &second),
+        ]),
+    )
+    .await
+    .expect("the seat answers")
+    .expect("the seat commits");
+    assert!(
+        matches!(outcomes[0], DormantSeatOutcome::AlreadySeated { .. })
+            && outcomes[1..]
+                .iter()
+                .all(|outcome| matches!(outcome, DormantSeatOutcome::Seated { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_restore_failures
+            .contains_key(&dsl::AgentIdentity::from_domain(&lost)),
+        "the verified pass records the worker whose session is lost Broken"
+    );
+    let trusted = mob.trusted(&lead).await;
+    for worker in [&first, &second] {
+        let peer = mob
+            .recorded_peer_id(worker)
+            .expect("the seat recorded the worker's endpoint");
+        assert!(
+            trusted.contains(&peer),
+            "the live orchestrator trusts {worker} at once: {trusted:?}"
+        );
+    }
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .owed_edge_repairs
+            .is_empty(),
+        "no repair is owed for the new workers' edges"
+    );
 }
