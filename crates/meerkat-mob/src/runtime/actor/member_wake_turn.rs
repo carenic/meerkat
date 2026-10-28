@@ -1214,12 +1214,21 @@ impl MobActor {
                     self.roll_back_member_wake(run, rollback);
                     return;
                 };
+                #[cfg(test)]
+                let hold = take_wake_topology_yield_hold_for_test(&run.identity);
                 self.dispatch_member_wake_step(
                     run,
                     MemberFence::exact(&entry),
                     rollback,
                     "member_wake_topology",
-                    async move { WakeStep::TopologyYield { topology } },
+                    async move {
+                        #[cfg(test)]
+                        if let Some((entered, release)) = hold {
+                            let _ = entered.send(());
+                            let _ = release.await;
+                        }
+                        WakeStep::TopologyYield { topology }
+                    },
                 );
                 return;
             }
@@ -1955,6 +1964,58 @@ async fn wait_for_wake_readiness_release_for_test(identity: &AgentIdentity) {
     if let Some(mut released) = held {
         let _ = released.wait_for(|released| *released).await;
     }
+}
+
+/// Test seam: members whose wake topology holds at its next pause between two
+/// chunks until the test releases it.
+#[cfg(test)]
+static WAKE_TOPOLOGY_YIELD_HOLDS_FOR_TEST: std::sync::Mutex<
+    Vec<(
+        AgentIdentity,
+        crate::tokio::sync::oneshot::Sender<()>,
+        crate::tokio::sync::oneshot::Receiver<()>,
+    )>,
+> = std::sync::Mutex::new(Vec::new());
+
+/// A held pause of a wake topology: `entered` fires once the pause is
+/// reached; sending on `release` (or dropping it) lets the topology go on.
+#[cfg(test)]
+pub(in crate::runtime) struct WakeTopologyYieldHold {
+    pub(in crate::runtime) entered: crate::tokio::sync::oneshot::Receiver<()>,
+    pub(in crate::runtime) release: crate::tokio::sync::oneshot::Sender<()>,
+}
+
+/// Hold the next pause between two chunks of `identity`'s wake topology,
+/// consumed once.
+#[cfg(test)]
+pub(in crate::runtime) fn hold_next_wake_topology_yield_for_test(
+    identity: &AgentIdentity,
+) -> WakeTopologyYieldHold {
+    let (entered_tx, entered_rx) = crate::tokio::sync::oneshot::channel();
+    let (release_tx, release_rx) = crate::tokio::sync::oneshot::channel();
+    WAKE_TOPOLOGY_YIELD_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .push((identity.clone(), entered_tx, release_rx));
+    WakeTopologyYieldHold {
+        entered: entered_rx,
+        release: release_tx,
+    }
+}
+
+#[cfg(test)]
+fn take_wake_topology_yield_hold_for_test(
+    identity: &AgentIdentity,
+) -> Option<(
+    crate::tokio::sync::oneshot::Sender<()>,
+    crate::tokio::sync::oneshot::Receiver<()>,
+)> {
+    let mut holds = WAKE_TOPOLOGY_YIELD_HOLDS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let index = holds.iter().position(|(armed, ..)| armed == identity)?;
+    let (_, entered, release) = holds.remove(index);
+    Some((entered, release))
 }
 
 /// Test seam: members whose next wake treats one wiring edge as failed (a

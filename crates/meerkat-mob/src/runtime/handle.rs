@@ -9450,13 +9450,13 @@ impl MobHandle {
     /// and a member seated later sees the ones seated before (an orchestrator
     /// member seated after the members that auto-wire to it is wired to
     /// them, which a spawn of it is not). The edges are MobMachine's and
-    /// journaled, and none wakes a member
-    /// (except as MobMachine wakes a Dormant member an edge joins to a placed
-    /// one): a live member trusts a seated one's recorded endpoint at once,
-    /// and the seated member's own trust is installed by its wake. A member on
-    /// network comms has no recorded endpoint until its boot wake registers
-    /// it, which then installs the trust of both ends. An identity answered
-    /// `AlreadySeated` keeps the edges it holds.
+    /// journaled, and none wakes a member (except as MobMachine wakes a
+    /// Dormant member an edge joins to a placed one): a live member trusts a
+    /// seated one's recorded endpoint at once, and the seated member's own
+    /// trust is installed by its wake. A member on network comms has no
+    /// recorded endpoint until its boot wake registers it, which then
+    /// installs the trust of both ends. An identity answered `AlreadySeated`
+    /// keeps the edges it holds.
     pub async fn seat_dormant_members(
         &self,
         specs: Vec<SpawnMemberSpec>,
