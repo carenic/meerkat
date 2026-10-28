@@ -246,7 +246,8 @@ them.
   seat built nothing creates its session under the id the seat named (see
   `MobHandle::seat_dormant_members`), after the host's build preparation, as
   any wake prepares it; a registration the host refuses there
-  (`MobError::MemberRegistrationRefused`) is the member's restore failure, as
+  (`MobError::MemberRegistrationRefused`, with the host's own reason) is the
+  member's restore failure, as
   is a create the factory or the host refuses for any other reason. A create
   that fails for a cause that clears on its own (the session store, the
   session's runtime authority or its hosting claim unavailable) leaves the

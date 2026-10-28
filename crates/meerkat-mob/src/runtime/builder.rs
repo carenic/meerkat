@@ -13118,15 +13118,23 @@ pub(super) async fn provision_durable_member_restore(
             // The provision's refusal slot is the only source of this typed
             // refusal; the seed records its code, and the transaction's own
             // rollback already removed the registration the host was asked
-            // about.
-            let registration_refusal = match &error {
-                MobError::MemberRegistrationRefused { call, .. } => Some(*call),
-                _ => None,
+            // about. The member's record keeps the host's own reason: a
+            // later answer of the recorded refusal (the member's wake, an
+            // `ensure_member_live`) is the refusal its host gave, not that
+            // refusal nested in this restore's diagnostic.
+            let (registration_refusal, reason) = match &error {
+                MobError::MemberRegistrationRefused { call, reason, .. } => {
+                    (Some(*call), reason.clone())
+                }
+                _ => (
+                    None,
+                    format!("failed to restore durable session '{bridge_session_id}': {error}"),
+                ),
             };
             unstage_member_build_hold(ctx, bridge_session_id).await;
             MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
                 bridge_session_id: Some(bridge_session_id.clone()),
-                reason: format!("failed to restore durable session '{bridge_session_id}': {error}"),
+                reason,
                 hold: None,
                 registration_refusal,
             })
