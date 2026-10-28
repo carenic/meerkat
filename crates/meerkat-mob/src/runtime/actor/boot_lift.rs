@@ -13,11 +13,19 @@
 //! (`AuthorizeExplicitResumeMember` answers Join), and the work path
 //! observes, provisions (an occupied claim awaits its release, a retained
 //! unattached actor is reclaimed, uncertain custody is parked) and accepts
-//! it; its own readiness then settles it Live, or Broken. A seat whose
-//! session is unborn, or a member with no durable endpoint yet, is realized
-//! by the actor's wake path instead (the cold recipe creates the session,
-//! or registers the endpoint), and the explicit resume joins that wake. The
-//! lift answers its caller only after the members it materializes settled.
+//! it; its own readiness then settles it Live, or Broken. Each member's
+//! rebuild is prepared and handed back on its own, so one member's slow
+//! preparation holds no other member (a fork seated with its source's
+//! overlay comes with its source when both are in the same round, so the
+//! source is rebuilt first). Until the explicit resume accepted it, such an
+//! attempt is bounded by the mob's wake bound, as a wake is: a caller that
+//! joined it is answered `WakeTimedOut` at the bound, the member is Dormant
+//! again with its owed retry armed, and the lift no longer waits on it. A
+//! seat whose session is unborn, or a member with no durable endpoint yet,
+//! is realized by the actor's wake path instead (the cold recipe creates the
+//! session, or registers the endpoint), and the explicit resume joins that
+//! wake. The lift answers its caller only after the members it materializes
+//! settled.
 //! It answers Ok unless a member it waited on did not end Live for a failure
 //! the resume itself answers; then it answers the first such member's typed
 //! error: a member that ended retryable (Dormant, its owed retry armed), a
@@ -140,7 +148,8 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     watched: BTreeSet<mob_dsl::AgentIdentity>,
     /// The members of `open` whose rebuild is being prepared for the
     /// explicit-resume work path: the explicit resume reserves each once its
-    /// rebuild is ready.
+    /// rebuild is ready. A member whose wake bound ended leaves it, and its
+    /// rebuild is dropped when it arrives.
     preparing: BTreeSet<mob_dsl::AgentIdentity>,
     /// The members the plan verified (`VerifyMember`), read once it has
     /// reached every member (those still Dormant then).
@@ -366,6 +375,12 @@ impl MobActor {
                     pending.attempt == *attempt && identity.0 == pending.identity.as_str()
                 })
             });
+            // Each is bounded by the mob's wake bound, as a wake is: a caller
+            // that joined its attempt is answered at the bound, and the bound
+            // ends a rebuild that has not been accepted by then.
+            for (identity, attempt) in &rebuilt {
+                self.arm_member_wake_bound(&AgentIdentity::from(identity.0.as_str()), *attempt);
+            }
         }
         let finished = dispatch.queue.is_empty()
             && dispatch.watched.is_empty()
@@ -804,9 +819,13 @@ impl MobActor {
     }
 
     /// Prepare, off the actor, the rebuilds of the members of a dispatch
-    /// round the lift realizes through the explicit-resume work path, each
-    /// member on its own (one member's failure is that member's), and hand
-    /// them back ([`Self::explicit_resume_boot_members_prepared`]).
+    /// round the lift realizes through the explicit-resume work path, and
+    /// hand each back as soon as it is prepared
+    /// ([`Self::explicit_resume_boot_members_prepared`]): one member's slow
+    /// or failed preparation holds no other member. A fork seated with its
+    /// source's overlay whose source is in the same round is prepared and
+    /// handed back with that source, so the source is rebuilt first and the
+    /// fork follows the overlay its source is rebuilt with.
     async fn prepare_explicit_resume_boot_members(
         &mut self,
         resume_attempt: &mob_dsl::ResumeAttemptId,
@@ -814,8 +833,11 @@ impl MobActor {
         progress: &super::super::state::LifecycleProgressSignal,
         members: Vec<(mob_dsl::AgentIdentity, u64)>,
     ) {
-        let mut prepared = Vec::new();
+        let mut unprepared = Vec::new();
         let mut candidates = Vec::new();
+        // Each candidate's in-mob source, when it is seated with that
+        // source's overlay.
+        let mut sources = BTreeMap::new();
         {
             let roster = self.roster.read().await;
             let state = self.dsl_authority.state();
@@ -839,13 +861,23 @@ impl MobActor {
                 });
                 match candidate {
                     Some(candidate) => {
+                        if let super::super::fork_build::ForkOverlayRule::FollowSource(source) =
+                            super::super::fork_build::fork_overlay_rule(
+                                &candidate.0,
+                                &self.definition.id,
+                                |identity| roster.get(identity),
+                                state,
+                            )
+                        {
+                            sources.insert(domain.clone(), source);
+                        }
                         let wired_peers =
                             super::super::member_build_preparer::member_build_wired_peers(
                                 state, &domain,
                             );
                         candidates.push((attempt, candidate, wired_peers));
                     }
-                    None => prepared.push(ExplicitResumeBootMemberPrepared {
+                    None => unprepared.push(ExplicitResumeBootMemberPrepared {
                         result: Err(ExplicitResumeBootMemberUnprepared::Failed(
                             MobError::Internal(format!(
                                 "the lift cannot rebuild '{domain}': it has no roster entry or session binding"
@@ -857,6 +889,30 @@ impl MobActor {
                 }
             }
         }
+        // The units handed back: a member alone, or a source of this round
+        // with the forks that follow its overlay (through forks of forks).
+        let in_round = candidates
+            .iter()
+            .map(|(_, candidate, _)| candidate.0.agent_identity.clone())
+            .collect::<BTreeSet<_>>();
+        let unit_of = |identity: &AgentIdentity| {
+            let mut unit = identity.clone();
+            let mut followed = BTreeSet::new();
+            while let Some(source) = sources.get(&unit)
+                && in_round.contains(source)
+                && followed.insert(unit.clone())
+            {
+                unit = source.clone();
+            }
+            unit
+        };
+        let mut units = BTreeMap::<AgentIdentity, Vec<_>>::new();
+        for candidate in candidates {
+            units
+                .entry(unit_of(&candidate.1.0.agent_identity))
+                .or_default()
+                .push(candidate);
+        }
         let context = Arc::new(self.explicit_resume_preparation_context());
         // The host's build preparer is a runtime adapter input.
         #[cfg(feature = "runtime-adapter")]
@@ -867,13 +923,27 @@ impl MobActor {
         let provisioner = Arc::clone(&self.provisioner);
         let admission = admission.clone();
         let progress = progress.clone();
-        let resume_attempt = resume_attempt.clone();
         let command_tx = self.command_tx.clone();
         #[cfg(all(test, feature = "runtime-adapter"))]
         let probe_mob = self.definition.id.clone();
-        self.actor_io_tasks.spawn(async move {
-            let rebuilds = futures::future::join_all(candidates.into_iter().map(
-                |(attempt, candidate, wired_peers)| {
+        for member in unprepared {
+            let resume_attempt = resume_attempt.clone();
+            let command_tx = command_tx.clone();
+            self.actor_io_tasks.spawn(async move {
+                let _ = command_tx
+                    .send(RoutedMobCommand::internal(
+                        MobCommand::ResumeLifecycleBootMembersPrepared {
+                            resume_attempt,
+                            prepared: vec![member],
+                        },
+                    ))
+                    .await;
+            });
+        }
+        for unit in units.into_values() {
+            let rebuilds = unit
+                .into_iter()
+                .map(|(attempt, candidate, wired_peers)| {
                     let context = Arc::clone(&context);
                     let preparer = preparer.clone();
                     let read_handle = read_handle.clone();
@@ -952,19 +1022,22 @@ impl MobActor {
                             result,
                         }
                     })
-                },
-            ))
-            .await;
-            prepared.extend(rebuilds);
-            let _ = command_tx
-                .send(RoutedMobCommand::internal(
-                    MobCommand::ResumeLifecycleBootMembersPrepared {
-                        resume_attempt,
-                        prepared,
-                    },
-                ))
-                .await;
-        });
+                })
+                .collect::<Vec<_>>();
+            let resume_attempt = resume_attempt.clone();
+            let command_tx = command_tx.clone();
+            self.actor_io_tasks.spawn(async move {
+                let prepared = futures::future::join_all(rebuilds).await;
+                let _ = command_tx
+                    .send(RoutedMobCommand::internal(
+                        MobCommand::ResumeLifecycleBootMembersPrepared {
+                            resume_attempt,
+                            prepared,
+                        },
+                    ))
+                    .await;
+            });
+        }
     }
 
     /// The rebuilds of a dispatch round's members are prepared. The explicit
@@ -1121,6 +1194,76 @@ impl MobActor {
         }
         // The lift goes on only while it still waits on its members: one a
         // lifecycle control superseded has already been answered.
+        let rebuilding = matches!(
+            self.pending_resume_lifecycle
+                .as_ref()
+                .map(|pending| &pending.phase),
+            Some(ResumeLifecyclePhase::RebuildingMembers { .. })
+        );
+        if rebuilding {
+            self.advance_explicit_resume_boot_plan().await;
+            self.continue_explicit_resume_after_rebuild().await;
+        }
+    }
+
+    /// The wake bound ended the plan attempt of `identity`, a member the lift
+    /// realizes through the explicit-resume work path, before the explicit
+    /// resume accepted it. The bound resolved the attempt retryable (the
+    /// member is Dormant, its owed retry armed) and answered its callers
+    /// `WakeTimedOut`; the explicit resume no longer waits on the member and
+    /// answers the same typed refusal. A rebuild still being prepared is
+    /// dropped when it arrives. Work the explicit resume reserved for the
+    /// member is settled now: a later wake of the member can never hold that
+    /// settlement, and the work's late acceptance is refused as stale and
+    /// its provision rolled back.
+    pub(super) async fn explicit_resume_work_path_wake_timed_out(
+        &mut self,
+        identity: &AgentIdentity,
+    ) {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        let preparing = self
+            .explicit_resume_boot_dispatch
+            .as_mut()
+            .is_some_and(|dispatch| dispatch.preparing.remove(&dsl_identity));
+        let reserved = {
+            let state = self.dsl_authority.state();
+            state.explicit_resume_attempt.clone().zip(
+                state
+                    .explicit_resume_member_work
+                    .get(&dsl_identity)
+                    .cloned(),
+            )
+        };
+        if !preparing && reserved.is_none() {
+            return;
+        }
+        self.retain_explicit_resume_member_failure(MobError::MemberWakeRefused {
+            member_id: identity.clone(),
+            refusal: crate::MemberWakeRefusal::WakeTimedOut,
+        });
+        if let Some((attempt, binding)) = reserved
+            && let Err(error) = self.apply_dsl_input(
+                mob_dsl::MobMachineInput::SettleExplicitResumeMember {
+                    attempt,
+                    agent_identity: dsl_identity,
+                    binding,
+                },
+                "settle_timed_out_explicit_resume_member",
+            )
+        {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                agent_identity = %identity,
+                %error,
+                "the explicit resume could not settle a member whose wake bound ended"
+            );
+        }
+        if let Some(pending) = self.pending_resume_lifecycle.as_ref() {
+            pending.progress.member_progress(
+                identity,
+                super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+            );
+        }
         let rebuilding = matches!(
             self.pending_resume_lifecycle
                 .as_ref()

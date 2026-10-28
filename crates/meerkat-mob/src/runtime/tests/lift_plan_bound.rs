@@ -51,6 +51,11 @@ const WAKE_BOUND: Duration = Duration::from_secs(10);
 /// that the later wake, released within milliseconds, never meets it.
 const SUPERSEDED_WAKE_BOUND: Duration = Duration::from_secs(5);
 
+/// The wake bound of the row whose rebuilt member's preparation is held:
+/// long enough that every other member, prepared and rebuilt on its own, is
+/// Live well within it even on a loaded runner.
+const REBUILD_WAKE_BOUND: Duration = Duration::from_secs(5);
+
 fn worker(index: usize) -> AgentIdentity {
     AgentIdentity::from(format!("plan-bound-{index}"))
 }
@@ -829,4 +834,103 @@ async fn a_lift_settles_a_member_whose_plan_wake_a_later_wake_superseded() {
         matches!(stopped, Ok(Ok(_))),
         "a Stop after the lift is served: {stopped:?}"
     );
+}
+
+/// A member the lift rebuilds through the explicit-resume work path is
+/// bounded by the mob's wake bound, as a wake is. While its rebuild
+/// preparation is held, a caller that joins its attempt is answered
+/// `WakeTimedOut` at the bound, and the member is Dormant again, never
+/// Broken. The other member of its round is prepared and rebuilt on its
+/// own, not behind it, every other member is Live, and the lift answers the
+/// typed timeout. The member's owed retry then wakes it.
+///
+/// RED before the fix: the attempt had no bound, so the caller waited for
+/// good (the row's bound ends the wait), and a round's preparations were
+/// handed back together, so the other member of the round stayed Waking
+/// behind the held one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_rebuilt_member_whose_preparation_hangs_times_out_alone_at_the_wake_bound() {
+    let mob = StoppedMob::configured("lift-rebuild-bound", BOUND, Some(REBUILD_WAKE_BOUND)).await;
+    let held = worker(0);
+    let probe = probe_member_wake_restores_for_test(mob.handle.mob_id(), [held.clone()]);
+    let lift = mob.lift();
+    let started = tokio::time::timeout(STEP, async {
+        while !probe.started().contains(&held) {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .is_ok();
+
+    // The other member of the round is rebuilt while the held one waits.
+    let other = dsl::AgentIdentity::from_domain(&worker(1));
+    let other_live = mob
+        .wait_for_state(|state| {
+            state.member_materialization.get(&other) == Some(&dsl::MemberMaterializationPhase::Live)
+        })
+        .await;
+    let joined = tokio::time::timeout(STEP, mob.handle.ensure_member_live(&held)).await;
+    let others: Vec<dsl::AgentIdentity> = (1..MEMBERS)
+        .map(|index| dsl::AgentIdentity::from_domain(&worker(index)))
+        .collect();
+    let others_live = mob
+        .wait_for_state(|state| {
+            others.iter().all(|id| {
+                state.member_materialization.get(id) == Some(&dsl::MemberMaterializationPhase::Live)
+            })
+        })
+        .await;
+    let lifted = mob.join_lift(lift).await;
+    let status = mob
+        .handle
+        .member_status(&held)
+        .await
+        .expect("the held member's status");
+    // Its stale preparation ends; the owed retry wakes the member.
+    probe.release(&held);
+    let held_id = dsl::AgentIdentity::from_domain(&held);
+    let retried = mob
+        .wait_for_state(|state| {
+            state.member_materialization.get(&held_id)
+                == Some(&dsl::MemberMaterializationPhase::Live)
+        })
+        .await;
+
+    assert!(started, "the held member's rebuild preparation started");
+    assert!(
+        other_live,
+        "the other member of the round is rebuilt and Live while the held one waits"
+    );
+    assert!(
+        matches!(
+            joined,
+            Ok(Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::WakeTimedOut,
+                ..
+            }))
+        ),
+        "a caller of the held member is answered at the wake bound: {joined:?}"
+    );
+    assert!(others_live, "every other member is Live");
+    let cause = match &lifted {
+        Err(MobError::SharedLifecycleFailure(inner)) => Some(inner.as_ref()),
+        Err(other) => Some(other),
+        Ok(()) => None,
+    };
+    assert!(
+        matches!(
+            cause,
+            Some(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::WakeTimedOut,
+                ..
+            })
+        ),
+        "the lift answers the typed timeout: {lifted:?}"
+    );
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a timed-out rebuild never breaks the member: {status:?}"
+    );
+    assert!(retried, "the member's owed retry wakes it");
 }
