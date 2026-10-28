@@ -42415,7 +42415,11 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
 /// session was archived and deleted, and the member's executor stopped on its
 /// own while the actor crash-stopped. The member's runtime registration is
 /// then still current in the shared runtime, Stopped, and bound to the dead
-/// actor's composition endpoint, whose transport is closed. Returns the
+/// actor's composition endpoint, whose transport is closed.
+///
+/// The rebuilt mob's start releases that registration: right after the
+/// start, before the explicit resume and before anything acts on the member,
+/// the runtime holds no registration of the member's session. Returns the
 /// rebuilt mob after its explicit resume under `policy`, the member's session
 /// and the shared runtime.
 async fn rebuilt_mob_over_a_dead_predecessors_registration(
@@ -42477,6 +42481,19 @@ async fn rebuilt_mob_over_a_dead_predecessors_registration(
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
+    // The actor answers a command only once its start ran.
+    assert_eq!(
+        resumed.status().await.expect("the rebuilt mob's status"),
+        MobState::Stopped,
+        "the rebuilt mob is stopped"
+    );
+    assert!(
+        machine
+            .current_session_registration_witness(&session)
+            .await
+            .is_none(),
+        "the rebuilt mob's start released the registration the dead predecessor held"
+    );
     resumed.resume().await.expect("explicit resume");
     (resumed, session, machine)
 }
@@ -42530,12 +42547,43 @@ async fn a_member_retires_over_a_registration_its_dead_predecessor_held_under_ea
 }
 
 /// On-demand restore: the member stays Dormant through the explicit resume,
-/// and its retire completes. The registration the dead predecessor held is
-/// released too: nothing of the predecessor stays in the runtime.
+/// and its retire completes. The registration the dead predecessor held was
+/// already released by the start (asserted in the helper), so nothing of the
+/// predecessor stays registered while the member is Dormant.
 #[tokio::test]
 async fn a_member_retires_over_a_registration_its_dead_predecessor_held_under_on_demand_restore() {
     let (resumed, session, machine) =
         rebuilt_mob_over_a_dead_predecessors_registration(MemberRestorePolicy::OnDemand).await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        resumed.retire(AgentIdentity::from("w-1")),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire completes");
+    assert!(
+        resumed
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the retired member left the roster"
+    );
+    assert!(
+        wait_for_registration_released(&machine, &session).await,
+        "the registration the dead predecessor held is released"
+    );
+}
+
+/// On-demand restore with the ready verdict: the member reads Broken at
+/// ready (its session is gone) without being materialized. Its retire
+/// completes and removes it, and the registration the dead predecessor held
+/// is released.
+#[tokio::test]
+async fn a_broken_at_ready_member_retires_over_a_dead_predecessors_registration() {
+    let (resumed, session, machine) =
+        rebuilt_mob_over_a_dead_predecessors_registration(MemberRestorePolicy::OnDemandVerified)
+            .await;
     tokio::time::timeout(
         Duration::from_secs(30),
         resumed.retire(AgentIdentity::from("w-1")),
