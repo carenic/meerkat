@@ -1824,12 +1824,32 @@ impl MobActor {
                 self.member_wakes.edge_repairs.remove(&edge);
             }
             Err(error) => {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    ?edge,
-                    %error,
-                    "an owed edge repair failed; it stays owed"
-                );
+                // The repair's first failure warns; while its cause persists
+                // it fails again at every backoff step, which is logged at
+                // debug with the retry count, so a lasting cause does not
+                // warn once a minute per edge.
+                let retries = self
+                    .member_wakes
+                    .edge_repairs
+                    .get(&edge)
+                    .map_or(0, |retry| retry.retries);
+                if retries <= 1 {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        ?edge,
+                        retries,
+                        %error,
+                        "an owed edge repair failed; it stays owed"
+                    );
+                } else {
+                    tracing::debug!(
+                        mob_id = %self.definition.id,
+                        ?edge,
+                        retries,
+                        %error,
+                        "an owed edge repair failed again; it stays owed"
+                    );
+                }
             }
         }
         self.resolve_member_edge_realization(&edge, realized.is_ok());
