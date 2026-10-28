@@ -8837,7 +8837,8 @@ enum CompositionDeliveryRestore {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum StartupMemberRecoveryCause {
     /// Its registration was the completed residue of a stopped attachment,
-    /// and the start took it over (unregistered it): the member is revived.
+    /// and the start took it over (unregistered it): MobMachine holds the
+    /// member Dormant, and its recovery wakes it.
     StoppedResidue,
     /// Its registration needs a durability reload: it is reloaded through
     /// the mob's own member registration reload.
@@ -9141,7 +9142,8 @@ pub(super) struct MobActor {
     /// Only that restore adds to it, and it is drained right after startup,
     /// when each member's recovery is dispatched. While it holds a member,
     /// and only for that reason, the startup readiness pass leaves the
-    /// member out: the recovery runs its readiness step itself.
+    /// member out (returning a taken-over member to Dormant): the recovery
+    /// runs its readiness step itself.
     #[cfg(feature = "runtime-adapter")]
     pub(super) startup_member_recoveries: BTreeMap<AgentIdentity, StartupMemberRecovery>,
     /// Member wake custody: the wake-route projection, the callers
@@ -34296,9 +34298,10 @@ impl MobActor {
     /// any command, so a delivery to the member waits behind it. Then the
     /// member is revived through the same MobMachine-authorized path a member
     /// turn or `MobHandle::ensure_member_live` takes (a member the reload
-    /// already revived answers as live), and its own readiness step runs: the
-    /// one the startup pass left out, an autonomous member's host loop
-    /// included. The outcome comes back as
+    /// already revived answers as live; a taken-over member, which the
+    /// startup pass returned to Dormant, is woken from Dormant), and its own
+    /// readiness step runs: the one the startup pass left out, an autonomous
+    /// member's host loop included. The outcome comes back as
     /// [`MobCommand::StartupMemberRecovered`].
     #[cfg(feature = "runtime-adapter")]
     async fn recover_startup_members(&mut self) {
@@ -34308,12 +34311,12 @@ impl MobActor {
         }
         if self.state() != MobState::Running {
             // A later startup step stopped the mob. A member whose stopped
-            // registration the start took over has no registration left, and
-            // the explicit resume rebuilds it. A member left out for a
-            // durability reload keeps its degraded registration: a resume
-            // refuses typed `MemberReloadRequired`, naming the member, until
-            // `MobHandle::reload_member_registration` reloads it (admitted
-            // while the mob is Stopped).
+            // registration the start took over has no registration left: it
+            // is Dormant, and a wake after the resume rebuilds it. A member
+            // left out for a durability reload keeps its degraded
+            // registration: a resume refuses typed `MemberReloadRequired`,
+            // naming the member, until `MobHandle::reload_member_registration`
+            // reloads it (admitted while the mob is Stopped).
             let members_with = |cause| {
                 recoveries
                     .iter()
@@ -34326,7 +34329,7 @@ impl MobActor {
                 tracing::warn!(
                     mob_id = %self.definition.id,
                     members = ?taken_over,
-                    "the mob start took over stopped member registrations but did not reach Running; the explicit resume rebuilds those members"
+                    "the mob start took over stopped member registrations but did not reach Running; those members are dormant until a wake after the resume rebuilds them"
                 );
             }
             let reload_required = members_with(StartupMemberRecoveryCause::ReloadRequired);
