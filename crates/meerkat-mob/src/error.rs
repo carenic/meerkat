@@ -381,7 +381,8 @@ pub enum MemberWakeRefusal {
     /// session (the takeover of its attachment) was still in flight, or the
     /// session service could not serve it now (a store failure that clears
     /// on its own, a busy session, unavailable runtime authority, a hosting
-    /// claim another owner holds, a durable tail held for its recovery).
+    /// claim another owner holds, an external write authority that could not
+    /// be checked without waiting).
     ResumeGateUnavailable,
     /// The mob's wake bound (`MobBuilder::with_member_wake_timeout`) ended
     /// before the member was ready. The member is dormant again.

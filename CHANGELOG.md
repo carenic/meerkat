@@ -492,6 +492,36 @@ them.
   registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
   restores the previous start.
 
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a member restore
+  that waits on work still in flight on the member's session (the takeover of
+  an attachment an earlier handle left), or that the session service cannot
+  serve now (a store failure that clears on its own, a busy session,
+  unavailable runtime authority, a hosting claim another owner holds), no
+  longer records the member Broken. The member stays Dormant with its owed
+  retry, and a caller waiting on its wake is refused retryably with
+  `MemberWakeRefusal::ResumeGateUnavailable` (`peer_wake_refused {
+  resume_gate_unavailable }` for a peer send). A malformed or refusing
+  persisted state, a held durable tail and every other cause still record the
+  member Broken with the typed reason.
+
+- Behaviour-only (not measured by the gate): `meerkat-mob`: the lift of a
+  stopped mob (`MobHandle::resume`) answers, once every member it waited on
+  settled and with the mob Running, the typed error of the first such member
+  that ended retryable, whose restore failed before its provision (its reads,
+  the spawn customizer, the host's build preparation, a successor repoint,
+  its reservation), whose readiness failed, or that a wake it joined left
+  Broken. A member whose provision or custody failed after its revival was
+  authorized, or whose durable session is missing, is recorded Broken and the
+  lift still answers Ok, as in 0.9.6.
+
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a member the lift
+  of a stopped mob rebuilds on its durable session is bounded by the mob's
+  wake bound (`MobBuilder::with_member_wake_timeout`) until its rebuild is
+  accepted. A delivery or `MobHandle::ensure_member_live` that waits on it is
+  answered `MemberWakeRefused { WakeTimedOut }` at the bound, and the member
+  stays Dormant with its owed retry; in 0.9.6 such a caller was refused at
+  once with `LifecycleOperationPending`.
+
 - `meerkat-runtime`: a background operation completion the runtime injected
   into its owner as a continuation is recorded durably with the ops
   lifecycle snapshot. A restart no longer reads it as owed, so the owner is
