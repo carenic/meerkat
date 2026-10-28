@@ -14580,7 +14580,7 @@ impl ProvisionFinish {
                             bridge_session_id = %created_bridge_session_id,
                             owner_bridge_session_id = %owner_bridge_session_id,
                             terminalized_operation_id = ?terminalized_operation_id,
-                            "missing-live revival found the parent owner context ended; the member is now self-owned"
+                            "a member revival found the parent owner context ended; the member is now self-owned"
                         );
                     } else {
                         tracing::debug!(
