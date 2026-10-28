@@ -48077,6 +48077,10 @@ impl MobActor {
         retiring_identity: Option<AgentIdentity>,
         preserve_machine_topology: bool,
     ) -> Result<wiring_io::WiringPreparation, MobError> {
+        // Each lane's future is built in its own frame (see
+        // `boxed_arm_future`): built here, every lane's future would take two
+        // slots of this frame in a debug build, on every unwire's stack,
+        // whichever lane runs.
         let peer_identity = match target {
             super::handle::PeerTarget::Local(id) => {
                 // Callers commonly unwire an external peer by name projected
@@ -48098,33 +48102,35 @@ impl MobActor {
                                 .is_some()
                         });
                 if !target_is_member && let Some(peer_name) = external_peer_name {
-                    return self
-                        .handle_unwire_external(local, peer_name, None)
-                        .await
-                        .map(|()| wiring_io::WiringPreparation::Settled);
+                    return boxed_arm_future(|| {
+                        self.handle_unwire_external(local, peer_name, None)
+                    })
+                    .await
+                    .map(|()| wiring_io::WiringPreparation::Settled);
                 }
                 id
             }
             super::handle::PeerTarget::ExternalName(peer_name) => {
-                return self
-                    .handle_unwire_external(local, peer_name, None)
+                return boxed_arm_future(|| self.handle_unwire_external(local, peer_name, None))
                     .await
                     .map(|()| wiring_io::WiringPreparation::Settled);
             }
             super::handle::PeerTarget::ExternalBinding(binding) => {
                 let descriptor = Self::trusted_peer_descriptor_from_external_binding(binding)?;
                 let peer_name = descriptor.name.clone();
-                return self
-                    .handle_unwire_external(local, peer_name, Some(descriptor))
-                    .await
-                    .map(|()| wiring_io::WiringPreparation::Settled);
+                return boxed_arm_future(|| {
+                    self.handle_unwire_external(local, peer_name, Some(descriptor))
+                })
+                .await
+                .map(|()| wiring_io::WiringPreparation::Settled);
             }
             super::handle::PeerTarget::External(descriptor) => {
                 let peer_name = descriptor.name.clone();
-                return self
-                    .handle_unwire_external(local, peer_name, Some(descriptor))
-                    .await
-                    .map(|()| wiring_io::WiringPreparation::Settled);
+                return boxed_arm_future(|| {
+                    self.handle_unwire_external(local, peer_name, Some(descriptor))
+                })
+                .await
+                .map(|()| wiring_io::WiringPreparation::Settled);
             }
         };
 
@@ -48193,72 +48199,26 @@ impl MobActor {
                 )));
             }
 
-            self.cancel_peer_deliveries_for_edge(
-                &local,
-                &peer_member_identity,
-                "members are unwiring",
-            )
-            .await?;
-            let _unwire_handoff = self.apply_unwire_members_idempotent(&edge)?;
-            if let Err(error) = self
-                .unwire_peer_only_recipient(
-                    local_spec,
-                    Some(local_binding),
-                    peer_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                self.rollback_peer_only_unwire(
-                    &edge,
-                    WiringSides::empty(),
+            return boxed_arm_future(|| async {
+                self.cancel_peer_deliveries_for_edge(
                     &local,
                     &peer_member_identity,
-                    local_spec,
-                    local_binding,
-                    peer_spec,
-                    peer_binding,
+                    "members are unwiring",
                 )
-                .await;
-                return Err(error);
-            }
-            if let Err(error) = self
-                .unwire_peer_only_recipient(
-                    peer_spec,
-                    Some(peer_binding),
-                    local_spec,
-                    std::time::Duration::from_secs(10),
-                )
-                .await
-            {
-                self.rollback_peer_only_unwire(
-                    &edge,
-                    WiringSides::local(),
-                    &local,
-                    &peer_member_identity,
-                    local_spec,
-                    local_binding,
-                    peer_spec,
-                    peer_binding,
-                )
-                .await;
-                return Err(error);
-            }
-
-            let event = NewMobEvent {
-                mob_id: self.definition.id.clone(),
-                timestamp: None,
-                kind: MobEventKind::MembersUnwired {
-                    a: AgentIdentity::from(edge.a.0.as_str()),
-                    b: AgentIdentity::from(edge.b.0.as_str()),
-                },
-            };
-            let stored = match self.events.append(event).await {
-                Ok(stored) => stored,
-                Err(error) => {
+                .await?;
+                let _unwire_handoff = self.apply_unwire_members_idempotent(&edge)?;
+                if let Err(error) = self
+                    .unwire_peer_only_recipient(
+                        local_spec,
+                        Some(local_binding),
+                        peer_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
                     self.rollback_peer_only_unwire(
                         &edge,
-                        WiringSides::both(),
+                        WiringSides::empty(),
                         &local,
                         &peer_member_identity,
                         local_spec,
@@ -48267,17 +48227,66 @@ impl MobActor {
                         peer_binding,
                     )
                     .await;
-                    return Err(MobError::from(error));
+                    return Err(error);
                 }
-            };
-            self.roster.write().await.apply_event(&stored);
-            return Ok(wiring_io::WiringPreparation::Settled);
+                if let Err(error) = self
+                    .unwire_peer_only_recipient(
+                        peer_spec,
+                        Some(peer_binding),
+                        local_spec,
+                        std::time::Duration::from_secs(10),
+                    )
+                    .await
+                {
+                    self.rollback_peer_only_unwire(
+                        &edge,
+                        WiringSides::local(),
+                        &local,
+                        &peer_member_identity,
+                        local_spec,
+                        local_binding,
+                        peer_spec,
+                        peer_binding,
+                    )
+                    .await;
+                    return Err(error);
+                }
+
+                let event = NewMobEvent {
+                    mob_id: self.definition.id.clone(),
+                    timestamp: None,
+                    kind: MobEventKind::MembersUnwired {
+                        a: AgentIdentity::from(edge.a.0.as_str()),
+                        b: AgentIdentity::from(edge.b.0.as_str()),
+                    },
+                };
+                let stored = match self.events.append(event).await {
+                    Ok(stored) => stored,
+                    Err(error) => {
+                        self.rollback_peer_only_unwire(
+                            &edge,
+                            WiringSides::both(),
+                            &local,
+                            &peer_member_identity,
+                            local_spec,
+                            local_binding,
+                            peer_spec,
+                            peer_binding,
+                        )
+                        .await;
+                        return Err(MobError::from(error));
+                    }
+                };
+                self.roster.write().await.apply_event(&stored);
+                Ok(wiring_io::WiringPreparation::Settled)
+            })
+            .await;
         }
         if matches!(local_endpoint, WiringEndpoint::Placed { .. })
             || matches!(peer_endpoint, WiringEndpoint::Placed { .. })
         {
-            return self
-                .unwire_edge_with_placement(
+            return boxed_arm_future(|| {
+                self.unwire_edge_with_placement(
                     &edge,
                     &local,
                     &peer_member_identity,
@@ -48287,8 +48296,9 @@ impl MobActor {
                     retiring_identity.as_ref(),
                     preserve_machine_topology,
                 )
-                .await
-                .map(|()| wiring_io::WiringPreparation::Settled);
+            })
+            .await
+            .map(|()| wiring_io::WiringPreparation::Settled);
         }
         if matches!(local_endpoint, WiringEndpoint::LocalDormant { .. })
             || matches!(peer_endpoint, WiringEndpoint::LocalDormant { .. })
@@ -48333,120 +48343,127 @@ impl MobActor {
             }
         };
 
-        let local_peer_id = Self::trusted_peer_removal_key(&local_spec);
-        let peer_peer_id = Self::trusted_peer_removal_key(&peer_spec);
+        boxed_arm_future(|| async {
+            let local_peer_id = Self::trusted_peer_removal_key(&local_spec);
+            let peer_peer_id = Self::trusted_peer_removal_key(&peer_spec);
 
-        // Idempotent absence stays a no-op only when live comms agrees.
-        // Stale trust cleanup needs MobMachine authority instead of using the
-        // roster projection as a behavior owner.
-        if !dsl_has_edge {
-            let local_has_stale_trust = local_comms
-                .peers()
-                .await
-                .iter()
-                .any(|peer| peer.peer_id.to_string() == peer_peer_id);
-            let peer_has_stale_trust = peer_comms
-                .peers()
-                .await
-                .iter()
-                .any(|peer| peer.peer_id.to_string() == local_peer_id);
-            if local_has_stale_trust || peer_has_stale_trust {
-                return Err(MobError::WiringError(format!(
-                    "unwire for '{local}' <-> '{peer_identity}' requires MobMachine wiring authority"
-                )));
+            // Idempotent absence stays a no-op only when live comms agrees.
+            // Stale trust cleanup needs MobMachine authority instead of using
+            // the roster projection as a behavior owner.
+            if !dsl_has_edge {
+                let local_has_stale_trust = local_comms
+                    .peers()
+                    .await
+                    .iter()
+                    .any(|peer| peer.peer_id.to_string() == peer_peer_id);
+                let peer_has_stale_trust = peer_comms
+                    .peers()
+                    .await
+                    .iter()
+                    .any(|peer| peer.peer_id.to_string() == local_peer_id);
+                if local_has_stale_trust || peer_has_stale_trust {
+                    return Err(MobError::WiringError(format!(
+                        "unwire for '{local}' <-> '{peer_identity}' requires MobMachine wiring authority"
+                    )));
+                }
+                return Ok(wiring_io::WiringPreparation::Settled);
             }
-            return Ok(wiring_io::WiringPreparation::Settled);
-        }
 
-        self.cancel_peer_deliveries_for_edge(&local, &peer_member_identity, "members are unwiring")
+            self.cancel_peer_deliveries_for_edge(
+                &local,
+                &peer_member_identity,
+                "members are unwiring",
+            )
             .await?;
 
-        // Submit DSL input first. Already-absent idempotency is a generated
-        // no-op transition; only `WiringGraphChanged` means rollback must
-        // re-submit the wire.
-        let unwire_handoff = self.apply_unwire_members_idempotent(&edge)?;
+            // Submit DSL input first. Already-absent idempotency is a
+            // generated no-op transition; only `WiringGraphChanged` means
+            // rollback must re-submit the wire.
+            let unwire_handoff = self.apply_unwire_members_idempotent(&edge)?;
 
-        // Every generated removal authority is derived HERE, while the
-        // machine is held, and handed to the effect step as an owned token
-        // (#1105).
-        unwire_handoff.require_peer_id_for(&peer_member_identity, &peer_peer_id)?;
-        let local_removal_authority =
-            unwire_handoff.unwiring_authority_for(&peer_member_identity, &peer_peer_id)?;
-        unwire_handoff.require_peer_id_for(&local, &local_peer_id)?;
-        let peer_removal_authority =
-            unwire_handoff.unwiring_authority_for(&local, &local_peer_id)?;
+            // Every generated removal authority is derived HERE, while the
+            // machine is held, and handed to the effect step as an owned
+            // token (#1105).
+            unwire_handoff.require_peer_id_for(&peer_member_identity, &peer_peer_id)?;
+            let local_removal_authority =
+                unwire_handoff.unwiring_authority_for(&peer_member_identity, &peer_peer_id)?;
+            unwire_handoff.require_peer_id_for(&local, &local_peer_id)?;
+            let peer_removal_authority =
+                unwire_handoff.unwiring_authority_for(&local, &local_peer_id)?;
 
-        // Notices are built on the actor; only the finished wire command
-        // travels with the detached step.
-        let notify_from_local = Self::peer_event_command(
-            "mob.peer_unwired",
-            &peer_spec,
-            &peer_member_identity,
-            &peer_entry,
-            &peer_spec,
-        )?;
-        let notify_from_peer = Self::peer_event_command(
-            "mob.peer_unwired",
-            &local_spec,
-            &local,
-            &local_entry,
-            &local_spec,
-        )?;
+            // Notices are built on the actor; only the finished wire command
+            // travels with the detached step.
+            let notify_from_local = Self::peer_event_command(
+                "mob.peer_unwired",
+                &peer_spec,
+                &peer_member_identity,
+                &peer_entry,
+                &peer_spec,
+            )?;
+            let notify_from_peer = Self::peer_event_command(
+                "mob.peer_unwired",
+                &local_spec,
+                &local,
+                &local_entry,
+                &local_spec,
+            )?;
 
-        // Order is unchanged: notify both sides BEFORE trust removal (the
-        // send path resolves the recipient through the trusted-peers table),
-        // then remove A-side trust, then B-side trust.
-        let steps = vec![
-            WiringStep::Notify {
-                owner: local.clone(),
-                counterpart: peer_member_identity.clone(),
-                notice: WiringNotice::PeerUnwired,
-                comms: Arc::clone(&local_comms),
-                command: Box::new(notify_from_local),
-            },
-            WiringStep::Notify {
-                owner: peer_member_identity.clone(),
-                counterpart: local.clone(),
-                notice: WiringNotice::PeerUnwired,
-                comms: Arc::clone(&peer_comms),
-                command: Box::new(notify_from_peer),
-            },
-            WiringStep::RemoveTrust {
-                owner: local.clone(),
-                counterpart: peer_member_identity.clone(),
-                peer_id: peer_peer_id.clone(),
-                comms: Arc::clone(&local_comms),
-                authority: local_removal_authority,
-            },
-            WiringStep::RemoveTrust {
-                owner: peer_member_identity.clone(),
-                counterpart: local.clone(),
-                peer_id: local_peer_id.clone(),
-                comms: Arc::clone(&peer_comms),
-                authority: peer_removal_authority,
-            },
-        ];
-        let plan = WiringPlan::Unwire {
-            custody: Box::new(LocalMemberUnwireCustody {
-                edge: edge.clone(),
-                local: local.clone(),
-                peer: peer_member_identity.clone(),
-                local_incarnation: MemberIncarnationFence::from_entry(&local_entry),
-                peer_incarnation: MemberIncarnationFence::from_entry(&peer_entry),
-                local_comms,
-                peer_comms,
-                local_spec,
-                peer_spec,
-                local_entry: Box::new(local_entry),
-                peer_entry: Box::new(peer_entry),
-                handoff: unwire_handoff,
-            }),
-        };
-        Ok(wiring_io::WiringPreparation::prepared_plan(
-            plan,
-            steps,
-            self.dsl_authority.generated_authority_owner_token(),
-        ))
+            // Order is unchanged: notify both sides BEFORE trust removal (the
+            // send path resolves the recipient through the trusted-peers
+            // table), then remove A-side trust, then B-side trust.
+            let steps = vec![
+                WiringStep::Notify {
+                    owner: local.clone(),
+                    counterpart: peer_member_identity.clone(),
+                    notice: WiringNotice::PeerUnwired,
+                    comms: Arc::clone(&local_comms),
+                    command: Box::new(notify_from_local),
+                },
+                WiringStep::Notify {
+                    owner: peer_member_identity.clone(),
+                    counterpart: local.clone(),
+                    notice: WiringNotice::PeerUnwired,
+                    comms: Arc::clone(&peer_comms),
+                    command: Box::new(notify_from_peer),
+                },
+                WiringStep::RemoveTrust {
+                    owner: local.clone(),
+                    counterpart: peer_member_identity.clone(),
+                    peer_id: peer_peer_id.clone(),
+                    comms: Arc::clone(&local_comms),
+                    authority: local_removal_authority,
+                },
+                WiringStep::RemoveTrust {
+                    owner: peer_member_identity.clone(),
+                    counterpart: local.clone(),
+                    peer_id: local_peer_id.clone(),
+                    comms: Arc::clone(&peer_comms),
+                    authority: peer_removal_authority,
+                },
+            ];
+            let plan = WiringPlan::Unwire {
+                custody: Box::new(LocalMemberUnwireCustody {
+                    edge: edge.clone(),
+                    local: local.clone(),
+                    peer: peer_member_identity.clone(),
+                    local_incarnation: MemberIncarnationFence::from_entry(&local_entry),
+                    peer_incarnation: MemberIncarnationFence::from_entry(&peer_entry),
+                    local_comms,
+                    peer_comms,
+                    local_spec,
+                    peer_spec,
+                    local_entry: Box::new(local_entry),
+                    peer_entry: Box::new(peer_entry),
+                    handoff: unwire_handoff,
+                }),
+            };
+            Ok(wiring_io::WiringPreparation::prepared_plan(
+                plan,
+                steps,
+                self.dsl_authority.generated_authority_owner_token(),
+            ))
+        })
+        .await
     }
 
     fn apply_unwire_members_idempotent(
