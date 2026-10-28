@@ -1568,11 +1568,15 @@ async fn a_destroy_during_a_wake_waits_for_it_and_leaves_no_session_behind() {
 /// waits for that step: one effect of a member at a time. The earlier step
 /// returns after the resume, fails its attempt fence and rolls back; only
 /// then does the new wake restore the member, which ends Live on that one
-/// restore (its build is reported once) with its session actor kept.
+/// restore (one build report after the spawn's own) with its session actor
+/// kept.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_wake_after_a_stop_and_resume_waits_for_the_preempted_wakes_step() {
     let fixture = WakeFixture::new("wake-after-preempted-step").await;
     let member = fixture.spawn("preempted-step-member").await;
+    // The spawn is a build of its own, reported off the actor: wait for its
+    // report so the wakes' reports are counted from it.
+    fixture.preparer.wait_built(1).await;
     let session = fixture.session(&member).await;
     fixture.release(&member).await;
 
@@ -1659,16 +1663,14 @@ async fn a_wake_after_a_stop_and_resume_waits_for_the_preempted_wakes_step() {
     );
     fixture.preparer.wait_built(built_before + 1).await;
     tokio::time::sleep(Duration::from_millis(200)).await;
+    let built = fixture.preparer.built();
     assert_eq!(
-        fixture
-            .preparer
-            .built()
-            .iter()
-            .filter(|report| report.agent_identity == member)
-            .count(),
-        1,
-        "one restore materialized the member and reported its build"
+        built.len(),
+        built_before + 1,
+        "one restore materialized the member and reported its build: {built:?}"
     );
+    assert_eq!(built[built_before].agent_identity, member);
+    assert_eq!(built[built_before].session_id, session);
     fixture.finish().await;
 }
 
