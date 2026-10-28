@@ -62,31 +62,36 @@ pub(super) async fn verify_live_actor_auth_binding(
 /// actor on the old binding that a surface could reach. Fail closed: the
 /// session's exact current runtime registration is unregistered to
 /// terminal, interrupting any work in flight, and the session's live actor
-/// is then discarded (a session already without one is retired).
+/// is then discarded (a session already without one is retired). A build
+/// without the runtime adapter has no runtime registration to end, so it
+/// only discards the live actor.
 pub(super) async fn retire_conflicting_live_actor(
     session_service: &dyn MobSessionService,
     session_id: &SessionId,
 ) -> Result<(), MobError> {
-    let adapter = session_service
-        .acquire_runtime_adapter(None)
-        .map_err(|error| {
-            MobError::Internal(format!(
-                "retiring the conflicting live actor of session {session_id}: {error}"
-            ))
-        })?;
-    if let Some(adapter) = adapter
-        && let Some(registration) = adapter
-            .current_session_registration_witness(session_id)
-            .await
+    #[cfg(feature = "runtime-adapter")]
     {
-        adapter
-            .unregister_session_registration_until_terminal_if_current(&registration)
-            .await
+        let adapter = session_service
+            .acquire_runtime_adapter(None)
             .map_err(|error| {
                 MobError::Internal(format!(
-                    "retiring the conflicting runtime registration of session {session_id}: {error}"
+                    "retiring the conflicting live actor of session {session_id}: {error}"
                 ))
             })?;
+        if let Some(adapter) = adapter
+            && let Some(registration) = adapter
+                .current_session_registration_witness(session_id)
+                .await
+        {
+            adapter
+                .unregister_session_registration_until_terminal_if_current(&registration)
+                .await
+                .map_err(|error| {
+                    MobError::Internal(format!(
+                        "retiring the conflicting runtime registration of session {session_id}: {error}"
+                    ))
+                })?;
+        }
     }
     match session_service.discard_live_session(session_id).await {
         Ok(()) | Err(meerkat_core::service::SessionError::NotFound { .. }) => Ok(()),
