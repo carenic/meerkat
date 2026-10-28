@@ -17076,7 +17076,10 @@ impl MobHandle {
     /// idle and healthy with no in-flight work, answered from that fact
     /// (MobMachine's recorded last progress, when it holds one). Its preview
     /// and token count come from its committed durable head, read on
-    /// demand; the read never wakes it.
+    /// demand; the read never wakes it. A seated member never woken, whose
+    /// seat session is unborn (its first wake creates it), reads like an
+    /// eagerly created member before its first turn: no preview, zero
+    /// tokens, no `preview_unavailable`, with nothing read.
     pub async fn member_status(
         &self,
         identity: &AgentIdentity,

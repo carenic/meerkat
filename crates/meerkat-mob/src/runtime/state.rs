@@ -723,6 +723,12 @@ pub(super) struct MemberStatusProjectionTarget {
     /// from that fact. A wake between the observation and its completion
     /// changes the target, and the observation is driven again.
     pub(super) dormant: bool,
+    /// MobMachine holds the member's seat session unborn: its seat created
+    /// nothing, and its first wake creates the session. There is nothing to
+    /// read, and its view is an empty session's, as an eagerly created
+    /// session shows before its first turn. The born row changes the
+    /// target.
+    pub(super) unborn_seat: bool,
 }
 
 /// Which internal-error site of the explicit resume's readiness fan-out a

@@ -531,7 +531,11 @@ them.
   MobMachine: run state `idle`, health `healthy`, no in-flight work (no run
   is open on a member that is not materialized), where it read `unknown`
   for both before. Its preview and token count still come from its
-  committed durable head, read on demand, and the read wakes nothing.
+  committed durable head, read on demand, and the read wakes nothing. A
+  seated member never woken (its seat session unborn) reads like a member
+  created eagerly with an empty session: no preview, zero tokens and no
+  `preview_unavailable`, with nothing read, where it read `session_absent`
+  before.
   `MobHandle::collect_completed` reads nothing of a Dormant member, and the
   kickoff waits (`wait_for_kickoff_complete`,
   `wait_for_members_kickoff_complete`) poll a Dormant member's status from

@@ -78482,6 +78482,7 @@ async fn test_member_status_completion_cancels_while_mailbox_is_full() {
                 agent_runtime_id: None,
                 fence_token: None,
                 dormant: false,
+                unborn_seat: false,
             },
             super::actor::member_status_lane::MemberStatusObservationOutcome::Observed(Box::new(
                 super::state::MemberStatusSessionObservation {
