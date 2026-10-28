@@ -45,6 +45,8 @@ pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
 mod startup_readiness;
+#[cfg(feature = "runtime-adapter")]
+pub(super) mod wake_topology;
 pub(super) mod wiring_io;
 
 use super::uncertain_durability::UncertainDurabilityFailStop;
@@ -45437,13 +45439,7 @@ impl MobActor {
         }
         self.ensure_member_not_broken(&local).await?;
         self.ensure_member_not_broken(&peer_member_identity).await?;
-        if !self
-            .dsl_authority
-            .state()
-            .wiring_edges
-            .iter()
-            .any(|existing| existing == &edge)
-        {
+        if !self.dsl_authority.state().wiring_edges.contains(&edge) {
             return Err(MobError::WiringError(format!(
                 "respawn topology restore requires machine-owned edge ('{local}' <-> '{peer_identity}')"
             )));
@@ -45634,12 +45630,7 @@ impl MobActor {
         // The DSL emits a local repair effect; without a graph-change effect,
         // this path may reinstall live trust but must not synthesize a public
         // roster/event projection.
-        let dsl_has_edge = self
-            .dsl_authority
-            .state()
-            .wiring_edges
-            .iter()
-            .any(|existing| existing == &edge);
+        let dsl_has_edge = self.dsl_authority.state().wiring_edges.contains(&edge);
 
         // Resolve both endpoints' comms runtimes + specs BEFORE mutating
         // any authority state. Missing comms / missing public key yields
