@@ -10990,6 +10990,7 @@ impl MobBuilder {
                 &definition.id,
                 command_tx.clone(),
                 machine_state_watch_tx.subscribe(),
+                admission_closed_tx.subscribe(),
                 &durable_events,
                 // The host's build preparer reads through the launch's own
                 // handle on every wake, as the preactivation hook above and

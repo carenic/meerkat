@@ -177,16 +177,23 @@ impl MemberWakeAdmission {
 pub(in crate::runtime) struct MobPeerWaker {
     command_tx: mpsc::Sender<RoutedMobCommand>,
     machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
+    /// The mob's admission close, as its actor publishes it (D67: the
+    /// actor's `enter_admission_closed`, and the task-end guard for a lost
+    /// actor task, on the same channel the mob's handles read). A close is
+    /// for good: no owner is acquired after it.
+    admission_closed: tokio::sync::watch::Receiver<Option<crate::MobAdmissionCloseReason>>,
 }
 
 impl MobPeerWaker {
     fn new(
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
+        admission_closed: tokio::sync::watch::Receiver<Option<crate::MobAdmissionCloseReason>>,
     ) -> Self {
         Self {
             command_tx,
             machine_state,
+            admission_closed,
         }
     }
 }
@@ -249,11 +256,20 @@ impl meerkat_core::session_owner_wake::SessionOwnerWaker for MobPeerWaker {
     /// machine still holds Live has lost its materialization, and the
     /// machine's drift verdict decides its wake (re-observed on the actor
     /// first).
+    ///
+    /// A mob whose admission has closed (stood down, its last owner gone,
+    /// shut down, destroyed, or stopped by a failure) wakes no member again,
+    /// so it owns none of its members' sessions for this registry any more:
+    /// it answers `NotOwned` and wakes nothing, and the operation proceeds as
+    /// for an unowned session, as a process that never held the mob would.
     fn wake_session_owner(
         &self,
         session_id: &SessionId,
     ) -> meerkat_core::session_owner_wake::SessionOwnerWakeFuture {
         use meerkat_core::session_owner_wake::SessionOwnerWakeOutcome;
+        if self.admission_closed.borrow().is_some() {
+            return Box::pin(async { Ok(SessionOwnerWakeOutcome::NotOwned) });
+        }
         let wanted = mob_dsl::SessionId::from_domain(session_id);
         let member = self
             .machine_state
@@ -504,6 +520,7 @@ impl MemberWakes {
         mob_id: &MobId,
         command_tx: mpsc::Sender<RoutedMobCommand>,
         machine_state: tokio::sync::watch::Receiver<mob_dsl::MobMachineState>,
+        admission_closed: tokio::sync::watch::Receiver<Option<crate::MobAdmissionCloseReason>>,
         replayed: &[MobEvent],
         host_read_handle: crate::runtime::MobReadHandle,
     ) -> Result<Self, MobError> {
@@ -517,7 +534,11 @@ impl MemberWakes {
             .to_string();
         Ok(Self {
             namespace,
-            waker: Arc::new(MobPeerWaker::new(command_tx, machine_state)),
+            waker: Arc::new(MobPeerWaker::new(
+                command_tx,
+                machine_state,
+                admission_closed,
+            )),
             routes: BTreeMap::new(),
             waiters: BTreeMap::new(),
             resolving: BTreeSet::new(),

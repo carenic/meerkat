@@ -930,6 +930,15 @@ them.
   rebuilds (members still materialized in the process) at most that many at
   a time. On a host store each such wake or observation may read the
   member's stored session.
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a mob whose
+  admission has closed (stood down, its last owner gone, shut down,
+  destroyed, or stopped by a failure) no longer answers for its members'
+  sessions when a session-keyed operation asks the session's owner to wake
+  it. Within one process, a successor runtime, or any session-keyed
+  operation (a turn, a live channel, a cold attach) on such a member's
+  session, was refused busy by that mob; it now proceeds as for a session no
+  mob owns, as in a process that never held the mob. A peer wake addressed
+  to a member of a closed mob is refused as before.
 
 ### Known limitations
 
