@@ -620,6 +620,15 @@ them.
 
 ### Fixed
 
+- `meerkat-runtime`: a WholeBlob session whose run a restart continued from
+  its provisional tail compacts again. The continued run's session is now
+  decoded from the tail's bytes exactly as a committed body is, so it keeps
+  the row lineage of those bytes, and the bytes must match the digest the
+  store issued the tail under (a tail that does not is refused as invalid
+  evidence, as an undecodable one is). Before, every compaction of that
+  session made its summary call and then failed with "live transcript has no
+  exact row-lineage authority", so the transcript did not compact until the
+  session was next loaded from a committed body.
 - `meerkat-mob`: a mob's start no longer stops when the runtime
   unregistered a member's session registration after the start restored
   the member, for example when a run on that session failed and the
