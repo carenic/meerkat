@@ -100,12 +100,27 @@ impl MobActor {
                 // A member still held Waking for a readiness pass (none, once
                 // every member's work settled) is settled by this one.
                 targets.extend(self.held_member_readiness_targets().await);
+                let target_epochs: BTreeMap<_, _> = {
+                    let epochs = &self.dsl_authority.state().member_materialization_epoch;
+                    targets
+                        .iter()
+                        .filter_map(|target| {
+                            let identity =
+                                mob_dsl::AgentIdentity::from_domain(&target.entry.agent_identity);
+                            let epoch = epochs.get(&identity).cloned()?;
+                            Some((identity, epoch))
+                        })
+                        .collect()
+                };
                 self.spawn_resume_readiness_fanout(
                     targets,
                     Some(progress.clone()),
                     PendingResumeLifecycle {
                         ticket: ResumeStepTicket::default(),
-                        phase: ResumeLifecyclePhase::PostCommitReadiness { post_commit_error },
+                        phase: ResumeLifecyclePhase::PostCommitReadiness {
+                            post_commit_error,
+                            target_epochs,
+                        },
                         admission,
                         progress,
                         reply_tx,

@@ -369,14 +369,16 @@ impl MobActor {
     /// them: each is that member's outcome, never the lift's. The pass ran
     /// while the mob served, so a failure is resolved only while it still
     /// describes the member: the roster holds the incarnation it observed,
-    /// and MobMachine holds the member materialized, neither Broken nor
-    /// retiring. The failure of a member retired, respawned, released or
-    /// recorded Broken while its readiness ran is dropped: that path owns
-    /// the member's outcome. Returns the outcomes left to apply (the
-    /// successes).
+    /// and MobMachine holds the member materialized under the epoch it held
+    /// when the pass began (`target_epochs`), neither Broken nor retiring.
+    /// The failure of a member retired, respawned, released (and perhaps
+    /// woken again) or recorded Broken while its readiness ran is dropped:
+    /// that path owns the member's outcome. Returns the outcomes left to
+    /// apply (the successes).
     pub(super) async fn resolve_live_member_readiness_failures(
         &mut self,
         outcomes: Vec<MemberReadinessOutcome>,
+        target_epochs: &BTreeMap<mob_dsl::AgentIdentity, Option<mob_dsl::RuntimeEpochId>>,
     ) -> Vec<MemberReadinessOutcome> {
         let mut rest = Vec::with_capacity(outcomes.len());
         for outcome in outcomes {
@@ -384,7 +386,10 @@ impl MobActor {
                 rest.push(outcome);
                 continue;
             }
-            if !self.live_readiness_target_is_current(&outcome.entry).await {
+            if !self
+                .live_readiness_target_is_current(&outcome.entry, target_epochs)
+                .await
+            {
                 tracing::info!(
                     mob_id = %self.definition.id,
                     agent_identity = %outcome.entry.agent_identity,
@@ -405,9 +410,13 @@ impl MobActor {
     }
 
     /// Whether the member a readiness target observed is still that Live
-    /// target: the same incarnation in the roster, materialized, neither
-    /// Broken nor retiring.
-    async fn live_readiness_target_is_current(&self, observed: &RosterEntry) -> bool {
+    /// target: the same incarnation in the roster, materialized under the
+    /// epoch it held when the pass began, neither Broken nor retiring.
+    async fn live_readiness_target_is_current(
+        &self,
+        observed: &RosterEntry,
+        target_epochs: &BTreeMap<mob_dsl::AgentIdentity, Option<mob_dsl::RuntimeEpochId>>,
+    ) -> bool {
         let same_incarnation = self
             .roster
             .read()
@@ -418,12 +427,10 @@ impl MobActor {
                     && entry.fence_token == observed.fence_token
             });
         let state = self.dsl_authority.state();
+        let identity = mob_dsl::AgentIdentity::from_domain(&observed.agent_identity);
         same_incarnation
-            && !state
-                .member_restore_failures
-                .contains_key(&mob_dsl::AgentIdentity::from_domain(
-                    &observed.agent_identity,
-                ))
+            && target_epochs.get(&identity) == state.member_materialization_epoch.get(&identity)
+            && !state.member_restore_failures.contains_key(&identity)
             && !super::super::boot_plan::domain_member_is_unmaterialized(
                 state,
                 &observed.agent_identity,
