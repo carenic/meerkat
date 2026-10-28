@@ -426,8 +426,8 @@ async fn a_later_verified_pass_whose_first_read_hangs_is_answered_as_a_stall() {
     assert!(
         matches!(
             first,
-            Err(MobError::LifecycleOperationProgressStalled { ref stage, .. })
-                if *stage == "member_session_metadata_probe"
+            Err(MobError::LifecycleOperationProgressStalled { stage, .. })
+                if stage == "member_session_metadata_probe"
         ),
         "the held read of the later verified pass is answered as a stall: {first:?}"
     );
