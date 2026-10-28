@@ -18,8 +18,6 @@
 //! lifecycle phase. It also fails when an expected arm family is missing, so
 //! the scan cannot pass vacuously.
 
-use std::path::Path;
-
 /// Transition-name prefixes of the member-residency arms the scan covers.
 const RESIDENCY_ARM_PREFIXES: &[&str] = &[
     "WakeMember",
@@ -95,9 +93,11 @@ const RESIDENCY_HELPER_PREFIXES: &[&str] = &[
 ];
 
 fn dsl_source(file: &str) -> String {
-    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("src/catalog/dsl")
-        .join(file);
+    let manifest_dir = std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR is set for test processes"),
+    );
+    let path = manifest_dir.join("src/catalog/dsl").join(file);
     std::fs::read_to_string(&path).unwrap_or_else(|err| panic!("read {}: {err}", path.display()))
 }
 
