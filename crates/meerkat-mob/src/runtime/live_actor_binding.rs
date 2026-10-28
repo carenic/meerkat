@@ -3,10 +3,11 @@
 //! A member is rebuilt on the auth binding its current spec names. Where a
 //! path would keep a session's live actor instead of rebuilding it (a
 //! Resume-mode spawn of a session with a live actor, a restore that keeps a
-//! live session, a wake onto a live successor session), the actor is kept
-//! only when it runs that binding: a live actor is never reused on another
-//! binding. Where a restore or a wake finds the conflict, the member is
-//! recorded broken and the live actor is retired, so no surface reaches it.
+//! live session, a wake onto a live successor session, a durability reload
+//! whose build found the session live), the actor is kept only when it runs
+//! that binding: a live actor is never reused on another binding. Where a
+//! restore, a wake or a reload finds the conflict, the member is recorded
+//! broken and the live actor is retired, so no surface reaches it.
 
 use meerkat_core::types::SessionId;
 
@@ -58,13 +59,13 @@ pub(super) async fn verify_live_actor_auth_binding(
 }
 
 /// Retire the live actor of `session_id` that a binding conflict refused to
-/// keep (at a restore or a wake), so a member recorded broken keeps no live
-/// actor on the old binding that a surface could reach. Fail closed: the
-/// session's exact current runtime registration is unregistered to
-/// terminal, interrupting any work in flight, and the session's live actor
-/// is then discarded (a session already without one is retired). A build
-/// without the runtime adapter has no runtime registration to end, so it
-/// only discards the live actor.
+/// keep (at a restore, a wake or a reload), so a member recorded broken
+/// keeps no live actor on the old binding that a surface could reach. Fail
+/// closed: the session's exact current runtime registration is unregistered
+/// to terminal, interrupting any work in flight, and the session's live
+/// actor is then discarded (a session already without one is retired). A
+/// build without the runtime adapter has no runtime registration to end, so
+/// it only discards the live actor.
 pub(super) async fn retire_conflicting_live_actor(
     session_service: &dyn MobSessionService,
     session_id: &SessionId,

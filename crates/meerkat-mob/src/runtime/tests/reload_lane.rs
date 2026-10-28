@@ -1322,6 +1322,82 @@ async fn a_reload_of_an_unwired_member_without_comms_repairs_its_registration() 
     );
 }
 
+/// A warm reload whose build finds the member's session already live keeps
+/// that live actor only when it runs the binding the rebuild names (the host
+/// customizer's resume answer), as every reuse of a live actor does. A live
+/// actor on another binding is not adopted: the reload fails with the typed
+/// conflict, the member is recorded Broken, and the actor is retired, so no
+/// surface reaches the old binding.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_warm_reload_never_adopts_an_already_live_actor_on_another_binding() {
+    let mob = create_isolation_mob_with(1, turn_driven_definition(), |builder| {
+        builder.with_spawn_member_customizer(Arc::new(ResumeAuthBindingCustomizer(
+            scoped_auth_binding(),
+        )))
+    })
+    .await;
+    mob.degrade_member(0).await;
+    mob.store.fail_commit(mob.session(0), false);
+    // The session's recorded binding is another one, and the reload's build
+    // finds the session identity already active and the session live again,
+    // on that other binding.
+    mob.service
+        .record_session_auth_binding(mob.session(0), other_auth_binding())
+        .await;
+    mob.service
+        .set_create_session_identity_already_active(mob.session(0))
+        .await;
+
+    let refused = tokio::time::timeout(
+        Duration::from_secs(5),
+        mob.handle.reload_member_registration(mob.member(0)),
+    )
+    .await
+    .expect("the reload settles");
+    assert!(
+        refused.is_err(),
+        "a live actor on another binding is not adopted: {refused:?}"
+    );
+    let conflict = MobError::MemberAuthBindingConflict {
+        member_id: mob.member(0).clone(),
+        session_id: mob.session(0).clone(),
+        requested: Box::new(scoped_auth_binding()),
+        recorded: Some(Box::new(other_auth_binding())),
+    }
+    .to_string();
+    let status = mob
+        .handle
+        .member_status(mob.member(0))
+        .await
+        .expect("member status");
+    assert_eq!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{status:?}"
+    );
+    let recorded = mob
+        .handle
+        .query_machine_state()
+        .await
+        .expect("MobMachine state")
+        .member_restore_failures
+        .get(&mob_dsl::AgentIdentity::from_domain(mob.member(0)))
+        .cloned();
+    assert!(
+        recorded
+            .as_deref()
+            .is_some_and(|reason| reason.contains(&conflict)),
+        "the member's recorded failure is the typed conflict: {recorded:?}"
+    );
+    assert!(
+        !mob.service
+            .has_live_session(mob.session(0))
+            .await
+            .unwrap_or(false),
+        "the refused live actor is retired: no surface reaches the old binding"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn stop_waits_for_warm_construction_without_blocking_query_progress() {
     let mob = create_isolation_mob(2).await;

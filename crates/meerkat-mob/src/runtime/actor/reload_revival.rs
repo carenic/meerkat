@@ -451,6 +451,7 @@ impl MobActor {
                             ))).await,
                         }
                     }
+                    let requested_auth_binding = recipe.auth_binding.clone();
                     let request = match recipe.into_request(Arc::clone(&service)).await {
                         Ok(mut request) => {
                             request.runtime_revival_intent =
@@ -470,7 +471,39 @@ impl MobActor {
                         && revival_error_means_session_already_live(error, &worker_work.session_id)
                     {
                         match service.has_live_session(&worker_work.session_id).await {
-                            Ok(true) => return RevivalStep::AlreadyLiveAfterBuild,
+                            Ok(true) => {
+                                // The live actor is kept only when it runs the
+                                // binding the rebuild names, as every reuse of
+                                // a live actor (`live_actor_binding`); otherwise
+                                // the reload fails with the check's error and
+                                // the actor is retired, not reused.
+                                let Some(requested) = requested_auth_binding.as_ref() else {
+                                    return RevivalStep::AlreadyLiveAfterBuild;
+                                };
+                                let Err(refused) = super::super::live_actor_binding::verify_live_actor_auth_binding(
+                                    service.as_ref(),
+                                    &worker_work.entry.agent_identity,
+                                    &worker_work.session_id,
+                                    requested,
+                                )
+                                .await
+                                else {
+                                    return RevivalStep::AlreadyLiveAfterBuild;
+                                };
+                                if let Err(error) = super::super::live_actor_binding::retire_conflicting_live_actor(
+                                    service.as_ref(),
+                                    &worker_work.session_id,
+                                )
+                                .await
+                                {
+                                    tracing::error!(
+                                        session_id = %worker_work.session_id,
+                                        %error,
+                                        "a reloaded member's live actor refused by its auth binding check could not be retired"
+                                    );
+                                }
+                                return RevivalStep::Built(Err(refused));
+                            }
                             Ok(false) | Err(meerkat_core::service::SessionError::NotFound { .. }) => {}
                             Err(_) => return RevivalStep::Unsettled,
                         }
