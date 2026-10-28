@@ -1522,6 +1522,11 @@ async fn a_run_resumed_from_its_tail_compacts_and_the_compaction_persists_over_t
         "the committed transcript holds each kept call's result once"
     );
     assert_eq!(
+        (report.interrupted.clone(), restarted.notices),
+        (Vec::<String>::new(), 0),
+        "nothing of the run is repaired"
+    );
+    assert_eq!(
         (
             restarted.terminal.clone(),
             report.receipts,
