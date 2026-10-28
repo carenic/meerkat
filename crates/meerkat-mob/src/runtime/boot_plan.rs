@@ -454,6 +454,29 @@ impl<'a> BootObligationIndex<'a> {
     }
 }
 
+/// Test seam: the next runtime obligation scan of each armed mob reads its
+/// store only after the armed delay, as a slow store's read answers late.
+#[cfg(all(test, feature = "runtime-adapter"))]
+static BOOT_OBLIGATION_SCAN_DELAYS_FOR_TEST: std::sync::Mutex<BTreeMap<MobId, Duration>> =
+    std::sync::Mutex::new(BTreeMap::new());
+
+/// Delay the next runtime obligation scan of `mob_id` by `delay` (once).
+#[cfg(all(test, feature = "runtime-adapter"))]
+pub(crate) fn delay_next_boot_obligation_scan_for_test(mob_id: &MobId, delay: Duration) {
+    BOOT_OBLIGATION_SCAN_DELAYS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(mob_id.clone(), delay);
+}
+
+#[cfg(all(test, feature = "runtime-adapter"))]
+fn take_boot_obligation_scan_delay_for_test(mob_id: &MobId) -> Option<Duration> {
+    BOOT_OBLIGATION_SCAN_DELAYS_FOR_TEST
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(mob_id)
+}
+
 /// Run the one store-wide runtime obligation scan and attribute its runtimes
 /// to the seated local members of `state`.
 ///
@@ -477,6 +500,10 @@ pub(crate) async fn scan_boot_obligations(
         return Ok(BootObligations::none());
     };
     let index = BootObligationIndex::new(state, mob_id, incarnation)?;
+    #[cfg(test)]
+    if let Some(delay) = take_boot_obligation_scan_delay_for_test(mob_id) {
+        tokio::time::sleep(delay).await;
+    }
     let scanned = match adapter.boot_recovery_obligations().await {
         Ok(scanned) => scanned,
         Err(error) => {
@@ -808,6 +835,10 @@ pub(crate) struct VerifiedPassContext<'a> {
     /// Sessions bound to members: never another member's successor.
     pub(crate) member_bound_sessions: &'a HashSet<meerkat_core::types::SessionId>,
     pub(crate) concurrency: usize,
+    /// The lift's progress, when a lift runs the pass: each member's read
+    /// is reported as that member's progress, so a pass over many members
+    /// on a slow store is not read as a stalled lift.
+    pub(super) progress: Option<&'a super::state::LifecycleProgressSignal>,
 }
 
 /// Read the durable verdict of every target, at most `concurrency` at a
@@ -830,12 +861,19 @@ pub(crate) async fn verify_dormant_members(
     // authority is one of its row entries), so this pass reads every
     // dormant member's rows at every start there.
     let session_service = ctx.session_service;
+    let progress = ctx.progress;
     let observed = futures::stream::iter(targets)
         .map(|target| async move {
             let authority = session_service
                 .observe_session_resume_authority(&target.session_id)
                 .await
                 .map_err(MobError::SessionError)?;
+            if let Some(progress) = progress {
+                progress.member_progress(
+                    &target.entry.agent_identity,
+                    super::state::LifecycleProgressStage::MemberSessionMetadataProbe,
+                );
+            }
             let verdict =
                 super::session_service::observed_resume_verdict(&target.session_id, &authority);
             Ok::<_, MobError>((target, verdict))
@@ -864,7 +902,14 @@ pub(crate) async fn verify_dormant_members(
                     session_service.as_ref(),
                     ctx.listed_sessions,
                     ctx.member_bound_sessions,
-                    || {},
+                    || {
+                        if let Some(progress) = progress {
+                            progress.member_progress(
+                                &target.entry.agent_identity,
+                                super::state::LifecycleProgressStage::MemberSuccessorSessionScan,
+                            );
+                        }
+                    },
                 )
                 .await?;
                 let successor = index
@@ -886,6 +931,12 @@ pub(crate) async fn verify_dormant_members(
                             .observe_session_resume_authority(&successor_id)
                             .await
                             .map_err(MobError::SessionError)?;
+                        if let Some(progress) = progress {
+                            progress.member_progress(
+                                &target.entry.agent_identity,
+                                super::state::LifecycleProgressStage::MemberSessionMetadataProbe,
+                            );
+                        }
                         match super::session_service::observed_resume_verdict(
                             &successor_id,
                             &authority,
