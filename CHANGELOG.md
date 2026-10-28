@@ -965,6 +965,14 @@ them.
   unregistered registration and binds the session to its new one, and the
   mob comes up Running.
 
+- `meerkat-mob`: a member's kickoff that a crash left starting (its start
+  was recorded, then its run or the mob's wait for it was lost) now resumes
+  after the restart. The start wakes the member for it and admits the
+  kickoff's input again under the kickoff's own key, which attaches to the
+  input the runtime still holds and runs it only when the runtime holds none,
+  so the kickoff runs once and its status resolves. Before, the restart did
+  not resume it, and the kickoff's status stayed `starting`.
+
 - `meerkat-runtime`: a mob member's runtime registration keeps serving after
   an empty resume (a background operation's completion waking an idle
   member, or the same wake recovered at a start, that finds nothing pending).
