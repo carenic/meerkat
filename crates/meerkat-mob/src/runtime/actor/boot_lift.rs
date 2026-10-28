@@ -843,6 +843,14 @@ impl MobActor {
                     let probe_mob = probe_mob.clone();
                     Box::pin(async move {
                         let identity = candidate.0.agent_identity.clone();
+                        // The lift waits on the member's host materialization,
+                        // as it waits on a wake's: no platform budget answers it
+                        // as stalled while the host builds. The rebuild's own
+                        // store reads report their progress as they run.
+                        progress.awaiting_member(
+                            &identity,
+                            super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+                        );
                         // The rows' restore probe holds the member's restore at
                         // its start, as it holds a wake's.
                         #[cfg(all(test, feature = "runtime-adapter"))]
@@ -875,6 +883,10 @@ impl MobActor {
                                 })
                             })
                             .map_err(ExplicitResumeBootMemberUnprepared::Failed);
+                        progress.awaiting_member(
+                            &identity,
+                            super::super::state::LifecycleProgressStage::MemberLiveMaterialization,
+                        );
                         // The host prepares the member's build before its
                         // provision, as it prepares every wake's and every
                         // boot restore's.
