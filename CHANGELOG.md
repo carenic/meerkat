@@ -943,6 +943,18 @@ them.
   snapshot: until then a restart presents it again (one more wake and one
   repeated notice, never a lost completion).
 
+- `meerkat-core`: each field of a `ReviewOperationContext` (the action account
+  and the mandate an operation's owners state for its R2 review and its R3
+  consent presentation) is bounded at 64 KiB instead of 4 KiB
+  (`authorization::MAX_REVIEW_OPERATION_CONTEXT_BYTES`). A mandate composed
+  with the bounds its contributing originals narrow it to, or the listing of
+  every input's own mandate for a multi-input work, no longer passes the
+  bound at realistic sizes; past the old bound the call settled as
+  `review_unavailable` (`context_unavailable`) and was neither reviewed nor
+  presented for consent. A field over the new bound is still unavailable,
+  never truncated, and the model reviewer still refuses, as unavailable, an
+  input over its own 128 KiB bound.
+
 ### Fixed
 
 - `meerkat-mob`: a member rebuilt on its durable session (an explicit resume
