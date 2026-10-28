@@ -88,11 +88,11 @@ fi
 # run found, so a guard that silently disables arms fails the lane.
 seed_states=3078
 wake_states=1608
-retire_states=7974
+retire_states=5659
 terminal_states=238
 resume_states=4004
 edge_states=1148
-seat_states=58102
+seat_states=23452
 wake2_states=1425
 
 # Every arm each run must fire. TLC names an arm after the generated
