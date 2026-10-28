@@ -115,7 +115,15 @@ pub struct GovernedRealmBootstrap {
     pub invocation: ScopedInvocation,
     /// Current account, resource, sink and controller rules.
     pub operation_owner: Arc<dyn OperationPolicyOwner>,
-    /// Governed retained-work resume, when the host supports it.
+    /// Governed retained-work resume: the check that admits a continuation of
+    /// an earlier run (the approved notice of consent parked at that run's
+    /// close, a fork_off or council completion) as a resume of exactly that
+    /// run. Without it the realm admits no retained resume: such a
+    /// continuation stays pending (`UnsupportedScope`), or is refused once
+    /// its run's destination is superseded. Build it over the
+    /// same originals custody and invocation policy as above with
+    /// `ScopedRetainedResume`, as `ScopedGrantComposition::with_retained_resume`
+    /// does. [`RealmGovernance::Stock`] builds its own.
     pub retained_resume: Option<Arc<NativeRetainedResumeCheck>>,
     /// The restarted host's fresh publication, shared with its other owners.
     pub publication: LocalAuthorizationPublication,
