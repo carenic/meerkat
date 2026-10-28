@@ -688,6 +688,15 @@ them.
   until it finishes, even when its caller was cancelled, and the destroy
   removes the files only after that (`SqliteMobStores::drain_observers`
   refuses while one runs).
+- `meerkat-comms`: `Keypair::load_or_generate` stores a new key pair
+  atomically and never replaces a stored one, so concurrent first calls on
+  one directory all get the one key it then holds. Before, concurrent first
+  calls (two runtimes or processes sharing an identity directory) could each
+  generate and save a key, the last save replacing the others, so a caller
+  could go on using a key the directory no longer held. The key is written
+  to a temporary file in the directory and hard-linked into place (created
+  exclusively where the file system has no hard links); the key file's
+  permissions are unchanged (`0600` on Unix).
 - Host-store realms: a session no longer keeps up to 4 MiB of superseded
   copies of its runtime's registry of background operations. Core rewrites
   that registry whole each time an operation finishes or its result is
