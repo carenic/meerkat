@@ -54,8 +54,8 @@
 //! session, whichever controller that prompt used, the earlier run's resume
 //! is refused for good. After the session is closed and reopened in the
 //! same process, the earlier run's resume is not ready (its new registration
-//! has no pin for it) until the session's next governed prompt, and is then
-//! refused for good.
+//! has no pin for it) until the session's destination is next bound, and is
+//! then refused for good.
 
 pub mod caller;
 pub mod consent;

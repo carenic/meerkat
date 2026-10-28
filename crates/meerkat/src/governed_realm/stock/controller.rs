@@ -329,8 +329,9 @@ mod tests {
 
     /// The pins serve, per session runtime, only the client of its newest
     /// binding (a binding that finishes after a later one never displaces
-    /// it), only for that runtime and that selection, and nothing once the
-    /// registration's runtime entry is gone.
+    /// it, and a newer binding always replaces it), only for that runtime
+    /// and that selection, and nothing once the registration's runtime entry
+    /// is gone.
     #[tokio::test]
     async fn resume_pins_serve_only_the_newest_binding_of_a_live_registration() {
         let machine = meerkat_runtime::MeerkatMachine::ephemeral();
@@ -362,6 +363,17 @@ mod tests {
         assert!(
             Arc::ptr_eq(served.client(), newer.client()),
             "the binding of generation 5 never displaces the one of generation 9"
+        );
+        let newest = client();
+        pins.record(registration.clone(), 12, newest.clone());
+        let served = pins
+            .controller_owner(&runtime)
+            .reacquire_controller(&pinned)
+            .expect("answerable")
+            .expect("the newest binding's client");
+        assert!(
+            Arc::ptr_eq(served.client(), newest.client()),
+            "the binding of generation 12 replaces the pin of generation 9"
         );
         assert!(
             pins.controller_owner(&runtime)
