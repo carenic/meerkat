@@ -281,10 +281,10 @@ impl SpawnActivationWorkerContext {
             SubmitWorkDispatchCompletion::AwaitAutonomousDispatch {
                 agent_identity,
                 readiness,
-                material,
+                mut material,
             } => {
-                if let Some(readiness) = readiness {
-                    MobActor::run_local_turn_readiness(
+                if let Some(readiness) = readiness
+                    && let Some(session) = MobActor::run_local_turn_readiness(
                         &self.readiness,
                         &self.session_service,
                         &self.command_tx,
@@ -292,7 +292,9 @@ impl SpawnActivationWorkerContext {
                         readiness,
                         &material.member_ref,
                     )
-                    .await?;
+                    .await?
+                {
+                    material.follow_session(&session);
                 }
                 self.readiness
                     .dispatch_autonomous(&agent_identity, *material)
@@ -302,7 +304,7 @@ impl SpawnActivationWorkerContext {
                 operation_id,
                 agent_identity,
                 readiness,
-                member_ref,
+                mut member_ref,
                 req,
                 completion_tx,
                 llm_identity_applied_tx,
@@ -310,8 +312,8 @@ impl SpawnActivationWorkerContext {
                 placed_incarnation,
                 placed_input_id,
             } => {
-                if let Some(readiness) = readiness {
-                    MobActor::run_local_turn_readiness(
+                if let Some(readiness) = readiness
+                    && let Some(session) = MobActor::run_local_turn_readiness(
                         &self.readiness,
                         &self.session_service,
                         &self.command_tx,
@@ -319,7 +321,9 @@ impl SpawnActivationWorkerContext {
                         readiness,
                         &member_ref,
                     )
-                    .await?;
+                    .await?
+                {
+                    member_ref = MobActor::member_ref_on_session(&member_ref, &session);
                 }
                 // A placed first turn rides the ordinary placed ingress lane
                 // (see the rustdoc above): no carrier intent covers it, and a
