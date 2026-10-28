@@ -18844,7 +18844,10 @@ mod tests {
     /// #1701 control under the default restore policy (`OnDemand`): a
     /// host-created mob is never a child mob, so the child policy does not
     /// govern its member's rebuild. The member's first touch builds it once
-    /// more, on its own session, with the binding it was seated with.
+    /// more, with the binding it was seated with. This mock serves no
+    /// persistent sessions (`supports_persistent_sessions` is false), so the
+    /// rebuild creates the member a fresh session, as every restore on such a
+    /// service does; only a persistent service resumes the seated one.
     #[tokio::test]
     async fn a_dormant_host_mob_member_is_rebuilt_once_at_its_first_touch_with_its_seated_binding()
     {
@@ -18865,6 +18868,7 @@ mod tests {
             .expect("the host mob restores");
         assert_eq!(status.status, meerkat_mob::MobMemberStatus::Active);
         let seated = svc.build_policies_for(&session);
+        let activations_before = svc.session_activation_count();
         restored
             .handle_for(&mob_id)
             .await
@@ -18872,20 +18876,18 @@ mod tests {
             .ensure_member_live(&worker)
             .await
             .expect("the member's first touch rebuilds it");
+        assert_eq!(
+            svc.session_activation_count(),
+            activations_before + 1,
+            "the first touch built the member once"
+        );
         let rebuilt_on = restored
             .mob_resolve_bridge_session_id(&mob_id, &worker)
             .await
             .expect("resolve bridge session")
             .expect("the restored member has a session");
-        assert_eq!(rebuilt_on, session, "the member resumes its own session");
-        let rebuilt = svc.build_policies_for(&rebuilt_on);
         assert_eq!(
-            rebuilt.len(),
-            seated.len() + 1,
-            "the first touch built the member once"
-        );
-        assert_eq!(
-            rebuilt.last(),
+            svc.build_policies_for(&rebuilt_on).last(),
             seated.last(),
             "the restored member is built with the binding it was seated with"
         );
