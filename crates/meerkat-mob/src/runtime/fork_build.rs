@@ -232,6 +232,64 @@ pub(crate) enum FollowedSourceOverlay {
     },
 }
 
+/// What a lift's preparation resolved, off the actor, for the rebuild of a
+/// fork that follows a source this process did not build and that is not
+/// rebuilt before it ([`resolve_followed_source_overlay`]).
+pub(crate) enum PreparedFollowedOverlay {
+    /// The overlay the source (or the in-mob ancestor its overlay comes
+    /// through) holds in this process, or the one its rebuild would compose.
+    Resolved(Option<Arc<dyn AgentToolDispatcher>>),
+    /// That overlay could not be computed: the fork takes its own rule,
+    /// warned, as a woken fork does.
+    Unavailable,
+}
+
+/// Resolve, off the actor, the overlay a fork follows when `followed` is
+/// where its source's overlay comes from (`None`: the source's lineage could
+/// not be walked): a retained overlay as it is, or the overlay the rebuild of
+/// the member the chain carries it from would compose
+/// ([`rebuilt_own_overlay`]). Nothing is rebuilt or woken.
+pub(crate) async fn resolve_followed_source_overlay(
+    mob_id: &MobId,
+    session_service: &dyn super::session_service::MobSessionService,
+    customizer: Option<&Arc<dyn super::handle::SpawnMemberCustomizer>>,
+    member: &AgentIdentity,
+    followed: Option<FollowedSourceOverlay>,
+) -> PreparedFollowedOverlay {
+    match followed {
+        Some(FollowedSourceOverlay::Retained(overlay)) => {
+            PreparedFollowedOverlay::Resolved(overlay)
+        }
+        Some(FollowedSourceOverlay::Rebuild {
+            entry,
+            session_id,
+            seat_build,
+        }) => match rebuilt_own_overlay(
+            mob_id,
+            session_service,
+            customizer,
+            &entry,
+            &session_id,
+            seat_build.as_deref(),
+        )
+        .await
+        {
+            Ok(overlay) => PreparedFollowedOverlay::Resolved(overlay),
+            Err(error) => {
+                tracing::warn!(
+                    %mob_id,
+                    agent_identity = %member,
+                    overlay_member = %entry.agent_identity,
+                    %error,
+                    "the overlay a rebuilt fork follows could not be computed from its source's rebuild"
+                );
+                PreparedFollowedOverlay::Unavailable
+            }
+        },
+        None => PreparedFollowedOverlay::Unavailable,
+    }
+}
+
 /// Every member's retained per-spawn overlay and where it came from, written
 /// only by the mob actor (and the restart restore that seeds it) and shared
 /// read-only with its handles.
@@ -863,12 +921,15 @@ impl super::actor::MobActor {
     /// `session_id` composes, given `spec`, its rebuild request
     /// ([`rebuild_resume_spec`]), and where it comes from. Sources are rebuilt
     /// before their forks in the same pass, so a source's retained overlay is
-    /// the one it is rebuilt with.
+    /// the one it is rebuilt with. A fork whose source this process did not
+    /// build (and that is not rebuilt before it) takes `followed`, what the
+    /// lift's preparation resolved from its source's chain.
     pub(super) async fn recustomized_rebuild_overlay(
         &self,
         entry: &RosterEntry,
         session_id: &SessionId,
         spec: &super::handle::SpawnMemberSpec,
+        followed: Option<&PreparedFollowedOverlay>,
     ) -> Result<(Option<Arc<dyn AgentToolDispatcher>>, RetainedOverlayOrigin), MobError> {
         let own = || {
             rebuild_own_overlay(
@@ -889,13 +950,33 @@ impl super::actor::MobActor {
                 own
             }
             ForkOverlayRule::FollowSource(source) => {
-                let inherited = self
-                    .per_spawn_external_tools
-                    .read()
-                    .await
-                    .get(&source)
-                    .cloned();
-                return Ok((inherited, RetainedOverlayOrigin::Inherited));
+                // The overlay the source, or the in-mob ancestor its overlay
+                // comes through, was built with in this process: a source
+                // rebuilt earlier in this pass included.
+                if let Some(FollowedSourceOverlay::Retained(overlay)) =
+                    self.followed_source_overlay(&source).await
+                {
+                    return Ok((overlay, RetainedOverlayOrigin::Inherited));
+                }
+                match followed {
+                    Some(PreparedFollowedOverlay::Resolved(overlay)) => {
+                        return Ok((overlay.clone(), RetainedOverlayOrigin::Inherited));
+                    }
+                    Some(PreparedFollowedOverlay::Unavailable) => {
+                        let own = own()?;
+                        warn_fork_source_unavailable(
+                            &self.definition.id,
+                            entry,
+                            &ForkSourceUnavailable::NotRebuilt,
+                            own.is_some(),
+                        );
+                        own
+                    }
+                    // Nothing was resolved for it: it follows what its source
+                    // holds in this process, which is none (a source this pass
+                    // rebuilt with no overlay holds none).
+                    None => return Ok((None, RetainedOverlayOrigin::Inherited)),
+                }
             }
             ForkOverlayRule::SourceUnavailable(reason) => {
                 let own = own()?;
