@@ -9490,11 +9490,15 @@ impl MobHandle {
     /// seat's first wake does. Both journal rows are written in one batch, so
     /// the identity is never a non-member: during the retirement its current
     /// incarnation is Retiring, and deliveries to it are refused typed.
-    /// Returns the new session. The next incarnation is the same member's
-    /// successor, as a respawn's is: it keeps the member's creation id, with
-    /// [`crate::MemberCreationProvenance::Successor`] provenance naming the
-    /// retired incarnation's session, whatever creation origin the spec
-    /// names.
+    /// Returns the new session. The next incarnation of a seated identity is
+    /// the same member's successor, as a respawn's is: it keeps the member's
+    /// creation id, with [`crate::MemberCreationProvenance::Successor`]
+    /// provenance naming the retired incarnation's session, whatever creation
+    /// origin the spec names. When the retired incarnation recorded no
+    /// creation token, the next one is recorded
+    /// [`crate::MemberCreationProvenance::Unproven`] with a new id, never as a
+    /// new root. An identity that is not seated (below) is created with the
+    /// spec's origin, as a seat is: a host-root spec is a new root.
     ///
     /// The spec launches `Fresh`. When it owes a kickoff (an
     /// `AutonomousHost` member's one kickoff turn, or an initial message),
