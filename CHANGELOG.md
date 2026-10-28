@@ -980,8 +980,10 @@ them.
   composition endpoint, and then refused every retire the rebuilt mob
   routed to it ("session registration belongs to another composition
   endpoint"). The rebuilt mob's start now releases such a registration of a
-  dormant member, under either member restore policy, so the retire
-  completes and nothing of the ended actor stays registered.
+  dormant member, under every member restore policy, so the retire
+  completes and nothing of the ended actor stays registered. Inputs still
+  queued on that registration end as stopped, as when an explicit resume
+  takes over a member's registration.
 
 - `meerkat-runtime`: a mob member's runtime registration keeps serving after
   an empty resume (a background operation's completion waking an idle
