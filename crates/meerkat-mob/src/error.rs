@@ -3005,6 +3005,14 @@ impl MobError {
         match self {
             Self::SessionError(error) => error.durable_resume_hold(),
             Self::MemberRestoreFailed { hold, .. } => *hold,
+            // A resume its session owner refused at an unprovable committed
+            // boundary: the durable tail is withheld from resume (held for,
+            // or refused by, its recovery) and kept intact, as a start
+            // reported it before 0.9.7 (`MemberDurableTailUnprovable`).
+            Self::SessionUnavailableForResume {
+                reason: SessionResumeUnavailableReason::CommittedBoundaryUnprovable,
+                ..
+            } => Some(meerkat_core::service::DurableResumeHold::TailHeldForRecovery),
             Self::SharedRetirementFailure(error)
             | Self::SharedLifecycleFailure(error)
             | Self::MemberRetirementStuck { cause: error, .. }

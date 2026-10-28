@@ -12852,10 +12852,11 @@ pub(super) async fn restore_resumed_member(
             super::session_service::SessionResumeVerdict::Rejected(rejection)
                 if rejection.kind != super::session_service::ResumeRejectionKind::Absent =>
             {
-                SeatedMemberRestoreOutcome::Refused(member_restore_failure(
-                    &bridge_session_id,
-                    rejection.detail,
-                ))
+                let hold = rejection.durable_resume_hold();
+                SeatedMemberRestoreOutcome::Refused(super::handle::RestoreFailureDiagnostic {
+                    hold,
+                    ..member_restore_failure(&bridge_session_id, rejection.detail)
+                })
             }
             super::session_service::SessionResumeVerdict::Rejected(_) if seat_session_unborn => {
                 SeatedMemberRestoreOutcome::Provision(Box::new(
