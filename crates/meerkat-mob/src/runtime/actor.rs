@@ -34463,10 +34463,13 @@ impl MobActor {
     /// member Broken, with the typed reason, on any failure but a retryable
     /// one. A revival whose wake was refused retryably (the host asked to
     /// retry its build preparation, an unavailable resume gate, the wake
-    /// bound) left the member as every retryable wake leaves it: Dormant,
-    /// its boot obligation still owed and the owed retry armed, so it stays
-    /// retryable and is never recorded Broken. An outcome for an incarnation
-    /// the roster no longer holds is dropped.
+    /// bound) left the member as every retryable wake leaves it: Dormant, so
+    /// it stays retryable and is never recorded Broken. The owed retry is
+    /// armed only for a member that still owes its boot obligation (a
+    /// taken-over member, not a reload-required one, whose Live settle
+    /// cleared it) and whose wake attempt opened before the refusal; any
+    /// other such member waits Dormant for its next delivery or start. An
+    /// outcome for an incarnation the roster no longer holds is dropped.
     async fn startup_member_recovered(
         &mut self,
         cause: StartupMemberRecoveryCause,
