@@ -24995,7 +24995,9 @@ macro_rules! mob_catalog_machine_dsl {
         // A member is network-reachable (the helper's network_transport) when
         // its endpoint's transport is Tcp or Uds, or when a wiring edge joins
         // it to a placed member: a peer in another process cannot use an
-        // inproc wake route either way.
+        // inproc wake route either way. That edge is looked up per placed
+        // member, so a mob with no placed member reads none of its edges for
+        // a plan, however many it holds.
         transition PlanBootMaterializationWake {
             on input PlanBootMaterialization { agent_identity, obligation, host_required, orchestrator_notified }
             guard { self.lifecycle_phase == Phase::Running }
@@ -25010,11 +25012,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     (self.member_peer_endpoints.contains_key(agent_identity) == true
                         && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
-                    || exists(edge in self.wiring_edges,
-                        (mob_machine_wiring_edge_a(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                        || (mob_machine_wiring_edge_b(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
+                    || exists(placed_id in self.member_placement.keys(),
+                        mob_machine_wiring_contains_pair(self.wiring_edges, agent_identity, placed_id)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required,
@@ -25069,11 +25068,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     (self.member_peer_endpoints.contains_key(agent_identity) == true
                         && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
-                    || exists(edge in self.wiring_edges,
-                        (mob_machine_wiring_edge_a(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                        || (mob_machine_wiring_edge_b(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
+                    || exists(placed_id in self.member_placement.keys(),
+                        mob_machine_wiring_contains_pair(self.wiring_edges, agent_identity, placed_id)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required,
@@ -25103,11 +25099,8 @@ macro_rules! mob_catalog_machine_dsl {
                     self.member_kickoff_pending.contains(agent_identity) || self.member_kickoff_starting.contains(agent_identity),
                     (self.member_peer_endpoints.contains_key(agent_identity) == true
                         && self.member_peer_endpoints.get_cloned(agent_identity).get("value").transport != PeerTransportKind::Inproc)
-                    || exists(edge in self.wiring_edges,
-                        (mob_machine_wiring_edge_a(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                        || (mob_machine_wiring_edge_b(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)),
+                    || exists(placed_id in self.member_placement.keys(),
+                        mob_machine_wiring_contains_pair(self.wiring_edges, agent_identity, placed_id)),
                     orchestrator_notified,
                     self.member_peer_endpoints.contains_key(agent_identity),
                     host_required,
@@ -25953,11 +25946,8 @@ macro_rules! mob_catalog_machine_dsl {
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(member_id),
                         self.member_materialization_epoch.contains_key(member_id),
-                        exists(edge in self.wiring_edges,
-                            (mob_machine_wiring_edge_a(edge) == member_id
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                            || (mob_machine_wiring_edge_b(edge) == member_id
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))))
+                        exists(placed_id in self.member_placement.keys(),
+                            mob_machine_wiring_contains_pair(self.wiring_edges, member_id, placed_id))))
             }
             update {
                 // The guard admitted this registration's member, its pin
@@ -26001,11 +25991,8 @@ macro_rules! mob_catalog_machine_dsl {
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(member_id),
                         self.member_materialization_epoch.contains_key(member_id),
-                        exists(edge in self.wiring_edges,
-                            (mob_machine_wiring_edge_a(edge) == member_id
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                            || (mob_machine_wiring_edge_b(edge) == member_id
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))))
+                        exists(placed_id in self.member_placement.keys(),
+                            mob_machine_wiring_contains_pair(self.wiring_edges, member_id, placed_id))))
             }
             update {}
             to Running
@@ -26136,16 +26123,10 @@ macro_rules! mob_catalog_machine_dsl {
                         self.boot_plan_sealed,
                         self.member_peer_endpoints.contains_key(agent_identity),
                         self.member_materialization_epoch.contains_key(agent_identity),
-                        exists(edge in self.wiring_edges,
-                            (mob_machine_wiring_edge_a(edge) == agent_identity
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                            || (mob_machine_wiring_edge_b(edge) == agent_identity
-                                && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true))),
-                    exists(edge in self.wiring_edges,
-                        (mob_machine_wiring_edge_a(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_b(edge)) == true)
-                        || (mob_machine_wiring_edge_b(edge) == agent_identity
-                            && self.member_placement.contains_key(mob_machine_wiring_edge_a(edge)) == true)))
+                        exists(placed_id in self.member_placement.keys(),
+                            mob_machine_wiring_contains_pair(self.wiring_edges, agent_identity, placed_id))),
+                    exists(placed_id in self.member_placement.keys(),
+                        mob_machine_wiring_contains_pair(self.wiring_edges, agent_identity, placed_id)))
             }
         }
 
