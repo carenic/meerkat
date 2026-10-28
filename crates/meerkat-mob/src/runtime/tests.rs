@@ -21432,9 +21432,11 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
         "a release before the binding recorded the registration's epoch demotes nothing"
     );
 
-    let err = handle
-        .destroy()
+    // The worker's readiness observation stays held for the whole row: bound
+    // every lifecycle call, so a wait behind the held signal fails fast.
+    let err = tokio::time::timeout(Duration::from_secs(10), handle.destroy())
         .await
+        .expect("the destroy answers while the readiness observation is held")
         .expect_err("missing runtime adapter registration should make destroy incomplete");
     let report = match err {
         crate::runtime::handle::MobDestroyError::Incomplete { report } => report,
@@ -21460,9 +21462,9 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
         MobState::Destroyed,
         "durable destroy admission should close live authority after partial cleanup"
     );
-    let stop_err = handle
-        .stop()
+    let stop_err = tokio::time::timeout(Duration::from_secs(10), handle.stop())
         .await
+        .expect("the stop answers while the readiness observation is held")
         .expect_err("destroy-admitted mob must reject non-destroy mutation");
     assert!(
         matches!(stop_err, MobError::InvalidTransition { .. }),
@@ -21495,9 +21497,9 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
         "partial destroy must retain the durable destroy marker"
     );
 
-    let retry_err = handle
-        .destroy()
+    let retry_err = tokio::time::timeout(Duration::from_secs(10), handle.destroy())
         .await
+        .expect("the destroy retry answers while the readiness observation is held")
         .expect_err("retry should report the retained retire-admission failure");
     let retry_report = match retry_err {
         crate::runtime::handle::MobDestroyError::Incomplete { report } => report,
@@ -35410,6 +35412,11 @@ async fn test_respawn_reports_machine_local_edge_to_retired_peer() {
         !before.wiring_edges.contains(&stale_edge),
         "no edge to the retired peer survives its terminal retire"
     );
+    assert!(
+        !before.member_placement.contains_key(&machine_left)
+            && !before.member_placement.contains_key(&machine_right),
+        "neither end is placed, so no placement guard can refuse the edge"
+    );
 
     // The only refusal open to this edge is the seating guard: the mob is
     // Running, the edge is not wired and neither end is placed.
@@ -38323,13 +38330,13 @@ async fn test_cold_resume_notification_failure_is_recorded_once_after_its_bounde
     );
 }
 
-/// An explicit resume reports its orchestrator notification's outcome, not a
-/// failed attempt the runtime retries: when the retry delivers the
-/// notification, the resume succeeds. The lift hands the notification turn
-/// to the actor's lifecycle owner (as a cold resume does), so its attempts
-/// run after the resume answers: the row waits, bounded, for the failed
-/// attempt and the retry that delivered it, then pins that the delivered
-/// notification recorded no failure.
+/// An explicit resume hands its orchestrator's resume notification turn to
+/// the actor's lifecycle owner (as a cold resume does) and does not wait for
+/// it, so the notification's attempts run after the resume answers. A
+/// notification whose first attempt fails and whose runtime retry delivers it
+/// was delivered: the row waits, bounded, for the failed attempt and the
+/// retry that delivered it, then pins that no notification failure was
+/// recorded and the mob runs.
 #[tokio::test]
 async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notification() {
     let service = Arc::new(MockSessionService::new());
@@ -38381,7 +38388,7 @@ async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notific
     resumed
         .resume()
         .await
-        .expect("the explicit resume succeeds once the runtime's retry delivers the notification");
+        .expect("the explicit resume succeeds without waiting for the notification turn");
 
     // The first attempt fails and the runtime's retry of the same input
     // enters its turn; then that input settles.
@@ -38744,14 +38751,6 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
     );
     assert!(snapshot.is_final, "broken members should be terminal");
     assert_eq!(snapshot.current_session_id, Some(old_sid.clone()));
-    assert!(
-        snapshot
-            .error
-            .as_deref()
-            .is_some_and(|message| is_missing_session_snapshot_reason(message, &old_sid)),
-        "broken member should surface restore failure reason: {:?}",
-        snapshot.error
-    );
 
     let machine_state = resumed
         .query_machine_state()
@@ -38775,6 +38774,10 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
             .is_some_and(|reason| is_missing_session_snapshot_reason(reason, &old_sid)),
         "MobMachine owns the missing-snapshot classification of the member's session: {lifecycle:?}"
     );
+    assert_eq!(
+        snapshot.error, lifecycle.error,
+        "broken member status should surface MobMachine's own restore failure reason"
+    );
 
     let members = resumed.list_members().await;
     let broken = members
@@ -38786,14 +38789,10 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         crate::runtime::handle::MobMemberStatus::Broken
     );
     assert!(broken.is_final);
-    assert_eq!(broken.current_session_id, Some(old_sid.clone()));
-    assert!(
-        broken
-            .error
-            .as_deref()
-            .is_some_and(|message| is_missing_session_snapshot_reason(message, &old_sid)),
-        "projected member listing should carry the restore failure: {:?}",
-        broken.error
+    assert_eq!(broken.current_session_id, Some(old_sid));
+    assert_eq!(
+        broken.error, lifecycle.error,
+        "projected member listing should carry MobMachine's own restore failure reason"
     );
 
     let including_retiring = resumed.list_members_including_retiring().await;
@@ -40975,6 +40974,17 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await;
 
     crash_stop_and_release_routes(resumed).await;
+    // The replayed retirement start is archive-only: no runtime of this
+    // process holds the retiring member's session, so the retirement archives
+    // it and routes no runtime retire, and the restart re-drives it at once.
+    // The re-drive is held at its session archive. Every trust-bearing stage
+    // and the machine wiring cleanup run before that stage (the trust
+    // cleanups, then retirement_finish_machine_wiring, then
+    // retirement_prepare_archive), so the survivor is woken after its peer's
+    // trust cleanup and before the retirement ends, deterministically: the
+    // interleaving a delivery that wakes a survivor mid-retirement takes.
+    let archive_hold =
+        super::actor::retirement_stage_hold::install(&retiring, "retire-session-archive");
     let restarted = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -40983,25 +40993,66 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
     .resume()
     .await
     .expect("restart should replay recovered endpoint authority");
-    // The replayed retirement start is archive-only: no runtime of this
-    // process holds the retiring member's session, so the retirement archives
-    // it and routes no runtime retire. The restart re-drives it at once,
-    // beside the first commands. The survivor holds no work, so the restart
-    // leaves it dormant: wake it. Whichever lands first, the survivor ends
-    // with no trust for the retired member: the retirement removes a live
-    // survivor's rows for both generations, and a survivor woken after the
-    // retirement takes its trust from MobMachine, which no longer wires it to
-    // the retired member. No trust row is ever restored from durable state.
-    restarted
-        .ensure_member_live(&survivor)
+    tokio::time::timeout(Duration::from_secs(10), archive_hold.entered())
         .await
-        .expect("wake the survivor");
-    // The retry joins the restart's re-drive, or re-drives the retirement
-    // from its durable start marker, and answers at its terminal.
-    restarted
-        .retire(retiring.clone())
+        .expect("the restart re-drives the recovered retirement to its session archive");
+
+    // While the retirement is held, replay still holds the retiring member's
+    // current endpoint and its historical cleanup anchor, and its retirement
+    // is archive-only.
+    let retired_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
+    let held = restarted
+        .query_machine_state()
         .await
-        .expect("retry retirement from durable start marker");
+        .expect("query MobMachine state while the retirement is held");
+    assert!(
+        held.member_prior_peer_endpoints
+            .get(&retired_identity)
+            .is_some_and(|prior| prior
+                .iter()
+                .any(|endpoint| endpoint.peer_id.0 == old_peer_id.to_string())),
+        "replay retains the historical endpoint cleanup anchor while the retirement is in flight: {:?}",
+        held.member_prior_peer_endpoints.get(&retired_identity)
+    );
+    assert!(
+        held.member_peer_endpoints
+            .get(&retired_identity)
+            .is_some_and(|endpoint| endpoint.peer_id.0 == replacement_peer_id.to_string()),
+        "replay retains the current endpoint while the retirement is in flight: {:?}",
+        held.member_peer_endpoints.get(&retired_identity)
+    );
+    assert!(
+        held.identity_to_runtime
+            .get(&retired_identity)
+            .is_some_and(|runtime| held.runtime_retire_archive_only.contains(runtime)),
+        "the recovered retirement is archive-only"
+    );
+
+    // The survivor holds no work, so the restart left it dormant. Wake it
+    // while its peer's retirement is held: it wakes Live, not Broken.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        restarted.ensure_member_live(&survivor),
+    )
+    .await
+    .expect("the survivor wakes while its peer's retirement is held")
+    .expect("wake the survivor mid-retirement");
+    assert_eq!(
+        restarted.member_materialization_for_test(&survivor),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a survivor woken mid-retirement is Live"
+    );
+
+    // Release the archive; the retry joins the restart's re-drive (or finds
+    // it done) and answers at its terminal.
+    archive_hold.release();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        retire_to_terminal(&restarted, &retiring),
+    )
+    .await
+    .expect("the recovered retirement reaches its terminal once its archive runs")
+    .expect("retry retirement from durable start marker");
     assert!(
         restarted
             .get_member(&retiring)
@@ -41033,7 +41084,6 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .query_machine_state()
         .await
         .expect("query MobMachine state after the retirement");
-    let retired_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
     assert!(
         !machine_state
             .member_peer_endpoints
@@ -80442,9 +80492,9 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         "the session archive alone terminates the Dormant member"
     );
 
-    let refusal = handle
-        .retire(pinned.clone())
+    let refusal = tokio::time::timeout(Duration::from_secs(10), handle.retire(pinned.clone()))
         .await
+        .expect("the routed retire answers while the readiness observation is held")
         .expect_err("unregistered runtime consumer must refuse the routed retire");
     assert!(
         refusal.is_closed_runtime_effect_refusal(),
@@ -80483,17 +80533,24 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         "the refused retirement publishes no final event"
     );
 
+    // The pinned member's readiness observation is still held: bound every
+    // lifecycle call below, so a wait behind the held signal fails fast.
     let expected_phase = if crash_restart {
-        crash_stop_and_release_routes(handle).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crash_stop_and_release_routes(handle),
+        )
+        .await
+        .expect("the crash stop answers while the readiness observation is held");
         MobState::Running
     } else {
-        handle
-            .stop()
+        tokio::time::timeout(Duration::from_secs(10), handle.stop())
             .await
+            .expect("the stop answers while the readiness observation is held")
             .expect("persist stopped lifecycle before cold restart");
-        handle
-            .shutdown()
+        tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
             .await
+            .expect("the shutdown answers while the readiness observation is held")
             .expect("shutdown refused actor before cold restart");
         assert!(
             events
