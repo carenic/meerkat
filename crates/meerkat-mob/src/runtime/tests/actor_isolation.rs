@@ -881,16 +881,6 @@ async fn create_isolation_mob_with_definition(
     member_count: usize,
     definition: MobDefinition,
 ) -> IsolationMob {
-    create_isolation_mob_with(member_count, definition, |builder| builder).await
-}
-
-/// [`create_isolation_mob_with_definition`], with `configure` applied to the
-/// mob's builder.
-async fn create_isolation_mob_with(
-    member_count: usize,
-    definition: MobDefinition,
-    configure: impl FnOnce(MobBuilder) -> MobBuilder,
-) -> IsolationMob {
     let store = FaultInjectingRuntimeStore::new();
     let runtime_store: Arc<dyn RuntimeStore> = Arc::clone(&store) as Arc<dyn RuntimeStore>;
     let blob_store: Arc<dyn meerkat_core::BlobStore> =
@@ -900,12 +890,11 @@ async fn create_isolation_mob_with(
     );
     let service = Arc::new(MockSessionService::new());
     service.set_runtime_adapter(Arc::clone(&adapter));
-    let handle = configure(
-        MobBuilder::new(definition, MobStorage::in_memory()).with_session_service(service.clone()),
-    )
-    .create()
-    .await
-    .expect("create isolation mob");
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create isolation mob");
     let mut members = Vec::with_capacity(member_count);
     for index in 0..member_count {
         let identity = AgentIdentity::from(format!("w-{index}"));
