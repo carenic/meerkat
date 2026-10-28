@@ -42410,6 +42410,153 @@ async fn test_retire_broken_member_succeeds_and_removes_it() {
     );
 }
 
+/// The state a mob rebuilt in the same process can find after its
+/// predecessor's actor ended abnormally: the predecessor stopped, its member's
+/// session was archived and deleted, and the member's executor stopped on its
+/// own while the actor crash-stopped. The member's runtime registration is
+/// then still current in the shared runtime, Stopped, and bound to the dead
+/// actor's composition endpoint, whose transport is closed. Returns the
+/// rebuilt mob after its explicit resume under `policy`, the member's session
+/// and the shared runtime.
+async fn rebuilt_mob_over_a_dead_predecessors_registration(
+    policy: MemberRestorePolicy,
+) -> (MobHandle, SessionId, Arc<meerkat_runtime::MeerkatMachine>) {
+    let service = Arc::new(MockSessionService::new());
+    let machine = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    handle
+        .spawn(
+            ProfileName::from("worker"),
+            AgentIdentity::from("w-1"),
+            None,
+        )
+        .await
+        .expect("spawn");
+    handle.stop().await.expect("stop");
+    let session = handle
+        .get_member(&AgentIdentity::from("w-1"))
+        .await
+        .unwrap()
+        .expect("roster entry")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed member");
+    service
+        .archive(&session)
+        .await
+        .expect("archive live session");
+    service.delete_persisted_session(&session).await;
+    crash_stop_and_release_routes(handle).await;
+    let registration = machine
+        .current_session_registration_witness(&session)
+        .await
+        .expect("the predecessor's registration outlives its actor");
+    assert!(
+        machine
+            .stop_runtime_executor_until_terminal_if_current(
+                &registration,
+                "the predecessor's executor stops on its own",
+            )
+            .await
+            .expect("stop the predecessor's executor"),
+        "the predecessor's executor stops while its registration stays"
+    );
+    let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+        events,
+        runtime_metadata,
+    ))
+    .with_session_service(service.clone())
+    .with_member_restore_policy(policy)
+    .resume()
+    .await
+    .expect("stopped mob reconstruction should succeed");
+    resumed.resume().await.expect("explicit resume");
+    (resumed, session, machine)
+}
+
+/// Waits, within a bound, until the runtime holds no registration of
+/// `session`.
+async fn wait_for_registration_released(
+    machine: &meerkat_runtime::MeerkatMachine,
+    session: &SessionId,
+) -> bool {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while machine
+            .current_session_registration_witness(session)
+            .await
+            .is_some()
+        {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .is_ok()
+}
+
+/// Eager restore: the explicit resume restores the member, which ends Broken
+/// (its session is gone), and its retire reaches the runtime registration the
+/// dead predecessor still held. The retire completes and removes the member,
+/// and the registration is released.
+#[tokio::test]
+async fn a_member_retires_over_a_registration_its_dead_predecessor_held_under_eager_restore() {
+    let (resumed, session, machine) =
+        rebuilt_mob_over_a_dead_predecessors_registration(MemberRestorePolicy::Eager).await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        resumed.retire(AgentIdentity::from("w-1")),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire completes");
+    assert!(
+        resumed
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the retired member left the roster"
+    );
+    assert!(
+        wait_for_registration_released(&machine, &session).await,
+        "the registration the dead predecessor held is released"
+    );
+}
+
+/// On-demand restore: the member stays Dormant through the explicit resume,
+/// and its retire completes. The registration the dead predecessor held is
+/// released too: nothing of the predecessor stays in the runtime.
+#[tokio::test]
+async fn a_member_retires_over_a_registration_its_dead_predecessor_held_under_on_demand_restore() {
+    let (resumed, session, machine) =
+        rebuilt_mob_over_a_dead_predecessors_registration(MemberRestorePolicy::OnDemand).await;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        resumed.retire(AgentIdentity::from("w-1")),
+    )
+    .await
+    .expect("the retire answers")
+    .expect("the retire completes");
+    assert!(
+        resumed
+            .get_member(&AgentIdentity::from("w-1"))
+            .await
+            .unwrap()
+            .is_none(),
+        "the retired member left the roster"
+    );
+    assert!(
+        wait_for_registration_released(&machine, &session).await,
+        "the registration the dead predecessor held is released"
+    );
+}
+
 #[tokio::test]
 async fn test_respawn_broken_member_clears_restore_diagnostic() {
     let service = Arc::new(MockSessionService::new());

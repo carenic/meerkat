@@ -973,6 +973,16 @@ them.
   so the kickoff runs once and its status resolves. Before, the restart did
   not resume it, and the kickoff's status stayed `starting`.
 
+- `meerkat-mob`: retiring a member of a stopped or completed mob that was
+  rebuilt in the same process after its previous actor ended abnormally (a
+  crash, or a crash-stop) no longer stays stuck. The member's last runtime
+  registration could outlive that actor, still bound to the actor's closed
+  composition endpoint, and then refused every retire the rebuilt mob
+  routed to it ("session registration belongs to another composition
+  endpoint"). The rebuilt mob's start now releases such a registration of a
+  dormant member, under either member restore policy, so the retire
+  completes and nothing of the ended actor stays registered.
+
 - `meerkat-runtime`: a mob member's runtime registration keeps serving after
   an empty resume (a background operation's completion waking an idle
   member, or the same wake recovered at a start, that finds nothing pending).
