@@ -37,6 +37,9 @@
 //! included), one whose recipe, provision, custody or readiness failed, one
 //! whose durable session is missing, and any member the cold recipe
 //! realizes. A caller waiting on a member still gets its own typed answer.
+//! Whatever the lift answers once its durable Resume committed, the mob it
+//! leaves Running is settled first: its member plan is sealed and its stuck
+//! retirements are queued for re-drive (`finish_explicit_resume_attempt`).
 //! A member is never materialized twice: one attempt per member, and every
 //! other wake of it joins that attempt. Every other member stays Dormant and
 //! is materialized by its first delivery.

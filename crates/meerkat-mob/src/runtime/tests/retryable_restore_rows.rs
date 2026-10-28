@@ -17,6 +17,13 @@ fn phase_of(
     handle.member_materialization_for_test(identity)
 }
 
+/// Whether MobMachine holds the mob's member plan sealed: every Dormant or
+/// Waking member has a durable endpoint, so every one is peer-wakeable. A
+/// stopped mob a new handle reconstructed has none sealed until its lift.
+fn boot_plan_sealed(handle: &MobHandle) -> bool {
+    handle.machine_state_watch_rx.borrow().boot_plan_sealed
+}
+
 /// One turn-driven worker spawned live on a session service the whole row
 /// shares, whose mob's actor then went away (after a stop when `stop`): the
 /// runtime still serves the worker's session with that handle's attachment
@@ -492,6 +499,10 @@ async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
         MobState::Stopped
     );
     service.find_persisted_session_metadata_malformed_for(session.clone());
+    assert!(
+        !boot_plan_sealed(&resumed),
+        "the stopped mob's plan is not sealed before its lift"
+    );
 
     let error = tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
@@ -507,6 +518,10 @@ async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
     assert_eq!(
         resumed.status().await.expect("the mob answers"),
         MobState::Running
+    );
+    assert!(
+        boot_plan_sealed(&resumed),
+        "a lift that committed seals its member plan whatever it answers"
     );
     assert_broken_by_the_malformed_state(&resumed, &service, &member, &session).await;
 }
@@ -653,6 +668,10 @@ async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lif
     });
     let (resumed, _service, members) =
         built_stopped_mob("lift-host-prepares-later", 3, Some(preparer)).await;
+    assert!(
+        !boot_plan_sealed(&resumed),
+        "the stopped mob's plan is not sealed before its lift"
+    );
 
     tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
@@ -663,6 +682,10 @@ async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lif
     assert_eq!(
         resumed.status().await.expect("the mob answers"),
         MobState::Running
+    );
+    assert!(
+        boot_plan_sealed(&resumed),
+        "the lift sealed its member plan: the member left Dormant is peer-wakeable"
     );
     for (identity, _) in members.iter().filter(|(identity, _)| identity != &deferred) {
         assert_eq!(

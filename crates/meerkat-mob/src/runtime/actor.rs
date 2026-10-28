@@ -23118,13 +23118,24 @@ impl MobActor {
         None
     }
 
+    /// End the lift's attempt with its answer. Once the durable Resume
+    /// committed, whatever the lift answers, the mob it leaves Running is
+    /// made consistent first: its member plan is sealed and its stuck
+    /// retirements are queued for re-drive
+    /// (`settle_committed_explicit_resume`). The answer only informs.
     fn finish_explicit_resume_attempt(
         &mut self,
         result: Result<(), MobError>,
     ) -> Result<(), MobError> {
         // The lift's plan dispatches nothing after its attempt ends.
         self.explicit_resume_boot_dispatch = None;
-        if result.is_err() {
+        let closed = self.close_explicit_resume_attempt(result.is_err());
+        let settled = self.settle_committed_explicit_resume();
+        closed.and(result).and(settled)
+    }
+
+    fn close_explicit_resume_attempt(&mut self, cancel: bool) -> Result<(), MobError> {
+        if cancel {
             self.apply_explicit_resume_input(
                 |attempt| mob_dsl::MobMachineInput::CancelExplicitResume { attempt },
                 "cancel_failed_explicit_resume",
@@ -23133,17 +23144,33 @@ impl MobActor {
         self.apply_explicit_resume_input(
             |attempt| mob_dsl::MobMachineInput::FinishExplicitResume { attempt },
             "finish_explicit_resume",
-        )?;
-        if result.is_ok() {
-            // The lift's boot set settled: seal its member plan. From here on
-            // every Dormant or Waking member has a durable endpoint, so every
-            // one is peer-wakeable; the seal rebuilds the wake routes.
-            self.apply_dsl_input(
-                mob_dsl::MobMachineInput::SealBootMaterializationPlan {},
-                "seal_explicit_resume_boot_materialization_plan",
-            )?;
+        )
+    }
+
+    /// Settle the mob a committed lift leaves Running, whatever the lift
+    /// answers: every retirement this actor owns as stuck is queued for
+    /// re-drive, and the member plan is sealed (from here on every Dormant or
+    /// Waking member has a durable endpoint, so every one is peer-wakeable;
+    /// the seal rebuilds the wake routes). The seal's guards read the
+    /// members, never the lift's answer: a member left without a durable
+    /// endpoint refuses it, typed, and the refusal is logged. A lift that did
+    /// not commit, or whose mob left Running since, does neither.
+    fn settle_committed_explicit_resume(&mut self) -> Result<(), MobError> {
+        if self.state() != MobState::Running {
+            return Ok(());
         }
-        result
+        self.enqueue_stuck_retirement_redrives();
+        self.apply_dsl_input(
+            mob_dsl::MobMachineInput::SealBootMaterializationPlan {},
+            "seal_explicit_resume_boot_materialization_plan",
+        )
+        .inspect_err(|error| {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                %error,
+                "the committed explicit resume could not seal its member plan"
+            );
+        })
     }
 
     async fn begin_resume_lifecycle(
@@ -23477,6 +23504,8 @@ impl MobActor {
             |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeReadiness { attempt },
             "settle_explicit_resume_readiness",
         ) {
+            // A committed lift leaves its mob settled whatever it answers.
+            let _ = self.settle_committed_explicit_resume();
             let _ = reply_tx.send(Err(error));
             return;
         }
@@ -23491,6 +23520,18 @@ impl MobActor {
             .await;
             return;
         }
+        // After the durable Resume, a Live member's readiness failure is that
+        // member's outcome, as at startup: it is Broken with its failure, or
+        // woken again when its comms runtime is gone. The lift goes on and
+        // does not answer it. Before the Resume, every member's readiness
+        // gates the commit.
+        let outcomes = if matches!(phase, ResumeLifecyclePhase::PostCommitReadiness { .. })
+            && self.state() == MobState::Running
+        {
+            self.resolve_live_member_readiness_failures(outcomes).await
+        } else {
+            outcomes
+        };
         let readiness_result = self.apply_member_readiness_outcomes(outcomes).await;
         // Other commands ran while the fan-out was in flight. Re-probe the
         // lifecycle before continuing so a Stop/Complete/Reset/Destroy that
@@ -23503,6 +23544,7 @@ impl MobActor {
             | ResumeLifecyclePhase::AwaitingTopologyOwners { .. }
             | ResumeLifecyclePhase::PostCommitTopology { .. }
             | ResumeLifecyclePhase::PostCommitMembers { .. } => {
+                let _ = self.settle_committed_explicit_resume();
                 let _ = reply_tx.send(Err(MobError::Internal(
                     "resume readiness resolved before session preparation".to_string(),
                 )));
@@ -23543,6 +23585,8 @@ impl MobActor {
                     }));
                     return;
                 }
+                // Only a refused machine input is left in the readiness
+                // result: no member's failure is the lift's.
                 let post_commit_error = post_commit_error.or(readiness_result.err());
                 self.begin_resume_lifecycle_post_commit(
                     admission,

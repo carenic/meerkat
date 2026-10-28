@@ -538,11 +538,14 @@ them.
   with the member, and the lift answers Ok with the mob Running: a member
   that ended retryable (Dormant with its owed retry, a wake bound and a host
   that asks to prepare later included), a member whose provision, custody or
-  readiness failed (Broken with its reason), a member whose durable session
-  is missing, and a member woken through the wake path. A caller waiting on
-  a member still gets that member's own typed answer. In 0.9.6 a resume view
-  the store could not serve, and a rebuilt member's readiness failure, made
-  the lift answer an error.
+  readiness failed (Broken with its reason, or woken again when its comms
+  runtime is gone), a member whose durable session is missing, and a member
+  woken through the wake path. A caller waiting on a member still gets that
+  member's own typed answer. In 0.9.6 a resume view the store could not
+  serve, and a member's readiness failure after the durable Resume, made the
+  lift answer an error. A lift whose durable Resume committed re-drives the
+  mob's stuck retirements whatever it answers; in 0.9.6 a lift that answered
+  an error re-drove none.
 
 - Behaviour-only (not measured by the gate): `meerkat-mob`: a member the lift
   of a stopped mob rebuilds on its durable session is bounded by the mob's
