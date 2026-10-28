@@ -1679,6 +1679,9 @@ impl MobActor {
 /// actor discarded, its registration closed), as the explicit resume retires
 /// a live actor it does not reuse, and the run-start hold its build
 /// preparation staged is removed (the next wake prepares the build again).
+/// No rebuild follows, so the inputs queued on that registration end as
+/// stopped rather than requeued: the member is Dormant until its next wake,
+/// and nothing would run them before it.
 /// The session itself stays, for the next wake. Nothing retired is not a
 /// release: the wake's own provision left that attachment live.
 async fn release_kept_seat_session(
@@ -1689,7 +1692,7 @@ async fn release_kept_seat_session(
         MobError::Internal("a kept seat session's provision names no session".to_string())
     })?;
     let retired = provisioner
-        .retire_live_member_session_for_explicit_resume(
+        .release_live_member_session_without_rebuild(
             session_id,
             Instant::now() + super::super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
         )
