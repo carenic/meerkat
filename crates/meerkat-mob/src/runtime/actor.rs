@@ -8748,6 +8748,13 @@ struct ExplicitResumePreparationContext {
     provisioner: Arc<dyn MobProvisioner>,
     session_service: Arc<dyn MobSessionService>,
     spawn_member_customizer: Option<Arc<dyn super::SpawnMemberCustomizer>>,
+    /// The sessions bound to members of the roster when the preparation
+    /// began. Each is owned by its member and is never another member's
+    /// successor, so a successor search never reads one, however the
+    /// preparation is split (one lift round's members are prepared one unit
+    /// at a time): another member's unreadable session never fails a
+    /// member's search.
+    member_bound_sessions: HashSet<SessionId>,
 }
 
 /// What the explicit resume's preparation does for one member, before the
@@ -21734,12 +21741,20 @@ impl MobActor {
     /// Only `MemberRef::Session` is local session ownership. An unplaced
     /// `BackendPeer` remains external peer-only material even if a legacy
     /// machine journal still carries a stale session binding for it.
-    fn explicit_resume_preparation_context(&self) -> ExplicitResumePreparationContext {
+    async fn explicit_resume_preparation_context(&self) -> ExplicitResumePreparationContext {
+        let member_bound_sessions: HashSet<SessionId> = self
+            .roster
+            .read()
+            .await
+            .list()
+            .filter_map(|entry| entry.member_ref.bridge_session_id().cloned())
+            .collect();
         ExplicitResumePreparationContext {
             definition: Arc::clone(&self.definition),
             provisioner: Arc::clone(&self.provisioner),
             session_service: Arc::clone(&self.session_service),
             spawn_member_customizer: self.spawn_member_customizer.clone(),
+            member_bound_sessions,
         }
     }
 }
@@ -21755,10 +21770,12 @@ impl ExplicitResumePreparationContext {
         let mut rebuild = Vec::new();
         let mut listed_sessions = None;
         let mut successor_index = None;
-        let member_bound_sessions = candidates
-            .iter()
-            .map(|(_, _, session_id, _)| session_id.clone())
-            .collect::<std::collections::HashSet<_>>();
+        let mut member_bound_sessions = self.member_bound_sessions.clone();
+        member_bound_sessions.extend(
+            candidates
+                .iter()
+                .map(|(_, _, session_id, _)| session_id.clone()),
+        );
         for (member_index, (entry, member_ref, session_id, preparation)) in
             candidates.into_iter().enumerate()
         {
@@ -23266,7 +23283,7 @@ impl MobActor {
             progress: progress.clone(),
             reply_tx,
         });
-        let context = self.explicit_resume_preparation_context();
+        let context = self.explicit_resume_preparation_context().await;
         let command_tx = self.command_tx.clone();
         let mob_id = self.definition.id.clone();
         self.actor_io_tasks.spawn(async move {
