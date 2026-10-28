@@ -28,7 +28,9 @@ use super::{
     SpiRuntimeStore,
 };
 use crate::identifiers::LogicalRuntimeId;
-use crate::input_state::{InputStatePersistenceRecord, StoredInputState};
+use crate::input_state::{
+    InputLifecycleState, InputStatePersistenceRecord, InputTerminalOutcome, StoredInputState,
+};
 use crate::ops_lifecycle::{OpsLifecycleConfig, PersistedOpsSnapshot, RuntimeOpsLifecycleRegistry};
 use crate::runtime_state::RuntimeState;
 use crate::store::{
@@ -1615,7 +1617,9 @@ async fn boot_obligation_scan_spi_store_lists_the_runtimes_with_work_without_hos
 // a JSON normaliser's rewrite, which drops it) may leave the ops lifecycle's
 // work out: the scan lists their runtime as holding work, fail closed,
 // without the open loading its body, until the runtime's next commit pins
-// the folded form.
+// the folded form. The runtime holds rows (a terminal input under an idle
+// lifecycle: no recovery work), so its body is one the open would have to
+// load: a runtime of pinned entries alone is resident once they are read.
 #[tokio::test]
 async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the_ops_fold() {
     let host = Arc::new(TestHost::new());
@@ -1631,6 +1635,20 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
         )
         .await
         .expect("delivery cas");
+    opened
+        .1
+        .commit_machine_lifecycle(&quiet, idle_lifecycle(&quiet), &[])
+        .await
+        .expect("the runtime is registered");
+    let mut terminal = StoredInputState::new_accepted(InputId::new());
+    terminal.seed.phase = InputLifecycleState::Consumed;
+    terminal.seed.terminal_outcome = Some(InputTerminalOutcome::Consumed);
+    terminal.seed.recovery_lane = None;
+    opened
+        .1
+        .persist_input_state(&quiet, &persistable(terminal))
+        .await
+        .expect("a terminal input row");
     assert!(
         !opened
             .1
@@ -1678,6 +1696,13 @@ async fn boot_obligation_scan_spi_store_fails_closed_on_a_head_pinned_before_the
             .expect("the scan answers")
             .contains(&quiet),
         "a head without the marker is listed, fail closed"
+    );
+    let window = host
+        .window_of(ScopeKind::Session, &runtime_scope_prefix(&quiet))
+        .expect("the runtime's scope is on the host");
+    assert!(
+        window.end > window.start,
+        "the runtime's head names rows, so its body is not resident unless loaded"
     );
     assert!(
         !reopened.1.runtime_loaded_for_test("quiet").await,
