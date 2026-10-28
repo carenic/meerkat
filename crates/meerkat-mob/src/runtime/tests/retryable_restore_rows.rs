@@ -622,6 +622,96 @@ async fn a_lifted_member_whose_repoint_fails_ends_alone_with_its_own_error() {
     );
 }
 
+/// A lift's planned member whose bound session is gone is rebuilt on its
+/// successor although another member's persisted state reads malformed. The
+/// lift prepares its members one at a time, and a successor search never
+/// reads a session bound to any member of the roster: the other member's
+/// unreadable session is never read for this member's successor, so it
+/// cannot fail this member's rebuild.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_member_is_repointed_past_another_members_unreadable_session() {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    // The sample mob's own id: the successor is named for it.
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let repointed = AgentIdentity::from("a-repointed");
+    let unreadable = AgentIdentity::from("b-unreadable");
+    let mut sessions = Vec::new();
+    for member in [&repointed, &unreadable] {
+        let mut spec = SpawnMemberSpec::new("worker", member.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn a worker");
+        sessions.push(
+            handle
+                .resolve_bridge_session_id(member)
+                .await
+                .expect("a session-backed worker"),
+        );
+    }
+    handle.stop().await.expect("stop the mob");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    // The repointed member's bound session is gone; its successor is in the
+    // realm. The other member's session is bound and reads malformed.
+    restarted.delete_persisted_session(&sessions[0]).await;
+    let successor = create_realm_session_for_test(&restarted, Some(&repointed)).await;
+    let resumed = tokio::time::timeout(
+        ROW_STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events,
+                runtime_metadata,
+            ))
+            .with_session_service(restarted.clone())
+            .notify_orchestrator_on_resume(false)
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the reconstruction answers")
+    .expect("the reconstruction succeeds");
+    assert_eq!(
+        resumed
+            .status()
+            .await
+            .expect("the reconstructed mob answers"),
+        MobState::Stopped
+    );
+    restarted.find_persisted_session_metadata_malformed_for(sessions[1].clone());
+
+    let _lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers");
+    assert_eq!(
+        phase_of(&resumed, &repointed),
+        Some(dsl::MemberMaterializationPhase::Live),
+        "the repointed member is rebuilt"
+    );
+    let status = resumed
+        .member_status(&repointed)
+        .await
+        .expect("the repointed member's status");
+    assert_eq!(
+        status.current_session_id.as_ref(),
+        Some(&successor),
+        "the member is rebuilt on its successor: {status:?}"
+    );
+    assert!(
+        status.error.is_none(),
+        "the member carries no error of another member: {status:?}"
+    );
+}
+
 /// The cause an explicit resume answered: a shared lifecycle operation's
 /// failure reaches every caller inside the shared envelope.
 fn shared_cause(error: &MobError) -> &MobError {

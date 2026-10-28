@@ -938,7 +938,7 @@ impl MobActor {
         for (fork, source) in &sources {
             followed.insert(fork.clone(), self.followed_source_overlay(source).await);
         }
-        let context = Arc::new(self.explicit_resume_preparation_context());
+        let context = Arc::new(self.explicit_resume_preparation_context().await);
         // The host's build preparer is a runtime adapter input.
         #[cfg(feature = "runtime-adapter")]
         let preparer = self.member_residency.build_preparer.clone();
