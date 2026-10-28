@@ -606,8 +606,8 @@ them.
   (`NoAdmissibleWorkBinding`) before any owner is asked, so its notice
   records `Failed` and the parked consent is withdrawn, instead of staying
   pending forever. After a stock session is closed and reopened in the same
-  process, the notice stays owed until the session's next governed prompt,
-  and then fails.
+  process, the notice stays owed until the session's destination is next
+  bound, and then fails.
 - Host-store realms: opening a realm loads the sessions that hold recovery
   work (an unsettled input, an undelivered background result, an open run)
   up to 16 at a time, instead of one after another. With K such sessions,
