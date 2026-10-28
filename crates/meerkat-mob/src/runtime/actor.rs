@@ -45557,6 +45557,22 @@ impl MobActor {
 
         let local_identity = AgentIdentity::from(local.as_str());
         let peer_member_identity = AgentIdentity::from(peer_identity.as_str());
+        // Pre-flight: roster lookups. A missing member answers MemberNotFound
+        // before the admission probe, whose seated-ends guard would answer it
+        // as an invalid transition, and before any authority mutation.
+        let (local_entry, peer_entry) = {
+            let roster = self.roster.read().await;
+            (
+                roster
+                    .get(&local)
+                    .cloned()
+                    .ok_or_else(|| MobError::MemberNotFound(local.clone()))?,
+                roster
+                    .get(&peer_member_identity)
+                    .cloned()
+                    .ok_or_else(|| MobError::MemberNotFound(peer_member_identity.clone()))?,
+            )
+        };
         let dsl_a = mob_dsl::AgentIdentity::from_domain(&local_identity);
         let dsl_b = mob_dsl::AgentIdentity::from_domain(&peer_identity);
         let edge = mob_dsl::WiringEdge::new(dsl_a, dsl_b);
@@ -45574,22 +45590,6 @@ impl MobActor {
         self.ensure_member_not_broken(&local).await?;
 
         self.ensure_member_not_broken(&peer_member_identity).await?;
-
-        // Pre-flight: roster lookups. Missing members fail fast before
-        // any authority mutation.
-        let (local_entry, peer_entry) = {
-            let roster = self.roster.read().await;
-            (
-                roster
-                    .get(&local)
-                    .cloned()
-                    .ok_or_else(|| MobError::MemberNotFound(local.clone()))?,
-                roster
-                    .get(&peer_member_identity)
-                    .cloned()
-                    .ok_or_else(|| MobError::MemberNotFound(peer_member_identity.clone()))?,
-            )
-        };
 
         // Idempotent repair path when the MobMachine already owns the edge.
         // The DSL emits a local repair effect; without a graph-change effect,
