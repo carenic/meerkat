@@ -1598,15 +1598,18 @@ impl MobActor {
             // Waking: a delivery joined or superseded the retry. Live: done.
             return;
         }
-        match self
-            .apply_member_wake(
+        // Built in its own frame (see `boxed_arm_future`): this handler runs
+        // from a timer on the actor's stack.
+        match boxed_arm_future(|| {
+            self.apply_member_wake(
                 &identity,
                 cause,
                 false,
                 mob_dsl::PeerInputClass::Content,
                 false,
             )
-            .await
+        })
+        .await
         {
             MemberWakeAdmission::Pending(_) | MemberWakeAdmission::Ready => {}
             MemberWakeAdmission::LifecycleNoticeConsumed => {}
@@ -1755,7 +1758,9 @@ impl MobActor {
                 }
             }
         };
-        match self.prepare_member_wire(local, target).await {
+        // Built in its own frame (see `boxed_arm_future`): this handler runs
+        // from a timer on the actor's stack.
+        match boxed_arm_future(|| self.prepare_member_wire(local, target)).await {
             Ok(prepared) => match prepared.into_prepared() {
                 None => self.finish_owed_edge_repair(edge, Ok(())),
                 // The realization runs off the actor; its continuation
