@@ -345,7 +345,16 @@ them.
     inherits its creator's tool visibility is refused (spawn it).
     `MobBuilder::with_member_comms_identity_root` (inproc comms) or
     `MobBuilder::with_network_member_comms` (Tcp or Uds comms) names where
-    a seat's endpoint comes from.
+    a seat's endpoint comes from. A seated member is wired to the edges the
+    definition declares (`auto_wire_orchestrator` and `role_wiring`), as a
+    spawn of it would be, once its chunk is committed, so the members seated
+    together see each other: one machine step and one journal batch of
+    `MembersWired` rows per chunk, waking no member (as for any wire, but
+    for an edge to a placed member). A live member trusts a seated member's
+    recorded endpoint at once; a member on network comms, which has no
+    endpoint until its boot wake registers one, gets the trust of both ends
+    at that wake. An identity answered `AlreadySeated` keeps the edges it
+    holds.
   - `MobHandle::rotate_member(spec)`: a fresh life for a seated member (a
     reset): its current incarnation is retired and the next one is seated
     Dormant under a new name-based session id in the retirement's terminal
@@ -355,8 +364,9 @@ them.
     that owes a kickoff (an `AutonomousHost` member, or an initial message)
     records it on the new incarnation in the same batch: it wakes the new
     incarnation once and runs exactly once on its new session, also across
-    a restart. The new incarnation keeps no wiring. A rotation is refused
-    typed unless the mob is Running, and a refused rotation retires
+    a restart. The new incarnation keeps none of the old one's edges and is
+    wired to the edges the definition declares, as a seat is. A rotation is
+    refused typed unless the mob is Running, and a refused rotation retires
     nothing.
 
 - `meerkat-runtime`: `RuntimeStore::list_runtimes_with_recovery_work`, the

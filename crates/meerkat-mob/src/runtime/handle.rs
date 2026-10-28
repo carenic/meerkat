@@ -9442,6 +9442,18 @@ impl MobHandle {
     /// [`super::DormantSeatOutcome::AlreadySeated`]. Seating an identity
     /// clears its host-pending mark
     /// ([`super::MobBuilder::with_host_pending_members`]) in the same step.
+    ///
+    /// A seated member is wired to the edges the definition declares
+    /// (`auto_wire_orchestrator` and `role_wiring`), as a spawn of it would
+    /// be, once its chunk is committed: the members seated in one call see
+    /// each other, and a member seated later sees the ones seated before.
+    /// The edges are MobMachine's and journaled, and none wakes a member
+    /// (except as MobMachine wakes a Dormant member an edge joins to a placed
+    /// one): a live member trusts a seated one's recorded endpoint at once,
+    /// and the seated member's own trust is installed by its wake. A member on
+    /// network comms has no recorded endpoint until its boot wake registers
+    /// it, which then installs the trust of both ends. An identity answered
+    /// `AlreadySeated` keeps the edges it holds.
     pub async fn seat_dormant_members(
         &self,
         specs: Vec<SpawnMemberSpec>,
@@ -9487,7 +9499,9 @@ impl MobHandle {
     /// The spec launches `Fresh`. When it owes a kickoff (an
     /// `AutonomousHost` member's one kickoff turn, or an initial message),
     /// the new incarnation owes it: the kickoff wakes it once and runs
-    /// exactly once on its new session. Its wiring is not carried over. An
+    /// exactly once on its new session. Its wiring is not carried over: the
+    /// new incarnation is wired to the edges the definition declares, as a
+    /// spawn of it would be (see [`Self::seat_dormant_members`]). An
     /// identity that is not seated (its last retirement already completed) is
     /// seated as one fresh seat, which a spec that owes a kickoff spawns live,
     /// as [`Self::seat_dormant_members`] does. Refused typed unless the mob is

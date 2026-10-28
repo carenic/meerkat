@@ -24,7 +24,11 @@
 //!    at a time, so the refused one is answered alone), then one runtime
 //!    obligation scan and the seated identities' `PlanBootMaterialization`
 //!    as one more batch, then the `MemberSpawned` rows in one `append_batch`
-//!    before the base-checked commit.
+//!    before the base-checked commit. The members the chunk seated are then
+//!    wired to the edges their definition declares, as a spawn of each would
+//!    be, in one more step on the actor: their `WireMembers` inputs on one
+//!    prepared authority and their `MembersWired` rows in one more
+//!    `append_batch`.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

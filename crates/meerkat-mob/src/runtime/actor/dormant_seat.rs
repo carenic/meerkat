@@ -417,7 +417,9 @@ impl MobActor {
     /// left, so both ways answer every entry the same. Entries of one chunk
     /// name distinct identities, so an already-seated entry's check, which
     /// reads only its own identity, reads the same before the chunk's inputs
-    /// as between them.
+    /// as between them. Once the chunk is committed, the members it seated
+    /// are wired to the edges their definition declares, in one more step
+    /// (see `seat_wiring`).
     pub(super) async fn commit_dormant_seats(
         &mut self,
         entries: Vec<DormantSeatCommitEntry>,
@@ -615,6 +617,10 @@ impl MobActor {
                 }
             }
         }
+        let seated_members = seated
+            .iter()
+            .map(|seat| seat.agent_identity.clone())
+            .collect::<Vec<_>>();
         for seat in seated {
             tracing::debug!(
                 mob_id = %self.definition.id,
@@ -644,6 +650,11 @@ impl MobActor {
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = verify;
+        // The edges the definition declares for the members this chunk
+        // seated, wired as a spawn of each would be, with every member of the
+        // chunk seated already. An identity seated before, or embodied by a
+        // spawn, keeps the edges it holds.
+        Box::pin(self.wire_seated_declared_edges(&seated_members)).await;
         outcomes
             .into_iter()
             .map(|outcome| {
@@ -981,7 +992,9 @@ impl MobActor {
     /// and the next one seated Dormant on the recorded session and endpoint,
     /// in one transition. Its `MemberRetired` and `MemberSpawned` rows go to
     /// the journal in one `append_batch` before the commit, so the identity is
-    /// never a non-member. The roster takes the next incarnation at once.
+    /// never a non-member. The roster takes the next incarnation at once, and
+    /// the next incarnation, which holds none of its predecessor's edges, is
+    /// wired to the edges its definition declares (see `seat_wiring`).
     pub(super) async fn commit_member_rotation(
         &mut self,
         ctx: &DisposalContext,
@@ -1229,6 +1242,10 @@ impl MobActor {
                 );
             }
         }
+        // CommitMemberRotation ends every edge of the retired incarnation;
+        // the next one is wired to the edges its definition declares, as a
+        // spawn of it would be.
+        Box::pin(self.wire_seated_declared_edges(std::slice::from_ref(identity))).await;
         Ok(())
     }
 }

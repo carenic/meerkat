@@ -1695,6 +1695,17 @@ async fn ten_thousand_dormant_members_restart_without_materializing_any() {
     );
 }
 
+/// What the identities of a seat-cost run are wired to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SeatCostWiring {
+    /// The sample definition, which declares no edge.
+    Undeclared,
+    /// `auto_wire_orchestrator` with the orchestrator live before the seats:
+    /// one declared edge per seat, whose live end trusts the seated member's
+    /// recorded endpoint.
+    LiveOrchestrator,
+}
+
 /// What one seat-cost run measured.
 struct SeatCostRun {
     members: usize,
@@ -1705,6 +1716,10 @@ struct SeatCostRun {
     seat: Duration,
     chunks: Vec<crate::runtime::handle::seat_chunk_timing::SeatChunkTiming>,
     restart: Duration,
+    /// Under [`SeatCostWiring::LiveOrchestrator`]: the orchestrator's first
+    /// wake after the restart, whose topology step realizes its edge to every
+    /// seated member.
+    orchestrator_wake: Option<Duration>,
 }
 
 /// Microseconds per seat of `elapsed` over `seats` seats.
@@ -1770,16 +1785,28 @@ impl SeatCostRun {
             );
         }
         eprintln!("  restart: {:?}", self.restart);
+        if let Some(wake) = self.orchestrator_wake {
+            eprintln!(
+                "  the orchestrator's wake over {} edges: {wake:?}",
+                self.members
+            );
+        }
     }
 }
 
 /// Seat `members` identities on a fresh mob as a host's first boot after an
 /// import does (Resume seats of sessions that exist, with their comms key
 /// pairs), then crash-stop and restart it, timing each phase and each seat
-/// chunk's steps.
-async fn seat_cost_run(members: usize) -> SeatCostRun {
+/// chunk's steps. Under [`SeatCostWiring::LiveOrchestrator`] each seat is
+/// also wired to the orchestrator, spawned live before the seats, and the
+/// run checks every edge, its row and the orchestrator's trust.
+async fn seat_cost_run(members: usize, wiring: SeatCostWiring) -> SeatCostRun {
     let keys = tempfile::tempdir().expect("a comms identity root");
-    let definition = with_unique_mob_id(sample_definition(), "seat-cost");
+    let definition = match wiring {
+        SeatCostWiring::Undeclared => sample_definition(),
+        SeatCostWiring::LiveOrchestrator => sample_definition_with_auto_wire(),
+    };
+    let definition = with_unique_mob_id(definition, "seat-cost");
     let service = Arc::new(MockSessionService::new());
     let _adapter = service.enable_runtime_adapter();
 
@@ -1814,6 +1841,15 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
         .await
         .expect("create the mob");
     let create = started.elapsed();
+    let orchestrator = AgentIdentity::from("seat-cost-orchestrator");
+    if wiring == SeatCostWiring::LiveOrchestrator {
+        let mut spec = SpawnMemberSpec::new("lead", orchestrator.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle
+            .spawn_spec(spec)
+            .await
+            .expect("spawn the orchestrator live");
+    }
 
     let timings = crate::runtime::handle::seat_chunk_timing::watch(handle.mob_id());
     let started = std::time::Instant::now();
@@ -1837,8 +1873,57 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
         .filter(|phase| matches!(phase, dsl::MemberMaterializationPhase::Dormant))
         .count();
     assert_eq!(dormant, members, "every seat is Dormant");
-    assert!(
-        service.recorded_create_requests().await.is_empty(),
+    if wiring == SeatCostWiring::LiveOrchestrator {
+        let dsl_orchestrator = dsl::AgentIdentity::from_domain(&orchestrator);
+        let (edges, peer_ids) = {
+            let state = handle.machine_state_watch_rx.borrow();
+            let edges = state.wiring_edges.clone();
+            let peer_ids = state
+                .member_peer_ids
+                .iter()
+                .filter(|(identity, _)| **identity != dsl_orchestrator)
+                .map(|(_, peer_id)| peer_id.0.clone())
+                .collect::<BTreeSet<_>>();
+            (edges, peer_ids)
+        };
+        assert_eq!(edges.len(), members, "one declared edge per seat");
+        assert!(
+            edges
+                .iter()
+                .all(|edge| edge.a == dsl_orchestrator || edge.b == dsl_orchestrator),
+            "every edge joins the orchestrator"
+        );
+        let rows = events
+            .replay_all()
+            .await
+            .expect("read the journal")
+            .iter()
+            .filter(|event| matches!(event.kind, MobEventKind::MembersWired { .. }))
+            .count();
+        assert_eq!(rows, members, "one MembersWired row per seat");
+        let session = handle
+            .resolve_bridge_session_id(&orchestrator)
+            .await
+            .expect("the orchestrator's session");
+        let trusted = service
+            .comms_runtime(&session)
+            .await
+            .expect("the orchestrator's comms runtime")
+            .peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.peer_id.to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            peer_ids.is_subset(&trusted),
+            "the orchestrator trusts every seated member's recorded endpoint"
+        );
+    }
+    // The orchestrator's spawn is the one create: a seat, and the wiring of
+    // one, builds and creates nothing.
+    assert_eq!(
+        service.recorded_create_requests().await.len(),
+        usize::from(wiring == SeatCostWiring::LiveOrchestrator),
         "a seat builds and creates nothing"
     );
     let chunks = timings
@@ -1873,6 +1958,46 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
         0,
         "the restart materializes no seated member"
     );
+    // The orchestrator's first wake after the restart realizes its edge to
+    // every seated member in its topology step: it then trusts every seated
+    // member's recorded endpoint.
+    let orchestrator_wake = if wiring == SeatCostWiring::LiveOrchestrator {
+        let started = std::time::Instant::now();
+        let woken = resumed.ensure_member_live(&orchestrator).await;
+        let wake = started.elapsed();
+        if let Err(error) = woken {
+            panic!("the orchestrator's wake over {members} edges failed after {wake:?}: {error}");
+        }
+        let dsl_orchestrator = dsl::AgentIdentity::from_domain(&orchestrator);
+        let peer_ids = resumed
+            .machine_state_watch_rx
+            .borrow()
+            .member_peer_ids
+            .iter()
+            .filter(|(identity, _)| **identity != dsl_orchestrator)
+            .map(|(_, peer_id)| peer_id.0.clone())
+            .collect::<BTreeSet<_>>();
+        let session = resumed
+            .resolve_bridge_session_id(&orchestrator)
+            .await
+            .expect("the orchestrator's session");
+        let trusted = restarted
+            .comms_runtime(&session)
+            .await
+            .expect("the woken orchestrator's comms runtime")
+            .peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.peer_id.to_string())
+            .collect::<BTreeSet<_>>();
+        assert!(
+            peer_ids.is_subset(&trusted),
+            "the woken orchestrator trusts every seated member's recorded endpoint"
+        );
+        Some(wake)
+    } else {
+        None
+    };
     crash_stop_and_release_routes(resumed).await;
     SeatCostRun {
         members,
@@ -1881,6 +2006,7 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
         seat,
         chunks,
         restart,
+        orchestrator_wake,
     }
 }
 
@@ -1914,7 +2040,7 @@ async fn seat_cost_run(members: usize) -> SeatCostRun {
 async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
     let mut runs = Vec::new();
     for members in [1_000, 10_000] {
-        let run = seat_cost_run(members).await;
+        let run = seat_cost_run(members, SeatCostWiring::Undeclared).await;
         run.report();
         runs.push(run);
     }
@@ -1930,6 +2056,47 @@ async fn seating_a_thousand_then_ten_thousand_identities_reports_each_phase() {
         "the restart over {} seated identities took {:?}",
         largest.members,
         largest.restart
+    );
+}
+
+/// First-boot seat cost at scale with a declared edge per seat: a fresh mob
+/// under `auto_wire_orchestrator` spawns its orchestrator live, then seats
+/// 10,000 identities, each wired to the orchestrator as a spawn of it would
+/// be (the machine edge, its MembersWired row, and the live orchestrator's
+/// trust in the seated member's recorded endpoint), restarts, and wakes the
+/// orchestrator, whose topology step realizes its 10,000 edges. Each chunk's
+/// edges are one prepared machine step and one journal batch, so the wiring
+/// adds a fixed number of machine state copies per chunk and a few map
+/// reads, one row and one trust install per seat: the 10,000 seats stay
+/// under the same 10 s bound as seats with no declared edge, the restart
+/// under 60 s, and the orchestrator's wake under 60 s. A wire per edge would
+/// copy the whole machine state several times per seat, quadratic in the
+/// roster. Run explicitly, in the release profile, with the output shown
+/// (nextest `--no-capture`).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "scale row: run explicitly in the release profile"]
+async fn seating_ten_thousand_identities_wired_to_a_live_orchestrator_stays_under_the_bound() {
+    let run = seat_cost_run(10_000, SeatCostWiring::LiveOrchestrator).await;
+    run.report();
+    assert!(
+        run.seat < Duration::from_secs(10),
+        "seating {} identities wired to the orchestrator took {:?}, over the 10 s bound",
+        run.members,
+        run.seat
+    );
+    assert!(
+        run.restart < Duration::from_secs(60),
+        "the restart over {} seated, wired identities took {:?}",
+        run.members,
+        run.restart
+    );
+    let wake = run
+        .orchestrator_wake
+        .expect("the run woke the orchestrator after the restart");
+    assert!(
+        wake < Duration::from_secs(60),
+        "the orchestrator's wake over {} edges took {wake:?}, over the 60 s bound",
+        run.members
     );
 }
 
