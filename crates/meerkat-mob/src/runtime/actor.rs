@@ -3126,11 +3126,52 @@ struct LocalTurnAdmissionReadiness {
     /// The member's wake, when MobMachine authorized or joined one for this
     /// delivery (`WakeMember(HostDelivery)`): the lane waits for it first.
     wake: Option<oneshot::Receiver<member_wake::MemberWakeAnswer>>,
+    /// MobMachine's published state: a wake can bind the member to another
+    /// session than the one resolved before it (a session recreated fresh,
+    /// or a successor), and the delivery follows the binding the wake left.
+    machine_state: MachineStateView,
     /// #37: probe the live session actor; when it is gone, re-enter the actor
     /// for the machine-authorized drift wake and continue once it answered.
     check_live_session: bool,
     /// AutonomousHost members: mob comms drain + injector capability.
     autonomous_runtime: bool,
+}
+
+/// MobMachine's published state, as a member's admission lane reads it.
+struct MachineStateView(tokio::sync::watch::Receiver<mob_dsl::MobMachineState>);
+
+impl std::fmt::Debug for MachineStateView {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("MachineStateView")
+    }
+}
+
+impl MachineStateView {
+    /// The session MobMachine binds `agent_identity` to now.
+    fn bound_session(&self, agent_identity: &AgentIdentity) -> Option<SessionId> {
+        self.0
+            .borrow()
+            .member_session_bindings
+            .get(&mob_dsl::AgentIdentity::from_domain(agent_identity))
+            .and_then(|session_id| SessionId::parse(&session_id.0).ok())
+    }
+
+    /// After a wake: move `session` to the session MobMachine binds
+    /// `agent_identity` to now when that is another one, and record it in
+    /// `followed`.
+    fn follow(
+        &self,
+        agent_identity: &AgentIdentity,
+        session: &mut SessionId,
+        followed: &mut Option<SessionId>,
+    ) {
+        if let Some(bound) = self.bound_session(agent_identity)
+            && bound != *session
+        {
+            *session = bound.clone();
+            *followed = Some(bound);
+        }
+    }
 }
 
 /// Off-loop autonomous dispatch material. After readiness the lane probes the
@@ -3194,6 +3235,30 @@ enum PendingTurnDispatch {
         placed_identity: Option<AgentIdentity>,
         remote: Option<PreparedPlacedCompletionWait>,
     },
+}
+
+impl PendingTurnDispatch {
+    /// Deliver to `session`, the member's session after the wake this
+    /// delivery waited on.
+    fn follow_session(&mut self, session: &SessionId) {
+        match self {
+            Self::Admission { member_ref, .. }
+            | Self::Governed { member_ref, .. }
+            | Self::Completion { member_ref, .. } => {
+                *member_ref = MobActor::member_ref_on_session(member_ref, session);
+            }
+            Self::Autonomous(material) => material.follow_session(session),
+        }
+    }
+}
+
+impl AutonomousDispatchMaterial {
+    /// Deliver to `session`, the member's session after the wake this
+    /// delivery waited on.
+    fn follow_session(&mut self, session: &SessionId) {
+        self.member_ref = MobActor::member_ref_on_session(&self.member_ref, session);
+        self.bridge_session_id = session.clone();
+    }
 }
 
 enum ParkedMemberTurnAdmission {
@@ -14558,6 +14623,13 @@ impl MobActor {
         }
     }
 
+    /// `member_ref` moved to `session`, the session MobMachine binds its
+    /// member to now.
+    fn member_ref_on_session(member_ref: &MemberRef, session: &SessionId) -> MemberRef {
+        Self::project_member_ref_session_binding(member_ref, Some(session.clone()))
+            .unwrap_or_else(|| member_ref.clone())
+    }
+
     fn machine_member_ref_for_behavior(
         &self,
         entry: &RosterEntry,
@@ -19242,7 +19314,7 @@ impl MobActor {
         let PendingMemberTurnAdmission {
             agent_identity,
             readiness,
-            dispatch,
+            mut dispatch,
         } = pending;
         if reply_tx.is_closed() {
             // Parked long enough for the caller to leave: never run a ghost
@@ -19262,7 +19334,7 @@ impl MobActor {
                 | PendingTurnDispatch::Completion { member_ref, .. } => member_ref,
                 PendingTurnDispatch::Autonomous(material) => &material.member_ref,
             };
-            if let Err(error) = Self::run_local_turn_readiness(
+            match Self::run_local_turn_readiness(
                 context,
                 session_service,
                 command_tx,
@@ -19272,8 +19344,12 @@ impl MobActor {
             )
             .await
             {
-                let _ = reply_tx.send(Err(error));
-                return;
+                Ok(None) => {}
+                Ok(Some(session)) => dispatch.follow_session(&session),
+                Err(error) => {
+                    let _ = reply_tx.send(Err(error));
+                    return;
+                }
             }
         }
         #[cfg(any(test, feature = "test-support"))]
@@ -19376,6 +19452,10 @@ impl MobActor {
     /// The member-local readiness steps that ran inline on the loop before
     /// #1102: the #37 live-session probe (revival re-enters the actor) and,
     /// for AutonomousHost members, comms-drain plus injector readiness.
+    ///
+    /// Answers the member's session when the wake this delivery waited on
+    /// bound the member to another session than the delivery resolved
+    /// before it: the caller then delivers there.
     async fn run_local_turn_readiness(
         context: &DetachedMemberReadinessContext,
         session_service: &Arc<dyn MobSessionService>,
@@ -19383,18 +19463,30 @@ impl MobActor {
         agent_identity: &AgentIdentity,
         readiness: LocalTurnAdmissionReadiness,
         member_ref: &MemberRef,
-    ) -> Result<(), MobError> {
-        if let Some(answer) = readiness.wake {
+    ) -> Result<Option<SessionId>, MobError> {
+        let LocalTurnAdmissionReadiness {
+            mut bridge_session_id,
+            wake,
+            machine_state,
+            check_live_session,
+            autonomous_runtime,
+        } = readiness;
+        let mut followed = None;
+        if let Some(answer) = wake {
             // The member was not materialized: MobMachine authorized (or
             // joined) its wake for this delivery. Wait for it here, in the
             // member's lane, never on the actor.
             member_wake::MemberWakeAdmission::Pending(answer)
                 .settled_for_host(agent_identity)
                 .await?;
+            // The wake may have restored the member on another session (a
+            // session recreated fresh, or a successor): the delivery follows
+            // the binding MobMachine holds now.
+            machine_state.follow(agent_identity, &mut bridge_session_id, &mut followed);
         }
-        if readiness.check_live_session {
+        if check_live_session {
             match session_service
-                .live_session_actor_registered(&readiness.bridge_session_id)
+                .live_session_actor_registered(&bridge_session_id)
                 .await
             {
                 Ok(true) => {}
@@ -19411,16 +19503,23 @@ impl MobActor {
                         true,
                     )
                     .await?;
+                    machine_state.follow(agent_identity, &mut bridge_session_id, &mut followed);
                 }
                 Err(error) => return Err(MobError::SessionError(error)),
             }
         }
-        if readiness.autonomous_runtime {
+        if autonomous_runtime {
+            let followed_ref = followed
+                .as_ref()
+                .map(|session| Self::member_ref_on_session(member_ref, session));
             context
-                .ensure_autonomous_runtime_ready(agent_identity, member_ref)
+                .ensure_autonomous_runtime_ready(
+                    agent_identity,
+                    followed_ref.as_ref().unwrap_or(member_ref),
+                )
                 .await?;
         }
-        Ok(())
+        Ok(followed)
     }
 
     async fn request_member_live_revival(
@@ -60865,6 +60964,7 @@ impl MobActor {
             Some(LocalTurnAdmissionReadiness {
                 bridge_session_id: bridge_session_id.clone(),
                 wake,
+                machine_state: MachineStateView(self.machine_state_watch_tx.subscribe()),
                 check_live_session: !live_steer_admission,
                 autonomous_runtime: entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost,
             })
