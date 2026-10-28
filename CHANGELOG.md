@@ -697,6 +697,20 @@ them.
   to a temporary file in the directory and hard-linked into place (created
   exclusively where the file system has no hard links); the key file's
   permissions are unchanged (`0600` on Unix).
+- `meerkat-runtime`: the threads of the crate's two process-wide Tokio
+  runtimes (`meerkat-machine-cleanup` and `meerkat-runtime-serving`) now
+  follow the host stack knobs: `RKAT_WORKER_STACK_BYTES` sets their stack
+  exactly, and without it they take the 8 MiB budget, or `RUST_MIN_STACK`
+  when that asks for more. Before, they always ran on 8 MiB: their explicit
+  size kept `RUST_MIN_STACK` out, and `RKAT_WORKER_STACK_BYTES` reached only
+  a host's own runtime. These runtimes run session and mob work for the
+  whole process, so an embedding whose debug build needed deeper stacks
+  aborted with a stack overflow on a `meerkat-machine-cleanup` thread
+  whatever it set, and the documented `RKAT_WORKER_STACK_BYTES` sweep could
+  not tell a large frame from recursion there. Nothing changes when neither
+  variable is set. An invalid `RKAT_WORKER_STACK_BYTES` now also fails every
+  operation that needs one of these runtimes until it is corrected, with the
+  refusal a host binary gives at startup.
 - Host-store realms: a session no longer keeps up to 4 MiB of superseded
   copies of its runtime's registry of background operations. Core rewrites
   that registry whole each time an operation finishes or its result is

@@ -2892,12 +2892,6 @@ pub enum EnsureRuntimeExecutorAttachment {
 static MACHINE_CLEANUP_RUNTIME: OnceLock<StdMutex<Option<crate::tokio::runtime::Runtime>>> =
     OnceLock::new();
 
-// Machine cleanup can restore and reduce the same generated DSL state as the
-// host runtime, so its worker runs on the same documented budget as every
-// host binary's workers (see `crate::host_stack`).
-#[cfg(not(target_arch = "wasm32"))]
-const MACHINE_CLEANUP_THREAD_STACK_SIZE: usize = crate::host_stack::HOST_WORKER_STACK_BUDGET;
-
 /// A durability-degradation caller must observe its canonical repair-blocked
 /// result even when a public custom interrupt handle never completes. The
 /// exact process-owned callback continues after this acknowledgement budget.
@@ -3259,12 +3253,21 @@ impl MachineCleanupTaskSpawner {
             });
         }
 
+        // Machine cleanup restores and reduces the same generated DSL state
+        // as the host runtime and runs session and mob work for the whole
+        // process, so its threads follow the host stack budget and its knobs
+        // (see `crate::host_stack`).
+        let stack_bytes = crate::host_stack::process_runtime_stack_bytes().map_err(|error| {
+            RuntimeDriverError::Internal(format!(
+                "failed to start machine cleanup runtime: {error}"
+            ))
+        })?;
         let candidate = crate::tokio::runtime::Builder::new_multi_thread()
             // Cleanup and ingress share this dispatcher. One owner's
             // synchronous poll must not monopolize every session's lane.
             .worker_threads(2)
             .thread_name("meerkat-machine-cleanup")
-            .thread_stack_size(MACHINE_CLEANUP_THREAD_STACK_SIZE)
+            .thread_stack_size(stack_bytes)
             .enable_all()
             .build()
             .map_err(|error| {
