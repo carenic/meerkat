@@ -78575,6 +78575,106 @@ async fn test_revival_already_active_identity_is_idempotent_success() {
     );
 }
 
+/// Names `binding` on every resume request, as a host whose member's
+/// sessions moved to that binding does.
+struct ResumeAuthBindingCustomizer(meerkat_core::AuthBindingRef);
+
+impl SpawnMemberCustomizer for ResumeAuthBindingCustomizer {
+    fn customize_spawn(
+        &self,
+        ctx: &SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), MobError> {
+        if ctx.spawn_source == SpawnSource::Resume {
+            spec.auth_binding = Some(self.0.clone());
+        }
+        Ok(())
+    }
+}
+
+/// A wake whose build finds the member's session already live (another
+/// materialization made it live) keeps that live actor only when it runs the
+/// binding the member's restore names, as every reuse of a live actor does.
+/// A live actor on another binding is not adopted: the delivery is refused
+/// with the typed conflict, the member is recorded Broken, and the actor is
+/// retired, so no surface reaches the old binding.
+#[tokio::test]
+async fn a_wake_never_adopts_an_already_live_actor_on_another_binding() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .expect("inline worker profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(ResumeAuthBindingCustomizer(scoped_auth_binding())))
+        .create()
+        .await
+        .expect("create mob");
+    let identity = AgentIdentity::from("w-1");
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn worker");
+    let session = receipt
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    // The session's recorded binding is another one, and its live actor is
+    // gone; the member's next build finds the session identity already
+    // active and the session live again, on that other binding.
+    service
+        .record_session_auth_binding(&session, other_auth_binding())
+        .await;
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard live session");
+    service
+        .set_create_session_identity_already_active(&session)
+        .await;
+
+    let refused = handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn(ContentInput::from(
+            "deliver to the other binding".to_string(),
+        ))
+        .await;
+    let conflict = MobError::MemberAuthBindingConflict {
+        member_id: identity.clone(),
+        session_id: session.clone(),
+        requested: Box::new(scoped_auth_binding()),
+        recorded: Some(Box::new(other_auth_binding())),
+    }
+    .to_string();
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::MemberRestoreFailed { reason, .. }) if reason == &conflict
+        ),
+        "a live actor on another binding is refused with the typed conflict: {refused:?}"
+    );
+    let status = handle
+        .member_status(&identity)
+        .await
+        .expect("read the member status");
+    assert_eq!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{status:?}"
+    );
+    assert!(
+        !service.has_live_session(&session).await.unwrap_or(false),
+        "the refused live actor is retired: no surface reaches the old binding"
+    );
+}
+
 /// Task #37 regression (failure path): when the machine-authorized revival
 /// itself fails terminally, the outcome is the typed `MemberRestoreFailed`
 /// and the machine-owned Broken classification — and the machine refuses any

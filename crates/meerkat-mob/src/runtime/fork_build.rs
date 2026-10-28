@@ -71,7 +71,9 @@
 //! - **Warm revival** (in process): the child's retained overlay, which is the
 //!   one it was built with. A wake of a member this process built before (a
 //!   released member, or a revival that runs through the member's wake) keeps
-//!   its retained overlay the same way.
+//!   its retained overlay the same way, an ordinary member's own overlay
+//!   included: its tools stay what they were while it was live, as for a
+//!   member that stayed live, until a respawn or a restart.
 //! - **Wake of a child this process did not build** (a lazy start leaves
 //!   every member Dormant, and a wake rebuilds one member): a child seated
 //!   with its source's overlay gets the overlay its source holds in this
