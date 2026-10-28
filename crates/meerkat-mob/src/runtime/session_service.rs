@@ -1124,17 +1124,32 @@ pub(crate) fn durable_fork_unsupported() -> SessionError {
 /// A known actor's stream ends when that actor ends, and its witness is
 /// revoked before the actor is removed or replaced, so a host can hold a
 /// successor's stream back until a revoked predecessor's stream drained.
+///
+/// A subscription opened while its member was not materialized in this
+/// process (dormant, or waking) attaches at the member's wake: `actor` and
+/// `epoch` are `None`, and `attached_epoch` is set once the stream attached,
+/// to the sequence space the woken actor's stream names.
 #[non_exhaustive]
 pub struct AgentEventSubscription {
     /// The member's events.
     pub stream: EventStream,
     /// The actor incarnation `stream` belongs to. `None` when the service
-    /// cannot name it (for example a placed member's pump-tap stream).
+    /// cannot name it (for example a placed member's pump-tap stream), and
+    /// for a subscription that attaches at its member's wake.
     pub actor: Option<meerkat_session::LiveSessionActorWitness>,
     /// Sequence space of the stream's envelope sequences, to be carried in
     /// a later [`meerkat_core::comms::SessionEventCursor::After`]. `None`
-    /// when the service cannot name one (a live-only service).
+    /// when the service cannot name one (a live-only service), and for a
+    /// subscription that attaches at its member's wake (see
+    /// `attached_epoch`).
     pub epoch: Option<meerkat_core::comms::SessionEventEpoch>,
+    /// For a subscription that attaches at its member's wake: set once the
+    /// stream attached and before its first event, to the sequence space of
+    /// the woken actor's stream (`None` inside when the service cannot name
+    /// one); unset while the stream waits. `None` for a subscription that
+    /// attached when it was opened.
+    pub attached_epoch:
+        Option<Arc<std::sync::OnceLock<Option<meerkat_core::comms::SessionEventEpoch>>>>,
 }
 
 impl AgentEventSubscription {
@@ -1147,6 +1162,21 @@ impl AgentEventSubscription {
             stream,
             actor: None,
             epoch,
+            attached_epoch: None,
+        }
+    }
+
+    /// A subscription of a member that is not materialized yet, whose
+    /// `stream` attaches at the member's wake and sets `attached_epoch`.
+    pub(crate) fn attaching_at_wake(
+        stream: EventStream,
+        attached_epoch: Arc<std::sync::OnceLock<Option<meerkat_core::comms::SessionEventEpoch>>>,
+    ) -> Self {
+        Self {
+            stream,
+            actor: None,
+            epoch: None,
+            attached_epoch: Some(attached_epoch),
         }
     }
 }
@@ -1157,6 +1187,7 @@ impl From<meerkat_session::LiveActorEventSubscription> for AgentEventSubscriptio
             stream: subscription.stream,
             actor: Some(subscription.actor),
             epoch: Some(subscription.epoch),
+            attached_epoch: None,
         }
     }
 }

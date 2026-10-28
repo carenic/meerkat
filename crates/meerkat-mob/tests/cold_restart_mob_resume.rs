@@ -1181,6 +1181,173 @@ async fn restored_member_first_run_replays_to_a_late_subscriber() {
     assert!(not_live.is_missing_target());
 }
 
+/// A mob-wide event subscription carries a member a cold restart left
+/// dormant, from its wake: the subscription opens with the member not
+/// materialized and wakes nothing, the member's next delivery wakes it, and
+/// the run that delivery starts reaches the subscription from `RunStarted`.
+/// After the member is released and woken again, its new actor's run
+/// reaches the same subscription.
+#[cfg(feature = "test-support")]
+#[tokio::test(flavor = "multi_thread")]
+async fn the_mob_event_router_carries_a_dormant_member_from_its_wake_and_after_a_rewake() {
+    use meerkat_mob::machines::mob_machine::MemberMaterializationPhase;
+
+    let temp = tempfile::tempdir().expect("temp dir");
+    let paths = Paths::new(temp.path());
+    let worker = AgentIdentity::from("w-1");
+    let mut definition = mob_definition(MobRuntimeMode::TurnDriven);
+    definition.orchestrator = None;
+    definition.wiring = WiringRules {
+        auto_wire_orchestrator: false,
+        role_wiring: vec![],
+    };
+
+    // ---------------- Lifetime 1: one turn, then the process stops ----------
+    let runtime_store_1: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+            .expect("open durable runtime store"),
+    );
+    let (service_1, _store_1) = persistent_service(&paths, runtime_store_1.clone());
+    let handle_1 = MobBuilder::new(
+        definition,
+        MobStorage::persistent(&paths.mob_db_path).expect("persistent mob storage"),
+    )
+    .with_session_service(service_1.clone())
+    .with_default_llm_client(openai_test_client())
+    .create()
+    .await
+    .expect("create persistent mob");
+    handle_1
+        .spawn_spec(SpawnMemberSpec::new("worker", worker.clone()))
+        .await
+        .expect("spawn worker");
+    let w1_sid = handle_1
+        .resolve_bridge_session_id(&worker)
+        .await
+        .expect("worker session id");
+    send_and_wait(
+        &handle_1,
+        service_1.as_ref(),
+        "w-1",
+        "PRE_RESTART_ROUTER_TURN",
+        "lifetime1",
+    )
+    .await;
+    handle_1
+        .shutdown()
+        .await
+        .expect("shutdown mob before restart");
+    service_1
+        .discard_live_session(&w1_sid)
+        .await
+        .expect("discard live session before restart");
+    drop(handle_1);
+    drop(service_1);
+    drop(runtime_store_1);
+
+    // ---------------- Lifetime 2: the member starts dormant -----------------
+    let runtime_store_2: Arc<dyn meerkat_runtime::RuntimeStore> = Arc::new(
+        meerkat_runtime::store::SqliteRuntimeStore::new_whole_blob(&paths.realm_db_path)
+            .expect("reopen durable runtime store"),
+    );
+    let (service_2, _store_2) = persistent_service(&paths, runtime_store_2);
+    let handle_2 = MobBuilder::for_resume(
+        MobStorage::persistent(&paths.mob_db_path).expect("reopen mob storage"),
+    )
+    .with_session_service(service_2.clone())
+    .with_default_llm_client(openai_test_client())
+    .notify_orchestrator_on_resume(false)
+    .resume()
+    .await
+    .expect("mob resume after cold restart");
+    assert_eq!(
+        handle_2.member_materialization_for_test(&worker),
+        Some(MemberMaterializationPhase::Dormant),
+        "the start leaves the member dormant"
+    );
+    let mut router = handle_2
+        .subscribe_mob_events()
+        .await
+        .expect("the mob event subscription opens");
+    assert_eq!(
+        handle_2.member_materialization_for_test(&worker),
+        Some(MemberMaterializationPhase::Dormant),
+        "the subscription wakes nothing"
+    );
+
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "ROUTER_FIRST_WAKE_TURN",
+        "first wake",
+    )
+    .await;
+    wait_for_routed_run_started(&mut router.event_rx, &worker, "first wake").await;
+
+    // ---------------- Released, then woken again -----------------------------
+    let deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        match handle_2.release_member(&worker).await {
+            Ok(()) => break,
+            Err(meerkat_mob::MobError::LifecycleOperationPending { .. })
+                if Instant::now() < deadline =>
+            {
+                sleep(Duration::from_millis(50)).await;
+            }
+            Err(error) => panic!("release the woken member: {error}"),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while handle_2.member_materialization_for_test(&worker)
+        != Some(MemberMaterializationPhase::Dormant)
+    {
+        assert!(
+            Instant::now() < deadline,
+            "the released member never reads dormant: {:?}",
+            handle_2.member_materialization_for_test(&worker)
+        );
+        sleep(Duration::from_millis(20)).await;
+    }
+    send_and_wait(
+        &handle_2,
+        service_2.as_ref(),
+        "w-1",
+        "ROUTER_REWAKE_TURN",
+        "rewake",
+    )
+    .await;
+    wait_for_routed_run_started(&mut router.event_rx, &worker, "rewake").await;
+    handle_2.shutdown().await.expect("shutdown mob");
+}
+
+/// Wait until `router` delivers a `RunStarted` of `member`.
+#[cfg(feature = "test-support")]
+async fn wait_for_routed_run_started(
+    router: &mut tokio::sync::mpsc::Receiver<meerkat_mob::AttributedEvent>,
+    member: &AgentIdentity,
+    context: &str,
+) {
+    tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let attributed = router
+                .recv()
+                .await
+                .unwrap_or_else(|| panic!("[{context}] the mob event subscription ended"));
+            if attributed.source.identity == *member
+                && matches!(
+                    attributed.envelope.payload,
+                    meerkat_core::AgentEvent::RunStarted { .. }
+                )
+            {
+                return;
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("[{context}] the member's run never reached the subscription"));
+}
+
 /// RuntimeStore is the singular committed body/catalog authority. Replacing it
 /// with a blank store is durable data loss, so stale non-authoritative
 /// SessionStore projections must not resurrect either member.

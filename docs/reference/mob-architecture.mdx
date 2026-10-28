@@ -122,19 +122,23 @@ of the life before it stays in that list.
 
 A seated member that is not materialized in this process (dormant, or waking
 while its wake runs) is not served yet: a dormant member has no session
-actor, and a waking one may or may not have one before its wake ends, so
-`MobHandle::subscribe_agent_events_from` may refuse it
-`MobError::MemberSessionNotLive` until the wake ends live.
-`MobHandle::member_unmaterialized(identity)` reads that fact from the
+actor, and a waking one may or may not have one before its wake ends. A
+subscription to its agent events opens anyway, without waking it and with no
+command to the mob while it waits: `MobHandle::subscribe_agent_events`,
+`subscribe_agent_events_from`, `subscribe_agent_events_observation` and
+`subscribe_all_agent_events` attach the member's stream at its wake, from the
+woken actor's earliest retained event, so the run its next delivery starts is
+read from its first event (the subscription's `attached_epoch` is set at the
+attach, to the sequence space the woken actor's stream names). The mob event
+router (`subscribe_mob_events`) carries such a member from its wake, and a
+member released and woken again from its new actor. A member the machine holds
+live whose session actor is gone is refused `MobError::MemberSessionNotLive`.
+`MobHandle::member_unmaterialized(identity)` reads the residency fact from the
 published machine state, with no command and without waking the member, and
 stays true until the wake ends. The answer can be stale by the time the host
 acts on it, and the read is never a write path: only the machine's own
 transitions move a member's residency, and a host that needs a member live
-wakes it with a delivery or `ensure_member_live`. A host that keeps members'
-agent events attached waits on `machine_state_changes()` and subscribes a
-member once it reads materialized, replaying from
-`SessionEventCursor::Earliest`, so the run its wake started is read from its
-first event.
+wakes it with a delivery or `ensure_member_live`.
 
 ### One-shot durable role migration
 

@@ -67,6 +67,23 @@ them.
   or answered as an unconfirmed (ambiguous) delivery. The stop closes each live
   member's in-process route for peer ingress and the resume reopens it, so the
   sender retries after the mob resumes.
+- Behaviour: `meerkat-mob`: a subscription to the agent events of a member
+  that is not materialized in this process (dormant, or waking) opens without
+  waking it and attaches at the member's wake, from the woken actor's earliest
+  retained event, so a host that subscribes and then sends receives the run
+  its send starts from `RunStarted`. Before, `MobHandle::subscribe_agent_events`
+  and `subscribe_agent_events_from` refused it `MemberSessionNotLive`, and
+  `subscribe_agent_events_observation` failed with an internal "stream not
+  found" error. Such a subscription names no `actor` and no `epoch`; the new
+  `AgentEventSubscription::attached_epoch` is set when the stream attaches, to
+  the sequence space the woken actor's stream names, before its first event.
+  `subscribe_all_agent_events` no longer fails while a member is dormant: each
+  dormant member's stream attaches at its wake. The mob event router
+  (`subscribe_mob_events`) carries a member that was dormant when it
+  subscribed, from its wake, and a member released and woken again, from its
+  new actor; before, it never carried either. A member the machine holds live
+  whose session actor is gone is still refused `MemberSessionNotLive`, and
+  `subscribe_agent_events_observation` now refuses it typed the same way.
 - Behaviour: `rkat resume` and the MCP server's `meerkat_resume` refuse a
   mob member's session that no mob in their own process owns
   (`SESSION_UNSUPPORTED`, the message names the member and its mob): deliver
@@ -429,11 +446,10 @@ them.
   (a member reset seats the next life on a new, unborn session).
   `MobHandle::member_unmaterialized(identity)` answers whether a seated member
   is not materialized in this process (dormant, or waking while its wake
-  runs), from the published machine state and without waking it: until its
-  wake ends, a subscription to its agent events may be refused not live
-  (the read stays true until then), so a host that keeps members' agent
-  events attached subscribes it after the machine state change that ends the
-  wake, with no command while it waits.
+  runs), from the published machine state and without waking it; the read
+  stays true until the wake ends. A subscription to the member's agent events
+  opens meanwhile and attaches at its wake (see the behaviour entry under
+  Breaking).
   The answer can be stale by the time the host acts on it, and the read is
   never a write path.
 

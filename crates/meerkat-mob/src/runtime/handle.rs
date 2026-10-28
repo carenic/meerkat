@@ -8852,6 +8852,10 @@ impl MobHandle {
                 let (authorized_runtimes, authorized_external) =
                     Self::all_agent_event_subscription_authority_from_effects(effects)?;
                 let mut streams = Vec::new();
+                // Members refused not live while not materialized in this
+                // process (dormant, or waking): their streams attach at
+                // their wakes, all through one wait.
+                let mut at_wake = Vec::new();
                 for (dsl_identity, runtime_id) in &machine_state.identity_to_runtime {
                     if !authorized_runtimes.contains(runtime_id) {
                         continue;
@@ -8869,10 +8873,32 @@ impl MobHandle {
                     let agent_identity = AgentIdentity::from(dsl_identity.0.as_str());
                     let session_id =
                         Self::session_id_from_dsl(dsl_session_id, "all-agent event subscription")?;
-                    let stream = self
+                    match self
                         .subscribe_authorized_agent_session_events(&agent_identity, &session_id)
-                        .await?;
-                    streams.push((agent_identity, stream));
+                        .await
+                    {
+                        Ok(stream) => streams.push((agent_identity, stream)),
+                        Err(MobError::MemberSessionNotLive { .. })
+                            if super::boot_plan::domain_member_is_unmaterialized(
+                                &machine_state,
+                                &agent_identity,
+                            ) || self.member_unmaterialized(&agent_identity) =>
+                        {
+                            at_wake.push(agent_identity);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !at_wake.is_empty() {
+                    streams.extend(
+                        super::member_event_attach::spawn_wake_attach(
+                            self,
+                            at_wake,
+                            super::member_event_attach::AttachPath::Authorized,
+                        )
+                        .into_iter()
+                        .map(|(identity, subscription)| (identity, subscription.stream)),
+                    );
                 }
                 // Authorized external members ride pump taps (same item
                 // shape as the local entries).
@@ -9863,15 +9889,14 @@ impl MobHandle {
     /// Whether MobMachine holds `identity` seated and not materialized in
     /// this process: Dormant, or Waking while its one wake attempt runs. A
     /// Dormant member has no session actor; a Waking one may already have
-    /// one (the wake builds it before its readiness settles) or may not, so
-    /// a subscription to its agent events
-    /// ([`Self::subscribe_agent_events_from`]) may be refused
-    /// [`MobError::MemberSessionNotLive`] until its wake ends Live, and this
-    /// read stays `true` until then. The end of the wake changes the machine
-    /// state ([`Self::machine_state_changes`]): a
-    /// host that keeps members' agent events attached subscribes a member
+    /// one (the wake builds it before its readiness settles) or may not, and
+    /// this read stays `true` until the wake ends Live. A subscription to
+    /// its agent events ([`Self::subscribe_agent_events_from`]) opens all the
+    /// same and attaches at the wake. The end of the wake changes the
+    /// machine state ([`Self::machine_state_changes`]): a host that keeps
+    /// many members' agent events attached can instead subscribe a member
     /// after the change that makes this read `false`, with no command to the
-    /// actor while it reads `true`, and replays from
+    /// actor while it reads `true`, and replay from
     /// [`SessionEventCursor::Earliest`], so the run the wake started is read
     /// from its first event.
     ///
@@ -12248,9 +12273,14 @@ impl MobHandle {
     /// Delivers only events published after the subscription attaches; use
     /// [`Self::subscribe_agent_events_from`] to replay retained events.
     ///
+    /// A member that is not materialized in this process (dormant, or waking)
+    /// is subscribed without waking it: the stream attaches at its wake, as
+    /// [`Self::subscribe_agent_events_from`] describes.
+    ///
     /// Returns `MobError::MemberNotFound` if the member is not in the
     /// roster or has no backing bridge session, and
-    /// `MobError::MemberSessionNotLive` if its session has no live actor.
+    /// `MobError::MemberSessionNotLive` if its session has no live actor
+    /// while MobMachine holds it live.
     pub async fn subscribe_agent_events(
         &self,
         identity: &AgentIdentity,
@@ -12277,7 +12307,38 @@ impl MobHandle {
     /// The subscription names the exact actor incarnation of a local member
     /// (`None` for a placed member), so a host can let a revoked
     /// predecessor's stream drain before a successor's.
+    ///
+    /// A member MobMachine holds seated and not materialized in this process
+    /// (dormant, or waking) has no live actor to attach to yet. Its
+    /// subscription opens anyway, without waking it and with no command to
+    /// the mob while it waits: the stream attaches at the member's wake, from
+    /// the woken actor's earliest retained event whatever `cursor` is (all of
+    /// it happened after the wake, so a cursor into an earlier incarnation
+    /// has nothing newer to skip), so the run the host's next delivery starts
+    /// is read from its `RunStarted`. Such a subscription names no actor and
+    /// no epoch; its `attached_epoch` is set at the attach, to the sequence
+    /// space the woken actor's stream names. Its stream ends with no event
+    /// when the member leaves the mob or the mob ends first. A member
+    /// MobMachine holds live whose session actor is gone is refused
+    /// `MobError::MemberSessionNotLive`.
     pub async fn subscribe_agent_events_from(
+        &self,
+        identity: &AgentIdentity,
+        cursor: SessionEventCursor,
+    ) -> Result<AgentEventSubscription, MobError> {
+        super::member_event_attach::subscribe_or_attach_at_wake(
+            self,
+            identity,
+            cursor,
+            super::member_event_attach::AttachPath::Authorized,
+        )
+        .await
+    }
+
+    /// One subscription attempt through MobMachine's subscription authority,
+    /// which refuses a member with no live session actor
+    /// `MobError::MemberSessionNotLive`.
+    pub(super) async fn subscribe_agent_events_once(
         &self,
         identity: &AgentIdentity,
         cursor: SessionEventCursor,
@@ -12304,10 +12365,35 @@ impl MobHandle {
     /// local bridge session. Placed members require the actor-owned external
     /// event pump, so this non-blocking helper rejects them explicitly rather
     /// than treating their host-resident session id as a local session id.
+    ///
+    /// A member that is not materialized in this process (dormant, or waking)
+    /// is subscribed without waking it and attaches at its wake, at the
+    /// session MobMachine binds it to then, as
+    /// [`Self::subscribe_agent_events_from`] describes. A member MobMachine
+    /// holds live whose session actor is gone is refused
+    /// `MobError::MemberSessionNotLive`.
     pub async fn subscribe_agent_events_observation(
         &self,
         identity: &AgentIdentity,
     ) -> Result<EventStream, MobError> {
+        super::member_event_attach::subscribe_or_attach_at_wake(
+            self,
+            identity,
+            SessionEventCursor::Live,
+            super::member_event_attach::AttachPath::Observation,
+        )
+        .await
+        .map(|subscription| subscription.stream)
+    }
+
+    /// One observation-only subscription attempt at the session MobMachine
+    /// binds `identity` to now, refused `MobError::MemberSessionNotLive`
+    /// when that session has no live actor.
+    pub(super) async fn subscribe_agent_events_observation_once(
+        &self,
+        identity: &AgentIdentity,
+        cursor: SessionEventCursor,
+    ) -> Result<AgentEventSubscription, MobError> {
         let runtime_mode = {
             let roster = self.roster.read().await;
             let entry = roster
@@ -12315,36 +12401,35 @@ impl MobHandle {
                 .ok_or_else(|| MobError::MemberNotFound(identity.clone()))?;
             entry.runtime_mode
         };
-        let machine_state = self.machine_state_watch_rx.borrow().clone();
-        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
-        if super::member_runtime_is_host_owned(&machine_state, identity) {
-            return Err(MobError::UnsupportedForMode {
-                mode: runtime_mode,
-                reason: "observation-only agent event subscriptions for placed members require the actor-owned external event pump"
-                    .to_string(),
-            });
-        }
-        let session_id = machine_state
-            .member_session_bindings
-            .get(&dsl_identity)
-            .ok_or_else(|| MobError::UnsupportedForMode {
-                mode: runtime_mode,
-                reason: "agent event subscriptions are not supported for peer-only members"
-                    .to_string(),
-            })
-            .and_then(|session_id| {
-                Self::session_id_from_dsl(session_id, "observation agent event subscription")
-            })?;
-        crate::runtime::session_service::MobSessionService::subscribe_session_events(
+        let session_id = {
+            let machine_state = self.machine_state_watch_rx.borrow();
+            let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+            if super::member_runtime_is_host_owned(&machine_state, identity) {
+                return Err(MobError::UnsupportedForMode {
+                    mode: runtime_mode,
+                    reason: "observation-only agent event subscriptions for placed members require the actor-owned external event pump"
+                        .to_string(),
+                });
+            }
+            machine_state
+                .member_session_bindings
+                .get(&dsl_identity)
+                .ok_or_else(|| MobError::UnsupportedForMode {
+                    mode: runtime_mode,
+                    reason: "agent event subscriptions are not supported for peer-only members"
+                        .to_string(),
+                })
+                .and_then(|session_id| {
+                    Self::session_id_from_dsl(session_id, "observation agent event subscription")
+                })?
+        };
+        crate::runtime::session_service::MobSessionService::subscribe_agent_session_events_from(
             self.session_service.as_ref(),
             &session_id,
+            cursor,
         )
         .await
-        .map_err(|error| {
-            MobError::Internal(format!(
-                "failed to subscribe to agent events for '{identity}': {error}"
-            ))
-        })
+        .map_err(|error| agent_event_subscription_error(identity, &session_id, error))
     }
 
     /// Subscribe to agent events for all active members (point-in-time snapshot).

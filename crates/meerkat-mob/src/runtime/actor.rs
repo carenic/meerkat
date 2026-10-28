@@ -13069,13 +13069,21 @@ impl MobActor {
                 .swap(revision, std::sync::atomic::Ordering::AcqRel)
                 != revision
         });
+        let feed = self.lifecycle_observations.materialization_feed();
+        let mut moved_members = None;
         self.machine_state_watch_tx.send_if_modified(|published| {
             let state_changed = published != state;
             if state_changed {
+                moved_members = feed.changes_between(published, state);
                 published.clone_from(state);
             }
             state_changed || roster_changed
         });
+        // After the state is published: a subscription waiting for a
+        // member's wake reads the state the change names.
+        if let Some(moved_members) = moved_members {
+            feed.publish(moved_members);
+        }
     }
 
     fn apply_dsl_input(
