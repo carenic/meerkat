@@ -20997,7 +20997,7 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    let adapter = service.enable_runtime_adapter();
     let handle = MobBuilder::new(
         definition,
         MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone()),
@@ -21179,7 +21179,25 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
             .expect("test generation has a successor"),
         "cold replay must preserve retired generation history"
     );
+    let replacement_session = replacement
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed replacement");
     crash_stop_and_release_routes(resumed).await;
+    // A crash ends the process and every runtime registration it held. This
+    // harness rebuilds the mob in the same process over the same runtime
+    // adapter (a crash simulation, not a supported path), where the crashed
+    // actor's registration of the replacement's session outlives the actor,
+    // still bound to its closed signal queue: nothing in the rebuilt mob
+    // adopts a Dormant member's leftover registration, and the replacement's
+    // archive-only retire would retire that registration and fail on the
+    // closed queue. Settle it as the crash would have, so the rebuilt mob
+    // starts from what a restarted process starts from.
+    if adapter.contains_session(&replacement_session).await {
+        unregister_runtime_session_until_complete(adapter.as_ref(), &replacement_session)
+            .await
+            .expect("settle the crashed actor's registration of the replacement's session");
+    }
 
     let resumed_replacement = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -21353,15 +21371,33 @@ async fn test_destroy_storage_finalizing_append_failure_precedes_storage_scrub()
     );
 }
 
+/// A destroy whose retire of a member is refused after the durable destroy
+/// marker keeps the member's roster anchor for a retry and closes the mob's
+/// live authority. The member's runtime registration is unregistered from
+/// outside the mob, which releases it to the mob, and the member is one that
+/// release cannot demote: its routed binding is held, so the registration's
+/// epoch is not recorded and the release is MobMachine's accepted Stale no-op
+/// (`NotYetReleasable`). It stays Live with no registration, so the destroy
+/// still routes its runtime retire, which the unregistered consumer refuses.
+/// (A member the release demotes is Dormant, and the destroy retires it
+/// archive-only:
+/// `test_destroy_of_a_member_released_outside_the_mob_archives_it_without_a_routed_retire`.)
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor_and_closes_authority()
  {
+    // The binding hold is keyed by member identity for the whole process, so
+    // the worker's identity is unique. It is held for the whole row.
+    let worker = AgentIdentity::from(format!(
+        "destroy-stop-loop-worker-{}",
+        Uuid::new_v4().simple()
+    ));
+    let _binding_hold = crate::runtime::composition::ready_signal_test_hold::hold(worker.as_str());
     let definition = with_unique_mob_id(sample_definition(), "destroy-retire-admission-fail");
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let (handle, service) = create_test_mob_with_events(definition, events.clone()).await;
     service.set_keep_alive_turns_complete_immediately(true);
     let adapter = service.enable_runtime_adapter();
-    let worker = AgentIdentity::from("destroy-stop-loop-worker");
     let bridge_session_id = handle
         .spawn(
             ProfileName::from("worker"),
@@ -21377,6 +21413,24 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
     unregister_runtime_session_until_complete(adapter.as_ref(), &bridge_session_id)
         .await
         .expect("bridge session should unregister cleanly");
+    // The actor handles its commands in order: a status answered after the
+    // unregister returned was handled after the release it published.
+    handle
+        .status()
+        .await
+        .expect("an actor round trip after the release");
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&crate::machines::mob_machine::AgentIdentity::from_domain(
+                &worker
+            ))
+            .copied(),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a release before the binding recorded the registration's epoch demotes nothing"
+    );
 
     let err = handle
         .destroy()
@@ -21462,6 +21516,67 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
                 )
         }),
         "same-process retry must preserve the cold-reload requirement and partial destroy state: {retry_report:?}"
+    );
+}
+
+/// The member's runtime registration is unregistered from outside the mob,
+/// and the final unregister is released to the mob
+/// (`RuntimeRegistrationReleased`): MobMachine demotes the member to Dormant,
+/// and a destroy retires a Dormant member archive-only. No runtime of this
+/// process holds its session, so the destroy routes it no runtime retire,
+/// nothing refuses, and the destroy completes: the session archive alone
+/// terminates the member. A member the release cannot demote keeps the routed
+/// retire and the consumer's refusal of it:
+/// `test_destroy_retire_admission_failure_after_marker_retains_retry_anchor_and_closes_authority`.
+#[tokio::test]
+async fn test_destroy_of_a_member_released_outside_the_mob_archives_it_without_a_routed_retire() {
+    let definition = with_unique_mob_id(sample_definition(), "destroy-released-member");
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+    let adapter = service.enable_runtime_adapter();
+    let worker = AgentIdentity::from("destroy-released-worker");
+    let bridge_session_id = handle
+        .spawn(ProfileName::from("worker"), worker.clone(), None)
+        .await
+        .expect("spawn autonomous worker before the destroy")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed worker");
+
+    unregister_runtime_session_until_complete(adapter.as_ref(), &bridge_session_id)
+        .await
+        .expect("bridge session should unregister cleanly");
+    let key = crate::machines::mob_machine::AgentIdentity::from_domain(&worker);
+    let mut machine = handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.wait_for(|state| {
+            state.member_materialization.get(&key)
+                == Some(&crate::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        }),
+    )
+    .await
+    .expect("the released registration demotes the member in time")
+    .expect("the machine state stays published");
+
+    let report = handle.destroy().await.expect(
+        "the destroy retires the Dormant member archive-only, with no routed retire to refuse",
+    );
+    assert!(
+        report.errors.is_empty(),
+        "the archive-only destroy reports no cleanup error: {report:?}"
+    );
+    assert!(
+        report.namespace_cleaned && report.metadata_scrubbed && report.events_cleared,
+        "the destroy completes its cleanup: {report:?}"
+    );
+    assert_eq!(
+        handle.status().await.expect("status after the destroy"),
+        MobState::Destroyed
+    );
+    assert!(
+        service.test_is_session_archived(&bridge_session_id).await,
+        "the session archive alone terminates the Dormant member"
     );
 }
 
@@ -80067,17 +80182,45 @@ async fn test_shutdown_skips_interrupt_for_host_owned_runtime_release_anchor() {
     );
 }
 
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_retire_consumer_refusal_survives_cold_restart_and_retries() {
     assert_retire_consumer_refusal_survives_cold_restart(false).await;
 }
 
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_retire_consumer_refusal_running_cold_restart_preserves_detached_binding() {
     assert_retire_consumer_refusal_survives_cold_restart(true).await;
 }
 
+/// The members' runtime registrations are unregistered from outside the mob,
+/// and each final unregister is released to the mob
+/// (`RuntimeRegistrationReleased`).
+///
+/// A member the release demotes is Dormant, and retiring a Dormant member is
+/// archive-only: no runtime of this process holds its session, so its retire
+/// routes no runtime retire, nothing can refuse it, and it completes at once.
+///
+/// A member the release cannot demote keeps the routed retire and the
+/// consumer's refusal of it: here one whose routed binding has not recorded
+/// its registration's epoch yet (MobMachine's `NotYetReleasable`), so the
+/// release is the accepted Stale no-op and the member stays Live with no
+/// registration. The unregistered runtime consumer refuses its routed retire,
+/// and the durable retirement start stays its retry anchor across a cold
+/// restart (a Stop then a shutdown, or a crash while Running). The restart
+/// recovers the retirement archive-only (no retiring member is woken after a
+/// restart), so the retry completes it with the runtime still unregistered.
+#[cfg(feature = "runtime-adapter")]
 async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: bool) {
+    let released = AgentIdentity::from("w-released");
+    // The binding hold is keyed by member identity for the whole process, so
+    // the held member's identity is unique. It is held from its spawn until
+    // the refusing actor is gone.
+    let pinned = AgentIdentity::from(format!("w-1-binding-held-{}", Uuid::new_v4().simple()));
+    let binding_hold = crate::runtime::composition::ready_signal_test_hold::hold(pinned.as_str());
+    let released_key = crate::machines::mob_machine::AgentIdentity::from_domain(&released);
+    let pinned_key = crate::machines::mob_machine::AgentIdentity::from_domain(&pinned);
     let service = Arc::new(MockSessionService::new());
     let adapter = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -80088,19 +80231,87 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         .create()
         .await
         .expect("create mob");
-    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    let mut spec = SpawnMemberSpec::new("worker", released.as_str());
     spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
-    handle.spawn_spec(spec).await.expect("spawn w-1");
-    let session_id = handle
-        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the member the release demotes");
+    let released_session = handle
+        .resolve_bridge_session_id(&released)
         .await
         .expect("session-backed");
-    unregister_runtime_session_until_complete(adapter.as_ref(), &session_id)
+    let mut spec = SpawnMemberSpec::new("worker", pinned.as_str());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
         .await
-        .expect("bridge session should unregister cleanly");
+        .expect("spawn the member the release cannot demote");
+    let session_id = handle
+        .resolve_bridge_session_id(&pinned)
+        .await
+        .expect("session-backed");
+    assert!(
+        !handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization_epoch
+            .get(&pinned_key)
+            .is_some_and(Option::is_some),
+        "the held binding has not recorded the registration's epoch"
+    );
+    for session in [&released_session, &session_id] {
+        unregister_runtime_session_until_complete(adapter.as_ref(), session)
+            .await
+            .expect("bridge session should unregister cleanly");
+    }
+    let mut machine = handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.wait_for(|state| {
+            state.member_materialization.get(&released_key)
+                == Some(&crate::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        }),
+    )
+    .await
+    .expect("the released registration demotes its member in time")
+    .expect("the machine state stays published");
+    // The actor handles its commands in order: a status answered after both
+    // unregisters returned was handled after both releases they published.
+    handle
+        .status()
+        .await
+        .expect("an actor round trip after the releases");
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&pinned_key)
+            .copied(),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a release before the binding recorded the registration's epoch demotes nothing"
+    );
+
+    handle
+        .retire(released.clone())
+        .await
+        .expect("a Dormant member retires archive-only, with no routed retire to refuse");
+    assert!(
+        handle
+            .get_member(&released)
+            .await
+            .expect("read the archive-only retirement's roster")
+            .is_none(),
+        "the archive-only retirement completes at once"
+    );
+    assert!(
+        service.test_is_session_archived(&released_session).await,
+        "the session archive alone terminates the Dormant member"
+    );
 
     let refusal = handle
-        .retire(AgentIdentity::from("w-1"))
+        .retire(pinned.clone())
         .await
         .expect_err("unregistered runtime consumer must refuse the routed retire");
     assert!(
@@ -80109,25 +80320,35 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     );
     assert!(
         handle
-            .get_member(&AgentIdentity::from("w-1"))
+            .get_member(&pinned)
             .await
             .expect("read retained member")
             .is_some(),
         "consumer refusal must retain the roster cleanup anchor"
     );
     let after_refusal = events.replay_all().await.expect("replay refusal events");
+    for (identity, session, label) in [
+        (&released, &released_session, "archive-only"),
+        (&pinned, &session_id, "refused"),
+    ] {
+        assert!(
+            after_refusal.iter().any(|event| matches!(
+                &event.kind,
+                MobEventKind::MemberRetirementStarted {
+                    agent_identity,
+                    releasing: Some(releasing),
+                    ..
+                } if agent_identity == identity && releasing == session
+            )),
+            "the {label} durable retirement must release this exact ordinary member binding"
+        );
+    }
     assert!(
-        after_refusal.iter().any(|event| matches!(
+        after_refusal.iter().all(|event| !matches!(
             &event.kind,
-            MobEventKind::MemberRetirementStarted { releasing: Some(releasing), .. }
-                if releasing == &session_id
+            MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == &pinned
         )),
-        "the durable retirement must release this exact ordinary member binding"
-    );
-    assert!(
-        after_refusal
-            .iter()
-            .all(|event| !matches!(event.kind, MobEventKind::MemberRetired { .. }))
+        "the refused retirement publishes no final event"
     );
 
     let expected_phase = if crash_restart {
@@ -80153,15 +80374,18 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         );
         MobState::Stopped
     };
+    // The refusing actor is gone: the held readiness observation can reach no
+    // live mob now.
+    drop(binding_hold);
 
-    // Repair the external runtime reachability that caused the first refusal.
     // Resume must derive RETIRE retry authority solely from the durable start
-    // event; the in-memory refusal maps and actor state are gone.
-    adapter
-        .register_session(session_id.clone())
-        .await
-        .expect("restore runtime reachability before retry");
-
+    // event; the in-memory refusal maps and actor state are gone. The runtime
+    // stays unregistered: the recovered retirement routes no runtime retire.
+    // A start re-drives every retirement it recovered, and the row's retry
+    // joins that re-drive: the retry is held at its archive stage, so the
+    // recovered state is read before the retirement completes.
+    let archive_hold =
+        super::actor::retirement_stage_hold::install(&pinned, "retire-session-archive");
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -80171,23 +80395,49 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     .resume()
     .await
     .expect("resume retiring mob from durable event journal");
+    let retry = {
+        let resumed = resumed.clone();
+        let pinned = pinned.clone();
+        tokio::spawn(async move { retire_to_terminal(&resumed, &pinned).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), archive_hold.entered())
+        .await
+        .expect("the retry of the recovered retirement reaches its archive");
 
     let recovered = resumed
         .query_machine_state()
         .await
         .expect("query recovered machine state");
-    assert!(
+    let pinned_runtime = recovered
+        .identity_to_runtime
+        .get(&pinned_key)
+        .cloned()
+        .expect("the retiring member keeps its runtime binding until its retirement completes");
+    assert_eq!(
         recovered
             .runtime_retire_pending_sessions
-            .values()
-            .any(|pending| pending.0 == session_id.to_string()),
+            .get(&pinned_runtime)
+            .map(|pending| pending.0.clone()),
+        Some(session_id.to_string()),
         "cold replay must restore the exact pending runtime-retire correlation"
     );
     assert!(
-        !recovered
-            .member_session_bindings
-            .contains_key(&crate::machines::mob_machine::AgentIdentity::from("w-1")),
+        recovered
+            .runtime_retire_archive_only
+            .contains(&pinned_runtime),
+        "a retirement recovered at a start is archive-only: it routes no runtime retire"
+    );
+    assert!(
+        !recovered.member_session_bindings.contains_key(&pinned_key),
         "cleanup recovery must not restore the ordinary binding released by the durable retirement"
+    );
+    assert!(
+        resumed
+            .get_member(&released)
+            .await
+            .expect("read the archive-only retirement after the restart")
+            .is_none(),
+        "the completed archive-only retirement stays complete across the restart"
     );
     assert_eq!(
         resumed
@@ -80198,27 +80448,34 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         "cleanup delivery recovery must preserve the durable lifecycle phase"
     );
 
-    resumed
-        .retire(AgentIdentity::from("w-1"))
+    archive_hold.release();
+    tokio::time::timeout(Duration::from_secs(10), retry)
         .await
+        .expect("the retry answers once its archive runs")
+        .expect("retry task")
         .expect("cold-restarted pending retirement should retry and complete");
     assert!(
         resumed
-            .get_member(&AgentIdentity::from("w-1"))
+            .get_member(&pinned)
             .await
             .expect("read member after completed retry")
             .is_none(),
         "successful retry must remove the completed roster entry"
     );
     let completed = events.replay_all().await.expect("replay completed events");
-    assert_eq!(
-        completed
-            .iter()
-            .filter(|event| matches!(event.kind, MobEventKind::MemberRetired { .. }))
-            .count(),
-        1,
-        "retry must publish exactly one final MemberRetired event"
-    );
+    for identity in [&pinned, &released] {
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == identity
+                ))
+                .count(),
+            1,
+            "each retirement must publish exactly one final MemberRetired event: {identity}"
+        );
+    }
 
     assert_eq!(
         resumed.status().await.expect("query recovered lifecycle"),
