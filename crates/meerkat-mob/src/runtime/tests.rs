@@ -37238,10 +37238,17 @@ async fn test_for_resume_rebuilds_definition_and_roster() {
         .expect("the actor provisioner must own the attachment sidecar committed by recovery");
 }
 
+/// A running autonomous member whose kickoff resolved before the process
+/// ended gets its startup readiness back from the recovered actor's own
+/// checks, with no second kickoff turn: the restart owes it nothing. A
+/// kickoff a crash leaves starting is owed instead and runs once after the
+/// restart (the rotated-kickoff restart rows).
 #[tokio::test]
 async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without_kickoff() {
     let service = Arc::new(MockSessionService::new());
     let _ = service.enable_runtime_adapter();
+    // The first life's kickoff turn completes, so its kickoff resolves.
+    service.set_keep_alive_turns_complete_immediately(true);
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
     let runs = storage.runs.clone();
@@ -37272,6 +37279,18 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
         service.keep_alive_start_turn_call_count(),
         1,
         "fresh spawn must execute exactly one kickoff turn"
+    );
+    let resolved = handle
+        .wait_for_members_kickoff_complete(
+            std::slice::from_ref(&member),
+            Some(Duration::from_secs(2)),
+        )
+        .await
+        .expect("the first life's kickoff resolves");
+    assert_eq!(
+        resolved[0].1.kickoff.as_ref().map(|kickoff| kickoff.phase),
+        Some(crate::roster::MobMemberKickoffPhase::Started),
+        "the first life's kickoff resolved before the process ends"
     );
 
     // Rebuild from durable state using a process-restart-faithful service.
@@ -37314,11 +37333,27 @@ async fn test_cold_running_resume_reestablishes_autonomous_startup_ready_without
     assert_eq!(ready.len(), 1);
     assert_eq!(ready[0].0, member);
     assert_eq!(ready[0].1.status, MobMemberStatus::Active);
-    assert_eq!(
-        restarted_service.keep_alive_start_turn_call_count(),
-        0,
-        "cold readiness recovery must not synthesize a second kickoff turn"
+    let dsl_member = crate::machines::mob_machine::AgentIdentity::from_domain(&member);
+    let state = resumed
+        .query_machine_state()
+        .await
+        .expect("the resumed mob's machine state");
+    assert!(
+        !state.member_kickoff_pending.contains(&dsl_member)
+            && !state.member_kickoff_starting.contains(&dsl_member),
+        "the restart owes no kickoff: the first life's kickoff resolved"
     );
+    // A kickoff the restart started would reach the service within
+    // milliseconds of readiness; the count stays zero over a bounded window.
+    let window_end = tokio::time::Instant::now() + Duration::from_secs(1);
+    while tokio::time::Instant::now() < window_end {
+        assert_eq!(
+            restarted_service.keep_alive_start_turn_call_count(),
+            0,
+            "cold readiness recovery must not synthesize a second kickoff turn"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
 }
 
 /// How a host ends a member's session runtime outside the mob's own retire
