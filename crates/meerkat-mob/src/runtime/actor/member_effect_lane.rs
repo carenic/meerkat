@@ -27,8 +27,8 @@
 //! member do not wait for such a step: MobMachine closes the step's wake
 //! attempt when a Stop or a Complete commits and when the member's
 //! retirement starts, and the step's late commit fails that fence and rolls
-//! back. A started retirement's own steps still run after it, one effect of
-//! a member at a time.
+//! back. A started retirement's own steps, and a later wake attempt's
+//! restore, still run after it: one effect of a member at a time.
 //!
 //! What the lane deliberately does NOT own: what the effects mean. It never
 //! inspects the payload and never invents a compensation — the caller's
@@ -1055,6 +1055,14 @@ impl MobActor {
         });
     }
 
+    /// Whether the lane owns a wake or warm-reload step of `identity` now.
+    pub(in crate::runtime) fn member_wake_effects_in_flight(
+        &self,
+        identity: &AgentIdentity,
+    ) -> bool {
+        self.member_wake_effects.borrow().contains(identity)
+    }
+
     /// A future that resolves once the lane owns no wake or warm-reload step
     /// of `identity`, or `None` when it owns none now: one effect of a member
     /// at a time. A started retirement's own steps wait on it, so a wake's
@@ -1064,7 +1072,7 @@ impl MobActor {
         &self,
         identity: &AgentIdentity,
     ) -> Option<impl std::future::Future<Output = ()> + MemberEffectSend + 'static> {
-        if !self.member_wake_effects.borrow().contains(identity) {
+        if !self.member_wake_effects_in_flight(identity) {
             return None;
         }
         let mut waking = self.member_wake_effects.subscribe();

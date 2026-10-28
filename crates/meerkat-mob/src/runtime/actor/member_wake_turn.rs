@@ -425,10 +425,47 @@ impl MemberWakeRestoreProbe {
 impl MobActor {
     /// Start every materialization MobMachine handed off since the last loop
     /// boundary.
+    ///
+    /// One effect of a member at a time: an open attempt of a member that
+    /// still has an earlier wake or warm-reload step in flight (a Stop or a
+    /// Complete left it running; its late commit fails its attempt fence and
+    /// rolls its provision back) does not start its restore beside that
+    /// step. It stays handed off, with its wake bound armed, and starts at
+    /// the first loop boundary after the member's last such step settled.
     pub(in crate::runtime) async fn start_pending_member_materializations(&mut self) {
+        let mut waiting = Vec::new();
         while let Some(pending) = self.member_wakes.pending.pop_front() {
+            if self.member_wake_attempt_is_open(&pending.identity, pending.attempt)
+                && self.member_wake_effects_in_flight(&pending.identity)
+            {
+                self.begin_running_member_wake(&pending.identity, pending.cause, pending.attempt);
+                waiting.push(pending);
+                continue;
+            }
             self.start_member_materialization(pending).await;
         }
+        self.member_wakes.pending.extend(waiting);
+    }
+
+    /// Take `attempt` as a wake this actor runs and arm the mob's wake bound
+    /// for it, once per attempt.
+    fn begin_running_member_wake(
+        &mut self,
+        identity: &AgentIdentity,
+        cause: mob_dsl::MemberWakeCause,
+        attempt: MemberWakeAttempt,
+    ) {
+        if self.member_wakes.running.contains_key(&attempt) {
+            return;
+        }
+        self.member_wakes.running.insert(
+            attempt,
+            RunningMemberWake {
+                identity: identity.clone(),
+                cause,
+            },
+        );
+        self.arm_member_wake_bound(identity, attempt);
     }
 
     /// Step A: dispatch the cold restore of one authorized attempt.
@@ -449,14 +486,7 @@ impl MobActor {
             attempt,
             cause,
         };
-        self.member_wakes.running.insert(
-            attempt,
-            RunningMemberWake {
-                identity: identity.clone(),
-                cause,
-            },
-        );
-        self.arm_member_wake_bound(&identity, attempt);
+        self.begin_running_member_wake(&identity, cause, attempt);
 
         // The seat's build inputs ride the member's first build, as a
         // spawn's do; a member whose session a build created has none.
