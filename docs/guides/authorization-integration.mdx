@@ -551,8 +551,21 @@ Revoking allowances that were published earlier, for example on logout, stays
 with the host's existing publication and withdrawal path. The stock servers
 build no such event.
 
-Waking the owning session on a decision, durable delivery with a visible
-failure, and handing approved consent across a new turn are later work.
+An embedding host delivers consent notices into the owning session by
+composing `ConsentNoticeProjector` into its delivery owner
+(`SessionServiceDeliveryHost::with_consent_notices`). Each Approved, Denied or
+Withdrawn notice is admitted as a resume of the run that issued the consent,
+and the approval records its receipt: `Admitted` for the input that carries
+it, or `Failed` for a notice that can never be admitted. Approved consent
+parked at that run's close moves into the resumed run its notice starts, and
+that run spends it once; a `Failed` notice withdraws it. The governed
+composition admits a resume only through its retained-resume owner: the stock
+governed composition installs one, and a custom composition supplies its own
+(`ScopedGrantComposition::with_retained_resume`). Without one, every notice
+stays owed. On a stock governed realm, an approval resumes the parked run only
+while no later governed prompt has moved that session's destination; after
+one, its notice fails visibly. The stock servers compose no notice delivery of
+their own.
 
 Reusable consent applies only to a requirement that owner policy explicitly
 makes reusable, with a defined scope, use limits where bounded, expiry or an

@@ -1,16 +1,23 @@
-//! Stock rkat's controller pin: the actual selected controller client the
-//! stock factory built for the session, handed to the scoped original
-//! composition as its [`RetainedControllerOwner`].
+//! Stock rkat's controller pin: the actual selected controller client a
+//! session's governed binding was made with, the one the stock factory built
+//! for the session and its host passed to [`super::StockGovernance::bind_prompt`],
+//! [`super::StockGovernance::bind_caller_prompt`] or
+//! [`super::StockGovernance::bind_host_outcome`]. The ingress pins that client
+//! on the input it admits (`NativeIngressContext::with_controller_client`).
 //!
-//! The pin is the client itself, never rebuilt from a selection: a request
-//! for any other selection gets no client. The CLI ingress pins the same
-//! client on the input it admits (`NativeIngressContext::with_controller_client`).
+//! The stock composition keeps each session runtime's latest pin and hands
+//! it, for a retained resume of that runtime's work only, to the scoped
+//! original composition's retained-resume check as its
+//! [`RetainedControllerOwner`]. The pin is the client itself, never rebuilt
+//! from a selection: a request for any other selection gets no client.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use meerkat_core::authorization::ControllerReadinessFailure;
 use meerkat_core::{ControllerModelClient, ControllerModelSelection};
 use meerkat_runtime::meerkat_machine::RetainedControllerOwner;
+use meerkat_runtime::{LogicalRuntimeId, RuntimeSessionRegistrationWitness};
 
 /// The route report of a pinned controller client, defined in
 /// [`crate::controller_route`] and re-exported here unchanged.
@@ -39,6 +46,92 @@ impl RetainedControllerOwner for StockControllerPin {
         selection: &ControllerModelSelection,
     ) -> Result<Option<ControllerModelClient>, ControllerReadinessFailure> {
         Ok((self.client.selection() == selection).then(|| self.client.clone()))
+    }
+}
+
+/// The controller pins of one stock composition's sessions, for retained
+/// resume only: per session runtime, the pin of the client the session's
+/// latest governed binding was made with, kept for the exact registration
+/// that binding was made on.
+///
+/// A capability cache, not lifecycle state: it holds no authority, decides
+/// nothing and records no fact of any owner. Every governed binding of a
+/// session replaces its pin. A pin whose registration has ended (the session
+/// unbound, unregistered or retired) is never served again and is removed at
+/// the next binding or resume check, so the cache does not grow with dead
+/// sessions in a long-running host. Only the composition's retained-resume
+/// check reads it: no authority decision does, and the pin answers no
+/// selection but its own client's.
+#[derive(Default)]
+pub(crate) struct StockResumePins {
+    pins: std::sync::Mutex<HashMap<LogicalRuntimeId, RegistrationPin>>,
+}
+
+/// One session runtime's pin and the registration it was made on.
+struct RegistrationPin {
+    registration: RuntimeSessionRegistrationWitness,
+    pin: Arc<StockControllerPin>,
+}
+
+impl StockResumePins {
+    /// Pin `client` for the session `registration` registers, replacing that
+    /// session's earlier pin, and drop every pin whose registration has
+    /// ended.
+    pub(crate) fn record(
+        &self,
+        registration: RuntimeSessionRegistrationWitness,
+        client: ControllerModelClient,
+    ) {
+        let runtime = LogicalRuntimeId::for_session(registration.session_id());
+        let mut pins = self.lock();
+        pins.retain(|_, pinned| !pinned.registration.has_ended());
+        pins.insert(
+            runtime,
+            RegistrationPin {
+                registration,
+                pin: StockControllerPin::new(client),
+            },
+        );
+    }
+
+    /// The retained-resume controller owner of `runtime`: its session's pin
+    /// while the registration it was made on has not ended, otherwise one
+    /// that has no client for any selection (the check then answers the
+    /// resume not ready). An ended pin is removed here.
+    pub(crate) fn controller_owner(
+        &self,
+        runtime: &LogicalRuntimeId,
+    ) -> Arc<dyn RetainedControllerOwner> {
+        let mut pins = self.lock();
+        if pins
+            .get(runtime)
+            .is_some_and(|pinned| pinned.registration.has_ended())
+        {
+            pins.remove(runtime);
+        }
+        let current = pins
+            .get(runtime)
+            .map(|pinned| Arc::clone(&pinned.pin) as Arc<dyn RetainedControllerOwner>);
+        drop(pins);
+        current.unwrap_or_else(|| Arc::new(Unpinned))
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<LogicalRuntimeId, RegistrationPin>> {
+        self.pins
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// A session runtime with no current pin: no client for any selection.
+struct Unpinned;
+
+impl RetainedControllerOwner for Unpinned {
+    fn reacquire_controller(
+        &self,
+        _selection: &ControllerModelSelection,
+    ) -> Result<Option<ControllerModelClient>, ControllerReadinessFailure> {
+        Ok(None)
     }
 }
 

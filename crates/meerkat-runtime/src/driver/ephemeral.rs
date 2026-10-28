@@ -1506,18 +1506,37 @@ impl EphemeralRuntimeDriver {
 
     /// A governed input is admitted only for the scoped destination this
     /// session document currently serves, when one is bound.
+    ///
+    /// A resume of retained work names its original's destination. When the
+    /// document has since bound a later generation of that same destination,
+    /// the resume can never be admitted here (a document's generations only
+    /// advance): it is refused for good, so the delivery carrying it settles
+    /// instead of retrying forever. Every other mismatch stays retryable.
     fn check_scoped_context(&self, input: &Input) -> Result<(), RuntimeDriverError> {
-        let (current, ever_bound) = self.with_dsl_state(|state| {
-            (
-                state.scoped_context_binding.clone(),
-                state.scoped_context_generation > 0 || state.scoped_context_required,
-            )
-        });
+        let (current, current_scope, current_generation, ever_bound) =
+            self.with_dsl_state(|state| {
+                (
+                    state.scoped_context_binding.clone(),
+                    state.scoped_context_scope.clone(),
+                    state.scoped_context_generation,
+                    state.scoped_context_generation > 0 || state.scoped_context_required,
+                )
+            });
         match (
             current,
             crate::input_authority::input_context_target(input)?,
         ) {
             (Some(current), Some(target)) if current != target => {
+                if crate::input_authority::retained_resume_destination_superseded(
+                    input,
+                    current_scope.as_deref(),
+                    current_generation,
+                )? {
+                    return Err(RuntimeDriverError::RetainedResumeRefused {
+                        reason:
+                            crate::retained_work::RetainedResumeRefusal::NoAdmissibleWorkBinding,
+                    });
+                }
                 Err(crate::input_authority::unavailable())
             }
             // A retired destination (or a required, not yet bound one) is

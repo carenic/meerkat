@@ -192,7 +192,11 @@ impl<S> SessionServiceDeliveryHost<S> {
     /// to this host's hosting domain on the owner's rounds, and confirm them
     /// against that owner when a governed runtime admits them. A stable
     /// capability: the host opts in whether or not the owner is available
-    /// now.
+    /// now. A governed runtime admits a notice as a resume of the consent's
+    /// origin run, so its composition needs a retained-resume owner: the
+    /// stock composition installs one, and a custom composition supplies its
+    /// own (`NativeGrantWorkConfiguration::retained_resume`); without one
+    /// every notice stays owed.
     #[must_use]
     pub fn with_consent_notices(mut self, projector: Arc<crate::ConsentNoticeProjector>) -> Self {
         self.consent_notices = Some(projector);

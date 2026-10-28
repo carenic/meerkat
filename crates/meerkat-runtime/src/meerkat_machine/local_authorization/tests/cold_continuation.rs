@@ -959,6 +959,288 @@ async fn an_undelivered_continuation_resumes_its_original_once_after_a_same_proc
     assert_eq!(original.seed.last_run_id.as_ref(), Some(&original_run));
 }
 
+/// The controller `template`'s claims select.
+fn controller_selection(template: &Input) -> ControllerModelSelection {
+    template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .controller_model
+        .clone()
+        .expect("controller")
+}
+
+/// The host's owners over `configuration`'s grant authority and operation
+/// owner, whose policy admits `template`'s requester for its executor.
+fn owners_of(configuration: &NativeGrantWorkConfiguration, template: &Input) -> HostOwners {
+    let claims = template
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .clone();
+    HostOwners {
+        grants: Arc::clone(&configuration.grants),
+        ingress_domain: claims.ingress_namespace.ingress.clone(),
+        custody: Arc::default(),
+        policy: Arc::new(Policy {
+            requester: claims.requester.clone(),
+            executor: claims.logical_executor.clone(),
+        }),
+        controllers: Arc::default(),
+        operation_owner: Arc::clone(&configuration.operation_owner),
+    }
+}
+
+/// On `machine`, with an executor that answers `reply`: the original of
+/// `template`, held in the host's custody and bound to its destination,
+/// runs once and settles, and the continuation of its retained work is
+/// committed to `store`'s delivery inbox, not delivered. Returns that
+/// destination, the executor's effect count and its apply receiver.
+async fn settle_original_with_continuation(
+    machine: &Arc<MeerkatMachine>,
+    store: &InMemoryRuntimeStore,
+    session: &SessionId,
+    template: &Input,
+    owners: &HostOwners,
+    reply: &'static str,
+) -> (
+    meerkat_authorization_contracts::work_association::NativeWorkTarget,
+    Arc<AtomicUsize>,
+    tokio::sync::mpsc::UnboundedReceiver<Applied>,
+) {
+    let runtime = LogicalRuntimeId::for_session(session);
+    let (effects, mut applied) = attach(machine, session, reply).await;
+    install_credential(
+        machine,
+        &EphemeralTokenStore::new(),
+        &controller_selection(template),
+    )
+    .await;
+    let original = original_prompt(template, &runtime);
+    owners.custody.hold(&original);
+    bind_destination(machine, session, &original).await;
+    let destination = original
+        .header()
+        .authority_association
+        .as_ref()
+        .expect("claims")
+        .candidate()
+        .target
+        .clone();
+    let original_id = original.id().clone();
+    let outcome = machine
+        .ingest(&runtime, original)
+        .await
+        .expect("governed original admitted");
+    assert!(
+        matches!(outcome, AcceptOutcome::Accepted { .. }),
+        "{outcome:?}"
+    );
+    let entered = next_apply(&mut applied, "original").await;
+    assert_eq!(entered.ids, vec![original_id.clone()]);
+    let identity = entered
+        .context
+        .retained_work()
+        .cloned()
+        .expect("the run's retained work, as an effect owner captures it");
+    assert_eq!(completed_text(machine, session, &original_id).await, reply);
+    RuntimeDeliveryInbox::new(Arc::new(store.clone()))
+        .submit(
+            &runtime,
+            RuntimeDeliverySubmission::new(
+                RuntimeDeliveryId::new(DELIVERY).expect("id"),
+                RuntimeDeliveryKind::Continuation,
+                "auth",
+                1,
+                CONTINUATION_KEY,
+                serde_json::to_vec(&identity).expect("retained work row"),
+            )
+            .expect("submission"),
+        )
+        .await
+        .expect("the continuation is committed, not delivered");
+    (destination, effects, applied)
+}
+
+/// Bind `target` on `session`'s current registration once the session's
+/// run has settled (no destination binds while a run is in flight), within
+/// bound.
+async fn bind_when_settled(
+    machine: &MeerkatMachine,
+    session: &SessionId,
+    target: &meerkat_authorization_contracts::work_association::NativeWorkTarget,
+) {
+    let mut last = None;
+    let bound = tokio::time::timeout(BOUND, async {
+        loop {
+            let registration = machine
+                .current_session_registration_witness(session)
+                .await
+                .expect("current registration");
+            match machine.bind_scoped_context(&registration, target).await {
+                Ok(()) => return,
+                Err(error) => {
+                    last = Some(error);
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+            }
+        }
+    })
+    .await;
+    assert!(
+        bound.is_ok(),
+        "the destination's later generation binds once the run settled: {last:?}"
+    );
+}
+
+/// A continuation's resume names its original's destination. Once the
+/// session document has bound a later generation of that same destination
+/// (the session moved on, as a stock session does at its next prompt), the
+/// resume can never be admitted there, since a document's generations only
+/// advance. It is refused for good, `NoAdmissibleWorkBinding`, so the
+/// delivery carrying it settles instead of retrying forever, and nothing
+/// runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_whose_destination_moved_on_is_refused_for_good() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let owners = owners_of(&configuration, &template);
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let machine = open(&store, &blobs, &owners).await;
+    let (destination, effects, _applied) = settle_original_with_continuation(
+        &machine,
+        &store,
+        &session,
+        &template,
+        &owners,
+        "the original's result",
+    )
+    .await;
+
+    let mut moved = destination;
+    moved.context_generation += 1;
+    bind_when_settled(&machine, &session, &moved).await;
+
+    let resume = continuation();
+    let resume_id = resume.id().clone();
+    let refused = machine
+        .accept_retained_resume(
+            &session,
+            resume,
+            head_request(&store, &runtime, DELIVERY, 1).await,
+        )
+        .await
+        .map(|(outcome, _)| outcome);
+    assert!(
+        matches!(
+            refused,
+            Err(RuntimeDriverError::RetainedResumeRefused {
+                reason: crate::retained_work::RetainedResumeRefusal::NoAdmissibleWorkBinding
+            })
+        ),
+        "a resume whose destination moved on is refused for good; a retryable refusal would \
+         leave its delivery pending forever: {refused:?}"
+    );
+    assert!(
+        machine
+            .input_state(&session, &resume_id)
+            .await
+            .expect("row read")
+            .is_none(),
+        "nothing was admitted for the resume"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 1, "only the original ran");
+}
+
+/// Control: a resume naming a destination its session document has not
+/// bound yet (after a reopen, before the registration owner binds it again)
+/// is only not admissible yet. Its refusal stays retryable, never final, and
+/// once the owner binds that destination the same resume is admitted and
+/// runs once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_resume_waits_while_its_destination_is_not_bound_yet() {
+    let (configuration, template, _account, _publication) = mutable_controller_configuration(true);
+    let owners = owners_of(&configuration, &template);
+    drop(configuration);
+    let store = InMemoryRuntimeStore::new();
+    let blobs = Arc::new(MemoryBlobStore::new());
+    let session = SessionId::new();
+    let runtime = LogicalRuntimeId::for_session(&session);
+    let destination = original_prompt(&template, &runtime);
+    {
+        let machine = open(&store, &blobs, &owners).await;
+        let _settled = settle_original_with_continuation(
+            &machine,
+            &store,
+            &session,
+            &template,
+            &owners,
+            "the original's result",
+        )
+        .await;
+    }
+
+    let machine = open(&store, &blobs, &owners).await;
+    let (effects, mut applied) = attach(&machine, &session, "resumed").await;
+    install_credential(
+        &machine,
+        &EphemeralTokenStore::new(),
+        &controller_selection(&template),
+    )
+    .await;
+    let resume = continuation();
+    let resume_id = resume.id().clone();
+    let waiting = machine
+        .accept_retained_resume(
+            &session,
+            resume.clone(),
+            head_request(&store, &runtime, DELIVERY, 1).await,
+        )
+        .await
+        .map(|(outcome, _)| outcome);
+    assert!(
+        matches!(waiting, Err(RuntimeDriverError::ValidationFailed { .. })),
+        "a destination not bound yet leaves the resume retryable, never refused for good: \
+         {waiting:?}"
+    );
+    assert!(
+        machine
+            .input_state(&session, &resume_id)
+            .await
+            .expect("row read")
+            .is_none(),
+        "nothing was admitted while the destination was not bound"
+    );
+
+    bind_destination(&machine, &session, &destination).await;
+    let (admitted, _) = machine
+        .accept_retained_resume(
+            &session,
+            resume,
+            head_request(&store, &runtime, DELIVERY, 1).await,
+        )
+        .await
+        .expect("the resume is admitted once its destination is bound");
+    assert!(
+        matches!(admitted, AcceptOutcome::Accepted { .. }),
+        "{admitted:?}"
+    );
+    let entered = next_apply(&mut applied, "resume").await;
+    assert_eq!(entered.ids, vec![resume_id.clone()]);
+    assert_eq!(
+        completed_text(&machine, &session, &resume_id).await,
+        "resumed"
+    );
+    assert_eq!(effects.load(Ordering::SeqCst), 1, "the resume ran once");
+}
+
 /// A continuation produced by a resumed run, delivered after another reopen.
 /// The resumed run's identity names the original and selects the resume
 /// input it staged; by the second reopen both rows are terminal and held only

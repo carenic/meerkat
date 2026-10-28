@@ -588,6 +588,23 @@ them.
   event append exports its new events the same way. A subscription catching
   up from an old cursor no longer slows down with the square of the log's
   length.
+- `meerkat`, `meerkat-runtime`: on a stock governed realm, the approved
+  notice of consent parked at a run's close is now admitted as a resume of
+  that run, and the parked consent moves into the resumed run. The stock
+  composition installed no retained-resume owner, so such a notice, like any
+  other retained completion, stayed pending forever (`UnsupportedScope`). It
+  now resumes retained work through the owners that admitted it: its
+  originals ledger, the stock requester rule (a host-authenticated caller is
+  asked of the host again), the realm's grants and the session's latest
+  pinned controller. A resume of work this process's ledger does not hold,
+  such as an earlier process's, or of a requester no longer admitted is
+  refused, and its notice records `Failed`. An approval resumes the parked
+  run only while no later governed prompt has moved that session's
+  destination: on any governed composition, a retained resume whose
+  destination its session has since bound a later generation of is now
+  refused for good (`NoAdmissibleWorkBinding`), so its notice records
+  `Failed` and the parked consent is withdrawn, instead of staying pending
+  forever.
 - Host-store realms: opening a realm loads the sessions that hold recovery
   work (an unsettled input, an undelivered background result, an open run)
   up to 16 at a time, instead of one after another. With K such sessions,

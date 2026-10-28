@@ -730,6 +730,32 @@ pub(crate) fn input_context_target(input: &Input) -> Result<Option<String>, Runt
         .transpose()
 }
 
+/// Whether `input` resumes retained work whose original destination the
+/// session document has since superseded: its canonical original's target
+/// names the document's current stable scope `current_scope` at a generation
+/// strictly older than the current binding's `current_generation`. A
+/// document's generations only advance, so such a resume can never be
+/// admitted on it. Any other input, and any other mismatch, proves nothing.
+pub(crate) fn retained_resume_destination_superseded(
+    input: &Input,
+    current_scope: Option<&str>,
+    current_generation: u64,
+) -> Result<bool, RuntimeDriverError> {
+    let Some(grant) = input.header().retained_resume.as_ref() else {
+        return Ok(false);
+    };
+    let canonical = grant
+        .evidence
+        .contributors
+        .first()
+        .ok_or_else(unavailable)?;
+    let target = &canonical.association().candidate().target;
+    if target.context_generation >= current_generation {
+        return Ok(false);
+    }
+    Ok(current_scope == Some(context_scope_binding(target)?.as_str()))
+}
+
 fn hex(bytes: &[u8]) -> String {
     const DIGITS: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
