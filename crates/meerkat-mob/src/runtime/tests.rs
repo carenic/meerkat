@@ -15092,6 +15092,17 @@ impl MobSessionService for PersistedListingSessionService {
             .await
     }
 
+    async fn interrupt_run_with_machine_authority(
+        &self,
+        session_id: &SessionId,
+        expected_run_id: &meerkat_core::RunId,
+        authority: meerkat_runtime::MachineSessionControlAuthority,
+    ) -> Result<bool, SessionError> {
+        self.inner
+            .interrupt_run_with_machine_authority(session_id, expected_run_id, authority)
+            .await
+    }
+
     async fn cancel_after_boundary_with_machine_authority(
         &self,
         session_id: &SessionId,
