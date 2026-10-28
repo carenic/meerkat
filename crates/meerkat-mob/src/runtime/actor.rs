@@ -3492,6 +3492,10 @@ enum ResumeLifecyclePhase {
     /// Rebuilt attachments: readiness runs after the commit and the rebuild.
     PostCommitReadiness {
         post_commit_error: Option<MobError>,
+        /// MobMachine's materialization epoch of each target when the pass
+        /// began (`member_materialization_epoch`): a member released and
+        /// woken again while the pass ran holds another one.
+        target_epochs: BTreeMap<mob_dsl::AgentIdentity, Option<mob_dsl::RuntimeEpochId>>,
     },
     AwaitingTopologyOwners {
         post_commit_error: Option<MobError>,
@@ -23525,12 +23529,14 @@ impl MobActor {
         // woken again when its comms runtime is gone. The lift goes on and
         // does not answer it. Before the Resume, every member's readiness
         // gates the commit.
-        let outcomes = if matches!(phase, ResumeLifecyclePhase::PostCommitReadiness { .. })
-            && self.state() == MobState::Running
-        {
-            self.resolve_live_member_readiness_failures(outcomes).await
-        } else {
-            outcomes
+        let outcomes = match &phase {
+            ResumeLifecyclePhase::PostCommitReadiness { target_epochs, .. }
+                if self.state() == MobState::Running =>
+            {
+                self.resolve_live_member_readiness_failures(outcomes, target_epochs)
+                    .await
+            }
+            _ => outcomes,
         };
         let readiness_result = self.apply_member_readiness_outcomes(outcomes).await;
         // Other commands ran while the fan-out was in flight. Re-probe the
@@ -23572,7 +23578,9 @@ impl MobActor {
                 self.commit_resume_lifecycle(admission, progress, reply_tx, Vec::new())
                     .await;
             }
-            ResumeLifecyclePhase::PostCommitReadiness { post_commit_error } => {
+            ResumeLifecyclePhase::PostCommitReadiness {
+                post_commit_error, ..
+            } => {
                 let current_phase = self.state();
                 if current_phase != MobState::Running {
                     tracing::warn!(
