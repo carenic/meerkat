@@ -32119,8 +32119,60 @@ async fn fork_child_restored_after_a_crash_is_built_as_its_source() {
     .await;
 }
 
-/// Resume the crashed mob over `storage` with the per-identity customizer, and
-/// hand back a storage over the same durable truth for the next restart.
+/// Under the lazy default a restart leaves the fork source and its child
+/// Dormant, and a wake rebuilds one member. The child woken while its source
+/// stays Dormant is built with the overlay its source would be rebuilt with
+/// (the host's overlay for the source), computed without waking the source,
+/// never with the host's overlay for the child's own identity.
+#[tokio::test]
+async fn fork_child_woken_while_its_source_is_dormant_is_built_as_its_source() {
+    let (service, storage, source_identity, child_identity, first, expected_source) =
+        seat_fork_child_then_crash(false).await;
+    let resumed = MobBuilder::for_resume(storage)
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(IdentityOverlayCustomizer {
+            source: source_identity.clone(),
+        }))
+        .resume()
+        .await
+        .expect("resume");
+    let dormant = Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant);
+    assert_eq!(
+        resumed.member_materialization_for_test(&source_identity),
+        dormant
+    );
+    assert_eq!(
+        resumed.member_materialization_for_test(&child_identity),
+        dormant
+    );
+
+    resumed
+        .ensure_member_live(&child_identity)
+        .await
+        .expect("the child wakes");
+    assert_eq!(
+        resumed.member_materialization_for_test(&source_identity),
+        dormant,
+        "the source is not woken for its child"
+    );
+    let rebuilt = last_member_build(&service, &child_identity).await;
+    assert_rebuilt_as_first_build(&first, &rebuilt, &expected_source);
+    for tool in FORK_SOURCE_OVERLAY_TOOLS {
+        assert!(
+            rebuilt.external_tool_names.iter().any(|name| name == tool),
+            "the woken child carries the overlay its source would be rebuilt with ('{tool}'): {:?}",
+            rebuilt.external_tool_names
+        );
+    }
+    assert!(
+        !rebuilt
+            .external_tool_names
+            .iter()
+            .any(|name| name == GENERIC_RESUME_OVERLAY_TOOL),
+        "the woken child is not given the host's overlay for its own identity: {:?}",
+        rebuilt.external_tool_names
+    );
+}
 async fn restart_with_identity_overlays(
     service: &Arc<MockSessionService>,
     storage: MobStorage,
@@ -78533,6 +78585,106 @@ async fn test_revival_already_active_identity_is_idempotent_success() {
             .member_wake_attempts
             .contains_key(&machine_identity),
         "already-live revival success must resolve the machine-owned obligation"
+    );
+}
+
+/// Names `binding` on every resume request, as a host whose member's
+/// sessions moved to that binding does.
+struct ResumeAuthBindingCustomizer(meerkat_core::AuthBindingRef);
+
+impl SpawnMemberCustomizer for ResumeAuthBindingCustomizer {
+    fn customize_spawn(
+        &self,
+        ctx: &SpawnCustomizationContext,
+        spec: &mut SpawnMemberSpec,
+    ) -> Result<(), MobError> {
+        if ctx.spawn_source == SpawnSource::Resume {
+            spec.auth_binding = Some(self.0.clone());
+        }
+        Ok(())
+    }
+}
+
+/// A wake whose build finds the member's session already live (another
+/// materialization made it live) keeps that live actor only when it runs the
+/// binding the member's restore names, as every reuse of a live actor does.
+/// A live actor on another binding is not adopted: the delivery is refused
+/// with the typed conflict, the member is recorded Broken, and the actor is
+/// retired, so no surface reaches the old binding.
+#[tokio::test]
+async fn a_wake_never_adopts_an_already_live_actor_on_another_binding() {
+    let mut definition = sample_definition();
+    definition
+        .profiles
+        .get_mut(&ProfileName::from("worker"))
+        .expect("worker profile")
+        .as_inline_mut()
+        .expect("inline worker profile")
+        .runtime_mode = crate::MobRuntimeMode::TurnDriven;
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let handle = MobBuilder::new(definition, MobStorage::in_memory())
+        .with_session_service(service.clone())
+        .with_spawn_member_customizer(Arc::new(ResumeAuthBindingCustomizer(scoped_auth_binding())))
+        .create()
+        .await
+        .expect("create mob");
+    let identity = AgentIdentity::from("w-1");
+    let receipt = handle
+        .spawn(ProfileName::from("worker"), identity.clone(), None)
+        .await
+        .expect("spawn worker");
+    let session = receipt
+        .bridge_session_id()
+        .expect("session-backed member")
+        .clone();
+    // The session's recorded binding is another one, and its live actor is
+    // gone; the member's next build finds the session identity already
+    // active and the session live again, on that other binding.
+    service
+        .record_session_auth_binding(&session, other_auth_binding())
+        .await;
+    MobSessionService::discard_live_session(service.as_ref(), &session)
+        .await
+        .expect("discard live session");
+    service
+        .set_create_session_identity_already_active(&session)
+        .await;
+
+    let refused = handle
+        .member(&identity)
+        .await
+        .expect("member handle")
+        .internal_turn(ContentInput::from(
+            "deliver to the other binding".to_string(),
+        ))
+        .await;
+    let conflict = MobError::MemberAuthBindingConflict {
+        member_id: identity.clone(),
+        session_id: session.clone(),
+        requested: Box::new(scoped_auth_binding()),
+        recorded: Some(Box::new(other_auth_binding())),
+    }
+    .to_string();
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::MemberRestoreFailed { reason, .. }) if reason == &conflict
+        ),
+        "a live actor on another binding is refused with the typed conflict: {refused:?}"
+    );
+    let status = handle
+        .member_status(&identity)
+        .await
+        .expect("read the member status");
+    assert_eq!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "{status:?}"
+    );
+    assert!(
+        !service.has_live_session(&session).await.unwrap_or(false),
+        "the refused live actor is retired: no surface reaches the old binding"
     );
 }
 

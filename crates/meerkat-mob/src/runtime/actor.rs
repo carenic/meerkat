@@ -31464,12 +31464,19 @@ impl MobActor {
                     reply_tx,
                 } => {
                     // A live channel to a local member needs the
-                    // member materialized. One that is not is woken first
-                    // (`WakeMember(HostDelivery)`), and the open is submitted
-                    // again, under its own authority, once it is ready. A
-                    // placed member's host owns its materialization, and an
+                    // member materialized. One that is not (Dormant or
+                    // Waking) is woken first (`WakeMember(HostDelivery)`),
+                    // and the open is submitted again, under its own
+                    // authority, once it is ready. A member that is Live, or
+                    // not seated, is not woken: the open makes its own checks
+                    // and keeps its own refusal (a retiring Live member is
+                    // refused as retiring, not by the wake verdict). A placed
+                    // member's host owns its materialization, and an
                     // ineligible open keeps its own refusal.
                     let wake = if !super::member_runtime_is_host_owned(
+                        self.dsl_authority.state(),
+                        &agent_identity,
+                    ) && super::boot_plan::domain_member_is_unmaterialized(
                         self.dsl_authority.state(),
                         &agent_identity,
                     ) && self.require_member_operation_eligible().is_ok()

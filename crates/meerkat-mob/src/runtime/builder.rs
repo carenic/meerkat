@@ -11791,6 +11791,12 @@ pub(super) enum MemberRestoreProvisionOutcome {
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
     },
+    /// Another materialization of the member made its session live while
+    /// this provision built it (the build answered the session identity
+    /// already active, and the session is live): nothing was provisioned,
+    /// and the member is kept on the registration that live session holds,
+    /// as a warm revival keeps it.
+    AlreadyLive { bridge_session_id: SessionId },
     /// The member's session was created fresh: a nonpersistent service
     /// recreated it, or (`seat_session`) the member's first materialization
     /// created the session its seat named.
@@ -12095,6 +12101,7 @@ async fn restore_resumed_members(
                         base,
                         super::fork_build::ForkOverlayRule::Own,
                         no_restored_overlays,
+                        None,
                     )
                     .await
                     .map(MemberRestoreStep::Planned)
@@ -12186,7 +12193,8 @@ async fn release_unapplied_member_restore(
         | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
         // Nothing was provisioned.
         MemberRestoreProvisionOutcome::Failed(_)
-        | MemberRestoreProvisionOutcome::Retryable { .. } => return,
+        | MemberRestoreProvisionOutcome::Retryable { .. }
+        | MemberRestoreProvisionOutcome::AlreadyLive { .. } => return,
     };
     let released = match receipt.session_origin {
         super::provisioner::ProvisionSessionOrigin::Fresh => {
@@ -12457,6 +12465,7 @@ async fn apply_member_restore_step(
                 commit.authority,
                 fork_rule,
                 commit.restored_overlays,
+                None,
             ))
             .await?
         }
@@ -12470,7 +12479,14 @@ async fn apply_member_restore_step(
 ///
 /// `fork_rule` is the member's overlay rule, and `restored_overlays` the
 /// overlays the members restored before it in this pass were restored with,
-/// which a rule that follows the member's source reads.
+/// which a rule that follows the member's source reads. `retained` is the
+/// overlay this process last built the member with (a wake of a member it
+/// built before), which the member keeps, as its warm revival does, unless
+/// its source is gone. That holds for a member's own overlay too: an
+/// in-process wake leaves its tools as they were while it was live, as a
+/// member that stayed live keeps them until a respawn or a restart, and the
+/// customizer is not asked for them again. A restore of members this process
+/// never built passes `None`.
 #[cfg(feature = "runtime-adapter")]
 pub(super) async fn restore_resumed_member(
     ctx: &ResumeMemberRestoreContext<'_>,
@@ -12478,6 +12494,7 @@ pub(super) async fn restore_resumed_member(
     base: &crate::machines::mob_machine::MobMachineAuthority,
     fork_rule: super::fork_build::ForkOverlayRule,
     restored_overlays: &BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    retained: Option<&super::fork_build::RetainedMemberOverlay>,
 ) -> Result<MemberRestorePlan, MobError> {
     let entry = &candidate.entry;
     let definition = ctx.definition;
@@ -12630,42 +12647,59 @@ pub(super) async fn restore_resumed_member(
         )
     };
     let mut restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Own;
-    let restore_overlay = match fork_rule {
-        super::fork_build::ForkOverlayRule::Own => own_overlay()?,
-        super::fork_build::ForkOverlayRule::Caller => {
-            let own = own_overlay()?;
-            if own.is_none() {
-                super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
-            }
-            own
-        }
-        super::fork_build::ForkOverlayRule::FollowSource(source) => {
-            match restored_overlays.get(&source).cloned() {
-                Some(source_overlay) => {
-                    restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Inherited;
-                    source_overlay
+    // A member this process built before keeps the overlay it was built
+    // with, as its warm revival does (`fork_build`): the customizer is asked
+    // only for a member nothing is retained for. A fork whose source is gone
+    // or replaced is the exception: it takes the overlay for its own
+    // identity, below.
+    let retained = retained.filter(|_| {
+        !matches!(
+            fork_rule,
+            super::fork_build::ForkOverlayRule::SourceUnavailable(_)
+        )
+    });
+    let restore_overlay = if let Some(retained) = retained {
+        restore_overlay_origin = retained.origin;
+        Some(Arc::clone(&retained.overlay))
+    } else {
+        match fork_rule {
+            super::fork_build::ForkOverlayRule::Own => own_overlay()?,
+            super::fork_build::ForkOverlayRule::Caller => {
+                let own = own_overlay()?;
+                if own.is_none() {
+                    super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
                 }
-                None => {
-                    let own = own_overlay()?;
-                    super::fork_build::warn_fork_source_unavailable(
-                        &definition.id,
-                        entry,
-                        &super::fork_build::ForkSourceUnavailable::NotRebuilt,
-                        own.is_some(),
-                    );
-                    own
+                own
+            }
+            super::fork_build::ForkOverlayRule::FollowSource(source) => {
+                match restored_overlays.get(&source).cloned() {
+                    Some(source_overlay) => {
+                        restore_overlay_origin =
+                            super::fork_build::RetainedOverlayOrigin::Inherited;
+                        source_overlay
+                    }
+                    None => {
+                        let own = own_overlay()?;
+                        super::fork_build::warn_fork_source_unavailable(
+                            &definition.id,
+                            entry,
+                            &super::fork_build::ForkSourceUnavailable::NotRebuilt,
+                            own.is_some(),
+                        );
+                        own
+                    }
                 }
             }
-        }
-        super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
-            let own = own_overlay()?;
-            super::fork_build::warn_fork_source_unavailable(
-                &definition.id,
-                entry,
-                &reason,
-                own.is_some(),
-            );
-            own
+            super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
+                let own = own_overlay()?;
+                super::fork_build::warn_fork_source_unavailable(
+                    &definition.id,
+                    entry,
+                    &reason,
+                    own.is_some(),
+                );
+                own
+            }
         }
     };
     // The member's turn seeds the actor's retention map with the overlay
@@ -13091,21 +13125,82 @@ pub(super) async fn provision_durable_member_restore(
             }
         }
         Err(error) => {
-            // The provision's refusal slot is the only source of this typed
-            // refusal; the seed records its code, and the transaction's own
-            // rollback already removed the registration the host was asked
-            // about.
-            let registration_refusal = match &error {
-                MobError::MemberRegistrationRefused { call, .. } => Some(*call),
-                _ => None,
-            };
+            // The build found the member's session identity already active
+            // and the session is live: another materialization of the member
+            // made it live meanwhile, and it is kept, as a warm revival keeps
+            // it, on the binding the restore spec names only, as every reuse
+            // of a live actor (`live_actor_binding`).
+            let identity_in_use = matches!(
+                &error,
+                MobError::SessionError(meerkat_core::service::SessionError::Agent(
+                    meerkat_core::error::AgentError::SessionIdentityInUse(session_id),
+                )) if session_id == bridge_session_id
+            );
+            let already_live = identity_in_use
+                && matches!(
+                    ctx.session_service
+                        .has_live_session(bridge_session_id)
+                        .await,
+                    Ok(true)
+                );
             unstage_member_build_hold(ctx, bridge_session_id).await;
-            MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
-                bridge_session_id: Some(bridge_session_id.clone()),
-                reason: format!("failed to restore durable session '{bridge_session_id}': {error}"),
-                hold: None,
-                registration_refusal,
-            })
+            if already_live {
+                // A live actor on another binding is never adopted: the
+                // member's restore fails with the conflict, and the actor is
+                // retired so no surface reaches the old binding.
+                let conflict = match restore_spec.auth_binding.as_ref() {
+                    Some(requested) => super::live_actor_binding::verify_live_actor_auth_binding(
+                        ctx.session_service.as_ref(),
+                        &entry.agent_identity,
+                        bridge_session_id,
+                        requested,
+                    )
+                    .await
+                    .err(),
+                    None => None,
+                };
+                match conflict {
+                    Some(conflict) => {
+                        let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+                            ctx.session_service.as_ref(),
+                            bridge_session_id,
+                            &conflict,
+                        )
+                        .await;
+                        MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                            bridge_session_id,
+                            reason,
+                        ))
+                    }
+                    None => MemberRestoreProvisionOutcome::AlreadyLive {
+                        bridge_session_id: bridge_session_id.clone(),
+                    },
+                }
+            } else {
+                // The provision's refusal slot is the only source of this
+                // typed refusal; the seed records its code, and the
+                // transaction's own rollback already removed the registration
+                // the host was asked about. The member's record keeps the
+                // host's own reason: a later answer of the recorded refusal
+                // (the member's wake, an `ensure_member_live`) is the refusal
+                // its host gave, not that refusal nested in this restore's
+                // diagnostic.
+                let (registration_refusal, reason) = match &error {
+                    MobError::MemberRegistrationRefused { call, reason, .. } => {
+                        (Some(*call), reason.clone())
+                    }
+                    _ => (
+                        None,
+                        format!("failed to restore durable session '{bridge_session_id}': {error}"),
+                    ),
+                };
+                MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
+                    bridge_session_id: Some(bridge_session_id.clone()),
+                    reason,
+                    hold: None,
+                    registration_refusal,
+                })
+            }
         }
     };
     Ok(MemberRestoreProvision {
@@ -13712,6 +13807,31 @@ async fn apply_member_restore_provision(
     match outcome {
         MemberRestoreProvisionOutcome::Failed(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
+        }
+        // Nothing was provisioned: the member's attempt resolves bound on the
+        // registration its live session already holds, as a kept live actor
+        // does.
+        MemberRestoreProvisionOutcome::AlreadyLive { bridge_session_id } => {
+            if let Err(error) =
+                resolve_restored_member_bound(commit, entry, &bridge_session_id).await
+            {
+                record_member_restore_failure(
+                    commit.tool_handle,
+                    entry,
+                    member_restore_failure(
+                        &bridge_session_id,
+                        format!("failed to restore member runtime binding: {error}"),
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            commit
+                .tool_handle
+                .restore_diagnostics
+                .write()
+                .await
+                .remove(&entry.agent_identity);
         }
         MemberRestoreProvisionOutcome::Retryable { reason, cause } => {
             // Nothing was provisioned: the member's open wake attempt ends
