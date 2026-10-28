@@ -45,6 +45,8 @@ pub(super) mod spawn_activation;
 mod spawn_admission_io;
 pub(super) mod spawn_preparation;
 mod startup_readiness;
+#[cfg(feature = "runtime-adapter")]
+pub(super) mod wake_topology;
 pub(super) mod wiring_io;
 
 use super::uncertain_durability::UncertainDurabilityFailStop;
@@ -5783,6 +5785,20 @@ pub(super) async fn reconcile_exact_mob_event_after_cursor(
 /// member on the target daemon. It is deliberately wider than an ordinary
 /// bridge command while remaining bounded for retry convergence.
 const HOST_REVOKE_BRIDGE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Which side of `auto_wire_orchestrator` a declared wiring pass takes for
+/// an orchestrator member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum OrchestratorAutoWire {
+    /// A member is wired to the orchestrator's members, and an orchestrator
+    /// member gets no auto-wire targets of its own: a spawn, whose wiring is
+    /// fail-fast and rolled back with the spawn.
+    ToOrchestrator,
+    /// An orchestrator member is also wired to every member that auto-wires
+    /// to it, so the edge does not depend on which of the two came first: a
+    /// seat and a rotation, which stage their edges in their own step.
+    BothWays,
+}
 
 #[derive(Clone)]
 pub(super) enum WiringEndpoint {
@@ -40490,9 +40506,14 @@ impl MobActor {
         profile_name: &ProfileName,
         agent_identity: &AgentIdentity,
     ) -> Vec<AgentIdentity> {
-        Self::declared_wiring_targets(&self.definition, profile_name, |target_profile| {
-            self.active_machine_member_ids_for_profile(target_profile, agent_identity)
-        })
+        Self::declared_wiring_targets(
+            &self.definition,
+            profile_name,
+            OrchestratorAutoWire::ToOrchestrator,
+            |target_profile| {
+                self.active_machine_member_ids_for_profile(target_profile, agent_identity)
+            },
+        )
     }
 
     /// Whether `definition` declares any edge between its profiles' members:
@@ -40504,17 +40525,16 @@ impl MobActor {
 
     /// The members a member of `profile_name` is wired to by the edges its
     /// definition declares, in order: under `auto_wire_orchestrator`, the
-    /// orchestrator's members for any other member, and for an orchestrator
-    /// member every member that auto-wires to it (the active members of
-    /// every other profile, flow members aside, which take no declared
-    /// wiring), so the edge is the same whichever of the two came first; then
-    /// the members of every profile a role wiring rule pairs with
-    /// `profile_name`, each once. `active_members_of` answers a profile's
-    /// active members other than the member itself. One rule for a spawn, a
-    /// seat and a rotation alike.
+    /// orchestrator's members for any other member, and, as `auto_wire`
+    /// says, for an orchestrator member every member that auto-wires to it
+    /// (the active members of every other profile, flow members aside, which
+    /// take no declared wiring); then the members of every profile a role
+    /// wiring rule pairs with `profile_name`, each once. `active_members_of`
+    /// answers a profile's active members other than the member itself.
     pub(super) fn declared_wiring_targets(
         definition: &MobDefinition,
         profile_name: &ProfileName,
+        auto_wire: OrchestratorAutoWire,
         mut active_members_of: impl FnMut(&ProfileName) -> Vec<AgentIdentity>,
     ) -> Vec<AgentIdentity> {
         let mut targets = Vec::new();
@@ -40523,7 +40543,13 @@ impl MobActor {
         if definition.wiring.auto_wire_orchestrator
             && let Some(orchestrator) = &definition.orchestrator
         {
-            if profile_name == &orchestrator.profile {
+            if profile_name != &orchestrator.profile {
+                for orchestrator_id in active_members_of(&orchestrator.profile) {
+                    if named.insert(orchestrator_id.clone()) {
+                        targets.push(orchestrator_id);
+                    }
+                }
+            } else if auto_wire == OrchestratorAutoWire::BothWays {
                 for profile in definition.profiles.keys() {
                     if profile == &orchestrator.profile {
                         continue;
@@ -40532,12 +40558,6 @@ impl MobActor {
                         if !member.is_flow_member_namespace() && named.insert(member.clone()) {
                             targets.push(member);
                         }
-                    }
-                }
-            } else {
-                for orchestrator_id in active_members_of(&orchestrator.profile) {
-                    if named.insert(orchestrator_id.clone()) {
-                        targets.push(orchestrator_id);
                     }
                 }
             }
@@ -45486,13 +45506,7 @@ impl MobActor {
         }
         self.ensure_member_not_broken(&local).await?;
         self.ensure_member_not_broken(&peer_member_identity).await?;
-        if !self
-            .dsl_authority
-            .state()
-            .wiring_edges
-            .iter()
-            .any(|existing| existing == &edge)
-        {
+        if !self.dsl_authority.state().wiring_edges.contains(&edge) {
             return Err(MobError::WiringError(format!(
                 "respawn topology restore requires machine-owned edge ('{local}' <-> '{peer_identity}')"
             )));
@@ -45695,12 +45709,7 @@ impl MobActor {
         // The DSL emits a local repair effect; without a graph-change effect,
         // this path may reinstall live trust but must not synthesize a public
         // roster/event projection.
-        let dsl_has_edge = self
-            .dsl_authority
-            .state()
-            .wiring_edges
-            .iter()
-            .any(|existing| existing == &edge);
+        let dsl_has_edge = self.dsl_authority.state().wiring_edges.contains(&edge);
 
         // Resolve both endpoints' comms runtimes + specs BEFORE mutating
         // any authority state. Missing comms / missing public key yields

@@ -155,13 +155,18 @@ enum WakePlan {
     },
 }
 
-/// The topology step's remaining edges.
+/// The topology step's edges, taken a chunk at a time
+/// ([`super::wake_topology`]).
 struct WakeTopology {
-    remaining: VecDeque<(
-        super::super::handle::PeerTarget,
-        RespawnTopologyPeerId,
-        MemberWiringEdge,
-    )>,
+    /// The edges no chunk has taken yet, in order.
+    remaining: VecDeque<super::wake_topology::WakeTopologyEdge>,
+    /// The current chunk's edges that take the single-edge wire path.
+    single: VecDeque<super::wake_topology::WakeTopologyEdge>,
+    /// The edges each chunk takes, fixed when the step starts.
+    chunk: usize,
+    /// A chunk ran since the turn last returned to the actor: the turn
+    /// yields before it takes the next one.
+    yield_due: bool,
     failed: Vec<RespawnTopologyPeerId>,
 }
 
@@ -174,6 +179,10 @@ enum WakeStep {
         peer: RespawnTopologyPeerId,
         edge: Box<MemberWiringEdge>,
         result: Result<(), MobError>,
+    },
+    /// The topology step yielded to the actor between two chunks.
+    TopologyYield {
+        topology: WakeTopology,
     },
     /// A rollback of the wake's provision finished (`false`: it could not be
     /// settled and its custody was abandoned).
@@ -707,6 +716,16 @@ impl MobActor {
                 self.advance_member_wake_topology(run, rollback, topology)
                     .await;
             }
+            WakeStep::TopologyYield { topology } => {
+                if !settlement.fence.is_current()
+                    || !self.member_wake_attempt_is_open(&run.identity, run.attempt)
+                {
+                    self.roll_back_member_wake(run, rollback);
+                    return;
+                }
+                self.advance_member_wake_topology(run, rollback, topology)
+                    .await;
+            }
             WakeStep::RolledBack { settled } => {
                 if !settled {
                     tracing::error!(
@@ -1159,11 +1178,15 @@ impl MobActor {
                 }
             }
         }
+        let chunk = self.wake_topology_chunk_size(remaining.len());
         self.advance_member_wake_topology(
             run,
             rollback,
             WakeTopology {
                 remaining,
+                single: VecDeque::new(),
+                chunk,
+                yield_due: false,
                 failed: Vec::new(),
             },
         )
@@ -1171,67 +1194,98 @@ impl MobActor {
     }
 
     /// Topology: restore the woken member's wiring over the machine's edges,
-    /// one edge at a time on the wiring lane, then resolve it Ready.
+    /// a chunk at a time ([`super::wake_topology`]): a chunk's edges to
+    /// members that are not materialized as one batch, its other edges one
+    /// at a time on the wiring lane. The turn yields to the actor between
+    /// chunks. Then it resolves the member Ready.
     async fn advance_member_wake_topology(
         &mut self,
         run: WakeRun,
         rollback: Option<WakeRollback>,
         mut topology: WakeTopology,
     ) {
-        while let Some((target, peer, edge)) = topology.remaining.pop_front() {
-            #[cfg(test)]
-            if take_wake_edge_failure_for_test(&run.identity) {
-                tracing::warn!(
-                    mob_id = %self.definition.id,
-                    agent_identity = %run.identity,
-                    peer = %peer,
-                    "test seam: a woken member's wiring edge fails; its repair is owed"
-                );
-                topology.failed.push(peer);
-                self.resolve_member_edge_realization(&edge, false);
-                continue;
-            }
-            match self.prepare_member_wire(run.identity.clone(), target).await {
-                Ok(prepared) => {
-                    if let Some(prepared) = prepared.into_prepared() {
-                        let continuation = self.realize_wiring_detached(*prepared);
-                        let Some(entry) = self.roster.read().await.get(&run.identity).cloned()
-                        else {
-                            self.roll_back_member_wake(run, rollback);
-                            return;
-                        };
-                        self.dispatch_member_wake_step(
-                            run,
-                            MemberFence::exact(&entry),
-                            rollback,
-                            "member_wake_topology",
-                            async move {
-                                let result = continuation.settled().await;
-                                WakeStep::Topology {
-                                    topology,
-                                    peer,
-                                    edge: Box::new(edge),
-                                    result,
-                                }
-                            },
-                        );
-                        return;
-                    }
-                    // Settled inside its preparation: the edge is realized.
-                    self.resolve_member_edge_realization(&edge, true);
-                }
-                Err(error) => {
-                    tracing::warn!(
+        loop {
+            while let Some((target, peer, edge)) = topology.single.pop_front() {
+                if self.wake_edge_unwired(&edge) {
+                    tracing::debug!(
                         mob_id = %self.definition.id,
                         agent_identity = %run.identity,
                         peer = %peer,
-                        %error,
-                        "a woken member's wiring edge could not be prepared; its repair is owed"
+                        "a woken member's edge MobMachine no longer holds is not restored"
                     );
-                    topology.failed.push(peer);
-                    self.resolve_member_edge_realization(&edge, false);
+                    continue;
+                }
+                match self.prepare_member_wire(run.identity.clone(), target).await {
+                    Ok(prepared) => {
+                        if let Some(prepared) = prepared.into_prepared() {
+                            let continuation = self.realize_wiring_detached(*prepared);
+                            let Some(entry) = self.roster.read().await.get(&run.identity).cloned()
+                            else {
+                                self.roll_back_member_wake(run, rollback);
+                                return;
+                            };
+                            self.dispatch_member_wake_step(
+                                run,
+                                MemberFence::exact(&entry),
+                                rollback,
+                                "member_wake_topology",
+                                async move {
+                                    let result = continuation.settled().await;
+                                    WakeStep::Topology {
+                                        topology,
+                                        peer,
+                                        edge: Box::new(edge),
+                                        result,
+                                    }
+                                },
+                            );
+                            return;
+                        }
+                        // Settled inside its preparation: the edge is realized.
+                        self.resolve_member_edge_realization(&edge, true);
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            mob_id = %self.definition.id,
+                            agent_identity = %run.identity,
+                            peer = %peer,
+                            %error,
+                            "a woken member's wiring edge could not be prepared; its repair is owed"
+                        );
+                        topology.failed.push(peer);
+                        self.resolve_member_edge_realization(&edge, false);
+                    }
                 }
             }
+            if topology.remaining.is_empty() {
+                break;
+            }
+            if topology.yield_due {
+                // Between two chunks the turn returns to the actor, which
+                // serves what waits for it before the next chunk.
+                topology.yield_due = false;
+                let Some(entry) = self.roster.read().await.get(&run.identity).cloned() else {
+                    self.roll_back_member_wake(run, rollback);
+                    return;
+                };
+                self.dispatch_member_wake_step(
+                    run,
+                    MemberFence::exact(&entry),
+                    rollback,
+                    "member_wake_topology",
+                    async move { WakeStep::TopologyYield { topology } },
+                );
+                return;
+            }
+            let take = topology.chunk.min(topology.remaining.len());
+            let chunk = topology.remaining.drain(..take).collect::<Vec<_>>();
+            topology.single = Box::pin(self.realize_wake_topology_chunk(
+                &run.identity,
+                chunk,
+                &mut topology.failed,
+            ))
+            .await;
+            topology.yield_due = true;
         }
         if let Err(error) =
             self.resolve_respawn_topology_restore_result(&run.identity, topology.failed)
@@ -2020,7 +2074,7 @@ pub(in crate::runtime) fn fail_next_wake_edge_for_test(identity: &AgentIdentity)
 }
 
 #[cfg(test)]
-fn take_wake_edge_failure_for_test(identity: &AgentIdentity) -> bool {
+pub(super) fn take_wake_edge_failure_for_test(identity: &AgentIdentity) -> bool {
     let mut failures = WAKE_EDGE_FAILURES_FOR_TEST
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);

@@ -588,7 +588,8 @@ impl MobActor {
             })
             .collect::<BTreeSet<_>>();
         // The edges the definition declares for the members this chunk
-        // seats, wired as a spawn of each would be, on the same prepared
+        // seats, wired as a spawn of each would be (and an orchestrator
+        // member to the members that auto-wire to it), on the same prepared
         // authority: their MembersWired rows go in the chunk's one append, so
         // no seat is durable without its declared edges. An identity seated
         // before, or embodied by a spawn, keeps the edges it holds.
@@ -598,7 +599,7 @@ impl MobActor {
             .collect::<Vec<_>>();
         let declared_edges = self
             .stage_seated_declared_edges(&mut authority, &seated_ends, &mut effects, &mut journal)
-            .await;
+            .await?;
         let prepared = PreparedDslInput {
             authority,
             effects,
@@ -631,6 +632,14 @@ impl MobActor {
                 }
             }
         }
+        // The chunk's declared edges are committed with its seats: the live
+        // ends trust their counterparts now, and any edge with a placed or
+        // peer-only end takes the single-edge wire path. This comes before
+        // the verified pass below: a member that pass records Broken moves
+        // the topology epoch, which would leave every trust permission the
+        // step minted stale. A member the pass breaks keeps its edges and its
+        // live peers' trust, as a spawned member that breaks later does.
+        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         for seat in seated {
             tracing::debug!(
                 mob_id = %self.definition.id,
@@ -660,10 +669,6 @@ impl MobActor {
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = verify;
-        // The chunk's declared edges are committed with its seats: the live
-        // ends trust their counterparts now, and any edge with a placed or
-        // peer-only end takes the single-edge wire path.
-        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         outcomes
             .into_iter()
             .map(|outcome| {
@@ -1153,7 +1158,7 @@ impl MobActor {
                 &mut effects,
                 &mut wired_rows,
             )
-            .await;
+            .await?;
         let prepared = PreparedDslInput {
             authority,
             effects,

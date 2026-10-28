@@ -2757,6 +2757,77 @@ async fn a_member_waking_among_dormant_neighbours_owes_no_edge_repairs() {
     fixture.finish().await;
 }
 
+/// A woken member's edges to Dormant neighbours are realized a chunk at a
+/// time, each chunk one machine step: at two edges a chunk, five neighbours
+/// take three batches of two, two and one edges, the turn yielding to the
+/// actor between them. The woken member then trusts every neighbour's
+/// durable endpoint, no edge owes a repair, and the neighbours stay Dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_member_woken_among_dormant_neighbours_realizes_its_edges_a_chunk_at_a_time() {
+    let fixture = WakeFixture::new("wake-topology-chunks").await;
+    let member = fixture.spawn("chunked-member").await;
+    let mut neighbours = Vec::new();
+    for index in 0..5 {
+        let neighbour = fixture.spawn(&format!("chunked-neighbour-{index}")).await;
+        fixture.wire(&member, &neighbour).await;
+        neighbours.push(neighbour);
+    }
+    for neighbour in &neighbours {
+        fixture.release(neighbour).await;
+    }
+    fixture.release(&member).await;
+    crate::runtime::actor::wake_topology::set_wake_topology_chunk_for_test(
+        fixture.handle.mob_id(),
+        2,
+    );
+
+    fixture
+        .ensure_live(&member)
+        .await
+        .expect("the member wakes among dormant neighbours");
+    assert_eq!(
+        crate::runtime::actor::wake_topology::wake_topology_batches_for_test(
+            fixture.handle.mob_id()
+        ),
+        vec![2, 2, 1],
+        "each chunk of the woken member's edges is one machine step"
+    );
+    let trusted = fixture
+        .comms(&member)
+        .await
+        .peers()
+        .await
+        .into_iter()
+        .map(|peer| peer.peer_id.to_string())
+        .collect::<BTreeSet<_>>();
+    {
+        let state = fixture.handle.machine_state_watch_rx.borrow();
+        for neighbour in &neighbours {
+            let peer_id = state
+                .member_peer_ids
+                .get(&mob_dsl::AgentIdentity::from_domain(neighbour))
+                .expect("the neighbour's recorded endpoint");
+            assert!(
+                trusted.contains(&peer_id.0),
+                "the woken member trusts {neighbour}'s durable endpoint: {trusted:?}"
+            );
+        }
+        assert!(
+            state.owed_edge_repairs.is_empty(),
+            "no edge owes a repair: {:?}",
+            state.owed_edge_repairs
+        );
+    }
+    for neighbour in &neighbours {
+        assert_eq!(
+            fixture.residency(neighbour),
+            Some(mob_dsl::MemberMaterializationPhase::Dormant),
+            "the member's wake leaves its neighbours dormant"
+        );
+    }
+    fixture.finish().await;
+}
+
 /// A mob over an in-memory session service (one that keeps no durable
 /// sessions), with a real factory and real in-process comms: a member's
 /// session exists only while the member is materialized.

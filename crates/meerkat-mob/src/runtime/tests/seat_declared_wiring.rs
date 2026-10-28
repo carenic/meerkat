@@ -9,8 +9,8 @@
 
 use super::*;
 use crate::machines::mob_machine as dsl;
-use crate::runtime::DormantSeatOutcome;
 use crate::runtime::actor::member_wake_turn::probe_member_wake_restores_for_test;
+use crate::runtime::{DormantSeatOutcome, MemberRestorePolicy};
 
 const STEP: Duration = Duration::from_secs(60);
 
@@ -61,6 +61,24 @@ struct WiringMob {
 
 impl WiringMob {
     async fn new(label: &str, definition: MobDefinition, network_comms: bool) -> Self {
+        Self::build(label, definition, network_comms, None).await
+    }
+
+    /// A mob on session-scoped comms keys under the restore `policy`.
+    async fn with_restore_policy(
+        label: &str,
+        definition: MobDefinition,
+        policy: MemberRestorePolicy,
+    ) -> Self {
+        Self::build(label, definition, false, Some(policy)).await
+    }
+
+    async fn build(
+        label: &str,
+        definition: MobDefinition,
+        network_comms: bool,
+        policy: Option<MemberRestorePolicy>,
+    ) -> Self {
         let keys = tempfile::tempdir().expect("a comms identity root");
         let definition = with_unique_mob_id(definition, label);
         let service = Arc::new(MockSessionService::new());
@@ -72,6 +90,10 @@ impl WiringMob {
             builder.with_network_member_comms()
         } else {
             builder.with_member_comms_identity_root(keys.path())
+        };
+        let builder = match policy {
+            Some(policy) => builder.with_member_restore_policy(policy),
+            None => builder,
         };
         let handle = builder.create().await.expect("create the mob");
         Self {
@@ -576,57 +598,6 @@ async fn rotating_the_orchestrator_rewires_every_worker_to_its_next_incarnation(
     }
 }
 
-/// A spawned orchestrator is wired to the workers spawned before it, as each
-/// of them would have been wired to it had it been spawned first: the edges,
-/// their rows, and the trust of both live ends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_spawned_orchestrator_is_wired_to_the_workers_spawned_before_it() {
-    let mob = WiringMob::new(
-        "spawn-wiring-orchestrator-later",
-        sample_definition_with_auto_wire(),
-        false,
-    )
-    .await;
-    let lead = AgentIdentity::from("spawn-lead");
-    let first = AgentIdentity::from("spawn-worker-1");
-    let second = AgentIdentity::from("spawn-worker-2");
-    for worker in [&first, &second] {
-        mob.handle
-            .spawn_spec(spec("worker", worker))
-            .await
-            .expect("spawn a worker");
-    }
-    assert!(mob.edges().is_empty(), "no orchestrator is spawned yet");
-
-    mob.handle
-        .spawn_spec(spec("lead", &lead))
-        .await
-        .expect("spawn the orchestrator");
-    let expected = BTreeSet::from([pair(&first, &lead), pair(&second, &lead)]);
-    assert_eq!(
-        mob.edges(),
-        expected,
-        "the orchestrator's spawn wires every worker spawned before it"
-    );
-    let rows = mob.wired_rows().await;
-    assert_eq!(rows.len(), 2, "one MembersWired row per edge: {rows:?}");
-    assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), expected);
-    let lead_peer = mob
-        .recorded_peer_id(&lead)
-        .expect("the orchestrator's endpoint");
-    for worker in [&first, &second] {
-        let worker_peer = mob.recorded_peer_id(worker).expect("the worker's endpoint");
-        assert!(
-            mob.trusted(worker).await.contains(&lead_peer),
-            "{worker} trusts the orchestrator"
-        );
-        assert!(
-            mob.trusted(&lead).await.contains(&worker_peer),
-            "the orchestrator trusts {worker}"
-        );
-    }
-}
-
 /// A seat chunk journals its seats and their declared edges in one append,
 /// and so does a rotation its next incarnation and its edges: a seat is
 /// never durable without the edges its definition declares. (No fault seam
@@ -657,4 +628,168 @@ async fn a_seat_step_journals_its_members_and_their_declared_edges_in_one_append
         "the rotation's one append carries the next incarnation and its declared edge"
     );
     assert_eq!(mob.edges(), BTreeSet::from([pair(&member, &helper)]));
+}
+
+/// A member the verified pass of a seat chunk records Broken moves the
+/// topology epoch, so the chunk's live ends trust their counterparts before
+/// that pass, under the permissions the chunk minted. Here a live
+/// orchestrator, a worker seated earlier on a session that is then lost, and
+/// a chunk that re-sends that worker (already seated) with two new workers:
+/// the pass records the lost worker Broken, and the orchestrator trusts both
+/// new workers at once, with no repair owed for their edges.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_member_the_verified_pass_breaks_leaves_the_healthy_seats_of_its_chunk_trusted() {
+    let mob = WiringMob::with_restore_policy(
+        "seat-wiring-verified-pass",
+        sample_definition_with_auto_wire(),
+        MemberRestorePolicy::OnDemandVerified,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let lost = AgentIdentity::from("seat-lost");
+    let first = AgentIdentity::from("seat-worker-1");
+    let second = AgentIdentity::from("seat-worker-2");
+    mob.handle
+        .spawn_spec(spec("lead", &lead))
+        .await
+        .expect("spawn the orchestrator");
+    let lost_session = SessionId::new();
+    mob.service
+        .replace_live_session(Session::with_id(lost_session.clone()))
+        .await;
+    let resume_lost = || {
+        let mut spec = spec("worker", &lost);
+        spec.launch_mode = crate::launch::MemberLaunchMode::Resume {
+            bridge_session_id: lost_session.clone(),
+            resume_from_role: None,
+        };
+        spec
+    };
+    mob.seat(vec![resume_lost()]).await;
+    mob.service.delete_persisted_session(&lost_session).await;
+
+    let outcomes = tokio::time::timeout(
+        STEP,
+        mob.handle.seat_dormant_members(vec![
+            resume_lost(),
+            spec("worker", &first),
+            spec("worker", &second),
+        ]),
+    )
+    .await
+    .expect("the seat answers")
+    .expect("the seat commits");
+    assert!(
+        matches!(outcomes[0], DormantSeatOutcome::AlreadySeated { .. })
+            && outcomes[1..]
+                .iter()
+                .all(|outcome| matches!(outcome, DormantSeatOutcome::Seated { .. })),
+        "{outcomes:?}"
+    );
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_restore_failures
+            .contains_key(&dsl::AgentIdentity::from_domain(&lost)),
+        "the verified pass records the worker whose session is lost Broken"
+    );
+    let trusted = mob.trusted(&lead).await;
+    for worker in [&first, &second] {
+        let peer = mob
+            .recorded_peer_id(worker)
+            .expect("the seat recorded the worker's endpoint");
+        assert!(
+            trusted.contains(&peer),
+            "the live orchestrator trusts {worker} at once: {trusted:?}"
+        );
+    }
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .owed_edge_repairs
+            .is_empty(),
+        "no repair is owed for the new workers' edges"
+    );
+}
+
+/// A declared edge whose live end the seat step cannot resolve (the live
+/// orchestrator's comms runtime reports no public key) is still MobMachine's
+/// edge, staged in the step with its row, and its failed realization is owed
+/// a repair in MobMachine rather than only logged. Once the orchestrator's
+/// end resolves again, the repair realizes the edge: the orchestrator trusts
+/// the seated worker's recorded endpoint, and nothing more is journaled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_declared_edge_whose_realization_fails_at_its_seat_is_owed_a_repair() {
+    let mob = WiringMob::new(
+        "seat-wiring-owed-repair",
+        sample_definition_with_auto_wire(),
+        false,
+    )
+    .await;
+    let lead = AgentIdentity::from("seat-lead");
+    let seated = AgentIdentity::from("seat-worker");
+    mob.handle
+        .spawn_spec(spec("lead", &lead))
+        .await
+        .expect("spawn the orchestrator");
+    let lead_comms = test_comms_name_for(mob.handle.mob_id(), "lead", lead.as_str());
+    mob.service
+        .set_comms_behavior(
+            &lead_comms,
+            MockCommsBehavior {
+                missing_public_key: true,
+                ..MockCommsBehavior::default()
+            },
+        )
+        .await;
+
+    mob.seat(vec![spec("worker", &seated)]).await;
+    let edge = dsl::WiringEdge::new(
+        dsl::AgentIdentity::from_domain(&seated),
+        dsl::AgentIdentity::from_domain(&lead),
+    );
+    assert_eq!(
+        mob.edges(),
+        BTreeSet::from([pair(&seated, &lead)]),
+        "the declared edge is MobMachine's"
+    );
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&seated, &lead)],
+        "the edge is journaled with its seat"
+    );
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .owed_edge_repairs
+            .contains(&edge),
+        "the edge whose realization failed is owed a repair"
+    );
+    let seated_peer = mob
+        .recorded_peer_id(&seated)
+        .expect("the seat recorded the worker's endpoint");
+
+    mob.service
+        .set_comms_behavior(&lead_comms, MockCommsBehavior::default())
+        .await;
+    let mut state = mob.handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        STEP,
+        state.wait_for(|state| !state.owed_edge_repairs.contains(&edge)),
+    )
+    .await
+    .expect("the repair realizes the edge")
+    .expect("the machine state stays published");
+    assert!(
+        mob.trusted(&lead).await.contains(&seated_peer),
+        "the orchestrator trusts the seated worker's recorded endpoint"
+    );
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&seated, &lead)],
+        "the repair journals nothing more"
+    );
 }

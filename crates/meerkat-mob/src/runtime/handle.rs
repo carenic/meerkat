@@ -9449,7 +9449,8 @@ impl MobHandle {
     /// seats and their edges: the members seated in one call see each other,
     /// and a member seated later sees the ones seated before (an orchestrator
     /// member seated after the members that auto-wire to it is wired to
-    /// them). The edges are MobMachine's and journaled, and none wakes a member
+    /// them, which a spawn of it is not). The edges are MobMachine's and
+    /// journaled, and none wakes a member
     /// (except as MobMachine wakes a Dormant member an edge joins to a placed
     /// one): a live member trusts a seated one's recorded endpoint at once,
     /// and the seated member's own trust is installed by its wake. A member on
