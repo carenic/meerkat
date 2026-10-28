@@ -1,9 +1,14 @@
-//! A consented (R3) governed call that continues with governed helper steps
-//! after its single consuming entry. The native grant-backed work owner (with
-//! its audit wrapper), the approval owner with a host human consent route, the
-//! real fenced entry, the retained consent attempt, the helper WorkGraph fence
-//! and the helper child issuance are production code; the human route, the
-//! records policy and the original source are fixtures.
+//! Reviewed governed calls that continue with governed helper steps after
+//! their single consuming entry.
+//!
+//! The consented (R3) rows run on the native grant-backed work owner (with
+//! its audit wrapper), the approval owner with a host human consent route,
+//! the real fenced entry and the retained consent attempt. The cancelled run
+//! row runs a model-reviewed (R2) call inside a real native run (the
+//! MeerkatMachine run custody, the Agent owners and the review owner). Every
+//! row uses the real helper WorkGraph fence and helper child issuance; the
+//! reviewer, the human route, the records policy, the original source and
+//! the scripted controller are fixtures.
 
 use super::*;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -923,5 +928,475 @@ async fn a_cancelled_consented_dispatch_keeps_its_review_in_use_until_its_held_s
             ConsentNoticeKind::Approved,
             ConsentNoticeKind::Used,
         ]
+    );
+}
+
+/// The records owner rating every record tool R2 (one model review), with
+/// the controller admitted as `RecordOwner` admits it and no separately
+/// selected action account.
+struct ReviewedRecords;
+impl OperationPolicyOwner for ReviewedRecords {
+    fn authorize_controller_admission(
+        &self,
+        association: &InputAuthorityAssociation,
+        facts: &meerkat_core::ControllerModelFacts,
+        now_ms: u64,
+    ) -> Result<
+        meerkat_authorization::grant_policy::ControllerAdmissionAllowance,
+        meerkat_core::OperationAuthorizationError,
+    > {
+        RecordOwner.authorize_controller_admission(association, facts, now_ms)
+    }
+
+    fn authorize_operation(
+        &self,
+        association: &InputAuthorityAssociation,
+        binding: &PreparedAuthorizationBinding,
+        purpose: LocalPolicyPurpose,
+        now_ms: u64,
+    ) -> Result<LocalPolicyAllowance, meerkat_core::OperationAuthorizationError> {
+        let mut allowance =
+            RecordOwner.authorize_operation(association, binding, purpose, now_ms)?;
+        if matches!(binding.facts().operation, AuthorizationOperation::Tool(_)) {
+            allowance.review_tier = meerkat_core::authorization::OperationReviewTier::R2;
+        }
+        Ok(allowance)
+    }
+
+    fn review_action_account(
+        &self,
+        _: &InputAuthorityAssociation,
+        _: &PreparedAuthorizationBinding,
+        _: u64,
+    ) -> Result<Option<String>, meerkat_core::OperationAuthorizationError> {
+        Ok(None)
+    }
+}
+
+/// The bound model reviewer of the reviewed run: it allows, and counts.
+#[derive(Default)]
+struct AllowingReviewer(AtomicUsize);
+#[async_trait]
+impl OperationReviewer for AllowingReviewer {
+    async fn review(
+        &self,
+        _candidate: &ReviewCandidate<'_>,
+    ) -> Result<ReviewVerdict, ReviewerFailure> {
+        self.0.fetch_add(1, Ordering::SeqCst);
+        Ok(ReviewVerdict::Allow)
+    }
+}
+
+/// The reviewed call's id in the controller's response.
+const REVIEWED_CALL: &str = "reviewed-read";
+
+/// The controller of the reviewed run: its first request asks for the
+/// reviewed read, and the run is cancelled before it needs another.
+#[derive(Default)]
+struct ReviewedReadProvider(AtomicUsize);
+#[async_trait]
+impl LlmClient for ReviewedReadProvider {
+    fn plain_model_route(
+        &self,
+        logical_model: &str,
+    ) -> Result<meerkat_llm_core::PlainModelRoute, meerkat_core::ControllerFactsUnavailable> {
+        if logical_model != MODEL {
+            return Err(meerkat_core::ControllerFactsUnavailable);
+        }
+        meerkat_llm_core::PlainModelRoute::new(ENDPOINT, MODEL)
+    }
+
+    fn controller_model_selection(&self) -> Option<ControllerModelSelection> {
+        Some(selection())
+    }
+
+    fn project_replay_messages(&self, messages: &[Message]) -> Result<Vec<Message>, LlmError> {
+        Ok(messages.to_vec())
+    }
+
+    fn stream<'a>(&'a self, _: &'a LlmRequest) -> LlmStream<'a> {
+        panic!("governed request must reach the prepared provider entry")
+    }
+
+    fn stream_prepared<'a>(&'a self, request: &'a PreparedLlmRequest) -> LlmStream<'a> {
+        let check = request
+            .authorization()
+            .expect("native work reaches actual provider")
+            .prepare(model_facts())
+            .expect("actual native controller authorization")
+            .current()
+            .expect("final controller entry check");
+        check
+            .observe_entry(meerkat_core::OperationEntryBoundary::ModelRequest)
+            .expect("native audit stages actual transport entry");
+        check
+            .observe_outcome(OperationObservedOutcome::HttpResponse { status: 200 })
+            .expect("native audit stages fixture response headers");
+        if self.0.fetch_add(1, Ordering::SeqCst) == 0 {
+            Box::pin(futures::stream::iter(tool_events(
+                REVIEWED_CALL,
+                "read_record",
+            )))
+        } else {
+            Box::pin(futures::stream::iter([
+                Ok(LlmEvent::TextDelta {
+                    delta: "unexpected continuation after the cancellation".into(),
+                    meta: None,
+                }),
+                done(StopReason::EndTurn),
+            ]))
+        }
+    }
+
+    fn provider(&self) -> Provider {
+        Provider::Anthropic
+    }
+
+    async fn health_check(&self) -> Result<(), LlmError> {
+        Ok(())
+    }
+}
+
+/// A model-reviewed (R2) call in a real native run enters with
+/// `enter_governed_operation` and hands its helper WorkGraph admission to a
+/// worker, whose step is held in flight. The run is cancelled meanwhile.
+/// While the step is still held: the run reaches its cancelled terminal
+/// within a bound; a step started after the cancellation is refused and
+/// commits nothing (MalformedFacts at core once the runtime applied the
+/// cancellation, with no not-dispatched certificate; Denied at the helpers);
+/// and no Used is reported. Once the gate opens, the held commit lands and
+/// Used is reported exactly once, after the worker's last witness clone
+/// drops.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_cancelled_reviewed_run_settles_while_its_entered_step_is_held() {
+    let grants = Arc::new(
+        LocalGrantAuthority::new(
+            LocalGrantConfiguration {
+                root: principal("grant-owner"),
+                namespace: id("entered-review-grants"),
+                generation: 1,
+            },
+            LocalAuthorizationPublication::new(),
+            Arc::new(HostAuthorizationClock),
+        )
+        .expect("actual generated grant owner"),
+    );
+    let controller = grants
+        .issue_root(
+            &principal("grant-owner"),
+            id("controller"),
+            principal("executor"),
+            None,
+            ceiling("infer"),
+        )
+        .expect("actual controller lineage with unrestricted lifetime");
+    let operation = grants
+        .issue_root(
+            &principal("grant-owner"),
+            id("read-only"),
+            principal("executor"),
+            None,
+            ceiling("read"),
+        )
+        .expect("actual read-only operation grant");
+    // Issued before the run: a held step keeps the grant publication's
+    // writer, so no owner change can land while it is held.
+    let helper_parent = grants
+        .issue_root(
+            &principal("grant-owner"),
+            id("helper-parent"),
+            principal("helper-operator"),
+            None,
+            ExecutionRestrictions::unrestricted(),
+        )
+        .expect("actual independent parent grant");
+    let expected_controller = controller.clone();
+    let expected_operation = operation.clone();
+    let ingress: Arc<NativeIngressCheck> = Arc::new(move |runtime, _, current, claimed| {
+        let candidate = claimed.candidate();
+        if current.requester() != &principal("requester")
+            || current.ingress_actor() != &principal("ingress")
+            || current.realm() != &RealmId::parse("native-loop").expect("realm")
+            || candidate.logical_executor != principal("executor")
+            || candidate.represented_subject.is_some()
+            || candidate.target.logical_runtime != id(&runtime.to_string())
+            || candidate.controller_grant_lineage != [expected_controller.clone()]
+            || candidate.authority_basis
+                != (WorkAuthorityBasis::GrantLineage {
+                    lineage: vec![expected_operation.clone()],
+                })
+            || candidate.controller_model.as_ref() != Some(&selection())
+            || candidate.controller_ceiling != ceiling("infer")
+        {
+            return Err(denied().into());
+        }
+        Ok(())
+    });
+    let machine = Arc::new(
+        MeerkatMachine::ephemeral()
+            .with_local_grant_authorization(NativeGrantWorkConfiguration {
+                retained_resume: None,
+                require_scoped_destination: false,
+                grants: Arc::clone(&grants),
+                ingress,
+                invocation_owner: Arc::new(InvocationOwner),
+                operation_owner: Arc::new(ReviewedRecords),
+                configured_mcp_attachment: None,
+            })
+            .expect("exclusive actual native host setup"),
+    );
+    let originals = Arc::new(StepOriginals::new());
+    let _release = ReleaseOnDrop(Arc::clone(&originals));
+    let leaf = Arc::new(EnteredLeaf {
+        mode: LeafMode::Blocked,
+        graph: meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new())),
+        originals: Arc::clone(&originals),
+        bodies: AtomicUsize::new(0),
+        steps: Mutex::new(Vec::new()),
+        witness: Mutex::new(None),
+        worker: Mutex::new(None),
+    });
+    let reviewer = Arc::new(AllowingReviewer::default());
+    let observer = Arc::new(UsedObservations::default());
+    let review = Arc::new(
+        BoundOperationReview::new(
+            reviewer.clone(),
+            meerkat_core::ApprovalService::new(),
+            Duration::from_secs(30),
+        )
+        .with_observer(observer.clone()),
+    );
+    let mut builder = FactoryAgentBuilder::new(
+        AgentFactory::minimal().with_operation_review(review),
+        Config::default(),
+    );
+    builder.default_llm_client = Some(Arc::new(ReviewedReadProvider::default()));
+    builder.default_tool_dispatcher = Some(leaf.clone());
+    builder.default_session_store = Some(Arc::new(RecordingStore::default()));
+    let service = Arc::new(EphemeralSessionService::new(builder, 2));
+    let created = meerkat::surface::materialize_ephemeral_runtime_session(
+        &service,
+        &machine,
+        CreateSessionRequest {
+            model: MODEL.into(),
+            prompt: "".into(),
+            injected_context: Vec::new(),
+            system_prompt: meerkat_core::config::SystemPromptOverride::Inherit,
+            max_tokens: None,
+            event_tx: None,
+            initial_turn: InitialTurnPolicy::Defer,
+            deferred_prompt_policy: DeferredPromptPolicy::Discard,
+            build: None,
+            labels: None,
+        },
+        false,
+    )
+    .await
+    .expect("real native executor and deferred Agent actor");
+    let session_id = created.session_id;
+    let actor = service
+        .live_session_actor_witness(&session_id)
+        .await
+        .expect("actual live actor");
+    let pin = service
+        .pin_controller_client_for_actor(&actor)
+        .await
+        .expect("actual immutable selected LlmClientAdapter");
+    let credential_owner = machine.generated_auth_lease_handle();
+    meerkat_core::publish_token_lifecycle_acquired_for_identity_within(
+        &credential_owner,
+        pin.selection().credential(),
+        &meerkat_core::auth::PersistedTokens::api_key("synthetic-native-loop-credential"),
+        tokio::time::Instant::now() + CREDENTIAL_PUBLICATION_WAIT,
+    )
+    .await
+    .expect("actual generated fixture credential before native admission");
+    let runtime = LogicalRuntimeId::for_session(&session_id);
+    let mut prompt = PromptInput::new("Read record-7 through its reviewed tool", None);
+    prompt.header.authority_association = Some(association(
+        &runtime,
+        controller,
+        operation,
+        pin.selection().clone(),
+    ));
+    let input = Input::Prompt(prompt);
+    let current = NativeIngressContext::from_trusted_ingress(
+        &input,
+        principal("requester"),
+        principal("ingress"),
+        RealmId::parse("native-loop").expect("realm"),
+        evidence("fresh-transport-authentication"),
+    )
+    .expect("separate current trusted ingress observation")
+    .with_controller_client(&input, pin)
+    .expect("bind real pin before native acceptance");
+    let input = input
+        .with_ingress_context(current)
+        .expect("exact finalized input binding");
+
+    // The helper step the leaf hands to its worker is held inside the work
+    // owners' exclusion, after the review owner admitted it.
+    originals.armed.store(true, Ordering::SeqCst);
+    let (_, completion) = machine
+        .accept_input_with_completion(&session_id, input)
+        .await
+        .expect("real native admission");
+    let completion = completion.expect("actual native completion waiter");
+    tokio::time::timeout(Duration::from_secs(20), originals.in_flight.notified())
+        .await
+        .expect("the reviewed call entered and its helper step is admitted and held");
+    assert_eq!(
+        reviewer.0.load(Ordering::SeqCst),
+        1,
+        "one model review, spent at the entry"
+    );
+
+    // The host cancels the run while the step is held. The dispatch end hands
+    // the attempt back without waiting, so the run reaches its cancelled
+    // terminal with the gate still closed.
+    meerkat::surface::interrupt_ephemeral_runtime_session(&machine, &session_id)
+        .await
+        .expect("the run is interrupted");
+    let outcome = tokio::time::timeout(Duration::from_secs(10), completion.wait())
+        .await
+        .expect("the cancelled terminal is reported while the step is held")
+        .expect("native completion observation");
+    assert!(
+        matches!(outcome, CompletionOutcome::Cancelled),
+        "the run ends cancelled: {outcome:?}"
+    );
+
+    // Still held. A step started now is refused and commits nothing: the
+    // runtime applied the cancellation before it reported the terminal, so
+    // the run's custody refuses the ended run (MalformedFacts) before the
+    // review owner is asked.
+    let witness = leaf
+        .witness
+        .lock()
+        .expect("witness")
+        .take()
+        .expect("the entry minted its witness");
+    let further = FurtherOriginals {
+        originals: no_contributors(),
+        source: Arc::new(SourceOriginalBasis::new(originals.clone())),
+    };
+    let mut ran = false;
+    let refused = witness.run_if_current_within(&further, &mut || ran = true);
+    match &refused {
+        Err(ToolError::AuthorizationRefused { refusal }) => {
+            assert_eq!(
+                refusal.kind(),
+                OperationRefusalKind::MalformedFacts,
+                "the ended run refuses the step"
+            );
+            assert_eq!(refusal.dispatch(), RefusalDispatch::Unknown);
+        }
+        other => panic!("a step after the cancellation is refused: {other:?}"),
+    }
+    assert!(!ran, "the refused step ran nothing");
+    let error = refused.expect_err("refused");
+    assert_eq!(error.to_error_payload()["data"]["tool_invoked"], "unknown");
+    // The held step keeps its own graph's write lock: the late admission
+    // goes to a graph of its own.
+    let late_graph = meerkat::WorkGraphService::new(Arc::new(meerkat::MemoryWorkGraphStore::new()));
+    let late_key = meerkat::WorkAdmissionKey::new("helper-after-the-cancellation").expect("key");
+    let late_admission = late_graph
+        .admission_identity(late_key.clone(), helper_request())
+        .expect("identity");
+    let late_fence = GovernedHelperAdmissionFence::from_entered(
+        &witness,
+        originals.clone(),
+        no_contributors(),
+        "default",
+        meerkat::WorkNamespace::default(),
+        late_admission,
+    );
+    assert!(
+        late_graph
+            .create_idempotent_with_fence(late_key, helper_request(), late_fence.clone())
+            .await
+            .is_err(),
+        "the late admission commits nothing"
+    );
+    assert_eq!(late_fence.refusal(), Some(HelperAdmissionRefusal::Denied));
+    drop(late_fence);
+    assert!(
+        late_graph
+            .list(meerkat::WorkItemFilter {
+                include_terminal: true,
+                ..Default::default()
+            })
+            .await
+            .expect("list")
+            .is_empty(),
+        "nothing committed after the cancellation"
+    );
+    let late_child = GovernedHelperChildIssuance::from_entered(
+        &witness,
+        originals.clone(),
+        no_contributors(),
+        child_intent(&helper_parent, "child-after-the-cancellation"),
+    )
+    .issue_or_recover();
+    assert_eq!(late_child, Err(HelperChildIssuanceRefusal::Denied));
+    assert_eq!(
+        grants
+            .issued_reference(&id("child-after-the-cancellation"))
+            .expect("lookup"),
+        None,
+        "nothing issued after the cancellation"
+    );
+    assert_eq!(
+        observer.used(REVIEWED_CALL),
+        0,
+        "no Used while the admitted step is held"
+    );
+    drop(witness);
+    assert_eq!(
+        observer.used(REVIEWED_CALL),
+        0,
+        "the held worker keeps the entered custody"
+    );
+
+    // The gate opens: the held step completes and commits its item, and the
+    // worker's last witness clone releases the entered custody.
+    originals.release();
+    let worker = leaf
+        .worker
+        .lock()
+        .expect("helper worker")
+        .take()
+        .expect("the entry started its helper worker");
+    let (committed, refusal) = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || worker.join()),
+    )
+    .await
+    .expect("the helper worker finishes")
+    .expect("join task")
+    .expect("helper worker");
+    assert!(committed, "the held commit answers Created");
+    assert_eq!(refusal, None);
+    assert_eq!(
+        leaf.graph
+            .list(meerkat::WorkItemFilter {
+                include_terminal: true,
+                ..Default::default()
+            })
+            .await
+            .expect("list")
+            .len(),
+        1,
+        "exactly the held step's item"
+    );
+    assert_eq!(
+        observer.used(REVIEWED_CALL),
+        1,
+        "Used is reported once, after the worker's last witness clone"
+    );
+    assert_eq!(
+        leaf.bodies.load(Ordering::SeqCst),
+        0,
+        "the cancelled call's body never returned"
     );
 }
