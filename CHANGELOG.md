@@ -741,13 +741,6 @@ them.
   this way, so a rollback needs nothing. A session's existing rows shrink at
   its next commit; a dormant member's session keeps its rows until the
   member is next woken, and Core does not read them meanwhile.
-- `meerkat-mob`: under `auto_wire_orchestrator`, an orchestrator member
-  spawned after members of the mob's other profiles is now wired to them,
-  as each of them is wired to an orchestrator member spawned before it.
-  The rule ran only from the side of the member being spawned, so an
-  orchestrator spawned after its workers was never wired to them, and the
-  edges depended on the order the members were brought up in. A flow member
-  still takes no declared wiring.
 - `meerkat-mob`: reading a mob's member binding history
   (`MobHandle::member_binding_history`, and `last_member_binding`,
   `member_binding_for_session`, `durable_identity_members` and

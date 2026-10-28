@@ -24,7 +24,8 @@
 //!    at a time, so the refused one is answered alone), then one runtime
 //!    obligation scan and the seated identities' `PlanBootMaterialization`
 //!    as one more batch, then the edges the definition declares for the
-//!    members it seats, as a spawn of each would be (their `WireMembers`
+//!    members it seats, as a spawn of each would be and, for an orchestrator
+//!    member, to the members that auto-wire to it (their `WireMembers`
 //!    inputs), then the `MemberSpawned` rows and the edges' `MembersWired`
 //!    rows in one `append_batch` before the base-checked commit: a seat is
 //!    never durable without its declared edges.

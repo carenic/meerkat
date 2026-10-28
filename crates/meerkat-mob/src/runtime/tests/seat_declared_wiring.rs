@@ -598,57 +598,6 @@ async fn rotating_the_orchestrator_rewires_every_worker_to_its_next_incarnation(
     }
 }
 
-/// A spawned orchestrator is wired to the workers spawned before it, as each
-/// of them would have been wired to it had it been spawned first: the edges,
-/// their rows, and the trust of both live ends.
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_spawned_orchestrator_is_wired_to_the_workers_spawned_before_it() {
-    let mob = WiringMob::new(
-        "spawn-wiring-orchestrator-later",
-        sample_definition_with_auto_wire(),
-        false,
-    )
-    .await;
-    let lead = AgentIdentity::from("spawn-lead");
-    let first = AgentIdentity::from("spawn-worker-1");
-    let second = AgentIdentity::from("spawn-worker-2");
-    for worker in [&first, &second] {
-        mob.handle
-            .spawn_spec(spec("worker", worker))
-            .await
-            .expect("spawn a worker");
-    }
-    assert!(mob.edges().is_empty(), "no orchestrator is spawned yet");
-
-    mob.handle
-        .spawn_spec(spec("lead", &lead))
-        .await
-        .expect("spawn the orchestrator");
-    let expected = BTreeSet::from([pair(&first, &lead), pair(&second, &lead)]);
-    assert_eq!(
-        mob.edges(),
-        expected,
-        "the orchestrator's spawn wires every worker spawned before it"
-    );
-    let rows = mob.wired_rows().await;
-    assert_eq!(rows.len(), 2, "one MembersWired row per edge: {rows:?}");
-    assert_eq!(rows.into_iter().collect::<BTreeSet<_>>(), expected);
-    let lead_peer = mob
-        .recorded_peer_id(&lead)
-        .expect("the orchestrator's endpoint");
-    for worker in [&first, &second] {
-        let worker_peer = mob.recorded_peer_id(worker).expect("the worker's endpoint");
-        assert!(
-            mob.trusted(worker).await.contains(&lead_peer),
-            "{worker} trusts the orchestrator"
-        );
-        assert!(
-            mob.trusted(&lead).await.contains(&worker_peer),
-            "the orchestrator trusts {worker}"
-        );
-    }
-}
-
 /// A seat chunk journals its seats and their declared edges in one append,
 /// and so does a rotation its next incarnation and its edges: a seat is
 /// never durable without the edges its definition declares. (No fault seam

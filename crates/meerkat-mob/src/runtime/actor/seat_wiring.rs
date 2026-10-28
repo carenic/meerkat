@@ -2,12 +2,13 @@
 //!
 //! A seat (`MobActor::commit_dormant_seats`) and a rotation's next
 //! incarnation (`MobActor::commit_member_rotation`) wire their member to the
-//! members a spawn of it would be wired to (`MobActor::declared_wiring_targets`:
-//! under `auto_wire_orchestrator`, a member to the orchestrator's members, and
-//! an orchestrator member to every member that auto-wires to it; and the
-//! members of every profile a `role_wiring` rule pairs with its own). An
-//! identity that was seated already, or that a spawn embodied, is wired by
-//! nothing here: it holds the edges it holds.
+//! members the definition declares (`MobActor::declared_wiring_targets`:
+//! under `auto_wire_orchestrator`, a member to the orchestrator's members, as
+//! a spawn of it is, and an orchestrator member to every member that
+//! auto-wires to it, which a spawn of it is not; and the members of every
+//! profile a `role_wiring` rule pairs with its own). An identity that was
+//! seated already, or that a spawn embodied, is wired by nothing here: it
+//! holds the edges it holds.
 //!
 //! The edges are staged on the seat step's own prepared authority, after its
 //! seats, so the members seated in one chunk see each other: their lifecycle
@@ -313,10 +314,11 @@ impl MobActor {
     /// The new edges the definition declares for `seated`, each as (seated
     /// member, target) and each unordered pair once, from one pass over the
     /// members of `state` (the seat step's prepared state, which holds its
-    /// seats): a seated member's targets are the ones a spawn of it computes
-    /// (`declared_wiring_targets` over the active members of each profile the
-    /// rule reads). An edge `state` holds already is left out, as is a seated
-    /// member that is not active (a Broken one, say).
+    /// seats): a seated member's targets are the declared rule's, both ways
+    /// for an orchestrator member (`declared_wiring_targets` over the active
+    /// members of each profile the rule reads). An edge `state` holds already
+    /// is left out, as is a seated member that is not active (a Broken one,
+    /// say).
     fn seated_declared_pairs(
         &self,
         state: &mob_dsl::MobMachineState,
@@ -376,6 +378,7 @@ impl MobActor {
             let targets = Self::declared_wiring_targets(
                 &self.definition,
                 &ProfileName::from(profile.as_str()),
+                OrchestratorAutoWire::BothWays,
                 |target_profile| {
                     active
                         .get(target_profile.as_str())

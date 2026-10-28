@@ -588,7 +588,8 @@ impl MobActor {
             })
             .collect::<BTreeSet<_>>();
         // The edges the definition declares for the members this chunk
-        // seats, wired as a spawn of each would be, on the same prepared
+        // seats, wired as a spawn of each would be (and an orchestrator
+        // member to the members that auto-wire to it), on the same prepared
         // authority: their MembersWired rows go in the chunk's one append, so
         // no seat is durable without its declared edges. An identity seated
         // before, or embodied by a spawn, keeps the edges it holds.
