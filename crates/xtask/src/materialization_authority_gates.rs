@@ -264,6 +264,11 @@ pub(crate) const MOB_LIVE_SESSION_OBSERVATIONS: &[SiteAllowance] = &[
         "serving_member_binding_registry",
         "explicit-resume lift mechanics: the operation registry of a registration that already serves the member's exact binding is reused only while its session actor is present, else the full restore runs; no residency is decided",
     ),
+    settled(
+        "crates/meerkat-mob/src/runtime/actor.rs",
+        "session_has_retained_materialization",
+        "explicit-resume seam mechanics: a member MobMachine holds Dormant is a candidate only while its session still holds something this process left behind (an executor attachment, or a live session actor from an earlier handle of the mob), which the seam retires before the durable Resume; it reads only in-memory state, never the store, so a lazy resume stays lazy, and decides no member state (the member stays Dormant for the lift's plan)",
+    ),
     pending(
         "crates/meerkat-mob/src/runtime/actor.rs",
         "realize_restored_member_operation_binding",
