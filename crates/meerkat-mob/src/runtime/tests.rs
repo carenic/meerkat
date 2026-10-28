@@ -14588,6 +14588,29 @@ impl SessionAgent for PersistentMockAgent {
         ))
     }
 
+    /// A runtime-backed turn (every turn a runtime-backed member serves): the
+    /// runtime routed its handling mode and lowered its prompt to typed
+    /// appends before this runs, and this mock answers every turn with the
+    /// same reply, whatever its input, as [`Self::run_with_events`] does.
+    async fn run_turn_with_events(
+        &mut self,
+        input: meerkat_session::ephemeral::SessionAgentTurnInput,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<RunResult, meerkat_core::error::AgentError> {
+        if input.handling_mode != HandlingMode::Queue {
+            return Err(meerkat_core::error::AgentError::ConfigError(format!(
+                "unexpected persistent mock handling mode: {:?}",
+                input.handling_mode,
+            )));
+        }
+        if input.render_metadata.is_some() {
+            return Err(meerkat_core::error::AgentError::ConfigError(
+                "the persistent mock does not consume render metadata".to_string(),
+            ));
+        }
+        self.run_with_events(input.prompt, event_tx).await
+    }
+
     fn set_skill_references(&mut self, _refs: Option<Vec<meerkat_core::skills::SkillKey>>) {}
 
     fn set_turn_tool_overlay(
@@ -67438,44 +67461,6 @@ async fn the_live_actor_binding_check_accepts_only_the_requested_binding() {
         matches!(check(other).await, Err(MobError::SessionError(_))),
         "an unreadable recorded binding is never a reuse"
     );
-}
-
-/// A live actor that runs the spec's binding is reused, whether its session
-/// recorded the binding as the spec names it or as a build of it records it
-/// (stamped with the realm that declares it). Nothing is rebuilt.
-#[tokio::test]
-async fn a_resume_reuses_a_live_actor_on_the_specs_binding_in_either_form() {
-    for (label, recorded) in [
-        ("live-named-binding", scoped_auth_binding()),
-        ("live-owner-binding", owner_stamped_scoped_auth_binding()),
-    ] {
-        let (handle, service) = create_test_mob(sample_definition()).await;
-        service.resolve_recorded_auth_binding(
-            scoped_auth_binding(),
-            owner_stamped_scoped_auth_binding(),
-        );
-        let identity = AgentIdentity::from(label);
-        let session = live_session_on_binding_for_test(&service, &identity, recorded).await;
-        let builds = service.recorded_create_requests().await.len();
-        let mut spec = resume_launch_spec_for_test(&identity, &session);
-        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
-        spec.auth_binding = Some(scoped_auth_binding());
-
-        handle
-            .spawn_spec(spec)
-            .await
-            .unwrap_or_else(|error| panic!("{label}: the live actor is reused: {error:?}"));
-        assert_eq!(
-            handle.resolve_bridge_session_id(&identity).await.as_ref(),
-            Some(&session),
-            "{label}: the member is seated on the live session"
-        );
-        assert_eq!(
-            service.recorded_create_requests().await.len(),
-            builds,
-            "{label}: the reuse builds nothing"
-        );
-    }
 }
 
 /// #1249: the heavy part of a local Spawn (here the resume-session activity

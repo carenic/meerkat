@@ -1257,13 +1257,17 @@ async fn readiness_failure_rolls_the_reload_back_and_leaves_the_member_dormant()
             .is_err()
     );
     // A reload whose readiness fails is retryable: the member is not Broken.
+    // A failure names what recorded it Broken (MobMachine's restore failure).
+    let status = mob
+        .handle
+        .member_status(mob.member(0))
+        .await
+        .expect("member status");
     assert_ne!(
-        mob.handle
-            .member_status(mob.member(0))
-            .await
-            .expect("member status")
-            .status,
-        crate::runtime::handle::MobMemberStatus::Broken
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a reload whose readiness failed left the member Broken: {:?}",
+        status.error
     );
     // The provision the reload committed on its Bound verdict is
     // rolled back with its attempt. Nothing MobMachine does not hold stays
