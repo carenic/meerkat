@@ -376,7 +376,12 @@ pub enum MemberWakeRefusal {
     /// The member's host has preparation pending for it (a first-boot row,
     /// or its build preparation asked to be retried).
     HostPreparationPending,
-    /// The member's durable resume gate was unavailable.
+    /// The member's restore could not proceed now and keeps its authority:
+    /// its durable resume gate was unavailable, a lifecycle operation on its
+    /// session (the takeover of its attachment) was still in flight, or the
+    /// session service could not serve it now (a store failure that clears
+    /// on its own, a busy session, unavailable runtime authority, a hosting
+    /// claim another owner holds, a durable tail held for its recovery).
     ResumeGateUnavailable,
     /// The mob's wake bound (`MobBuilder::with_member_wake_timeout`) ended
     /// before the member was ready. The member is dormant again.

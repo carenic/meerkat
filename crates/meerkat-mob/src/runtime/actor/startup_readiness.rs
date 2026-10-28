@@ -117,7 +117,32 @@ impl MobActor {
         &mut self,
         outcomes: Vec<MemberReadinessOutcome>,
     ) -> (Vec<MemberReadinessOutcome>, Option<MobError>) {
-        let mut held = std::mem::take(&mut self.startup_boot_attempts);
+        let held = std::mem::take(&mut self.startup_boot_attempts);
+        self.settle_held_readiness(held, outcomes).await
+    }
+
+    /// [`Self::settle_held_member_readiness`] for one held member alone: an
+    /// explicit resume's rebuilt member, whose own readiness ran right after
+    /// its acceptance. Every other held member stays held.
+    pub(super) async fn settle_held_member_readiness_of(
+        &mut self,
+        identity: &AgentIdentity,
+        outcomes: Vec<MemberReadinessOutcome>,
+    ) -> (Vec<MemberReadinessOutcome>, Option<MobError>) {
+        let held: BTreeMap<AgentIdentity, u64> = self
+            .startup_boot_attempts
+            .remove(identity)
+            .map(|attempt| (identity.clone(), attempt))
+            .into_iter()
+            .collect();
+        self.settle_held_readiness(held, outcomes).await
+    }
+
+    async fn settle_held_readiness(
+        &mut self,
+        mut held: BTreeMap<AgentIdentity, u64>,
+        outcomes: Vec<MemberReadinessOutcome>,
+    ) -> (Vec<MemberReadinessOutcome>, Option<MobError>) {
         let mut rest = Vec::with_capacity(outcomes.len());
         let mut first_failure = None;
         for outcome in outcomes {

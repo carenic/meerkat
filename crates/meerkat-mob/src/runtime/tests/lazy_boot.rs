@@ -3275,3 +3275,68 @@ async fn a_boot_restore_hands_the_build_preparer_the_mobs_own_read_view() {
         Some(dsl::MemberMaterializationPhase::Live)
     );
 }
+
+/// The lift of a stopped mob asks the host's build preparer about each member
+/// its Eager plan rebuilds, with the mob's own read-only view, before the
+/// member's provision, as a wake and a boot restore do: the lift rebuilds
+/// the member through the explicit-resume work path, which prepares no build
+/// of its own. Its one preparation is answered and the member ends Live.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lift_hands_the_build_preparer_each_member_it_rebuilds() {
+    let definition = with_unique_mob_id(sample_definition(), "lift-preparer-read-view");
+    let service = Arc::new(MockSessionService::new());
+    let _adapter = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let handle = MobBuilder::new(definition, storage.clone())
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let member = worker(0);
+    handle
+        .spawn_spec(turn_driven(&member))
+        .await
+        .expect("spawn the member");
+    handle.stop().await.expect("stop the mob");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    let preparer = Arc::new(ManagementReadingPreparer::default());
+    let resumed = tokio::time::timeout(
+        LAZY_STEP,
+        Box::pin(
+            MobBuilder::for_resume(storage)
+                .with_session_service(restarted.clone())
+                .notify_orchestrator_on_resume(false)
+                .with_member_restore_policy(MemberRestorePolicy::Eager)
+                .with_member_build_preparer(preparer.clone())
+                .resume(),
+        ),
+    )
+    .await
+    .expect("the reconstruction answers")
+    .expect("the reconstruction succeeds");
+    assert_eq!(resumed.status().await.unwrap(), MobState::Stopped);
+    assert!(
+        preparer.reads().is_empty(),
+        "a stopped start builds nothing: {:?}",
+        preparer.reads()
+    );
+
+    tokio::time::timeout(LAZY_STEP, resumed.resume())
+        .await
+        .expect("the lift answers")
+        .expect("the lift succeeds");
+    assert_eq!(
+        preparer.reads(),
+        vec![Ok(crate::MemberIdentityManagement::CommandDriven)],
+        "the lift's one preparation of the member read who manages its identity, answered"
+    );
+    resumed.status().await.expect("the mob answers");
+    assert_eq!(
+        phase_of(&resumed, &member),
+        Some(dsl::MemberMaterializationPhase::Live)
+    );
+}

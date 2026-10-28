@@ -1027,6 +1027,13 @@ pub(super) enum MobCommand {
         work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
         completion: super::actor::ExplicitResumeMemberCompletion,
     },
+    /// The readiness of one explicit resume member held Waking after its
+    /// acceptance resolved; its work settles once MobMachine holds the
+    /// member Live, or Broken with the failure.
+    ResumeLifecycleMemberReadinessResolved {
+        work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
+        outcomes: Vec<super::actor::MemberReadinessOutcome>,
+    },
     ResumeLifecycleMemberCleanupHeld {
         work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
         retry_tx: oneshot::Sender<()>,
@@ -1040,11 +1047,21 @@ pub(super) enum MobCommand {
         stage: super::actor::UnprovenResumeCustodyStage,
     },
     /// A member the clean-stop lift's plan materializes closed its wake
-    /// attempt (`joined`: it went Live); the lift dispatches the next members
-    /// of its plan and settles the member's resume work.
+    /// attempt (`failure`: the wake's typed answer when it did not end Live);
+    /// the lift dispatches the next members of its plan and settles the
+    /// member's resume work.
     ResumeLifecycleBootMemberSettled {
         member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
-        joined: bool,
+        failure: Option<MobError>,
+    },
+    /// The rebuild of a member the clean-stop lift's plan materializes
+    /// through the explicit-resume work path (with the forks of its round
+    /// that follow its overlay) was prepared off the actor (`resume_attempt`
+    /// is the lift's); the explicit resume reserves and rebuilds each, and
+    /// the plan goes on.
+    ResumeLifecycleBootMembersPrepared {
+        resume_attempt: mob_dsl::ResumeAttemptId,
+        prepared: Vec<super::actor::boot_lift::ExplicitResumeBootMemberPrepared>,
     },
     ResumeLifecycleRollbackStep {
         attempt: mob_dsl::ResumeAttemptId,
@@ -2085,9 +2102,13 @@ impl MobCommand {
             Self::ResumeLifecycleMemberObserved { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberReady { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleMemberReadinessResolved { .. } => {
+                ShutdownAnswerClass::ActorCompletion
+            }
             Self::ResumeLifecycleMemberCleanupHeld { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberUnproven { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleBootMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleBootMembersPrepared { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackStep { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackFinalized { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumePostCommitMemberCompleted { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2331,9 +2352,13 @@ impl MobCommand {
             Self::ResumeLifecycleMemberObserved { .. } => "ResumeLifecycleMemberObserved",
             Self::ResumeLifecycleMemberReady { .. } => "ResumeLifecycleMemberReady",
             Self::ResumeLifecycleMemberSettled { .. } => "ResumeLifecycleMemberSettled",
+            Self::ResumeLifecycleMemberReadinessResolved { .. } => {
+                "ResumeLifecycleMemberReadinessResolved"
+            }
             Self::ResumeLifecycleMemberCleanupHeld { .. } => "ResumeLifecycleMemberCleanupHeld",
             Self::ResumeLifecycleMemberUnproven { .. } => "ResumeLifecycleMemberUnproven",
             Self::ResumeLifecycleBootMemberSettled { .. } => "ResumeLifecycleBootMemberSettled",
+            Self::ResumeLifecycleBootMembersPrepared { .. } => "ResumeLifecycleBootMembersPrepared",
             Self::ResumeLifecycleRollbackStep { .. } => "ResumeLifecycleRollbackStep",
             Self::ResumeLifecycleRollbackFinalized { .. } => "ResumeLifecycleRollbackFinalized",
             Self::ResumePostCommitMemberCompleted { .. } => "ResumePostCommitMemberCompleted",

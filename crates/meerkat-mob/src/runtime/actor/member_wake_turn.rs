@@ -46,9 +46,10 @@ use super::*;
 use crate::runtime::builder::{
     MemberRestoreCommit, MemberRestorePlan, MemberRestoreProvisionOutcome, MemberSuccessorSearch,
     PersistedMemberSessionIndex, RecordedContinuity, ResumeMemberRestoreContext,
-    ResumeRestoreCandidate, SeatedMemberRestoreOutcome, append_recovered_session_binding,
-    apply_member_restore_plan, member_endpoint_broken_reason, member_endpoint_mismatch_detail,
-    member_restore_failure, provision_durable_member_restore, restore_resumed_member,
+    ResumeRestoreCandidate, RetryableRestoreCause, SeatedMemberRestoreOutcome,
+    append_recovered_session_binding, apply_member_restore_plan, member_endpoint_broken_reason,
+    member_endpoint_mismatch_detail, member_restore_failure, provision_durable_member_restore,
+    restore_error_is_retryable, restore_resumed_member,
 };
 
 /// The wake one turn runs.
@@ -317,9 +318,10 @@ pub(in crate::runtime) fn probe_member_wake_restores_for_test(
 
 /// A restore of `identity` in `mob_id` starts: recorded by the mob's probe,
 /// if one is installed, and held while its hold is armed. Counted running
-/// until the answer is dropped.
+/// until the answer is dropped. The lift's rebuild preparation of a member it
+/// realizes through the explicit-resume work path enters it too.
 #[cfg(test)]
-async fn enter_member_wake_restore_probe(
+pub(in crate::runtime) async fn enter_member_wake_restore_probe(
     mob_id: &MobId,
     identity: AgentIdentity,
 ) -> Option<ProbedMemberWakeRestore> {
@@ -333,10 +335,10 @@ async fn enter_member_wake_restore_probe(
 
 /// One restore the probe counts as running until it is dropped.
 #[cfg(test)]
-struct ProbedMemberWakeRestore {
+pub(in crate::runtime) struct ProbedMemberWakeRestore {
     probe: Arc<MemberWakeRestoreProbe>,
     /// The row ended this restore at its start: it reads nothing.
-    aborted: bool,
+    pub(in crate::runtime) aborted: bool,
 }
 
 #[cfg(test)]
@@ -684,6 +686,12 @@ impl MobActor {
                     self.commit_member_wake_plan(run, plan, settlement.fence.is_current())
                         .await;
                 }
+                // Work still in flight on the member's session (its
+                // attachment's takeover) or a store that cannot serve it now
+                // never breaks the member: the wake ends retryable.
+                Err(error) if restore_error_is_retryable(&error) => {
+                    self.end_member_wake_retryable(&run, error).await;
+                }
                 Err(error) => self.fail_member_wake(&run, None, &error).await,
             },
             WakeStep::Ready(result) => {
@@ -989,6 +997,7 @@ impl MobActor {
             tool_consequence_policy_registry: self.tool_consequence_policy_registry.as_ref(),
             member_build_preparer: None,
             host_read_handle: &self.member_wakes.host_read_handle,
+            unreadable_view_is_retryable: false,
         };
         let mut commit = MemberRestoreCommit {
             authority: &mut self.dsl_authority,
@@ -1400,6 +1409,63 @@ impl MobActor {
         self.fail_member_wake_with(run, diagnostic).await;
     }
 
+    /// End `run`'s attempt retryable for a restore error that clears on its
+    /// own ([`restore_error_is_retryable`]): nothing was provisioned, the
+    /// member is Dormant again with its boot obligation owed (its retry joins
+    /// the work still in flight), and its callers get the typed retryable
+    /// refusal. An explicit resume that waits on the member answers the
+    /// typed error.
+    async fn end_member_wake_retryable(&mut self, run: &WakeRun, error: MobError) {
+        tracing::info!(
+            mob_id = %self.definition.id,
+            agent_identity = %run.identity,
+            attempt = run.attempt,
+            %error,
+            "the member's restore waits on work in flight or an unavailable store; its wake is retried"
+        );
+        let cause = RetryableRestoreCause::RestoreUnavailable;
+        self.member_wakes.running.remove(&run.attempt);
+        match self
+            .resolve_member_wake_retryable(
+                &run.identity,
+                run.attempt,
+                cause.wake_kind(),
+                cause.wake_refusal(),
+                "member_wake_restore_unavailable",
+            )
+            .await
+        {
+            mob_dsl::MemberWakeFeedbackVerdict::Applied => {
+                self.retain_explicit_resume_member_error(&run.identity, error);
+            }
+            mob_dsl::MemberWakeFeedbackVerdict::StaleAttempt => {
+                self.finish_closed_member_wake(&run.identity, run.attempt)
+                    .await;
+            }
+        }
+    }
+
+    /// Hand a member's typed retryable restore error to the explicit resume
+    /// that waits on the member (its resume work is pending), which answers
+    /// it once every member settled. A wake no explicit resume waits on
+    /// answers its own callers only.
+    fn retain_explicit_resume_member_error(&mut self, identity: &AgentIdentity, error: MobError) {
+        let awaited = self
+            .dsl_authority
+            .state()
+            .explicit_resume_member_work
+            .contains_key(&mob_dsl::AgentIdentity::from_domain(identity));
+        let rebuilding = matches!(
+            self.pending_resume_lifecycle
+                .as_ref()
+                .map(|pending| &pending.phase),
+            Some(ResumeLifecyclePhase::RebuildingMembers { .. })
+        );
+        if awaited && rebuilding {
+            self.retain_explicit_resume_error(error);
+        }
+    }
+
     /// Resolve `run`'s attempt Broken with `diagnostic` and answer its
     /// callers with the Broken answer.
     async fn fail_member_wake_with(
@@ -1721,6 +1787,8 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         tool_consequence_policy_registry: tool_consequence_policy_registry.as_ref(),
         member_build_preparer: member_build_preparer.as_ref(),
         host_read_handle: &host_read_handle,
+        // A view the store cannot serve now ends this wake retryable.
+        unreadable_view_is_retryable: true,
     };
     // The overlay the followed source holds in this process, or the one its
     // rebuild would compose, computed here, off the actor, without waking it.
@@ -1880,6 +1948,9 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         .await
         {
             Ok(view) => view,
+            // A read the store cannot serve now ends the wake retryable, as
+            // the bound session's view read does.
+            Err(error) if restore_error_is_retryable(&error) => return Err(error),
             Err(error) => {
                 return Ok(WakePlan::Restore {
                     plan: MemberRestorePlan::Unseated(member_restore_failure(
