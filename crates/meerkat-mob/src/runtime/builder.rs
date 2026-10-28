@@ -11879,14 +11879,13 @@ pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
 /// serve the request now
 /// ([`super::actor::SessionStoreFailureClass::Unavailable`]), the session was
 /// busy, its runtime authority was unavailable, another runtime owner holds
-/// its hosting claim (or the claim cannot be taken now), its durable tail is
-/// held until the machine-authorized recovery promotes it, or its external
+/// its hosting claim (or the claim cannot be taken now), or its external
 /// write authority could not be checked without waiting. A malformed or
-/// refusing persisted state, a durable tail the recovery refused (which can
-/// need an operator's investigation), quarantined or diverged durable
-/// evidence (which needs its sanctioned repair), an agent fault and every
-/// other typed cause are terminal. The settlement diagnostics a failure
-/// carries never change its class.
+/// refusing persisted state, a durable tail held for or refused by its
+/// recovery (a hold is reported with the member Broken, so its host sees it),
+/// quarantined or diverged durable evidence (which needs its sanctioned
+/// repair), an agent fault and every other typed cause are terminal. The
+/// settlement diagnostics a failure carries never change its class.
 pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionError) -> bool {
     use meerkat_core::service::SessionError;
 
@@ -11900,12 +11899,12 @@ pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionE
         | SessionError::Busy { .. }
         | SessionError::ServedElsewhere { .. }
         | SessionError::HostingUnavailable { .. }
-        | SessionError::DurableTailHeldForRecovery { .. }
         | SessionError::ExternalWriteFenceBackoff { .. } => true,
         SessionError::NotFound { .. }
         | SessionError::PersistenceDisabled
         | SessionError::CompactionDisabled
         | SessionError::NotRunning { .. }
+        | SessionError::DurableTailHeldForRecovery { .. }
         | SessionError::DurableTailRecoveryRefused { .. }
         | SessionError::DurableEvidenceQuarantined { .. }
         | SessionError::WholeBlobAuditedEndpointDivergence { .. }
