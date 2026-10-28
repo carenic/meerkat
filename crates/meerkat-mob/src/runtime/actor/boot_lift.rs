@@ -1024,18 +1024,28 @@ impl MobActor {
                         .as_ref()
                         .map(|dispatch| dispatch.progress.clone())
                 });
-            let refusal = match progress {
+            let mut failed: BTreeMap<AgentIdentity, MobError> = match progress {
                 Some(progress) => self
                     .rebuild_explicit_resume_member_sessions(rebuild, &progress)
                     .await
-                    .err()
-                    .map(|error| error.to_string()),
-                None => Some("the lift lost its explicit resume".to_string()),
+                    .into_iter()
+                    .collect(),
+                None => reserving
+                    .iter()
+                    .map(|(identity, _, _)| {
+                        (
+                            identity.clone(),
+                            MobError::Internal("the lift lost its explicit resume".to_string()),
+                        )
+                    })
+                    .collect(),
             };
             // A member the explicit resume did not reserve still holds its
-            // plan attempt, which nothing would realize: it ends here, and a
-            // run-start hold its build preparation staged is removed.
+            // plan attempt, which nothing would realize: it ends here with its
+            // own typed error, and a run-start hold its build preparation
+            // staged is removed.
             for (identity, attempt, staged_hold) in reserving {
+                let error = failed.remove(&identity);
                 let reserved = self
                     .dsl_authority
                     .state()
@@ -1047,17 +1057,13 @@ impl MobActor {
                 if let Some(session_id) = staged_hold {
                     self.unstage_member_build_hold(&session_id).await;
                 }
-                let reason = refusal
-                    .clone()
-                    .unwrap_or_else(|| "the explicit resume did not reserve it".to_string());
-                self.end_explicit_resume_boot_member(
-                    &identity,
-                    attempt,
+                let error = error.unwrap_or_else(|| {
                     MobError::Internal(format!(
-                        "the explicit resume could not rebuild '{identity}': {reason}"
-                    )),
-                )
-                .await;
+                        "the explicit resume did not reserve '{identity}' for its rebuild"
+                    ))
+                });
+                self.end_explicit_resume_boot_member(&identity, attempt, error)
+                    .await;
             }
         }
         // The lift goes on only while it still waits on its members: one a

@@ -479,3 +479,99 @@ async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
     );
     assert_broken_by_the_malformed_state(&resumed, &service, &member, &session).await;
 }
+
+/// A lift whose planned member cannot be repointed to its successor session
+/// (the journal write of its recovered binding fails) ends that member alone,
+/// with its own typed error. Every other member the lift plans is rebuilt and
+/// Live: one member's failure never ends another, nor lends it its error.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_member_whose_repoint_fails_ends_alone_with_its_own_error() {
+    let events = Arc::new(FaultInjectedMobEventStore::new());
+    let (handle, service, runs, specs, runtime_metadata, identity_store, identity_status) =
+        create_test_mob_with_recoverable_fault_events(sample_definition(), events.clone()).await;
+    // Ordered so the failing member is rebuilt first.
+    let repointed = AgentIdentity::from("a-repointed");
+    let plain = AgentIdentity::from("b-plain");
+    let mut sessions = Vec::new();
+    for member in [&repointed, &plain] {
+        let mut spec = SpawnMemberSpec::new("worker", member.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn a worker");
+        sessions.push(
+            handle
+                .resolve_bridge_session_id(member)
+                .await
+                .expect("a session-backed worker"),
+        );
+    }
+    handle.stop().await.expect("stop the mob");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    // The repointed member's bound session is gone; its successor is in the
+    // realm.
+    restarted.delete_persisted_session(&sessions[0]).await;
+    let successor = create_realm_session_for_test(&restarted, Some(&repointed)).await;
+    let resumed = tokio::time::timeout(
+        ROW_STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::custom_with_runtime_metadata(
+                events.clone(),
+                runs,
+                specs,
+                runtime_metadata,
+                identity_store,
+                identity_status,
+            ))
+            .with_session_service(restarted.clone())
+            .notify_orchestrator_on_resume(false)
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the reconstruction answers")
+    .expect("the reconstruction succeeds");
+    assert_eq!(
+        resumed
+            .status()
+            .await
+            .expect("the reconstructed mob answers"),
+        MobState::Stopped
+    );
+    events
+        .fail_appends_for("MemberSessionBindingRecovered")
+        .await;
+
+    let _lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers");
+    assert_eq!(
+        phase_of(&resumed, &plain),
+        Some(dsl::MemberMaterializationPhase::Live),
+        "the other planned member is rebuilt"
+    );
+    let plain_status = resumed
+        .member_status(&plain)
+        .await
+        .expect("the other member's status");
+    assert!(
+        plain_status.error.is_none(),
+        "the other member carries no error of another member: {plain_status:?}"
+    );
+    let status = resumed
+        .member_status(&repointed)
+        .await
+        .expect("the repointed member's status");
+    assert!(
+        status.error.as_deref().is_some_and(|error| error
+            .contains("fault-injected append failure for MemberSessionBindingRecovered")),
+        "the member ends with its own typed error: {status:?}"
+    );
+    assert_ne!(
+        status.current_session_id.as_ref(),
+        Some(&successor),
+        "a member whose repoint failed is not bound to its successor"
+    );
+}

@@ -22160,11 +22160,15 @@ impl MobActor {
     /// Running, so the existing machine-owned classify -> materialize ->
     /// resolve seam is authoritative. Results return through the member
     /// continuation; returning here does not certify construction completion.
+    ///
+    /// One member's failure is that member's: every other member is still
+    /// rebuilt. Returns each member whose rebuild failed before its work was
+    /// reserved, with its own typed error.
     async fn rebuild_explicit_resume_member_sessions(
         &mut self,
         mut rebuild: Vec<ExplicitResumeMemberRebuild>,
         progress: &super::state::LifecycleProgressSignal,
-    ) -> Result<(), MobError> {
+    ) -> Vec<(AgentIdentity, MobError)> {
         // A fork-derived member seated with its source's overlay is rebuilt
         // with the overlay its source is rebuilt with, so every source's
         // overlay is retained before its forks are rebuilt.
@@ -22178,7 +22182,7 @@ impl MobActor {
         let observation_permits = Arc::new(tokio::sync::Semaphore::new(
             self.member_residency.verify_concurrency.max(1),
         ));
-        let mut first_infrastructure_error = None;
+        let mut failed = Vec::new();
         for rebuild in rebuild {
             let ExplicitResumeMemberRebuild {
                 mut entry,
@@ -22207,7 +22211,7 @@ impl MobActor {
                 // detached authority, appends the replay-authority event, and
                 // publishes the machine only after that write succeeds. Apply
                 // the same event to the live roster projection afterward.
-                let event = super::builder::append_recovered_session_binding(
+                let event = match super::builder::append_recovered_session_binding(
                     &mut self.dsl_authority,
                     &self.events,
                     &self.definition.id,
@@ -22216,7 +22220,14 @@ impl MobActor {
                     recovered_peer_endpoint.clone(),
                     "explicit_resume_repoint_missing_member_session_binding",
                 )
-                .await?;
+                .await
+                {
+                    Ok(event) => event,
+                    Err(error) => {
+                        failed.push((entry.agent_identity.clone(), error));
+                        continue;
+                    }
+                };
                 self.roster.write().await.apply_event(&event);
                 let _ = self
                     .machine_state_watch_tx
@@ -22235,7 +22246,7 @@ impl MobActor {
                     )
                     .await
                 {
-                    first_infrastructure_error.get_or_insert(error);
+                    failed.push((entry.agent_identity.clone(), error));
                     continue;
                 }
             }
@@ -22253,16 +22264,20 @@ impl MobActor {
                 ..
             } = &restore_spec.launch_mode
             else {
-                return Err(MobError::Internal(format!(
+                let error = MobError::Internal(format!(
                     "explicit-resume rebuild lost its Resume launch for '{}'",
                     entry.agent_identity
-                )));
+                ));
+                failed.push((entry.agent_identity.clone(), error));
+                continue;
             };
             if customized_session_id != &bridge_session_id {
-                return Err(MobError::Internal(format!(
+                let error = MobError::Internal(format!(
                     "explicit-resume rebuild session drifted for '{}': request='{}' selected='{}'",
                     entry.agent_identity, customized_session_id, bridge_session_id
-                )));
+                ));
+                failed.push((entry.agent_identity.clone(), error));
+                continue;
             }
             entry.effective_profile_override = restore_spec.override_profile.clone();
             entry.effective_model_override = restore_spec.model_override.clone();
@@ -22287,7 +22302,7 @@ impl MobActor {
                     origin
                 }
                 Err(error) => {
-                    first_infrastructure_error.get_or_insert(error);
+                    failed.push((entry.agent_identity.clone(), error));
                     continue;
                 }
             };
@@ -22307,12 +22322,13 @@ impl MobActor {
                 }
                 *roster = super::roster_authority::RosterAuthority::from_roster(snapshot);
             }
-            let attempt = self
-                .dsl_authority
-                .state()
-                .explicit_resume_attempt
-                .clone()
-                .ok_or_else(|| MobError::Internal("resume work lost its attempt".to_string()))?;
+            let Some(attempt) = self.dsl_authority.state().explicit_resume_attempt.clone() else {
+                failed.push((
+                    entry.agent_identity.clone(),
+                    MobError::Internal("resume work lost its attempt".to_string()),
+                ));
+                continue;
+            };
             let binding = mob_dsl::ResumeMemberBinding {
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
@@ -22327,7 +22343,7 @@ impl MobActor {
                 },
                 "authorize_explicit_resume_member",
             ) {
-                first_infrastructure_error.get_or_insert(error);
+                failed.push((entry.agent_identity.clone(), error));
                 continue;
             }
             // The reservation left the member Waking under one wake attempt
@@ -22361,10 +22377,7 @@ impl MobActor {
                 Arc::clone(&observation_permits),
             );
         }
-        if let Some(error) = first_infrastructure_error {
-            return Err(error);
-        }
-        Ok(())
+        failed
     }
 
     /// Observe one rebuilt member's live and durable session off the actor,
@@ -23544,12 +23557,21 @@ impl MobActor {
                 progress: progress.clone(),
                 reply_tx,
             });
-            if rebuilt_attachment
-                && let Err(error) = self
+            if rebuilt_attachment {
+                // A member that could not be rebuilt is answered as the
+                // resume's typed error; every other member is rebuilt.
+                for (identity, error) in self
                     .rebuild_explicit_resume_member_sessions(rebuild, &progress)
                     .await
-            {
-                self.retain_explicit_resume_error(error);
+                {
+                    tracing::warn!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %identity,
+                        %error,
+                        "the explicit resume could not rebuild a member"
+                    );
+                    self.retain_explicit_resume_error(error);
+                }
             }
             if let Err(error) = self.join_explicit_resume_boot_members(boot_members) {
                 self.retain_explicit_resume_error(error);
