@@ -249,6 +249,7 @@ mod live_actor_binding;
 mod live_bridge_operation;
 mod member_build_preparer;
 mod member_creation;
+mod member_event_attach;
 #[cfg(any(test, feature = "test-support"))]
 mod member_status_test_support;
 mod member_wake_config;

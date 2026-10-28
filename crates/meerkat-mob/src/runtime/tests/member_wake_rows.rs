@@ -862,16 +862,19 @@ async fn reads_of_a_released_member_never_wake_it() {
 
 /// `MobHandle::member_unmaterialized` reads the member's residency from the
 /// machine state the actor publishes, with no command: a released member
-/// reads unmaterialized, and a subscription to its agent events is refused
-/// not live meanwhile; neither read wakes it. While its wake is held at the
-/// build preparer's gate the member is Waking and still reads
-/// unmaterialized. The end of the wake changes the machine state, after
-/// which it reads materialized and its agent events subscribe, replaying the
-/// woken actor's events from the first, so the turn it then runs is read
-/// from its `RunStarted`. An identity the mob does not seat reads
-/// materialized: there is no wake to wait for.
+/// reads unmaterialized. A subscription to its agent events opens meanwhile
+/// with nothing to attach to yet (no actor, no epoch); neither the read nor
+/// the subscription wakes it. While its wake is held at the build
+/// preparer's gate the member is Waking, still reads unmaterialized, and the
+/// subscription has delivered nothing. The end of the wake changes the
+/// machine state, after which the member reads materialized and the
+/// subscription attaches to the woken actor from its first retained event,
+/// so the turn it then runs is read from its `RunStarted`, and the
+/// subscription names the woken actor's sequence space. A subscription made
+/// after the wake replays the same turn. An identity the mob does not seat
+/// reads materialized: there is no wake to wait for.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_after_it() {
+async fn a_released_member_reads_unmaterialized_until_its_wake_and_a_subscription_attaches_at_it() {
     let fixture = WakeFixture::new("wake-unmaterialized").await;
     let member = fixture.spawn("unmaterialized-member").await;
     assert!(
@@ -883,19 +886,25 @@ async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_af
         fixture.handle.member_unmaterialized(&member),
         "a released member"
     );
-    let refused = fixture
+    let early = fixture
         .handle
         .subscribe_agent_events_from(&member, meerkat_core::comms::SessionEventCursor::Earliest)
         .await
-        .err();
+        .expect("a released member's agent events subscribe");
     assert!(
-        matches!(refused, Some(MobError::MemberSessionNotLive { .. })),
-        "{refused:?}"
+        early.actor.is_none() && early.epoch.is_none(),
+        "nothing is attached before the wake"
     );
+    let attached_epoch = early
+        .attached_epoch
+        .clone()
+        .expect("the subscription names the woken actor's epoch once attached");
+    assert!(attached_epoch.get().is_none(), "not attached yet");
+    let mut early = early.stream;
     assert_eq!(
         fixture.residency(&member),
         Some(mob_dsl::MemberMaterializationPhase::Dormant),
-        "neither read woke the member"
+        "neither the read nor the subscription woke the member"
     );
     assert!(
         !fixture
@@ -919,6 +928,10 @@ async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_af
         fixture.handle.member_unmaterialized(&member),
         "a waking member"
     );
+    assert!(
+        futures::FutureExt::now_or_never(futures::StreamExt::next(&mut early)).is_none(),
+        "nothing is delivered before the wake ends"
+    );
     fixture.preparer.open_gate();
     tokio::time::timeout(WAIT, wake)
         .await
@@ -935,6 +948,22 @@ async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_af
     );
     let body = token("unmaterialized");
     fixture.host_turn(&member, &body, HandlingMode::Queue).await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let event = futures::StreamExt::next(&mut early)
+                .await
+                .expect("the early subscription attaches at the wake");
+            if matches!(event.payload, AgentEvent::RunStarted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the early subscription carries the turn from its start");
+    assert!(
+        matches!(attached_epoch.get(), Some(Some(_))),
+        "the attached subscription names the woken actor's epoch"
+    );
     let mut events = fixture
         .handle
         .subscribe_agent_events_from(&member, meerkat_core::comms::SessionEventCursor::Earliest)
@@ -953,6 +982,98 @@ async fn a_released_member_reads_unmaterialized_until_its_wake_and_subscribes_af
     })
     .await
     .expect("the replay holds the turn the woken member ran");
+    fixture.finish().await;
+}
+
+/// A host that subscribes to a released member's agent events and then
+/// sends to it receives the run its send starts, from `RunStarted`: the
+/// subscription opens without waking the member and attaches at the wake
+/// the send causes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_subscription_before_a_released_members_wake_receives_the_run_its_send_starts() {
+    let fixture = WakeFixture::new("wake-subscribe-first").await;
+    let member = fixture.spawn("subscribe-first-member").await;
+    fixture.release(&member).await;
+
+    let mut events = fixture
+        .handle
+        .subscribe_agent_events(&member)
+        .await
+        .expect("a released member's agent events subscribe");
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Dormant),
+        "the subscription wakes nothing"
+    );
+
+    let body = token("subscribe-first");
+    fixture.host_turn(&member, &body, HandlingMode::Queue).await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let event = futures::StreamExt::next(&mut events)
+                .await
+                .expect("the subscription attaches at the wake");
+            if matches!(event.payload, AgentEvent::RunStarted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the run the send started arrives from its start");
+    fixture.finish().await;
+}
+
+/// A subscription to every member's agent events opens while members are
+/// dormant, without waking any of them, and carries a member's events from
+/// its wake; the members it does not wake stay dormant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_all_members_subscription_carries_a_dormant_member_from_its_wake() {
+    let fixture = WakeFixture::new("wake-subscribe-all").await;
+    let woken = fixture.spawn("subscribe-all-woken").await;
+    let dormant = fixture.spawn("subscribe-all-dormant").await;
+    fixture.release(&woken).await;
+    fixture.release(&dormant).await;
+
+    let streams = fixture
+        .handle
+        .subscribe_all_agent_events()
+        .await
+        .expect("the subscription opens with dormant members");
+    assert!(
+        streams.iter().any(|(identity, _)| identity == &dormant),
+        "the dormant member has its stream"
+    );
+    let mut events = streams
+        .into_iter()
+        .find_map(|(identity, stream)| (identity == woken).then_some(stream))
+        .expect("the member to wake has its stream");
+    for identity in [&woken, &dormant] {
+        assert_eq!(
+            fixture.residency(identity),
+            Some(mob_dsl::MemberMaterializationPhase::Dormant),
+            "the subscription wakes nothing"
+        );
+    }
+
+    let body = token("subscribe-all");
+    fixture.host_turn(&woken, &body, HandlingMode::Queue).await;
+    tokio::time::timeout(WAIT, async {
+        loop {
+            let event = futures::StreamExt::next(&mut events)
+                .await
+                .expect("the member's stream attaches at its wake");
+            if matches!(event.payload, AgentEvent::RunStarted { .. }) {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the woken member's run arrives from its start");
+    assert_eq!(
+        fixture.residency(&dormant),
+        Some(mob_dsl::MemberMaterializationPhase::Dormant),
+        "the member nothing woke stays dormant"
+    );
     fixture.finish().await;
 }
 
