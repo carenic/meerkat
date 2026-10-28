@@ -5,7 +5,11 @@
 //! MobMachine holds them Live (Live means ready). The topology settled in the builder;
 //! this pass runs their readiness with the readiness of every other member
 //! materialized in this process, then applies each boot member's
-//! `ResolveMemberRevivalSucceeded` under its open attempt.
+//! `ResolveMemberRevivalSucceeded` under its open attempt. A boot member
+//! the start left to be recovered right after it (its stopped registration
+//! taken over, or its registration needing a durability reload) gets no
+//! readiness run here: it is settled Live, and its recovery revives or
+//! reloads it and runs its readiness then.
 //!
 //! A member's readiness failure is that member's outcome, never the
 //! mob's: a boot member's attempt is abandoned with the typed
@@ -67,11 +71,20 @@ impl MobActor {
     /// The readiness targets of the members held Waking for a readiness pass
     /// (`startup_boot_attempts`: a start's boot set, or the members an
     /// explicit resume rebuilt). The Live-only target set leaves them out.
+    ///
+    /// A held member this start left to be recovered right after it (its
+    /// stopped registration taken over, or its registration needing a
+    /// durability reload) is left out as the Live-only target set leaves it
+    /// out: it has no registration to make ready now, and its recovery runs
+    /// its readiness on the registration it revives or reloads
+    /// (`recover_startup_members`). The settlement settles it Live with no
+    /// readiness run, as the recovery expects.
     pub(super) async fn held_member_readiness_targets(&self) -> Vec<MemberReadinessTarget> {
         let roster = self.roster.read().await;
         let state = self.dsl_authority.state();
         self.startup_boot_attempts
             .keys()
+            .filter(|identity| !self.recovered_after_start(identity))
             .filter_map(|identity| roster.get(identity))
             .map(|entry| MemberReadinessTarget {
                 entry: entry.clone(),
@@ -87,8 +100,9 @@ impl MobActor {
     /// on). A held member the pass recorded Broken before its readiness (its
     /// runtime ended outside the mob) has its attempt closed with that
     /// failure. A held member the pass ran no readiness for (none runs while
-    /// a lifecycle cleanup owns the mob, or the pass was not dispatched) is
-    /// settled Live as every other member is then. Returns the outcomes
+    /// a lifecycle cleanup owns the mob, the pass was not dispatched, or the
+    /// start left the member to be recovered right after it) is settled Live
+    /// as every other member is then. Returns the outcomes
     /// left to apply (every other member's, and each held member's
     /// success) and the first held member's readiness failure, which a
     /// caller may report.

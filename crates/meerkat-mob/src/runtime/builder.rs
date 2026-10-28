@@ -14097,6 +14097,33 @@ mod tests {
                 "test_recover_member",
             )
             .expect("recover the member");
+            // Each member's durable endpoint, recovered from its spawn as a
+            // replay recovers it. A member the boot plan wakes without one is
+            // owed its endpoint, and its wake closes Live only once the
+            // endpoint is registered.
+            let mut pubkey = [0_u8; 32];
+            pubkey[0] = index as u8 + 1;
+            pubkey[31] = pubkey[0].wrapping_mul(7);
+            let name = format!("restore-mob/worker/{identity}");
+            let endpoint = TrustedPeerDescriptor::unsigned_with_pubkey(
+                name.clone(),
+                PeerId::from_ed25519_pubkey(&pubkey).to_string(),
+                pubkey,
+                format!("inproc://{name}"),
+            )
+            .expect("the member's durable endpoint");
+            apply_seeded_mob_signal(
+                &mut recovered,
+                mob_dsl::MobMachineSignal::RecoverSpawnedMemberPeerEndpoint {
+                    agent_identity: mob_dsl::AgentIdentity::from_domain(&identity),
+                    agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&runtime_id),
+                    fence_token: mob_dsl::FenceToken::from_domain(crate::ids::FenceToken::new(1)),
+                    generation: mob_dsl::Generation::from_domain(Generation::new(0)),
+                    peer_endpoint: mob_dsl::MemberPeerEndpoint::from(&endpoint),
+                },
+                "test_recover_member_peer_endpoint",
+            )
+            .expect("recover the member's durable endpoint");
             apply_seeded_member_session_binding(
                 &mut recovered,
                 &identity,
