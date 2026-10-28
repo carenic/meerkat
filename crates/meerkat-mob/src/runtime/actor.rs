@@ -45606,11 +45606,20 @@ impl MobActor {
         let dsl_a = mob_dsl::AgentIdentity::from_domain(&local_identity);
         let dsl_b = mob_dsl::AgentIdentity::from_domain(&peer_identity);
         let edge = mob_dsl::WiringEdge::new(dsl_a, dsl_b);
-        self.probe_command_admission(
+        let refusal = match self.probe_command_admission(
             mob_dsl::MobMachineInput::WireMembers { edge: edge.clone() },
             MobState::Running,
             "wire_members_command_admission",
-        )?;
+        ) {
+            Ok(()) => None,
+            // A mob that is not running answers the machine's lifecycle
+            // refusal before any member lookup.
+            Err(refusal) if self.state() != MobState::Running => return Err(refusal),
+            // In a running mob the member checks below keep their order: an
+            // end that is not a member answers MemberNotFound before the
+            // machine's refusal of an edge to an identity that is not seated.
+            Err(refusal) => Some(refusal),
+        };
 
         if local_identity == peer_identity {
             return Err(MobError::WiringError(format!(
@@ -45636,6 +45645,9 @@ impl MobActor {
                     .ok_or_else(|| MobError::MemberNotFound(peer_member_identity.clone()))?,
             )
         };
+        if let Some(refusal) = refusal {
+            return Err(refusal);
+        }
 
         // Idempotent repair path when the MobMachine already owns the edge.
         // The DSL emits a local repair effect; without a graph-change effect,
