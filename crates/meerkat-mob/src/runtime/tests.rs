@@ -21092,7 +21092,7 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let runtime_metadata = Arc::new(InMemoryMobRuntimeMetadataStore::new());
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    let adapter = service.enable_runtime_adapter();
     let handle = MobBuilder::new(
         definition,
         MobStorage::with_events_and_runtime_metadata(events.clone(), runtime_metadata.clone()),
@@ -21274,7 +21274,25 @@ async fn test_retire_final_replay_prunes_wiring_and_preserves_generation_history
             .expect("test generation has a successor"),
         "cold replay must preserve retired generation history"
     );
+    let replacement_session = replacement
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed replacement");
     crash_stop_and_release_routes(resumed).await;
+    // A crash ends the process and every runtime registration it held. This
+    // harness rebuilds the mob in the same process over the same runtime
+    // adapter (a crash simulation, not a supported path), where the crashed
+    // actor's registration of the replacement's session outlives the actor,
+    // still bound to its closed signal queue: nothing in the rebuilt mob
+    // adopts a Dormant member's leftover registration, and the replacement's
+    // archive-only retire would retire that registration and fail on the
+    // closed queue. Settle it as the crash would have, so the rebuilt mob
+    // starts from what a restarted process starts from.
+    if adapter.contains_session(&replacement_session).await {
+        unregister_runtime_session_until_complete(adapter.as_ref(), &replacement_session)
+            .await
+            .expect("settle the crashed actor's registration of the replacement's session");
+    }
 
     let resumed_replacement = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
@@ -21448,15 +21466,33 @@ async fn test_destroy_storage_finalizing_append_failure_precedes_storage_scrub()
     );
 }
 
+/// A destroy whose retire of a member is refused after the durable destroy
+/// marker keeps the member's roster anchor for a retry and closes the mob's
+/// live authority. The member's runtime registration is unregistered from
+/// outside the mob, which releases it to the mob, and the member is one that
+/// release cannot demote: its routed binding is held, so the registration's
+/// epoch is not recorded and the release is MobMachine's accepted Stale no-op
+/// (`NotYetReleasable`). It stays Live with no registration, so the destroy
+/// still routes its runtime retire, which the unregistered consumer refuses.
+/// (A member the release demotes is Dormant, and the destroy retires it
+/// archive-only:
+/// `test_destroy_of_a_member_released_outside_the_mob_archives_it_without_a_routed_retire`.)
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor_and_closes_authority()
  {
+    // The binding hold is keyed by member identity for the whole process, so
+    // the worker's identity is unique. It is held for the whole row.
+    let worker = AgentIdentity::from(format!(
+        "destroy-stop-loop-worker-{}",
+        Uuid::new_v4().simple()
+    ));
+    let _binding_hold = crate::runtime::composition::ready_signal_test_hold::hold(worker.as_str());
     let definition = with_unique_mob_id(sample_definition(), "destroy-retire-admission-fail");
     let events = Arc::new(FaultInjectedMobEventStore::new());
     let (handle, service) = create_test_mob_with_events(definition, events.clone()).await;
     service.set_keep_alive_turns_complete_immediately(true);
     let adapter = service.enable_runtime_adapter();
-    let worker = AgentIdentity::from("destroy-stop-loop-worker");
     let bridge_session_id = handle
         .spawn(
             ProfileName::from("worker"),
@@ -21472,10 +21508,30 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
     unregister_runtime_session_until_complete(adapter.as_ref(), &bridge_session_id)
         .await
         .expect("bridge session should unregister cleanly");
-
-    let err = handle
-        .destroy()
+    // The actor handles its commands in order: a status answered after the
+    // unregister returned was handled after the release it published.
+    handle
+        .status()
         .await
+        .expect("an actor round trip after the release");
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&crate::machines::mob_machine::AgentIdentity::from_domain(
+                &worker
+            ))
+            .copied(),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a release before the binding recorded the registration's epoch demotes nothing"
+    );
+
+    // The worker's readiness observation stays held for the whole row: bound
+    // every lifecycle call, so a wait behind the held signal fails fast.
+    let err = tokio::time::timeout(Duration::from_secs(10), handle.destroy())
+        .await
+        .expect("the destroy answers while the readiness observation is held")
         .expect_err("missing runtime adapter registration should make destroy incomplete");
     let report = match err {
         crate::runtime::handle::MobDestroyError::Incomplete { report } => report,
@@ -21501,9 +21557,9 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
         MobState::Destroyed,
         "durable destroy admission should close live authority after partial cleanup"
     );
-    let stop_err = handle
-        .stop()
+    let stop_err = tokio::time::timeout(Duration::from_secs(10), handle.stop())
         .await
+        .expect("the stop answers while the readiness observation is held")
         .expect_err("destroy-admitted mob must reject non-destroy mutation");
     assert!(
         matches!(stop_err, MobError::InvalidTransition { .. }),
@@ -21536,9 +21592,9 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
         "partial destroy must retain the durable destroy marker"
     );
 
-    let retry_err = handle
-        .destroy()
+    let retry_err = tokio::time::timeout(Duration::from_secs(10), handle.destroy())
         .await
+        .expect("the destroy retry answers while the readiness observation is held")
         .expect_err("retry should report the retained retire-admission failure");
     let retry_report = match retry_err {
         crate::runtime::handle::MobDestroyError::Incomplete { report } => report,
@@ -21557,6 +21613,67 @@ async fn test_destroy_retire_admission_failure_after_marker_retains_retry_anchor
                 )
         }),
         "same-process retry must preserve the cold-reload requirement and partial destroy state: {retry_report:?}"
+    );
+}
+
+/// The member's runtime registration is unregistered from outside the mob,
+/// and the final unregister is released to the mob
+/// (`RuntimeRegistrationReleased`): MobMachine demotes the member to Dormant,
+/// and a destroy retires a Dormant member archive-only. No runtime of this
+/// process holds its session, so the destroy routes it no runtime retire,
+/// nothing refuses, and the destroy completes: the session archive alone
+/// terminates the member. A member the release cannot demote keeps the routed
+/// retire and the consumer's refusal of it:
+/// `test_destroy_retire_admission_failure_after_marker_retains_retry_anchor_and_closes_authority`.
+#[tokio::test]
+async fn test_destroy_of_a_member_released_outside_the_mob_archives_it_without_a_routed_retire() {
+    let definition = with_unique_mob_id(sample_definition(), "destroy-released-member");
+    let (handle, service) = create_test_mob(definition).await;
+    service.set_keep_alive_turns_complete_immediately(true);
+    let adapter = service.enable_runtime_adapter();
+    let worker = AgentIdentity::from("destroy-released-worker");
+    let bridge_session_id = handle
+        .spawn(ProfileName::from("worker"), worker.clone(), None)
+        .await
+        .expect("spawn autonomous worker before the destroy")
+        .bridge_session_id()
+        .cloned()
+        .expect("session-backed worker");
+
+    unregister_runtime_session_until_complete(adapter.as_ref(), &bridge_session_id)
+        .await
+        .expect("bridge session should unregister cleanly");
+    let key = crate::machines::mob_machine::AgentIdentity::from_domain(&worker);
+    let mut machine = handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.wait_for(|state| {
+            state.member_materialization.get(&key)
+                == Some(&crate::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        }),
+    )
+    .await
+    .expect("the released registration demotes the member in time")
+    .expect("the machine state stays published");
+
+    let report = handle.destroy().await.expect(
+        "the destroy retires the Dormant member archive-only, with no routed retire to refuse",
+    );
+    assert!(
+        report.errors.is_empty(),
+        "the archive-only destroy reports no cleanup error: {report:?}"
+    );
+    assert!(
+        report.namespace_cleaned && report.metadata_scrubbed && report.events_cleared,
+        "the destroy completes its cleanup: {report:?}"
+    );
+    assert_eq!(
+        handle.status().await.expect("status after the destroy"),
+        MobState::Destroyed
+    );
+    assert!(
+        service.test_is_session_archived(&bridge_session_id).await,
+        "the session archive alone terminates the Dormant member"
     );
 }
 
@@ -35369,6 +35486,17 @@ async fn test_respawn_repairs_local_machine_edge_without_roster_projection() {
     );
 }
 
+/// Negative row since the 0.9.7 residency model: a machine-local edge to a
+/// retired peer cannot exist. Every wiring edge joins two seated members (or
+/// a member a respawn's preserved topology holds): the
+/// `edge_endpoints_seated_or_held` guard on `WireMembers` and the
+/// `wiring_edges_connect_seated_members` invariant. The row used to seed such
+/// an edge and pin that a respawn reports it (`TopologyRestoreFailed` naming
+/// the retired peer); it now pins that the machine refuses the edge, typed and
+/// without touching the graph, and that the respawn that follows has no edge
+/// to the retired peer to restore, report or project. A respawn's report of a
+/// peer it cannot restore stays pinned by
+/// `test_respawn_role_wired_member_survives_peer_without_comms_runtime`.
 #[tokio::test]
 async fn test_respawn_reports_machine_local_edge_to_retired_peer() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
@@ -35407,41 +35535,99 @@ async fn test_respawn_reports_machine_local_edge_to_retired_peer() {
             .is_none(),
         "test setup should remove the old peer from the live roster"
     );
-    let stale_edge = crate::machines::mob_machine::WiringEdge::new(
-        crate::machines::mob_machine::AgentIdentity::from(left.as_str()),
-        crate::machines::mob_machine::AgentIdentity::from(right.as_str()),
+    let machine_left = crate::machines::mob_machine::AgentIdentity::from(left.as_str());
+    let machine_right = crate::machines::mob_machine::AgentIdentity::from(right.as_str());
+    let stale_edge =
+        crate::machines::mob_machine::WiringEdge::new(machine_left.clone(), machine_right.clone());
+    let before = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the terminal retire");
+    assert!(
+        before.identity_to_runtime.contains_key(&machine_left),
+        "the surviving end is seated"
     );
-    handle
+    assert!(
+        !before.identity_to_runtime.contains_key(&machine_right),
+        "the retired peer is no longer seated"
+    );
+    assert!(
+        !before.pending_respawn_topology.contains(&machine_right),
+        "no respawn's preserved topology holds the retired peer"
+    );
+    assert!(
+        !before.wiring_edges.contains(&stale_edge),
+        "no edge to the retired peer survives its terminal retire"
+    );
+    assert!(
+        !before.member_placement.contains_key(&machine_left)
+            && !before.member_placement.contains_key(&machine_right),
+        "neither end is placed, so no placement guard can refuse the edge"
+    );
+
+    // The only refusal open to this edge is the seating guard: the mob is
+    // Running, the edge is not wired and neither end is placed.
+    let refusal = handle
         .project_machine_input(crate::machines::mob_machine::MobMachineInput::WireMembers {
-            edge: stale_edge,
+            edge: stale_edge.clone(),
         })
         .await
-        .expect("seed stale machine-owned edge after terminal retire cleanup");
+        .expect_err("the machine refuses a local edge to a retired peer");
+    match &refusal {
+        MobError::Internal(message) => assert!(
+            message.starts_with("DSL authority (project_machine_input) rejected WireMembers")
+                && message.ends_with(
+                    "guard rejected transition from phase Running for input::WireMembers"
+                ),
+            "the refusal is the machine's guard rejection of the wiring: {message}"
+        ),
+        other => panic!("expected the machine's guard rejection of the wiring, got {other:?}"),
+    }
+    let after = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the refused wiring");
+    assert_eq!(
+        after.wiring_edges, before.wiring_edges,
+        "the refused wiring leaves the machine-owned graph untouched"
+    );
 
-    let error = handle
+    handle
         .respawn(
             AgentIdentity::from(left.as_str()),
-            Some("report stale peer".into()),
+            Some("no stale peer to report".into()),
         )
         .await
-        .expect_err("respawn should report machine edge to retired peer");
-    let failed_peer_ids = match error {
-        crate::runtime::handle::MobRespawnError::TopologyRestoreFailed {
-            failed_peer_ids, ..
-        } => failed_peer_ids,
-        other => panic!("expected TopologyRestoreFailed, got {other:?}"),
-    };
-    assert_eq!(
-        failed_peer_ids,
-        vec![crate::ids::RespawnTopologyPeerId::from(right.as_str())],
-        "machine-owned local peer edge must reach generated respawn topology result authority"
+        .expect("a respawn has no machine edge to a retired peer to restore or report");
+    let left_after = handle
+        .get_member(&AgentIdentity::from(left.as_str()))
+        .await
+        .unwrap()
+        .expect("left after respawn");
+    assert!(
+        !left_after
+            .wired_to
+            .contains(&AgentIdentity::from(right.as_str())),
+        "the respawn does not resurrect an edge to the retired peer"
+    );
+    let respawned = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the respawn");
+    assert!(
+        respawned
+            .wiring_edges
+            .iter()
+            .all(|edge| edge.a != machine_right && edge.b != machine_right),
+        "no machine-owned edge names the retired peer after the respawn: {:?}",
+        respawned.wiring_edges
     );
     let events = handle.events().replay_all().await.expect("replay");
     assert!(
         !events
             .iter()
             .any(|event| matches!(event.kind, MobEventKind::MembersWired { .. })),
-        "failed respawn trust repair must not synthesize a MembersWired projection event"
+        "neither the refused edge nor the respawn may synthesize a MembersWired projection event"
     );
 }
 
@@ -37356,7 +37542,6 @@ async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
 enum ColdLocalReadinessFault {
     RuntimeAdapter,
     TurnDrivenRuntimeAdapter,
-    CommsRuntime,
 }
 
 /// Wait for the spawn-detached keep-alive `start_turn` kickoff to be issued.
@@ -37441,7 +37626,6 @@ async fn assert_cold_running_local_resume_fails_closed(
         ColdLocalReadinessFault::TurnDrivenRuntimeAdapter => {
             "cold-turn-driven-missing-runtime-adapter"
         }
-        ColdLocalReadinessFault::CommsRuntime => "cold-missing-comms-runtime",
     });
 
     handle
@@ -37466,22 +37650,13 @@ async fn assert_cold_running_local_resume_fails_closed(
     );
 
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
-    match fault {
-        ColdLocalReadinessFault::RuntimeAdapter
-        | ColdLocalReadinessFault::TurnDrivenRuntimeAdapter => {}
-        ColdLocalReadinessFault::CommsRuntime => {
-            let _ = restarted_service.enable_runtime_adapter();
-            // Cold builder reconciliation observes the live runtime four
-            // times while rebuilding endpoint/trust projections. The fifth
-            // observation is the recovered actor's readiness check.
-            restarted_service.set_comms_runtime_missing_after_successes(4);
-        }
-    }
     crash_stop_and_release_routes(handle).await;
     drop(service);
 
+    // The builder refuses a session-backed local member before it restores
+    // any member, so no member restore policy applies here.
     let resume_result = MobBuilder::for_resume(MobStorage {
-        events: events.clone(),
+        events,
         runs,
         specs,
         definition_projection_composition:
@@ -37496,84 +37671,18 @@ async fn assert_cold_running_local_resume_fails_closed(
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
-    // The comms fault hits the restore's readiness check, so the start restores members.
-    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await;
 
-    if matches!(
-        fault,
-        ColdLocalReadinessFault::RuntimeAdapter | ColdLocalReadinessFault::TurnDrivenRuntimeAdapter
-    ) {
-        let error = match resume_result {
-            Ok(_) => panic!("missing composition adapter must reject cold resume synchronously"),
-            Err(error) => error,
-        };
-        assert_missing_outbound_comms_capability(error, &member, expected_context);
-        assert_eq!(
-            restarted_service.keep_alive_start_turn_call_count(),
-            0,
-            "a synchronous composition failure must not start a replacement kickoff turn"
-        );
-        return;
-    }
-
-    // Per-session comms is discovered only after durable reconstruction. The
-    // recovered actor owns that lifecycle failure: it commits Stopped and
-    // retains the handle, whose explicit resume is the canonical typed retry.
-    let resumed = resume_result
-        .expect("per-session readiness failure must return its durably fail-stopped handle");
-
-    let resumed_status = resumed.status().await.expect("failed cold-resume status");
-    let comms_observations = restarted_service
-        .comms_runtime_observations
-        .load(Ordering::Relaxed);
-    let remaining_successes = restarted_service
-        .comms_runtime_successes_before_missing
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        resumed_status,
-        MobState::Stopped,
-        "local cold resume must fail closed when comms-drain readiness is unavailable; observations={comms_observations}, remaining_successes={remaining_successes}"
-    );
-    let durable_events = events
-        .replay_all()
-        .await
-        .expect("replay startup fail-stop events");
-    assert_eq!(
-        durable_events
-            .iter()
-            .filter(|event| matches!(event.kind, MobEventKind::MobStopped))
-            .count(),
-        1,
-        "polling a pending exact interrupt must commit one structural Stop transition"
-    );
-    assert_eq!(
-        durable_events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    &event.kind,
-                    MobEventKind::MemberKickoffUpdated {
-                        member: event_member,
-                        kickoff,
-                    } if event_member == &member
-                        && kickoff.phase == crate::MobMemberKickoffPhase::Cancelled
-                )
-            })
-            .count(),
-        1,
-        "polling the retained interrupt receiver must not duplicate its durable kickoff cancellation"
-    );
-    let error = resumed
-        .resume()
-        .await
-        .expect_err("explicit retry must preserve the typed missing capability failure");
+    let error = match resume_result {
+        Ok(_) => panic!("missing composition adapter must reject cold resume synchronously"),
+        Err(error) => error,
+    };
     assert_missing_outbound_comms_capability(error, &member, expected_context);
     assert_eq!(
         restarted_service.keep_alive_start_turn_call_count(),
         0,
-        "a readiness failure must not synthesize a replacement kickoff turn"
+        "a synchronous composition failure must not start a replacement kickoff turn"
     );
 }
 
@@ -37595,13 +37704,175 @@ async fn test_cold_running_turn_driven_resume_fails_closed_without_runtime_adapt
     .await;
 }
 
+/// A cold resume of a running mob whose member's comms runtime is gone by the
+/// recovered actor's readiness pass fails closed for that member alone: one
+/// member's readiness failure is its own outcome, never the mob's. The
+/// builder reconstructs the member while its comms runtime is still present
+/// (per-session comms is discovered only after durable reconstruction); the
+/// readiness pass then finds it missing, so MobMachine records the member
+/// Broken with the typed missing-capability failure. The member is never
+/// served as ready and runs no kickoff turn; the mob keeps running and
+/// commits no Stop.
 #[tokio::test]
 async fn test_cold_running_resume_fails_closed_without_comms_runtime() {
-    assert_cold_running_local_resume_fails_closed(
-        ColdLocalReadinessFault::CommsRuntime,
-        "local member comms-drain startup",
-    )
-    .await;
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runs = storage.runs.clone();
+    let specs = storage.specs.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let identity = storage.identity.clone();
+    let identity_member = storage.identity_member.clone();
+    let identity_status = storage.identity_status.clone();
+    let realm_profiles = storage.realm_profiles.clone();
+    let forked_participants = storage.forked_participants.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let member = AgentIdentity::from("cold-missing-comms-runtime");
+    handle
+        .spawn(ProfileName::from("worker"), member.clone(), None)
+        .await
+        .expect("spawn local member");
+    handle
+        .wait_for_members_ready(std::slice::from_ref(&member), Some(Duration::from_secs(2)))
+        .await
+        .expect("fresh member reaches startup readiness");
+    wait_for_keep_alive_start_turn_count(service.as_ref(), 1).await;
+    let member_session = handle
+        .get_member(&member)
+        .await
+        .expect("fresh member lookup")
+        .expect("fresh member roster entry")
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("local member must be session-backed before cold restart");
+    let mob_id = handle.mob_id().clone();
+
+    let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted_service.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    // The builder reconstructs the member with its comms runtime present;
+    // the runtime is gone when the recovered actor's readiness pass reads it.
+    let (entered, release) = super::actor::arm_startup_readiness_test_gate(mob_id);
+    let resume = tokio::spawn(
+        MobBuilder::for_resume(MobStorage {
+            events: events.clone(),
+            runs,
+            specs,
+            definition_projection_composition:
+                crate::storage::DefinitionProjectionComposition::Independent,
+            runtime_metadata,
+            identity,
+            identity_member,
+            identity_status,
+            identity_status_projection_order: Default::default(),
+            realm_profiles,
+            forked_participants,
+        })
+        .with_session_service(restarted_service.clone())
+        .notify_orchestrator_on_resume(false)
+        // The start restores the member, so its readiness runs at this start.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
+        .resume(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("the cold start reaches its readiness pass")
+        .expect("startup readiness gate");
+    restarted_service
+        .set_missing_comms_runtime(&member_session)
+        .await;
+    let _ = release.send(());
+    let resumed = tokio::time::timeout(Duration::from_secs(10), resume)
+        .await
+        .expect("the cold start answers")
+        .expect("resume task")
+        .expect("one member's readiness failure does not fail the cold start");
+
+    // An actor round trip: answered once the readiness pass settled the
+    // member.
+    assert_eq!(
+        resumed.status().await.expect("cold-resume status"),
+        MobState::Running,
+        "one member's missing comms runtime is that member's outcome: the mob keeps running"
+    );
+    let missing_capability = MobError::MissingMemberCapability {
+        member_id: member.clone(),
+        capability: crate::error::MobMemberCapability::OutboundCommsRuntime,
+        context: "local member comms-drain startup",
+    };
+    let expected_reason = format!(
+        "member '{member}' was restored at this start but its readiness failed: {missing_capability}"
+    );
+    let machine_state = resumed
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state");
+    assert_eq!(
+        machine_state.member_lifecycle_for_identity(
+            &crate::machines::mob_machine::AgentIdentity::from_domain(&member)
+        ),
+        crate::machines::mob_machine::MobMemberLifecycleMaterial {
+            status: crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
+            terminal_class: crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
+            error: Some(expected_reason.clone()),
+        },
+        "MobMachine records the member Broken with its typed readiness failure"
+    );
+    assert_eq!(
+        resumed.member_materialization_for_test(&member),
+        None,
+        "a member whose readiness failed is neither live nor waking"
+    );
+    let snapshot = resumed
+        .member_status(&member)
+        .await
+        .expect("the broken member's status");
+    assert_eq!(snapshot.status, MobMemberStatus::Broken, "{snapshot:?}");
+    assert!(
+        snapshot.is_final,
+        "a broken member is terminal: {snapshot:?}"
+    );
+    assert_eq!(snapshot.error.as_deref(), Some(expected_reason.as_str()));
+    match resumed.member(&member).await {
+        Err(MobError::MemberRestoreFailed {
+            member_id,
+            session_id,
+            reason,
+            hold,
+        }) => {
+            assert_eq!(member_id, member);
+            assert_eq!(session_id, Some(member_session));
+            assert_eq!(reason, expected_reason);
+            assert!(hold.is_none(), "the readiness failure holds nothing");
+        }
+        Ok(_) => panic!("a member without its comms runtime is never served as ready"),
+        Err(other) => panic!("expected the typed restore failure, got {other:?}"),
+    }
+    let durable_events = events
+        .replay_all()
+        .await
+        .expect("replay the cold start's events");
+    assert_eq!(
+        durable_events
+            .iter()
+            .filter(|event| matches!(event.kind, MobEventKind::MobStopped))
+            .count(),
+        0,
+        "a member's readiness failure commits no Stop"
+    );
+    assert_eq!(
+        restarted_service.keep_alive_start_turn_call_count(),
+        0,
+        "a readiness failure must not synthesize a replacement kickoff turn"
+    );
 }
 
 #[tokio::test]
@@ -38206,13 +38477,17 @@ async fn test_cold_resume_notification_failure_is_recorded_once_after_its_bounde
     );
 }
 
-/// An explicit resume reports its orchestrator notification's outcome, not a
-/// failed attempt the runtime retries: when the retry delivers the
-/// notification, the resume succeeds.
+/// An explicit resume hands its orchestrator's resume notification turn to
+/// the actor's lifecycle owner (as a cold resume does) and does not wait for
+/// it, so the notification's attempts run after the resume answers. A
+/// notification whose first attempt fails and whose runtime retry delivers it
+/// was delivered: the row waits, bounded, for the failed attempt and the
+/// retry that delivered it, then pins that no notification failure was
+/// recorded and the mob runs.
 #[tokio::test]
 async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notification() {
     let service = Arc::new(MockSessionService::new());
-    let _ = service.enable_runtime_adapter();
+    let runtime = service.enable_runtime_adapter();
     let mut def = sample_definition();
     for profile in def.profiles.values_mut().filter_map(|b| b.as_inline_mut()) {
         profile.runtime_mode = crate::MobRuntimeMode::TurnDriven;
@@ -38252,10 +38527,35 @@ async fn test_explicit_resume_succeeds_when_a_runtime_retry_delivers_the_notific
     .resume()
     .await
     .expect("stopped mob reconstruction should succeed");
+    let cursor = resumed
+        .events()
+        .latest_cursor()
+        .await
+        .expect("event cursor before the lift");
     resumed
         .resume()
         .await
-        .expect("the explicit resume succeeds once the runtime's retry delivers the notification");
+        .expect("the explicit resume succeeds without waiting for the notification turn");
+
+    // The first attempt fails and the runtime's retry of the same input
+    // enters its turn; then that input settles.
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while service.recorded_start_turn_prompts().await.len() < prompts_before + 2 {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the runtime retries the failed notification input");
+    wait_for_session_runtime_inputs_settled(&runtime, &orchestrator_session).await;
+    // A failure event, if any, is appended once the notification's outcome
+    // is known; give it room to land before asserting there is none.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        orchestrator_resume_notification_failures(&resumed, cursor).await,
+        Vec::new(),
+        "a notification the runtime's retry delivered records no failure"
+    );
     assert_eq!(
         resume_notification_attempts_since(&service, &orchestrator_session, prompts_before).await,
         2,
@@ -38508,6 +38808,29 @@ async fn test_resume_restores_missing_sessions_with_tool_wiring() {
     );
 }
 
+/// Whether `reason` is the restore diagnostic of a member whose durable
+/// session snapshot is gone, naming exactly `session_id`. A wake's and a
+/// start's restore word it "missing durable session snapshot"; the explicit
+/// resume's own rebuild and the warm revival word it "missing bridge session
+/// snapshot". The rows pin the typed Broken outcome and the session the
+/// reason names, not which restore recipe classified the member.
+fn is_missing_session_snapshot_reason(reason: &str, session_id: &SessionId) -> bool {
+    reason == format!("missing durable session snapshot for '{session_id}'")
+        || reason == format!("missing bridge session snapshot for '{session_id}'")
+}
+
+/// Whether `reason` is the restore diagnostic of a failed revival of exactly
+/// `session_id`. A wake's cold recipe words it "failed to restore durable
+/// session '<id>': <cause>"; the warm revival "machine-authorized revival of
+/// bridge session '<id>' failed: <cause>". The rows pin the typed terminal
+/// outcome, the session and the cause, not which recipe rebuilt the member.
+fn is_failed_revival_reason(reason: &str, session_id: &SessionId) -> bool {
+    let cold_restore = format!("failed to restore durable session '{session_id}': ");
+    let warm_revival =
+        format!("machine-authorized revival of bridge session '{session_id}' failed: ");
+    reason.starts_with(&cold_restore) || reason.starts_with(&warm_revival)
+}
+
 #[tokio::test]
 async fn test_resume_marks_missing_persisted_session_as_broken() {
     let service = Arc::new(MockSessionService::new());
@@ -38575,13 +38898,6 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
     );
     assert!(snapshot.is_final, "broken members should be terminal");
     assert_eq!(snapshot.current_session_id, Some(old_sid.clone()));
-    assert!(
-        snapshot
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("missing bridge session snapshot")),
-        "broken member should surface restore failure reason"
-    );
 
     let machine_state = resumed
         .query_machine_state()
@@ -38589,14 +38905,25 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
         .expect("query MobMachine state after restore failure");
     let machine_identity =
         crate::machines::mob_machine::AgentIdentity::from_domain(&AgentIdentity::from("w-1"));
+    let lifecycle = machine_state.member_lifecycle_for_identity(&machine_identity);
     assert_eq!(
-        machine_state.member_lifecycle_for_identity(&machine_identity),
-        crate::machines::mob_machine::MobMemberLifecycleMaterial {
-            status: crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
-            terminal_class: crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
-            error: Some(format!("missing bridge session snapshot for '{old_sid}'")),
-        },
+        (lifecycle.status, lifecycle.terminal_class),
+        (
+            crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
+            crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
+        ),
         "restore-failure member status must be owned by MobMachine, not reconstructed by projection code"
+    );
+    assert!(
+        lifecycle
+            .error
+            .as_deref()
+            .is_some_and(|reason| is_missing_session_snapshot_reason(reason, &old_sid)),
+        "MobMachine owns the missing-snapshot classification of the member's session: {lifecycle:?}"
+    );
+    assert_eq!(
+        snapshot.error, lifecycle.error,
+        "broken member status should surface MobMachine's own restore failure reason"
     );
 
     let members = resumed.list_members().await;
@@ -38610,12 +38937,9 @@ async fn test_resume_marks_missing_persisted_session_as_broken() {
     );
     assert!(broken.is_final);
     assert_eq!(broken.current_session_id, Some(old_sid));
-    assert!(
-        broken
-            .error
-            .as_deref()
-            .is_some_and(|message| message.contains("missing bridge session snapshot")),
-        "projected member listing should carry the restore failure"
+    assert_eq!(
+        broken.error, lifecycle.error,
+        "projected member listing should carry MobMachine's own restore failure reason"
     );
 
     let including_retiring = resumed.list_members_including_retiring().await;
@@ -40897,12 +41221,6 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await
         .expect("old retiring comms runtime");
     let old_peer_id = old_runtime.peer_id().expect("old retiring peer id");
-    let old_peer_endpoint = super::provisioner::SessionBackend::trusted_peer_spec_from_runtime(
-        recovered_comms_name,
-        old_runtime.as_ref(),
-    )
-    .expect("old peer endpoint material")
-    .expect("old peer endpoint");
     let initial_survivor_runtime = {
         let sessions = service.sessions.read().await;
         sessions
@@ -41060,20 +41378,193 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await;
 
     crash_stop_and_release_routes(resumed).await;
+    // The replayed retirement start is archive-only: no runtime of this
+    // process holds the retiring member's session, so the retirement archives
+    // it and routes no runtime retire, and the restart re-drives it at once.
+    // The re-drive is held at its local trust cleanup. Its endpoint
+    // observations ran first, while the survivor was still dormant, so the
+    // cleanup holds no trust job for the survivor; and MobMachine still wires
+    // the two until retirement_finish_machine_wiring, which runs after this
+    // stage. Waking the survivor here is, deterministically, the interleaving
+    // a delivery that wakes a survivor mid-retirement takes while its edge to
+    // the retiring member still exists.
+    let trust_cleanup_hold =
+        super::actor::retirement_stage_hold::install(&retiring, "retire-local-trust-cleanup");
     let restarted = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-        events,
+        events.clone(),
         runtime_metadata,
     ))
     .with_session_service(service.clone())
     .resume()
     .await
     .expect("restart should replay recovered endpoint authority");
-    // The survivor holds no work, so the restart leaves it dormant: wake it,
-    // so the retry sweeps the trust of a live survivor.
-    restarted
-        .ensure_member_live(&survivor)
+    tokio::time::timeout(Duration::from_secs(10), trust_cleanup_hold.entered())
         .await
-        .expect("wake the survivor");
+        .expect("the restart re-drives the recovered retirement to its local trust cleanup");
+
+    // While the retirement is held, replay still holds the retiring member's
+    // current endpoint and its historical cleanup anchor, its retirement is
+    // archive-only, the survivor is still dormant, and MobMachine still wires
+    // the survivor to the retiring member.
+    let retired_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
+    let survivor_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&survivor);
+    let held = restarted
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state while the retirement is held");
+    assert!(
+        held.member_prior_peer_endpoints
+            .get(&retired_identity)
+            .is_some_and(|prior| prior
+                .iter()
+                .any(|endpoint| endpoint.peer_id.0 == old_peer_id.to_string())),
+        "replay retains the historical endpoint cleanup anchor while the retirement is in flight: {:?}",
+        held.member_prior_peer_endpoints.get(&retired_identity)
+    );
+    assert!(
+        held.member_peer_endpoints
+            .get(&retired_identity)
+            .is_some_and(|endpoint| endpoint.peer_id.0 == replacement_peer_id.to_string()),
+        "replay retains the current endpoint while the retirement is in flight: {:?}",
+        held.member_peer_endpoints.get(&retired_identity)
+    );
+    assert!(
+        held.identity_to_runtime
+            .get(&retired_identity)
+            .is_some_and(|runtime| held.runtime_retire_archive_only.contains(runtime)),
+        "the recovered retirement is archive-only"
+    );
+    assert_eq!(
+        restarted.member_materialization_for_test(&survivor),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant),
+        "the survivor holds no work, so the restart left it dormant"
+    );
+    assert!(
+        held.wiring_edges.iter().any(|edge| {
+            (edge.a == retired_identity && edge.b == survivor_identity)
+                || (edge.a == survivor_identity && edge.b == retired_identity)
+        }),
+        "MobMachine still wires the survivor to the retiring member while its trust cleanup is held"
+    );
+
+    // Wake the survivor while the trust cleanup is held. The wake is not a
+    // deferred control and its steps run on member effects of its own, which
+    // the held stage does not serialize, so it completes while the stage is
+    // held. Its topology step cannot realize the edge to the retiring member:
+    // the recovered retirement removed that member's session binding, so its
+    // endpoint does not resolve, and MobMachine owes no repair of an edge
+    // whose end is retiring. The survivor wakes Live, not Broken, with no
+    // trust toward either retiring endpoint.
+    let survivor_wake = tokio::spawn({
+        let restarted = restarted.clone();
+        let survivor = survivor.clone();
+        async move { restarted.ensure_member_live(&survivor).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), survivor_wake)
+        .await
+        .expect("the survivor's wake completes while its peer's trust cleanup is held")
+        .expect("the survivor's wake task completes")
+        .expect("wake the survivor mid-retirement");
+    assert_eq!(
+        restarted.member_materialization_for_test(&survivor),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a survivor woken mid-retirement is Live"
+    );
+    let woken = restarted
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after the survivor's wake");
+    assert!(
+        !woken
+            .owed_edge_repairs
+            .iter()
+            .any(|edge| edge.a == retired_identity || edge.b == retired_identity),
+        "MobMachine owes no repair of an edge whose end is retiring: {:?}",
+        woken.owed_edge_repairs
+    );
+    let woken_survivor_runtime = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&survivor_sid)
+            .cloned()
+            .expect("woken surviving comms runtime")
+    };
+    let woken_runtime_carried_over =
+        Arc::ptr_eq(&woken_survivor_runtime, &resumed_survivor_runtime);
+    let installed_peer_ids = {
+        let trusted = woken_survivor_runtime.trusted_peers.read().await;
+        [old_peer_id, replacement_peer_id]
+            .into_iter()
+            .map(|peer_id| peer_id.to_string())
+            .filter(|peer_id| trusted.contains_key(peer_id))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        installed_peer_ids.is_empty(),
+        "a survivor woken mid-retirement installs no trust toward the retiring member; old={old_peer_id}, current={replacement_peer_id}, installed={installed_peer_ids:?}, survivor runtime carried over the restart={woken_runtime_carried_over}"
+    );
+
+    // Release the trust cleanup; the retry joins the restart's re-drive (or
+    // finds it done) and answers at its terminal.
+    trust_cleanup_hold.release();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        retire_to_terminal(&restarted, &retiring),
+    )
+    .await
+    .expect("the recovered retirement reaches its terminal once its trust cleanup runs")
+    .expect("retry retirement from durable start marker");
+    assert!(
+        restarted
+            .get_member(&retiring)
+            .await
+            .expect("roster query after the retirement")
+            .is_none(),
+        "the recovered retirement is terminal"
+    );
+    let retired_count = events
+        .replay_all()
+        .await
+        .expect("replay the recovered retirement")
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == &retiring
+            )
+        })
+        .count();
+    assert_eq!(
+        retired_count, 1,
+        "the recovered retirement terminates exactly once"
+    );
+    // Terminal MemberRetired clears the retired member's endpoint history
+    // with its current endpoint and its edges, so no topology step can
+    // install trust for either generation again.
+    let machine_state = restarted
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after the retirement");
+    assert!(
+        !machine_state
+            .member_peer_endpoints
+            .contains_key(&retired_identity),
+        "terminal retirement clears the retired member's current endpoint"
+    );
+    assert!(
+        !machine_state
+            .member_prior_peer_endpoints
+            .contains_key(&retired_identity),
+        "terminal retirement clears the retired member's endpoint history"
+    );
+    assert!(
+        !machine_state
+            .wiring_edges
+            .iter()
+            .any(|edge| edge.a == retired_identity || edge.b == retired_identity),
+        "terminal retirement unwires the retired member"
+    );
+
     let restarted_survivor_runtime = {
         let sessions = service.sessions.read().await;
         sessions
@@ -41081,20 +41572,8 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
             .cloned()
             .expect("restarted surviving comms runtime")
     };
-
-    // Model a durable trust projection restoring the old generation row after
-    // retirement admission. The actor retry, not ordinary resume repair, must
-    // sweep it before terminal MemberRetired clears endpoint history.
-    restarted_survivor_runtime
-        .trusted_peers
-        .write()
-        .await
-        .insert(old_peer_id.to_string(), old_peer_endpoint);
-    restarted
-        .retire(retiring)
-        .await
-        .expect("retry retirement from durable start marker");
-
+    let survivor_runtime_carried_over =
+        Arc::ptr_eq(&restarted_survivor_runtime, &resumed_survivor_runtime);
     let trusted = restarted_survivor_runtime.trusted_peers.read().await;
     let residual_peer_ids = [old_peer_id, replacement_peer_id]
         .into_iter()
@@ -41103,7 +41582,7 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .collect::<Vec<_>>();
     assert!(
         residual_peer_ids.is_empty(),
-        "terminal retirement must remove both historical and current peer trust; old={old_peer_id}, current={replacement_peer_id}, residual={residual_peer_ids:?}"
+        "terminal retirement must remove both historical and current peer trust; old={old_peer_id}, current={replacement_peer_id}, residual={residual_peer_ids:?}, survivor runtime carried over the restart={survivor_runtime_carried_over}"
     );
 }
 
@@ -78269,7 +78748,7 @@ async fn test_submit_work_marks_missing_bridge_session_broken_without_prior_stat
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("missing bridge session"),
+                is_missing_session_snapshot_reason(&reason, &bridge_session_id),
                 "unexpected restore failure reason: {reason}"
             );
         }
@@ -79077,8 +79556,12 @@ async fn test_revival_failure_is_typed_terminal_without_retry_loop() {
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("machine-authorized revival"),
+                is_failed_revival_reason(&reason, &bridge_session_id),
                 "failure reason must carry the typed revival outcome: {reason}"
+            );
+            assert!(
+                reason.contains("mock create_session failure"),
+                "failure reason must carry the re-materialization's own cause: {reason}"
             );
         }
         other => panic!("expected MemberRestoreFailed, got {other:?}"),
@@ -79210,7 +79693,7 @@ async fn test_revival_already_active_without_live_session_is_typed_terminal() {
             assert_eq!(member_id, AgentIdentity::from("w-1"));
             assert_eq!(session_id, Some(bridge_session_id.clone()));
             assert!(
-                reason.contains("machine-authorized revival"),
+                is_failed_revival_reason(&reason, &bridge_session_id),
                 "failure reason must carry the typed revival outcome: {reason}"
             );
             assert!(
@@ -80439,17 +80922,45 @@ async fn test_shutdown_skips_interrupt_for_host_owned_runtime_release_anchor() {
     );
 }
 
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_retire_consumer_refusal_survives_cold_restart_and_retries() {
     assert_retire_consumer_refusal_survives_cold_restart(false).await;
 }
 
+#[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn test_retire_consumer_refusal_running_cold_restart_preserves_detached_binding() {
     assert_retire_consumer_refusal_survives_cold_restart(true).await;
 }
 
+/// The members' runtime registrations are unregistered from outside the mob,
+/// and each final unregister is released to the mob
+/// (`RuntimeRegistrationReleased`).
+///
+/// A member the release demotes is Dormant, and retiring a Dormant member is
+/// archive-only: no runtime of this process holds its session, so its retire
+/// routes no runtime retire, nothing can refuse it, and it completes at once.
+///
+/// A member the release cannot demote keeps the routed retire and the
+/// consumer's refusal of it: here one whose routed binding has not recorded
+/// its registration's epoch yet (MobMachine's `NotYetReleasable`), so the
+/// release is the accepted Stale no-op and the member stays Live with no
+/// registration. The unregistered runtime consumer refuses its routed retire,
+/// and the durable retirement start stays its retry anchor across a cold
+/// restart (a Stop then a shutdown, or a crash while Running). The restart
+/// recovers the retirement archive-only (no retiring member is woken after a
+/// restart), so the retry completes it with the runtime still unregistered.
+#[cfg(feature = "runtime-adapter")]
 async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: bool) {
+    let released = AgentIdentity::from("w-released");
+    // The binding hold is keyed by member identity for the whole process, so
+    // the held member's identity is unique. It is held from its spawn until
+    // the refusing actor is gone.
+    let pinned = AgentIdentity::from(format!("w-1-binding-held-{}", Uuid::new_v4().simple()));
+    let binding_hold = crate::runtime::composition::ready_signal_test_hold::hold(pinned.as_str());
+    let released_key = crate::machines::mob_machine::AgentIdentity::from_domain(&released);
+    let pinned_key = crate::machines::mob_machine::AgentIdentity::from_domain(&pinned);
     let service = Arc::new(MockSessionService::new());
     let adapter = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
@@ -80460,20 +80971,88 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         .create()
         .await
         .expect("create mob");
-    let mut spec = SpawnMemberSpec::new("worker", "w-1");
+    let mut spec = SpawnMemberSpec::new("worker", released.as_str());
     spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
-    handle.spawn_spec(spec).await.expect("spawn w-1");
-    let session_id = handle
-        .resolve_bridge_session_id(&AgentIdentity::from("w-1"))
+    handle
+        .spawn_spec(spec)
+        .await
+        .expect("spawn the member the release demotes");
+    let released_session = handle
+        .resolve_bridge_session_id(&released)
         .await
         .expect("session-backed");
-    unregister_runtime_session_until_complete(adapter.as_ref(), &session_id)
+    let mut spec = SpawnMemberSpec::new("worker", pinned.as_str());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    handle
+        .spawn_spec(spec)
         .await
-        .expect("bridge session should unregister cleanly");
+        .expect("spawn the member the release cannot demote");
+    let session_id = handle
+        .resolve_bridge_session_id(&pinned)
+        .await
+        .expect("session-backed");
+    assert!(
+        !handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization_epoch
+            .get(&pinned_key)
+            .is_some_and(Option::is_some),
+        "the held binding has not recorded the registration's epoch"
+    );
+    for session in [&released_session, &session_id] {
+        unregister_runtime_session_until_complete(adapter.as_ref(), session)
+            .await
+            .expect("bridge session should unregister cleanly");
+    }
+    let mut machine = handle.machine_state_watch_rx.clone();
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        machine.wait_for(|state| {
+            state.member_materialization.get(&released_key)
+                == Some(&crate::machines::mob_machine::MemberMaterializationPhase::Dormant)
+        }),
+    )
+    .await
+    .expect("the released registration demotes its member in time")
+    .expect("the machine state stays published");
+    // The actor handles its commands in order: a status answered after both
+    // unregisters returned was handled after both releases they published.
+    handle
+        .status()
+        .await
+        .expect("an actor round trip after the releases");
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_materialization
+            .get(&pinned_key)
+            .copied(),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
+        "a release before the binding recorded the registration's epoch demotes nothing"
+    );
 
-    let refusal = handle
-        .retire(AgentIdentity::from("w-1"))
+    handle
+        .retire(released.clone())
         .await
+        .expect("a Dormant member retires archive-only, with no routed retire to refuse");
+    assert!(
+        handle
+            .get_member(&released)
+            .await
+            .expect("read the archive-only retirement's roster")
+            .is_none(),
+        "the archive-only retirement completes at once"
+    );
+    assert!(
+        service.test_is_session_archived(&released_session).await,
+        "the session archive alone terminates the Dormant member"
+    );
+
+    let refusal = tokio::time::timeout(Duration::from_secs(10), handle.retire(pinned.clone()))
+        .await
+        .expect("the routed retire answers while the readiness observation is held")
         .expect_err("unregistered runtime consumer must refuse the routed retire");
     assert!(
         refusal.is_closed_runtime_effect_refusal(),
@@ -80481,38 +81060,55 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     );
     assert!(
         handle
-            .get_member(&AgentIdentity::from("w-1"))
+            .get_member(&pinned)
             .await
             .expect("read retained member")
             .is_some(),
         "consumer refusal must retain the roster cleanup anchor"
     );
     let after_refusal = events.replay_all().await.expect("replay refusal events");
+    for (identity, session, label) in [
+        (&released, &released_session, "archive-only"),
+        (&pinned, &session_id, "refused"),
+    ] {
+        assert!(
+            after_refusal.iter().any(|event| matches!(
+                &event.kind,
+                MobEventKind::MemberRetirementStarted {
+                    agent_identity,
+                    releasing: Some(releasing),
+                    ..
+                } if agent_identity == identity && releasing == session
+            )),
+            "the {label} durable retirement must release this exact ordinary member binding"
+        );
+    }
     assert!(
-        after_refusal.iter().any(|event| matches!(
+        after_refusal.iter().all(|event| !matches!(
             &event.kind,
-            MobEventKind::MemberRetirementStarted { releasing: Some(releasing), .. }
-                if releasing == &session_id
+            MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == &pinned
         )),
-        "the durable retirement must release this exact ordinary member binding"
-    );
-    assert!(
-        after_refusal
-            .iter()
-            .all(|event| !matches!(event.kind, MobEventKind::MemberRetired { .. }))
+        "the refused retirement publishes no final event"
     );
 
+    // The pinned member's readiness observation is still held: bound every
+    // lifecycle call below, so a wait behind the held signal fails fast.
     let expected_phase = if crash_restart {
-        crash_stop_and_release_routes(handle).await;
+        tokio::time::timeout(
+            Duration::from_secs(10),
+            crash_stop_and_release_routes(handle),
+        )
+        .await
+        .expect("the crash stop answers while the readiness observation is held");
         MobState::Running
     } else {
-        handle
-            .stop()
+        tokio::time::timeout(Duration::from_secs(10), handle.stop())
             .await
+            .expect("the stop answers while the readiness observation is held")
             .expect("persist stopped lifecycle before cold restart");
-        handle
-            .shutdown()
+        tokio::time::timeout(Duration::from_secs(10), handle.shutdown())
             .await
+            .expect("the shutdown answers while the readiness observation is held")
             .expect("shutdown refused actor before cold restart");
         assert!(
             events
@@ -80525,15 +81121,18 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         );
         MobState::Stopped
     };
+    // The refusing actor is gone: the held readiness observation can reach no
+    // live mob now.
+    drop(binding_hold);
 
-    // Repair the external runtime reachability that caused the first refusal.
     // Resume must derive RETIRE retry authority solely from the durable start
-    // event; the in-memory refusal maps and actor state are gone.
-    adapter
-        .register_session(session_id.clone())
-        .await
-        .expect("restore runtime reachability before retry");
-
+    // event; the in-memory refusal maps and actor state are gone. The runtime
+    // stays unregistered: the recovered retirement routes no runtime retire.
+    // A start re-drives every retirement it recovered, and the row's retry
+    // joins that re-drive: the retry is held at its archive stage, so the
+    // recovered state is read before the retirement completes.
+    let archive_hold =
+        super::actor::retirement_stage_hold::install(&pinned, "retire-session-archive");
     let resumed = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -80543,23 +81142,49 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
     .resume()
     .await
     .expect("resume retiring mob from durable event journal");
+    let retry = {
+        let resumed = resumed.clone();
+        let pinned = pinned.clone();
+        tokio::spawn(async move { retire_to_terminal(&resumed, &pinned).await })
+    };
+    tokio::time::timeout(Duration::from_secs(10), archive_hold.entered())
+        .await
+        .expect("the retry of the recovered retirement reaches its archive");
 
     let recovered = resumed
         .query_machine_state()
         .await
         .expect("query recovered machine state");
-    assert!(
+    let pinned_runtime = recovered
+        .identity_to_runtime
+        .get(&pinned_key)
+        .cloned()
+        .expect("the retiring member keeps its runtime binding until its retirement completes");
+    assert_eq!(
         recovered
             .runtime_retire_pending_sessions
-            .values()
-            .any(|pending| pending.0 == session_id.to_string()),
+            .get(&pinned_runtime)
+            .map(|pending| pending.0.clone()),
+        Some(session_id.to_string()),
         "cold replay must restore the exact pending runtime-retire correlation"
     );
     assert!(
-        !recovered
-            .member_session_bindings
-            .contains_key(&crate::machines::mob_machine::AgentIdentity::from("w-1")),
+        recovered
+            .runtime_retire_archive_only
+            .contains(&pinned_runtime),
+        "a retirement recovered at a start is archive-only: it routes no runtime retire"
+    );
+    assert!(
+        !recovered.member_session_bindings.contains_key(&pinned_key),
         "cleanup recovery must not restore the ordinary binding released by the durable retirement"
+    );
+    assert!(
+        resumed
+            .get_member(&released)
+            .await
+            .expect("read the archive-only retirement after the restart")
+            .is_none(),
+        "the completed archive-only retirement stays complete across the restart"
     );
     assert_eq!(
         resumed
@@ -80570,27 +81195,34 @@ async fn assert_retire_consumer_refusal_survives_cold_restart(crash_restart: boo
         "cleanup delivery recovery must preserve the durable lifecycle phase"
     );
 
-    resumed
-        .retire(AgentIdentity::from("w-1"))
+    archive_hold.release();
+    tokio::time::timeout(Duration::from_secs(10), retry)
         .await
+        .expect("the retry answers once its archive runs")
+        .expect("retry task")
         .expect("cold-restarted pending retirement should retry and complete");
     assert!(
         resumed
-            .get_member(&AgentIdentity::from("w-1"))
+            .get_member(&pinned)
             .await
             .expect("read member after completed retry")
             .is_none(),
         "successful retry must remove the completed roster entry"
     );
     let completed = events.replay_all().await.expect("replay completed events");
-    assert_eq!(
-        completed
-            .iter()
-            .filter(|event| matches!(event.kind, MobEventKind::MemberRetired { .. }))
-            .count(),
-        1,
-        "retry must publish exactly one final MemberRetired event"
-    );
+    for identity in [&pinned, &released] {
+        assert_eq!(
+            completed
+                .iter()
+                .filter(|event| matches!(
+                    &event.kind,
+                    MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == identity
+                ))
+                .count(),
+            1,
+            "each retirement must publish exactly one final MemberRetired event: {identity}"
+        );
+    }
 
     assert_eq!(
         resumed.status().await.expect("query recovered lifecycle"),
