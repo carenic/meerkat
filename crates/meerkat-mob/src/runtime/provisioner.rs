@@ -2081,7 +2081,11 @@ pub trait MobProvisioner: Send + Sync {
     /// reused on another binding. The attachment is retired as
     /// [`Self::prepare_member_session_for_explicit_resume`] retires one it
     /// does not own (same exact witness fence, attachment-local queued work
-    /// never adopted), and the caller rebuilds the member on its spec.
+    /// never adopted), and the caller rebuilds the member on its spec. The
+    /// eligible inputs queued on the retired registration stay durably
+    /// queued for the rebuilt one (a requeue with the default max age, as a
+    /// graceful process shutdown keeps them), so a run queued while the mob
+    /// was stopped runs on the binding the spec names, never on the old one.
     /// Returns `true` when the caller must rebuild, `false` when nothing was
     /// retired (no runtime adapter participates). Default: `false`.
     async fn retire_live_member_session_for_explicit_resume(
@@ -2439,6 +2443,25 @@ struct ExplicitResumeAttachmentRetirement {
 enum OwnLiveAttachment {
     Keep,
     Retire,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl OwnLiveAttachment {
+    /// The disposition, for the inputs queued on the registration the
+    /// retirement ends, of a retirement that makes way for the member's
+    /// rebuild on the binding its resume request names: the eligible ones are
+    /// kept durably queued for the rebuilt registration, as a graceful
+    /// process shutdown keeps them, so a run queued while the mob was stopped
+    /// runs on that binding. `None` for a takeover, which ends them as
+    /// stopped, as it always did.
+    fn requeue_for_rebuild(self) -> Option<meerkat_runtime::UnregisterQueuedInputs> {
+        match self {
+            Self::Keep => None,
+            Self::Retire => Some(meerkat_runtime::UnregisterQueuedInputs::Requeue {
+                max_age: meerkat_runtime::UnregisterQueuedInputs::DEFAULT_MAX_AGE,
+            }),
+        }
+    }
 }
 
 /// Exact physical capabilities retained across retryable cold-recovery
@@ -5978,16 +6001,28 @@ impl SessionBackend {
                                 .registration_is_current_without_runtime_owner(&registration)
                                 .await
                         {
-                            adapter
-                                .unregister_session_registration_until_terminal_if_current(
-                                    &registration,
-                                )
-                                .await
-                                .map_err(|error| {
-                                    MobError::Internal(format!(
-                                        "explicit resume could not release the unattached runtime registration for '{session_id}': {error}"
-                                    ))
-                                })?;
+                            let released = match own_live.requeue_for_rebuild() {
+                                None => {
+                                    adapter
+                                        .unregister_session_registration_until_terminal_if_current(
+                                            &registration,
+                                        )
+                                        .await
+                                }
+                                Some(queued_inputs) => {
+                                    adapter
+                                        .unregister_session_registration_until_terminal_with_queued_inputs_if_current(
+                                            &registration,
+                                            queued_inputs,
+                                        )
+                                        .await
+                                }
+                            };
+                            released.map_err(|error| {
+                                MobError::Internal(format!(
+                                    "explicit resume could not release the unattached runtime registration for '{session_id}': {error}"
+                                ))
+                            })?;
                         }
                         self.remove_runtime_session_state(session_id, observed_sidecar.as_ref())
                             .await;
@@ -6022,8 +6057,11 @@ impl SessionBackend {
             // The retirement lease retains exact M. Release B before the
             // process-owned teardown reacquires B for post-stop cleanup.
             drop(boundary);
-            let retired = retirement
-            .commit()
+            let committed = match own_live.requeue_for_rebuild() {
+                None => retirement.commit(),
+                Some(queued_inputs) => retirement.commit_with_queued_inputs(queued_inputs),
+            };
+            let retired = committed
             .map_err(|error| {
                 MobError::Internal(format!(
                     "failed to start exact explicit-resume takeover for '{session_id}': {error}"

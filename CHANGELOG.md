@@ -402,6 +402,14 @@ them.
   returns its operation registry when it does. The lift of a stopped mob
   uses it to bind such a member without queueing behind its run.
 
+- `meerkat-runtime`:
+  `PreparedRuntimeExecutorAttachmentRetirement::commit_with_queued_inputs`
+  commits a prepared attachment retirement with the unregister's disposition
+  for the inputs queued on the registration (`UnregisterQueuedInputs`);
+  `commit` keeps ending them as stopped. A disposition that
+  `UnregisterQueuedInputs::check` refuses answers
+  `RuntimeDriverError::QueuedInputsRefused` and starts nothing.
+
 - `meerkat-mob`: `MobHandle::session_unborn(session_id)` and
   `MemberBindingHistory::session_unborn(session_id)` answer whether a session
   is unborn: a seat or a rotation named it for a member that builds nothing
@@ -583,8 +591,12 @@ them.
   `MobError::MemberAuthBindingConflict`, and its live actor is retired. The
   lift releases the run starts the stop held only after every member's check
   (and any retirement) completed, so a run queued while the mob was stopped
-  never starts on the old binding. Before, the lift released them first and
-  kept every live actor on whatever binding it ran.
+  never starts on the old binding. The retirement keeps the member's queued
+  inputs durably queued for its rebuilt runtime, as a graceful process
+  shutdown does (`UnregisterQueuedInputs::Requeue` with the default 15-minute
+  max age), so such a run starts on the new binding instead of ending as
+  stopped. Before, the lift released them first and kept every live actor on
+  whatever binding it ran.
 
 - `meerkat-mob`: `MobBuilder::resume` restores a running mob's members
   concurrently, up to the builder's restore concurrency, instead of one at a
