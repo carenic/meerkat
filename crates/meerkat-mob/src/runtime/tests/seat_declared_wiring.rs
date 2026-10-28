@@ -793,3 +793,96 @@ async fn a_declared_edge_whose_realization_fails_at_its_seat_is_owed_a_repair() 
         "the repair journals nothing more"
     );
 }
+
+/// An edge MobMachine no longer holds when a woken member's topology step
+/// reaches it is not restored. The woken member's wake pauses between its
+/// first chunk and its second (one edge a chunk), and meanwhile its second
+/// neighbour is rotated, which ends that neighbour's edges: the second chunk
+/// restores nothing. The woken member trusts its first neighbour only, the
+/// edge to the rotated neighbour is neither wired nor journaled again, and no
+/// repair is owed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_woken_members_edge_ended_during_its_topology_step_is_not_restored() {
+    let mob = WiringMob::new("wake-topology-ended-edge", sample_definition(), false).await;
+    let woken = AgentIdentity::from("wake-member");
+    let first = AgentIdentity::from("wake-peer-1");
+    let second = AgentIdentity::from("wake-peer-2");
+    mob.seat(vec![
+        spec("worker", &woken),
+        spec("worker", &first),
+        spec("worker", &second),
+    ])
+    .await;
+    for peer in [&first, &second] {
+        tokio::time::timeout(STEP, mob.handle.wire(woken.clone(), peer.clone()))
+            .await
+            .expect("the wire answers")
+            .expect("wire two dormant members");
+    }
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&woken, &first), pair(&woken, &second)]
+    );
+    crate::runtime::actor::wake_topology::set_wake_topology_chunk_for_test(mob.handle.mob_id(), 1);
+    let crate::runtime::actor::member_wake_turn::WakeTopologyYieldHold { entered, release } =
+        crate::runtime::actor::member_wake_turn::hold_next_wake_topology_yield_for_test(&woken);
+    let wake = tokio::spawn({
+        let handle = mob.handle.clone();
+        let woken = woken.clone();
+        async move { handle.ensure_member_live(&woken).await }
+    });
+    tokio::time::timeout(STEP, entered)
+        .await
+        .expect("the wake pauses after its first chunk")
+        .expect("the pause is reached");
+
+    tokio::time::timeout(STEP, mob.handle.rotate_member(spec("worker", &second)))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation succeeds");
+    assert_eq!(
+        mob.edges(),
+        BTreeSet::from([pair(&woken, &first)]),
+        "the rotation ended the second neighbour's edge"
+    );
+    let _ = release.send(());
+    tokio::time::timeout(STEP, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task finishes")
+        .expect("the member wakes");
+
+    assert_eq!(
+        mob.edges(),
+        BTreeSet::from([pair(&woken, &first)]),
+        "the ended edge is not restored"
+    );
+    assert_eq!(
+        mob.wired_rows().await,
+        vec![pair(&woken, &first), pair(&woken, &second)],
+        "no edge is journaled again"
+    );
+    assert!(
+        mob.handle
+            .machine_state_watch_rx
+            .borrow()
+            .owed_edge_repairs
+            .is_empty(),
+        "no repair is owed"
+    );
+    let trusted = mob.trusted(&woken).await;
+    let first_peer = mob
+        .recorded_peer_id(&first)
+        .expect("the first neighbour's endpoint");
+    let second_peer = mob
+        .recorded_peer_id(&second)
+        .expect("the rotated neighbour's endpoint");
+    assert!(
+        trusted.contains(&first_peer),
+        "the woken member trusts its first neighbour: {trusted:?}"
+    );
+    assert!(
+        !trusted.contains(&second_peer),
+        "the woken member does not trust the rotated neighbour: {trusted:?}"
+    );
+}

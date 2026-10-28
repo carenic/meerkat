@@ -278,6 +278,7 @@ impl MobActor {
                 tracing::warn!(
                     mob_id = %self.definition.id,
                     agent_identity = %woken,
+                    edges = batched.len(),
                     "MobMachine answered a woken member's batched edges with a transition count \
                      that does not match them; each takes the single-edge path"
                 );
@@ -285,9 +286,10 @@ impl MobActor {
                 return unbatched;
             }
             Err(error) => {
-                tracing::debug!(
+                tracing::warn!(
                     mob_id = %self.definition.id,
                     agent_identity = %woken,
+                    edges = batched.len(),
                     %error,
                     "MobMachine refused a woken member's batched edges; each takes the single-edge path"
                 );
@@ -316,6 +318,7 @@ impl MobActor {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 agent_identity = %woken,
+                edges = batched.len(),
                 %error,
                 "a woken member's batched edges were refused; each takes the single-edge path"
             );
@@ -343,6 +346,7 @@ impl MobActor {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 agent_identity = %woken,
+                edges = batched.len(),
                 %error,
                 "a woken member's batched edges could not be committed; each takes the single-edge path"
             );
