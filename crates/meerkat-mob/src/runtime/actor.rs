@@ -495,16 +495,65 @@ async fn member_session_present(
     }
 }
 
+/// What a session store failure says about the session's persisted state, by
+/// its typed cause. Display text is diagnostic only. Every classifier of a
+/// session read or restore failure reads a store failure through this one
+/// split ([`session_store_failure_class`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SessionStoreFailureClass {
+    /// The persisted state cannot be decoded or verified (`Serialization`,
+    /// `Corrupted`). `Corrupted` is deterministic for the same persisted state
+    /// and request by the `SessionStoreError::Corrupted` contract, never a
+    /// race with a concurrent writer.
+    Malformed,
+    /// The persisted state does not hold what the request needs, or refuses
+    /// it: the session is missing, or a save or rewrite breaks its
+    /// monotonicity, its transcript continuity or the rewrite rules. The same
+    /// state answers the same request the same way.
+    Refused,
+    /// The store could not serve the request now: I/O, a race with a
+    /// concurrent writer (a transcript revision conflict), a projection known
+    /// degraded, an internal store fault, or a source that is not a session
+    /// store error.
+    Unavailable,
+}
+
+/// Classify the source of a [`meerkat_core::service::SessionError::Store`]
+/// ([`SessionStoreFailureClass`]).
+pub(super) fn session_store_failure_class(
+    source: &(dyn std::error::Error + Send + Sync + 'static),
+) -> SessionStoreFailureClass {
+    use meerkat_core::SessionStoreError;
+
+    match source.downcast_ref::<SessionStoreError>() {
+        Some(SessionStoreError::Serialization(_) | SessionStoreError::Corrupted(_)) => {
+            SessionStoreFailureClass::Malformed
+        }
+        Some(
+            SessionStoreError::NotFound(_)
+            | SessionStoreError::MonotonicityViolation { .. }
+            | SessionStoreError::TranscriptContinuityViolation { .. }
+            | SessionStoreError::InvalidTranscriptRewrite { .. },
+        ) => SessionStoreFailureClass::Refused,
+        Some(
+            SessionStoreError::Io(_)
+            | SessionStoreError::TranscriptRevisionConflict { .. }
+            | SessionStoreError::ProjectionReadRefused { .. }
+            | SessionStoreError::Internal(_),
+        )
+        | None => SessionStoreFailureClass::Unavailable,
+    }
+}
+
 /// Classify a session read failure by its typed cause. Durable corruption and
 /// unsupported persistence are permanent observations; transport, I/O, and
-/// unknown failures remain retryable. Display text is diagnostic only.
-/// `Corrupted` is permanent because the `SessionStoreError::Corrupted`
-/// contract makes it deterministic for the same persisted state and request,
-/// never a race with a concurrent writer.
+/// unknown failures remain retryable. Display text is diagnostic only. A store
+/// failure is read through [`session_store_failure_class`]: only a malformed
+/// persisted state is permanent here, and the identity machine reads a
+/// missing or refusing one again on its retry.
 fn identity_session_load_error_class(
     error: &meerkat_core::service::SessionError,
 ) -> IdentitySessionLoadErrorClass {
-    use meerkat_core::SessionStoreError;
     use meerkat_core::service::SessionError;
 
     match error {
@@ -514,21 +563,11 @@ fn identity_session_load_error_class(
         SessionError::PersistenceDisabled
         | SessionError::CapabilityUnavailable(_)
         | SessionError::Unsupported(_) => IdentitySessionLoadErrorClass::Malformed,
-        SessionError::Store(source) => match source.downcast_ref::<SessionStoreError>() {
-            Some(SessionStoreError::Serialization(_) | SessionStoreError::Corrupted(_)) => {
-                IdentitySessionLoadErrorClass::Malformed
+        SessionError::Store(source) => match session_store_failure_class(source.as_ref()) {
+            SessionStoreFailureClass::Malformed => IdentitySessionLoadErrorClass::Malformed,
+            SessionStoreFailureClass::Refused | SessionStoreFailureClass::Unavailable => {
+                IdentitySessionLoadErrorClass::Unavailable
             }
-            Some(
-                SessionStoreError::Io(_)
-                | SessionStoreError::NotFound(_)
-                | SessionStoreError::MonotonicityViolation { .. }
-                | SessionStoreError::TranscriptContinuityViolation { .. }
-                | SessionStoreError::TranscriptRevisionConflict { .. }
-                | SessionStoreError::InvalidTranscriptRewrite { .. }
-                | SessionStoreError::ProjectionReadRefused { .. }
-                | SessionStoreError::Internal(_),
-            )
-            | None => IdentitySessionLoadErrorClass::Unavailable,
         },
         // Forked/unverifiable durable evidence is a permanent corruption
         // verdict; a tail held for reconciliation — or a recovery refused by

@@ -11853,37 +11853,69 @@ impl RetryableRestoreCause {
 /// Whether a member's restore failed for a cause that clears on its own,
 /// with its authority kept: a lifecycle operation on the member's session
 /// (the takeover of its exact attachment) still in flight past the caller's
-/// budget or not yet admitted, whose retry joins it, or a session store that
-/// could not serve the member's reads now. Such a restore never breaks the
-/// member: it ends retryable, and the member stays Dormant with its boot
-/// obligation owed. Any other cause breaks only that member.
+/// budget or not yet admitted, whose retry joins it, or a session service
+/// that cannot serve the member now ([`session_error_is_retryable`]). Such a
+/// restore never breaks the member: it ends retryable, and the member stays
+/// Dormant with its boot obligation owed. Any other cause breaks only that
+/// member, with its typed reason.
 pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
     match error {
         MobError::LifecycleOperationPending { .. }
-        | MobError::LifecycleOperationAdmissionPending { .. }
-        | MobError::SessionError(meerkat_core::service::SessionError::Store(_)) => true,
+        | MobError::LifecycleOperationAdmissionPending { .. } => true,
         MobError::SharedLifecycleFailure(inner) => restore_error_is_retryable(inner),
+        MobError::SessionError(error) => session_error_is_retryable(error),
         _ => false,
     }
 }
 
-/// Whether a seat's first create failed for a cause that clears on its own:
-/// the session store failed the write, the session was busy, its runtime
-/// authority was unavailable, or another runtime owner held its hosting
-/// claim. Any other cause (a build the host or the factory refuses, an
+/// Whether a session service failure clears on its own: the store could not
+/// serve the request now
+/// ([`super::actor::SessionStoreFailureClass::Unavailable`]), the session was
+/// busy, its runtime authority was unavailable, or another runtime owner holds
+/// its hosting claim (or the claim cannot be taken now). A malformed or
+/// refusing persisted state, a held, refused or quarantined durable tail, an
+/// agent fault and every other typed cause are terminal. The settlement
+/// diagnostics a failure carries never change its class.
+pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionError) -> bool {
+    use meerkat_core::service::SessionError;
+
+    match error {
+        SessionError::WithSettlementFailures { error, .. } => session_error_is_retryable(error),
+        SessionError::Store(source) => {
+            super::actor::session_store_failure_class(source.as_ref())
+                == super::actor::SessionStoreFailureClass::Unavailable
+        }
+        SessionError::RuntimeUnavailable { .. }
+        | SessionError::Busy { .. }
+        | SessionError::ServedElsewhere { .. }
+        | SessionError::HostingUnavailable { .. } => true,
+        SessionError::NotFound { .. }
+        | SessionError::PersistenceDisabled
+        | SessionError::CompactionDisabled
+        | SessionError::NotRunning { .. }
+        | SessionError::DurableTailHeldForRecovery { .. }
+        | SessionError::DurableTailRecoveryRefused { .. }
+        | SessionError::DurableEvidenceQuarantined { .. }
+        | SessionError::WholeBlobAuditedEndpointDivergence { .. }
+        | SessionError::Agent(_)
+        | SessionError::FailedWithData { .. }
+        | SessionError::CapabilityUnavailable(_)
+        | SessionError::Unsupported(_)
+        | SessionError::ExternalWriteFenceConflict { .. }
+        | SessionError::ExternalWriteFenceBackoff { .. }
+        | SessionError::ForkInstructionRefused(_) => false,
+    }
+}
+
+/// Whether a seat's first create failed for a cause that clears on its own
+/// ([`session_error_is_retryable`]): the store could not serve the write
+/// now, the session was busy, its runtime authority was unavailable, or
+/// another runtime owner held its hosting claim. Any other cause (a build the
+/// host or the factory refuses, a malformed or refusing persisted state, an
 /// internal fault) breaks the member.
 #[cfg(feature = "runtime-adapter")]
 fn seat_create_failure_is_retryable(error: &MobError) -> bool {
-    matches!(
-        error,
-        MobError::SessionError(
-            meerkat_core::service::SessionError::Store(_)
-                | meerkat_core::service::SessionError::Busy { .. }
-                | meerkat_core::service::SessionError::RuntimeUnavailable { .. }
-                | meerkat_core::service::SessionError::ServedElsewhere { .. }
-                | meerkat_core::service::SessionError::HostingUnavailable { .. }
-        )
-    )
+    matches!(error, MobError::SessionError(error) if session_error_is_retryable(error))
 }
 
 #[cfg(feature = "runtime-adapter")]

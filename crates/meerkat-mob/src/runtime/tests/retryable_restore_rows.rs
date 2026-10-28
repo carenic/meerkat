@@ -348,3 +348,134 @@ async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift
         "the member's owed retry materializes it once the store serves it"
     );
 }
+
+/// The backoff of the owed retry in the rows that check no retry runs.
+const RETRY_STEP: Duration = Duration::from_millis(20);
+
+/// The mob of [`seat_member_with_provider_params_then_crash`] restarted under
+/// `policy`, with a resume customizer (so the restore reads the member's view)
+/// and an owed retry that would run within a few [`RETRY_STEP`]s.
+async fn restarted_with_customized_restore(
+    storage: MobStorage,
+    service: &Arc<MockSessionService>,
+    policy: MemberRestorePolicy,
+) -> MobHandle {
+    tokio::time::timeout(
+        ROW_STEP,
+        Box::pin(
+            MobBuilder::for_resume(storage)
+                .with_session_service(service.clone())
+                .with_spawn_member_customizer(Arc::new(PromptCacheMigration::default()))
+                .with_member_restore_policy(policy)
+                .with_member_wake_retry_backoff(RETRY_STEP, RETRY_STEP * 2)
+                .resume(),
+        ),
+    )
+    .await
+    .expect("the restart answers")
+    .expect("the restart succeeds")
+}
+
+/// `member` is Broken with the malformed state's typed reason, and stays so:
+/// no owed retry reads its session again.
+async fn assert_broken_by_the_malformed_state(
+    handle: &MobHandle,
+    service: &MockSessionService,
+    member: &AgentIdentity,
+    session: &SessionId,
+) {
+    let status = handle
+        .member_status(member)
+        .await
+        .expect("the member's status");
+    assert_eq!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a malformed persisted state breaks the member: {status:?}"
+    );
+    assert!(
+        status
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("mock malformed session metadata")),
+        "the member carries the typed reason: {status:?}"
+    );
+    let reads = service.persisted_session_metadata_reads_for(session);
+    tokio::time::sleep(RETRY_STEP * 20).await;
+    assert_eq!(
+        service.persisted_session_metadata_reads_for(session),
+        reads,
+        "no owed retry reads the member's session again"
+    );
+    assert_eq!(
+        handle
+            .member_status(member)
+            .await
+            .expect("the member's status")
+            .status,
+        crate::runtime::handle::MobMemberStatus::Broken
+    );
+}
+
+/// A wake whose view read finds the member's persisted state malformed (a
+/// typed decode failure: the same state reads the same way again) breaks the
+/// member with the typed reason. The wake never ends retryable, so no owed
+/// retry reads the session again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_wake_whose_view_read_finds_the_state_malformed_breaks_the_member() {
+    let (service, storage, member, session) =
+        seat_member_with_provider_params_then_crash(false).await;
+    let resumed =
+        restarted_with_customized_restore(storage, &service, MemberRestorePolicy::OnDemand).await;
+    assert_eq!(
+        resumed.status().await.expect("the restarted mob answers"),
+        MobState::Running
+    );
+    assert_eq!(
+        phase_of(&resumed, &member),
+        Some(dsl::MemberMaterializationPhase::Dormant),
+        "the lazy start materialized nothing"
+    );
+    service.find_persisted_session_metadata_malformed_for(session.clone());
+
+    let refused = tokio::time::timeout(ROW_STEP, resumed.ensure_member_live(&member))
+        .await
+        .expect("the wake answers");
+    assert!(
+        matches!(
+            &refused,
+            Err(MobError::MemberRestoreFailed { reason, .. })
+                if reason.contains("mock malformed session metadata")
+        ),
+        "the wake answers the member's typed restore failure: {refused:?}"
+    );
+    assert_broken_by_the_malformed_state(&resumed, &service, &member, &session).await;
+}
+
+/// The lift of a stopped mob whose planned member's view read finds its
+/// persisted state malformed breaks that member with the typed reason, and
+/// no owed retry reads the session again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lift_whose_view_read_finds_the_state_malformed_breaks_the_member() {
+    let (service, storage, member, session) =
+        seat_member_with_provider_params_then_crash(true).await;
+    let resumed =
+        restarted_with_customized_restore(storage, &service, MemberRestorePolicy::Eager).await;
+    assert_eq!(
+        resumed
+            .status()
+            .await
+            .expect("the reconstructed mob answers"),
+        MobState::Stopped
+    );
+    service.find_persisted_session_metadata_malformed_for(session.clone());
+
+    let _lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers");
+    assert_eq!(
+        resumed.status().await.expect("the mob answers"),
+        MobState::Running
+    );
+    assert_broken_by_the_malformed_state(&resumed, &service, &member, &session).await;
+}

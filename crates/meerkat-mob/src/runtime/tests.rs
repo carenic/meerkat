@@ -2284,6 +2284,9 @@ struct MockSessionService {
     durable_reads_for: std::sync::Mutex<HashMap<SessionId, DurableSessionReadCounts>>,
     /// Sessions whose metadata-only read fails with a store error.
     metadata_read_failures_for: std::sync::Mutex<HashSet<SessionId>>,
+    /// Sessions whose metadata-only read finds the persisted state malformed
+    /// (a typed `SessionStoreError::Serialization`).
+    malformed_metadata_reads_for: std::sync::Mutex<HashSet<SessionId>>,
     load_persisted_session_in_flight: AtomicU64,
     load_persisted_session_max_in_flight: AtomicU64,
     create_session_in_flight: AtomicU64,
@@ -2525,6 +2528,7 @@ impl MockSessionService {
             metadata_reads_for: Default::default(),
             durable_reads_for: Default::default(),
             metadata_read_failures_for: Default::default(),
+            malformed_metadata_reads_for: Default::default(),
             load_persisted_session_in_flight: AtomicU64::new(0),
             load_persisted_session_max_in_flight: AtomicU64::new(0),
             create_session_in_flight: AtomicU64::new(0),
@@ -3607,6 +3611,16 @@ impl MockSessionService {
 
     fn fail_persisted_session_metadata_reads_for(&self, session_id: SessionId) {
         self.metadata_read_failures_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id);
+    }
+
+    /// Make every metadata-only read of `session_id` find its persisted
+    /// state malformed: a deterministic store failure, as a durable record
+    /// that fails its typed decode is.
+    fn find_persisted_session_metadata_malformed_for(&self, session_id: SessionId) {
+        self.malformed_metadata_reads_for
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(session_id);
@@ -5416,6 +5430,18 @@ impl MockSessionService {
             return Err(SessionError::Store(Box::new(std::io::Error::other(
                 "mock metadata read failure",
             ))));
+        }
+        if self
+            .malformed_metadata_reads_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(session_id)
+        {
+            return Err(SessionError::Store(Box::new(
+                meerkat_core::SessionStoreError::Serialization(
+                    "mock malformed session metadata".to_string(),
+                ),
+            )));
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
         let persisted =
