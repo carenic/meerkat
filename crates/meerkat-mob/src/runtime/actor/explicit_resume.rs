@@ -167,6 +167,35 @@ impl MobActor {
         }
     }
 
+    /// End a rebuilt member's open wake attempt retryable for a restore
+    /// error that clears on its own
+    /// ([`crate::runtime::builder::restore_error_is_retryable`]): the member
+    /// is Dormant again, a boot obligation it owes stays owed with its retry
+    /// armed, and the explicit resume answers the typed error. A refused
+    /// resolution is what the resume answers instead (the attempt is then
+    /// abandoned before the member's work settles).
+    fn resolve_explicit_resume_member_retryable(
+        &mut self,
+        identity: &mob_dsl::AgentIdentity,
+        attempt: u64,
+        error: MobError,
+    ) {
+        match self.apply_dsl_signal_collect_transition(
+            mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
+                agent_identity: identity.clone(),
+                attempt,
+                kind: mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
+            },
+            "resolve_retryable_explicit_resume_member",
+        ) {
+            Ok(_) => {
+                self.schedule_owed_member_wake_retry(&AgentIdentity::from(identity.0.as_str()));
+                self.retain_explicit_resume_error(error);
+            }
+            Err(refused) => self.retain_explicit_resume_error(refused),
+        }
+    }
+
     pub(super) async fn explicit_resume_member_observed(
         &mut self,
         work: Arc<ExplicitResumeMemberWork>,
@@ -624,7 +653,16 @@ impl MobActor {
                         .get(&identity)
                         == Some(attempt)
                 });
-                if let Some(attempt) = open_attempt {
+                if let Some(attempt) = open_attempt
+                    && crate::runtime::builder::restore_error_is_retryable(&error)
+                {
+                    // Work still in flight on the member's session (its
+                    // attachment's takeover) or a store that cannot serve it
+                    // now never breaks the member: its attempt ends retryable
+                    // (Dormant, a boot obligation kept owed) and the resume
+                    // answers the typed error.
+                    self.resolve_explicit_resume_member_retryable(&identity, attempt, error);
+                } else if let Some(attempt) = open_attempt {
                     let (signal, reason) = Self::member_revival_failure_signal(
                         identity.clone(),
                         attempt,

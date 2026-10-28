@@ -25,6 +25,8 @@ mod member_wake_rows;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod parallel_resume_restore;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
+mod retryable_restore_rows;
+#[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_build_inputs;
 #[cfg(all(feature = "runtime-adapter", not(target_arch = "wasm32")))]
 mod seat_comms_key;

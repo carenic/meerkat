@@ -10177,6 +10177,7 @@ impl MobBuilder {
             tool_consequence_policy_registry,
             member_build_preparer: member_residency.build_preparer.as_ref(),
             host_read_handle: &host_read_handle,
+            unreadable_view_is_retryable: false,
         };
         restore_resumed_members(
             &restore_context,
@@ -11689,6 +11690,11 @@ pub(super) struct ResumeMemberRestoreContext<'a> {
     /// authority is the member tools' agent lane: the preparer is the host's
     /// callback, and a read handle issues no actor command.
     pub(super) host_read_handle: &'a super::MobReadHandle,
+    /// Whether a member view the store cannot serve now ends the restore
+    /// with its typed error ([`restore_error_is_retryable`]): a wake, which
+    /// then ends retryable. A start's restore pass fails only that member
+    /// with the read failure as its diagnostic (the boot rule).
+    pub(super) unreadable_view_is_retryable: bool,
 }
 
 /// Everything a member's restore writes, applied in the member's turn.
@@ -11814,6 +11820,11 @@ pub(super) enum RetryableRestoreCause {
     /// ([`seat_create_failure_is_retryable`]): the member stays Dormant
     /// with its session unborn, and a later delivery wakes it again.
     SeatCreateUnavailable,
+    /// The restore met work still in flight on the member's session, or a
+    /// store that could not serve it now ([`restore_error_is_retryable`]):
+    /// the member stays Dormant with its boot obligation owed, and its retry
+    /// joins the work still in flight.
+    RestoreUnavailable,
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -11822,7 +11833,9 @@ impl RetryableRestoreCause {
     pub(super) fn wake_kind(self) -> mob_dsl::MemberWakeRetryableKind {
         match self {
             Self::BuildPreparation => mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
-            Self::SeatCreateUnavailable => mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable
+            }
         }
     }
 
@@ -11830,8 +11843,27 @@ impl RetryableRestoreCause {
     pub(super) fn wake_refusal(self) -> crate::MemberWakeRefusal {
         match self {
             Self::BuildPreparation => crate::MemberWakeRefusal::HostPreparationPending,
-            Self::SeatCreateUnavailable => crate::MemberWakeRefusal::ResumeGateUnavailable,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                crate::MemberWakeRefusal::ResumeGateUnavailable
+            }
         }
+    }
+}
+
+/// Whether a member's restore failed for a cause that clears on its own,
+/// with its authority kept: a lifecycle operation on the member's session
+/// (the takeover of its exact attachment) still in flight past the caller's
+/// budget or not yet admitted, whose retry joins it, or a session store that
+/// could not serve the member's reads now. Such a restore never breaks the
+/// member: it ends retryable, and the member stays Dormant with its boot
+/// obligation owed. Any other cause breaks only that member.
+pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
+    match error {
+        MobError::LifecycleOperationPending { .. }
+        | MobError::LifecycleOperationAdmissionPending { .. }
+        | MobError::SessionError(meerkat_core::service::SessionError::Store(_)) => true,
+        MobError::SharedLifecycleFailure(inner) => restore_error_is_retryable(inner),
+        _ => false,
     }
 }
 
@@ -12520,7 +12552,9 @@ pub(super) async fn restore_resumed_member(
     // first build (see `fork_build`). What the bound session holds, read
     // once, for the customizer's resume view (an ordinary member only; a
     // fork-derived member's rebuild is not customized). A failed read fails
-    // this member's restore, like any other per-member restore failure.
+    // this member's restore, like any other per-member restore failure; on a
+    // wake, a read the store cannot serve now ends the restore with its typed
+    // error instead, and the wake ends retryable.
     let restore_view = if entry.fork_source.is_none() && spawn_member_customizer.is_some() {
         match super::fork_build::load_resumed_member_view(
             session_service.as_ref(),
@@ -12529,6 +12563,11 @@ pub(super) async fn restore_resumed_member(
         .await
         {
             Ok(view) => view,
+            Err(error)
+                if ctx.unreadable_view_is_retryable && restore_error_is_retryable(&error) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 return Ok(MemberRestorePlan::Unseated(member_restore_failure(
                     &bridge_session_id,

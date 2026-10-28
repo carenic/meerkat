@@ -8679,6 +8679,25 @@ struct ExplicitResumePreparationContext {
     spawn_member_customizer: Option<Arc<dyn super::SpawnMemberCustomizer>>,
 }
 
+/// What the explicit resume's preparation does for one member, before the
+/// durable Resume.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExplicitResumePreparation {
+    /// A member materialized in this process: its exact attachment is taken
+    /// over (kept when this handle owns it, retired otherwise) and its
+    /// rebuild is planned.
+    Live,
+    /// A Dormant member whose session still has a materialization of this
+    /// process (an attachment or a live actor an earlier handle of the mob
+    /// left): the seam retires it, as it retires every foreign attachment,
+    /// and the member stays Dormant for the lift's plan.
+    RetireRetained,
+}
+
+/// One member of the explicit resume's preparation: its roster entry, its
+/// projected member ref, its bound session and what the preparation does.
+type ExplicitResumeCandidate = (RosterEntry, MemberRef, SessionId, ExplicitResumePreparation);
+
 pub(super) struct ExplicitResumeMemberWork {
     rebuild: ExplicitResumeMemberRebuild,
     attempt: mob_dsl::ResumeAttemptId,
@@ -21633,7 +21652,7 @@ impl MobActor {
 impl ExplicitResumePreparationContext {
     async fn prepare(
         &self,
-        candidates: Vec<(RosterEntry, MemberRef, SessionId)>,
+        candidates: Vec<ExplicitResumeCandidate>,
         admission: super::state::LifecycleAdmissionSignal,
         progress: &super::state::LifecycleProgressSignal,
     ) -> Result<Vec<ExplicitResumeMemberRebuild>, MobError> {
@@ -21643,9 +21662,11 @@ impl ExplicitResumePreparationContext {
         let mut successor_index = None;
         let member_bound_sessions = candidates
             .iter()
-            .map(|(_, _, session_id)| session_id.clone())
+            .map(|(_, _, session_id, _)| session_id.clone())
             .collect::<std::collections::HashSet<_>>();
-        for (member_index, (entry, member_ref, session_id)) in candidates.into_iter().enumerate() {
+        for (member_index, (entry, member_ref, session_id, preparation)) in
+            candidates.into_iter().enumerate()
+        {
             let member_position = member_index + 1;
             progress.awaiting_member(
                 &entry.agent_identity,
@@ -21660,6 +21681,9 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation started"
             );
+            // Each member's takeover gets its own retirement budget, from its
+            // own turn of this serial pass: a slow member never spends a later
+            // member's budget.
             let mut requires_materialization = self
                 .provisioner
                 .prepare_member_session_for_explicit_resume(
@@ -21682,6 +21706,11 @@ impl ExplicitResumePreparationContext {
                 replacement_session = false,
                 "explicit resume member attachment/session preparation completed"
             );
+            // A Dormant member's retained materialization is retired; the
+            // member itself is the lift's plan's to materialize, or not.
+            if preparation == ExplicitResumePreparation::RetireRetained {
+                continue;
+            }
             // A fork-derived member's request is its own durable records, not
             // customized, like its first build (see `fork_build`), and names
             // no auth binding of its own.
@@ -21987,53 +22016,87 @@ impl ExplicitResumePreparationContext {
 }
 
 impl MobActor {
-    async fn explicit_resume_candidates(
-        &self,
-    ) -> Result<Vec<(RosterEntry, MemberRef, SessionId)>, MobError> {
-        let roster = self.roster.read().await;
-        let machine = self.dsl_authority.state();
-        roster
-            .list()
-            .filter_map(|entry| {
-                if !matches!(&entry.member_ref, MemberRef::Session { .. }) {
-                    return None;
-                }
-                let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
-                if machine.member_placement.contains_key(&identity) {
-                    return None;
-                }
-                // A member that is not materialized in this process is not a
-                // candidate: there is no attachment of it to prepare. The
-                // lift's member plan decides, after the durable Resume, which
-                // Dormant members it materializes (see `boot_lift`).
-                if super::boot_plan::member_is_dormant(machine, &identity) {
-                    return None;
-                }
-                let binding = machine.member_session_bindings.get(&identity)?;
-                Some(
-                    SessionId::parse(&binding.0)
-                        .map_err(|error| {
-                            MobError::Internal(format!(
-                                "MobMachine has invalid explicit-resume session binding '{}' for '{}': {error}",
-                                binding.0, entry.agent_identity
-                            ))
-                        })
-                        .and_then(|session_id| {
-                            Self::project_member_ref_session_binding(
-                                &entry.member_ref,
-                                Some(session_id.clone()),
-                            )
-                            .map(|member_ref| (entry.clone(), member_ref, session_id))
-                            .ok_or_else(|| {
+    async fn explicit_resume_candidates(&self) -> Result<Vec<ExplicitResumeCandidate>, MobError> {
+        let listed = {
+            let roster = self.roster.read().await;
+            let machine = self.dsl_authority.state();
+            roster
+                .list()
+                .filter_map(|entry| {
+                    if !matches!(&entry.member_ref, MemberRef::Session { .. }) {
+                        return None;
+                    }
+                    let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+                    if machine.member_placement.contains_key(&identity) {
+                        return None;
+                    }
+                    let dormant = super::boot_plan::member_is_dormant(machine, &identity);
+                    let binding = machine.member_session_bindings.get(&identity)?;
+                    Some(
+                        SessionId::parse(&binding.0)
+                            .map_err(|error| {
                                 MobError::Internal(format!(
-                                    "explicit resume cannot project the current session binding for '{}'",
-                                    entry.agent_identity
+                                    "MobMachine has invalid explicit-resume session binding '{}' for '{}': {error}",
+                                    binding.0, entry.agent_identity
                                 ))
                             })
-                        }),
-                )
-            })
-            .collect()
+                            .and_then(|session_id| {
+                                Self::project_member_ref_session_binding(
+                                    &entry.member_ref,
+                                    Some(session_id.clone()),
+                                )
+                                .map(|member_ref| {
+                                    (entry.clone(), member_ref, session_id, dormant)
+                                })
+                                .ok_or_else(|| {
+                                    MobError::Internal(format!(
+                                        "explicit resume cannot project the current session binding for '{}'",
+                                        entry.agent_identity
+                                    ))
+                                })
+                            }),
+                    )
+                })
+                .collect::<Result<Vec<_>, MobError>>()?
+        };
+        let mut candidates = Vec::with_capacity(listed.len());
+        for (entry, member_ref, session_id, dormant) in listed {
+            // A Dormant member is a candidate only while its session still
+            // has a materialization of this process, which the seam retires
+            // (an earlier handle of this mob left it; a fresh provisioner
+            // never adopts it). One with nothing of this process stays lazy:
+            // the lift's member plan decides, after the durable Resume, which
+            // Dormant members it materializes (see `boot_lift`).
+            let preparation = if !dormant {
+                ExplicitResumePreparation::Live
+            } else if self.session_has_retained_materialization(&session_id).await {
+                ExplicitResumePreparation::RetireRetained
+            } else {
+                continue;
+            };
+            candidates.push((entry, member_ref, session_id, preparation));
+        }
+        Ok(candidates)
+    }
+
+    /// Whether `session_id` still has a materialization of this process: an
+    /// executor attachment the runtime serves it with, or a live session
+    /// actor. In-memory reads only: no store is read, so a lazy resume stays
+    /// lazy.
+    async fn session_has_retained_materialization(&self, session_id: &SessionId) -> bool {
+        #[cfg(feature = "runtime-adapter")]
+        if let Some(adapter) = self.runtime_adapter.as_ref()
+            && adapter
+                .current_executor_attachment_witness(session_id)
+                .await
+                .is_some()
+        {
+            return true;
+        }
+        self.session_service
+            .live_session_actor_registered(session_id)
+            .await
+            .unwrap_or(false)
     }
 
     /// Schedule rebuilding only the sessions whose prior exact attachment was retired by
