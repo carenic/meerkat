@@ -202,6 +202,14 @@ async fn a_pending_background_op_completion_across_a_restart_is_delivered_with_n
         .expect("the completion is durable");
 
     let handle = mob.resume().await;
+    // The builder answers once the actor is spawned; the boot set's
+    // readiness, which settles its Waking members Live, runs before the
+    // actor serves its first command. One round trip reads the phases after
+    // it.
+    assert_eq!(
+        handle.status().await.expect("the mob's phase"),
+        MobState::Running
+    );
     assert_eq!(handle.boot_set_basis(), MobBootSetBasis::Observed);
     assert_eq!(
         mob.materialized().await,
