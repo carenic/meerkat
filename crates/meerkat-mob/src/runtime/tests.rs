@@ -40977,14 +40977,15 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
     // The replayed retirement start is archive-only: no runtime of this
     // process holds the retiring member's session, so the retirement archives
     // it and routes no runtime retire, and the restart re-drives it at once.
-    // The re-drive is held at its session archive. Every trust-bearing stage
-    // and the machine wiring cleanup run before that stage (the trust
-    // cleanups, then retirement_finish_machine_wiring, then
-    // retirement_prepare_archive), so the survivor is woken after its peer's
-    // trust cleanup and before the retirement ends, deterministically: the
-    // interleaving a delivery that wakes a survivor mid-retirement takes.
-    let archive_hold =
-        super::actor::retirement_stage_hold::install(&retiring, "retire-session-archive");
+    // The re-drive is held at its local trust cleanup. Its endpoint
+    // observations ran first, while the survivor was still dormant, so the
+    // cleanup holds no trust job for the survivor; and MobMachine still wires
+    // the two until retirement_finish_machine_wiring, which runs after this
+    // stage. Waking the survivor here is, deterministically, the interleaving
+    // a delivery that wakes a survivor mid-retirement takes while its edge to
+    // the retiring member still exists.
+    let trust_cleanup_hold =
+        super::actor::retirement_stage_hold::install(&retiring, "retire-local-trust-cleanup");
     let restarted = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
         events.clone(),
         runtime_metadata,
@@ -40993,14 +40994,16 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
     .resume()
     .await
     .expect("restart should replay recovered endpoint authority");
-    tokio::time::timeout(Duration::from_secs(10), archive_hold.entered())
+    tokio::time::timeout(Duration::from_secs(10), trust_cleanup_hold.entered())
         .await
-        .expect("the restart re-drives the recovered retirement to its session archive");
+        .expect("the restart re-drives the recovered retirement to its local trust cleanup");
 
     // While the retirement is held, replay still holds the retiring member's
-    // current endpoint and its historical cleanup anchor, and its retirement
-    // is archive-only.
+    // current endpoint and its historical cleanup anchor, its retirement is
+    // archive-only, the survivor is still dormant, and MobMachine still wires
+    // the survivor to the retiring member.
     let retired_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
+    let survivor_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&survivor);
     let held = restarted
         .query_machine_state()
         .await
@@ -41027,31 +41030,85 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
             .is_some_and(|runtime| held.runtime_retire_archive_only.contains(runtime)),
         "the recovered retirement is archive-only"
     );
+    assert_eq!(
+        restarted.member_materialization_for_test(&survivor),
+        Some(crate::machines::mob_machine::MemberMaterializationPhase::Dormant),
+        "the survivor holds no work, so the restart left it dormant"
+    );
+    assert!(
+        held.wiring_edges.iter().any(|edge| {
+            (edge.a == retired_identity && edge.b == survivor_identity)
+                || (edge.a == survivor_identity && edge.b == retired_identity)
+        }),
+        "MobMachine still wires the survivor to the retiring member while its trust cleanup is held"
+    );
 
-    // The survivor holds no work, so the restart left it dormant. Wake it
-    // while its peer's retirement is held: it wakes Live, not Broken.
-    tokio::time::timeout(
-        Duration::from_secs(10),
-        restarted.ensure_member_live(&survivor),
-    )
-    .await
-    .expect("the survivor wakes while its peer's retirement is held")
-    .expect("wake the survivor mid-retirement");
+    // Wake the survivor while the trust cleanup is held. The wake is not a
+    // deferred control and its steps run on member effects of its own, which
+    // the held stage does not serialize, so it completes while the stage is
+    // held. Its topology step cannot realize the edge to the retiring member:
+    // the recovered retirement removed that member's session binding, so its
+    // endpoint does not resolve, and MobMachine owes no repair of an edge
+    // whose end is retiring. The survivor wakes Live, not Broken, with no
+    // trust toward either retiring endpoint.
+    let survivor_wake = tokio::spawn({
+        let restarted = restarted.clone();
+        let survivor = survivor.clone();
+        async move { restarted.ensure_member_live(&survivor).await }
+    });
+    tokio::time::timeout(Duration::from_secs(10), survivor_wake)
+        .await
+        .expect("the survivor's wake completes while its peer's trust cleanup is held")
+        .expect("the survivor's wake task completes")
+        .expect("wake the survivor mid-retirement");
     assert_eq!(
         restarted.member_materialization_for_test(&survivor),
         Some(crate::machines::mob_machine::MemberMaterializationPhase::Live),
         "a survivor woken mid-retirement is Live"
     );
+    let woken = restarted
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after the survivor's wake");
+    assert!(
+        !woken
+            .owed_edge_repairs
+            .iter()
+            .any(|edge| edge.a == retired_identity || edge.b == retired_identity),
+        "MobMachine owes no repair of an edge whose end is retiring: {:?}",
+        woken.owed_edge_repairs
+    );
+    let woken_survivor_runtime = {
+        let sessions = service.sessions.read().await;
+        sessions
+            .get(&survivor_sid)
+            .cloned()
+            .expect("woken surviving comms runtime")
+    };
+    let woken_runtime_carried_over =
+        Arc::ptr_eq(&woken_survivor_runtime, &resumed_survivor_runtime);
+    let installed_peer_ids = {
+        let trusted = woken_survivor_runtime.trusted_peers.read().await;
+        [old_peer_id, replacement_peer_id]
+            .into_iter()
+            .map(|peer_id| peer_id.to_string())
+            .filter(|peer_id| trusted.contains_key(peer_id))
+            .collect::<Vec<_>>()
+    };
+    assert!(
+        installed_peer_ids.is_empty(),
+        "a survivor woken mid-retirement installs no trust toward the retiring member; old={old_peer_id}, current={replacement_peer_id}, installed={installed_peer_ids:?}, survivor runtime carried over the restart={woken_runtime_carried_over}"
+    );
 
-    // Release the archive; the retry joins the restart's re-drive (or finds
-    // it done) and answers at its terminal.
-    archive_hold.release();
+    // Release the trust cleanup; the retry joins the restart's re-drive (or
+    // finds it done) and answers at its terminal.
+    trust_cleanup_hold.release();
     tokio::time::timeout(
         Duration::from_secs(10),
         retire_to_terminal(&restarted, &retiring),
     )
     .await
-    .expect("the recovered retirement reaches its terminal once its archive runs")
+    .expect("the recovered retirement reaches its terminal once its trust cleanup runs")
     .expect("retry retirement from durable start marker");
     assert!(
         restarted
