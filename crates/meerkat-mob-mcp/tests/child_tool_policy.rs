@@ -1500,6 +1500,9 @@ async fn an_agent_retires_and_destroys_its_dormant_members_after_a_cold_restart(
         Some(meerkat_mob::machines::mob_machine::MemberMaterializationPhase::Dormant),
         "the retirement left its wired peer dormant"
     );
+    // A handle kept here would own the mob database's observer, and the
+    // destroy would leave its storage cleanup outstanding.
+    drop(handle);
     dispatch(
         &surface,
         "mob_destroy",
