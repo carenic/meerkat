@@ -860,13 +860,15 @@ impl MobActor {
     /// the terminal step). The retirement's admission applies it in the same
     /// prepared step as its `Retire`, before the retirement's durable start,
     /// so a refused rotation journals nothing. A re-drive of the same
-    /// rotation keeps the intent it recorded. Returns the effects to realize,
-    /// or `None` when the intent and the authority are already recorded.
+    /// rotation keeps the intent it recorded, and its candidate's profile
+    /// authority replaces the grant an earlier attempt recorded: a role
+    /// changed between attempts is the one the terminal step seats. Returns
+    /// the effects to realize.
     pub(super) fn apply_member_rotation_begin(
         authority: &mut mob_dsl::MobMachinePreparedAuthority,
         entry: &RosterEntry,
         rotation: &MemberRotation,
-    ) -> Result<Option<Vec<mob_dsl::MobMachineEffect>>, MobError> {
+    ) -> Result<Vec<mob_dsl::MobMachineEffect>, MobError> {
         let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         let next_session = mob_dsl::SessionId::from_domain(&rotation.candidate.session_id);
         let state = authority.state();
@@ -879,7 +881,7 @@ impl MobActor {
                 });
             }
             None => inputs.push(mob_dsl::MobMachineInput::BeginMemberRotation {
-                agent_identity: dsl_identity.clone(),
+                agent_identity: dsl_identity,
                 agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
                 fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
                 generation: mob_dsl::Generation::from_domain(entry.generation),
@@ -892,15 +894,9 @@ impl MobActor {
                 session_archived: false,
             }),
         }
-        let authorize = !state
-            .spawn_profile_authority_profile_names
-            .contains_key(&dsl_identity);
-        if authorize {
-            inputs.push(rotation.candidate.authorize_input.clone());
-        }
-        if inputs.is_empty() {
-            return Ok(None);
-        }
+        // Under the rotation's intent the granting arm records the
+        // candidate's authority, replacing any grant an earlier attempt left.
+        inputs.push(rotation.candidate.authorize_input.clone());
         let transitions =
             authority
                 .apply_batch(inputs)
@@ -908,22 +904,18 @@ impl MobActor {
                     context: "begin_member_rotation",
                     reason: error.to_string(),
                 })?;
-        if authorize {
-            let authorized = transitions.last().ok_or_else(|| {
-                MobError::Internal("the rotation's profile authority applied nothing".into())
-            })?;
-            require_authorized_effect(
-                authorized,
-                &rotation.candidate.authorized,
-                "begin_member_rotation",
-            )?;
-        }
-        Ok(Some(
-            transitions
-                .into_iter()
-                .flat_map(mob_dsl::MobMachineTransition::into_effects)
-                .collect(),
-        ))
+        let authorized = transitions.last().ok_or_else(|| {
+            MobError::Internal("the rotation's profile authority applied nothing".into())
+        })?;
+        require_authorized_effect(
+            authorized,
+            &rotation.candidate.authorized,
+            "begin_member_rotation",
+        )?;
+        Ok(transitions
+            .into_iter()
+            .flat_map(mob_dsl::MobMachineTransition::into_effects)
+            .collect())
     }
 
     /// [`Self::apply_member_rotation_begin`] on its own, for a rotation
@@ -935,10 +927,7 @@ impl MobActor {
         rotation: &MemberRotation,
     ) -> Result<(), MobError> {
         let mut authority = self.dsl_authority.prepare_authority();
-        let Some(effects) = Self::apply_member_rotation_begin(&mut authority, entry, rotation)?
-        else {
-            return Ok(());
-        };
+        let effects = Self::apply_member_rotation_begin(&mut authority, entry, rotation)?;
         self.commit_prepared_dsl_input(PreparedDslInput {
             authority,
             effects,

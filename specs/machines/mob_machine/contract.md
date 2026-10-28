@@ -983,6 +983,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - `seat_session_unborn_is_seated`
 - `seat_session_unborn_is_never_bound`
 - `unborn_seat_session_is_recorded`
+- `spawn_profile_authority_is_a_pending_grant`
 - `owed_edge_repairs_join_seated_members`
 - `destroyed_mob_holds_no_member_lifecycle`
 
@@ -4350,6 +4351,7 @@ _Generated from the Rust machine catalog. Do not edit by hand._
 - Guards:
   - `lifecycle_origin_open`
   - `coordinator_bound`
+  - `grant_for_a_spawn_seat_or_rotation`
 - Emits: `SpawnProfileAuthorized`
 - To: `Running`
 
@@ -16912,6 +16914,17 @@ _Generated from the Rust machine catalog. Do not edit by hand._
   - `replay_not_sealed`
   - `identity_runtime_matches`
   - `session_binding_present`
+- To: `Running`
+
+### `AuthorizeSpawnProfileSeatedRunning`
+- From: `Running`
+- On: `AuthorizeSpawnProfile`(agent_identity, profile_name, model, profile_material_digest, tool_config_digest, skills_digest, provider_params_digest, output_schema_digest, external_addressable, resolved_spec_digest)
+- Guards:
+  - `lifecycle_origin_open`
+  - `coordinator_bound`
+  - `member_seated`
+  - `no_rotation_intent`
+- Emits: `SpawnProfileAuthorized`
 - To: `Running`
 
 ## Coverage

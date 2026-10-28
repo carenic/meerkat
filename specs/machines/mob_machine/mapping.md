@@ -4743,6 +4743,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
 - `RecoverMemberSeatSessionBornRunning`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
+- `AuthorizeSpawnProfileSeatedRunning`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
 
 ### Effects
 - `HoldMemberRunStarts`
@@ -5471,6 +5474,9 @@ This section is generated from the Rust machine catalog. Do not edit it by hand.
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `unborn_seat_session_is_recorded`
+  - anchors: (unclaimed)
+  - scenarios: (unclaimed)
+- `spawn_profile_authority_is_a_pending_grant`
   - anchors: (unclaimed)
   - scenarios: (unclaimed)
 - `owed_edge_repairs_join_seated_members`

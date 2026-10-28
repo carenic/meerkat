@@ -558,9 +558,9 @@ fi
 # work in its readiness or topology stages and reserves the members it
 # rebuilds only before its readiness, with the ASSUME over the wake refusal
 # helper. It runs with TLC coverage and requires every listed arm to fire and
-# a floor of distinct states per run, and requires its thirty-one witnesses
+# a floor of distinct states per run, and requires its thirty-two witnesses
 # reached. Its --mutants mode (run by hand, outside the shard's budget)
-# refuses fifty-one seeded defects, one per residency invariant and property.
+# refuses fifty-three seeded defects, one per residency invariant and property.
 member_residency_audit="${workspace_root}/specs/machines/mob_machine/member_residency_audit.sh"
 if [[ ! -x "${member_residency_audit}" ]]; then
   echo "error: member residency audit runner is missing from workspace runfiles: ${member_residency_audit}" >&2
