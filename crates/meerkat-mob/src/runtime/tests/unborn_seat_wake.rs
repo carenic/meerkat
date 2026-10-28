@@ -563,12 +563,13 @@ async fn an_eager_start_with_one_failing_seat_create_leaves_only_that_member_dor
 /// seated the next life unborn, and a mob reset empties them.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds_it() {
-    /// Crash the mob and resume it over the same stores, as a restart does.
+    /// Crash the mob and resume it over the same stores, as a restart does:
+    /// the same storage composition, its built-in identity member store
+    /// included, which the running mob's binding history reads through.
     async fn restart(
         handle: MobHandle,
         service: &MockSessionService,
-        events: &Arc<dyn MobEventStore>,
-        runtime_metadata: &Arc<dyn MobRuntimeMetadataStore>,
+        storage: &MobStorage,
         keys: &std::path::Path,
     ) -> (MobHandle, Arc<MockSessionService>) {
         crash_stop_and_release_routes(handle).await;
@@ -577,15 +578,12 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         let handle = tokio::time::timeout(
             STEP,
             Box::pin(
-                MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-                    events.clone(),
-                    runtime_metadata.clone(),
-                ))
-                .with_session_service(restarted.clone())
-                .with_member_comms_identity_root(keys)
-                .with_member_restore_policy(MemberRestorePolicy::OnDemand)
-                .notify_orchestrator_on_resume(false)
-                .resume(),
+                MobBuilder::for_resume(storage.clone())
+                    .with_session_service(restarted.clone())
+                    .with_member_comms_identity_root(keys)
+                    .with_member_restore_policy(MemberRestorePolicy::OnDemand)
+                    .notify_orchestrator_on_resume(false)
+                    .resume(),
             ),
         )
         .await
@@ -600,8 +598,7 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
     let _adapter = service.enable_runtime_adapter();
     let storage = MobStorage::in_memory();
     let events = storage.events.clone();
-    let runtime_metadata = storage.runtime_metadata.clone();
-    let handle = MobBuilder::new(definition, storage)
+    let handle = MobBuilder::new(definition, storage.clone())
         .with_session_service(service.clone())
         .with_member_comms_identity_root(keys.path())
         .create()
@@ -691,8 +688,7 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
         "its created session stays among the sessions since the latest reset"
     );
 
-    let (handle, service) =
-        restart(handle, &service, &events, &runtime_metadata, keys.path()).await;
+    let (handle, service) = restart(handle, &service, &storage, keys.path()).await;
     let journal = events.replay_all().await.expect("read the journal");
     let history = history_of(&journal, &handle);
     for (session, unborn, shape) in &expected {
@@ -753,8 +749,7 @@ async fn the_binding_history_reads_each_seat_session_unborn_as_the_machine_holds
     assert_eq!(since_reset(&history), only_reseated);
     assert_eq!(since_reset(&read), only_reseated);
 
-    let (handle, _service) =
-        restart(handle, &service, &events, &runtime_metadata, keys.path()).await;
+    let (handle, _service) = restart(handle, &service, &storage, keys.path()).await;
     let journal = events.replay_all().await.expect("read the journal");
     let history = history_of(&journal, &handle);
     for (session, unborn, shape) in &after {
