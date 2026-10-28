@@ -297,6 +297,8 @@ them.
   wake ends, a subscription to its agent events is refused not live, so a
   host that keeps members' agent events attached subscribes it after the
   machine state change that ends the wake, with no command while it waits.
+  The answer can be stale by the time the host acts on it, and the read is
+  never a write path.
 
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates

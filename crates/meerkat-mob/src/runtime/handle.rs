@@ -9647,7 +9647,8 @@ impl MobHandle {
     /// The materialization phase MobMachine holds for `identity` in this
     /// process, read from the published machine state without an actor round
     /// trip: test support for rows that prove a read never wakes a member.
-    /// The phase is internal; no public surface reports it.
+    /// No public surface reports the phase itself; a host reads whether a
+    /// member is unmaterialized through [`Self::member_unmaterialized`].
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-support"))]
     pub fn member_materialization_for_test(
@@ -9775,7 +9776,13 @@ impl MobHandle {
     /// from its first event.
     ///
     /// Read from the machine state the actor last published, without a
-    /// command; reading it never wakes the member. `false` for a live member
+    /// command; reading it never wakes the member. The answer can be stale
+    /// by the time the caller acts on it (the actor may publish the next
+    /// state right after the read), so a caller treats a refusal of what it
+    /// then asks as the answer that counts. It is an observation, never a
+    /// write path: only MobMachine's transitions move the member's
+    /// residency, and a host that needs the member live wakes it with a
+    /// delivery or [`Self::ensure_member_live`]. `false` for a live member
     /// and for an identity this mob does not hold seated in this process.
     pub fn member_unmaterialized(&self, identity: &AgentIdentity) -> bool {
         super::boot_plan::domain_member_is_unmaterialized(
