@@ -6820,6 +6820,11 @@ mod tests {
         let mut retired = seeded.state().clone();
         retired.identity_to_runtime.remove(&identity);
         retired.member_session_bindings.remove(&identity);
+        // A replayed retirement removes the residency phase with the seat
+        // (RecoverRosterMemberRetiredRunning): a phase belongs to seated,
+        // session-bound members only.
+        retired.member_materialization.remove(&identity);
+        retired.member_materialization_epoch.remove(&identity);
         retired
             .identity_runtime_generations
             .insert(identity.clone(), Generation(1));
