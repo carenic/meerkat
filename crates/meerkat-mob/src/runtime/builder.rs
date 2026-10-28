@@ -4020,6 +4020,31 @@ async fn commit_placed_spawn_event_repairs(
     Ok(reloaded_plan)
 }
 
+/// Replay MobMachine's unborn-seat fact from the journal row that records it
+/// (`crate::event::SeatSessionRow`): the seat's row marks the session
+/// unborn, the row of its creation marks it born. The member binding history
+/// folds the same rows ([`crate::MemberBindingHistory::session_unborn`]).
+fn recover_seat_session_row(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    row: crate::event::SeatSessionRow<'_>,
+) -> Result<(), MobError> {
+    use crate::machines::mob_machine as mob_dsl;
+
+    apply_seeded_mob_signal(
+        authority,
+        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
+            agent_identity: mob_dsl::AgentIdentity::from_domain(row.agent_identity),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(row.agent_runtime_id),
+            unborn: row.unborn,
+        },
+        if row.unborn {
+            "recover_member_seat_session_unborn"
+        } else {
+            "recover_member_seat_session_born"
+        },
+    )
+}
+
 fn seed_mob_authority_sync_from_events(
     authority: &mut crate::machines::mob_machine::MobMachineAuthority,
     events: &[crate::event::MobEvent],
@@ -4263,20 +4288,8 @@ fn seed_mob_authority_sync_from_events(
                 // A seat that created nothing: the member's session is
                 // unborn until its first wake creates it, whose own row
                 // (below) clears the fact durably.
-                if member_spawned.seat_session_unborn() {
-                    apply_seeded_mob_signal(
-                        authority,
-                        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
-                            agent_identity: mob_dsl::AgentIdentity::from_domain(
-                                &member_spawned.agent_identity,
-                            ),
-                            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
-                                &member_spawned.agent_runtime_id,
-                            ),
-                            unborn: true,
-                        },
-                        "recover_member_seat_session_unborn",
-                    )?;
+                if let Some(row) = event.kind.seat_session_row() {
+                    recover_seat_session_row(authority, row)?;
                 }
             }
             MobEventKind::MemberReset {
@@ -4362,20 +4375,8 @@ fn seed_mob_authority_sync_from_events(
                 // The first wake of a seated member created its session
                 // under this binding: the unborn fact clears durably, so a
                 // session lost later is never recreated empty.
-                if recovered.records_seat_session_born() {
-                    apply_seeded_mob_signal(
-                        authority,
-                        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
-                            agent_identity: mob_dsl::AgentIdentity::from_domain(
-                                &recovered.agent_identity,
-                            ),
-                            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
-                                &recovered.agent_runtime_id,
-                            ),
-                            unborn: false,
-                        },
-                        "recover_member_seat_session_born",
-                    )?;
+                if let Some(row) = event.kind.seat_session_row() {
+                    recover_seat_session_row(authority, row)?;
                 }
             }
             // Retirement start is deliberately replayed in a second pass.

@@ -280,6 +280,24 @@ them.
   returns its operation registry when it does. The lift of a stopped mob
   uses it to bind such a member without queueing behind its run.
 
+- `meerkat-mob`: `MobHandle::session_unborn(session_id)` and
+  `MemberBindingHistory::session_unborn(session_id)` answer whether a session
+  is unborn: a seat or a rotation named it for a member that builds nothing
+  until its first wake, and that wake has not created it yet. No store holds
+  such a session, and none is missing. The handle reads it from the running
+  mob; the history reads it with no running mob, from the journal rows the
+  mob's own restart restores it from, so a host that checks a stopped state
+  directory for lost sessions can leave unborn ones out.
+  `MemberBindingHistory::with_unborn_sessions` (`test-support`) gives a host's
+  test double of these reads its unborn sessions. `MobHandle::member_history`
+  of a member whose session is unborn answers an empty page, and the read
+  does not wake the member; Core's reads by session id (RPC `session/history`,
+  REST `GET /sessions/{id}/history`) answer not found for it, since no store
+  holds it. `MemberBindingHistory::session_bindings_since_reset` lists the
+  latest binding of each session named since the latest mob reset, so a host
+  can tell whether an identity had a created session before its last binding
+  (a member reset seats the next life on a new, unborn session).
+
 - `meerkat-mob-mcp`: `MobMcpState::with_member_restore_policy` and
   `MobMcpState::with_resume_restore_concurrency`. Every mob the state creates
   or resumes, the child mobs its agents create included, starts with that
