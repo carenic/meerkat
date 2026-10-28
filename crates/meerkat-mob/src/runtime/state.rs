@@ -1027,6 +1027,13 @@ pub(super) enum MobCommand {
         work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
         completion: super::actor::ExplicitResumeMemberCompletion,
     },
+    /// The readiness of one explicit resume member held Waking after its
+    /// acceptance resolved; its work settles once MobMachine holds the
+    /// member Live, or Broken with the failure.
+    ResumeLifecycleMemberReadinessResolved {
+        work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
+        outcomes: Vec<super::actor::MemberReadinessOutcome>,
+    },
     ResumeLifecycleMemberCleanupHeld {
         work: std::sync::Arc<super::actor::ExplicitResumeMemberWork>,
         retry_tx: oneshot::Sender<()>,
@@ -2085,6 +2092,9 @@ impl MobCommand {
             Self::ResumeLifecycleMemberObserved { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberReady { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleMemberReadinessResolved { .. } => {
+                ShutdownAnswerClass::ActorCompletion
+            }
             Self::ResumeLifecycleMemberCleanupHeld { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberUnproven { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleBootMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2331,6 +2341,9 @@ impl MobCommand {
             Self::ResumeLifecycleMemberObserved { .. } => "ResumeLifecycleMemberObserved",
             Self::ResumeLifecycleMemberReady { .. } => "ResumeLifecycleMemberReady",
             Self::ResumeLifecycleMemberSettled { .. } => "ResumeLifecycleMemberSettled",
+            Self::ResumeLifecycleMemberReadinessResolved { .. } => {
+                "ResumeLifecycleMemberReadinessResolved"
+            }
             Self::ResumeLifecycleMemberCleanupHeld { .. } => "ResumeLifecycleMemberCleanupHeld",
             Self::ResumeLifecycleMemberUnproven { .. } => "ResumeLifecycleMemberUnproven",
             Self::ResumeLifecycleBootMemberSettled { .. } => "ResumeLifecycleBootMemberSettled",

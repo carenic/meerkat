@@ -638,6 +638,16 @@ impl MobActor {
         work: Arc<ExplicitResumeMemberWork>,
         completion: ExplicitResumeMemberCompletion,
     ) {
+        // An accepted member is held Waking until its readiness settles it
+        // (Live means ready). It runs that readiness now, its own, and its
+        // work settles once the readiness resolved its attempt: the resume's
+        // readiness stage only begins once every member's work settled.
+        if matches!(completion, ExplicitResumeMemberCompletion::Accepted)
+            && self.explicit_resume_member_held_for_readiness(&work)
+        {
+            self.spawn_explicit_resume_member_readiness(work).await;
+            return;
+        }
         let identity = mob_dsl::AgentIdentity::from_domain(&work.rebuild.entry.agent_identity);
         if let ExplicitResumeMemberCompletion::Failed(error) = completion {
             if matches!(
@@ -704,11 +714,17 @@ impl MobActor {
                 }
             }
         }
-        // Settle requires the member's wake attempt closed. A resume that
-        // ends without resolving the attempt it opened (its work was
-        // classified stale, or its own resolution was refused) abandons it
-        // first: the member is Dormant again, and its next delivery wakes it.
-        // No provision of such an attempt was committed.
+        self.settle_explicit_resume_member_work(work).await;
+    }
+
+    /// Settle `work`'s member in MobMachine and let the resume go on. Settle
+    /// requires the member's wake attempt closed. A resume that ends without
+    /// resolving the attempt it opened (its work was classified stale, or its
+    /// own resolution was refused) abandons it first: the member is Dormant
+    /// again, and its next delivery wakes it. No provision of such an attempt
+    /// was committed.
+    async fn settle_explicit_resume_member_work(&mut self, work: Arc<ExplicitResumeMemberWork>) {
+        let identity = mob_dsl::AgentIdentity::from_domain(&work.rebuild.entry.agent_identity);
         let still_open = work.wake_attempt.filter(|attempt| {
             self.dsl_authority
                 .state()
@@ -753,6 +769,103 @@ impl MobActor {
             );
         }
         self.continue_explicit_resume_after_rebuild().await;
+    }
+
+    /// Whether `work`'s member was accepted and is held Waking for its
+    /// readiness under the attempt its rebuild realized
+    /// ([`Self::accept_explicit_resume_member`]).
+    fn explicit_resume_member_held_for_readiness(&self, work: &ExplicitResumeMemberWork) -> bool {
+        let Some(attempt) = work.wake_attempt else {
+            return false;
+        };
+        let identity = mob_dsl::AgentIdentity::from_domain(&work.rebuild.entry.agent_identity);
+        self.startup_boot_attempts
+            .get(&work.rebuild.entry.agent_identity)
+            == Some(&attempt)
+            && self
+                .dsl_authority
+                .state()
+                .member_wake_attempts
+                .get(&identity)
+                == Some(&attempt)
+    }
+
+    /// Run the readiness of one accepted member held Waking, off the actor
+    /// (bounded as every member readiness is), and hand its outcome back
+    /// ([`Self::explicit_resume_member_readiness_resolved`]).
+    async fn spawn_explicit_resume_member_readiness(
+        &mut self,
+        work: Arc<ExplicitResumeMemberWork>,
+    ) {
+        let entry = self
+            .roster
+            .read()
+            .await
+            .get(&work.rebuild.entry.agent_identity)
+            .cloned();
+        let Some(entry) = entry else {
+            // A member that left the roster closed its attempt as it left.
+            self.settle_explicit_resume_member_work(work).await;
+            return;
+        };
+        let target = MemberReadinessTarget {
+            stage: member_readiness_stage(&entry),
+            drain_required: member_requires_comms_drain(self.dsl_authority.state(), &entry),
+            entry,
+        };
+        let expected = member_readiness_expectations(std::slice::from_ref(&target));
+        let progress = self
+            .pending_resume_lifecycle
+            .as_ref()
+            .map(|pending| pending.progress.clone());
+        let readiness = self.spawn_member_readiness_tasks(vec![target], progress);
+        let command_tx = self.command_tx.clone();
+        let mob_id = self.definition.id.clone();
+        self.actor_io_tasks.spawn(async move {
+            let outcomes = collect_member_readiness_outcomes(readiness, expected, &mob_id).await;
+            let _ = command_tx
+                .send(RoutedMobCommand::internal(
+                    MobCommand::ResumeLifecycleMemberReadinessResolved { work, outcomes },
+                ))
+                .await;
+        });
+    }
+
+    /// An accepted member's own readiness resolved: MobMachine holds it Live
+    /// (Live means ready), or Broken with its readiness failure (the
+    /// member's own outcome, which the resume reports as a held member's
+    /// failure); then its work settles and the resume goes on.
+    pub(super) async fn explicit_resume_member_readiness_resolved(
+        &mut self,
+        work: Arc<ExplicitResumeMemberWork>,
+        outcomes: Vec<MemberReadinessOutcome>,
+    ) {
+        let (outcomes, held_failure) = self
+            .settle_held_member_readiness_of(&work.rebuild.entry.agent_identity, outcomes)
+            .await;
+        if let Err(error) = self.apply_member_readiness_outcomes(outcomes).await {
+            self.retain_explicit_resume_member_failure(error);
+        }
+        if let Some(failure) = held_failure {
+            self.retain_explicit_resume_member_failure(failure);
+        }
+        self.settle_explicit_resume_member_work(work).await;
+    }
+
+    /// [`Self::retain_explicit_resume_error`] while the resume still waits on
+    /// its members' work. A member that settles after a lifecycle control
+    /// superseded the resume has no caller to answer.
+    fn retain_explicit_resume_member_failure(&mut self, error: MobError) {
+        if matches!(
+            self.pending_resume_lifecycle
+                .as_ref()
+                .map(|pending| &pending.phase),
+            Some(ResumeLifecyclePhase::RebuildingMembers { .. })
+        ) {
+            self.retain_explicit_resume_error(error);
+        } else {
+            tracing::warn!(%error, "an explicit resume member settled after its resume moved on");
+        }
     }
 
     pub(super) async fn explicit_resume_member_cleanup_held(

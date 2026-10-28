@@ -28961,6 +28961,9 @@ impl MobActor {
                 MobCommand::ResumeLifecycleMemberSettled { work, completion } => {
                     Box::pin(self.explicit_resume_member_settled(work, completion)).await;
                 }
+                MobCommand::ResumeLifecycleMemberReadinessResolved { work, outcomes } => {
+                    Box::pin(self.explicit_resume_member_readiness_resolved(work, outcomes)).await;
+                }
                 MobCommand::ResumeLifecycleMemberCleanupHeld {
                     work,
                     retry_tx,
