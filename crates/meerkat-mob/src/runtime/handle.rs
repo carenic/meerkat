@@ -9764,11 +9764,14 @@ impl MobHandle {
     }
 
     /// Whether MobMachine holds `identity` seated and not materialized in
-    /// this process: Dormant, or Waking while its one wake attempt runs.
-    /// Such a member has no session actor, so a subscription to its agent
-    /// events ([`Self::subscribe_agent_events_from`]) is refused
-    /// [`MobError::MemberSessionNotLive`] until its wake ends Live. The
-    /// wake changes the machine state ([`Self::machine_state_changes`]): a
+    /// this process: Dormant, or Waking while its one wake attempt runs. A
+    /// Dormant member has no session actor; a Waking one may already have
+    /// one (the wake builds it before its readiness settles) or may not, so
+    /// a subscription to its agent events
+    /// ([`Self::subscribe_agent_events_from`]) may be refused
+    /// [`MobError::MemberSessionNotLive`] until its wake ends Live, and this
+    /// read stays `true` until then. The end of the wake changes the machine
+    /// state ([`Self::machine_state_changes`]): a
     /// host that keeps members' agent events attached subscribes a member
     /// after the change that makes this read `false`, with no command to the
     /// actor while it reads `true`, and replays from

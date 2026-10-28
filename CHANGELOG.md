@@ -294,9 +294,10 @@ them.
   `MobHandle::member_unmaterialized(identity)` answers whether a seated member
   is not materialized in this process (dormant, or waking while its wake
   runs), from the published machine state and without waking it: until its
-  wake ends, a subscription to its agent events is refused not live, so a
-  host that keeps members' agent events attached subscribes it after the
-  machine state change that ends the wake, with no command while it waits.
+  wake ends, a subscription to its agent events may be refused not live
+  (the read stays true until then), so a host that keeps members' agent
+  events attached subscribes it after the machine state change that ends the
+  wake, with no command while it waits.
   The answer can be stale by the time the host acts on it, and the read is
   never a write path.
 
