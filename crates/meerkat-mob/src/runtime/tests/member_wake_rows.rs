@@ -411,6 +411,15 @@ impl WakeFixture {
 
     /// [`Self::new`], with `configure` applied to the factory's config.
     async fn new_with_config(label: &str, configure: impl FnOnce(&mut meerkat::Config)) -> Self {
+        Self::new_with(label, configure, |_| {}).await
+    }
+
+    /// [`Self::new_with_config`], with `edit` applied to the mob's definition.
+    async fn new_with(
+        label: &str,
+        configure: impl FnOnce(&mut meerkat::Config),
+        edit: impl FnOnce(&mut MobDefinition),
+    ) -> Self {
         let root = tempfile::Builder::new()
             .prefix("meerkat-member-wake-")
             .tempdir()
@@ -452,7 +461,9 @@ impl WakeFixture {
         ));
         let preparer = Arc::new(RecordingPreparer::new());
         let customizer = Arc::new(VersionedCustomizer::new());
-        let handle = MobBuilder::new(wake_rows_definition(label), MobStorage::in_memory())
+        let mut definition = wake_rows_definition(label);
+        edit(&mut definition);
+        let handle = MobBuilder::new(definition, MobStorage::in_memory())
             .with_session_service(service.clone())
             .with_default_llm_client(Arc::new(client.clone()))
             .with_member_build_preparer(preparer.clone())
@@ -3094,5 +3105,53 @@ async fn a_release_without_durable_sessions_keeps_the_member_live_on_its_session
         "the turn after the release runs on the session that holds the first turn"
     );
     drop(requests);
+    fixture.finish().await;
+}
+
+/// A kickoff status notice is content: a live member's kickoff notices to a
+/// wired Dormant peer wake that peer once and are delivered, never dropped.
+/// The notice leaves through the sender's own comms send, and the
+/// recipient's wake route wakes it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn kickoff_notices_to_a_dormant_peer_wake_it_once() {
+    let fixture = WakeFixture::new_with(
+        "wake-kickoff-notice",
+        |_| {},
+        |definition| {
+            definition.wiring.role_wiring = vec![RoleWiringRule {
+                a: ProfileName::from("worker"),
+                b: ProfileName::from("worker"),
+            }];
+        },
+    )
+    .await;
+    let dormant = fixture.spawn("notice-dormant").await;
+    fixture.release(&dormant).await;
+
+    // A new autonomous worker is wired to the dormant one by the role rule
+    // at its spawn, before its kickoff starts, so its kickoff notices go to
+    // the dormant peer.
+    let live = AgentIdentity::from(format!("notice-live-{}", Uuid::new_v4().simple()));
+    let mut spec = SpawnMemberSpec::new("worker", live.clone());
+    spec.runtime_mode = Some(crate::MobRuntimeMode::AutonomousHost);
+    tokio::time::timeout(WAIT, fixture.handle.spawn_spec(spec))
+        .await
+        .expect("the spawn answers")
+        .expect("spawn the live member");
+    fixture
+        .handle
+        .wait_for_members_kickoff_complete(std::slice::from_ref(&live), Some(WAIT))
+        .await
+        .expect("the live member's kickoff resolves");
+    fixture
+        .wait_residency(&dormant, Some(mob_dsl::MemberMaterializationPhase::Live))
+        .await;
+    let builds = fixture
+        .preparer
+        .prepared()
+        .into_iter()
+        .filter(|build| build.identity == dormant)
+        .count();
+    assert_eq!(builds, 1, "the notices woke the dormant peer once");
     fixture.finish().await;
 }

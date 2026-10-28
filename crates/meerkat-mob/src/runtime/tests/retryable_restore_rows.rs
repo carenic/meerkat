@@ -624,10 +624,10 @@ async fn a_lifted_member_whose_repoint_fails_ends_alone_with_its_own_error() {
 
 /// A lift's planned member whose bound session is gone is rebuilt on its
 /// successor although another member's persisted state reads malformed. The
-/// lift prepares its members one at a time, and a successor search never
-/// reads a session bound to any member of the roster: the other member's
-/// unreadable session is never read for this member's successor, so it
-/// cannot fail this member's rebuild.
+/// lift prepares its members one unit at a time, and a successor search
+/// never reads a session bound to any member of the roster: the other
+/// member's unreadable session is never read for this member's successor,
+/// so it cannot fail this member's rebuild.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lifted_member_is_repointed_past_another_members_unreadable_session() {
     let service = Arc::new(MockSessionService::new());
@@ -687,6 +687,14 @@ async fn a_lifted_member_is_repointed_past_another_members_unreadable_session() 
             .expect("the reconstructed mob answers"),
         MobState::Stopped
     );
+    // The realm lists the other member's persisted session, as a persistent
+    // service lists every session it stores (the mock lists the sessions it
+    // holds data for), so the successor search meets it; it reads malformed.
+    let other_session = restarted
+        .persisted_session_clone(&sessions[1])
+        .await
+        .expect("the other member's persisted session");
+    restarted.replace_live_session(other_session).await;
     restarted.find_persisted_session_metadata_malformed_for(sessions[1].clone());
 
     let _lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
