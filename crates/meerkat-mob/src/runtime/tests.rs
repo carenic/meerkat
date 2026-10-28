@@ -37388,7 +37388,6 @@ async fn cold_start_breaks_only_the_member_whose_runtime_ended_outside_the_mob(
 enum ColdLocalReadinessFault {
     RuntimeAdapter,
     TurnDrivenRuntimeAdapter,
-    CommsRuntime,
 }
 
 /// Wait for the spawn-detached keep-alive `start_turn` kickoff to be issued.
@@ -37473,7 +37472,6 @@ async fn assert_cold_running_local_resume_fails_closed(
         ColdLocalReadinessFault::TurnDrivenRuntimeAdapter => {
             "cold-turn-driven-missing-runtime-adapter"
         }
-        ColdLocalReadinessFault::CommsRuntime => "cold-missing-comms-runtime",
     });
 
     handle
@@ -37498,22 +37496,13 @@ async fn assert_cold_running_local_resume_fails_closed(
     );
 
     let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
-    match fault {
-        ColdLocalReadinessFault::RuntimeAdapter
-        | ColdLocalReadinessFault::TurnDrivenRuntimeAdapter => {}
-        ColdLocalReadinessFault::CommsRuntime => {
-            let _ = restarted_service.enable_runtime_adapter();
-            // Cold builder reconciliation observes the live runtime four
-            // times while rebuilding endpoint/trust projections. The fifth
-            // observation is the recovered actor's readiness check.
-            restarted_service.set_comms_runtime_missing_after_successes(4);
-        }
-    }
     crash_stop_and_release_routes(handle).await;
     drop(service);
 
+    // The builder refuses a session-backed local member before it restores
+    // any member, so no member restore policy applies here.
     let resume_result = MobBuilder::for_resume(MobStorage {
-        events: events.clone(),
+        events,
         runs,
         specs,
         definition_projection_composition:
@@ -37528,84 +37517,18 @@ async fn assert_cold_running_local_resume_fails_closed(
     })
     .with_session_service(restarted_service.clone())
     .notify_orchestrator_on_resume(false)
-    // The comms fault hits the restore's readiness check, so the start restores members.
-    .with_member_restore_policy(MemberRestorePolicy::Eager)
     .resume()
     .await;
 
-    if matches!(
-        fault,
-        ColdLocalReadinessFault::RuntimeAdapter | ColdLocalReadinessFault::TurnDrivenRuntimeAdapter
-    ) {
-        let error = match resume_result {
-            Ok(_) => panic!("missing composition adapter must reject cold resume synchronously"),
-            Err(error) => error,
-        };
-        assert_missing_outbound_comms_capability(error, &member, expected_context);
-        assert_eq!(
-            restarted_service.keep_alive_start_turn_call_count(),
-            0,
-            "a synchronous composition failure must not start a replacement kickoff turn"
-        );
-        return;
-    }
-
-    // Per-session comms is discovered only after durable reconstruction. The
-    // recovered actor owns that lifecycle failure: it commits Stopped and
-    // retains the handle, whose explicit resume is the canonical typed retry.
-    let resumed = resume_result
-        .expect("per-session readiness failure must return its durably fail-stopped handle");
-
-    let resumed_status = resumed.status().await.expect("failed cold-resume status");
-    let comms_observations = restarted_service
-        .comms_runtime_observations
-        .load(Ordering::Relaxed);
-    let remaining_successes = restarted_service
-        .comms_runtime_successes_before_missing
-        .load(Ordering::Relaxed);
-    assert_eq!(
-        resumed_status,
-        MobState::Stopped,
-        "local cold resume must fail closed when comms-drain readiness is unavailable; observations={comms_observations}, remaining_successes={remaining_successes}"
-    );
-    let durable_events = events
-        .replay_all()
-        .await
-        .expect("replay startup fail-stop events");
-    assert_eq!(
-        durable_events
-            .iter()
-            .filter(|event| matches!(event.kind, MobEventKind::MobStopped))
-            .count(),
-        1,
-        "polling a pending exact interrupt must commit one structural Stop transition"
-    );
-    assert_eq!(
-        durable_events
-            .iter()
-            .filter(|event| {
-                matches!(
-                    &event.kind,
-                    MobEventKind::MemberKickoffUpdated {
-                        member: event_member,
-                        kickoff,
-                    } if event_member == &member
-                        && kickoff.phase == crate::MobMemberKickoffPhase::Cancelled
-                )
-            })
-            .count(),
-        1,
-        "polling the retained interrupt receiver must not duplicate its durable kickoff cancellation"
-    );
-    let error = resumed
-        .resume()
-        .await
-        .expect_err("explicit retry must preserve the typed missing capability failure");
+    let error = match resume_result {
+        Ok(_) => panic!("missing composition adapter must reject cold resume synchronously"),
+        Err(error) => error,
+    };
     assert_missing_outbound_comms_capability(error, &member, expected_context);
     assert_eq!(
         restarted_service.keep_alive_start_turn_call_count(),
         0,
-        "a readiness failure must not synthesize a replacement kickoff turn"
+        "a synchronous composition failure must not start a replacement kickoff turn"
     );
 }
 
@@ -37627,13 +37550,175 @@ async fn test_cold_running_turn_driven_resume_fails_closed_without_runtime_adapt
     .await;
 }
 
+/// A cold resume of a running mob whose member's comms runtime is gone by the
+/// recovered actor's readiness pass fails closed for that member alone: one
+/// member's readiness failure is its own outcome, never the mob's. The
+/// builder reconstructs the member while its comms runtime is still present
+/// (per-session comms is discovered only after durable reconstruction); the
+/// readiness pass then finds it missing, so MobMachine records the member
+/// Broken with the typed missing-capability failure. The member is never
+/// served as ready and runs no kickoff turn; the mob keeps running and
+/// commits no Stop.
 #[tokio::test]
 async fn test_cold_running_resume_fails_closed_without_comms_runtime() {
-    assert_cold_running_local_resume_fails_closed(
-        ColdLocalReadinessFault::CommsRuntime,
-        "local member comms-drain startup",
-    )
-    .await;
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runs = storage.runs.clone();
+    let specs = storage.specs.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let identity = storage.identity.clone();
+    let identity_member = storage.identity_member.clone();
+    let identity_status = storage.identity_status.clone();
+    let realm_profiles = storage.realm_profiles.clone();
+    let forked_participants = storage.forked_participants.clone();
+    let handle = MobBuilder::new(sample_definition(), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create mob");
+    let member = AgentIdentity::from("cold-missing-comms-runtime");
+    handle
+        .spawn(ProfileName::from("worker"), member.clone(), None)
+        .await
+        .expect("spawn local member");
+    handle
+        .wait_for_members_ready(std::slice::from_ref(&member), Some(Duration::from_secs(2)))
+        .await
+        .expect("fresh member reaches startup readiness");
+    wait_for_keep_alive_start_turn_count(service.as_ref(), 1).await;
+    let member_session = handle
+        .get_member(&member)
+        .await
+        .expect("fresh member lookup")
+        .expect("fresh member roster entry")
+        .member_ref
+        .bridge_session_id()
+        .cloned()
+        .expect("local member must be session-backed before cold restart");
+    let mob_id = handle.mob_id().clone();
+
+    let restarted_service = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted_service.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+
+    // The builder reconstructs the member with its comms runtime present;
+    // the runtime is gone when the recovered actor's readiness pass reads it.
+    let (entered, release) = super::actor::arm_startup_readiness_test_gate(mob_id);
+    let resume = tokio::spawn(
+        MobBuilder::for_resume(MobStorage {
+            events: events.clone(),
+            runs,
+            specs,
+            definition_projection_composition:
+                crate::storage::DefinitionProjectionComposition::Independent,
+            runtime_metadata,
+            identity,
+            identity_member,
+            identity_status,
+            identity_status_projection_order: Default::default(),
+            realm_profiles,
+            forked_participants,
+        })
+        .with_session_service(restarted_service.clone())
+        .notify_orchestrator_on_resume(false)
+        // The start restores the member, so its readiness runs at this start.
+        .with_member_restore_policy(MemberRestorePolicy::Eager)
+        .resume(),
+    );
+    tokio::time::timeout(Duration::from_secs(10), entered)
+        .await
+        .expect("the cold start reaches its readiness pass")
+        .expect("startup readiness gate");
+    restarted_service
+        .set_missing_comms_runtime(&member_session)
+        .await;
+    let _ = release.send(());
+    let resumed = tokio::time::timeout(Duration::from_secs(10), resume)
+        .await
+        .expect("the cold start answers")
+        .expect("resume task")
+        .expect("one member's readiness failure does not fail the cold start");
+
+    // An actor round trip: answered once the readiness pass settled the
+    // member.
+    assert_eq!(
+        resumed.status().await.expect("cold-resume status"),
+        MobState::Running,
+        "one member's missing comms runtime is that member's outcome: the mob keeps running"
+    );
+    let missing_capability = MobError::MissingMemberCapability {
+        member_id: member.clone(),
+        capability: crate::error::MobMemberCapability::OutboundCommsRuntime,
+        context: "local member comms-drain startup",
+    };
+    let expected_reason = format!(
+        "member '{member}' was restored at this start but its readiness failed: {missing_capability}"
+    );
+    let machine_state = resumed
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state");
+    assert_eq!(
+        machine_state.member_lifecycle_for_identity(
+            &crate::machines::mob_machine::AgentIdentity::from_domain(&member)
+        ),
+        crate::machines::mob_machine::MobMemberLifecycleMaterial {
+            status: crate::machines::mob_machine::MobMemberLifecycleStatus::Broken,
+            terminal_class: crate::machines::mob_machine::MobMemberTerminalClass::TerminalFailure,
+            error: Some(expected_reason.clone()),
+        },
+        "MobMachine records the member Broken with its typed readiness failure"
+    );
+    assert_eq!(
+        resumed.member_materialization_for_test(&member),
+        None,
+        "a member whose readiness failed is neither live nor waking"
+    );
+    let snapshot = resumed
+        .member_status(&member)
+        .await
+        .expect("the broken member's status");
+    assert_eq!(snapshot.status, MobMemberStatus::Broken, "{snapshot:?}");
+    assert!(
+        snapshot.is_final,
+        "a broken member is terminal: {snapshot:?}"
+    );
+    assert_eq!(snapshot.error.as_deref(), Some(expected_reason.as_str()));
+    match resumed.member(&member).await {
+        Err(MobError::MemberRestoreFailed {
+            member_id,
+            session_id,
+            reason,
+            hold,
+        }) => {
+            assert_eq!(member_id, member);
+            assert_eq!(session_id, Some(member_session));
+            assert_eq!(reason, expected_reason);
+            assert!(hold.is_none(), "the readiness failure holds nothing");
+        }
+        Ok(_) => panic!("a member without its comms runtime is never served as ready"),
+        Err(other) => panic!("expected the typed restore failure, got {other:?}"),
+    }
+    let durable_events = events
+        .replay_all()
+        .await
+        .expect("replay the cold start's events");
+    assert_eq!(
+        durable_events
+            .iter()
+            .filter(|event| matches!(event.kind, MobEventKind::MobStopped))
+            .count(),
+        0,
+        "a member's readiness failure commits no Stop"
+    );
+    assert_eq!(
+        restarted_service.keep_alive_start_turn_call_count(),
+        0,
+        "a readiness failure must not synthesize a replacement kickoff turn"
+    );
 }
 
 #[tokio::test]
@@ -40733,12 +40818,6 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .await
         .expect("old retiring comms runtime");
     let old_peer_id = old_runtime.peer_id().expect("old retiring peer id");
-    let old_peer_endpoint = super::provisioner::SessionBackend::trusted_peer_spec_from_runtime(
-        recovered_comms_name,
-        old_runtime.as_ref(),
-    )
-    .expect("old peer endpoint material")
-    .expect("old peer endpoint");
     let initial_survivor_runtime = {
         let sessions = service.sessions.read().await;
         sessions
@@ -40897,19 +40976,84 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
 
     crash_stop_and_release_routes(resumed).await;
     let restarted = MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
-        events,
+        events.clone(),
         runtime_metadata,
     ))
     .with_session_service(service.clone())
     .resume()
     .await
     .expect("restart should replay recovered endpoint authority");
-    // The survivor holds no work, so the restart leaves it dormant: wake it,
-    // so the retry sweeps the trust of a live survivor.
+    // The replayed retirement start is archive-only: no runtime of this
+    // process holds the retiring member's session, so the retirement archives
+    // it and routes no runtime retire. The restart re-drives it at once,
+    // beside the first commands. The survivor holds no work, so the restart
+    // leaves it dormant: wake it. Whichever lands first, the survivor ends
+    // with no trust for the retired member: the retirement removes a live
+    // survivor's rows for both generations, and a survivor woken after the
+    // retirement takes its trust from MobMachine, which no longer wires it to
+    // the retired member. No trust row is ever restored from durable state.
     restarted
         .ensure_member_live(&survivor)
         .await
         .expect("wake the survivor");
+    // The retry joins the restart's re-drive, or re-drives the retirement
+    // from its durable start marker, and answers at its terminal.
+    restarted
+        .retire(retiring.clone())
+        .await
+        .expect("retry retirement from durable start marker");
+    assert!(
+        restarted
+            .get_member(&retiring)
+            .await
+            .expect("roster query after the retirement")
+            .is_none(),
+        "the recovered retirement is terminal"
+    );
+    let retired_count = events
+        .replay_all()
+        .await
+        .expect("replay the recovered retirement")
+        .iter()
+        .filter(|event| {
+            matches!(
+                &event.kind,
+                MobEventKind::MemberRetired { agent_identity, .. } if agent_identity == &retiring
+            )
+        })
+        .count();
+    assert_eq!(
+        retired_count, 1,
+        "the recovered retirement terminates exactly once"
+    );
+    // Terminal MemberRetired clears the retired member's endpoint history
+    // with its current endpoint and its edges, so no topology step can
+    // install trust for either generation again.
+    let machine_state = restarted
+        .query_machine_state()
+        .await
+        .expect("query MobMachine state after the retirement");
+    let retired_identity = crate::machines::mob_machine::AgentIdentity::from_domain(&retiring);
+    assert!(
+        !machine_state
+            .member_peer_endpoints
+            .contains_key(&retired_identity),
+        "terminal retirement clears the retired member's current endpoint"
+    );
+    assert!(
+        !machine_state
+            .member_prior_peer_endpoints
+            .contains_key(&retired_identity),
+        "terminal retirement clears the retired member's endpoint history"
+    );
+    assert!(
+        !machine_state
+            .wiring_edges
+            .iter()
+            .any(|edge| edge.a == retired_identity || edge.b == retired_identity),
+        "terminal retirement unwires the retired member"
+    );
+
     let restarted_survivor_runtime = {
         let sessions = service.sessions.read().await;
         sessions
@@ -40917,20 +41061,8 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
             .cloned()
             .expect("restarted surviving comms runtime")
     };
-
-    // Model a durable trust projection restoring the old generation row after
-    // retirement admission. The actor retry, not ordinary resume repair, must
-    // sweep it before terminal MemberRetired clears endpoint history.
-    restarted_survivor_runtime
-        .trusted_peers
-        .write()
-        .await
-        .insert(old_peer_id.to_string(), old_peer_endpoint);
-    restarted
-        .retire(retiring)
-        .await
-        .expect("retry retirement from durable start marker");
-
+    let survivor_runtime_carried_over =
+        Arc::ptr_eq(&restarted_survivor_runtime, &resumed_survivor_runtime);
     let trusted = restarted_survivor_runtime.trusted_peers.read().await;
     let residual_peer_ids = [old_peer_id, replacement_peer_id]
         .into_iter()
@@ -40939,7 +41071,7 @@ async fn test_retire_after_snapshotless_member_head_recovery_removes_old_and_new
         .collect::<Vec<_>>();
     assert!(
         residual_peer_ids.is_empty(),
-        "terminal retirement must remove both historical and current peer trust; old={old_peer_id}, current={replacement_peer_id}, residual={residual_peer_ids:?}"
+        "terminal retirement must remove both historical and current peer trust; old={old_peer_id}, current={replacement_peer_id}, residual={residual_peer_ids:?}, survivor runtime carried over the restart={survivor_runtime_carried_over}"
     );
 }
 
