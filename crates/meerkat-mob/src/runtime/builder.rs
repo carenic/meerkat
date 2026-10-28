@@ -11791,6 +11791,12 @@ pub(super) enum MemberRestoreProvisionOutcome {
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
     },
+    /// Another materialization of the member made its session live while
+    /// this provision built it (the build answered the session identity
+    /// already active, and the session is live): nothing was provisioned,
+    /// and the member is kept on the registration that live session holds,
+    /// as a warm revival keeps it.
+    AlreadyLive { bridge_session_id: SessionId },
     /// The member's session was created fresh: a nonpersistent service
     /// recreated it, or (`seat_session`) the member's first materialization
     /// created the session its seat named.
@@ -12187,7 +12193,8 @@ async fn release_unapplied_member_restore(
         | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
         // Nothing was provisioned.
         MemberRestoreProvisionOutcome::Failed(_)
-        | MemberRestoreProvisionOutcome::Retryable { .. } => return,
+        | MemberRestoreProvisionOutcome::Retryable { .. }
+        | MemberRestoreProvisionOutcome::AlreadyLive { .. } => return,
     };
     let released = match receipt.session_origin {
         super::provisioner::ProvisionSessionOrigin::Fresh => {
@@ -13115,29 +13122,53 @@ pub(super) async fn provision_durable_member_restore(
             }
         }
         Err(error) => {
-            // The provision's refusal slot is the only source of this typed
-            // refusal; the seed records its code, and the transaction's own
-            // rollback already removed the registration the host was asked
-            // about. The member's record keeps the host's own reason: a
-            // later answer of the recorded refusal (the member's wake, an
-            // `ensure_member_live`) is the refusal its host gave, not that
-            // refusal nested in this restore's diagnostic.
-            let (registration_refusal, reason) = match &error {
-                MobError::MemberRegistrationRefused { call, reason, .. } => {
-                    (Some(*call), reason.clone())
-                }
-                _ => (
-                    None,
-                    format!("failed to restore durable session '{bridge_session_id}': {error}"),
-                ),
-            };
+            // The build found the member's session identity already active
+            // and the session is live: another materialization of the member
+            // made it live meanwhile, and it is kept, as a warm revival keeps
+            // it.
+            let identity_in_use = matches!(
+                &error,
+                MobError::SessionError(meerkat_core::service::SessionError::Agent(
+                    meerkat_core::error::AgentError::SessionIdentityInUse(session_id),
+                )) if session_id == bridge_session_id
+            );
+            let already_live = identity_in_use
+                && matches!(
+                    ctx.session_service
+                        .has_live_session(bridge_session_id)
+                        .await,
+                    Ok(true)
+                );
             unstage_member_build_hold(ctx, bridge_session_id).await;
-            MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
-                bridge_session_id: Some(bridge_session_id.clone()),
-                reason,
-                hold: None,
-                registration_refusal,
-            })
+            if already_live {
+                MemberRestoreProvisionOutcome::AlreadyLive {
+                    bridge_session_id: bridge_session_id.clone(),
+                }
+            } else {
+                // The provision's refusal slot is the only source of this
+                // typed refusal; the seed records its code, and the
+                // transaction's own rollback already removed the registration
+                // the host was asked about. The member's record keeps the
+                // host's own reason: a later answer of the recorded refusal
+                // (the member's wake, an `ensure_member_live`) is the refusal
+                // its host gave, not that refusal nested in this restore's
+                // diagnostic.
+                let (registration_refusal, reason) = match &error {
+                    MobError::MemberRegistrationRefused { call, reason, .. } => {
+                        (Some(*call), reason.clone())
+                    }
+                    _ => (
+                        None,
+                        format!("failed to restore durable session '{bridge_session_id}': {error}"),
+                    ),
+                };
+                MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
+                    bridge_session_id: Some(bridge_session_id.clone()),
+                    reason,
+                    hold: None,
+                    registration_refusal,
+                })
+            }
         }
     };
     Ok(MemberRestoreProvision {
@@ -13744,6 +13775,31 @@ async fn apply_member_restore_provision(
     match outcome {
         MemberRestoreProvisionOutcome::Failed(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
+        }
+        // Nothing was provisioned: the member's attempt resolves bound on the
+        // registration its live session already holds, as a kept live actor
+        // does.
+        MemberRestoreProvisionOutcome::AlreadyLive { bridge_session_id } => {
+            if let Err(error) =
+                resolve_restored_member_bound(commit, entry, &bridge_session_id).await
+            {
+                record_member_restore_failure(
+                    commit.tool_handle,
+                    entry,
+                    member_restore_failure(
+                        &bridge_session_id,
+                        format!("failed to restore member runtime binding: {error}"),
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            commit
+                .tool_handle
+                .restore_diagnostics
+                .write()
+                .await
+                .remove(&entry.agent_identity);
         }
         MemberRestoreProvisionOutcome::Retryable { reason, cause } => {
             // Nothing was provisioned: the member's open wake attempt ends

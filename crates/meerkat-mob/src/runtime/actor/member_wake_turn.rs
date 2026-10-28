@@ -91,7 +91,8 @@ impl WakeRollback {
                 ..
             } => (receipt, *seat_session),
             MemberRestoreProvisionOutcome::Failed(_)
-            | MemberRestoreProvisionOutcome::Retryable { .. } => return None,
+            | MemberRestoreProvisionOutcome::Retryable { .. }
+            | MemberRestoreProvisionOutcome::AlreadyLive { .. } => return None,
         };
         Some(Self {
             member_ref: receipt.member_ref.clone(),
@@ -784,8 +785,11 @@ impl MobActor {
                     .await;
                     return;
                 }
+                // A session another materialization made live is kept: the
+                // plan's application binds to it, as a warm revival does.
                 MemberRestoreProvisionOutcome::Durable { .. }
-                | MemberRestoreProvisionOutcome::Fresh { .. } => {}
+                | MemberRestoreProvisionOutcome::Fresh { .. }
+                | MemberRestoreProvisionOutcome::AlreadyLive { .. } => {}
             },
             MemberRestorePlan::Seated {
                 outcome: SeatedMemberRestoreOutcome::SuccessorNeeded { .. },
