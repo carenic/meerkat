@@ -28844,11 +28844,11 @@ impl MobActor {
                 }
                 MobCommand::RetryOwedMemberWake { agent_identity } => {
                     self.inline_step_watchdog.set_step("retry_owed_member_wake");
-                    Box::pin(self.retry_owed_member_wake(agent_identity)).await;
+                    boxed_arm_future(|| self.retry_owed_member_wake(agent_identity)).await;
                 }
                 MobCommand::RepairOwedEdge { edge } => {
                     self.inline_step_watchdog.set_step("repair_owed_edge");
-                    Box::pin(self.repair_owed_edge(edge)).await;
+                    boxed_arm_future(|| self.repair_owed_edge(edge)).await;
                 }
                 MobCommand::ReleaseMember {
                     agent_identity,
@@ -45607,16 +45607,20 @@ impl MobActor {
         // WiringError with zero side effects.
         let local_endpoint = self.resolve_wiring_endpoint(&local_entry, "wire").await?;
         let peer_endpoint = self.resolve_wiring_endpoint(&peer_entry, "wire").await?;
+        // Each lane's future is built in its own frame (see
+        // `boxed_arm_future`): built here, every lane's future would take a
+        // slot of this frame in a debug build, on every wire's stack.
         if dsl_has_edge {
-            return self
-                .repair_existing_member_wire(
+            return boxed_arm_future(|| {
+                self.repair_existing_member_wire(
                     &edge,
                     &local,
                     &peer_member_identity,
                     &local_endpoint,
                     &peer_endpoint,
                 )
-                .await;
+            })
+            .await;
         }
         if matches!(local_endpoint, WiringEndpoint::Placed { .. })
             || matches!(peer_endpoint, WiringEndpoint::Placed { .. })
@@ -45635,13 +45639,15 @@ impl MobActor {
         if matches!(local_endpoint, WiringEndpoint::LocalDormant { .. })
             || matches!(peer_endpoint, WiringEndpoint::LocalDormant { .. })
         {
-            return Box::pin(self.wire_new_edge_with_dormant_endpoint(
-                &edge,
-                &local,
-                &peer_member_identity,
-                &local_endpoint,
-                &peer_endpoint,
-            ))
+            return boxed_arm_future(|| {
+                self.wire_new_edge_with_dormant_endpoint(
+                    &edge,
+                    &local,
+                    &peer_member_identity,
+                    &local_endpoint,
+                    &peer_endpoint,
+                )
+            })
             .await
             .map(|()| wiring_io::WiringPreparation::Settled);
         }
@@ -47915,14 +47921,16 @@ impl MobActor {
         if matches!(local_endpoint, WiringEndpoint::LocalDormant { .. })
             || matches!(peer_endpoint, WiringEndpoint::LocalDormant { .. })
         {
-            return Box::pin(self.unwire_edge_with_dormant_endpoint(
-                &edge,
-                &local,
-                &peer_member_identity,
-                &local_endpoint,
-                &peer_endpoint,
-                dsl_has_edge,
-            ))
+            return boxed_arm_future(|| {
+                self.unwire_edge_with_dormant_endpoint(
+                    &edge,
+                    &local,
+                    &peer_member_identity,
+                    &local_endpoint,
+                    &peer_endpoint,
+                    dsl_has_edge,
+                )
+            })
             .await
             .map(|()| wiring_io::WiringPreparation::Settled);
         }
