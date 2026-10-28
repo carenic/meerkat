@@ -3340,3 +3340,200 @@ async fn a_lift_hands_the_build_preparer_each_member_it_rebuilds() {
         Some(dsl::MemberMaterializationPhase::Live)
     );
 }
+
+/// The durable-head status-view reads the session service made of each of
+/// `mob`'s workers so far, in spawn order.
+fn status_head_reads(mob: &CrashedMob) -> Vec<u64> {
+    mob.sessions
+        .iter()
+        .map(|(_, session)| {
+            mob.service
+                .durable_reads_of(session)
+                .member_status_durable_head
+        })
+        .collect()
+}
+
+/// A Dormant member's status reads like an idle live member's: run state
+/// idle, healthy and no in-flight work, from MobMachine's Dormant fact (no
+/// run of it is open in a process that has not materialized it, so no
+/// execution snapshot is asked for), with its preview and token count from
+/// its committed durable head, one read of that head per status read. The
+/// read wakes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_dormant_members_status_reads_idle_and_healthy_with_its_durable_preview() {
+    use crate::runtime::handle::{MemberHealthClass, MemberRunState};
+    use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, Usage};
+
+    let mob = CrashedMob::new("dormant-status", 2, false, false).await;
+    let target = worker(0);
+    let session = mob.session(0);
+    let mut answered = mob
+        .service
+        .persisted_session_clone(&session)
+        .await
+        .expect("the worker's committed body");
+    answered.push(Message::BlockAssistant(BlockAssistantMessage::new(
+        vec![AssistantBlock::Text {
+            text: "the last durable answer".to_string(),
+            meta: None,
+        }],
+        StopReason::EndTurn,
+    )));
+    answered.record_cumulative_usage(Usage {
+        input_tokens: 30,
+        output_tokens: 12,
+        ..Usage::default()
+    });
+    mob.service.replace_persisted_session(answered).await;
+    mob.service.serve_durable_head_status_views();
+    let handle = mob.resume(mob.builder()).await;
+    assert_eq!(
+        phase_of(&handle, &target),
+        Some(dsl::MemberMaterializationPhase::Dormant)
+    );
+
+    let snapshots_before = mob.service.execution_snapshot_calls();
+    for read in 1..=2_u64 {
+        let status = handle
+            .member_status(&target)
+            .await
+            .expect("a dormant member's status");
+        let progress = status
+            .progress
+            .as_ref()
+            .expect("a local member's status carries its progress");
+        assert_eq!(progress.run_state, MemberRunState::Idle, "{status:?}");
+        assert_eq!(progress.health, MemberHealthClass::Healthy, "{status:?}");
+        assert_eq!(progress.in_flight_work, 0, "{status:?}");
+        assert_eq!(
+            status.output_preview.as_deref(),
+            Some("the last durable answer"),
+            "{status:?}"
+        );
+        assert_eq!(status.tokens_used, 42, "{status:?}");
+        assert_eq!(status.preview_unavailable, None, "{status:?}");
+        assert_eq!(status.current_session_id.as_ref(), Some(&session));
+        assert_eq!(
+            mob.service
+                .durable_reads_of(&session)
+                .member_status_durable_head,
+            read,
+            "one durable-head read per status read"
+        );
+    }
+    assert_eq!(
+        mob.service.execution_snapshot_calls(),
+        snapshots_before,
+        "a Dormant member's progress asks no session for an execution snapshot"
+    );
+
+    assert!(
+        mob.materialized().await.is_empty(),
+        "the status reads built no member: {:?}",
+        mob.materialized().await
+    );
+    assert_eq!(mob.service.active_session_count().await, 0);
+    for (identity, _) in &mob.sessions {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+    }
+}
+
+/// The all-member waits read a Dormant member's session at most once per
+/// call. `collect_completed` reads nothing of it (a Dormant member holds no
+/// run to collect, and MobMachine answers that it is not terminal). The
+/// kickoff waits poll its status from MobMachine and read only the snapshot
+/// they return. The readiness waits take its readiness from MobMachine and
+/// read its durable head once for the snapshot they return, which reads
+/// like an idle live member's. None of them wakes a member.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_all_member_waits_read_a_dormant_member_at_most_once_per_call() {
+    use crate::runtime::handle::{MemberHealthClass, MemberRunState};
+
+    let mob = CrashedMob::new("dormant-waits", 3, false, false).await;
+    mob.service.serve_durable_head_status_views();
+    let handle = mob.resume(mob.builder()).await;
+    let members = mob
+        .sessions
+        .iter()
+        .map(|(identity, _)| identity.clone())
+        .collect::<Vec<_>>();
+    for identity in &members {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+    }
+
+    assert!(handle.collect_completed().await.is_empty());
+    assert_eq!(
+        status_head_reads(&mob),
+        vec![0, 0, 0],
+        "collect_completed reads no Dormant member"
+    );
+
+    let kicked = tokio::time::timeout(LAZY_STEP, handle.wait_for_kickoff_complete(Some(LAZY_STEP)))
+        .await
+        .expect("the kickoff wait answers")
+        .expect("no Dormant member holds the kickoff wait");
+    assert_eq!(kicked.len(), members.len());
+    assert_eq!(
+        status_head_reads(&mob),
+        vec![1, 1, 1],
+        "the kickoff poll reads no Dormant member; its snapshots read one head each"
+    );
+    tokio::time::timeout(
+        LAZY_STEP,
+        handle.wait_for_members_kickoff_complete(&members, Some(LAZY_STEP)),
+    )
+    .await
+    .expect("the members' kickoff wait answers")
+    .expect("no Dormant member holds the members' kickoff wait");
+    assert_eq!(status_head_reads(&mob), vec![2, 2, 2]);
+
+    let ready = tokio::time::timeout(LAZY_STEP, handle.wait_for_ready(Some(LAZY_STEP)))
+        .await
+        .expect("the readiness wait answers")
+        .expect("a Dormant member is ready");
+    assert_eq!(ready.len(), members.len());
+    for (identity, snapshot) in &ready {
+        let progress = snapshot
+            .progress
+            .as_ref()
+            .expect("a local member's snapshot carries its progress");
+        assert_eq!(progress.run_state, MemberRunState::Idle, "{identity}");
+        assert_eq!(progress.health, MemberHealthClass::Healthy, "{identity}");
+        assert_eq!(snapshot.preview_unavailable, None, "{identity}");
+    }
+    assert_eq!(
+        status_head_reads(&mob),
+        vec![3, 3, 3],
+        "readiness reads no Dormant member; its snapshots read one head each"
+    );
+    tokio::time::timeout(
+        LAZY_STEP,
+        handle.wait_for_members_ready(&members, Some(LAZY_STEP)),
+    )
+    .await
+    .expect("the members' readiness wait answers")
+    .expect("Dormant members are ready");
+    assert_eq!(status_head_reads(&mob), vec![4, 4, 4]);
+
+    assert!(
+        mob.materialized().await.is_empty(),
+        "the waits built no member: {:?}",
+        mob.materialized().await
+    );
+    for identity in &members {
+        assert_eq!(
+            phase_of(&handle, identity),
+            Some(dsl::MemberMaterializationPhase::Dormant),
+            "{identity}"
+        );
+    }
+}
