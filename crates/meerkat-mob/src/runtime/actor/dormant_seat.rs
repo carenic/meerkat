@@ -417,9 +417,9 @@ impl MobActor {
     /// left, so both ways answer every entry the same. Entries of one chunk
     /// name distinct identities, so an already-seated entry's check, which
     /// reads only its own identity, reads the same before the chunk's inputs
-    /// as between them. Once the chunk is committed, the members it seated
-    /// are wired to the edges their definition declares, in one more step
-    /// (see `seat_wiring`).
+    /// as between them. The edges the definition declares for the members
+    /// the chunk seats are staged on the same prepared authority and
+    /// journaled in the same append (see `seat_wiring`).
     pub(super) async fn commit_dormant_seats(
         &mut self,
         entries: Vec<DormantSeatCommitEntry>,
@@ -504,7 +504,7 @@ impl MobActor {
         }
         let SettledSeatChunk {
             mut effects,
-            journal,
+            mut journal,
             mut seated,
             plan,
         } = settled;
@@ -587,10 +587,22 @@ impl MobActor {
                 _ => None,
             })
             .collect::<BTreeSet<_>>();
+        // The edges the definition declares for the members this chunk
+        // seats, wired as a spawn of each would be, on the same prepared
+        // authority: their MembersWired rows go in the chunk's one append, so
+        // no seat is durable without its declared edges. An identity seated
+        // before, or embodied by a spawn, keeps the edges it holds.
+        let seated_ends = seated
+            .iter()
+            .map(|seat| (seat.agent_identity.clone(), seat.endpoint.clone()))
+            .collect::<Vec<_>>();
+        let declared_edges = self
+            .stage_seated_declared_edges(&mut authority, &seated_ends, &mut effects, &mut journal)
+            .await;
         let prepared = PreparedDslInput {
             authority,
             effects,
-            phase_changed: false,
+            phase_changed: declared_edges.phase_changed,
         };
         // Journal before commit: the machine never reports a member seated
         // before its MemberSpawned row is durable.
@@ -598,6 +610,8 @@ impl MobActor {
             self.commit_prepared_dsl_input(prepared)?;
             Vec::new()
         } else {
+            #[cfg(test)]
+            super::seat_wiring::record_seat_step_append_for_test(&self.definition.id, &journal);
             let events = Arc::clone(&self.events);
             self.commit_prepared_dsl_input_after(prepared, move || async move {
                 events.append_batch(journal).await.map_err(MobError::from)
@@ -617,10 +631,6 @@ impl MobActor {
                 }
             }
         }
-        let seated_members = seated
-            .iter()
-            .map(|seat| seat.agent_identity.clone())
-            .collect::<Vec<_>>();
         for seat in seated {
             tracing::debug!(
                 mob_id = %self.definition.id,
@@ -650,11 +660,10 @@ impl MobActor {
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = verify;
-        // The edges the definition declares for the members this chunk
-        // seated, wired as a spawn of each would be, with every member of the
-        // chunk seated already. An identity seated before, or embodied by a
-        // spawn, keeps the edges it holds.
-        Box::pin(self.wire_seated_declared_edges(&seated_members)).await;
+        // The chunk's declared edges are committed with its seats: the live
+        // ends trust their counterparts now, and any edge with a placed or
+        // peer-only end takes the single-edge wire path.
+        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         outcomes
             .into_iter()
             .map(|outcome| {
@@ -990,11 +999,13 @@ impl MobActor {
 
     /// The rotation's archive terminal: the current incarnation retired
     /// and the next one seated Dormant on the recorded session and endpoint,
-    /// in one transition. Its `MemberRetired` and `MemberSpawned` rows go to
-    /// the journal in one `append_batch` before the commit, so the identity is
-    /// never a non-member. The roster takes the next incarnation at once, and
-    /// the next incarnation, which holds none of its predecessor's edges, is
-    /// wired to the edges its definition declares (see `seat_wiring`).
+    /// in one transition. The next incarnation holds none of its
+    /// predecessor's edges and is wired to the edges its definition declares
+    /// in the same step (see `seat_wiring`). Its `MemberRetired`,
+    /// `MemberSpawned` and `MembersWired` rows go to the journal in one
+    /// `append_batch` before the commit, so the identity is never a
+    /// non-member, nor a member without its declared edges. The roster takes
+    /// the next incarnation at once.
     pub(super) async fn commit_member_rotation(
         &mut self,
         ctx: &DisposalContext,
@@ -1127,7 +1138,7 @@ impl MobActor {
         let phase_changed = transitions
             .iter()
             .any(|transition| transition.from_phase != transition.to_phase);
-        let effects: Vec<mob_dsl::MobMachineEffect> = transitions
+        let mut effects: Vec<mob_dsl::MobMachineEffect> = transitions
             .into_iter()
             .flat_map(mob_dsl::MobMachineTransition::into_effects)
             .collect();
@@ -1142,10 +1153,22 @@ impl MobActor {
                 _ => None,
             })
             .collect::<Vec<_>>();
+        // CommitMemberRotation ends every edge of the retired incarnation;
+        // the next one is wired to the edges its definition declares, as a
+        // spawn of it would be, in this same step and append.
+        let mut wired_rows = Vec::new();
+        let declared_edges = self
+            .stage_seated_declared_edges(
+                &mut authority,
+                &[(identity.clone(), rotation.endpoint.clone())],
+                &mut effects,
+                &mut wired_rows,
+            )
+            .await;
         let prepared = PreparedDslInput {
             authority,
             effects,
-            phase_changed,
+            phase_changed: phase_changed || declared_edges.phase_changed,
         };
         let creation = self.seat_creation_record(candidate).await;
         let mut spawned = crate::event::MemberSpawnedEvent::new(
@@ -1199,6 +1222,9 @@ impl MobActor {
                 },
             });
         }
+        batch.extend(wired_rows);
+        #[cfg(test)]
+        super::seat_wiring::record_seat_step_append_for_test(&self.definition.id, &batch);
         let events = Arc::clone(&self.events);
         let stored = self
             .commit_prepared_dsl_input_after(prepared, move || async move {
@@ -1233,10 +1259,10 @@ impl MobActor {
                 );
             }
         }
-        // CommitMemberRotation ends every edge of the retired incarnation;
-        // the next one is wired to the edges its definition declares, as a
-        // spawn of it would be.
-        Box::pin(self.wire_seated_declared_edges(std::slice::from_ref(identity))).await;
+        // The next incarnation's declared edges are committed with it: the
+        // live ends trust its recorded endpoint now, and any edge with a
+        // placed or peer-only end takes the single-edge wire path.
+        Box::pin(self.realize_staged_declared_edges(declared_edges)).await;
         Ok(())
     }
 }

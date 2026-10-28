@@ -23,12 +23,11 @@
 //!    identity, the batch is undone and the chunk applied again one identity
 //!    at a time, so the refused one is answered alone), then one runtime
 //!    obligation scan and the seated identities' `PlanBootMaterialization`
-//!    as one more batch, then the `MemberSpawned` rows in one `append_batch`
-//!    before the base-checked commit. The members the chunk seated are then
-//!    wired to the edges their definition declares, as a spawn of each would
-//!    be, in one more step on the actor: their `WireMembers` inputs on one
-//!    prepared authority and their `MembersWired` rows in one more
-//!    `append_batch`.
+//!    as one more batch, then the edges the definition declares for the
+//!    members it seats, as a spawn of each would be (their `WireMembers`
+//!    inputs), then the `MemberSpawned` rows and the edges' `MembersWired`
+//!    rows in one `append_batch` before the base-checked commit: a seat is
+//!    never durable without its declared edges.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
