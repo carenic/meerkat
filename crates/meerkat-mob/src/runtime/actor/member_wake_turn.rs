@@ -1793,6 +1793,9 @@ async fn plan_member_wake(input: WakeRestoreInput) -> Result<WakePlan, MobError>
         .await
         {
             Ok(view) => view,
+            // A read the store cannot serve now ends the wake retryable, as
+            // the bound session's view read does.
+            Err(error) if restore_error_is_retryable(&error) => return Err(error),
             Err(error) => {
                 return Ok(WakePlan::Restore {
                     plan: MemberRestorePlan::Unseated(member_restore_failure(

@@ -95,8 +95,10 @@ impl MobActor {
                 .await;
             }
             Ok(Some(mut targets)) => {
-                // The rebuilt members are held Waking: the Live-only target
-                // set leaves them out, and their readiness settles them.
+                // Each rebuilt member ran its own readiness right after its
+                // acceptance, before its work settled, and is Live or Broken.
+                // A member still held Waking for a readiness pass (none, once
+                // every member's work settled) is settled by this one.
                 targets.extend(self.held_member_readiness_targets().await);
                 self.spawn_resume_readiness_fanout(
                     targets,
@@ -228,6 +230,12 @@ impl MobActor {
             }
         };
         if matches!(observation, ExplicitResumeLiveObservation::AlreadyLive) {
+            // The live actor keeps its registration: no new one applies the
+            // run-start hold the host's build preparation staged.
+            if work.rebuild.build_hold_staged {
+                self.unstage_member_build_hold(&work.rebuild.bridge_session_id)
+                    .await;
+            }
             self.spawn_explicit_resume_provision(work, None);
             return;
         }
@@ -293,6 +301,12 @@ impl MobActor {
         });
         match verdict {
             Some(mob_dsl::MemberRevivalVerdictKind::BrokenRecorded) => {
+                // Nothing is provisioned for a Broken member: no registration
+                // applies the run-start hold its build preparation staged.
+                if work.rebuild.build_hold_staged {
+                    self.unstage_member_build_hold(&work.rebuild.bridge_session_id)
+                        .await;
+                }
                 self.record_member_restore_failure(
                     &work.rebuild.entry.agent_identity,
                     crate::runtime::handle::RestoreFailureDiagnostic {
@@ -589,7 +603,8 @@ impl MobActor {
         let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
         if let Some(attempt) = work.wake_attempt {
             self.resolve_explicit_resume_member_bound(&identity, attempt)?;
-            // Held Waking until the resume's readiness settles it Live.
+            // Held Waking until its own readiness, run right after this
+            // acceptance, settles it Live (or Broken).
             self.startup_boot_attempts
                 .insert(entry.agent_identity.clone(), attempt);
         }
@@ -602,12 +617,12 @@ impl MobActor {
 
     /// Resolve the wake attempt the rebuild of `identity` holds bound: the
     /// member's runtime binding is requested, and the member stays Waking.
-    /// The explicit resume's readiness then settles it Live (Live means
-    /// ready), or Broken with its readiness failure; its topology runs after
-    /// that, as for every member the resume finds live. A stale attempt (the
-    /// member's wake was abandoned or superseded meanwhile) is the machine's
-    /// no-op, and the rebuild is refused, so its provision is rolled back
-    /// rather than committed.
+    /// Its own readiness, run right after its acceptance, then settles it Live
+    /// (Live means ready), or Broken with its readiness failure; its topology
+    /// runs with the resume's, as for every member the resume finds live. A
+    /// stale attempt (the member's wake was abandoned or superseded meanwhile)
+    /// is the machine's no-op, and the rebuild is refused, so its provision
+    /// is rolled back rather than committed.
     fn resolve_explicit_resume_member_bound(
         &mut self,
         identity: &mob_dsl::AgentIdentity,

@@ -1072,6 +1072,9 @@ impl MobActor {
         };
         let mut rebuild = Vec::new();
         let mut reserving = Vec::new();
+        // Members whose live successor in this process serves them: the
+        // rebuild repoints each and provisions nothing.
+        let mut kept = BTreeSet::new();
         for ExplicitResumeBootMemberPrepared {
             identity,
             attempt,
@@ -1086,6 +1089,9 @@ impl MobActor {
             }
             match result {
                 Ok(member) if lift_current => {
+                    if !member.requires_materialization {
+                        kept.insert(identity.clone());
+                    }
                     reserving.push((
                         identity,
                         attempt,
@@ -1168,9 +1174,14 @@ impl MobActor {
                     .collect(),
             };
             // A member the explicit resume did not reserve still holds its
-            // plan attempt, which nothing would realize: it ends here with its
-            // own typed error, and a run-start hold its build preparation
-            // staged is removed.
+            // plan attempt, which nothing would realize, and a run-start hold
+            // its build preparation staged is removed. A member its live
+            // successor serves (the rebuild repointed it and provisioned
+            // nothing) is settled as the live member it is: the wake path
+            // realizes the plan's attempt on that successor (its readiness and
+            // topology, then Live), and the lift joins that wake. Any other
+            // member ends here with its own typed error.
+            let mut served = Vec::new();
             for (identity, attempt, staged_hold) in reserving {
                 let error = failed.remove(&identity);
                 let reserved = self
@@ -1184,6 +1195,17 @@ impl MobActor {
                 if let Some(session_id) = staged_hold {
                     self.unstage_member_build_hold(&session_id).await;
                 }
+                if error.is_none() && kept.contains(&identity) {
+                    self.member_wakes.pending.push_back(
+                        super::member_wake::PendingMemberMaterialization {
+                            identity: identity.clone(),
+                            cause: mob_dsl::MemberWakeCause::Boot,
+                            attempt,
+                        },
+                    );
+                    served.push((mob_dsl::AgentIdentity::from_domain(&identity), attempt));
+                    continue;
+                }
                 let error = error.unwrap_or_else(|| {
                     MobError::Internal(format!(
                         "the explicit resume did not reserve '{identity}' for its rebuild"
@@ -1191,6 +1213,19 @@ impl MobActor {
                 });
                 self.end_explicit_resume_boot_member(&identity, attempt, error)
                     .await;
+            }
+            if !served.is_empty() {
+                match self
+                    .explicit_resume_boot_members(&resume_attempt, served, Vec::new())
+                    .await
+                {
+                    Ok(members) => {
+                        if let Err(error) = self.join_explicit_resume_boot_members(members) {
+                            self.retain_explicit_resume_member_failure(error);
+                        }
+                    }
+                    Err(error) => self.retain_explicit_resume_member_failure(error),
+                }
             }
         }
         // The lift goes on only while it still waits on its members: one a

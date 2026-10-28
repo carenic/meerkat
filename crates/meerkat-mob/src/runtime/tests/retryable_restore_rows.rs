@@ -128,7 +128,10 @@ async fn a_wake_whose_takeover_outlasts_its_budget_ends_retryable_not_broken() {
     assert!(
         matches!(
             &refused,
-            Err(MobError::MemberWakeRefused { refusal, .. }) if refusal.is_retryable()
+            Err(MobError::MemberWakeRefused {
+                refusal: crate::MemberWakeRefusal::ResumeGateUnavailable,
+                ..
+            })
         ),
         "a takeover still in flight ends the wake retryable: {refused:?}"
     );
@@ -309,10 +312,20 @@ async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift
         built_stopped_mob("lift-observation-store-failure", 3, None).await;
     let (failing, failing_session) = members[1].clone();
     service.fail_next_resume_authority_observes_for(&failing_session, 1);
+    // The explicit-resume work path's observations pass its probe (none is
+    // held); the actor's wake path never does.
+    let observations =
+        crate::runtime::actor::probe_explicit_resume_observations_for_test(resumed.mob_id());
+    observations.release(members.len());
 
     let lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
         .expect("the explicit resume answers");
+    assert_eq!(
+        observations.arrived(),
+        members.len(),
+        "the lift observed every member, the failing one included, on the explicit-resume work path"
+    );
     let error = lifted.expect_err("the lift answers the member's store error");
     let cause = match &error {
         MobError::SharedLifecycleFailure(inner) => inner.as_ref(),

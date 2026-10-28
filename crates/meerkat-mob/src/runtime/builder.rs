@@ -11871,11 +11871,15 @@ pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
 /// Whether a session service failure clears on its own: the store could not
 /// serve the request now
 /// ([`super::actor::SessionStoreFailureClass::Unavailable`]), the session was
-/// busy, its runtime authority was unavailable, or another runtime owner holds
-/// its hosting claim (or the claim cannot be taken now). A malformed or
-/// refusing persisted state, a held, refused or quarantined durable tail, an
-/// agent fault and every other typed cause are terminal. The settlement
-/// diagnostics a failure carries never change its class.
+/// busy, its runtime authority was unavailable, another runtime owner holds
+/// its hosting claim (or the claim cannot be taken now), its durable tail is
+/// held until the machine-authorized recovery promotes it, or its external
+/// write authority could not be checked without waiting. A malformed or
+/// refusing persisted state, a durable tail the recovery refused (which can
+/// need an operator's investigation), quarantined or diverged durable
+/// evidence (which needs its sanctioned repair), an agent fault and every
+/// other typed cause are terminal. The settlement diagnostics a failure
+/// carries never change its class.
 pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionError) -> bool {
     use meerkat_core::service::SessionError;
 
@@ -11888,12 +11892,13 @@ pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionE
         SessionError::RuntimeUnavailable { .. }
         | SessionError::Busy { .. }
         | SessionError::ServedElsewhere { .. }
-        | SessionError::HostingUnavailable { .. } => true,
+        | SessionError::HostingUnavailable { .. }
+        | SessionError::DurableTailHeldForRecovery { .. }
+        | SessionError::ExternalWriteFenceBackoff { .. } => true,
         SessionError::NotFound { .. }
         | SessionError::PersistenceDisabled
         | SessionError::CompactionDisabled
         | SessionError::NotRunning { .. }
-        | SessionError::DurableTailHeldForRecovery { .. }
         | SessionError::DurableTailRecoveryRefused { .. }
         | SessionError::DurableEvidenceQuarantined { .. }
         | SessionError::WholeBlobAuditedEndpointDivergence { .. }
@@ -11902,7 +11907,6 @@ pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionE
         | SessionError::CapabilityUnavailable(_)
         | SessionError::Unsupported(_)
         | SessionError::ExternalWriteFenceConflict { .. }
-        | SessionError::ExternalWriteFenceBackoff { .. }
         | SessionError::ForkInstructionRefused(_) => false,
     }
 }

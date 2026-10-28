@@ -23419,8 +23419,10 @@ impl MobActor {
             progress,
             reply_tx,
         } = pending;
-        // The members this resume rebuilt are held Waking: their readiness
-        // settles each Live, or Broken with its failure (the member's own
+        // A member held Waking for this pass (each rebuilt member already
+        // ran its own readiness and settled before the pass began, so none
+        // is left once every member's work settled) is settled from its
+        // outcome: Live, or Broken with its failure (the member's own
         // outcome), before anything else of the resume continues.
         let (outcomes, held_failure) = self.settle_held_member_readiness(outcomes).await;
         if let Err(error) = self.apply_explicit_resume_input(
