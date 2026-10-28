@@ -1292,6 +1292,15 @@ them.
   fails the same way. `OnDemandVerified` and `Eager` find it before the mob
   reports ready, at every start.
 
+- `meerkat-mob`: a member retirement that a restart recovered, in a mob that
+  came back running, is not retried in the running process when one of its
+  steps fails on a transient error, such as an archive of the member's
+  session that fails once. The retirement settles stuck and the member stays
+  retiring until the retirement is driven again: re-driving it
+  (`MobHandle::redrive_retirement`) completes it, and so does the mob's next
+  start, which drives the recovered retirement again. A plain retire of the
+  member answers that its retirement is stuck.
+
 - With TCP or UDS member comms (`MobBuilder::with_network_member_comms`),
   members are not lazy: every start of the mob, and every lift of a stopped
   one, wakes every member, whatever the restore policy. A dormant member has
