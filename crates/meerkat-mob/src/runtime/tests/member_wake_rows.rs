@@ -1467,6 +1467,92 @@ async fn a_stop_during_a_wake_abandons_the_wake_without_fail_stop() {
     fixture.finish().await;
 }
 
+/// A destroy during a wake waits for the wake's in-flight step: it tears
+/// down the storage and runtime that step works on, so it does not preempt
+/// it as a stop does. Once the held wake finishes, the destroy runs and
+/// leaves no session behind: no live session actor, and no resumable
+/// durable session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_destroy_during_a_wake_waits_for_it_and_leaves_no_session_behind() {
+    let fixture = WakeFixture::new("wake-destroy").await;
+    let member = fixture.spawn("destroy-member").await;
+    let session = fixture.session(&member).await;
+    fixture.release(&member).await;
+
+    fixture.preparer.close_gate();
+    let entered = fixture.preparer.prepared_count();
+    let wake = {
+        let handle = fixture.handle.clone();
+        let woken = member.clone();
+        tokio::spawn(async move { handle.ensure_member_live(&woken).await })
+    };
+    fixture.preparer.wait_entered(entered + 1).await;
+    fixture
+        .wait_residency(&member, Some(mob_dsl::MemberMaterializationPhase::Waking))
+        .await;
+
+    let mut destroy = fixture
+        .handle
+        .enqueue_actor_command_for_test(|reply_tx| MobCommand::Destroy { reply_tx })
+        .await
+        .expect("enqueue the destroy");
+    // The actor reads its commands in order: a status read sent after the
+    // destroy is answered Running only if the destroy was deferred (an
+    // admitted destroy runs first and leaves the mob Destroyed).
+    let status = tokio::time::timeout(STEP, fixture.handle.status())
+        .await
+        .expect("the status answers while the destroy waits")
+        .expect("read the mob's status");
+    assert_eq!(
+        status,
+        MobState::Running,
+        "the destroy waits for the held wake"
+    );
+    assert_eq!(
+        fixture.residency(&member),
+        Some(mob_dsl::MemberMaterializationPhase::Waking),
+        "the wake's attempt is still open"
+    );
+    assert!(
+        matches!(
+            destroy.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ),
+        "the destroy has not answered while the wake is held"
+    );
+
+    fixture.preparer.open_gate();
+    tokio::time::timeout(WAIT, wake)
+        .await
+        .expect("the wake answers")
+        .expect("the wake task joins")
+        .expect("the wake the destroy waited for completes");
+    tokio::time::timeout(WAIT, destroy)
+        .await
+        .expect("the destroy answers once the wake settled")
+        .expect("the destroy's reply")
+        .expect("the mob is destroyed");
+    assert!(
+        !MobSessionService::live_session_actor_registered(&*fixture.service, &session)
+            .await
+            .unwrap_or(false),
+        "the destroy leaves no live session actor"
+    );
+    let authority =
+        MobSessionService::observe_session_resume_authority(&*fixture.service, &session)
+            .await
+            .expect("read the session's durable authority");
+    let lifecycle = authority.lifecycle();
+    assert!(
+        !matches!(
+            lifecycle,
+            crate::runtime::session_service::SessionResumeLifecycle::Active { .. }
+        ),
+        "the destroy leaves no resumable session: {lifecycle:?}"
+    );
+    fixture.finish().await;
+}
+
 /// A wake rebuilds the member through the customizer's resume hook,
 /// with what the customizer answers now, never a previous build's spec.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

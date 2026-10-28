@@ -4795,6 +4795,15 @@ impl MobActor {
             &continuation.participants,
             scope,
         );
+        // One effect of a member at a time: a started retirement's own steps
+        // run after the member's in-flight wake or warm-reload step returns.
+        // The retirement's start closed that step's attempt, so its late
+        // commit fails the attempt fence and rolls its provision back first.
+        let wakes_settled = if continuation.retirement_started {
+            self.member_wake_effects_settled(&identity)
+        } else {
+            None
+        };
         self.retirements.insert(identity.clone(), continuation);
         let commit_identity = identity.clone();
         #[cfg(test)]
@@ -4804,6 +4813,12 @@ impl MobActor {
                 context,
                 members: commit,
                 effects: Box::pin(async move {
+                    let effect = async move {
+                        if let Some(wakes_settled) = wakes_settled {
+                            wakes_settled.await;
+                        }
+                        effect.await
+                    };
                     #[cfg(test)]
                     let effect = async move {
                         if let Some(held) = held {

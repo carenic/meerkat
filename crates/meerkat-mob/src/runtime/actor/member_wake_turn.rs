@@ -581,7 +581,7 @@ impl MobActor {
     {
         let worker_run = run.clone();
         let worker_rollback = rollback.clone();
-        self.dispatch_member_effect(MemberEffectRequest {
+        self.dispatch_member_wake_effect(MemberEffectRequest {
             context,
             members: vec![fence],
             effects: Box::pin(async move {
@@ -696,10 +696,15 @@ impl MobActor {
             }
             WakePlan::NoSuccessor { .. } | WakePlan::EndpointMismatch { .. } => None,
         };
-        if !fence_current || !self.member_wake_attempt_is_open(&run.identity, run.attempt) {
+        if !fence_current
+            || !self.member_wake_attempt_is_open(&run.identity, run.attempt)
+            || self.retirements.contains_key(&run.identity)
+        {
             // Stale: the machine closed the attempt, or the member's
-            // incarnation changed, while it planned. Nothing of the plan is
-            // applied; its provision is rolled back.
+            // incarnation changed, while it planned, or a retirement of the
+            // member is in progress (its start closes this attempt, and its
+            // steps are fenced to the incarnation it started from). Nothing
+            // of the plan is applied; its provision is rolled back.
             self.roll_back_member_wake(run, plan_rollback);
             return;
         }
