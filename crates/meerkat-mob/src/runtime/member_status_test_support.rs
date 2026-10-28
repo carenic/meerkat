@@ -58,6 +58,7 @@ pub async fn member_status_deadline_after_snapshot_wait_for_test()
         agent_runtime_id: None,
         fence_token: None,
         dormant: false,
+        unborn_seat: false,
     };
     let (observation, drain) = MobActor::observe_member_status_session(
         service.clone(),

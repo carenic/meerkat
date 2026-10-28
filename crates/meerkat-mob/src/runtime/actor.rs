@@ -14717,6 +14717,10 @@ impl MobActor {
                 .map(|(agent_runtime_id, _)| agent_runtime_id.clone()),
             fence_token: runtime_material.map(|(_, fence_token)| fence_token),
             dormant: super::boot_plan::member_is_dormant(self.dsl_authority.state(), &dsl_identity),
+            unborn_seat: super::boot_plan::domain_member_seat_session_unborn(
+                self.dsl_authority.state(),
+                &domain_identity,
+            ),
         })
     }
 
@@ -14791,6 +14795,14 @@ impl MobActor {
                 observation.runtime_run_state =
                     observe_member_runtime_run_state(runtime, session_id).await;
             }
+        }
+        // A seat whose session is unborn has nothing to read yet (its first
+        // wake creates the session): its view is an empty session's, as an
+        // eagerly created session shows before its first turn. No view read
+        // and no authority probe, and no marker: the preview is observed
+        // empty, not unavailable.
+        if target.unborn_seat {
+            return (observation, None);
         }
         // Preview and token count come from the session view, which serves
         // the live actor's published state or the committed durable head and

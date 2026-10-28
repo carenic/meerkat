@@ -3537,3 +3537,74 @@ async fn the_all_member_waits_read_a_dormant_member_at_most_once_per_call() {
         );
     }
 }
+
+/// A seated member never woken, whose seat session is unborn, reads like a
+/// member eagerly created with an empty session before its first turn: run
+/// state idle, healthy, no in-flight work, no preview and zero tokens with
+/// no `preview_unavailable` marker (a `session_absent` would claim the
+/// preview never comes back, where its first wake creates the session).
+/// The status read reads nothing of the session, which does not exist yet,
+/// and wakes nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_never_woken_seats_status_reads_like_an_idle_member_with_an_empty_session() {
+    use crate::runtime::handle::{MemberHealthClass, MemberRunState};
+
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, _events) = seat_mob("unborn-status", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
+    service.serve_durable_head_status_views();
+    let identity = worker(0);
+    let outcomes = handle
+        .seat_dormant_members(vec![turn_driven(&identity)])
+        .await
+        .expect("the batch answers");
+    let session = fresh_seat_session_id(
+        handle.mob_id(),
+        handle.incarnation(),
+        &identity,
+        crate::ids::Generation::INITIAL,
+    );
+    assert!(
+        matches!(&outcomes[0], DormantSeatOutcome::Seated { session_id, .. } if session_id == &session),
+        "{outcomes:?}"
+    );
+    assert!(seat_session_unborn(&handle, &identity));
+    let reads_before = service.session_reads_of(&session).calls;
+    let snapshots_before = service.execution_snapshot_calls();
+
+    let status = handle
+        .member_status(&identity)
+        .await
+        .expect("a seated member's status");
+    let progress = status
+        .progress
+        .as_ref()
+        .expect("a local member's status carries its progress");
+    assert_eq!(progress.run_state, MemberRunState::Idle, "{status:?}");
+    assert_eq!(progress.health, MemberHealthClass::Healthy, "{status:?}");
+    assert_eq!(progress.in_flight_work, 0, "{status:?}");
+    assert_eq!(status.output_preview, None, "{status:?}");
+    assert_eq!(status.tokens_used, 0, "{status:?}");
+    assert_eq!(status.preview_unavailable, None, "{status:?}");
+    assert_eq!(status.current_session_id.as_ref(), Some(&session));
+
+    assert_eq!(
+        service.durable_reads_of(&session),
+        DurableSessionReadCounts::default(),
+        "nothing of the unborn session is read, its resume authority included"
+    );
+    assert_eq!(service.session_reads_of(&session).calls, reads_before);
+    assert_eq!(service.execution_snapshot_calls(), snapshots_before);
+    assert!(
+        service.recorded_create_requests().await.is_empty(),
+        "the status read created no session"
+    );
+    assert_eq!(
+        phase_of(&handle, &identity),
+        Some(dsl::MemberMaterializationPhase::Dormant),
+        "the status read woke nothing"
+    );
+    assert!(seat_session_unborn(&handle, &identity));
+}
