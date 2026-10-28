@@ -4254,8 +4254,11 @@ macro_rules! mob_catalog_machine_dsl {
 
         // A spawn-profile authority is the pending grant of the operation that
         // consumes it: a spawn or a seat of an identity that is not seated, or
-        // the rotation of a member under its rotation intent. No grant
-        // outlives the operation it was recorded for.
+        // the rotation of a member under its rotation intent. A seated member
+        // holds a grant only under its rotation intent. (An identity that is
+        // not seated can keep a grant past an aborted spawn or an abandoned
+        // rotation; every operation that consumes one authorizes in the same
+        // step.)
         invariant spawn_profile_authority_is_a_pending_grant {
             for_all(id in self.spawn_profile_authority_profile_names.keys(),
                 self.identity_to_runtime.contains_key(id) == false

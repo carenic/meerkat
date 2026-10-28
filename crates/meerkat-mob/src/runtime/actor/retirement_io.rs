@@ -3631,11 +3631,12 @@ impl MobActor {
                 // rotation (a stopped or destroying mob, a held peer id)
                 // journals and commits nothing, and the member stays seated.
                 let mut effects = prepared.transition.effects().to_vec();
-                if let RetirementReply::Rotate { rotation, .. } = &continuation.reply
-                    && let Some(rotation_effects) =
-                        Self::apply_member_rotation_begin(&mut prepared.authority, entry, rotation)?
-                {
-                    effects.extend(rotation_effects);
+                if let RetirementReply::Rotate { rotation, .. } = &continuation.reply {
+                    effects.extend(Self::apply_member_rotation_begin(
+                        &mut prepared.authority,
+                        entry,
+                        rotation,
+                    )?);
                 }
                 if !continuation.retirement_started {
                     self.append_retirement_started_event_for_entry(

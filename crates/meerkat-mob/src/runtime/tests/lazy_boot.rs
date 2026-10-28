@@ -1611,6 +1611,64 @@ async fn a_rotation_after_a_wake_takes_its_new_role_at_once() {
     assert_eq!(listed.role, ProfileName::from("lead"));
 }
 
+/// A rotation re-driven over its stuck retirement with another role seats
+/// that role: the re-drive's profile authority replaces the grant the first
+/// attempt recorded under the rotation's intent. The new role also flips
+/// external addressability, which the rotation's commit holds to its grant,
+/// so a re-drive that kept the first attempt's grant could never commit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_redriven_with_another_role_seats_that_role() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, service, _events) = seat_mob("rotation-redrive-role", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
+    let identity = worker(0);
+    handle
+        .seat_dormant_members(vec![turn_driven(&identity)])
+        .await
+        .expect("the batch answers");
+    handle
+        .ensure_member_live(&identity)
+        .await
+        .expect("the wake materializes the member");
+    let old = handle
+        .resolve_bridge_session_id(&identity)
+        .await
+        .expect("a session-backed member");
+    // The first attempt's retirement starts and sticks at its archive.
+    service.set_archive_failure(&old).await;
+    tokio::time::timeout(LAZY_STEP, handle.rotate_member(turn_driven(&identity)))
+        .await
+        .expect("the first rotation answers")
+        .expect_err("the first rotation's retirement sticks at its archive");
+    service.clear_archive_failure(&old).await;
+    // The lead profile is externally addressable; the worker profile is not.
+    let mut lead = SpawnMemberSpec::new("lead", identity.clone());
+    lead.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    tokio::time::timeout(LAZY_STEP, handle.rotate_member(lead))
+        .await
+        .expect("the re-driven rotation answers")
+        .expect("the re-driven rotation commits under its own grant");
+    let listed = handle
+        .list_members()
+        .await
+        .into_iter()
+        .find(|entry| entry.agent_identity == identity)
+        .expect("the member is listed");
+    assert_eq!(listed.role, ProfileName::from("lead"));
+    assert_eq!(
+        handle
+            .machine_state_watch_rx
+            .borrow()
+            .member_profile_names
+            .get(&dsl::AgentIdentity::from_domain(&identity))
+            .map(String::as_str),
+        Some("lead"),
+        "the machine seats the role the re-drive was given"
+    );
+}
+
 /// A rotation retires the member's incarnation and seats the next
 /// one on a new name-based session in one journal batch: MemberRetired is
 /// followed at once by the next MemberSpawned, and the old session is

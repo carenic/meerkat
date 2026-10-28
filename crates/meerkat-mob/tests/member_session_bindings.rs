@@ -362,7 +362,16 @@ fn respawn_requires_terminal_retirement_then_fresh_exact_successor_spawn() {
         .member_session_bindings
         .get(&identity("alpha"))
         .cloned();
+    // A seated member's own check records no grant: only a spawn of an
+    // unseated identity, or a rotation, holds one.
     authorize_spawn_profile(&mut authority, "alpha", 1);
+    assert!(
+        !authority
+            .state()
+            .spawn_profile_authority_profile_names
+            .contains_key(&identity("alpha")),
+        "a seated member's profile check records no spawn grant",
+    );
     apply_spawn_ladder(&mut authority, "alpha", 1, "bridge-a-gen2", prior.clone())
         .expect_err("a live member must not be overwritten by a hot replacement spawn");
     assert_eq!(
@@ -414,6 +423,9 @@ fn respawn_requires_terminal_retirement_then_fresh_exact_successor_spawn() {
         })
         .expect("terminal retirement must clear the old current incarnation");
 
+    // The successor's spawn authorizes its profile once the predecessor is
+    // gone, as a production respawn does after its retirement settles.
+    authorize_spawn_profile(&mut authority, "alpha", 1);
     let transition = apply_spawn_ladder(&mut authority, "alpha", 1, "bridge-a-gen2", None)
         .expect("exact-successor respawn must re-enter through the fresh branch");
 
