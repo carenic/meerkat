@@ -2938,6 +2938,21 @@ fn route_install_obligations_validate_kind_against_wiring_graph() {
     let host = host_id("host-b");
     bind_owner_bridge(&mut authority);
     bind_host(&mut authority, &host, 1, HostCaps::FULL);
+    // A wiring edge joins seated members (`edge_endpoints_seated_or_held`):
+    // seat both ends as local members, so neither is placed on the host and
+    // the route-install guards read the same placement facts as before.
+    seed_local_member(
+        &mut authority,
+        "alpha",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+    seed_local_member(
+        &mut authority,
+        "beta",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
 
     let edge = WiringEdge::new(identity("alpha"), identity("beta"));
     let install = RouteInstallObligation {
@@ -3522,6 +3537,20 @@ fn route_install_requires_bound_host() {
     let mut authority = MobMachineAuthority::new();
     bind_owner_bridge(&mut authority);
     let host = host_id("host-c");
+    // A wiring edge joins seated members (`edge_endpoints_seated_or_held`):
+    // seat both ends, local, so only the host's bind phase decides.
+    seed_local_member(
+        &mut authority,
+        "alpha",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
+    seed_local_member(
+        &mut authority,
+        "beta",
+        0,
+        SpawnPolicyRuntimeMode::TurnDriven,
+    );
     let edge = WiringEdge::new(identity("alpha"), identity("beta"));
     MobMachineMutator::apply(
         &mut authority,

@@ -632,10 +632,27 @@ fn unwire_input(a: &str, b: &str) -> MobMachineInput {
     }
 }
 
+/// Seat "alpha" and "beta" through the spawn ladder and return the topology
+/// epoch the seating left. A wiring edge joins seated members (the
+/// `edge_endpoints_seated_or_held` guard on `WireMembers`), so the wiring rows
+/// seat both ends first and pin every epoch relative to this one.
+fn seat_wiring_ends(authority: &mut MobMachineAuthority) -> u64 {
+    for name in ["alpha", "beta"] {
+        authorize_spawn_profile(authority, name, 0);
+        apply_spawn_ladder(authority, name, 0, &format!("bridge-{name}-gen1"), None)
+            .expect("a wiring end is seated through the spawn ladder");
+    }
+    assert!(
+        authority.state().wiring_edges.is_empty(),
+        "seating wires nothing",
+    );
+    authority.state().topology_epoch
+}
+
 #[test]
 fn wire_members_inserts_edge_bumps_epoch_and_emits_wiring_graph_changed() {
     let mut authority = MobMachineAuthority::new();
-    assert_eq!(authority.state().topology_epoch, 0);
+    let seated_epoch = seat_wiring_ends(&mut authority);
 
     let transition = MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta"))
         .expect("wire_members accepted");
@@ -649,7 +666,7 @@ fn wire_members_inserts_edge_bumps_epoch_and_emits_wiring_graph_changed() {
     );
     assert_eq!(
         authority.state().topology_epoch,
-        1,
+        seated_epoch + 1,
         "topology_epoch must increment by exactly 1 per wire mutation",
     );
 
@@ -659,7 +676,7 @@ fn wire_members_inserts_edge_bumps_epoch_and_emits_wiring_graph_changed() {
     });
     assert_eq!(
         epoch_from_effect,
-        Some(1),
+        Some(seated_epoch + 1),
         "WiringGraphChanged must carry the post-transition epoch",
     );
 }
@@ -667,9 +684,10 @@ fn wire_members_inserts_edge_bumps_epoch_and_emits_wiring_graph_changed() {
 #[test]
 fn wire_members_idempotently_accepts_duplicate_edge_without_bumping_epoch() {
     let mut authority = MobMachineAuthority::new();
+    let seated_epoch = seat_wiring_ends(&mut authority);
     MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta"))
         .expect("first wire accepted");
-    assert_eq!(authority.state().topology_epoch, 1);
+    assert_eq!(authority.state().topology_epoch, seated_epoch + 1);
 
     let transition = MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta"))
         .expect("re-wiring a present edge is an idempotent no-op");
@@ -690,7 +708,7 @@ fn wire_members_idempotently_accepts_duplicate_edge_without_bumping_epoch() {
     );
     assert_eq!(
         authority.state().topology_epoch,
-        1,
+        seated_epoch + 1,
         "topology_epoch must not advance on an idempotent transition",
     );
 }
@@ -698,9 +716,10 @@ fn wire_members_idempotently_accepts_duplicate_edge_without_bumping_epoch() {
 #[test]
 fn unwire_members_removes_edge_bumps_epoch_and_emits_wiring_graph_changed() {
     let mut authority = MobMachineAuthority::new();
+    let seated_epoch = seat_wiring_ends(&mut authority);
     MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta"))
         .expect("initial wire accepted");
-    assert_eq!(authority.state().topology_epoch, 1);
+    assert_eq!(authority.state().topology_epoch, seated_epoch + 1);
 
     let transition = MobMachineMutator::apply(&mut authority, unwire_input("alpha", "beta"))
         .expect("unwire_members accepted");
@@ -712,13 +731,13 @@ fn unwire_members_removes_edge_bumps_epoch_and_emits_wiring_graph_changed() {
             .contains(&WiringEdge::new(identity("alpha"), identity("beta"))),
         "wiring_edges must not contain the edge after UnwireMembers",
     );
-    assert_eq!(authority.state().topology_epoch, 2);
+    assert_eq!(authority.state().topology_epoch, seated_epoch + 2);
 
     let epoch_from_effect = transition.effects().iter().find_map(|e| match e {
         MobMachineEffect::WiringGraphChanged { epoch } => Some(*epoch),
         _ => None,
     });
-    assert_eq!(epoch_from_effect, Some(2));
+    assert_eq!(epoch_from_effect, Some(seated_epoch + 2));
 }
 
 #[test]
@@ -733,7 +752,7 @@ fn unwire_members_idempotently_accepts_absent_edge_without_bumping_epoch() {
 #[test]
 fn topology_epoch_increments_monotonically_across_wire_mutations() {
     let mut authority = MobMachineAuthority::new();
-    let starting_epoch = authority.state().topology_epoch;
+    let starting_epoch = seat_wiring_ends(&mut authority);
 
     MobMachineMutator::apply(&mut authority, wire_input("alpha", "beta")).expect("wire accepted");
     assert_eq!(authority.state().topology_epoch, starting_epoch + 1);

@@ -35222,6 +35222,17 @@ async fn test_respawn_repairs_local_machine_edge_without_roster_projection() {
     );
 }
 
+/// Negative row since the 0.9.7 residency model: a machine-local edge to a
+/// retired peer cannot exist. Every wiring edge joins two seated members (or
+/// a member a respawn's preserved topology holds): the
+/// `edge_endpoints_seated_or_held` guard on `WireMembers` and the
+/// `wiring_edges_connect_seated_members` invariant. The row used to seed such
+/// an edge and pin that a respawn reports it (`TopologyRestoreFailed` naming
+/// the retired peer); it now pins that the machine refuses the edge, typed and
+/// without touching the graph, and that the respawn that follows has no edge
+/// to the retired peer to restore, report or project. A respawn's report of a
+/// peer it cannot restore stays pinned by
+/// `test_respawn_role_wired_member_survives_peer_without_comms_runtime`.
 #[tokio::test]
 async fn test_respawn_reports_machine_local_edge_to_retired_peer() {
     let (handle, _service) = create_test_mob(sample_definition()).await;
@@ -35260,41 +35271,94 @@ async fn test_respawn_reports_machine_local_edge_to_retired_peer() {
             .is_none(),
         "test setup should remove the old peer from the live roster"
     );
-    let stale_edge = crate::machines::mob_machine::WiringEdge::new(
-        crate::machines::mob_machine::AgentIdentity::from(left.as_str()),
-        crate::machines::mob_machine::AgentIdentity::from(right.as_str()),
+    let machine_left = crate::machines::mob_machine::AgentIdentity::from(left.as_str());
+    let machine_right = crate::machines::mob_machine::AgentIdentity::from(right.as_str());
+    let stale_edge =
+        crate::machines::mob_machine::WiringEdge::new(machine_left.clone(), machine_right.clone());
+    let before = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the terminal retire");
+    assert!(
+        before.identity_to_runtime.contains_key(&machine_left),
+        "the surviving end is seated"
     );
-    handle
+    assert!(
+        !before.identity_to_runtime.contains_key(&machine_right),
+        "the retired peer is no longer seated"
+    );
+    assert!(
+        !before.pending_respawn_topology.contains(&machine_right),
+        "no respawn's preserved topology holds the retired peer"
+    );
+    assert!(
+        !before.wiring_edges.contains(&stale_edge),
+        "no edge to the retired peer survives its terminal retire"
+    );
+
+    // The only refusal open to this edge is the seating guard: the mob is
+    // Running, the edge is not wired and neither end is placed.
+    let refusal = handle
         .project_machine_input(crate::machines::mob_machine::MobMachineInput::WireMembers {
-            edge: stale_edge,
+            edge: stale_edge.clone(),
         })
         .await
-        .expect("seed stale machine-owned edge after terminal retire cleanup");
+        .expect_err("the machine refuses a local edge to a retired peer");
+    match &refusal {
+        MobError::Internal(message) => assert!(
+            message.starts_with("DSL authority (project_machine_input) rejected WireMembers")
+                && message.ends_with(
+                    "guard rejected transition from phase Running for input::WireMembers"
+                ),
+            "the refusal is the machine's guard rejection of the wiring: {message}"
+        ),
+        other => panic!("expected the machine's guard rejection of the wiring, got {other:?}"),
+    }
+    let after = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the refused wiring");
+    assert_eq!(
+        after.wiring_edges, before.wiring_edges,
+        "the refused wiring leaves the machine-owned graph untouched"
+    );
 
-    let error = handle
+    handle
         .respawn(
             AgentIdentity::from(left.as_str()),
-            Some("report stale peer".into()),
+            Some("no stale peer to report".into()),
         )
         .await
-        .expect_err("respawn should report machine edge to retired peer");
-    let failed_peer_ids = match error {
-        crate::runtime::handle::MobRespawnError::TopologyRestoreFailed {
-            failed_peer_ids, ..
-        } => failed_peer_ids,
-        other => panic!("expected TopologyRestoreFailed, got {other:?}"),
-    };
-    assert_eq!(
-        failed_peer_ids,
-        vec![crate::ids::RespawnTopologyPeerId::from(right.as_str())],
-        "machine-owned local peer edge must reach generated respawn topology result authority"
+        .expect("a respawn has no machine edge to a retired peer to restore or report");
+    let left_after = handle
+        .get_member(&AgentIdentity::from(left.as_str()))
+        .await
+        .unwrap()
+        .expect("left after respawn");
+    assert!(
+        !left_after
+            .wired_to
+            .contains(&AgentIdentity::from(right.as_str())),
+        "the respawn does not resurrect an edge to the retired peer"
+    );
+    let respawned = handle
+        .query_machine_state()
+        .await
+        .expect("machine state after the respawn");
+    assert!(
+        respawned
+            .wiring_edges
+            .iter()
+            .all(|edge| edge.a != machine_right && edge.b != machine_right),
+        "no machine-owned edge names the retired peer after the respawn: {:?}",
+        respawned.wiring_edges
     );
     let events = handle.events().replay_all().await.expect("replay");
     assert!(
         !events
             .iter()
             .any(|event| matches!(event.kind, MobEventKind::MembersWired { .. })),
-        "failed respawn trust repair must not synthesize a MembersWired projection event"
+        "neither the refused edge nor the respawn may synthesize a MembersWired projection event"
     );
 }
 
