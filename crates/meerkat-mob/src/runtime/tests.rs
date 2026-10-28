@@ -64641,6 +64641,15 @@ async fn whole_crew_stop_resume_rebuild_keeps_parent_owned_worker_owner() {
     )
     .await;
     whole_crew_resume(&handle, "resume crew with lost worker incarnations").await;
+    // Under the lazy default the resume leaves a worker that holds no work
+    // Dormant; its wake rebuilds it, rebinding under the coordinator's owner
+    // context the worker's binding preserved.
+    for worker in [&actor_lost, &attachment_lost, &autonomous_actor_lost] {
+        handle
+            .ensure_member_live(&worker.identity)
+            .await
+            .unwrap_or_else(|error| panic!("'{}' wakes: {error:?}", worker.identity));
+    }
 
     assert_eq!(
         adapter

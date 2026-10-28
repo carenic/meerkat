@@ -132,6 +132,13 @@ impl SessionOpsBindingWitness {
         (self.generic_session_child && &self.owner_bridge_session_id != child_session_id)
             .then_some(&self.owner_bridge_session_id)
     }
+
+    /// Whether the witnessed binding was installed from a spawn-time owner
+    /// context: a coordinator session other than `child_session_id` owns its
+    /// mob-child operation (see [`Self::parent_owner`]).
+    pub(crate) fn is_parent_owned(&self, child_session_id: &SessionId) -> bool {
+        self.parent_owner(child_session_id).is_some()
+    }
 }
 
 #[cfg(feature = "runtime-adapter")]
