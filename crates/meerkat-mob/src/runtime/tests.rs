@@ -14586,6 +14586,29 @@ impl SessionAgent for PersistentMockAgent {
         ))
     }
 
+    /// A runtime-backed turn (every turn a runtime-backed member serves): the
+    /// runtime routed its handling mode and lowered its prompt to typed
+    /// appends before this runs, and this mock answers every turn with the
+    /// same reply, whatever its input, as [`Self::run_with_events`] does.
+    async fn run_turn_with_events(
+        &mut self,
+        input: meerkat_session::ephemeral::SessionAgentTurnInput,
+        event_tx: tokio::sync::mpsc::Sender<AgentEvent>,
+    ) -> Result<RunResult, meerkat_core::error::AgentError> {
+        if input.handling_mode != HandlingMode::Queue {
+            return Err(meerkat_core::error::AgentError::ConfigError(format!(
+                "unexpected persistent mock handling mode: {:?}",
+                input.handling_mode,
+            )));
+        }
+        if input.render_metadata.is_some() {
+            return Err(meerkat_core::error::AgentError::ConfigError(
+                "the persistent mock does not consume render metadata".to_string(),
+            ));
+        }
+        self.run_with_events(input.prompt, event_tx).await
+    }
+
     fn set_skill_references(&mut self, _refs: Option<Vec<meerkat_core::skills::SkillKey>>) {}
 
     fn set_turn_tool_overlay(
