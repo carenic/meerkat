@@ -2228,15 +2228,15 @@ async fn a_wake_queued_from_a_member_effect_completion_starts_with_no_further_co
 
 /// Every path that keeps a member's live actor instead of rebuilding it (a
 /// Resume-mode spawn, a restore that keeps the actor or a live successor, a
-/// wake's live successor, a restore whose build found the member's session
-/// already live, and the explicit resume of a mob stopped in this process,
-/// at its preparation and at its already-live observation) calls
-/// the one shared binding check, so none of them keeps an
-/// actor that runs another binding than the member's spec. Where a restore
-/// or a wake records the member broken on a conflict, it also retires the
-/// live actor, so no surface reaches the old binding. Read from the shipped
-/// source with a lexer pass (comments and literals blanked, test-only items
-/// removed), never a text search.
+/// wake's live successor, a restore or a warm reload whose build found the
+/// member's session already live, and the explicit resume of a mob stopped
+/// in this process, at its preparation and at its already-live observation)
+/// calls the one shared binding check, so none of them keeps an
+/// actor that runs another binding than the member's spec. Where a restore,
+/// a wake or a reload records the member broken on a conflict, it also
+/// retires the live actor, so no surface reaches the old binding. Read from
+/// the shipped source with a lexer pass (comments and literals blanked,
+/// test-only items removed), never a text search.
 #[test]
 fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
     use super::fail_stop_cause::{function_body, shipped_code, whole_identifier};
@@ -2292,6 +2292,12 @@ fn every_live_actor_reuse_path_calls_the_shared_binding_check() {
             "actor/member_wake_turn.rs",
             None,
             "async fn plan_member_wake(",
+            true,
+        ),
+        (
+            "actor/reload_revival.rs",
+            None,
+            "async fn commit_warm_revival(",
             true,
         ),
     ];
