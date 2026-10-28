@@ -12303,13 +12303,19 @@ mod tests {
                 || self.persisted_sessions.read().await.contains_key(id)
         }
 
+        /// The archive's runtime retire, as the persistent service does it: a
+        /// runtime this process registered for the session is retired, and a
+        /// session no runtime serves here (a member dormant after a restart,
+        /// or one never materialized in this process) is archived stored-only.
+        /// A registration is never synthesized to retire: the persistent
+        /// service releases any registration its archive recovers before it
+        /// returns, and a member disposal that captured the runtime absent
+        /// refuses one that appeared after the capture.
         async fn retire_with_machine_archive_authority(
             &self,
             session_id: &SessionId,
         ) -> Result<(), SessionError> {
-            if !self.session_exists(session_id).await
-                && !self.runtime_adapter.contains_session(session_id).await
-            {
+            if !self.runtime_adapter.contains_session(session_id).await {
                 return Ok(());
             }
 
@@ -12317,24 +12323,9 @@ mod tests {
             match meerkat_runtime::RuntimeControlPlane::retire(&*self.runtime_adapter, &runtime_id)
                 .await
             {
-                Ok(_) => Ok(()),
-                Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => {
-                    self.runtime_adapter
-                        .register_session(session_id.clone())
-                        .await
-                        .expect("register session");
-                    meerkat_runtime::RuntimeControlPlane::retire(
-                        &*self.runtime_adapter,
-                        &runtime_id,
-                    )
-                    .await
-                    .map(|_| ())
-                    .map_err(|error| {
-                        SessionError::Agent(meerkat_core::error::AgentError::InternalError(
-                            format!("machine archive retire failed after registration: {error}"),
-                        ))
-                    })
-                }
+                // A registration unregistered since the check has nothing
+                // left to retire.
+                Ok(_) | Err(meerkat_runtime::RuntimeControlPlaneError::NotFound(_)) => Ok(()),
                 Err(error) => Err(SessionError::Agent(
                     meerkat_core::error::AgentError::InternalError(format!(
                         "machine archive retire failed: {error}"
