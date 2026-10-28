@@ -9816,6 +9816,44 @@ pub(super) fn unavailable_member_progress(
     })
 }
 
+/// The progress of a member MobMachine holds Dormant, answered from that
+/// fact alone: no session read, no runtime read, no machine input.
+///
+/// Dormant means seated and not materialized in this process, and a run is
+/// only ever open on a materialized member, so no run of a Dormant member is
+/// open here: it reads like an idle live member (run state idle, no
+/// in-flight work, healthy). Its last progress time and event are the ones
+/// MobMachine recorded for it, when it holds them (a member that went
+/// Dormant after running in this process); otherwise there is no recorded
+/// progress (time 0, unchanged), as for a member never observed.
+pub(super) fn dormant_member_progress(
+    state: &mob_dsl::MobMachineState,
+    identity: &mob_dsl::AgentIdentity,
+) -> super::handle::MemberProgressSnapshot {
+    let last_progress_event = match state.member_last_progress_event.get(identity) {
+        Some(mob_dsl::MemberProgressEventKind::ExecutionAdvanced) => {
+            super::handle::MemberProgressEvent::ExecutionAdvanced
+        }
+        Some(mob_dsl::MemberProgressEventKind::BecameIdle) => {
+            super::handle::MemberProgressEvent::BecameIdle
+        }
+        Some(mob_dsl::MemberProgressEventKind::Unchanged) | None => {
+            super::handle::MemberProgressEvent::Unchanged
+        }
+    };
+    super::handle::MemberProgressSnapshot {
+        run_state: super::handle::MemberRunState::Idle,
+        in_flight_work: 0,
+        last_progress_at_ms: state
+            .member_last_progress_at_ms
+            .get(identity)
+            .copied()
+            .unwrap_or(0),
+        last_progress_event,
+        health: super::handle::MemberHealthClass::Healthy,
+    }
+}
+
 pub(super) fn advance_member_status_observation_clock(
     next_floor: u64,
     wall_clock_ms: u64,
@@ -14670,6 +14708,7 @@ impl MobActor {
                 .as_ref()
                 .map(|(agent_runtime_id, _)| agent_runtime_id.clone()),
             fence_token: runtime_material.map(|(_, fence_token)| fence_token),
+            dormant: super::boot_plan::member_is_dormant(self.dsl_authority.state(), &dsl_identity),
         })
     }
 
@@ -14686,8 +14725,7 @@ impl MobActor {
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: Option<Arc<meerkat_runtime::MeerkatMachine>>,
         agent_identity: AgentIdentity,
-        bridge_session_id: Option<SessionId>,
-        include_local_session_details: bool,
+        target: &super::state::MemberStatusProjectionTarget,
         observed_at_ms: u64,
         view_reads: &MemberStatusViewReads,
     ) -> (
@@ -14710,33 +14748,41 @@ impl MobActor {
             preview_unavailable: None,
             observed_at_ms,
         };
-        let Some(session_id) = bridge_session_id
+        let Some(session_id) = target
+            .bridge_session_id
             .as_ref()
-            .filter(|_| include_local_session_details)
+            .filter(|_| target.include_local_session_details)
         else {
             return (observation, None);
         };
-        // Status reads never queue behind the member's running turn (steer,
-        // not queue). The bounded execution snapshot answers only while the
-        // session actor is free. When it times out the member is busy; when
-        // it fails the member's execution state is unknown. Either way the
-        // run state comes from the runtime machine, which never queues behind
-        // the turn; a failed snapshot is never taken for an idle member.
-        let run_state_from_runtime = match tokio::time::timeout(
-            MEMBER_PROGRESS_OBSERVATION_TIMEOUT,
-            session_service.execution_snapshot(session_id),
-        )
-        .await
-        {
-            Ok(Ok(snapshot)) => {
-                observation.execution_snapshot = snapshot;
-                false
+        // A Dormant member has no session actor and no registered runtime in
+        // this process: its progress is MobMachine's fact (see
+        // `dormant_member_progress`), so neither is asked. Its preview is
+        // still read below, from the committed durable head.
+        if !target.dormant {
+            // Status reads never queue behind the member's running turn
+            // (steer, not queue). The bounded execution snapshot answers only
+            // while the session actor is free. When it times out the member
+            // is busy; when it fails the member's execution state is unknown.
+            // Either way the run state comes from the runtime machine, which
+            // never queues behind the turn; a failed snapshot is never taken
+            // for an idle member.
+            let run_state_from_runtime = match tokio::time::timeout(
+                MEMBER_PROGRESS_OBSERVATION_TIMEOUT,
+                session_service.execution_snapshot(session_id),
+            )
+            .await
+            {
+                Ok(Ok(snapshot)) => {
+                    observation.execution_snapshot = snapshot;
+                    false
+                }
+                Ok(Err(_)) | Err(_) => true,
+            };
+            if run_state_from_runtime && let Some(runtime) = runtime_adapter.as_deref() {
+                observation.runtime_run_state =
+                    observe_member_runtime_run_state(runtime, session_id).await;
             }
-            Ok(Err(_)) | Err(_) => true,
-        };
-        if run_state_from_runtime && let Some(runtime) = runtime_adapter.as_deref() {
-            observation.runtime_run_state =
-                observe_member_runtime_run_state(runtime, session_id).await;
         }
         // Preview and token count come from the session view, which serves
         // the live actor's published state or the committed durable head and
@@ -14879,6 +14925,7 @@ impl MobActor {
         agent_identity: &AgentIdentity,
         current_bridge_session_id: Option<SessionId>,
         include_local_session_details: bool,
+        dormant: bool,
         observation: super::state::MemberStatusSessionObservation,
     ) -> Result<CanonicalMemberSnapshotMaterial, MobError> {
         let roster_entry = {
@@ -14928,6 +14975,15 @@ impl MobActor {
         );
 
         let progress = match observation.execution_snapshot {
+            // MobMachine holds the member Dormant, and a run is only ever
+            // open on a materialized member: none of it is open here. Its
+            // progress is that fact, read like an idle live member's, with
+            // no machine input (a status read of a Dormant member changes no
+            // state).
+            _ if dormant => Some(dormant_member_progress(
+                self.dsl_authority.state(),
+                &dsl_identity,
+            )),
             Some(snapshot) => {
                 let run_open = snapshot.active_run_id.is_some() && !snapshot.turn_terminal;
                 let pending_operations = snapshot

@@ -718,6 +718,11 @@ pub(super) struct MemberStatusProjectionTarget {
     pub(super) include_local_session_details: bool,
     pub(super) agent_runtime_id: Option<AgentRuntimeId>,
     pub(super) fence_token: Option<FenceToken>,
+    /// MobMachine holds the member Dormant: seated and not materialized in
+    /// this process, so no run of it is open here. Its progress is answered
+    /// from that fact. A wake between the observation and its completion
+    /// changes the target, and the observation is driven again.
+    pub(super) dormant: bool,
 }
 
 /// Which internal-error site of the explicit resume's readiness fan-out a

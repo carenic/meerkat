@@ -1891,6 +1891,9 @@ struct DurableSessionReadCounts {
     load_persisted_session: u64,
     observe_session_resume_authority: u64,
     materialize_session_resume_verdict: u64,
+    /// Member-status view reads answered from the committed durable head
+    /// (see [`MockSessionService::serve_durable_head_status_views`]).
+    member_status_durable_head: u64,
 }
 
 /// Session reads of one session: calls, reads in flight, and the most in
@@ -2276,9 +2279,14 @@ struct MockSessionService {
     load_persisted_session_metadata_delay_ms: AtomicU64,
     metadata_reads_for: std::sync::Mutex<HashMap<SessionId, u64>>,
     /// Per-session durable reads (`load_persisted_session`,
-    /// `observe_session_resume_authority` and
-    /// `materialize_session_resume_verdict`).
+    /// `observe_session_resume_authority`,
+    /// `materialize_session_resume_verdict` and the member-status view's
+    /// durable-head reads).
     durable_reads_for: std::sync::Mutex<HashMap<SessionId, DurableSessionReadCounts>>,
+    /// When set, a member-status view read of a session with no live comms
+    /// runtime answers from its committed durable head, as the persistent
+    /// service does (see [`Self::serve_durable_head_status_views`]).
+    durable_head_status_views: AtomicBool,
     /// Sessions whose metadata-only read fails with a store error.
     metadata_read_failures_for: std::sync::Mutex<HashSet<SessionId>>,
     /// Sessions whose metadata-only read finds the persisted state malformed
@@ -2523,6 +2531,7 @@ impl MockSessionService {
             load_persisted_session_metadata_delay_ms: AtomicU64::new(0),
             metadata_reads_for: Default::default(),
             durable_reads_for: Default::default(),
+            durable_head_status_views: AtomicBool::new(false),
             metadata_read_failures_for: Default::default(),
             malformed_metadata_reads_for: Default::default(),
             load_persisted_session_in_flight: AtomicU64::new(0),
@@ -2640,6 +2649,36 @@ impl MockSessionService {
             .insert(session_id.clone(), session);
         self.archived_session_ids.write().await.remove(&session_id);
         self.issue_persisted_session_revision(&session_id).await;
+    }
+
+    /// Replace `session`'s committed durable body only, as an earlier
+    /// process wrote it: no live session and no comms runtime.
+    #[cfg_attr(
+        any(not(feature = "runtime-adapter"), target_arch = "wasm32"),
+        allow(dead_code)
+    )]
+    async fn replace_persisted_session(&self, session: Session) {
+        let _authority_guard = self.resume_authority_gate.lock().await;
+        let session_id = session.id().clone();
+        self.persisted_sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+        self.issue_persisted_session_revision(&session_id).await;
+    }
+
+    /// Serve member-status view reads as the persistent service does: a
+    /// session with a live comms runtime answers from its published state,
+    /// any other from its committed durable head (absent when it has none or
+    /// is archived). Each durable-head answer counts as a durable read of the
+    /// session (`member_status_durable_head`).
+    #[cfg_attr(
+        any(not(feature = "runtime-adapter"), target_arch = "wasm32"),
+        allow(dead_code)
+    )]
+    fn serve_durable_head_status_views(&self) {
+        self.durable_head_status_views
+            .store(true, Ordering::Relaxed);
     }
 
     async fn delete_persisted_session(&self, session_id: &SessionId) {
@@ -5539,6 +5578,23 @@ impl MobSessionService for MockSessionService {
         &self,
         session_id: &SessionId,
     ) -> Result<crate::MemberStatusSessionView, SessionError> {
+        if self.durable_head_status_views.load(Ordering::Relaxed)
+            && !self.sessions.read().await.contains_key(session_id)
+        {
+            self.count_durable_read(session_id, |reads| {
+                reads.member_status_durable_head += 1;
+            });
+            if self.archived_session_ids.read().await.contains(session_id) {
+                return Ok(crate::MemberStatusSessionView::absent());
+            }
+            return Ok(match self.persisted_session_clone(session_id).await {
+                Some(session) => crate::MemberStatusSessionView::durable_head(
+                    session.last_assistant_text(),
+                    session.total_tokens(),
+                ),
+                None => crate::MemberStatusSessionView::absent(),
+            });
+        }
         // In-memory test double: `read` is the published live state.
         crate::observe_member_status_view_via_read(self, session_id).await
     }
@@ -78425,6 +78481,7 @@ async fn test_member_status_completion_cancels_while_mailbox_is_full() {
                 include_local_session_details: false,
                 agent_runtime_id: None,
                 fence_token: None,
+                dormant: false,
             },
             super::actor::member_status_lane::MemberStatusObservationOutcome::Observed(Box::new(
                 super::state::MemberStatusSessionObservation {

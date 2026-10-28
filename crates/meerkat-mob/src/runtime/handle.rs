@@ -11605,6 +11605,29 @@ impl MobHandle {
         )
     }
 
+    /// The status and finality of a member MobMachine holds Dormant, read
+    /// from the published machine state: no command to the actor and no read
+    /// of the member's session. Both come from the member's machine lifecycle
+    /// alone, so they are the ones [`Self::member_status`] answers, without
+    /// the durable-head read that call makes for the preview. `None` for a
+    /// member that is not Dormant (Waking and Live members included).
+    ///
+    /// For the waits that use only these two fields; a caller that returns a
+    /// snapshot reads it through [`Self::member_status`].
+    fn dormant_member_status_from_machine_state(
+        &self,
+        identity: &AgentIdentity,
+    ) -> Option<(MobMemberStatus, bool)> {
+        let machine_state = self.machine_state_watch_rx.borrow();
+        if !super::boot_plan::domain_member_is_dormant(&machine_state, identity) {
+            return None;
+        }
+        let lifecycle = Self::member_lifecycle_from_machine_state(identity, &machine_state);
+        Some(MobMemberLifecycleProjection::status_and_finality(
+            &lifecycle,
+        ))
+    }
+
     fn project_roster_from_machine_state(
         roster: Roster,
         machine_state: &mob_dsl::MobMachineState,
@@ -16721,13 +16744,13 @@ impl MobHandle {
 
     fn kickoff_wait_is_satisfied(
         entry: &RosterEntry,
-        snapshot: &MobMemberSnapshot,
+        status: MobMemberStatus,
         pending_kickoff_member_ids: &BTreeSet<String>,
     ) -> bool {
         if entry.runtime_mode != crate::MobRuntimeMode::AutonomousHost {
             return true;
         }
-        match snapshot.status {
+        match status {
             MobMemberStatus::Unknown => false,
             MobMemberStatus::Active => {
                 !pending_kickoff_member_ids.contains(entry.agent_identity.as_str())
@@ -16806,12 +16829,20 @@ impl MobHandle {
                 let Some(entry) = entries.get(id) else {
                     continue;
                 };
-                let member_snapshot = self
-                    .member_status(&AgentIdentity::from(id.as_str()))
-                    .await?;
+                // The poll uses only the member's status. A Dormant member's
+                // comes from the published machine state, so a poll reads no
+                // Dormant member's session.
+                let status = match self.dormant_member_status_from_machine_state(id) {
+                    Some((status, _)) => status,
+                    None => {
+                        self.member_status(&AgentIdentity::from(id.as_str()))
+                            .await?
+                            .status
+                    }
+                };
                 if !Self::kickoff_wait_is_satisfied(
                     entry,
-                    &member_snapshot,
+                    status,
                     &kickoff_snapshot.pending_kickoff_member_ids,
                 ) {
                     pending_member_ids.push(id.clone());
@@ -17039,6 +17070,13 @@ impl MobHandle {
     /// resolves live peer connectivity when a comms runtime is available,
     /// and projects the current realtime attachment status from the
     /// MeerkatMachine (when the runtime adapter is available).
+    ///
+    /// A member MobMachine holds Dormant reads like an idle live member: a
+    /// run is only ever open on a materialized member, so its progress is
+    /// idle and healthy with no in-flight work, answered from that fact
+    /// (MobMachine's recorded last progress, when it holds one). Its preview
+    /// and token count come from its committed durable head, read on
+    /// demand; the read never wakes it.
     pub async fn member_status(
         &self,
         identity: &AgentIdentity,
@@ -17350,6 +17388,11 @@ impl MobHandle {
     /// autonomous member leaves `pending` / `starting` and reaches a terminal
     /// completion-handle phase. `callback_pending` is terminal for this barrier
     /// (and remains visible in the member snapshot for external fulfillment).
+    ///
+    /// The wait polls only each member's status, and a Dormant member's comes
+    /// from MobMachine with no read of its session. The returned snapshots are
+    /// [`Self::member_status`]'s: one durable-head read per Dormant member per
+    /// call, for its preview and token count.
     pub async fn wait_for_kickoff_complete(
         &self,
         timeout: Option<Duration>,
@@ -17373,7 +17416,8 @@ impl MobHandle {
 
     /// Wait until the given members resolve their initial kickoff.
     ///
-    /// See [`wait_for_kickoff_complete`](Self::wait_for_kickoff_complete) for details.
+    /// See [`wait_for_kickoff_complete`](Self::wait_for_kickoff_complete) for
+    /// details, the reads of Dormant members included.
     pub async fn wait_for_members_kickoff_complete(
         &self,
         ids: &[AgentIdentity],
@@ -17391,6 +17435,11 @@ impl MobHandle {
     /// Wait until all current members are startup-ready for orchestration.
     /// A Dormant member is ready (its startup is owed only at its wake, and
     /// the wait does not materialize it); a member being woken is waited for.
+    ///
+    /// Readiness is read from MobMachine, with no read of a Dormant member's
+    /// session. The returned snapshots are [`Self::member_status`]'s, the same
+    /// a live idle member's would show: one durable-head read per Dormant
+    /// member per call, for its preview and token count.
     pub async fn wait_for_ready(
         &self,
         timeout: Option<Duration>,
@@ -17414,6 +17463,9 @@ impl MobHandle {
     /// Wait until the given members are startup-ready for orchestration.
     /// A Dormant member is ready (its startup is owed only at its wake, and
     /// the wait does not materialize it); a member being woken is waited for.
+    ///
+    /// Reads as [`Self::wait_for_ready`] does: readiness from MobMachine, and
+    /// one durable-head read per Dormant member per call for the snapshots.
     pub async fn wait_for_members_ready(
         &self,
         ids: &[AgentIdentity],
@@ -17460,10 +17512,21 @@ impl MobHandle {
     }
 
     /// Collect snapshots for all members that have reached terminal states.
+    ///
+    /// A Dormant member is seated and wakeable: it holds no run to collect,
+    /// and MobMachine answers that it is not terminal, so the call reads
+    /// nothing of it (no command, no session read). Other members are read
+    /// through [`Self::member_status`].
     pub async fn collect_completed(&self) -> Vec<(AgentIdentity, MobMemberSnapshot)> {
         let entries = self.list_all_members().await;
         let mut completed = Vec::new();
         for entry in entries {
+            if matches!(
+                self.dormant_member_status_from_machine_state(&entry.agent_identity),
+                Some((_, false))
+            ) {
+                continue;
+            }
             if let Ok(snapshot) = self.member_status(&entry.agent_identity).await
                 && snapshot.is_final
             {

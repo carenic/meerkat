@@ -525,6 +525,19 @@ them.
   registers no runtime for a Dormant member. `MemberRestorePolicy::Eager`
   restores the previous start.
 
+- Behaviour-only (not measured by the gate): `meerkat-mob`: a Dormant
+  member's status reads like an idle live member's. `MobHandle::member_status`
+  (and `mob/member_status`, `mob_check_member`) answers its progress from
+  MobMachine: run state `idle`, health `healthy`, no in-flight work (no run
+  is open on a member that is not materialized), where it read `unknown`
+  for both before. Its preview and token count still come from its
+  committed durable head, read on demand, and the read wakes nothing.
+  `MobHandle::collect_completed` reads nothing of a Dormant member, and the
+  kickoff waits (`wait_for_kickoff_complete`,
+  `wait_for_members_kickoff_complete`) poll a Dormant member's status from
+  MobMachine; the kickoff and readiness waits read a Dormant member's
+  durable head once per call, for the snapshot they return.
+
 - Behaviour-only (not measured by the gate): `meerkat-mob`: a member restore
   that waits on work still in flight on the member's session (the takeover of
   an attachment an earlier handle left), or that the session service cannot
