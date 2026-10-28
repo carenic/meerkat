@@ -351,11 +351,23 @@ struct BootObligationIndex<'a> {
 
 #[cfg(feature = "runtime-adapter")]
 impl<'a> BootObligationIndex<'a> {
+    /// The index over every seated local member, or, with `among`, only as
+    /// much of it as `among`'s members are answered from: their own entries,
+    /// and the session entries of every member bound to one of their
+    /// sessions (so a session two members share still names the member the
+    /// whole index names). Every binding is still validated.
     fn new(
         state: &mob_dsl::MobMachineState,
         mob_id: &'a MobId,
         incarnation: meerkat_core::service::MobIncarnationId,
+        among: Option<&BTreeSet<mob_dsl::AgentIdentity>>,
     ) -> Result<Self, MobError> {
+        let among_sessions = among.map(|among| {
+            among
+                .iter()
+                .filter_map(|identity| state.member_session_bindings.get(identity))
+                .collect::<BTreeSet<_>>()
+        });
         let mut members = BTreeSet::new();
         let mut by_session_runtime = HashMap::new();
         let mut by_identity = HashMap::new();
@@ -373,14 +385,22 @@ impl<'a> BootObligationIndex<'a> {
                     session.0, identity.0
                 ))
             })?;
-            by_session_runtime.insert(
-                meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
-                identity.clone(),
-            );
-            by_session_runtime.insert(
-                meerkat_runtime::LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
-                identity.clone(),
-            );
+            if among_sessions
+                .as_ref()
+                .is_none_or(|sessions| sessions.contains(session))
+            {
+                by_session_runtime.insert(
+                    meerkat_runtime::LogicalRuntimeId::for_session(&session_id),
+                    identity.clone(),
+                );
+                by_session_runtime.insert(
+                    meerkat_runtime::LogicalRuntimeId::legacy_session_uuid_alias(&session_id),
+                    identity.clone(),
+                );
+            }
+            if among.is_some_and(|among| !among.contains(identity)) {
+                continue;
+            }
             members.insert(identity.clone());
             if let Some(generation) = state.identity_runtime_generations.get(identity) {
                 by_identity.insert(
@@ -495,11 +515,27 @@ pub(crate) async fn scan_boot_obligations(
     mob_id: &MobId,
     incarnation: meerkat_core::service::MobIncarnationId,
 ) -> Result<BootObligations, MobError> {
+    scan_boot_obligations_among(runtime_adapter, state, None, mob_id, incarnation).await
+}
+
+/// [`scan_boot_obligations`], answered for `among`'s members only when
+/// `among` names them (a seat chunk's planned identities): the same store
+/// scan, and the same obligation for each of them, with an index the size
+/// of the chunk instead of the whole roster's. A seat chunk that indexed
+/// every member made seating a large roster quadratic.
+#[cfg(feature = "runtime-adapter")]
+pub(crate) async fn scan_boot_obligations_among(
+    runtime_adapter: Option<&Arc<meerkat_runtime::MeerkatMachine>>,
+    state: &mob_dsl::MobMachineState,
+    among: Option<&BTreeSet<mob_dsl::AgentIdentity>>,
+    mob_id: &MobId,
+    incarnation: meerkat_core::service::MobIncarnationId,
+) -> Result<BootObligations, MobError> {
     let Some(adapter) = runtime_adapter else {
         // No runtime authority: no runtime store can hold member work.
         return Ok(BootObligations::none());
     };
-    let index = BootObligationIndex::new(state, mob_id, incarnation)?;
+    let index = BootObligationIndex::new(state, mob_id, incarnation, among)?;
     #[cfg(test)]
     if let Some(delay) = take_boot_obligation_scan_delay_for_test(mob_id) {
         tokio::time::sleep(delay).await;
@@ -1184,5 +1220,109 @@ mod tests {
                 ),
             ])
         );
+    }
+
+    /// A seat chunk's restricted obligation index answers every runtime id
+    /// that can name one of its planned members as the whole index does,
+    /// and names no other member. A session a planned and an unplanned
+    /// member share names the member the whole index names (the one whose
+    /// name sorts last), in either order of their names; an unplanned
+    /// member's own session runtime ids, which never parse as member
+    /// addresses, and its address reach nobody; a scan that cannot answer
+    /// reads exactly the planned members as holding work. Indexing only the
+    /// planned members' own session entries (filtering by
+    /// `among.contains(identity)` instead of by their sessions) turns it
+    /// red: with the planned member's name sorting first, the shared session
+    /// would name it where the whole index names the unplanned one.
+    #[cfg(feature = "runtime-adapter")]
+    #[test]
+    fn a_restricted_obligation_index_answers_its_members_as_the_whole_index_does() {
+        use meerkat_runtime::{LogicalRuntimeId, MemberDeliveryAddress};
+
+        let mob_id = MobId::from("restricted-obligation-index");
+        let incarnation = meerkat_core::service::MobIncarnationId::mint();
+        let address = |identity: &str, generation: u64| {
+            LogicalRuntimeId::for_member(&MemberDeliveryAddress {
+                mob_id: mob_id.as_str().to_owned(),
+                incarnation: Some(incarnation),
+                identity: identity.to_owned(),
+                generation,
+            })
+            .expect("a member delivery address")
+        };
+        for (planned, unplanned) in [("a-planned", "b-unplanned"), ("z-planned", "b-unplanned")] {
+            let shared = meerkat_core::types::SessionId::new();
+            let own = meerkat_core::types::SessionId::new();
+            let solo = meerkat_core::types::SessionId::new();
+            let mut state = mob_dsl::MobMachineState::default();
+            for (name, session, generation) in [
+                (planned, &shared, 1),
+                (unplanned, &shared, 1),
+                ("c-unplanned", &solo, 1),
+                ("d-planned", &own, 3),
+            ] {
+                let identity = mob_dsl::AgentIdentity(name.to_owned());
+                state
+                    .member_session_bindings
+                    .insert(identity.clone(), mob_dsl::SessionId::from_domain(session));
+                state.identity_to_runtime.insert(
+                    identity.clone(),
+                    mob_dsl::AgentRuntimeId(format!("{name}-runtime")),
+                );
+                state
+                    .identity_runtime_generations
+                    .insert(identity, mob_dsl::Generation(generation));
+            }
+            let among = BTreeSet::from([
+                mob_dsl::AgentIdentity(planned.to_owned()),
+                mob_dsl::AgentIdentity("d-planned".to_owned()),
+            ]);
+            let whole = BootObligationIndex::new(&state, &mob_id, incarnation, None)
+                .expect("the whole index");
+            let restricted = BootObligationIndex::new(&state, &mob_id, incarnation, Some(&among))
+                .expect("the restricted index");
+
+            for runtime_id in [
+                LogicalRuntimeId::for_session(&shared),
+                LogicalRuntimeId::legacy_session_uuid_alias(&shared),
+                LogicalRuntimeId::for_session(&own),
+                LogicalRuntimeId::legacy_session_uuid_alias(&own),
+                address(planned, 1),
+                address(planned, 2),
+                address("d-planned", 3),
+                address("d-planned", 1),
+            ] {
+                assert_eq!(
+                    restricted.member_for(&runtime_id),
+                    whole.member_for(&runtime_id),
+                    "{runtime_id:?}"
+                );
+            }
+            assert_eq!(
+                restricted.member_for(&LogicalRuntimeId::for_session(&shared)),
+                Some(&mob_dsl::AgentIdentity(planned.max(unplanned).to_owned())),
+                "the shared session names the member whose name sorts last"
+            );
+            for runtime_id in [
+                LogicalRuntimeId::for_session(&solo),
+                LogicalRuntimeId::legacy_session_uuid_alias(&solo),
+                address("c-unplanned", 1),
+            ] {
+                assert_eq!(
+                    whole.member_for(&runtime_id),
+                    Some(&mob_dsl::AgentIdentity("c-unplanned".to_owned())),
+                    "{runtime_id:?}"
+                );
+                assert_eq!(restricted.member_for(&runtime_id), None, "{runtime_id:?}");
+            }
+            assert_eq!(
+                restricted
+                    .unobserved(MobBootSetUnobservedCause::ScanFailed)
+                    .by_member
+                    .into_keys()
+                    .collect::<BTreeSet<_>>(),
+                among
+            );
+        }
     }
 }

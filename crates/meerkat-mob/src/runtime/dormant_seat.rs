@@ -18,12 +18,13 @@
 //!    build has, and applies the build inputs the seat carried
 //!    ([`SeatBuild`]).
 //! 3. The actor commits the chunk in one step: on one prepared
-//!    authority, per identity `AuthorizeSpawnProfile`, `BeginSpawnExec` and
-//!    `CommitDormantSeat` as one batch (an identity the machine refuses is
-//!    undone and answered alone), then one runtime obligation scan and each
-//!    seated identity's `PlanBootMaterialization`, then the
-//!    `MemberSpawned` rows in one `append_batch` before the base-checked
-//!    commit.
+//!    authority, every identity's `AuthorizeSpawnProfile`, `BeginSpawnExec`
+//!    and `CommitDormantSeat` as one batch (when the machine refuses an
+//!    identity, the batch is undone and the chunk applied again one identity
+//!    at a time, so the refused one is answered alone), then one runtime
+//!    obligation scan and the seated identities' `PlanBootMaterialization`
+//!    as one more batch, then the `MemberSpawned` rows in one `append_batch`
+//!    before the base-checked commit.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;

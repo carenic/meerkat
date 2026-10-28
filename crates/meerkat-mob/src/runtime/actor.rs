@@ -17470,8 +17470,47 @@ impl MobActor {
             },
             "compute_respawn_generation",
         )?;
+        Self::respawn_generation_from_effects(&prepared.effects)
+    }
+
+    /// [`Self::mint_spawn_generation`] for each of `identities` (a seat
+    /// chunk's), on ONE fork of the authority instead of a prepared
+    /// authority per identity. `ComputeRespawnGeneration` is a pure probe:
+    /// it changes no state, and the actor's state is fixed while it plans,
+    /// so every answer, a refusal included, is the one a probe of its own
+    /// would give. A prepared authority per identity copied the whole
+    /// machine state three times per seat.
+    fn mint_spawn_generations<'a>(
+        &self,
+        identities: impl IntoIterator<Item = &'a AgentIdentity>,
+    ) -> BTreeMap<AgentIdentity, Result<crate::ids::Generation, MobError>> {
+        let mut probe = self.dsl_authority.fork();
+        identities
+            .into_iter()
+            .map(|agent_identity| {
+                let minted = mob_dsl::MobMachineMutator::apply(
+                    &mut probe,
+                    mob_dsl::MobMachineInput::ComputeRespawnGeneration {
+                        agent_identity: mob_dsl::AgentIdentity::from_domain(agent_identity),
+                    },
+                )
+                .map_err(|error| {
+                    MobError::Internal(format!(
+                        "DSL authority prepared batch (compute_respawn_generation) rejected: {error}"
+                    ))
+                })
+                .and_then(|transition| Self::respawn_generation_from_effects(transition.effects()));
+                (agent_identity.clone(), minted)
+            })
+            .collect()
+    }
+
+    /// The one generation a `ComputeRespawnGeneration` transition emitted.
+    fn respawn_generation_from_effects(
+        effects: &[mob_dsl::MobMachineEffect],
+    ) -> Result<crate::ids::Generation, MobError> {
         let mut next_generation = None;
-        for effect in &prepared.effects {
+        for effect in effects {
             if let mob_dsl::MobMachineEffect::RespawnGenerationComputed {
                 next_generation: next,
                 ..
