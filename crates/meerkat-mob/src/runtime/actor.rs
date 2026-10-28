@@ -45557,9 +45557,35 @@ impl MobActor {
 
         let local_identity = AgentIdentity::from(local.as_str());
         let peer_member_identity = AgentIdentity::from(peer_identity.as_str());
-        // Pre-flight: roster lookups. A missing member answers MemberNotFound
-        // before the admission probe, whose seated-ends guard would answer it
-        // as an invalid transition, and before any authority mutation.
+        let dsl_a = mob_dsl::AgentIdentity::from_domain(&local_identity);
+        let dsl_b = mob_dsl::AgentIdentity::from_domain(&peer_identity);
+        let edge = mob_dsl::WiringEdge::new(dsl_a, dsl_b);
+        let refusal = match self.probe_command_admission(
+            mob_dsl::MobMachineInput::WireMembers { edge: edge.clone() },
+            MobState::Running,
+            "wire_members_command_admission",
+        ) {
+            Ok(()) => None,
+            // A mob that is not running answers the machine's lifecycle
+            // refusal before any member lookup.
+            Err(refusal) if self.state() != MobState::Running => return Err(refusal),
+            // In a running mob the member checks below keep their order: an
+            // end that is not a member answers MemberNotFound before the
+            // machine's refusal of an edge to an identity that is not seated.
+            Err(refusal) => Some(refusal),
+        };
+
+        if local_identity == peer_identity {
+            return Err(MobError::WiringError(format!(
+                "wire requires distinct members (got '{local}')"
+            )));
+        }
+        self.ensure_member_not_broken(&local).await?;
+
+        self.ensure_member_not_broken(&peer_member_identity).await?;
+
+        // Pre-flight: roster lookups. Missing members fail fast before
+        // any authority mutation.
         let (local_entry, peer_entry) = {
             let roster = self.roster.read().await;
             (
@@ -45573,23 +45599,9 @@ impl MobActor {
                     .ok_or_else(|| MobError::MemberNotFound(peer_member_identity.clone()))?,
             )
         };
-        let dsl_a = mob_dsl::AgentIdentity::from_domain(&local_identity);
-        let dsl_b = mob_dsl::AgentIdentity::from_domain(&peer_identity);
-        let edge = mob_dsl::WiringEdge::new(dsl_a, dsl_b);
-        self.probe_command_admission(
-            mob_dsl::MobMachineInput::WireMembers { edge: edge.clone() },
-            MobState::Running,
-            "wire_members_command_admission",
-        )?;
-
-        if local_identity == peer_identity {
-            return Err(MobError::WiringError(format!(
-                "wire requires distinct members (got '{local}')"
-            )));
+        if let Some(refusal) = refusal {
+            return Err(refusal);
         }
-        self.ensure_member_not_broken(&local).await?;
-
-        self.ensure_member_not_broken(&peer_member_identity).await?;
 
         // Idempotent repair path when the MobMachine already owns the edge.
         // The DSL emits a local repair effect; without a graph-change effect,
