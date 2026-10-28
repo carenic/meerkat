@@ -239,8 +239,9 @@ pub(crate) enum SessionRepointOpsBinding {
     },
 }
 
-/// How a missing-live revival (warm revival or an explicit-resume rebuild)
-/// bound the revived member session's operation registry.
+/// How a member revival (a missing-live or warm revival, an explicit-resume
+/// rebuild, or a wake's cold restore of a session whose binding a coordinator
+/// still holds) bound the revived member session's operation registry.
 #[cfg(feature = "runtime-adapter")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum RevivedSessionOpsBinding {
@@ -1266,7 +1267,7 @@ impl MobOpsAdapter {
     }
 
     /// Release the binding of a superseded runtime incarnation before a
-    /// missing-live revival binds the new one.
+    /// member revival binds the new one.
     ///
     /// The runtime may retire an idle member's executor on its own (for
     /// example after a detached-completion wake finds nothing pending), which
@@ -1290,27 +1291,27 @@ impl MobOpsAdapter {
         };
         let Some(observed) = observed else {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' appeared during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' appeared during a member revival"
             )));
         };
         if current.binding_id != observed.binding_id
             || !Arc::ptr_eq(&current.registry, &observed.registry)
         {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' changed during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' changed during a member revival"
             )));
         }
         if current.provision_claim.is_some() {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' still has an exact provision claim during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' still has an exact provision claim during a member revival"
             )));
         }
         bindings.remove(&member_key);
         Ok(())
     }
 
-    /// Bind a missing-live revival's session under the owner context
-    /// observed before the revival began.
+    /// Bind a revived member session under the owner context observed
+    /// before the revival began.
     ///
     /// The observed binding must still be current (same incarnation, same
     /// registry, no provision claim) or the revival fails closed, exactly as
@@ -1356,19 +1357,19 @@ impl MobOpsAdapter {
         };
         let Some(observed) = observed else {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' appeared during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' appeared during a member revival"
             )));
         };
         if current.binding_id != observed.binding_id
             || !Arc::ptr_eq(&current.registry, &observed.registry)
         {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' changed during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' changed during a member revival"
             )));
         }
         if current.provision_claim.is_some() {
             return Err(MobError::Internal(format!(
-                "operation-registry binding for session '{child_session_id}' still has an exact provision claim during missing-live revival"
+                "operation-registry binding for session '{child_session_id}' still has an exact provision claim during a member revival"
             )));
         }
         let revived = match observed.parent_owner(&child_session_id) {
@@ -4826,7 +4827,7 @@ mod tests {
         assert!(
             appeared
                 .to_string()
-                .contains("appeared during missing-live revival")
+                .contains("appeared during a member revival")
         );
         let changed = adapter
             .bind_session_registry_for_revival(
@@ -4839,7 +4840,7 @@ mod tests {
         assert!(
             changed
                 .to_string()
-                .contains("changed during missing-live revival")
+                .contains("changed during a member revival")
         );
 
         let (claimed, _, _, _) = published_owner_context_binding(&adapter).await;

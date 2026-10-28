@@ -64643,11 +64643,13 @@ async fn assert_worker_self_owned_after_parent_owner_ended(
 }
 
 /// Downstream regression: the whole crew is stopped and, while it is
-/// stopped, a parent-owned worker's actor (or its whole attachment) is lost,
-/// so the same-handle resume must REBUILD the worker. The rebuilt worker is
-/// rebound under the preserved coordinator owner and registry: the
-/// coordinator's exact mob-child operation stays the live one, and the
-/// worker never takes ownership of itself.
+/// stopped, a parent-owned worker's actor (or its whole attachment) is lost.
+/// The same-handle resume neither breaks nor re-owns the worker: it stays
+/// unbroken (Dormant under the lazy default, unless the boot plan woke it)
+/// under the coordinator's live operation, and its first wake REBUILDS it.
+/// The rebuilt worker is rebound under the preserved coordinator owner and
+/// registry: the coordinator's exact mob-child operation stays the live one,
+/// and the worker never takes ownership of itself.
 #[cfg(feature = "runtime-adapter")]
 #[tokio::test]
 async fn whole_crew_stop_resume_rebuild_keeps_parent_owned_worker_owner() {
@@ -64706,6 +64708,30 @@ async fn whole_crew_stop_resume_rebuild_keeps_parent_owned_worker_owner() {
     )
     .await;
     whole_crew_resume(&handle, "resume crew with lost worker incarnations").await;
+    // The resume alone neither breaks nor re-owns a worker: none is recorded
+    // Broken, and each one's operation is still the coordinator's live one.
+    for worker in [&actor_lost, &attachment_lost, &autonomous_actor_lost] {
+        let status = handle
+            .member_status(&worker.identity)
+            .await
+            .expect("worker status after resume");
+        assert_ne!(
+            status.status,
+            crate::runtime::handle::MobMemberStatus::Broken,
+            "after resume: '{}' is not recorded Broken (residency {:?}): {status:?}",
+            worker.identity,
+            handle
+                .machine_state_watch_rx
+                .borrow()
+                .member_materialization
+                .get(&crate::machines::mob_machine::AgentIdentity::from_domain(
+                    &worker.identity
+                ))
+                .copied()
+        );
+        assert_parent_owned_crew_worker_operation_owner(&adapter, worker, "after resume", true)
+            .await;
+    }
     // Under the lazy default the resume leaves a worker that holds no work
     // Dormant; its wake rebuilds it, rebinding under the coordinator's owner
     // context the worker's binding preserved.
