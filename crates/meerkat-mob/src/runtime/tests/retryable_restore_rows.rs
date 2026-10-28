@@ -301,13 +301,13 @@ async fn built_stopped_mob(
 
 /// The lift of a stopped mob rebuilds the members its Eager plan
 /// materializes through the explicit-resume work path. One member's durable
-/// observation meets a store that cannot serve it now: that member's attempt
-/// ends retryable, never Broken, the explicit resume answers the typed store
-/// error, every other member is Live, and the member's owed retry
-/// materializes it once the store serves it again.
+/// observation meets a store that cannot serve it now: that member ends
+/// Dormant with its owed retry, never Broken. That is the member's own
+/// outcome: the lift answers Ok with the mob Running, every other member is
+/// Live, and the member's owed retry materializes it once the store serves
+/// it again.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift_answers_the_store_error()
- {
+async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift_answers_ok() {
     let (resumed, service, members) =
         built_stopped_mob("lift-observation-store-failure", 3, None).await;
     let (failing, failing_session) = members[1].clone();
@@ -326,27 +326,10 @@ async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift
         members.len(),
         "the lift observed every member, the failing one included, on the explicit-resume work path"
     );
-    let error = lifted.expect_err("the lift answers the member's store error");
-    let cause = match &error {
-        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
-        other => other,
-    };
-    assert!(
-        matches!(cause, MobError::SessionError(SessionError::Store(_))),
-        "a typed store error: {error:?}"
-    );
+    lifted.expect("a member that ends retryable is its own outcome: the lift answers Ok");
     assert_eq!(
         resumed.status().await.expect("the mob answers"),
         MobState::Running
-    );
-    let status = resumed
-        .member_status(&failing)
-        .await
-        .expect("the member's status");
-    assert_ne!(
-        status.status,
-        crate::runtime::handle::MobMemberStatus::Broken,
-        "a store that cannot serve the member now never breaks it: {status:?}"
     );
     for (identity, _) in members.iter().filter(|(identity, _)| identity != &failing) {
         assert_eq!(
@@ -355,21 +338,37 @@ async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift
             "{identity} is Live"
         );
     }
-    let mut published = resumed.machine_state_watch_rx.clone();
-    let failing_id = dsl::AgentIdentity::from_domain(&failing);
+    assert_left_dormant_with_its_retry(&resumed, &failing).await;
+}
+
+/// `member` ended retryable at the lift: it is not Broken and carries no
+/// restore failure, and its owed retry, with no delivery, materializes it.
+async fn assert_left_dormant_with_its_retry(handle: &MobHandle, member: &AgentIdentity) {
+    let status = handle
+        .member_status(member)
+        .await
+        .expect("the member's status");
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a member that ends retryable is never Broken: {status:?}"
+    );
+    assert!(
+        status.error.is_none(),
+        "the member carries no restore failure: {status:?}"
+    );
+    let mut published = handle.machine_state_watch_rx.clone();
+    let member_id = dsl::AgentIdentity::from_domain(member);
     let retried = tokio::time::timeout(
         ROW_STEP,
         published.wait_for(|state| {
-            state.member_materialization.get(&failing_id)
+            state.member_materialization.get(&member_id)
                 == Some(&dsl::MemberMaterializationPhase::Live)
         }),
     )
     .await
     .is_ok_and(|seen| seen.is_ok());
-    assert!(
-        retried,
-        "the member's owed retry materializes it once the store serves it"
-    );
+    assert!(retried, "the member's owed retry materializes it");
 }
 
 /// The backoff of the owed retry in the rows that check no retry runs.
@@ -642,11 +641,11 @@ impl crate::runtime::MemberBuildPreparer for PreparesLaterOnce {
 
 /// The lift of a stopped mob whose host asks to prepare a planned member's
 /// build later ends that member retryable: Dormant, never Broken, its owed
-/// retry armed. The explicit resume answers the typed retryable refusal a
-/// wake's caller gets, every other member is Live, and the owed retry
+/// retry armed. That is the member's own outcome: the lift answers Ok with
+/// the mob Running, every other member is Live, and the owed retry
 /// materializes the member once the host prepares its build.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lift_answers_typed() {
+async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lift_answers_ok() {
     let deferred = AgentIdentity::from("lifted-1");
     let preparer = Arc::new(PreparesLaterOnce {
         member: deferred.clone(),
@@ -655,28 +654,15 @@ async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lif
     let (resumed, _service, members) =
         built_stopped_mob("lift-host-prepares-later", 3, Some(preparer)).await;
 
-    let error = tokio::time::timeout(ROW_STEP, resumed.resume())
+    tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
         .expect("the explicit resume answers")
-        .expect_err("the lift answers the member's typed retryable refusal");
-    assert!(
-        matches!(
-            shared_cause(&error),
-            MobError::MemberWakeRefused {
-                refusal: crate::MemberWakeRefusal::HostPreparationPending,
-                ..
-            }
-        ),
-        "the typed retryable refusal: {error:?}"
-    );
-    let status = resumed
-        .member_status(&deferred)
-        .await
-        .expect("the member's status");
-    assert_ne!(
-        status.status,
-        crate::runtime::handle::MobMemberStatus::Broken,
-        "a host that asks to prepare later never breaks the member: {status:?}"
+        .expect(
+            "a host that asks to prepare later is the member's own outcome: the lift answers Ok",
+        );
+    assert_eq!(
+        resumed.status().await.expect("the mob answers"),
+        MobState::Running
     );
     for (identity, _) in members.iter().filter(|(identity, _)| identity != &deferred) {
         assert_eq!(
@@ -685,29 +671,15 @@ async fn a_lifted_member_whose_host_asks_to_prepare_later_is_retried_and_the_lif
             "{identity} is Live"
         );
     }
-    let mut published = resumed.machine_state_watch_rx.clone();
-    let deferred_id = dsl::AgentIdentity::from_domain(&deferred);
-    let retried = tokio::time::timeout(
-        ROW_STEP,
-        published.wait_for(|state| {
-            state.member_materialization.get(&deferred_id)
-                == Some(&dsl::MemberMaterializationPhase::Live)
-        }),
-    )
-    .await
-    .is_ok_and(|seen| seen.is_ok());
-    assert!(
-        retried,
-        "the member's owed retry materializes it once the host prepares its build"
-    );
+    assert_left_dormant_with_its_retry(&resumed, &deferred).await;
 }
 
 /// A fork child the lift rebuilds in the same round as its source, whose
 /// source the host asks to prepare later, is still built with the overlay
 /// its source would be rebuilt with: the lift resolved it from the source's
 /// own rebuild request while preparing the child, so the source's deferral
-/// does not leave the child without it. The lift answers the source's typed
-/// retryable refusal.
+/// does not leave the child without it. The source's deferral is its own
+/// outcome: the lift answers Ok.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_lifted_fork_child_whose_source_the_host_defers_is_built_as_its_source() {
     let (service, storage, source_identity, child_identity, first, expected_source) =
@@ -733,20 +705,10 @@ async fn a_lifted_fork_child_whose_source_the_host_defers_is_built_as_its_source
     .expect("the reconstruction answers")
     .expect("the reconstruction succeeds");
 
-    let error = tokio::time::timeout(ROW_STEP, resumed.resume())
+    tokio::time::timeout(ROW_STEP, resumed.resume())
         .await
         .expect("the explicit resume answers")
-        .expect_err("the lift answers the source's deferral");
-    assert!(
-        matches!(
-            shared_cause(&error),
-            MobError::MemberWakeRefused {
-                refusal: crate::MemberWakeRefusal::HostPreparationPending,
-                ..
-            }
-        ),
-        "the typed retryable refusal: {error:?}"
-    );
+        .expect("the source's deferral is its own outcome: the lift answers Ok");
     assert_eq!(
         phase_of(&resumed, &child_identity),
         Some(dsl::MemberMaterializationPhase::Live),

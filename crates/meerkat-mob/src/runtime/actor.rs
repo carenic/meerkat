@@ -23470,8 +23470,9 @@ impl MobActor {
         // ran its own readiness and settled before the pass began, so none
         // is left once every member's work settled) is settled from its
         // outcome: Live, or Broken with its failure (the member's own
-        // outcome), before anything else of the resume continues.
-        let (outcomes, held_failure) = self.settle_held_member_readiness(outcomes).await;
+        // outcome, which the resume does not answer), before anything else
+        // of the resume continues.
+        let (outcomes, _member_failure) = self.settle_held_member_readiness(outcomes).await;
         if let Err(error) = self.apply_explicit_resume_input(
             |attempt| mob_dsl::MobMachineInput::SettleExplicitResumeReadiness { attempt },
             "settle_explicit_resume_readiness",
@@ -23542,9 +23543,7 @@ impl MobActor {
                     }));
                     return;
                 }
-                let post_commit_error = post_commit_error
-                    .or(readiness_result.err())
-                    .or(held_failure);
+                let post_commit_error = post_commit_error.or(readiness_result.err());
                 self.begin_resume_lifecycle_post_commit(
                     admission,
                     progress,
@@ -23613,8 +23612,11 @@ impl MobActor {
                 reply_tx,
             });
             if rebuilt_attachment {
-                // A member that could not be rebuilt is answered as the
-                // resume's typed error; every other member is rebuilt.
+                // A member whose rebuild failed terminally before its
+                // reservation is answered as the resume's typed error, as
+                // v0.9.6 answered it; one that waits on work in flight or a
+                // store that cannot serve it now is not. Every other member
+                // is rebuilt.
                 for (identity, error) in self
                     .rebuild_explicit_resume_member_sessions(rebuild, &progress)
                     .await
@@ -23625,7 +23627,9 @@ impl MobActor {
                         %error,
                         "the explicit resume could not rebuild a member"
                     );
-                    self.retain_explicit_resume_error(error);
+                    if !super::builder::restore_error_is_retryable(&error) {
+                        self.retain_explicit_resume_error(error);
+                    }
                 }
             }
             if let Err(error) = self.join_explicit_resume_boot_members(boot_members) {

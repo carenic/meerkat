@@ -26,16 +26,17 @@
 //! session, or registers the endpoint), and the explicit resume joins that
 //! wake. The lift answers its caller only after the members it materializes
 //! settled.
-//! It answers Ok unless a member it waited on did not end Live for a failure
-//! the resume itself answers; then it answers the first such member's typed
-//! error: a member that ended retryable (Dormant, its owed retry armed), a
-//! member whose restore failed before its provision (a read or the
+//! It answers the typed error of a member it rebuilds through the work path
+//! whose restore failed terminally before its provision (a read or its
 //! observation, the customizer, the host's build preparation, a successor
-//! repoint, its reservation), a member whose readiness failed, and a member
-//! the cold recipe left Broken (its typed failure does not tell the stage).
-//! A member whose recipe, provision or custody failed once MobMachine
-//! authorized its revival, or whose durable session is missing, is Broken as
-//! that member's own outcome, and the lift answers Ok for it.
+//! repoint, its reservation), as v0.9.6 answered a rebuild it could not
+//! prepare; the member is Broken with that reason. Every other end is the
+//! member's own outcome, recorded with the member, and the lift answers Ok
+//! with the mob Running: a member that ended retryable (Dormant with its
+//! owed retry, the wake bound and a host that asks to prepare later
+//! included), one whose recipe, provision, custody or readiness failed, one
+//! whose durable session is missing, and any member the cold recipe
+//! realizes. A caller waiting on a member still gets its own typed answer.
 //! A member is never materialized twice: one attempt per member, and every
 //! other wake of it joins that attempt. Every other member stays Dormant and
 //! is materialized by its first delivery.
@@ -728,37 +729,27 @@ impl MobActor {
 
     /// One planned member's wake closed. The wake path resolved the member
     /// through the machine (Live; Broken with its typed reason; or Dormant
-    /// again for a retryable cause, its obligation owed and retried). The
-    /// lift settles the member's resume work and goes on once every member
-    /// settled, and a member that did not end Live gives the lift its
-    /// `failure`, the wake's typed answer, which the lift answers once every
-    /// member settled. A wake the plan only watches gives it only when it
-    /// left the member Broken: a member it left Dormant is reached by the
-    /// plan again. The closed wake frees its slot of the plan first, so the
-    /// plan dispatches the members it has not reached yet, up to its bound.
+    /// again for a retryable cause, its obligation owed and retried), so the
+    /// lift reports none of those as its own failure: that is the member's
+    /// own outcome, recorded with the member, and the wake's typed answer
+    /// (`failure`) went to the wake's callers. The lift settles the member's
+    /// resume work and goes on once every member settled. The closed wake
+    /// frees its slot of the plan first, so the plan dispatches the members
+    /// it has not reached yet, up to its bound.
     pub(super) async fn explicit_resume_boot_member_settled(
         &mut self,
         member: Box<ExplicitResumeBootMember>,
-        mut failure: Option<MobError>,
+        failure: Option<MobError>,
     ) {
-        if failure.is_some() && !member.watched {
+        if let Some(failure) = failure.as_ref()
+            && !member.watched
+        {
             tracing::warn!(
                 mob_id = %self.definition.id,
                 agent_identity = %member.agent_identity,
+                %failure,
                 "a member the lift materializes did not become live; MobMachine holds its outcome"
             );
-        }
-        if !member.authorized
-            && self
-                .dsl_authority
-                .state()
-                .member_restore_failures
-                .contains_key(&mob_dsl::AgentIdentity::from_domain(&member.agent_identity))
-            && let Some(failure) = failure.take()
-        {
-            // A watched wake that left the member Broken: the plan does not
-            // reach it again.
-            self.retain_explicit_resume_member_failure(failure);
         }
         let dispatched = self.advance_explicit_resume_boot_plan().await;
         if !member.authorized {
@@ -809,9 +800,6 @@ impl MobActor {
             }
             tracing::warn!(%error, "stale resume boot-member settlement left current authority unchanged");
             return;
-        }
-        if let Some(failure) = failure {
-            self.retain_explicit_resume_member_failure(failure);
         }
         if let Some(pending) = self.pending_resume_lifecycle.as_ref() {
             pending.progress.member_progress(
@@ -1297,9 +1285,9 @@ impl MobActor {
     /// realizes through the explicit-resume work path, before the explicit
     /// resume accepted it. The bound resolved the attempt retryable (the
     /// member is Dormant, its owed retry armed) and answered its callers
-    /// `WakeTimedOut`; the explicit resume no longer waits on the member and
-    /// answers the same typed refusal. A rebuild still being prepared is
-    /// dropped when it arrives. Work the explicit resume reserved for the
+    /// `WakeTimedOut`; that is the member's own outcome, and the explicit
+    /// resume no longer waits on the member. A rebuild still being prepared
+    /// is dropped when it arrives. Work the explicit resume reserved for the
     /// member is settled now: a later wake of the member can never hold that
     /// settlement, and the work's late acceptance is refused as stale and
     /// its provision rolled back.
@@ -1324,10 +1312,6 @@ impl MobActor {
         if !preparing && reserved.is_none() {
             return;
         }
-        self.retain_explicit_resume_member_failure(MobError::MemberWakeRefused {
-            member_id: identity.clone(),
-            refusal: crate::MemberWakeRefusal::WakeTimedOut,
-        });
         if let Some((attempt, binding)) = reserved
             && let Err(error) = self.apply_dsl_input(
                 mob_dsl::MobMachineInput::SettleExplicitResumeMember {
@@ -1398,8 +1382,7 @@ impl MobActor {
 
     /// A planned member's build the host asked to prepare later: its attempt
     /// ends retryable (Dormant, its boot obligation owed and its retry
-    /// armed), as a wake's does, and the explicit resume answers the typed
-    /// retryable refusal a wake's caller gets.
+    /// armed), as a wake's does. That is the member's own outcome.
     fn end_explicit_resume_boot_member_for_host_retry(
         &mut self,
         identity: &AgentIdentity,
@@ -1420,13 +1403,7 @@ impl MobActor {
             },
             "resolve_host_retry_explicit_resume_boot_member",
         ) {
-            Ok(_) => {
-                self.schedule_owed_member_wake_retry(identity);
-                self.retain_explicit_resume_member_failure(MobError::MemberWakeRefused {
-                    member_id: identity.clone(),
-                    refusal: crate::MemberWakeRefusal::HostPreparationPending,
-                });
-            }
+            Ok(_) => self.schedule_owed_member_wake_retry(identity),
             Err(refused) => {
                 self.abandon_explicit_resume_boot_member(identity, attempt, refused.to_string());
             }
@@ -1437,9 +1414,10 @@ impl MobActor {
     /// (its restore failed before its provision), as a wake ends one:
     /// retryable for a cause that clears on its own
     /// ([`crate::runtime::builder::restore_error_is_retryable`]; the member
-    /// is Dormant with its boot obligation owed and its retry armed),
-    /// otherwise Broken with the error. Either way the explicit resume
-    /// answers the typed error once every member settled.
+    /// is Dormant with its boot obligation owed and its retry armed, the
+    /// member's own outcome), otherwise Broken with the error, which the
+    /// explicit resume answers once every member settled, as v0.9.6 answered
+    /// a rebuild it could not prepare.
     async fn end_explicit_resume_boot_member(
         &mut self,
         identity: &AgentIdentity,
@@ -1456,8 +1434,13 @@ impl MobActor {
                 "resolve_retryable_explicit_resume_boot_member",
             ) {
                 Ok(_) => {
+                    tracing::info!(
+                        mob_id = %self.definition.id,
+                        agent_identity = %identity,
+                        %error,
+                        "a planned member's rebuild waits on work in flight or an unavailable store; its owed retry is armed"
+                    );
                     self.schedule_owed_member_wake_retry(identity);
-                    self.retain_explicit_resume_member_failure(error);
                 }
                 Err(refused) => {
                     self.abandon_explicit_resume_boot_member(

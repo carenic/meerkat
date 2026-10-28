@@ -530,14 +530,19 @@ them.
   member Broken with the typed reason.
 
 - Behaviour-only (not measured by the gate): `meerkat-mob`: the lift of a
-  stopped mob (`MobHandle::resume`) answers, once every member it waited on
-  settled and with the mob Running, the typed error of the first such member
-  that ended retryable, whose restore failed before its provision (its reads,
-  the spawn customizer, the host's build preparation, a successor repoint,
-  its reservation), whose readiness failed, or that a wake it joined left
-  Broken. A member whose provision or custody failed after its revival was
-  authorized, or whose durable session is missing, is recorded Broken and the
-  lift still answers Ok, as in 0.9.6.
+  stopped mob (`MobHandle::resume`) answers a typed error only for a member
+  it rebuilds whose restore failed terminally before its provision (its
+  reads, the spawn customizer, the host's build preparation, a successor
+  repoint, its reservation), as 0.9.6 answered such a rebuild; the member is
+  recorded Broken. Every other end is the member's own outcome, recorded
+  with the member, and the lift answers Ok with the mob Running: a member
+  that ended retryable (Dormant with its owed retry, a wake bound and a host
+  that asks to prepare later included), a member whose provision, custody or
+  readiness failed (Broken with its reason), a member whose durable session
+  is missing, and a member woken through the wake path. A caller waiting on
+  a member still gets that member's own typed answer. In 0.9.6 a resume view
+  the store could not serve, and a rebuilt member's readiness failure, made
+  the lift answer an error.
 
 - Behaviour-only (not measured by the gate): `meerkat-mob`: a member the lift
   of a stopped mob rebuilds on its durable session is bounded by the mob's
