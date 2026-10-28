@@ -22,7 +22,8 @@
 \*     another epoch, no epoch), the drift and terminal classifications, the
 \*     peer notice classification, the replayed restore failures, the routed
 \*     binding refusal (current and stale), the spawned-endpoint recovery, the
-\*     release verdict, Stop and Resume.
+\*     member's own profile check (no grant), the release verdict, Stop and
+\*     Resume.
 \*   retire (AuditRetireSpec): one identity woken, released and retired: the
 \*     routed and the archive-only retirement starts, the routed retire
 \*     retry, the runtime retire observation, the session ingress detach, the
@@ -351,6 +352,11 @@ WBindingRefusal ==
 WSeatSession ==
     \/ RecoverMemberSeatSessionUnbornRunning(Id1, Rid1, TRUE)
     \/ RecoverMemberSeatSessionBornRunning(Id1, Rid1, FALSE)
+\* Member 1's own profile check (a wake's restore, a revival, a rebuild): it
+\* records no grant.
+WProfileCheck ==
+    AuthorizeSpawnProfileSeatedRunning(Id1, AuditProfile, AuditModel, AuditDigest, AuditDigest, AuditDigest,
+                                       None, None, FALSE, None)
 WReady == \E ep \in AuditEpochs : ObserveRuntimeReady(Rid1, 1, ep)
 WReadyEpoch1 == ObserveRuntimeReady(Rid1, 1, Epoch1)
 WRelease == \E ep \in AuditReleaseEpochs : ReleaseArm(Some(Rid1), Some(1), ep)
@@ -408,6 +414,7 @@ AuditWakeNext ==
     \/ WRegisterPeer
     \/ WRestoreFailure
     \/ WSeatSession
+    \/ WProfileCheck
     \/ WBindingRefusal
     \/ AuditPlanDefault(Id1)
     \/ SealBootMaterializationPlan
@@ -1228,6 +1235,10 @@ AuditWitnessSeatUnborn == \E id \in {Id1, Id2} : id \in member_seat_session_unbo
 AuditWitnessRotatedUnbornStep ==
     /\ SCommitRotation
     /\ Id1 \in member_seat_session_unborn'
+\* Retire run: the rotation's spawn-profile grant, recorded under its intent.
+AuditWitnessRotationGrant ==
+    /\ Id1 \in DOMAIN spawn_profile_authority_profile_names
+    /\ Id1 \in DOMAIN member_rotation_session_ids
 \* Edge run: the edge's trust repair is owed (an unrealized realization).
 AuditWitnessEdgeRepairOwed == AuditEdge \in owed_edge_repairs
 \* Edge run: after the seal an edge endpoint is unseated and held by the
@@ -1280,6 +1291,7 @@ NotAuditWitnessUnbornArchived == [][~AuditWitnessUnbornArchivedStep]_vars
 NotAuditWitnessSeatUnborn == ~AuditWitnessSeatUnborn
 NotAuditWitnessRotatedUnborn == [][~AuditWitnessRotatedUnbornStep]_vars
 NotAuditWitnessReseatCreated == [][~AuditWitnessReseatCreatedStep]_vars
+NotAuditWitnessRotationGrant == ~AuditWitnessRotationGrant
 NotAuditWitnessBrokenWake == ~AuditWitnessBrokenWake
 NotAuditWitnessCommsLessWokeLive == [][~AuditWitnessCommsLessWokeLiveStep]_vars
 NotAuditWitnessRetireCloses == [][~AuditWitnessRetireClosesStep]_vars

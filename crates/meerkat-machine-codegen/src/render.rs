@@ -554,6 +554,7 @@ const MACHINE_TRANSITION_ENUM_LATE_TAILS: &[(&str, &[&str])] = &[
             "ResolveMemberRevivalSessionCreatedStaleDestroyed",
             "RecoverMemberSeatSessionUnbornRunning",
             "RecoverMemberSeatSessionBornRunning",
+            "AuthorizeSpawnProfileSeatedRunning",
         ],
     ),
     // The entered-step arms of the review attempt lifecycle (0.9.7), after

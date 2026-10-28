@@ -4252,6 +4252,16 @@ macro_rules! mob_catalog_machine_dsl {
                 || self.unborn_seat_sessions.contains(self.member_session_bindings.get_cloned(id).get("value")))
         }
 
+        // A spawn-profile authority is the pending grant of the operation that
+        // consumes it: a spawn or a seat of an identity that is not seated, or
+        // the rotation of a member under its rotation intent. No grant
+        // outlives the operation it was recorded for.
+        invariant spawn_profile_authority_is_a_pending_grant {
+            for_all(id in self.spawn_profile_authority_profile_names.keys(),
+                self.identity_to_runtime.contains_key(id) == false
+                || self.member_rotation_session_ids.contains_key(id) == true)
+        }
+
         // An owed edge repair is a wired edge between seated members, and an
         // owed external repair is a wired external edge of a seated member:
         // the edge going, or an end being unseated, clears it.
@@ -8079,11 +8089,21 @@ macro_rules! mob_catalog_machine_dsl {
             to Destroyed
         }
 
+        // The grant of a spawn-profile authority, recorded for the operation
+        // that consumes it: a spawn or a seat of an identity that is not
+        // seated (CommitSpawnMembership, CommitDormantSeat), or the rotation
+        // of a member under its rotation intent (CommitMemberRotation;
+        // BeginMemberRotation records the intent first). A seated member's
+        // own profile check grants nothing (AuthorizeSpawnProfileSeatedRunning).
         transition AuthorizeSpawnProfileRunning {
             on input AuthorizeSpawnProfile { agent_identity, profile_name, model, profile_material_digest, tool_config_digest, skills_digest, provider_params_digest, output_schema_digest, external_addressable, resolved_spec_digest }
             guard { self.lifecycle_phase == Phase::Running }
             guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
             guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "grant_for_a_spawn_seat_or_rotation" {
+                self.identity_to_runtime.contains_key(agent_identity) == false
+                || self.member_rotation_session_ids.contains_key(agent_identity) == true
+            }
             update {
                 self.spawn_profile_authority_profile_names.insert(agent_identity, profile_name);
                 self.spawn_profile_authority_models.insert(agent_identity, model);
@@ -8242,6 +8262,17 @@ macro_rules! mob_catalog_machine_dsl {
                     ) == false)
             }
             update {
+                // A replayed seat holds no grant: one recorded before it was
+                // not for this incarnation.
+                self.spawn_profile_authority_profile_names.remove(agent_identity);
+                self.spawn_profile_authority_models.remove(agent_identity);
+                self.spawn_profile_authority_material_digests.remove(agent_identity);
+                self.spawn_profile_authority_tool_config_digests.remove(agent_identity);
+                self.spawn_profile_authority_skills_digests.remove(agent_identity);
+                self.spawn_profile_authority_provider_params_digests.remove(agent_identity);
+                self.spawn_profile_authority_output_schema_digests.remove(agent_identity);
+                self.spawn_profile_authority_resolved_spec_digests.remove(agent_identity);
+                self.spawn_profile_authority_external_addressable.remove(agent_identity);
                 self.live_runtime_ids.insert(agent_runtime_id);
                 if external_addressable {
                     self.externally_addressable_runtime_ids.insert(agent_runtime_id);
@@ -8370,6 +8401,17 @@ macro_rules! mob_catalog_machine_dsl {
                 && generation >= mob_machine_next_respawn_generation(self.identity_runtime_generations, agent_identity).get("value")
             }
             update {
+                // A replayed seat holds no grant: one recorded before it was
+                // not for this incarnation.
+                self.spawn_profile_authority_profile_names.remove(agent_identity);
+                self.spawn_profile_authority_models.remove(agent_identity);
+                self.spawn_profile_authority_material_digests.remove(agent_identity);
+                self.spawn_profile_authority_tool_config_digests.remove(agent_identity);
+                self.spawn_profile_authority_skills_digests.remove(agent_identity);
+                self.spawn_profile_authority_provider_params_digests.remove(agent_identity);
+                self.spawn_profile_authority_output_schema_digests.remove(agent_identity);
+                self.spawn_profile_authority_resolved_spec_digests.remove(agent_identity);
+                self.spawn_profile_authority_external_addressable.remove(agent_identity);
                 self.live_runtime_ids.insert(agent_runtime_id);
                 if external_addressable {
                     self.externally_addressable_runtime_ids.insert(agent_runtime_id);
@@ -8699,6 +8741,17 @@ macro_rules! mob_catalog_machine_dsl {
                 && self.member_materialization.get_cloned(agent_identity) != Some(MemberMaterializationPhase::Waking)
             }
             update {
+                // A replayed seat holds no grant: one recorded before it was
+                // not for this incarnation.
+                self.spawn_profile_authority_profile_names.remove(agent_identity);
+                self.spawn_profile_authority_models.remove(agent_identity);
+                self.spawn_profile_authority_material_digests.remove(agent_identity);
+                self.spawn_profile_authority_tool_config_digests.remove(agent_identity);
+                self.spawn_profile_authority_skills_digests.remove(agent_identity);
+                self.spawn_profile_authority_provider_params_digests.remove(agent_identity);
+                self.spawn_profile_authority_output_schema_digests.remove(agent_identity);
+                self.spawn_profile_authority_resolved_spec_digests.remove(agent_identity);
+                self.spawn_profile_authority_external_addressable.remove(agent_identity);
                 self.live_runtime_ids.remove(previous_agent_runtime_id);
                 self.runtime_fence_tokens.remove(previous_agent_runtime_id);
                 self.member_startup_binding_requested.remove(previous_agent_runtime_id);
@@ -26968,6 +27021,34 @@ macro_rules! mob_catalog_machine_dsl {
                 self.unborn_seat_sessions.remove(self.member_session_bindings.get_cloned(agent_identity).get("value"));
             }
             to Running
+        }
+
+        // A seated member's own profile check (its wake's restore, a warm
+        // revival, an explicit resume's rebuild) authorizes the material the
+        // member is built with and records no grant: nothing of a seated
+        // member outside a rotation consumes one, so a grant recorded here
+        // would outlive the check and stand in for a later rotation's role.
+        transition AuthorizeSpawnProfileSeatedRunning {
+            on input AuthorizeSpawnProfile { agent_identity, profile_name, model, profile_material_digest, tool_config_digest, skills_digest, provider_params_digest, output_schema_digest, external_addressable, resolved_spec_digest }
+            guard { self.lifecycle_phase == Phase::Running }
+            guard "lifecycle_origin_open" { self.placed_completion_lifecycle_quiescing == false }
+            guard "coordinator_bound" { self.coordinator_bound == true }
+            guard "member_seated" { self.identity_to_runtime.contains_key(agent_identity) == true }
+            guard "no_rotation_intent" { self.member_rotation_session_ids.contains_key(agent_identity) == false }
+            update {}
+            to Running
+            emit SpawnProfileAuthorized {
+                agent_identity: agent_identity,
+                profile_name: profile_name,
+                model: model,
+                profile_material_digest: profile_material_digest,
+                tool_config_digest: tool_config_digest,
+                skills_digest: skills_digest,
+                provider_params_digest: provider_params_digest,
+                output_schema_digest: output_schema_digest,
+                external_addressable: external_addressable,
+                resolved_spec_digest: resolved_spec_digest
+            }
         }
     }
         }

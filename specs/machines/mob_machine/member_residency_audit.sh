@@ -20,9 +20,9 @@
 #   plan and seal, every WakeMember arm for six input shapes, every
 #   attempt-fenced resolution (the fresh create of an unborn seat's session
 #   among them), the late feedback in Running and Stopped, the seat session
-#   replay, the runtime-ready observation, three release shapes, the drift and
-#   terminal classifications, the peer notice classification, the release
-#   verdict, Stop and Resume;
+#   replay, the member's own profile check, the runtime-ready observation,
+#   three release shapes, the drift and terminal classifications, the peer
+#   notice classification, the release verdict, Stop and Resume;
 # - retire (AuditRetireSpec): one identity woken, released and retired, the
 #   routed and archive-only retirement starts, the routed retire retry, the
 #   archives, the replayed starts, a rotation finished in Running and in
@@ -167,6 +167,7 @@ wake_covered_actions=(
   ResolveMemberRevivalSessionCreatedStaleStopped
   RecoverMemberSeatSessionUnbornRunning
   RecoverMemberSeatSessionBornRunning
+  AuthorizeSpawnProfileSeatedRunning
   ObserveRuntimeReady
   ReleaseMemberMaterializationReleasedRunning
   ReleaseMemberMaterializationReleasedStopped
@@ -604,7 +605,7 @@ for witness in \
   "resume:Action property:ResumeFinishedLive" "resume:Action property:ResumeJoinsAfterReadiness" \
   "edge:Invariant:HeldEdge" "edge:Invariant:EdgeRepairOwed" \
   "wake:Action property:UnbornCreated" "retire:Action property:UnbornArchived" \
-  "retire:Action property:ReseatCreated" \
+  "retire:Action property:ReseatCreated" "retire:Invariant:RotationGrant" \
   "seat:Invariant:SeatUnborn" "seat:Action property:RotatedUnborn" \
   "seat:Invariant:BothSeated" "seat:Invariant:SeatEndpointPending" \
   "seat:Action property:Rotated" "seat:Action property:ReleasedSpawn" \
@@ -884,6 +885,15 @@ rewrite_frame("RecoverMemberSessionBindingAlreadyCurrentRunning", {
   mutate retire lost_session_seats_unborn \
     "Error: Action property AuditReseatUnbornIffNeverBorn is violated" \
     'drop_guard("CommitDormantSeatRunning", "(fresh_launch = TRUE)")' "$@"
+  # A spawn-profile grant recorded for a seated member outside a rotation
+  # (it would outlive the check and stand in for a later rotation's role).
+  mutate retire grant_to_a_seated_member \
+    "Error: Invariant spawn_profile_authority_is_a_pending_grant is violated" \
+    'drop_guard("AuthorizeSpawnProfileRunning", "member_rotation_session_ids")' "$@"
+  # A replayed seat that keeps a grant recorded before it.
+  mutate retire replay_seat_keeps_grant \
+    "Error: Invariant spawn_profile_authority_is_a_pending_grant is violated" \
+    'keep_var("RecoverRosterMemberRunning", "spawn_profile_authority_profile_names")' "$@"
   # The rotation intent recorded for a member that is not Retiring.
   mutate seat rotation_without_retirement \
     "Error: Invariant rotation_intent_is_a_retiring_member is violated" \

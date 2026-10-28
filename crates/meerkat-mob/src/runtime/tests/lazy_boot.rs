@@ -1567,6 +1567,50 @@ async fn a_fresh_seat_on_a_service_without_durable_sessions_is_created_at_its_fi
     );
 }
 
+/// A woken member rotated into another role takes that role at once: its
+/// wake's profile check left no grant behind, so the rotation records its own
+/// under its intent. The new role here also flips external addressability,
+/// which the rotation's commit holds to its own grant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_rotation_after_a_wake_takes_its_new_role_at_once() {
+    let keys = tempfile::tempdir().expect("a comms identity root");
+    let (handle, _service, _events) = seat_mob("rotation-role", |builder| {
+        builder.with_member_comms_identity_root(keys.path())
+    })
+    .await;
+    let identity = worker(0);
+    handle
+        .seat_dormant_members(vec![turn_driven(&identity)])
+        .await
+        .expect("the batch answers");
+    handle
+        .ensure_member_live(&identity)
+        .await
+        .expect("the wake materializes the member");
+    assert!(
+        !handle
+            .machine_state_watch_rx
+            .borrow()
+            .spawn_profile_authority_profile_names
+            .contains_key(&dsl::AgentIdentity::from_domain(&identity)),
+        "the wake's profile check records no grant"
+    );
+    // The lead profile is externally addressable; the worker profile is not.
+    let mut lead = SpawnMemberSpec::new("lead", identity.clone());
+    lead.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+    tokio::time::timeout(LAZY_STEP, handle.rotate_member(lead))
+        .await
+        .expect("the rotation answers")
+        .expect("the rotation commits under its own grant");
+    let listed = handle
+        .list_members()
+        .await
+        .into_iter()
+        .find(|entry| entry.agent_identity == identity)
+        .expect("the member is listed");
+    assert_eq!(listed.role, ProfileName::from("lead"));
+}
+
 /// A rotation retires the member's incarnation and seats the next
 /// one on a new name-based session in one journal batch: MemberRetired is
 /// followed at once by the next MemberSpawned, and the old session is

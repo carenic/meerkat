@@ -10281,22 +10281,6 @@ mod tests {
         .expect("the host marks the identity's preparation pending");
         MobMachineMutator::apply(
             &mut authority,
-            MobMachineInput::AuthorizeSpawnProfile {
-                agent_identity: member.identity.clone(),
-                profile_name: "test".to_string(),
-                model: "test-model".to_string(),
-                profile_material_digest: "rotation-profile-digest".to_string(),
-                tool_config_digest: "test-tool-config-digest".to_string(),
-                skills_digest: "test-skills-digest".to_string(),
-                provider_params_digest: None,
-                output_schema_digest: None,
-                external_addressable: false,
-                resolved_spec_digest: None,
-            },
-        )
-        .expect("the rotation authorizes its next incarnation's profile");
-        MobMachineMutator::apply(
-            &mut authority,
             retire_input(&member, Some(member.session_id.clone())),
         )
         .expect("the rotation's retirement starts");
@@ -10313,6 +10297,22 @@ mod tests {
             },
         )
         .expect("the rotation records its intent");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
         close_ingress_detach(&mut authority, &member);
         assert!(
             authority.apply_signal(archived_signal(&member)).is_err(),
@@ -11051,22 +11051,6 @@ mod tests {
         let member = seat_live_member_with_endpoint(&mut authority, "forced-destroy-rotation", 37);
         MobMachineMutator::apply(
             &mut authority,
-            MobMachineInput::AuthorizeSpawnProfile {
-                agent_identity: member.identity.clone(),
-                profile_name: "test".to_string(),
-                model: "test-model".to_string(),
-                profile_material_digest: "forced-destroy-profile-digest".to_string(),
-                tool_config_digest: "test-tool-config-digest".to_string(),
-                skills_digest: "test-skills-digest".to_string(),
-                provider_params_digest: None,
-                output_schema_digest: None,
-                external_addressable: false,
-                resolved_spec_digest: None,
-            },
-        )
-        .expect("the rotation authorizes its next incarnation's profile");
-        MobMachineMutator::apply(
-            &mut authority,
             retire_input(&member, Some(member.session_id.clone())),
         )
         .expect("the rotation's retirement starts");
@@ -11084,6 +11068,22 @@ mod tests {
             },
         )
         .expect("the rotation records its intent");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "forced-destroy-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
         close_ingress_detach(&mut authority, &member);
         begin_completion_lifecycle_quiesce(
             &mut authority,
@@ -11115,22 +11115,6 @@ mod tests {
         let member = seat_live_member_with_endpoint(&mut authority, "kickoff-rotation", 35);
         MobMachineMutator::apply(
             &mut authority,
-            MobMachineInput::AuthorizeSpawnProfile {
-                agent_identity: member.identity.clone(),
-                profile_name: "test".to_string(),
-                model: "test-model".to_string(),
-                profile_material_digest: "kickoff-rotation-profile-digest".to_string(),
-                tool_config_digest: "test-tool-config-digest".to_string(),
-                skills_digest: "test-skills-digest".to_string(),
-                provider_params_digest: None,
-                output_schema_digest: None,
-                external_addressable: false,
-                resolved_spec_digest: None,
-            },
-        )
-        .expect("the rotation authorizes its next incarnation's profile");
-        MobMachineMutator::apply(
-            &mut authority,
             retire_input(&member, Some(member.session_id.clone())),
         )
         .expect("the rotation's retirement starts");
@@ -11147,6 +11131,22 @@ mod tests {
             },
         )
         .expect("the rotation records its intent");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "kickoff-rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
         close_ingress_detach(&mut authority, &member);
         let committed = MobMachineMutator::apply(
             &mut authority,
@@ -11567,22 +11567,6 @@ mod tests {
         let next_runtime = AgentRuntimeId::from("unborn-rotation:1");
         MobMachineMutator::apply(
             &mut authority,
-            MobMachineInput::AuthorizeSpawnProfile {
-                agent_identity: member.identity.clone(),
-                profile_name: "test".to_string(),
-                model: "test-model".to_string(),
-                profile_material_digest: "unborn-rotation-profile-digest".to_string(),
-                tool_config_digest: "test-tool-config-digest".to_string(),
-                skills_digest: "test-skills-digest".to_string(),
-                provider_params_digest: None,
-                output_schema_digest: None,
-                external_addressable: false,
-                resolved_spec_digest: None,
-            },
-        )
-        .expect("the rotation authorizes its next incarnation's profile");
-        MobMachineMutator::apply(
-            &mut authority,
             retire_input(&member, Some(member.session_id.clone())),
         )
         .expect("the rotation's retirement starts");
@@ -11599,6 +11583,22 @@ mod tests {
             },
         )
         .expect("the rotation records its intent");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::AuthorizeSpawnProfile {
+                agent_identity: member.identity.clone(),
+                profile_name: "test".to_string(),
+                model: "test-model".to_string(),
+                profile_material_digest: "unborn-rotation-profile-digest".to_string(),
+                tool_config_digest: "test-tool-config-digest".to_string(),
+                skills_digest: "test-skills-digest".to_string(),
+                provider_params_digest: None,
+                output_schema_digest: None,
+                external_addressable: false,
+                resolved_spec_digest: None,
+            },
+        )
+        .expect("the rotation authorizes its next incarnation's profile");
         close_ingress_detach(&mut authority, &member);
         MobMachineMutator::apply(
             &mut authority,
@@ -11868,5 +11868,175 @@ mod tests {
         )
         .expect("the resume seat of a created session is born");
         assert!(authority.state().member_seat_session_unborn.is_empty());
+    }
+
+    fn profile_check(
+        identity: &AgentIdentity,
+        profile_name: &str,
+        external_addressable: bool,
+    ) -> MobMachineInput {
+        MobMachineInput::AuthorizeSpawnProfile {
+            agent_identity: identity.clone(),
+            profile_name: profile_name.to_string(),
+            model: "test-model".to_string(),
+            profile_material_digest: format!("{profile_name}-profile-digest"),
+            tool_config_digest: "test-tool-config-digest".to_string(),
+            skills_digest: "test-skills-digest".to_string(),
+            provider_params_digest: None,
+            output_schema_digest: None,
+            external_addressable,
+            resolved_spec_digest: None,
+        }
+    }
+
+    /// A seated member's own profile check (a wake's restore, a warm revival,
+    /// an explicit resume's rebuild) authorizes the material and records no
+    /// grant. A rotation after the wake records its own grant under its
+    /// intent: the next incarnation's role is the rotation's at once, and the
+    /// commit holds when that role flips external addressability.
+    #[test]
+    fn a_seated_members_profile_check_grants_nothing_and_a_rotation_takes_its_own_role() {
+        let (mut authority, member) = dormant_member_authority("profile-check");
+        let attempt = open_wake_attempt(&mut authority, &member.identity);
+        let checked = MobMachineMutator::apply(
+            &mut authority,
+            profile_check(&member.identity, "worker", false),
+        )
+        .expect("the wake's restore checks its profile");
+        assert!(checked.effects().iter().any(|effect| matches!(
+            effect,
+            MobMachineEffect::SpawnProfileAuthorized { profile_name, .. } if profile_name == "worker"
+        )));
+        assert!(
+            !authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .contains_key(&member.identity),
+            "a seated member's profile check records no grant"
+        );
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalBound {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the wake's Bound step applies");
+        authority
+            .apply_signal(MobMachineSignal::ResolveMemberRevivalSucceeded {
+                agent_identity: member.identity.clone(),
+                attempt,
+            })
+            .expect("the wake closes Live");
+
+        MobMachineMutator::apply(
+            &mut authority,
+            retire_input(&member, Some(member.session_id.clone())),
+        )
+        .expect("the rotation's retirement starts");
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::BeginMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: SessionId::from("profile-check-next"),
+                peer_endpoint: None,
+                session_archived: false,
+            },
+        )
+        .expect("the rotation records its intent");
+        MobMachineMutator::apply(
+            &mut authority,
+            profile_check(&member.identity, "lead", true),
+        )
+        .expect("the rotation records its grant under its intent");
+        assert_eq!(
+            authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .get(&member.identity)
+                .map(String::as_str),
+            Some("lead")
+        );
+        close_ingress_detach(&mut authority, &member);
+        MobMachineMutator::apply(
+            &mut authority,
+            MobMachineInput::CommitMemberRotation {
+                agent_identity: member.identity.clone(),
+                agent_runtime_id: member.runtime_id.clone(),
+                fence_token: member.fence_token,
+                generation: Generation(0),
+                session_id: Some(member.session_id.clone()),
+                disposal: MemberSessionDisposal::Archived,
+                next_agent_runtime_id: AgentRuntimeId::from("profile-check:1"),
+                next_fence_token: FenceToken(8),
+                next_generation: Generation(1),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: true,
+                kickoff_owed: false,
+                kickoff_objective_id: String::new(),
+            },
+        )
+        .expect("the rotation commits under its own grant");
+        assert_eq!(
+            authority
+                .state()
+                .member_profile_names
+                .get(&member.identity)
+                .map(String::as_str),
+            Some("lead"),
+            "the next incarnation's role is the rotation's at once"
+        );
+        assert!(
+            authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .is_empty(),
+            "the rotation's commit consumes its grant"
+        );
+    }
+
+    /// A grant is recorded only for the operation that consumes it: a seated
+    /// member outside a rotation gets the profile check alone, and a replayed
+    /// seat drops a grant recorded before it.
+    #[test]
+    fn a_grant_is_recorded_only_for_a_spawn_a_seat_or_a_rotation() {
+        let identity = AgentIdentity::from("grant-holder");
+        let mut authority = MobMachineAuthority::new();
+        MobMachineMutator::apply(&mut authority, profile_check(&identity, "worker", false))
+            .expect("an identity that is not seated is granted");
+        assert!(
+            authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .contains_key(&identity)
+        );
+        authority
+            .apply_signal(MobMachineSignal::RecoverRosterMember {
+                agent_identity: identity.clone(),
+                agent_runtime_id: AgentRuntimeId::from("grant-holder:0"),
+                fence_token: FenceToken(1),
+                generation: Generation(0),
+                profile_name: "worker".to_string(),
+                runtime_mode: SpawnPolicyRuntimeMode::AutonomousHost,
+                external_addressable: false,
+            })
+            .expect("replay seats the identity");
+        assert!(
+            authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .is_empty(),
+            "a replayed seat drops a grant recorded before it"
+        );
+        MobMachineMutator::apply(&mut authority, profile_check(&identity, "lead", true))
+            .expect("a seated member's profile check answers");
+        assert!(
+            authority
+                .state()
+                .spawn_profile_authority_profile_names
+                .is_empty(),
+            "a seated member outside a rotation records no grant"
+        );
     }
 }
