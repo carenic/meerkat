@@ -2465,7 +2465,9 @@ async fn an_open_reads_only_the_obligated_runtimes_bounded_window() {
 // commit's one batch, a reset and the live image, with every earlier row
 // dropped at the image's first row; and a reopen folds the same entries: the
 // newest snapshot with the work it owes, the unsettled input, the committed
-// document and the run's provisional tail.
+// document and the run's provisional tail. Every entry folds byte for byte
+// but the ops snapshot, which memory encodes again from its hash maps: it
+// must fold to the same snapshot, compared decoded.
 #[tokio::test]
 async fn a_settling_runtime_keeps_its_window_under_the_rebase_bound() {
     use meerkat_core::lifecycle::RunId;
@@ -2548,11 +2550,32 @@ async fn a_settling_runtime_keeps_its_window_under_the_rebase_bound() {
         reopened.1.runtime_loaded_for_test(&runtime.0).await,
         "its work loads it at open"
     );
+    let folded = reopened.1.export_runtime_for_test(&runtime.0).await;
     assert_eq!(
-        reopened.1.export_runtime_for_test(&runtime.0).await,
-        image,
+        folded.keys().collect::<Vec<_>>(),
+        image.keys().collect::<Vec<_>>(),
         "the reopen folds the same entries"
     );
+    for (key, value) in &image {
+        if key == "ops" {
+            // Memory keeps the ops snapshot decoded and encodes it again for
+            // each export. Its operations, specs and feed entries are hash
+            // maps, so two encodings of the same snapshot may order their
+            // keys differently: the reopen must fold the same snapshot, not
+            // the same bytes.
+            let decode = |bytes: &[u8]| {
+                serde_json::from_slice::<serde_json::Value>(bytes)
+                    .expect("the ops snapshot is JSON")
+            };
+            assert_eq!(
+                decode(folded[key].as_slice()),
+                decode(value.as_slice()),
+                "the reopen folds the same ops snapshot"
+            );
+        } else {
+            assert_eq!(&folded[key], value, "the reopen folds {key} byte for byte");
+        }
+    }
     assert!(
         reopened
             .1
