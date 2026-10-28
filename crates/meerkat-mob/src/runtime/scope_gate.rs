@@ -231,6 +231,7 @@ impl MobCommand {
             | Self::ResumeLifecycleMemberCleanupHeld { .. }
             | Self::ResumeLifecycleMemberUnproven { .. }
             | Self::ResumeLifecycleBootMemberSettled { .. }
+            | Self::ResumeLifecycleBootMembersPrepared { .. }
             | Self::ResumeLifecycleRollbackStep { .. }
             | Self::ResumeLifecycleRollbackFinalized { .. }
             | Self::ResumePostCommitMemberCompleted { .. }
@@ -745,6 +746,7 @@ impl MobCommand {
             | Self::ResumeLifecycleMemberCleanupHeld { .. }
             | Self::ResumeLifecycleMemberUnproven { .. }
             | Self::ResumeLifecycleBootMemberSettled { .. }
+            | Self::ResumeLifecycleBootMembersPrepared { .. }
             | Self::ResumeLifecycleRollbackStep { .. }
             | Self::ResumeLifecycleRollbackFinalized { .. }
             | Self::ResumePostCommitMemberCompleted { .. }

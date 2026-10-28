@@ -768,6 +768,9 @@ impl MobActor {
                 crate::runtime::state::LifecycleProgressStage::MemberLiveMaterialization,
             );
         }
+        // A member the lift's plan rebuilt frees its slot of the plan: the
+        // plan dispatches the members it has not reached yet.
+        self.advance_explicit_resume_boot_plan().await;
         self.continue_explicit_resume_after_rebuild().await;
     }
 
@@ -855,7 +858,7 @@ impl MobActor {
     /// [`Self::retain_explicit_resume_error`] while the resume still waits on
     /// its members' work. A member that settles after a lifecycle control
     /// superseded the resume has no caller to answer.
-    fn retain_explicit_resume_member_failure(&mut self, error: MobError) {
+    pub(super) fn retain_explicit_resume_member_failure(&mut self, error: MobError) {
         if matches!(
             self.pending_resume_lifecycle
                 .as_ref()

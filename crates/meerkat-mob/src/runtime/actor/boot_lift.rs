@@ -5,15 +5,22 @@
 //! durable Resume made the mob Running again, one `PlanBootMaterialization`
 //! per Dormant member, with the start's restore policy and host inputs and
 //! one fresh runtime obligation scan. A member the plan selects is Waking
-//! under the plan's wake attempt; the actor's wake path materializes it
-//! through the one cold recipe every wake uses. The explicit resume joins
-//! each such wake (`AuthorizeExplicitResumeMember` answers Join), waits for
-//! its attempt to close (Live, Broken, or Dormant again for a retryable
-//! cause) and settles it, so the lift answers its caller only after the
-//! members it materializes settled. A member is never materialized twice:
-//! one attempt per member, and every other wake of it joins that attempt.
-//! Every other member stays Dormant and is materialized by its first
-//! delivery.
+//! under the plan's wake attempt, and the lift realizes that attempt itself
+//! through the explicit-resume work path, as an explicit resume rebuilds
+//! every member: its rebuild is prepared off the actor (its customized
+//! request, its view and snapshot reads; no takeover, which the seam ran
+//! before the Resume), the explicit resume reserves it
+//! (`AuthorizeExplicitResumeMember` answers Join), and the work path
+//! observes, provisions (an occupied claim awaits its release, a retained
+//! unattached actor is reclaimed, uncertain custody is parked) and accepts
+//! it; its own readiness then settles it Live, or Broken. A seat whose
+//! session is unborn, or a member with no durable endpoint yet, is realized
+//! by the actor's wake path instead (the cold recipe creates the session,
+//! or registers the endpoint), and the explicit resume joins that wake. The
+//! lift answers its caller only after the members it materializes settled.
+//! A member is never materialized twice: one attempt per member, and every
+//! other wake of it joins that attempt. Every other member stays Dormant and
+//! is materialized by its first delivery.
 //!
 //! The plan is dispatched at most the mob's restore concurrency at a time
 //! (`MobBuilder::with_resume_restore_concurrency`): the lift applies
@@ -121,6 +128,10 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     /// the plan applied nothing to them, and reaches them again once that
     /// wake closes.
     watched: BTreeSet<mob_dsl::AgentIdentity>,
+    /// The members of `open` whose rebuild is being prepared for the
+    /// explicit-resume work path: the explicit resume reserves each once its
+    /// rebuild is ready.
+    preparing: BTreeSet<mob_dsl::AgentIdentity>,
     /// The members the plan verified (`VerifyMember`), read once it has
     /// reached every member (those still Dormant then).
     verify: BTreeSet<AgentIdentity>,
@@ -129,6 +140,32 @@ pub(in crate::runtime) struct ExplicitResumeBootDispatch {
     bound: usize,
     /// The lift's progress: the plan's store reads report to it.
     progress: super::super::state::LifecycleProgressSignal,
+    /// The lift's admission: a rebuild the plan prepares joins a takeover
+    /// under it (a successor session's).
+    admission: super::super::state::LifecycleAdmissionSignal,
+}
+
+/// One member of a dispatch round whose rebuild the lift prepared off the
+/// actor, for the explicit-resume work path, under the plan's open
+/// `attempt`.
+pub(in crate::runtime) struct ExplicitResumeBootMemberPrepared {
+    identity: AgentIdentity,
+    attempt: u64,
+    result: Result<ExplicitResumeMemberRebuild, MobError>,
+}
+
+/// Whether the lift realizes `identity`'s planned attempt through the
+/// explicit-resume work path, as an explicit resume rebuilds a member: its
+/// session is born and its endpoint is durable. A seat whose session is
+/// unborn is created by its first wake, and a member with no durable
+/// endpoint yet registers one in its wake before it is Live, so the actor's
+/// wake path realizes those.
+fn lift_rebuilds_member(
+    state: &mob_dsl::MobMachineState,
+    identity: &mob_dsl::AgentIdentity,
+) -> bool {
+    !state.member_seat_session_unborn.contains(identity)
+        && state.member_peer_endpoints.contains_key(identity)
 }
 
 impl MobActor {
@@ -146,6 +183,7 @@ impl MobActor {
     /// that outlasts the inactivity budget does.
     pub(super) async fn plan_explicit_resume_boot_set(
         &mut self,
+        admission: &super::super::state::LifecycleAdmissionSignal,
         progress: &super::super::state::LifecycleProgressSignal,
     ) -> Result<Vec<ExplicitResumeBootMember>, MobError> {
         let resume_attempt = self
@@ -192,9 +230,11 @@ impl MobActor {
             queue,
             open: BTreeMap::new(),
             watched: BTreeSet::new(),
+            preparing: BTreeSet::new(),
             verify: BTreeSet::new(),
             bound,
             progress: progress.clone(),
+            admission: admission.clone(),
         });
         self.dispatch_explicit_resume_boot_members().await
     }
@@ -240,6 +280,7 @@ impl MobActor {
             }
         }
         let mut planned = Vec::new();
+        let mut rebuilt = Vec::new();
         let mut watching = Vec::new();
         while dispatch.open.len() < dispatch.bound {
             let Some(identity) = dispatch.queue.pop_front() else {
@@ -280,7 +321,12 @@ impl MobActor {
                         ..
                     } => {
                         dispatch.open.insert(agent_identity.clone(), *attempt);
-                        planned.push((agent_identity.clone(), *attempt));
+                        if lift_rebuilds_member(self.dsl_authority.state(), agent_identity) {
+                            dispatch.preparing.insert(agent_identity.clone());
+                            rebuilt.push((agent_identity.clone(), *attempt));
+                        } else {
+                            planned.push((agent_identity.clone(), *attempt));
+                        }
                     }
                     mob_dsl::MobMachineEffect::VerifyMember { agent_identity } => {
                         dispatch
@@ -291,7 +337,19 @@ impl MobActor {
                 }
             }
         }
-        let finished = dispatch.queue.is_empty() && dispatch.watched.is_empty();
+        if !rebuilt.is_empty() {
+            // The lift realizes these attempts itself, through the
+            // explicit-resume work path: the actor's wake path starts none of
+            // them.
+            self.member_wakes.pending.retain(|pending| {
+                !rebuilt.iter().any(|(identity, attempt)| {
+                    pending.attempt == *attempt && identity.0 == pending.identity.as_str()
+                })
+            });
+        }
+        let finished = dispatch.queue.is_empty()
+            && dispatch.watched.is_empty()
+            && dispatch.preparing.is_empty();
         #[cfg(feature = "runtime-adapter")]
         if finished {
             // A verified member a delivery has woken since reads its durable
@@ -318,6 +376,15 @@ impl MobActor {
         }
         #[cfg(not(feature = "runtime-adapter"))]
         let _ = (&dispatch.verify, &dispatch.progress);
+        if !rebuilt.is_empty() {
+            self.prepare_explicit_resume_boot_members(
+                &dispatch.resume_attempt,
+                &dispatch.admission,
+                &dispatch.progress,
+                rebuilt,
+            )
+            .await;
+        }
         let members = self
             .explicit_resume_boot_members(&dispatch.resume_attempt, planned, watching)
             .await?;
@@ -612,17 +679,7 @@ impl MobActor {
                 "a member the lift materializes did not become live; MobMachine holds its outcome"
             );
         }
-        let dispatched = self.explicit_resume_boot_dispatch_pending();
-        if dispatched {
-            match self.dispatch_explicit_resume_boot_members().await {
-                Ok(members) => {
-                    if let Err(error) = self.join_explicit_resume_boot_members(members) {
-                        self.retain_explicit_resume_error(error);
-                    }
-                }
-                Err(error) => self.retain_explicit_resume_error(error),
-            }
-        }
+        let dispatched = self.advance_explicit_resume_boot_plan().await;
         if !member.authorized {
             // The lift never took this wake over, so it has nothing to
             // settle; it goes on only when this close moved its plan. The
@@ -679,5 +736,364 @@ impl MobActor {
             );
         }
         self.continue_explicit_resume_after_rebuild().await;
+    }
+
+    /// Dispatch the next members of the lift's plan while it still has
+    /// members to reach (each closed wake frees its slot) and join the wakes
+    /// it opened or watches. Whether the plan was still dispatching.
+    pub(super) async fn advance_explicit_resume_boot_plan(&mut self) -> bool {
+        let dispatched = self.explicit_resume_boot_dispatch_pending();
+        if dispatched {
+            match self.dispatch_explicit_resume_boot_members().await {
+                Ok(members) => {
+                    if let Err(error) = self.join_explicit_resume_boot_members(members) {
+                        self.retain_explicit_resume_error(error);
+                    }
+                }
+                Err(error) => self.retain_explicit_resume_error(error),
+            }
+        }
+        dispatched
+    }
+
+    /// Prepare, off the actor, the rebuilds of the members of a dispatch
+    /// round the lift realizes through the explicit-resume work path, each
+    /// member on its own (one member's failure is that member's), and hand
+    /// them back ([`Self::explicit_resume_boot_members_prepared`]).
+    async fn prepare_explicit_resume_boot_members(
+        &mut self,
+        resume_attempt: &mob_dsl::ResumeAttemptId,
+        admission: &super::super::state::LifecycleAdmissionSignal,
+        progress: &super::super::state::LifecycleProgressSignal,
+        members: Vec<(mob_dsl::AgentIdentity, u64)>,
+    ) {
+        let mut prepared = Vec::new();
+        let mut candidates = Vec::new();
+        {
+            let roster = self.roster.read().await;
+            let state = self.dsl_authority.state();
+            for (identity, attempt) in members {
+                let domain = AgentIdentity::from(identity.0.as_str());
+                let candidate = roster.get(&domain).cloned().and_then(|entry| {
+                    let session_id = state
+                        .member_session_bindings
+                        .get(&identity)
+                        .and_then(|session| SessionId::parse(&session.0).ok())?;
+                    let member_ref = Self::project_member_ref_session_binding(
+                        &entry.member_ref,
+                        Some(session_id.clone()),
+                    )?;
+                    Some((
+                        entry,
+                        member_ref,
+                        session_id,
+                        ExplicitResumePreparation::Planned,
+                    ))
+                });
+                match candidate {
+                    Some(candidate) => candidates.push((attempt, candidate)),
+                    None => prepared.push(ExplicitResumeBootMemberPrepared {
+                        result: Err(MobError::Internal(format!(
+                            "the lift cannot rebuild '{domain}': it has no roster entry or session binding"
+                        ))),
+                        identity: domain,
+                        attempt,
+                    }),
+                }
+            }
+        }
+        let context = Arc::new(self.explicit_resume_preparation_context());
+        let admission = admission.clone();
+        let progress = progress.clone();
+        let resume_attempt = resume_attempt.clone();
+        let command_tx = self.command_tx.clone();
+        #[cfg(all(test, feature = "runtime-adapter"))]
+        let probe_mob = self.definition.id.clone();
+        self.actor_io_tasks.spawn(async move {
+            let rebuilds =
+                futures::future::join_all(candidates.into_iter().map(|(attempt, candidate)| {
+                    let context = Arc::clone(&context);
+                    let admission = admission.clone();
+                    let progress = progress.clone();
+                    #[cfg(all(test, feature = "runtime-adapter"))]
+                    let probe_mob = probe_mob.clone();
+                    Box::pin(async move {
+                        let identity = candidate.0.agent_identity.clone();
+                        // The rows' restore probe holds the member's restore at
+                        // its start, as it holds a wake's.
+                        #[cfg(all(test, feature = "runtime-adapter"))]
+                        let probed = super::member_wake_turn::enter_member_wake_restore_probe(
+                            &probe_mob,
+                            identity.clone(),
+                        )
+                        .await;
+                        #[cfg(all(test, feature = "runtime-adapter"))]
+                        if probed.as_ref().is_some_and(|restore| restore.aborted) {
+                            return ExplicitResumeBootMemberPrepared {
+                                identity,
+                                attempt,
+                                result: Err(MobError::Internal(
+                                    "the test probe ended this member restore at its start"
+                                        .to_string(),
+                                )),
+                            };
+                        }
+                        let result = context
+                            .prepare(vec![candidate], admission, &progress)
+                            .await
+                            .and_then(|mut rebuild| {
+                                rebuild.pop().ok_or_else(|| {
+                                    MobError::Internal(format!(
+                                        "the explicit resume prepared no rebuild of '{identity}'"
+                                    ))
+                                })
+                            });
+                        #[cfg(all(test, feature = "runtime-adapter"))]
+                        drop(probed);
+                        ExplicitResumeBootMemberPrepared {
+                            identity,
+                            attempt,
+                            result,
+                        }
+                    })
+                }))
+                .await;
+            prepared.extend(rebuilds);
+            let _ = command_tx
+                .send(RoutedMobCommand::internal(
+                    MobCommand::ResumeLifecycleBootMembersPrepared {
+                        resume_attempt,
+                        prepared,
+                    },
+                ))
+                .await;
+        });
+    }
+
+    /// The rebuilds of a dispatch round's members are prepared. The explicit
+    /// resume reserves each prepared member (Join: the plan's attempt is
+    /// open) and the work path materializes it. A member whose rebuild could
+    /// not be prepared, or that the explicit resume could not reserve, ends
+    /// its plan attempt as a wake would ([`Self::end_explicit_resume_boot_member`]).
+    /// A member whose attempt closed meanwhile (a stop, a retire) was not
+    /// provisioned and is left as its closure left it. Then the plan goes on.
+    pub(super) async fn explicit_resume_boot_members_prepared(
+        &mut self,
+        resume_attempt: mob_dsl::ResumeAttemptId,
+        prepared: Vec<ExplicitResumeBootMemberPrepared>,
+    ) {
+        if let Some(dispatch) = self
+            .explicit_resume_boot_dispatch
+            .as_mut()
+            .filter(|dispatch| dispatch.resume_attempt == resume_attempt)
+        {
+            for member in &prepared {
+                dispatch
+                    .preparing
+                    .remove(&mob_dsl::AgentIdentity::from_domain(&member.identity));
+            }
+        }
+        let lift_current = {
+            let state = self.dsl_authority.state();
+            state.lifecycle_phase == mob_dsl::MobPhase::Running
+                && !state.explicit_resume_cancel_requested
+                && state.explicit_resume_attempt.as_ref() == Some(&resume_attempt)
+        };
+        let mut rebuild = Vec::new();
+        let mut reserving = Vec::new();
+        for ExplicitResumeBootMemberPrepared {
+            identity,
+            attempt,
+            result,
+        } in prepared
+        {
+            if !self.member_wake_attempt_is_open(&identity, attempt) {
+                continue;
+            }
+            match result {
+                Ok(member) if lift_current => {
+                    reserving.push((identity, attempt));
+                    rebuild.push(member);
+                }
+                Ok(_) => self.abandon_explicit_resume_boot_member(
+                    &identity,
+                    attempt,
+                    "the lift that planned the member ended before its rebuild".to_string(),
+                ),
+                Err(error) => {
+                    self.end_explicit_resume_boot_member(&identity, attempt, error)
+                        .await;
+                }
+            }
+        }
+        if !rebuild.is_empty() {
+            let progress = self
+                .pending_resume_lifecycle
+                .as_ref()
+                .map(|pending| pending.progress.clone())
+                .or_else(|| {
+                    self.explicit_resume_boot_dispatch
+                        .as_ref()
+                        .map(|dispatch| dispatch.progress.clone())
+                });
+            let refusal = match progress {
+                Some(progress) => self
+                    .rebuild_explicit_resume_member_sessions(rebuild, &progress)
+                    .await
+                    .err()
+                    .map(|error| error.to_string()),
+                None => Some("the lift lost its explicit resume".to_string()),
+            };
+            // A member the explicit resume did not reserve still holds its
+            // plan attempt, which nothing would realize: it ends here.
+            for (identity, attempt) in reserving {
+                let reserved = self
+                    .dsl_authority
+                    .state()
+                    .explicit_resume_member_work
+                    .contains_key(&mob_dsl::AgentIdentity::from_domain(&identity));
+                if !reserved && self.member_wake_attempt_is_open(&identity, attempt) {
+                    let reason = refusal
+                        .clone()
+                        .unwrap_or_else(|| "the explicit resume did not reserve it".to_string());
+                    self.end_explicit_resume_boot_member(
+                        &identity,
+                        attempt,
+                        MobError::Internal(format!(
+                            "the explicit resume could not rebuild '{identity}': {reason}"
+                        )),
+                    )
+                    .await;
+                }
+            }
+        }
+        // The lift goes on only while it still waits on its members: one a
+        // lifecycle control superseded has already been answered.
+        let rebuilding = matches!(
+            self.pending_resume_lifecycle
+                .as_ref()
+                .map(|pending| &pending.phase),
+            Some(ResumeLifecyclePhase::RebuildingMembers { .. })
+        );
+        if rebuilding {
+            self.advance_explicit_resume_boot_plan().await;
+            self.continue_explicit_resume_after_rebuild().await;
+        }
+    }
+
+    /// End a planned member's open attempt that the lift could not rebuild,
+    /// as a wake ends one: retryable for a cause that clears on its own
+    /// ([`crate::runtime::builder::restore_error_is_retryable`]; the member
+    /// is Dormant with its boot obligation owed and its retry armed, and the
+    /// explicit resume answers the typed error), otherwise Broken with the
+    /// error, that member's own outcome.
+    async fn end_explicit_resume_boot_member(
+        &mut self,
+        identity: &AgentIdentity,
+        attempt: u64,
+        error: MobError,
+    ) {
+        let dsl_identity = mob_dsl::AgentIdentity::from_domain(identity);
+        if crate::runtime::builder::restore_error_is_retryable(&error) {
+            match self.apply_dsl_signal_collect_transition(
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
+                    agent_identity: dsl_identity,
+                    attempt,
+                    kind: mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable,
+                },
+                "resolve_retryable_explicit_resume_boot_member",
+            ) {
+                Ok(_) => {
+                    self.schedule_owed_member_wake_retry(identity);
+                    self.retain_explicit_resume_member_failure(error);
+                }
+                Err(refused) => {
+                    self.abandon_explicit_resume_boot_member(
+                        identity,
+                        attempt,
+                        refused.to_string(),
+                    );
+                }
+            }
+            return;
+        }
+        let session_id = self
+            .dsl_authority
+            .state()
+            .member_session_bindings
+            .get(&dsl_identity)
+            .and_then(|session| SessionId::parse(&session.0).ok());
+        let reason = error.to_string();
+        let registration_refusal = match &error {
+            MobError::MemberRegistrationRefused { call, .. } => Some(*call),
+            _ => None,
+        };
+        let signal = match registration_refusal {
+            Some(call) => mob_dsl::MobMachineSignal::ResolveMemberRevivalHostRefused {
+                agent_identity: dsl_identity.clone(),
+                refusal_code: call.as_code().to_string(),
+                reason: reason.clone(),
+                attempt,
+            },
+            None => mob_dsl::MobMachineSignal::ResolveMemberRevivalFailed {
+                agent_identity: dsl_identity.clone(),
+                reason: reason.clone(),
+                attempt,
+            },
+        };
+        match self.apply_dsl_signal_collect_transition(
+            signal,
+            "resolve_failed_explicit_resume_boot_member",
+        ) {
+            Ok(transition)
+                if super::super::boot_plan::wake_feedback_applied(
+                    transition.effects(),
+                    &dsl_identity,
+                    attempt,
+                ) =>
+            {
+                self.record_member_restore_failure(
+                    identity,
+                    super::super::handle::RestoreFailureDiagnostic {
+                        bridge_session_id: session_id,
+                        reason,
+                        hold: error.durable_resume_hold(),
+                        registration_refusal,
+                    },
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(refused) => {
+                self.abandon_explicit_resume_boot_member(identity, attempt, refused.to_string());
+            }
+        }
+    }
+
+    /// Close a planned member's open attempt that nothing realizes (the lift
+    /// that planned it ended, or its resolution was refused): the member is
+    /// Dormant again and its next delivery wakes it.
+    fn abandon_explicit_resume_boot_member(
+        &mut self,
+        identity: &AgentIdentity,
+        attempt: u64,
+        reason: String,
+    ) {
+        if let Err(error) = self.apply_dsl_signal(
+            mob_dsl::MobMachineSignal::AbandonMemberWake {
+                agent_identity: mob_dsl::AgentIdentity::from_domain(identity),
+                attempt,
+                kind: mob_dsl::MemberWakeAbandonKind::NotCurrent,
+                reason,
+            },
+            "abandon_unrealized_explicit_resume_boot_member",
+        ) {
+            tracing::warn!(
+                mob_id = %self.definition.id,
+                agent_identity = %identity,
+                %error,
+                "a planned member's attempt the lift does not realize could not be closed"
+            );
+        }
     }
 }

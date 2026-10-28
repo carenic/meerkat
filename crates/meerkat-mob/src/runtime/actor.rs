@@ -8692,6 +8692,11 @@ enum ExplicitResumePreparation {
     /// left): the seam retires it, as it retires every foreign attachment,
     /// and the member stays Dormant for the lift's plan.
     RetireRetained,
+    /// A member the lift's plan materializes after the durable Resume (its
+    /// wake attempt is open): no takeover (the seam retired any
+    /// materialization of this process before the Resume), only its rebuild
+    /// is planned, for the explicit-resume work path.
+    Planned,
 }
 
 /// One member of the explicit resume's preparation: its roster entry, its
@@ -21683,15 +21688,20 @@ impl ExplicitResumePreparationContext {
             );
             // Each member's takeover gets its own retirement budget, from its
             // own turn of this serial pass: a slow member never spends a later
-            // member's budget.
-            let mut requires_materialization = self
-                .provisioner
-                .prepare_member_session_for_explicit_resume(
-                    &session_id,
-                    Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
-                    Some(admission.clone()),
-                )
-                .await?;
+            // member's budget. A member the lift's plan materializes has no
+            // takeover of its own here.
+            let mut requires_materialization = if preparation == ExplicitResumePreparation::Planned
+            {
+                true
+            } else {
+                self.provisioner
+                    .prepare_member_session_for_explicit_resume(
+                        &session_id,
+                        Instant::now() + super::provisioner::EXPLICIT_RESUME_RETIRE_TOTAL_TIMEOUT,
+                        Some(admission.clone()),
+                    )
+                    .await?
+            };
             progress.member_progress(
                 &entry.agent_identity,
                 super::state::LifecycleProgressStage::MemberAttachmentSessionPreparation,
@@ -23463,10 +23473,16 @@ impl MobActor {
         // Running again: one `PlanBootMaterialization` per Dormant member,
         // with this start's policy and host inputs and a fresh obligation
         // scan, applied while fewer than the restore concurrency of the
-        // plan's wakes are open (the rest as they close, `boot_lift`). Each
-        // planned member is woken through the one cold recipe; the resume
-        // joins its wake and settles it once the wake closes.
-        let (boot_members, plan_error) = match self.plan_explicit_resume_boot_set(&progress).await {
+        // plan's wakes are open (the rest as they close, `boot_lift`). A
+        // planned member with a born session and a durable endpoint is
+        // rebuilt through the explicit-resume work path once its rebuild is
+        // prepared; any other planned member is woken through the cold
+        // recipe, and the resume joins its wake and settles it once the wake
+        // closes.
+        let (boot_members, plan_error) = match self
+            .plan_explicit_resume_boot_set(&admission, &progress)
+            .await
+        {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),
         };
@@ -28989,6 +29005,13 @@ impl MobActor {
                 }
                 MobCommand::ResumeLifecycleBootMemberSettled { member, joined } => {
                     Box::pin(self.explicit_resume_boot_member_settled(member, joined)).await;
+                }
+                MobCommand::ResumeLifecycleBootMembersPrepared {
+                    resume_attempt,
+                    prepared,
+                } => {
+                    Box::pin(self.explicit_resume_boot_members_prepared(resume_attempt, prepared))
+                        .await;
                 }
                 MobCommand::ResumeLifecycleRollbackStep { attempt } => {
                     Box::pin(self.drive_explicit_resume_rollback(attempt)).await;

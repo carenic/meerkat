@@ -2107,6 +2107,9 @@ struct MockSessionService {
     session_read_max_in_flight: AtomicU64,
     session_read_not_found_remaining: AtomicU64,
     resume_authority_absent_remaining: AtomicU64,
+    /// Sessions whose next resume-authority observations fail with a
+    /// transient store error, with how many are left.
+    resume_authority_observe_failures_for: std::sync::Mutex<HashMap<SessionId, u64>>,
     create_requests: RwLock<Vec<CreateSessionRecord>>,
     /// Records whether each create_session had external_tools configured.
     create_with_external_tools: RwLock<Vec<bool>>,
@@ -2429,6 +2432,7 @@ impl MockSessionService {
             session_read_max_in_flight: AtomicU64::new(0),
             session_read_not_found_remaining: AtomicU64::new(0),
             resume_authority_absent_remaining: AtomicU64::new(0),
+            resume_authority_observe_failures_for: std::sync::Mutex::new(HashMap::new()),
             create_requests: RwLock::new(Vec::new()),
             create_with_external_tools: RwLock::new(Vec::new()),
             create_with_compaction_curators: RwLock::new(Vec::new()),
@@ -3545,6 +3549,15 @@ impl MockSessionService {
     fn set_resume_authority_absent_remaining(&self, count: u64) {
         self.resume_authority_absent_remaining
             .store(count, Ordering::Release);
+    }
+
+    /// Make the next `count` resume-authority observations of `session_id`
+    /// fail with a transient store error.
+    fn fail_next_resume_authority_observes_for(&self, session_id: &SessionId, count: u64) {
+        self.resume_authority_observe_failures_for
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(session_id.clone(), count);
     }
 
     fn fail_next_session_read_as_absent(&self) {
@@ -5697,6 +5710,24 @@ impl MobSessionService for MockSessionService {
             .is_ok()
         {
             return Ok(SessionResumeAuthority::default());
+        }
+        let observe_fails = {
+            let mut failures = self
+                .resume_authority_observe_failures_for
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            match failures.get_mut(session_id) {
+                Some(remaining) if *remaining > 0 => {
+                    *remaining -= 1;
+                    true
+                }
+                _ => false,
+            }
+        };
+        if observe_fails {
+            return Err(SessionError::Store(Box::new(std::io::Error::other(
+                "mock resume authority observation failure",
+            ))));
         }
         let _authority_guard = self.resume_authority_gate.lock().await;
         let session = self

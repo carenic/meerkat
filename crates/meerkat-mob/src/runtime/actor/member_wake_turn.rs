@@ -299,9 +299,10 @@ pub(in crate::runtime) fn probe_member_wake_restores_for_test(
 
 /// A restore of `identity` in `mob_id` starts: recorded by the mob's probe,
 /// if one is installed, and held while its hold is armed. Counted running
-/// until the answer is dropped.
+/// until the answer is dropped. The lift's rebuild preparation of a member it
+/// realizes through the explicit-resume work path enters it too.
 #[cfg(test)]
-async fn enter_member_wake_restore_probe(
+pub(in crate::runtime) async fn enter_member_wake_restore_probe(
     mob_id: &MobId,
     identity: AgentIdentity,
 ) -> Option<ProbedMemberWakeRestore> {
@@ -315,10 +316,10 @@ async fn enter_member_wake_restore_probe(
 
 /// One restore the probe counts as running until it is dropped.
 #[cfg(test)]
-struct ProbedMemberWakeRestore {
+pub(in crate::runtime) struct ProbedMemberWakeRestore {
     probe: Arc<MemberWakeRestoreProbe>,
     /// The row ended this restore at its start: it reads nothing.
-    aborted: bool,
+    pub(in crate::runtime) aborted: bool,
 }
 
 #[cfg(test)]

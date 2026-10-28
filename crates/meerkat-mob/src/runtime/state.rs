@@ -1053,6 +1053,14 @@ pub(super) enum MobCommand {
         member: Box<super::actor::boot_lift::ExplicitResumeBootMember>,
         joined: bool,
     },
+    /// The rebuilds of members the clean-stop lift's plan materializes
+    /// through the explicit-resume work path were prepared off the actor
+    /// (`resume_attempt` is the lift's); the explicit resume reserves and
+    /// rebuilds each, and the plan goes on.
+    ResumeLifecycleBootMembersPrepared {
+        resume_attempt: mob_dsl::ResumeAttemptId,
+        prepared: Vec<super::actor::boot_lift::ExplicitResumeBootMemberPrepared>,
+    },
     ResumeLifecycleRollbackStep {
         attempt: mob_dsl::ResumeAttemptId,
     },
@@ -2098,6 +2106,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberCleanupHeld { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleMemberUnproven { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleBootMemberSettled { .. } => ShutdownAnswerClass::ActorCompletion,
+            Self::ResumeLifecycleBootMembersPrepared { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackStep { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumeLifecycleRollbackFinalized { .. } => ShutdownAnswerClass::ActorCompletion,
             Self::ResumePostCommitMemberCompleted { .. } => ShutdownAnswerClass::ActorCompletion,
@@ -2347,6 +2356,7 @@ impl MobCommand {
             Self::ResumeLifecycleMemberCleanupHeld { .. } => "ResumeLifecycleMemberCleanupHeld",
             Self::ResumeLifecycleMemberUnproven { .. } => "ResumeLifecycleMemberUnproven",
             Self::ResumeLifecycleBootMemberSettled { .. } => "ResumeLifecycleBootMemberSettled",
+            Self::ResumeLifecycleBootMembersPrepared { .. } => "ResumeLifecycleBootMembersPrepared",
             Self::ResumeLifecycleRollbackStep { .. } => "ResumeLifecycleRollbackStep",
             Self::ResumeLifecycleRollbackFinalized { .. } => "ResumeLifecycleRollbackFinalized",
             Self::ResumePostCommitMemberCompleted { .. } => "ResumePostCommitMemberCompleted",

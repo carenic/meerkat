@@ -221,3 +221,130 @@ async fn an_explicit_resume_retires_a_dormant_members_retained_attachment_and_ke
         "nothing is materialized"
     );
 }
+
+/// `count` turn-driven workers built on a session service, their mob stopped
+/// and its process gone: a fresh service holds their durable sessions only,
+/// and the stopped mob is reconstructed from its storage under the Eager
+/// policy, every member Dormant.
+async fn built_stopped_mob(
+    label: &str,
+    count: usize,
+) -> (
+    MobHandle,
+    Arc<MockSessionService>,
+    Vec<(AgentIdentity, SessionId)>,
+) {
+    let service = Arc::new(MockSessionService::new());
+    let _ = service.enable_runtime_adapter();
+    let storage = MobStorage::in_memory();
+    let events = storage.events.clone();
+    let runtime_metadata = storage.runtime_metadata.clone();
+    let handle = MobBuilder::new(with_unique_mob_id(sample_definition(), label), storage)
+        .with_session_service(service.clone())
+        .create()
+        .await
+        .expect("create the mob");
+    let mut members = Vec::with_capacity(count);
+    for index in 0..count {
+        let identity = AgentIdentity::from(format!("lifted-{index}"));
+        let mut spec = SpawnMemberSpec::new("worker", identity.clone());
+        spec.runtime_mode = Some(crate::MobRuntimeMode::TurnDriven);
+        handle.spawn_spec(spec).await.expect("spawn a worker");
+        let session = handle
+            .resolve_bridge_session_id(&identity)
+            .await
+            .expect("a session-backed worker");
+        members.push((identity, session));
+    }
+    handle.stop().await.expect("stop the mob");
+    let restarted = Arc::new(service.cold_restart_preserving_durable_state().await);
+    let _ = restarted.enable_runtime_adapter();
+    crash_stop_and_release_routes(handle).await;
+    drop(service);
+    let resumed = tokio::time::timeout(
+        ROW_STEP,
+        Box::pin(
+            MobBuilder::for_resume(MobStorage::with_events_and_runtime_metadata(
+                events,
+                runtime_metadata,
+            ))
+            .with_session_service(restarted.clone())
+            .notify_orchestrator_on_resume(false)
+            .with_member_restore_policy(MemberRestorePolicy::Eager)
+            .resume(),
+        ),
+    )
+    .await
+    .expect("the reconstruction answers")
+    .expect("the reconstruction succeeds");
+    assert_eq!(
+        resumed
+            .status()
+            .await
+            .expect("the reconstructed mob answers"),
+        MobState::Stopped
+    );
+    (resumed, restarted, members)
+}
+
+/// The lift of a stopped mob rebuilds the members its Eager plan
+/// materializes through the explicit-resume work path. One member's durable
+/// observation meets a store that cannot serve it now: that member's attempt
+/// ends retryable, never Broken, the explicit resume answers the typed store
+/// error, every other member is Live, and the member's owed retry
+/// materializes it once the store serves it again.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lifted_member_whose_durable_observation_fails_is_retried_and_the_lift_answers_the_store_error()
+ {
+    let (resumed, service, members) = built_stopped_mob("lift-observation-store-failure", 3).await;
+    let (failing, failing_session) = members[1].clone();
+    service.fail_next_resume_authority_observes_for(&failing_session, 1);
+
+    let lifted = tokio::time::timeout(ROW_STEP, resumed.resume())
+        .await
+        .expect("the explicit resume answers");
+    let error = lifted.expect_err("the lift answers the member's store error");
+    let cause = match &error {
+        MobError::SharedLifecycleFailure(inner) => inner.as_ref(),
+        other => other,
+    };
+    assert!(
+        matches!(cause, MobError::SessionError(SessionError::Store(_))),
+        "a typed store error: {error:?}"
+    );
+    assert_eq!(
+        resumed.status().await.expect("the mob answers"),
+        MobState::Running
+    );
+    let status = resumed
+        .member_status(&failing)
+        .await
+        .expect("the member's status");
+    assert_ne!(
+        status.status,
+        crate::runtime::handle::MobMemberStatus::Broken,
+        "a store that cannot serve the member now never breaks it: {status:?}"
+    );
+    for (identity, _) in members.iter().filter(|(identity, _)| identity != &failing) {
+        assert_eq!(
+            phase_of(&resumed, identity),
+            Some(dsl::MemberMaterializationPhase::Live),
+            "{identity} is Live"
+        );
+    }
+    let mut published = resumed.machine_state_watch_rx.clone();
+    let failing_id = dsl::AgentIdentity::from_domain(&failing);
+    let retried = tokio::time::timeout(
+        ROW_STEP,
+        published.wait_for(|state| {
+            state.member_materialization.get(&failing_id)
+                == Some(&dsl::MemberMaterializationPhase::Live)
+        }),
+    )
+    .await
+    .is_ok_and(|seen| seen.is_ok());
+    assert!(
+        retried,
+        "the member's owed retry materializes it once the store serves it"
+    );
+}
