@@ -23645,7 +23645,15 @@ impl MobActor {
             Ok(members) => (members, None),
             Err(error) => (Vec::new(), Some(error)),
         };
-        if rebuilt_attachment || !boot_members.is_empty() {
+        // The lift waits on its members while it rebuilds an attachment,
+        // joins a planned wake, or its plan still has members to reach: a
+        // member it rebuilds through the work path is handed back once its
+        // rebuild is prepared, after this round returned, and is reserved
+        // then (before the topology stage, which refuses a later join).
+        if rebuilt_attachment
+            || !boot_members.is_empty()
+            || self.explicit_resume_boot_dispatch_pending()
+        {
             self.pending_resume_lifecycle = Some(PendingResumeLifecycle {
                 ticket: ResumeStepTicket::default(),
                 phase: ResumeLifecyclePhase::RebuildingMembers {
