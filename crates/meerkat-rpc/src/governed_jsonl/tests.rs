@@ -5285,11 +5285,28 @@ async fn stock_r3_an_approved_consent_never_enters_once_its_grant_is_revoked() {
     let mut host = realm.start_host(&http).await;
     let outcome = r3_bounded(async {
         let record = stock_r3_spend_in_the_requesting_run(&http, &mut host, |host| {
-            host.governance
+            let grants = host
+                .governance
                 .composed_grant_owner_for_test()
-                .expect("the open composition's grant owner")
-                .revoke(&operator, &grant, &mut NoControllerWork)
-                .expect("revoked while the realm is open");
+                .expect("the open composition's grant owner");
+            // The revocation never waits: it answers `Unavailable` while
+            // another operation holds the owner's lock or its publication
+            // (the host's own traffic). Ask again until it is free, within
+            // a few seconds, without holding the publication meanwhile.
+            tokio::task::block_in_place(|| {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                loop {
+                    match grants.revoke(&operator, &grant, &mut NoControllerWork) {
+                        Ok(()) => break,
+                        Err(meerkat_authorization::grants::GrantRefusal::Unavailable)
+                            if std::time::Instant::now() < deadline =>
+                        {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        Err(refusal) => panic!("revoked while the realm is open: {refusal}"),
+                    }
+                }
+            });
         })
         .await;
         assert_eq!(record.status, meerkat_core::ApprovalStatus::Approved);
