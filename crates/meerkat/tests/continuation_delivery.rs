@@ -1119,9 +1119,10 @@ async fn a_notice_continuation_admits_exactly_the_live_completion_input() {
 /// A consent notice keeps the handling its delivery declares: it is
 /// admitted as the same notice record a detached job's completion carries,
 /// under `Queue`, so it waits for the owner's next turn in the queue lane,
-/// where a graceful requeue stop keeps it. A fork_off or council notice is
-/// admitted exactly as a detached job's completion record, which steers,
-/// whatever handling its delivery names.
+/// where a graceful requeue stop no longer ends it. Every other notice (a
+/// fork_off or council outcome, or another host producer's) is admitted
+/// exactly as a detached job's completion record, which steers, whatever
+/// handling its delivery names.
 #[tokio::test]
 async fn a_consent_notice_keeps_its_queue_handling_and_job_notices_steer() {
     let notice = meerkat_core::types::SystemNoticeMessage::new(
@@ -1137,6 +1138,11 @@ async fn a_consent_notice_keeps_its_queue_handling_and_job_notices_steer() {
         (
             "council:run-3",
             ContinuationProducer::Council,
+            meerkat_core::types::HandlingMode::Steer,
+        ),
+        (
+            "task-notice-1",
+            host_producer(),
             meerkat_core::types::HandlingMode::Steer,
         ),
         (
@@ -1183,6 +1189,98 @@ async fn a_consent_notice_keeps_its_queue_handling_and_job_notices_steer() {
             "{key}: the same notice record"
         );
     }
+}
+
+/// A consent notice an earlier version admitted before it kept its declared
+/// queue handling, as a detached job's steering completion record (its
+/// admission index entry still reserved at the upgrade), is this delivery's
+/// admission: the owner applies it and admits nothing over it, where it
+/// would otherwise fail as a conflict and be retried forever. The same
+/// steering form of another consent result under the key stays a conflict.
+#[tokio::test]
+async fn a_consent_notice_admitted_in_its_steering_form_is_this_delivery() {
+    let key = "consent:approval-1/approved";
+    let notice = meerkat_core::types::SystemNoticeMessage::new(
+        meerkat_core::types::SystemNoticeKind::Generic,
+        "Consent for approval approval-1 was approved.".to_string(),
+    );
+    let fixture = Fixture::new();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    let earlier = meerkat_runtime::Input::Prompt(
+        meerkat_runtime::PromptInput::detached_job_completed(key, notice.clone()),
+    );
+    sink.already_holds(&session, &earlier);
+    let mut continuation = delivery(key, meerkat::consent_notice_producer());
+    continuation.body = meerkat::ContinuationBody::notice(notice.clone());
+    fixture
+        .continuations
+        .submit(&owner, continuation, 1)
+        .await
+        .expect("consent notice continuation");
+    let handle = fixture
+        .owner()
+        .arm(Host::new(Some(sink.clone())))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    wait_for_status(&fixture, &owner, key, &mut passes, |status| {
+        matches!(status, ContinuationStatus::Applied { .. })
+    })
+    .await;
+    assert!(sink.admissions().is_empty(), "nothing is admitted over it");
+    assert!(matches!(
+        fixture
+            .continuations
+            .continuation_status(&owner, &ContinuationKey::new(key).expect("key"))
+            .await
+            .expect("status"),
+        ContinuationStatus::Applied { input, .. } if &input == earlier.id()
+    ));
+
+    // Another result's steering form under the same key is not this one.
+    let fixture = Fixture::new();
+    let sink = Arc::new(RecordingSink::default());
+    let session = SessionId::new();
+    let owner = ContinuationOwner::Session {
+        session_id: session.clone(),
+    };
+    sink.already_holds(
+        &session,
+        &meerkat_runtime::Input::Prompt(meerkat_runtime::PromptInput::detached_job_completed(
+            key,
+            meerkat_core::types::SystemNoticeMessage::new(
+                meerkat_core::types::SystemNoticeKind::Generic,
+                "Consent for approval approval-1 was denied.".to_string(),
+            ),
+        )),
+    );
+    let mut continuation = delivery(key, meerkat::consent_notice_producer());
+    continuation.body = meerkat::ContinuationBody::notice(notice);
+    fixture
+        .continuations
+        .submit(&owner, continuation, 1)
+        .await
+        .expect("consent notice continuation");
+    let handle = fixture
+        .owner()
+        .arm(Host::new(Some(sink.clone())))
+        .expect("arm");
+    let mut passes = handle.subscribe_passes();
+    let pass = wait_for_pass(&mut passes, "the other result blocked", |pass| {
+        !pass.blocked_runtimes.is_empty()
+    })
+    .await;
+    assert!(
+        pass.failures
+            .iter()
+            .any(|failure| failure.contains("is not this delivery")),
+        "a conflict: {:?}",
+        pass.failures
+    );
+    assert!(sink.admissions().is_empty(), "nothing is admitted over it");
 }
 
 /// A row under the same live key that is not this delivery (another result,

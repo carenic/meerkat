@@ -86,6 +86,10 @@ them.
 
 ### Added
 
+- `meerkat-runtime`: `PromptInput::detached_job_completed_with_handling`
+  admits a completion notice under the handling its producer declares,
+  with the same notice record as `PromptInput::detached_job_completed`.
+
 - `meerkat-runtime`: a caller reads the disposition the machine recorded
   for an unregister. A call that joins an unregister already in progress
   keeps the disposition that unregister began with, whatever it passed.
@@ -202,12 +206,14 @@ them.
   job's completion record, so a graceful requeue stop of its session
   (`UnregisterQueuedInputs::Requeue`) ended it as stopped, and the parked
   approval it carried was then withdrawn as `NoticeInputEnded`. The notice
-  now waits in the queue lane for the session's next turn, a requeue stop
-  keeps it for the next start, and the resumed run it starts spends the
-  approval once. Fork_off and council notices keep steering. A
-  `PromptInput::detached_job_completed_with_handling` constructor in
-  `meerkat-runtime` admits a completion notice under its producer's
-  handling.
+  now waits in the queue lane for the session's next turn, and a requeue
+  stop no longer ends it. Whether the run it resumes after the next start
+  can take the approval over follows the resume rules, unchanged (on a
+  stock governed realm, see the 0.9.7 known limitation below). Every other
+  notice (fork_off and council outcomes, and any other producer's) keeps
+  steering. A consent notice an earlier version admitted with steer
+  handling is still recognized as its delivery's admission, so an upgrade
+  that finds its admission reserved neither conflicts nor retries it.
 
 ## [0.9.7] - 2026-10-28
 

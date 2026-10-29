@@ -202,20 +202,6 @@ pub(crate) fn for_detached_job_completed()
     }
 }
 
-/// Canonical turn metadata of a completion notice whose producer declares
-/// its handling (see `PromptInput::detached_job_completed_with_handling`):
-/// that handling and nothing else. Lives HERE because this file is the
-/// single sanctioned construction site for `RuntimeTurnMetadata` (see
-/// `turn_metadata_single_construction_site`).
-pub(crate) fn for_detached_job_completed_with(
-    handling_mode: meerkat_core::types::HandlingMode,
-) -> meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-    meerkat_core::lifecycle::run_primitive::RuntimeTurnMetadata {
-        handling_mode: Some(handling_mode),
-        ..Default::default()
-    }
-}
-
 /// Merge the per-input turn metadata carried by a staged batch into a single
 /// typed carrier. Scalar conflicts (two inputs disagreeing on e.g. `model`)
 /// are refused with a typed error so caller policy is not silently replaced by

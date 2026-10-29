@@ -439,9 +439,8 @@ impl PromptInput {
         handling_mode: HandlingMode,
     ) -> Self {
         let mut prompt = Self::detached_job_completed(idempotency_key, notice);
-        prompt.turn_metadata = Some(crate::runtime_loop::for_detached_job_completed_with(
-            handling_mode,
-        ));
+        // The same turn metadata a continuation under that handling carries.
+        prompt.turn_metadata = Some(crate::runtime_loop::for_continuation(handling_mode));
         prompt
     }
 
