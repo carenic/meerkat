@@ -38689,19 +38689,26 @@ mod tests {
             }
 
             /// The work owner: the two restricted actions are R3 and every
-            /// other operation R1. It can withdraw one tool's permission,
-            /// answer its next preparation as an owner change in progress, and
-            /// be unable to read review material.
+            /// other operation R1. It can withdraw one tool's permission (and
+            /// publishes that change, as a policy owner does), answer its next
+            /// preparation as an owner change in progress, and be unable to
+            /// read review material.
             #[derive(Default)]
             struct Owner {
                 withdrawn: Mutex<std::collections::BTreeSet<&'static str>>,
+                /// The owner's publication, moved by each published change.
+                publication: std::sync::atomic::AtomicU64,
                 reprepare_once: std::sync::atomic::AtomicBool,
                 material_unavailable: std::sync::atomic::AtomicBool,
             }
 
             impl Owner {
+                /// Withdraw `tool`'s permission and publish the change: every
+                /// decision prepared before it is stale, and a fresh decision
+                /// of `tool` refuses it.
                 fn withdraw(&self, tool: &'static str) {
                     self.withdrawn.lock().unwrap().insert(tool);
+                    self.publication.fetch_add(1, Ordering::SeqCst);
                 }
             }
 
@@ -38710,6 +38717,8 @@ mod tests {
             struct Decision {
                 binding: PreparedAuthorizationBinding,
                 owner: Arc<Owner>,
+                /// The owner's publication this decision was prepared under.
+                publication: u64,
             }
 
             impl Decision {
@@ -38754,6 +38763,7 @@ mod tests {
                     Ok(Arc::new(Decision {
                         binding: binding.clone(),
                         owner: Arc::clone(&self.0),
+                        publication: self.0.publication.load(Ordering::SeqCst),
                     }))
                 }
             }
@@ -38774,6 +38784,11 @@ mod tests {
                     if !self.binding.same_operation(binding) {
                         return Err(
                             OperationRefused::new(OperationRefusalKind::MalformedFacts).into()
+                        );
+                    }
+                    if self.publication != self.owner.publication.load(Ordering::SeqCst) {
+                        return Err(
+                            OperationRefused::new(OperationRefusalKind::ReprepareRequired).into(),
                         );
                     }
                     if self
@@ -39472,10 +39487,12 @@ mod tests {
 
             /// Consent withdrawn between its move and the boundary that would
             /// spend it is never attempted: the work owner withdrew the
-            /// operation's permission, and the approval's read observed it
-            /// before the boundary. No body runs for it and nothing is spent,
-            /// while the other consent moved into the same run is still spent
-            /// once.
+            /// operation's permission and published the change, and the
+            /// approval's read, finding the decision stale, had its owners
+            /// decide it afresh and withdrew it on their refusal before the
+            /// boundary (ADR-001 D9). No body runs for it and nothing is spent,
+            /// while the other consent moved into the same run, decided afresh
+            /// at its attempt, is still spent once.
             #[tokio::test]
             async fn a_moved_consent_withdrawn_before_its_boundary_is_never_attempted() {
                 let model = Arc::new(ScriptedModel::default());
@@ -39500,7 +39517,8 @@ mod tests {
                 receipt(&host.approvals, &withdrawn, &scope, &withdrawn_input);
                 receipt(&host.approvals, &other, &scope, &other_input);
                 // At the run's first boundary, before its consent step, the
-                // owner withdraws one operation and its approval is read.
+                // owner withdraws one operation, publishing the change, and
+                // its approval is read.
                 let withdraw = {
                     let owner = Arc::clone(&owner);
                     let approvals = host.approvals.clone();
