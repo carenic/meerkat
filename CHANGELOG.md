@@ -35,6 +35,53 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-core` human consent
+  (R3): a route's `HumanConsentRoute::eligibility` is now also asked after
+  the decision, for the same approver and the approval as decided, when
+  the evidence an approved consent holds went stale (an owner change,
+  related or not): before its allowance is published and before a spend.
+  The question is then only whether the approver was revoked, or is
+  forbidden by policy, since deciding: a natural expiry of the login they
+  decided in is no revocation, and the consent keeps its own expiry. A
+  route that answers only for logins within their own expiry must keep
+  answering for a login through an approval decided in it, until that
+  login is logged out, replaced or retired; a refusal withdraws the
+  approved consent as `AuthorityChanged`, with zero entry. The stock route
+  does so: `StockConsentSurface::approver_login` states a login past its
+  own deadline with that deadline, and returns `None` only for a login
+  logged out, replaced, retired or no longer permitted.
+
+- Behaviour-only (not measured by the gate): `meerkat-core` approval reads
+  and decisions run host code. `ApprovalService::get` and `list` call the
+  host's authorization `prepare` and `review_operation_context` for a live
+  consent whose retained decision an owner publication change made stale,
+  and `decide_consent` does so for an approval also when that decision's
+  own check refuses it; a decision, an allowance's publication and a spend
+  ask the route's eligibility. All of it runs on the caller's thread,
+  outside the approval owner's locks: a host must not hold a lock its
+  owners take while it reads or decides approvals, and each re-preparation
+  is audited as a preparation.
+
+- Behaviour-only (not measured by the gate): `meerkat-core`:
+  `ApprovalService::decide_consent` can answer a retryable
+  `ApprovalError::StoreUnavailable`, with nothing recorded: for an approval
+  whose retained decision cannot be settled now (an owner change in
+  progress, unavailable owners, or a publication that keeps changing), and
+  for any decision while the eligibility owner cannot say. A decline is
+  recorded whatever the retained decision's currentness.
+
+- Behaviour-only (not measured by the gate): `meerkat-core` consent
+  withdrawal reasons. Owners that refuse the operation when asked afresh
+  (at a read, a decision, an attempt's admission or a spend) withdraw the
+  consent as `AuthorityChanged`; with an owner change this was
+  `context_changed`. An attempt whose held decision they change or refuse
+  is refused at its admission, and the consent withdrawn there. A consent
+  moving into a resumed run whose owners state another action account is
+  withdrawn at the move as `ContextChanged`, and one whose review material
+  they refuse is withdrawn there by the refusal's category.
+
 ### Added
 
 - `meerkat-runtime`: a caller reads the disposition the machine recorded
@@ -61,13 +108,29 @@ them.
   (`RuntimeStore::observe_machine_lifecycle`, then
   `DecodedMachineLifecycleObservation::unregister_progress`).
 
+- `meerkat-core`: `ConsentEligibilityAnswer` and the provided
+  `HumanConsentRoute::eligibility_answer` tell an eligibility owner's
+  refusal (`Refused`) apart from an owner that cannot say now
+  (`Unsettled`: an owner change in progress, or one published during the
+  read). The approval owner asks it at a decision, at the allowance's
+  publication and before a spend, and an unsettled answer decides
+  nothing: a decision answers a retryable `StoreUnavailable`, a
+  publication asks again within its bound, and a spend keeps the consent
+  (`owner_unavailable`). The default maps `eligibility`.
+  `meerkat-authorization`: `PublishedConsentEligibility::observe_answer`
+  answers it from one coherent observation of a local publication.
+
 ### Fixed
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
   across unrelated authorization changes and past the end of its decision's
   own validity window, and withdrawn only when its binding, review tier or
-  presented material changes, when its owners refuse the operation, when
-  its approver is no longer eligible, or when it expires. Before, any owner
+  presented material changes (`ContextChanged`), when its owners refuse the
+  operation or its approver is revoked or forbidden by policy since
+  deciding (`AuthorityChanged`), when it expires (`DeadlineExpired`), when
+  its run closes with no resumed run to take it over (`RunEnded`), or when
+  the notice input that carries it into a resumed run ends
+  (`NoticeInputEnded`). Before, any owner
   publication change on the work's authorization made the consent's
   retained decision stale, and the consent was withdrawn as
   `context_changed` at the next approval read (`get`, `list`), at its
@@ -81,23 +144,38 @@ them.
   their own window, nothing of the old one is carried forward, and past a
   fixed owner deadline the fresh preparation refuses. The consent stands
   while that decision keeps the binding, the review tier and the material
-  the approval presented, and an attempt is handed that decision and
-  spends the consent once. A changed tier or material, or another
-  operation's decision, withdraws it as before (`ContextChanged`); owners
-  that now refuse the operation withdraw it as `AuthorityChanged` (a
-  refusal that came with an owner change was `context_changed` before).
-  The approver's eligibility evidence is kept with the approved consent
+  the approval presented. An attempt is handed only a current decision:
+  its admission has the owners decide a held decision that is not current
+  afresh, the attempt spends the consent once with the decision they find
+  unchanged, and a change they find or their refusal withdraws the consent
+  and refuses the attempt, with zero entry. A changed tier or material, or
+  another operation's decision, withdraws it as before (`ContextChanged`);
+  owners that now refuse the operation withdraw it as `AuthorityChanged` (a
+  refusal that came with an owner change was `context_changed` before). A
+  consent that moves into a resumed run keeps the action account its
+  approval presented: the resumed run's owners' review material is taken
+  over at the move for that account only, and another account withdraws
+  it. The approver's eligibility evidence is kept with the approved consent
   and checked at the spend: evidence an owner change made stale, related
-  or not, is resolved again for the same approver, and only a refusal
-  withdraws the consent (`AuthorityChanged`, zero entry). An owner change
-  still in progress, unavailable owners, or a publication that keeps
-  changing through three re-adjudications in a row decide nothing: reads
-  return the consent unchanged, and a decision records nothing and answers
-  a retryable `StoreUnavailable`. Nothing enters on a decision that is not
-  current: a spend whose decision or eligibility evidence went stale after
-  its own staging refuses as `review_unavailable` (`owner_unavailable`)
-  and keeps the consent, and a run's own attempt then counts as not made
-  and is attempted again at the run's next boundary. A change during the
+  or not, is resolved again for the same approver and the approval as
+  they decided it, and they stay eligible unless revoked or forbidden by
+  policy since deciding (a natural expiry of the login they decided in is
+  no revocation); only that refusal withdraws the consent
+  (`AuthorityChanged`, zero entry). An owner change still in progress,
+  unavailable owners, an eligibility owner that cannot say now, or a
+  publication that keeps changing through three re-adjudications in a row
+  decide nothing: reads return the consent unchanged, an approval records
+  nothing and answers a retryable `StoreUnavailable` (a decline is still
+  recorded), and an attempt refuses as `owner_unavailable` and keeps the
+  consent. Reads decide afresh only a decision an owner publication change
+  made stale, and nothing calls the owners while a decision's own check
+  answers that they are unavailable. Nothing enters on a decision that is
+  not current: a spend whose decision or eligibility evidence went stale
+  after its own staging refuses as `review_unavailable`
+  (`owner_unavailable`) and keeps the consent, and a run's own attempt
+  then counts as not made and is attempted again at the run's next
+  boundary, unless it spent the consent (an entered effect's own result is
+  its outcome). A change during the
   spend's own store write still consumes the consent with zero effect, as
   before. Approval reads and decisions now run the host's authorization
   `prepare` and `review_operation_context` (and, at a decision or spend,

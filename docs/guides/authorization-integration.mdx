@@ -478,28 +478,49 @@ A fresh decision carries the owners' own window; nothing of the old one is
 carried forward, so past a fixed owner deadline the fresh preparation refuses.
 The consent, pending or approved, stands while that decision keeps the binding,
 the review tier and the material the approval presented. Approval reads
-(`get`, `list`), a decision and its publication apply this one rule, and an
-attempt is handed the decision decided afresh and spends the consent once. A
-changed tier or material withdraws the consent as `ContextChanged`; owners
-that now refuse the operation withdraw it as `AuthorityChanged`. An owner
-change still in progress, owners that are unavailable, or a publication that
-keeps changing through three re-adjudications in a row decide nothing: reads
-return the consent unchanged, and a decision records nothing and answers a
-retryable `StoreUnavailable`. The approver's eligibility evidence is kept with
-the approved consent and checked again at the spend. Evidence that an owner
-change made stale (related or not) is resolved again for the same approver
-and approval, and only a refusal withdraws the consent (`AuthorityChanged`,
-zero entry): a revoked approver, or a self-approval the host's policy no
-longer permits, never enters. Nothing enters on a decision that is not
-current: an attempt whose decision or eligibility evidence went stale after
-its own staging refuses as `owner_unavailable` and keeps the consent for a
-retry, and a run's own attempt then counts as not made. A change during the
-spend's own store write still consumes the consent, with zero effect. Approval
-reads and decisions therefore run the host's `prepare` and
-`review_operation_context` (and, at a decision or spend, the route's
-`eligibility` for stale evidence) on the caller's thread, outside the approval
-owner's locks: a host must not hold a lock its owners take while it reads or
-decides approvals, and each re-preparation is audited as a preparation. A
+(`get`, `list`), an approval and its publication, and an attempt's admission
+apply this one rule. Reads decide afresh only a decision that an owner
+publication change made stale, so polling never calls the owners for one whose
+own check refuses it, and nothing calls them while that check answers that
+they are unavailable. An attempt is handed only a current decision and spends
+the consent once with it. A changed tier or material withdraws the consent as
+`ContextChanged`; owners that now refuse the operation withdraw it as
+`AuthorityChanged`; at an attempt's admission either one also refuses the
+attempt, with zero entry. A consent that moves into a resumed run keeps the
+action account its approval presented: the resumed run's owners' review
+material is taken over at the move for that account only (its mandate may
+name the run's own requester), another account withdraws it as
+`ContextChanged`, their refusal of the operation or of its material withdraws
+it by the refusal's category, and owners that cannot answer now leave it
+parked. An owner change still in progress, owners that are unavailable, or a
+publication that keeps changing through three re-adjudications in a row
+decide nothing: reads return the consent unchanged, an approval records
+nothing and answers a retryable `StoreUnavailable`, and an attempt refuses as
+`owner_unavailable` and keeps the consent. A decline stands on no retained
+decision and is always recorded. The approver's eligibility evidence is kept
+with the approved consent and checked again at the spend. Evidence that an
+owner change made stale (related or not) is resolved again for the same
+approver and the approval as they decided it, and the question is then only
+whether that approver was revoked, or whether policy came to forbid them,
+since deciding: a natural expiry of the login they decided in is no
+revocation, and the consent keeps its own expiry. Only a refusal withdraws the
+consent (`AuthorityChanged`, zero entry): a revoked approver, or a
+self-approval the host's policy no longer permits, never enters. A route whose
+eligibility owner can be mid-change implements
+`HumanConsentRoute::eligibility_answer` (over a local publication,
+`PublishedConsentEligibility::observe_answer`): an owner that cannot say now
+(`ConsentEligibilityAnswer::Unsettled`) decides nothing, so a decision answers
+`StoreUnavailable` and a spend keeps the consent. Nothing enters on a decision
+that is not current: an attempt whose decision or eligibility evidence went
+stale after its own staging refuses as `owner_unavailable` and keeps the
+consent for a retry, and a run's own attempt then counts as not made, unless
+it spent the consent (an entered effect's own result is its outcome). A change
+during the spend's own store write still consumes the consent, with zero
+effect. Approval reads and decisions therefore run the host's `prepare` and
+`review_operation_context` (and, at a decision, a publication or a spend, the
+route's eligibility) on the caller's thread, outside the approval owner's
+locks: a host must not hold a lock its owners take while it reads or decides
+approvals, and each re-preparation is audited as a preparation. A
 retained call that a
 dispatcher this process rebuilt resolves again keeps its consent only as the same
 durable execution: the same call, tool declaration, execution mode, operation
@@ -534,9 +555,11 @@ custody for the approval. It does not report that another owner is live or
 that the issuing process stopped, and it does not mean a remote decision path
 exists. It is not transient in that service, so a host should request fresh
 consent rather than retry. Through the issuing owner, `OwnerUnavailable` also
-answers a spend that owner could not settle now (it was held, or the
-attempt's decision or the approver's eligibility evidence went stale after
-the attempt's staging): the consent is kept, and a retry decides afresh.
+answers an attempt or a spend that owner could not settle now (it was held,
+the held decision could not be decided afresh, the attempt's decision or the
+approver's eligibility evidence went stale after the attempt's staging, or
+the eligibility owner could not say): the consent is kept, and a retry
+decides afresh.
 
 A consent approval issued in a run that the runtime staged on a store with
 cross-process hosting claims records a passive owner scope: the store's
@@ -574,7 +597,11 @@ the approval and the decision. The adapter passes it with an
   scope. The host must refuse an event from a revoked login even while another
   login of the same person is live. Revoking a login must advance the
   publication that the returned evidence checks, so a decision already in
-  flight from that login is refused at commit.
+  flight from that login is refused at commit. After the decision, the route
+  is asked again, for the approval as decided, whenever that evidence went
+  stale: answer then whether the login was revoked (logged out, replaced or
+  retired) or the approver is forbidden since, not whether the login is still
+  within its own expiry.
 - The constructors of the approver and the event authenticate nobody. They
   record what the host adapter established, and the adapter supplies the
   current login scope and eligibility, including logout and revocation.
