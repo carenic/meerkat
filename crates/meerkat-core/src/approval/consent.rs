@@ -2734,6 +2734,8 @@ impl ApprovalService {
     /// current is held from now on (ADR-001 D9). Nothing else changes here:
     /// a decision they change or refuse, or cannot decide now, is left for
     /// the attempt's own staging and spend to settle, with their own answer.
+    /// Never waits for the owner (attempts run on async threads): a held
+    /// owner leaves the decision as it is.
     pub(crate) fn refresh_consent_decision(
         &self,
         approval_id: &ApprovalId,
@@ -2751,7 +2753,9 @@ impl ApprovalService {
                 | Readjudication::Refused(_)
                 | Readjudication::Unsettled => return,
             };
-            let state = self.state.write();
+            let Some(state) = self.state.try_write() else {
+                return;
+            };
             let held = is_live(&state, approval_id, candidate)
                 && !state.parked.contains(approval_id)
                 && retained_current_failure(&fresh).is_none();
