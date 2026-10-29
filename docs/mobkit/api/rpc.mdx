@@ -4,7 +4,7 @@ description: "JSON-RPC 2.0 protocol for Meta runtime operations: gating, memory,
 icon: "plug"
 ---
 
-*Mirrored from MobKit main at [00e6e0981d0d](https://github.com/lukacf/meerkat-meta/commit/00e6e0981d0d4848d0f8d2c444086aafef000295) on 2026-10-29; MobKit workspace version 0.9.6 at that commit.*
+*Mirrored from MobKit main at [aa3c9b3c0434](https://github.com/lukacf/meerkat-meta/commit/aa3c9b3c0434ee9be45b4e3f6593fe2a1d1ee6e3) on 2026-10-29; MobKit workspace version 0.9.6 at that commit.*
 
 Meta exposes its operational API over JSON-RPC 2.0. SDK gateways use JSON lines over stdio, while the embedded console uses `POST /console/rpc` for console-specific methods and explicitly implemented runtime operations. The HTTP dispatcher is not a general stdio passthrough; check `meta/capabilities` on the surface you use.
 
@@ -1019,7 +1019,8 @@ session, an absent one is dispatched again under the send's own delivery
 identity and pinned to that session, so the runtime keeps one input; if the
 session has moved, the send ends `delivery_failed` and is never retargeted.
 A governed send, or any other member's, is settled from evidence only and
-never dispatched again. At
+never dispatched again. A replay waits for that evidence as long as
+`meta/console/recover_send` does (below). At
 startup the gateway settles, from evidence only, the unsettled sends among
 the newest console frames whose input was admitted.
 
@@ -1061,6 +1062,14 @@ this is not evidence that nothing was delivered), or `unknown` (with a
 `delivered`; nothing is ever dispatched. A key the caller never used, and a
 key another caller used, both answer `-32001` with `data.kind =
 "send_not_found"`. The REST twin is `POST /console/send/recover`.
+
+Reading the evidence loads the session the send recorded from the runtime's
+durable store, which after a restart can take seconds on a remote store. The
+call waits up to 45 seconds in all for the evidence of both delivery keys,
+then answers `native.state` `unknown`. A client whose own timeout is shorter
+gives up first: the console and the SDKs' stdio transports wait 60 seconds by
+default, and `console_fetch_timeout_ms`, the bundled console's fetch timeout,
+should stay above 45 seconds.
 
 `skill_refs` is optional: typed, source-pinned skills selected for this exact
 turn, in the same shape as meerkat `turn/start`:
