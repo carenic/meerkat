@@ -6774,7 +6774,10 @@ pub struct MachineLifecycleSnapshot {
 /// unregister is in progress ([`RuntimeStore::observe_machine_lifecycle`],
 /// then [`DecodedMachineLifecycleObservation::unregister_progress`]):
 /// [`Self::requeue_max_age_ms`] and [`Self::keeps_recovered_inputs`] name the
-/// disposition that applies, the one the unregister began with.
+/// disposition that applies, the one the unregister began with. The caller
+/// that started or joined the unregister reads it from its own answer
+/// instead, without polling and also once the unregister completed
+/// ([`crate::RuntimeSessionUnregisterObserver::queued_inputs`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MachineUnregisterProgressSnapshot {
     runtime_loop_drain_pending: bool,

@@ -37,11 +37,25 @@ them.
 
 ### Added
 
-- `meerkat-runtime`: `MachineUnregisterProgressSnapshot::requeue_max_age_ms`
-  and `MachineUnregisterProgressSnapshot::keeps_recovered_inputs` are now
-  public. A call that joins an unregister already in progress keeps the
-  disposition that unregister began with, and returns no disposition
-  itself; a host now reads the disposition that applies from the session
+- `meerkat-runtime`: a caller reads the disposition the machine recorded
+  for an unregister. A call that joins an unregister already in progress
+  keeps the disposition that unregister began with, whatever it passed,
+  the machine can record another than any caller asked for (a keep is
+  recorded as a stop for a registration that served live work, and an
+  unserved attachment's unregister records a stop for a requeue), and the
+  until-terminal unregister answers only whether it unregistered. The
+  caller that starts or joins an unregister now reads the recorded
+  disposition from its own answer, without polling: the unregister's owned
+  worker publishes it to every observer as soon as the machine began the
+  unregister. `RuntimeSessionUnregisterObserver::queued_inputs` reads it
+  (`None` until then), and
+  `MeerkatMachine::unregister_session_registration_until_terminal_reporting_queued_inputs_if_current`
+  is the until-terminal unregister with queued inputs answering it on
+  completion (`None` where that answers `false`, or when the unregister
+  found the registration already gone).
+  `MachineUnregisterProgressSnapshot::requeue_max_age_ms` and
+  `MachineUnregisterProgressSnapshot::keeps_recovered_inputs` are now
+  public too: they read the recorded disposition from the session
   runtime's lifecycle row while the unregister is in progress
   (`RuntimeStore::observe_machine_lifecycle`, then
   `DecodedMachineLifecycleObservation::unregister_progress`).
