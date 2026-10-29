@@ -4894,16 +4894,29 @@ impl RunLifecyclePublication {
 /// notice inputs moved into it, and which of it the run already attempted.
 /// Scheduling and notice suppression only: at most one in-run attempt per
 /// decision per run (an attempt the session's rebuilt agent could not
-/// resolve yet does not count), and only the run's own requests and the
-/// consent moved into it are examined. Spend and withdrawal authority stays
-/// with the approval owner. Reset with each work-authorized run scope.
+/// resolve yet does not count), only the run's own requests and the
+/// consent moved into it are examined, and the consent left parked for a
+/// resumed run is moved again at most once per boundary. Spend and
+/// withdrawal authority stays with the approval owner. Reset with each
+/// work-authorized run scope.
 #[derive(Debug, Default)]
 pub(crate) struct RunConsentAttempts {
     requested: BTreeSet<crate::ApprovalId>,
     attempted: BTreeSet<crate::ApprovalId>,
+    /// The run's model operation sequence at the boundary that last tried
+    /// again to move the consent left parked for this run.
+    moves_retried_at: Option<u64>,
 }
 
 impl RunConsentAttempts {
+    /// Whether this is the first poll of the boundary after the run's model
+    /// operation `sequence`, recording it: only that poll tries again to
+    /// move the consent left parked for this run (ADR-001 D9), and a repoll
+    /// of the same boundary while a gate defers calls no owner again.
+    pub(crate) fn first_poll_of_boundary(&mut self, sequence: u64) -> bool {
+        self.moves_retried_at.replace(sequence) != Some(sequence)
+    }
+
     /// The run's own dispatch committed a consent request for one call.
     pub(crate) fn requested(&mut self, approval_id: &crate::ApprovalId) {
         self.requested.insert(approval_id.clone());

@@ -6768,8 +6768,14 @@ where
         }
         // Before anything of this boundary commits (its notices first): a
         // held approval owner makes the boundary look again with nothing of
-        // it delivered yet.
-        if !self.enrol_moved_run_consent().await {
+        // it delivered yet. Only the boundary's first poll, before a request
+        // of it is prepared, tries again to move the consent left parked for
+        // a resumed run: a repoll while a gate defers calls no owner again.
+        let first_poll = ctx.model_operation.is_none()
+            && self
+                .run_consent_attempts
+                .first_poll_of_boundary(*ctx.model_operation_sequence);
+        if !self.enrol_moved_run_consent(first_poll).await {
             return Ok(CallingLlmStep::Repoll);
         }
         match self.refresh_calling_llm_boundary_notices(ctx).await? {
@@ -7132,13 +7138,14 @@ where
     /// owner moved into it, at every boundary, since a receipt can commit,
     /// and move its consent here, after the run opened. A move that an owner
     /// change in progress or unavailable owners left parked is tried again
-    /// first, without waiting (ADR-001 D9); the run's close settles what
-    /// never moved. Each moved consent is still attempted at most once in
-    /// this run, by step 3c. Without a consent scope nothing can move into
-    /// the run, and the owner is not read. A held owner yields, as the
-    /// notice gate does: `false` means the boundary must repoll, with
-    /// nothing of it delivered yet.
-    async fn enrol_moved_run_consent(&mut self) -> bool {
+    /// first, without waiting, on the boundary's first poll only
+    /// (`retry_moves`; ADR-001 D9); the run's close settles what never
+    /// moved. Each moved consent is still attempted at most once in this
+    /// run, by step 3c. Without a consent scope nothing can move into the
+    /// run, and the owner is not read. A held owner yields, as the notice
+    /// gate does: `false` means the boundary must repoll, with nothing of it
+    /// delivered yet.
+    async fn enrol_moved_run_consent(&mut self, retry_moves: bool) -> bool {
         // A noncommitting live bridge run executes against a retained
         // snapshot and never spends consent.
         if self.noncommitting_live_bridge_run {
@@ -7150,7 +7157,7 @@ where
         ) && !work.resumed_inputs().is_empty()
             && work.consent_scope().is_some()
         {
-            if let Some(run_id) = self.tool_dispatch_context.run_id() {
+            if retry_moves && let Some(run_id) = self.tool_dispatch_context.run_id() {
                 review.retry_parked_consent_for_run(work, run_id);
             }
             match review.consent_moved_into_run(work, self.tool_dispatch_context.run_id()) {
@@ -40417,6 +40424,20 @@ mod tests {
                 assert_eq!(attempts.len(), 1, "{attempts:?}");
                 assert_eq!(attempts[0]["tool_use_id"], "consent-call");
                 assert_eq!(attempts[0]["resumed_input_id"], input.to_string());
+            }
+
+            /// A boundary tries again to move the consent left parked for its
+            /// resumed run on its first poll only: a repoll of it (the same
+            /// model operation sequence, while a gate defers) calls no owner
+            /// again, and the run's next boundary tries once more.
+            #[test]
+            fn parked_moves_are_retried_on_a_boundarys_first_poll_only() {
+                let mut attempts = crate::agent::RunConsentAttempts::default();
+                assert!(attempts.first_poll_of_boundary(0), "the first boundary");
+                assert!(!attempts.first_poll_of_boundary(0), "a repoll of it");
+                assert!(!attempts.first_poll_of_boundary(0), "another repoll");
+                assert!(attempts.first_poll_of_boundary(1), "the next boundary");
+                assert!(!attempts.first_poll_of_boundary(1), "a repoll of it");
             }
 
             /// A rebuilt agent that has not published the tool again at its
