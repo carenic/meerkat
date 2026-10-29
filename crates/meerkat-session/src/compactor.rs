@@ -2722,6 +2722,100 @@ mod tests {
         }
     }
 
+    /// The summary request names each image it leaves out by its media type
+    /// and says only that the content is omitted from that request, and the
+    /// prompt tells the summarizer that such a placeholder says nothing about
+    /// what the agent could see. A placeholder that named only the media type
+    /// was read as the agent having been unable to see the image, and the
+    /// resumed context inherited that claim. The rebuilt history keeps the
+    /// typed images.
+    #[test]
+    fn summary_request_names_media_as_omitted_and_rebuilt_history_keeps_it() {
+        use meerkat_core::types::{AssistantBlock, BlockAssistantMessage, StopReason, ToolResult};
+
+        let c = DefaultCompactor::new(make_config());
+        let messages = vec![
+            Message::User(UserMessage::text("an earlier request")),
+            Message::User(UserMessage::with_blocks(vec![
+                ContentBlock::Text {
+                    text: "does the page match this mockup?".to_string(),
+                },
+                inline_image_block("image/jpeg", "mockup-data"),
+            ])),
+            Message::BlockAssistant(BlockAssistantMessage::new(
+                vec![AssistantBlock::ToolUse {
+                    id: "tc_screenshot".to_string(),
+                    name: "screenshot".to_string(),
+                    args: serde_json::value::RawValue::from_string("{}".to_string()).unwrap(),
+                    meta: None,
+                }],
+                StopReason::ToolUse,
+            )),
+            Message::tool_results(vec![ToolResult::with_blocks(
+                "tc_screenshot".to_string(),
+                vec![
+                    ContentBlock::Text {
+                        text: "screenshot captured".to_string(),
+                    },
+                    blob_image_block("image/png", "sha256:screenshot"),
+                ],
+                false,
+            )]),
+        ];
+        let text_of = |block: &ContentBlock| match block {
+            ContentBlock::Text { text } => text.clone(),
+            other => panic!("the summary request carries text in place of media, got {other:?}"),
+        };
+
+        // The summary request is the prepared source, then the prompt.
+        let source = c.prepare_for_summarization(&messages, None).messages;
+        match &source[1] {
+            Message::User(user) => {
+                assert_eq!(
+                    text_of(&user.content[1]),
+                    "[image (image/jpeg) omitted from this summary request]"
+                );
+            }
+            other => panic!("expected the projected user row, got {other:?}"),
+        }
+        match &source[3] {
+            Message::ToolResults { results, .. } => {
+                assert_eq!(
+                    text_of(&results[0].content[1]),
+                    "[image (image/png) omitted from this summary request]"
+                );
+            }
+            other => panic!("expected the projected tool results, got {other:?}"),
+        }
+        let prompt = c.compaction_prompt();
+        for instruction in [
+            "their content is omitted from this summary request",
+            "Their absence here says nothing about what the agent could see.",
+            "Do not infer the agent's ability to see them from these placeholders",
+        ] {
+            assert!(
+                prompt.contains(instruction),
+                "the compaction prompt must say: {instruction}"
+            );
+        }
+
+        // The rebuilt active history keeps both images typed.
+        let result = c.rebuild_history(&messages, "summary");
+        assert_eq!(result.messages.len(), 4, "summary + the kept turn");
+        match &result.messages[1] {
+            Message::User(user) => {
+                assert_inline_image(&user.content[1], "image/jpeg", "mockup-data");
+            }
+            other => panic!("expected the kept user row, got {other:?}"),
+        }
+        match &result.messages[3] {
+            Message::ToolResults { results, .. } => {
+                assert_blob_image(&results[0].content[1], "image/png", "sha256:screenshot");
+            }
+            other => panic!("expected the kept tool results, got {other:?}"),
+        }
+    }
+
     #[test]
     fn rebuild_history_retains_assistant_message_ids_and_discards_old_ones() {
         let c = DefaultCompactor::new(CompactionConfig {
