@@ -7236,8 +7236,10 @@ where
                 match self.attempt_decided_consent(ctx, &review, decided).await? {
                     Some(op_refs) => pending_op_refs.extend(op_refs),
                     // Not ready: the rebuilt agent could not resolve its
-                    // retained call yet. The attempt does not count, and the
-                    // run's next boundary attempts it again.
+                    // retained call yet, or the approval owner kept the
+                    // consent without settling its spend now. The attempt
+                    // does not count, and the run's next boundary attempts
+                    // it again.
                     None => self.run_consent_attempts.not_attempted(&approval_id),
                 }
             }

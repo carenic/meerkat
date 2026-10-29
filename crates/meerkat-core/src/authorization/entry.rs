@@ -119,6 +119,28 @@ impl PreparedOperationCheck {
         self.0.decision.policy_observation()
     }
 
+    /// [`Self::current`] for a held consent decision (ADR-001 D9): its
+    /// owners prepare the exact retained operation afresh also when this
+    /// decision's own check refuses it rather than asks for a re-preparation
+    /// (its owner's validity window for it ended, for example), and their
+    /// answer is returned as is. Nothing of this decision (its window
+    /// included) is carried forward: past a real owner deadline the fresh
+    /// preparation refuses. A failure of this decision's own check that is
+    /// not a refusal is observed and returned, as on [`Self::current`].
+    pub(crate) fn reprepared(&self) -> Result<Self, OperationAuthorizationError> {
+        match self.0.decision.check_current(&self.0.binding) {
+            Ok(()) => Ok(self.clone()),
+            Err(OperationAuthorizationError::Refused(_)) => {
+                let refreshed = Self::prepare(self.0.context.clone(), self.0.binding.clone())?;
+                match refreshed.0.decision.check_current(&refreshed.0.binding) {
+                    Ok(()) => Ok(refreshed),
+                    Err(error) => Err(refreshed.observe_check_failure(error)),
+                }
+            }
+            Err(error) => Err(self.observe_check_failure(error)),
+        }
+    }
+
     /// The prepared owner's own coherent current check of this exact retained
     /// decision, and nothing else: no re-preparation, no observation, no
     /// callback. Owners hold their commit reservations only across this; a

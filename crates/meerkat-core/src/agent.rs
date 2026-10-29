@@ -3308,8 +3308,10 @@ async fn fenced_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
 /// that identity: a hybrid tool that selects another mode after the rebuild
 /// is a mismatch. A resolution that is not ready yet (the tool not published
 /// again, or its owner unavailable now) refuses here with zero entry and
-/// leaves the consent spendable; a run's own attempt then counts as not
-/// made, and the run's next boundary attempts it again.
+/// leaves the consent spendable, as does a spend the approval owner could
+/// not settle now (`owner_unavailable`, the consent kept); a run's own
+/// attempt then counts as not made, and the run's next boundary attempts it
+/// again.
 pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
@@ -3326,14 +3328,16 @@ pub(crate) enum RetainedConsentAttempt {
     /// It ran to its outcome: the dispatcher's own result, or a refusal with
     /// zero entry.
     Settled(Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>),
-    /// The session's rebuilt agent could not resolve the retained call yet:
-    /// nothing entered, the consent stays spendable, and the attempt counts
-    /// as not made.
+    /// The session's rebuilt agent could not resolve the retained call yet,
+    /// or the approval owner could not settle the spend now and kept the
+    /// consent (`owner_unavailable`: held, or the decision not current and
+    /// not settled for this attempt): nothing entered, the consent stays
+    /// spendable, and the attempt counts as not made.
     NotReady,
 }
 
 /// [`dispatch_retained_consent_attempt`] for a run's own attempt, which
-/// tells a resolution that is not ready yet apart from a refusal.
+/// tells a resolution or a spend that is not ready yet apart from a refusal.
 pub(crate) async fn dispatch_retained_consent_in_run<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
@@ -3341,7 +3345,13 @@ pub(crate) async fn dispatch_retained_consent_in_run<T: AgentToolDispatcher + ?S
 ) -> RetainedConsentAttempt {
     let (result, retained_call, not_ready) =
         attempt_retained_consent(dispatcher, context, approval_id).await;
-    if not_ready && result.is_err() {
+    let owner_unavailable = matches!(
+        result,
+        Err(crate::error::ToolError::ReviewUnavailable {
+            kind: crate::approval::review::ReviewUnavailableKind::OwnerUnavailable,
+        })
+    );
+    if result.is_err() && (not_ready || owner_unavailable) {
         return RetainedConsentAttempt::NotReady;
     }
     observe_retained_consent_refusal(context, &result, retained_call);

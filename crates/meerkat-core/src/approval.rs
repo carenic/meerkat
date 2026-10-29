@@ -2079,10 +2079,11 @@ impl ApprovalService {
     }
 
     fn refresh_expiry(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
-        // A live consent candidate whose decision an owner publication change
-        // made stale is re-adjudicated first, outside the reservation
-        // (ADR-001 D9).
-        self.readjudicate_consent(approval_id);
+        // A live consent candidate whose decision is no longer current (an
+        // owner publication change made it stale, or its own check refuses
+        // it) is re-adjudicated first, outside the reservation, on this
+        // caller's thread (ADR-001 D9). A read reports what it left.
+        let _ = self.readjudicate_consent(approval_id);
         let now = self.now();
         let mut state = self.state.write();
         let result = self.refresh_expiry_locked(&mut state, approval_id, now);
@@ -2115,13 +2116,14 @@ impl ApprovalService {
         // here: it is reconciled through the owner before reuse.
         self.record_pending_withdrawals_locked(state);
         state.ensure_reconciled(approval_id)?;
-        // Backstop for a run that closed without its eager withdrawal: a
-        // live candidate whose retained decision failed other than by a moved
-        // owner publication is withdrawn here (callback-free check under the
-        // reservation); one stale only because the publication moved stays
-        // for its re-adjudication (ADR-001 D9). A withdrawal that could not
-        // be recorded stops this read: nothing is derived from the old record
-        // and the retired machine state.
+        // An approved parked candidate past its deadline is withdrawn here
+        // (callback-free, under the reservation). A live candidate whose
+        // decision is no longer current (its run closed, its owners refuse
+        // it, or the owner publication moved) was re-adjudicated before this
+        // reservation, and its owners' refusal withdrew it there (ADR-001
+        // D9). A withdrawal that could not be recorded stops this read:
+        // nothing is derived from the old record and the retired machine
+        // state.
         self.withdraw_stale_consent_locked(state, approval_id);
         state.ensure_reconciled(approval_id)?;
         let Some(record) = state.records.get(approval_id).cloned() else {

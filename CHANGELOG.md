@@ -63,30 +63,47 @@ them.
 ### Fixed
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept
-  across unrelated authorization changes and withdrawn only when its
-  binding, validity or presented material changes. Before, any owner
+  across unrelated authorization changes and past the end of its decision's
+  own validity window, and withdrawn only when its binding, review tier or
+  presented material changes, when its owners refuse the operation, when
+  its approver is no longer eligible, or when it expires. Before, any owner
   publication change on the work's authorization made the consent's
   retained decision stale, and the consent was withdrawn as
   `context_changed` at the next approval read (`get`, `list`), at its
   decision or at its spend, even when nothing about the operation had
-  changed. The consent's own owners now re-adjudicate such a decision:
-  they prepare the same operation again, outside every owner lock, and the
-  consent stands only while that decision has the same review tier and
-  validity window and the owners read the same material the approval
-  presented; a later attempt then spends it once, against that decision.
-  A changed tier, validity window or material, or another operation's
-  decision withdraws it as before (`ContextChanged`). Owners that now
-  refuse the operation withdraw it as `AuthorityChanged`, the reason a
-  refusing current check already gave (a refusal that came with an owner
-  change was `context_changed` before). An owner change still in progress
-  decides nothing, and a publication that keeps changing through three
-  re-adjudications in a row withdraws the consent as `ContextChanged`. A
-  spend never enters on a stale decision: one whose decision went stale
-  after its own entry staging refuses as `review_unavailable`
-  (`owner_unavailable`) and keeps the consent for its next
-  re-adjudication. An approval read may now
-  re-prepare a pending consent's operation, which its audit records as a
-  preparation.
+  changed; a pending consent was withdrawn as `authority_changed` once its
+  decision's validity window ended, often before a human decides; an
+  unrelated change of the eligibility facts refused or withdrew an eligible
+  approval; and an approval outlived its approver's eligibility. The
+  consent's own owners now decide such a decision afresh, outside every
+  owner lock, and their answer is taken as is: a fresh decision carries
+  their own window, nothing of the old one is carried forward, and past a
+  fixed owner deadline the fresh preparation refuses. The consent stands
+  while that decision keeps the binding, the review tier and the material
+  the approval presented, and an attempt is handed that decision and
+  spends the consent once. A changed tier or material, or another
+  operation's decision, withdraws it as before (`ContextChanged`); owners
+  that now refuse the operation withdraw it as `AuthorityChanged` (a
+  refusal that came with an owner change was `context_changed` before).
+  The approver's eligibility evidence is kept with the approved consent
+  and checked at the spend: evidence an owner change made stale, related
+  or not, is resolved again for the same approver, and only a refusal
+  withdraws the consent (`AuthorityChanged`, zero entry). An owner change
+  still in progress, unavailable owners, or a publication that keeps
+  changing through three re-adjudications in a row decide nothing: reads
+  return the consent unchanged, and a decision records nothing and answers
+  a retryable `StoreUnavailable`. Nothing enters on a decision that is not
+  current: a spend whose decision or eligibility evidence went stale after
+  its own staging refuses as `review_unavailable` (`owner_unavailable`)
+  and keeps the consent, and a run's own attempt then counts as not made
+  and is attempted again at the run's next boundary. A change during the
+  spend's own store write still consumes the consent with zero effect, as
+  before. Approval reads and decisions now run the host's authorization
+  `prepare` and `review_operation_context` (and, at a decision or spend,
+  the route's `eligibility` for stale evidence) on the caller's thread,
+  outside the approval owner's locks: a host must not hold a lock its
+  owners take while it reads or decides approvals, and each re-preparation
+  is audited as a preparation.
 
 ## [0.9.7] - 2026-10-28
 

@@ -122,6 +122,9 @@ struct Route {
     /// Revokes the approver right after its eligibility was resolved, before
     /// the decision commits.
     revoke_after_resolve: AtomicBool,
+    /// The host's self-approval policy: the requester may decide their own
+    /// approval while set.
+    self_approval: AtomicBool,
 }
 
 impl Default for Route {
@@ -133,6 +136,7 @@ impl Default for Route {
             publication: LocalAuthorizationPublication::new(),
             eligible: Mutex::new(vec!["lead-1".to_string()]),
             revoke_after_resolve: AtomicBool::new(false),
+            self_approval: AtomicBool::new(false),
         }
     }
 }
@@ -142,6 +146,48 @@ impl Route {
     fn change_eligibility(&self, change: impl FnOnce(&mut Vec<String>)) {
         let _published = self.publication.begin_owner_change().expect("publication");
         change(&mut self.eligible.lock().expect("eligible"));
+    }
+
+    /// Set the self-approval policy, published as an owner change.
+    fn permit_self_approval(&self, permitted: bool) {
+        let _published = self.publication.begin_owner_change().expect("publication");
+        self.self_approval.store(permitted, Ordering::SeqCst);
+    }
+}
+
+/// An in-memory approval store that runs a hook once inside its next write.
+#[derive(Default)]
+struct HookedStore {
+    inner: meerkat_core::InMemoryApprovalStore,
+    hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+}
+
+impl meerkat_core::ApprovalStore for HookedStore {
+    fn load_all(&self) -> Result<Vec<ApprovalRecord>, meerkat_core::ApprovalStoreError> {
+        self.inner.load_all()
+    }
+
+    fn get(
+        &self,
+        approval_id: &ApprovalId,
+    ) -> Result<Option<ApprovalRecord>, meerkat_core::ApprovalStoreError> {
+        self.inner.get(approval_id)
+    }
+
+    fn put_if_current(
+        &self,
+        expected: Option<&ApprovalRecord>,
+        record: &ApprovalRecord,
+    ) -> Result<(), meerkat_core::ApprovalStoreError> {
+        let hook = self.hook.lock().expect("hook").take();
+        if let Some(hook) = hook {
+            hook();
+        }
+        self.inner.put_if_current(expected, record)
+    }
+
+    fn is_persistent(&self) -> bool {
+        self.inner.is_persistent()
     }
 }
 
@@ -178,11 +224,16 @@ impl HumanConsentRoute for Route {
     fn eligibility(
         &self,
         approver: &AuthenticatedApprover,
-        _approval: &ApprovalRecord,
+        approval: &ApprovalRecord,
     ) -> Result<Arc<dyn ConsentEligibility>, ConsentIneligible> {
         let id = approver.principal().id.as_str().to_owned();
+        let requester = approval.requester.as_str() == id;
         let evidence = PublishedConsentEligibility::observe(&self.publication, || {
-            self.eligible.lock().expect("eligible").contains(&id)
+            if requester {
+                self.self_approval.load(Ordering::SeqCst)
+            } else {
+                self.eligible.lock().expect("eligible").contains(&id)
+            }
         })?;
         if self.revoke_after_resolve.swap(false, Ordering::SeqCst) {
             self.change_eligibility(|eligible| eligible.retain(|eligible| *eligible != id));
@@ -250,10 +301,37 @@ impl ConsentWorld {
     /// Native work where `write private` is ALLOWED at R3 and `read public`
     /// at R1, with a host human route composed.
     fn new() -> Self {
+        Self::build(false, None)
+    }
+
+    /// [`Self::new`] whose route's eligibility owner publishes through the
+    /// work's own publication, so every owner change of the work, related
+    /// or not, makes its eligibility evidence stale; `store` backs the
+    /// approvals when given.
+    fn with_eligibility_on_work_publication(
+        store: Option<Arc<dyn meerkat_core::ApprovalStore>>,
+    ) -> Self {
+        Self::build(true, store)
+    }
+
+    fn build(
+        eligibility_on_work: bool,
+        store: Option<Arc<dyn meerkat_core::ApprovalStore>>,
+    ) -> Self {
         let work = ToolWork::for_session(&SessionId::new());
         work.set_write_tier(OperationReviewTier::R3);
-        let approvals = ApprovalService::new();
-        let route = Arc::new(Route::default());
+        let approvals = match store {
+            Some(store) => ApprovalService::with_store(store).expect("approval store"),
+            None => ApprovalService::new(),
+        };
+        let route = Arc::new(if eligibility_on_work {
+            Route {
+                publication: work.publication.clone(),
+                ..Route::default()
+            }
+        } else {
+            Route::default()
+        });
         let reviewer = Arc::new(NoReviewer::default());
         let review = Arc::new(
             BoundOperationReview::new(reviewer.clone(), approvals.clone(), Duration::from_secs(30))
@@ -1180,4 +1258,219 @@ async fn an_eligibility_revocation_before_commit_never_records_or_enters() {
         .await
         .expect("the retained candidate enters");
     assert_eq!(w.bodies(), vec!["consented".to_string()]);
+}
+
+/// The withdrawal reason of `approval_id`'s consent, if any.
+fn consent_withdrawal(
+    w: &ConsentWorld,
+    approval_id: &ApprovalId,
+) -> Option<meerkat_core::approval::ApprovalConsentWithdrawalReason> {
+    w.approvals
+        .get(approval_id)
+        .expect("record")
+        .consent
+        .and_then(|consent| consent.withdrawal)
+        .map(|withdrawal| withdrawal.reason)
+}
+
+/// ADR-001 D9 with the native compiler and an owner whose tool allowance
+/// slides with every preparation (now plus 60 s, as ordinary host work grants
+/// it), on a clock that moves on between the request and each
+/// re-adjudication. Unrelated owner changes keep the consent on reads, the
+/// decision records and publishes it, and the attempt enters exactly once:
+/// each fresh decision's own window differs, and never counts as a change.
+#[tokio::test]
+async fn a_sliding_owner_window_never_counts_as_a_change() {
+    let w = ConsentWorld::new();
+    w.work.slide_allowance(Duration::from_secs(60));
+    let approval_id = w.request("consented").await;
+
+    // Reads.
+    w.work.advance_clock(Duration::from_secs(10));
+    w.work.republish();
+    assert_eq!(
+        w.approvals.get(&approval_id).expect("record").status,
+        ApprovalStatus::Pending
+    );
+    assert!(
+        w.approvals
+            .list(ApprovalListFilter::default())
+            .expect("list")
+            .iter()
+            .any(|record| record.approval_id == approval_id
+                && record.status == ApprovalStatus::Pending)
+    );
+
+    // The decision.
+    w.work.advance_clock(Duration::from_secs(10));
+    w.work.republish();
+    let approved = w.approve(&approval_id);
+    assert_eq!(approved.status, ApprovalStatus::Approved);
+    assert_eq!(consent_withdrawal(&w, &approval_id), None);
+
+    // The spend.
+    w.work.advance_clock(Duration::from_secs(10));
+    w.work.republish();
+    w.attempt(&approval_id)
+        .await
+        .expect("the re-adjudicated consent enters");
+    assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
+    assert_eq!(
+        w.notices(&approval_id),
+        vec![
+            ConsentNoticeKind::Requested,
+            ConsentNoticeKind::Approved,
+            ConsentNoticeKind::Used,
+        ]
+    );
+}
+
+/// ADR-001 D9: a re-adjudication asks the owners afresh and takes their
+/// answer; it never synthesizes a window or carries the old one forward. An
+/// owner whose deadline for the operation is fixed refuses the fresh
+/// preparation once that deadline passed while the consent was pending: the
+/// consent is withdrawn as `AuthorityChanged` and the attempt enters nothing.
+/// Beside it, an owner whose allowance slides keeps the consent past the same
+/// moment, and its attempt enters once.
+#[tokio::test]
+async fn a_fixed_owner_deadline_withdraws_where_a_sliding_window_keeps() {
+    for sliding in [false, true] {
+        let w = ConsentWorld::new();
+        if sliding {
+            w.work.slide_allowance(Duration::from_secs(60));
+        }
+        let approval_id = w.request("consented").await;
+        // Past the fixed deadline and past the first sliding window, with
+        // no owner change.
+        w.work.advance_clock(Duration::from_secs(70));
+        let record = w.approvals.get(&approval_id).expect("record");
+        if sliding {
+            assert_eq!(record.status, ApprovalStatus::Pending, "kept");
+            assert_eq!(consent_withdrawal(&w, &approval_id), None);
+            w.approve(&approval_id);
+            w.attempt(&approval_id).await.expect("enters");
+            assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
+        } else {
+            assert_eq!(record.status, ApprovalStatus::Cancelled);
+            assert_eq!(
+                consent_withdrawal(&w, &approval_id),
+                Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged)
+            );
+            assert_human_consent_required(w.attempt(&approval_id).await);
+            assert!(w.bodies().is_empty(), "zero entry");
+        }
+    }
+}
+
+/// ADR-001 D9: a pending consent outlives its decision's window (a human
+/// takes longer than the 60 s an owner grants a decision). Approved after the
+/// window ended, its decision is decided afresh and published, and the
+/// attempt, after that window ended too, enters exactly once. A relevant
+/// change found after the window (here the review material) withdraws it as
+/// `context_changed`, with zero entry.
+#[tokio::test]
+async fn a_consent_outlives_its_decision_window() {
+    let w = ConsentWorld::new();
+    w.work.slide_allowance(Duration::from_secs(60));
+    let approval_id = w.request("consented").await;
+    w.work.advance_clock(Duration::from_secs(90));
+    let approved = w.approve(&approval_id);
+    assert_eq!(approved.status, ApprovalStatus::Approved);
+    assert_eq!(consent_withdrawal(&w, &approval_id), None);
+    w.work.advance_clock(Duration::from_secs(90));
+    w.attempt(&approval_id).await.expect("enters");
+    assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
+    assert_eq!(
+        w.notices(&approval_id),
+        vec![
+            ConsentNoticeKind::Requested,
+            ConsentNoticeKind::Approved,
+            ConsentNoticeKind::Used,
+        ]
+    );
+
+    // A relevant change found after the window.
+    let w = ConsentWorld::new();
+    w.work.slide_allowance(Duration::from_secs(60));
+    w.work.set_review_material(ReviewMaterial::Held {
+        account: "account-a".to_owned(),
+        mandate: "mandate-a".to_owned(),
+    });
+    let approval_id = w.request("consented").await;
+    w.work.advance_clock(Duration::from_secs(90));
+    w.work.set_review_material(ReviewMaterial::Held {
+        account: "account-b".to_owned(),
+        mandate: "mandate-a".to_owned(),
+    });
+    assert_eq!(
+        w.approvals.get(&approval_id).expect("record").status,
+        ApprovalStatus::Cancelled
+    );
+    assert_eq!(
+        consent_withdrawal(&w, &approval_id),
+        Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::ContextChanged)
+    );
+    assert_human_consent_required(w.attempt(&approval_id).await);
+    assert!(w.bodies().is_empty(), "zero entry");
+}
+
+/// ADR-001 D9 for the approver's eligibility, with the route's eligibility
+/// owner publishing through the work's own publication, so every owner
+/// change of the work makes its evidence stale. Revoked after the approval,
+/// the attempt enters nothing and the consent is withdrawn as
+/// `AuthorityChanged`; so is a self-approval the host's policy permitted
+/// once that policy forbids it. An unrelated owner change during the
+/// decision's own store write keeps the consent, which enters once.
+#[tokio::test]
+async fn an_approved_consent_follows_its_approvers_eligibility() {
+    // Revoked after the approval.
+    let w = ConsentWorld::with_eligibility_on_work_publication(None);
+    let approval_id = w.request("consented").await;
+    w.approve(&approval_id);
+    w.route
+        .change_eligibility(|eligible| eligible.retain(|id| id != "lead-1"));
+    assert_human_consent_required(w.attempt(&approval_id).await);
+    assert!(w.bodies().is_empty(), "zero entry");
+    assert_eq!(
+        consent_withdrawal(&w, &approval_id),
+        Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged)
+    );
+
+    // A self-approval the host's policy permitted, then forbids.
+    let w = ConsentWorld::with_eligibility_on_work_publication(None);
+    w.route.permit_self_approval(true);
+    let approval_id = w.request("consented").await;
+    w.approvals
+        .decide_consent(
+            &approval_id,
+            decision(ApprovalDecision::Approve, "human:child"),
+        )
+        .expect("self-approved under the permitting policy");
+    w.route.permit_self_approval(false);
+    assert_human_consent_required(w.attempt(&approval_id).await);
+    assert!(w.bodies().is_empty(), "zero entry");
+    assert_eq!(
+        consent_withdrawal(&w, &approval_id),
+        Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged)
+    );
+
+    // An unrelated owner change during the decision's own store write.
+    let store = Arc::new(HookedStore::default());
+    let w = ConsentWorld::with_eligibility_on_work_publication(Some(
+        Arc::clone(&store) as Arc<dyn meerkat_core::ApprovalStore>
+    ));
+    let approval_id = w.request("consented").await;
+    let publication = w.work.publication.clone();
+    *store.hook.lock().expect("hook") = Some(Box::new(move || {
+        drop(publication.begin_owner_change().expect("owner publication"));
+    }));
+    let approved = w.approve(&approval_id);
+    assert_eq!(approved.status, ApprovalStatus::Approved);
+    assert_eq!(consent_withdrawal(&w, &approval_id), None);
+    assert_eq!(
+        w.notices(&approval_id),
+        vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Approved]
+    );
+    w.attempt(&approval_id).await.expect("enters");
+    assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
 }
