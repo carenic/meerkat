@@ -3562,8 +3562,9 @@ enum RetainedRebind {
 /// ([`AgentToolDispatcher::validate_resolved_execution_plan`]: the caller's
 /// deadline chain, the tool published and callable, its mode within the live
 /// catalog contract). A tool the rebuilt agent has not published yet, or one
-/// unavailable now, is not ready, as is an approval owner that is held now;
-/// any other resolution or validation failure refuses.
+/// unavailable now, is not ready, as is an approval owner that is held now
+/// or a fresh decision its owners cannot make now (unavailable, or an owner
+/// change in progress); any other resolution or validation failure refuses.
 fn rebind_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,

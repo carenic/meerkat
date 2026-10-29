@@ -512,12 +512,14 @@ pub(crate) enum Readjudication {
     /// stays separate.
     Unchanged(PreparedOperationCheck),
     /// A related change: the owners decided the operation at another review
-    /// tier, for another operation or work, or no longer read that material
-    /// (or refuse to present it). The consent is withdrawn for this reason.
+    /// tier, for another operation or work, no longer read that material, or
+    /// state facts they cannot read. The consent is withdrawn for this
+    /// reason.
     Changed(ReviewRetirementReason),
     /// The owners, asked afresh, refuse the operation now (a revoked
-    /// permission, or an owner deadline that passed): the consent is
-    /// withdrawn as `AuthorityChanged`, with this refusal.
+    /// permission, or an owner deadline that passed), or refuse to present
+    /// its review material: the consent is withdrawn as `AuthorityChanged`,
+    /// with this refusal.
     Refused(OperationAuthorizationError),
     /// Another completed owner change met the re-adjudication: it is made
     /// again, within [`CONSENT_READJUDICATION_BOUND`].
@@ -652,7 +654,7 @@ impl ConsentCandidate {
             Some(fresh) => fresh,
             None => match retained.reprepared() {
                 Ok(fresh) => fresh,
-                Err(error) => return readjudication_refused(retained, error, true),
+                Err(error) => return readjudication_refused(retained, error),
             },
         };
         if !fresh.same_operation_and_work(retained) || fresh.review_tier() != retained.review_tier()
@@ -666,9 +668,9 @@ impl ConsentCandidate {
         match read {
             Ok(material) if material == self.material => Readjudication::Unchanged(fresh),
             Ok(_) => Readjudication::Changed(ReviewRetirementReason::ContextChanged),
-            // Material the owners refuse to present now is not the material
-            // the decision is compared against.
-            Err(error) => readjudication_refused(retained, error, false),
+            // A denial of the material is the owners' refusal of the
+            // operation, as a denial of its preparation is.
+            Err(error) => readjudication_refused(retained, error),
         }
     }
 
@@ -787,17 +789,15 @@ impl ConsentCandidate {
     }
 }
 
-/// A re-adjudication whose owners answered `error` instead of a decision
-/// (`prepared`) or material: a refusal for a moved publication is made
-/// again, or decides nothing while that owner change is still in progress;
-/// a denial of the preparation is their refusal of the operation, a denial
-/// of the material read a change of what the decision is compared against;
-/// malformed facts changed the candidate's context; and owners that are
-/// unavailable decide nothing.
+/// A re-adjudication whose owners answered `error` instead of a decision or
+/// its review material: a refusal for a moved publication is made again, or
+/// decides nothing while that owner change is still in progress; a denial
+/// (of the preparation, or of the material) is their refusal of the
+/// operation; malformed facts changed the candidate's context; and owners
+/// that are unavailable decide nothing.
 fn readjudication_refused(
     retained: &PreparedOperationCheck,
     error: OperationAuthorizationError,
-    prepared: bool,
 ) -> Readjudication {
     match error {
         OperationAuthorizationError::Refused(refusal) => match refusal.kind() {
@@ -813,8 +813,8 @@ fn readjudication_refused(
                     Readjudication::Moved
                 }
             }
-            OperationRefusalKind::Denied if prepared => Readjudication::Refused(error),
-            OperationRefusalKind::Denied | OperationRefusalKind::MalformedFacts => {
+            OperationRefusalKind::Denied => Readjudication::Refused(error),
+            OperationRefusalKind::MalformedFacts => {
                 Readjudication::Changed(ReviewRetirementReason::ContextChanged)
             }
         },
@@ -886,8 +886,10 @@ pub(crate) enum ConsentRebind {
     /// The custody now holds the fresh decision of the same durable
     /// execution; a new attempt of this run resolves it.
     Rebound,
-    /// Not decided now: the owner is held, or the fresh decision's owners
-    /// are unavailable. Nothing changed, and the consent stays spendable.
+    /// Not decided now: the owner is held, the fresh decision's owners are
+    /// unavailable, or an owner change is in progress (or published during
+    /// the fresh preparation). Nothing changed, and the consent stays
+    /// spendable.
     NotReady,
     /// Refused with zero entry: no live custody of this work and run, or a
     /// fresh plan that is not the same durable execution (which withdraws
@@ -1870,7 +1872,10 @@ impl ApprovalService {
     /// targets) of the same operation, decided afresh by the run's own
     /// owners as R3. A proven mismatch, or a refusal of the fresh decision,
     /// withdraws the consent; a held owner or a fresh decision that cannot
-    /// be made now leaves it spendable. The owner is never waited for.
+    /// be made now (its owners unavailable, or an owner change in progress
+    /// or published during the preparation: ADR-001 D9) leaves it
+    /// spendable, and the run's next boundary rebinds it afresh. The owner is
+    /// never waited for.
     pub(crate) fn rebind_consent_to_reresolved_plan(
         &self,
         approval_id: &ApprovalId,
@@ -1935,6 +1940,14 @@ impl ApprovalService {
                     ReviewRetirementReason::ContextChanged,
                     ConsentRefusal::ContextChanged,
                 ),
+                // An owner change in progress, or one published during the
+                // fresh preparation, decides nothing (ADR-001 D9): not ready,
+                // and the run's next boundary rebinds afresh.
+                Err(OperationAuthorizationError::Refused(refusal))
+                    if refusal.kind() == OperationRefusalKind::ReprepareRequired =>
+                {
+                    return ConsentRebind::NotReady;
+                }
                 Err(OperationAuthorizationError::Refused(refusal))
                     if refusal.kind() == OperationRefusalKind::Denied =>
                 {
@@ -2310,8 +2323,9 @@ impl ApprovalService {
         work: &WorkAuthorizationContext,
     ) {
         // A resumed run closed: parked consent its staged inputs carried by
-        // committed receipts but never took over (a refused, unavailable or
-        // uncommitted move) has no other run to reach it, and is withdrawn.
+        // committed receipts but never took over (its owners unavailable, or
+        // an owner change racing every move of its boundaries, or a move that
+        // committed nothing) has no other run to reach it, and is withdrawn.
         if let Some(position) = state
             .resumed_runs
             .iter()
@@ -2519,57 +2533,56 @@ impl ApprovalService {
     /// custody. Their refusal of either withdraws the candidate by the
     /// refusal's category, an action account other than the one the
     /// approval presented withdraws it as `ContextChanged`, and owners that
-    /// cannot answer now leave it parked. A proven no-commit keeps the
+    /// cannot answer now (unavailable, or an owner change in progress or
+    /// published during their reads) leave it parked: the resumed run's
+    /// boundaries move it later ([`Self::retry_parked_consent_for_run`]),
+    /// and its close settles what never moved. A proven no-commit keeps the
     /// candidate parked; a conflicting or unknown outcome retires its
     /// custody for reconciliation, and nothing executes.
     pub(crate) fn transfer_parked_consent(&self) {
         if self.ensure_available().is_err() {
             return;
         }
-        let ready: Vec<PendingTransfer> = {
-            let state = self.state.read();
-            state
-                .parked
-                .iter()
-                .filter(|approval_id| {
-                    !state.unpublished.contains(*approval_id)
-                        && !state.unreconciled.contains_key(*approval_id)
-                })
-                .filter_map(|approval_id| {
-                    let candidate = state.consent.get(approval_id)?;
-                    let record = state.records.get(approval_id)?;
-                    state.resumed_runs.iter().find_map(|run| {
-                        transfer_input(record, &run.work).map(|input_id| PendingTransfer {
-                            approval_id: approval_id.clone(),
-                            candidate: Arc::clone(candidate),
-                            record: record.clone(),
-                            run: run.clone(),
-                            input_id,
-                        })
-                    })
-                })
-                .collect()
-        };
+        let ready = pending_transfers(&self.state.read(), None);
         // A reader may have made a disposer's try-lock fail; settle after it.
         self.settle_owner_now().run();
         for transfer in ready {
-            // The resumed run's own owners decide the exact original
-            // operation afresh, outside every owner lock, and read its review
-            // material (ADR-001 D9): the move keeps the consent only for the
-            // account the approval presented, and an owner change in that
-            // run is compared against this read from then on.
-            let prepared = transfer
-                .candidate
-                .admitted()
-                .prepare_for_resumed_run(transfer.run.work.clone(), &transfer.run.run_id)
-                .map(|admitted| {
-                    let material = admitted
-                        .work_authorization()
-                        .authorization()
-                        .review_operation_context(admitted.binding());
-                    (admitted, material)
-                });
+            let prepared = prepare_move(&transfer);
             let mut state = self.state.write();
+            self.count_review_lock();
+            self.commit_transfer_locked(&mut state, transfer, prepared);
+            self.release_state(state).run();
+        }
+    }
+
+    /// At a boundary of the resumed run `run_id` of `work`: move into it the
+    /// parked candidates its staged inputs' committed receipts name that an
+    /// earlier move left parked (its owners could not answer then, or an
+    /// owner change was in progress: ADR-001 D9), exactly as
+    /// [`Self::transfer_parked_consent`] moves them. It never waits for the
+    /// owner (boundaries run on async threads): a held owner leaves them for
+    /// the run's next boundary, and the run's close settles what never
+    /// moved. Nothing is read or prepared when none waits.
+    pub(crate) fn retry_parked_consent_for_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: &RunId,
+    ) {
+        if work.resumed_inputs().is_empty() || self.ensure_available().is_err() {
+            return;
+        }
+        let Some(state) = self.state.try_read() else {
+            return;
+        };
+        let ready = pending_transfers(&state, Some((work, run_id)));
+        drop(state);
+        // A reader may have made a disposer's try-lock fail; settle after it.
+        self.settle_owner_now().run();
+        for transfer in ready {
+            let prepared = prepare_move(&transfer);
+            let Some(mut state) = self.state.try_write() else {
+                return;
+            };
             self.count_review_lock();
             self.commit_transfer_locked(&mut state, transfer, prepared);
             self.release_state(state).run();
@@ -2580,13 +2593,7 @@ impl ApprovalService {
         &self,
         state: &mut ApprovalServiceState,
         transfer: PendingTransfer,
-        prepared: Result<
-            (
-                PreparedOperationCheck,
-                Result<ReviewOperationContextResolution, OperationAuthorizationError>,
-            ),
-            OperationAuthorizationError,
-        >,
+        prepared: MovePreparation,
     ) {
         let PendingTransfer {
             approval_id,
@@ -2608,14 +2615,18 @@ impl ApprovalService {
             return;
         }
         // The resumed run's owners refuse the exact operation, or its review
-        // material: settled here, with the refusal's own category. Readiness
-        // or observation unavailable: still parked, and a later move reads
+        // material: settled here, with the refusal's own category. An owner
+        // change in progress or published during their reads, or readiness
+        // or observation unavailable, decides nothing (ADR-001 D9): still
+        // parked, and a later move, at the resumed run's next boundary, reads
         // both afresh (the run's close settles it unless one succeeds); the
         // move never carries the original material forward.
         let (admitted, material) = match prepared {
             Ok((admitted, Ok(material))) => (admitted, material),
             Ok((_, Err(OperationAuthorizationError::Refused(refusal))))
-            | Err(OperationAuthorizationError::Refused(refusal)) => {
+            | Err(OperationAuthorizationError::Refused(refusal))
+                if refusal.kind() != OperationRefusalKind::ReprepareRequired =>
+            {
                 self.withdraw_consent_locked(
                     state,
                     &approval_id,
@@ -3789,8 +3800,78 @@ fn unsettled_decision(approval_id: &ApprovalId) -> ApprovalError {
     ))
 }
 
+/// What a move's preparation found, outside every owner lock: the resumed
+/// run's own decision of the exact original operation with its owners'
+/// read of the review material, or their answer instead of a decision.
+type MovePreparation = Result<
+    (
+        PreparedOperationCheck,
+        Result<ReviewOperationContextResolution, OperationAuthorizationError>,
+    ),
+    OperationAuthorizationError,
+>;
+
+/// The parked candidates ready to move, each into the open resumed run whose
+/// staged input its committed receipt names: into any such run, or `only`
+/// into the run of that work and id.
+fn pending_transfers(
+    state: &ApprovalServiceState,
+    only: Option<(&WorkAuthorizationContext, &RunId)>,
+) -> Vec<PendingTransfer> {
+    state
+        .parked
+        .iter()
+        .filter(|approval_id| {
+            !state.unpublished.contains(*approval_id)
+                && !state.unreconciled.contains_key(*approval_id)
+        })
+        .filter_map(|approval_id| {
+            let candidate = state.consent.get(approval_id)?;
+            let record = state.records.get(approval_id)?;
+            state
+                .resumed_runs
+                .iter()
+                .filter(|run| {
+                    only.is_none_or(|(work, run_id)| {
+                        run.work.same_context(work) && &run.run_id == run_id
+                    })
+                })
+                .find_map(|run| {
+                    transfer_input(record, &run.work).map(|input_id| PendingTransfer {
+                        approval_id: approval_id.clone(),
+                        candidate: Arc::clone(candidate),
+                        record: record.clone(),
+                        run: run.clone(),
+                        input_id,
+                    })
+                })
+        })
+        .collect()
+}
+
+/// The resumed run's own owners decide the exact original operation of
+/// `transfer` afresh, outside every owner lock, and read its review material
+/// (ADR-001 D9): the move keeps the consent only for the account the
+/// approval presented, and an owner change in that run is compared against
+/// this read from then on.
+fn prepare_move(transfer: &PendingTransfer) -> MovePreparation {
+    transfer
+        .candidate
+        .admitted()
+        .prepare_for_resumed_run(transfer.run.work.clone(), &transfer.run.run_id)
+        .map(|admitted| {
+            let material = admitted
+                .work_authorization()
+                .authorization()
+                .review_operation_context(admitted.binding());
+            (admitted, material)
+        })
+}
+
 /// The withdrawal of a parked consent whose resumed run's owners refused its
-/// operation, or its review material, at the move: by the refusal's category.
+/// operation, or its review material, at the move: by the refusal's category
+/// (a denial is an authority answer; facts they cannot read changed the
+/// candidate's context). A change in progress never reaches here.
 fn move_refusal_reason(kind: OperationRefusalKind) -> ReviewRetirementReason {
     if kind == OperationRefusalKind::Denied {
         ReviewRetirementReason::AuthorityChanged
@@ -4219,9 +4300,11 @@ mod tests {
         /// mandate; both `None`: explicitly not applicable.
         material: parking_lot::Mutex<Option<String>>,
         mandate: parking_lot::Mutex<Option<String>>,
-        /// Material reads refuse (`Denied`), or find the owner unavailable.
+        /// Material reads refuse (`Denied`), find the owner unavailable, or
+        /// answer that an owner change is in progress (`ReprepareRequired`).
         material_refused: AtomicBool,
         material_unavailable: AtomicBool,
+        material_in_change: AtomicBool,
         /// The wall-clock end (ms) of the validity window decisions are
         /// prepared with; 0: decisions carry no window.
         expires_at_ms: AtomicU64,
@@ -4349,6 +4432,9 @@ mod tests {
             }
             if self.0.material_unavailable.load(Ordering::Acquire) {
                 return Err(OperationAuthorizationError::Unavailable);
+            }
+            if self.0.material_in_change.load(Ordering::Acquire) {
+                return Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into());
             }
             let account = self.0.material.lock().clone();
             let mandate = self.0.mandate.lock().clone();
@@ -6371,6 +6457,24 @@ mod tests {
                 approval_id: id.clone()
             })
         );
+    }
+
+    /// ADR-001 D9: owners that refuse to present the review material when
+    /// asked afresh refuse the operation: the consent is withdrawn as
+    /// `AuthorityChanged`, as for a refused preparation (and as at a move).
+    #[tokio::test]
+    async fn a_denied_material_read_withdraws_as_authority_changed() {
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.owner.material_refused.store(true, Ordering::Release);
+        w.owner.republish();
+        let record = w.record(&id);
+        assert_eq!(record.status, ApprovalStatus::Cancelled);
+        assert_eq!(
+            withdrawal_reason(&record),
+            Some(ApprovalConsentWithdrawalReason::AuthorityChanged)
+        );
+        assert_eq!(w.attempt(&id).err(), Some(human_consent_required()));
     }
 
     /// ADR-001 D9: a held decision whose owner's validity window for it ended
@@ -9601,8 +9705,9 @@ mod tests {
     /// review material settles the parked consent like their refusal of its
     /// operation, by its category (here `AuthorityChanged`), with zero entry.
     /// Owners that cannot read it now leave it parked: it never moves with
-    /// the material it held, nothing resolves it meanwhile, and a later move
-    /// reads the material afresh, moves it, and it enters once.
+    /// the material it held, nothing resolves it meanwhile, and the resumed
+    /// run's next boundary reads the material afresh, moves it, and it
+    /// enters once.
     #[tokio::test]
     async fn a_failed_material_read_at_the_move_settles_like_a_refused_preparation() {
         for unavailable in [false, true] {
@@ -9635,8 +9740,9 @@ mod tests {
                     "not ready"
                 );
                 w.owner.material_unavailable.store(false, Ordering::Release);
-                w.approvals.transfer_parked_consent();
-                assert!(!is_parked(&w, &id), "a later move");
+                w.review
+                    .retry_parked_consent_for_run(&resumed_work, &run_id);
+                assert!(!is_parked(&w, &id), "moved at the run's next boundary");
                 assert_eq!(spend_in(&w, &id, &resumed_work, &run_id), Ok(()));
                 assert_eq!(withdrawal_reason(&w.record(&id)), None);
             } else {
@@ -9650,6 +9756,130 @@ mod tests {
                     Some(human_consent_required())
                 );
                 assert!(!w.notices(&id).contains(&ConsentNoticeKind::Used));
+            }
+        }
+    }
+
+    /// ADR-001 D9 at the move: an owner change in progress while the resumed
+    /// run's owners prepare the operation or read its review material
+    /// decides nothing. The consent stays parked, never withdrawn, and an
+    /// attempt meanwhile is not ready; a boundary of the resumed run while
+    /// the change is still in progress moves nothing, and once it completed
+    /// the run's next boundary moves the consent and it enters once.
+    #[tokio::test]
+    async fn a_move_meeting_an_owner_change_stays_parked_until_a_later_boundary() {
+        for during_material_read in [false, true] {
+            let store = Arc::new(InMemoryApprovalStore::new());
+            let mut w = world_with(ApprovalService::with_store(store.clone()).expect("service"));
+            w.work = routed(w.work.clone());
+            let id = parked_approval(&w).await;
+            w.review.close_consent_for_work(&w.work);
+            let input = InputId::new();
+            admit_notice(&w, &id, &input);
+            let (resumed_work, run_id) = resumed(&w, &[&input]);
+            let in_change = if during_material_read {
+                &w.owner.material_in_change
+            } else {
+                &w.owner.in_progress
+            };
+            in_change.store(true, Ordering::Release);
+
+            w.review.open_consent_for_run(&resumed_work, &run_id);
+
+            assert!(
+                is_parked(&w, &id),
+                "still parked, during_material_read={during_material_read}"
+            );
+            assert_eq!(
+                custody_of(&store, &id),
+                Some(ApprovalConsentCustody::Parked)
+            );
+            assert_eq!(withdrawal_reason(&w.record(&id)), None, "never withdrawn");
+            assert_eq!(
+                attempt_in(&w, &id, &resumed_work, &run_id).err(),
+                Some(owner_unavailable()),
+                "not ready"
+            );
+            w.review
+                .retry_parked_consent_for_run(&resumed_work, &run_id);
+            assert!(is_parked(&w, &id), "the change is still in progress");
+
+            in_change.store(false, Ordering::Release);
+            w.review
+                .retry_parked_consent_for_run(&resumed_work, &run_id);
+            assert!(!is_parked(&w, &id), "moved at the next boundary");
+            assert_eq!(
+                custody_of(&store, &id),
+                Some(ApprovalConsentCustody::Transferred {
+                    input_id: input.to_string()
+                })
+            );
+            assert_eq!(spend_in(&w, &id, &resumed_work, &run_id), Ok(()));
+            let record = w.record(&id);
+            assert!(
+                record
+                    .consent
+                    .as_ref()
+                    .is_some_and(|consent| consent.consumed_at.is_some()),
+                "entered once"
+            );
+            assert_eq!(withdrawal_reason(&record), None);
+        }
+    }
+
+    /// ADR-001 D9 for the approver's eligibility after a move: the moved
+    /// custody keeps the approver, the approval as decided and the evidence.
+    /// An unrelated change of the eligibility facts before the move keeps
+    /// the consent, and the resumed run's spend enters once. The approver
+    /// revoked before the move is refused at the spend, which withdraws the
+    /// consent as `AuthorityChanged`, with zero entry.
+    #[tokio::test]
+    async fn a_moved_consent_keeps_its_approvers_eligibility() {
+        for revoked in [false, true] {
+            let store = Arc::new(InMemoryApprovalStore::new());
+            let mut w = world_with(ApprovalService::with_store(store.clone()).expect("service"));
+            w.work = routed(w.work.clone());
+            let id = parked_approval(&w).await;
+            w.review.close_consent_for_work(&w.work);
+            let input = InputId::new();
+            admit_notice(&w, &id, &input);
+            let (resumed_work, run_id) = resumed(&w, &[&input]);
+            if revoked {
+                w.route
+                    .publish(|eligible| eligible.retain(|eligible| eligible != "lead-1"));
+            } else {
+                w.route
+                    .publish(|eligible| eligible.push("lead-2".to_string()));
+            }
+
+            w.review.open_consent_for_run(&resumed_work, &run_id);
+
+            assert!(!is_parked(&w, &id), "moved, revoked={revoked}");
+            let spent = spend_in(&w, &id, &resumed_work, &run_id);
+            let record = w.record(&id);
+            if revoked {
+                assert_eq!(spent.err(), Some(human_consent_required()));
+                assert!(
+                    record
+                        .consent
+                        .as_ref()
+                        .is_some_and(|consent| consent.consumed_at.is_none()),
+                    "zero entry"
+                );
+                assert_eq!(
+                    withdrawal_reason(&record),
+                    Some(ApprovalConsentWithdrawalReason::AuthorityChanged)
+                );
+            } else {
+                assert_eq!(spent, Ok(()));
+                assert!(
+                    record
+                        .consent
+                        .as_ref()
+                        .is_some_and(|consent| consent.consumed_at.is_some()),
+                    "entered once"
+                );
+                assert_eq!(withdrawal_reason(&record), None);
             }
         }
     }

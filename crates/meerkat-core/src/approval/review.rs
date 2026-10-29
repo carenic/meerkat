@@ -725,6 +725,21 @@ impl BoundOperationReview {
             .decided_consent_for_run(work, run_id, requested)
     }
 
+    /// At a boundary of the resumed run `run_id` of `work`: move into it, without
+    /// waiting, the parked consent its staged inputs' committed receipts name
+    /// that an earlier move left parked (see
+    /// [`super::ApprovalService::retry_parked_consent_for_run`]); nothing
+    /// without a human route.
+    pub(crate) fn retry_parked_consent_for_run(
+        &self,
+        work: &WorkAuthorizationContext,
+        run_id: &RunId,
+    ) {
+        if self.human_consent.is_some() {
+            self.approvals.retry_parked_consent_for_run(work, run_id);
+        }
+    }
+
     /// The human consent the approval owner moved into the resumed run
     /// `run_id` of `work` by the committed receipts of its staged notice
     /// inputs (see [`super::ApprovalService::consent_moved_into_run`]); none

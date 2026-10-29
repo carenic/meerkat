@@ -423,6 +423,14 @@ impl PublishedConsentEligibility {
     /// without I/O. An ineligible approver, or an owner change during the
     /// observation, yields no evidence.
     ///
+    /// The two are one error here. A host route that resolves eligibility
+    /// with this and keeps the default
+    /// [`meerkat_core::approval::consent::HumanConsentRoute::eligibility_answer`]
+    /// therefore answers an owner change in progress (or one published
+    /// during the read) as a refusal, which withdraws an approved consent at
+    /// its spend: such a route overrides `eligibility_answer` with
+    /// [`Self::observe_answer`].
+    ///
     /// # Errors
     /// [`meerkat_core::approval::consent::ConsentIneligible`] when there is
     /// no current evidence of eligibility.
