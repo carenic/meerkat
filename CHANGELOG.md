@@ -184,9 +184,10 @@ them.
   nothing and answers a retryable `StoreUnavailable` (so does a decline
   while the eligibility owner cannot say, though it is recorded whatever
   the retained decision's currentness), and an attempt refuses as
-  `owner_unavailable` and keeps the consent. Reads decide afresh only a decision an owner publication change
-  made stale, and nothing calls the owners while a decision's own check
-  answers that they are unavailable. Nothing enters on a decision that is
+  `owner_unavailable` and keeps the consent. Reads decide afresh only a
+  decision an owner publication change made stale, and nothing calls
+  the owners while a decision's own check answers that they are
+  unavailable. Nothing enters on a decision that is
   not current: a spend whose decision or eligibility evidence went stale
   after its own staging refuses as `review_unavailable`
   (`owner_unavailable`) and keeps the consent, and a run's own attempt

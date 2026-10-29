@@ -495,12 +495,15 @@ it as `AuthorityChanged`, and owners that cannot answer now (unavailable, or
 an owner change in progress) leave it parked: the resumed run's boundaries
 move it afresh, without waiting, and its close withdraws what never moved. A
 rebind for an agent this process rebuilt that meets an owner change in
-progress is not ready, and the run's next boundary rebinds it afresh. An owner change still in progress, owners that are unavailable, or a
+progress is not ready, and the run's next boundary rebinds it afresh. An
+owner change still in progress, owners that are unavailable, or a
 publication that keeps changing through three re-adjudications in a row
 decide nothing: reads return the consent unchanged, an approval records
 nothing and answers a retryable `StoreUnavailable`, and an attempt refuses as
 `owner_unavailable` and keeps the consent. A decline stands on no retained
-decision and is always recorded. The approver's eligibility evidence is kept
+decision: it is recorded whatever that decision's currentness, though like an
+approval it answers `StoreUnavailable` while the eligibility owner cannot say
+now. The approver's eligibility evidence is kept
 with the approved consent and checked again at the spend. Evidence that an
 owner change made stale (related or not) is resolved again for the same
 approver and the approval as they decided it, and the question is then only
