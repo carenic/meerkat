@@ -4,7 +4,7 @@ description: "Meta Python SDK — typed builder API, async runtime, and streamin
 icon: "python"
 ---
 
-*Mirrored from MobKit main at [aa3c9b3c0434](https://github.com/lukacf/meerkat-meta/commit/aa3c9b3c0434ee9be45b4e3f6593fe2a1d1ee6e3) on 2026-10-29; MobKit workspace version 0.9.6 at that commit.*
+*Mirrored from MobKit main at [9c52020c8d5e](https://github.com/lukacf/meerkat-meta/commit/9c52020c8d5ef6afbd2542fb0cf5942fc7ff8681) on 2026-10-29; MobKit workspace version 0.9.6 at that commit.*
 
 The Meta Python SDK provides a typed host API for launching and operating
 Meerkat mobs through the SDK-facing gateway. Apps own policy. Meerkat and
@@ -974,7 +974,10 @@ adopted instead of respawned, a respawn. `customize_build` runs:
   life, and when a declared role migration moves it to its new role, with
   the runtime's real context (every registered identity as `active_peers`,
   the roster's managed edges). That call publishes the tools and records
-  the customized spawn spec, nothing more: nothing is built, and
+  the customized spawn spec. It builds nothing, except where the seat
+  builds the member from it: a seat that revives the session of a member
+  that was retired after it was built (a respawn, for example), and a
+  declared role migration's move of the member onto its session.
   `resolved_tools`, which reports the tools a build actually resolved,
   answers `no_build_recorded` until the member's first build. Your
   `after_create(identity,
@@ -984,6 +987,19 @@ adopted instead of respawned, a respawn. `customize_build` runs:
   that is not materialized (a send, a dispatch, a peer message, a kickoff),
   and at start for the members that must be live then. No `after_create`
   follows a build.
+
+A respawn of a built member calls `customize_build` once and `after_create`
+once, with the session the respawn keeps, and the member is built once, with
+that call's tools: the mob keeps the retired member's session archived, so
+the respawn's seat revives the member on it, and that revival is the build.
+The same holds for a materialization, a warm or a delivery whose seat builds
+the member: the member stays live for it. The roster pass asks the mob to
+release a member its seat built, so that identity is then like a lazily
+seated one. A lazily
+seated identity (one seated with nothing built yet) gets two
+`customize_build` calls before its first run: its seat's, then its first
+build's. A respawn of a member that was never built does the same: its seat
+calls `customize_build`, and its build calls it again.
 
 A member is never built without its tools, so its first run sees them. A
 restart over idle members the mob already holds calls `customize_build` for
