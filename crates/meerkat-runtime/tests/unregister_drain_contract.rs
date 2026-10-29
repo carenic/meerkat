@@ -1033,3 +1033,69 @@ async fn a_requeue_call_on_an_unserved_attachments_unregister_reports_the_record
     );
     assert!(!adapter.contains_session(&sid).await);
 }
+
+/// A host's graceful shutdown asks to requeue a session whose executor
+/// attachment is still pending, on a registration that already served live
+/// work. Its unregister waits for the session's mutation gate, which the
+/// pending attachment holds until its abort begins the unregister with the
+/// keep an unserved attachment asks for; the machine records a stop for a
+/// registration that served live work. The shutdown call then holds the
+/// unregister's coordinator, the attachment's abort joins it, and the
+/// shutdown reports the recorded stop, not its requeue.
+#[tokio::test]
+async fn a_graceful_requeue_on_a_pending_attachment_reports_the_recorded_stop() {
+    use meerkat_runtime::{EnsureRuntimeExecutorAttachment, UnregisterQueuedInputs};
+
+    let adapter = Arc::new(MeerkatMachine::ephemeral());
+    let sid = CoreSessionId::new();
+    adapter
+        .register_session(sid.clone())
+        .await
+        .expect("register session");
+    let (outcome, _completion) = adapter
+        .accept_input_with_completion(&sid, make_prompt("live work"))
+        .await
+        .expect("accept input");
+    assert!(outcome.is_accepted());
+    let pending = match adapter
+        .ensure_session_with_executor_factory(sid.clone(), |_witness| {
+            Box::new(GatedExecutor {
+                entered: Arc::new(AtomicBool::new(false)),
+                release: Arc::new(Notify::new()),
+            })
+        })
+        .await
+        .expect("attach an executor")
+    {
+        EnsureRuntimeExecutorAttachment::Pending(pending) => pending,
+        EnsureRuntimeExecutorAttachment::Existing(witness) => {
+            panic!("the registration had no attachment yet: {witness:?}")
+        }
+    };
+
+    // The graceful shutdown resolves the session's registration by its id.
+    let registration = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("the session is registered");
+    let mut shutdown = Box::pin(
+        adapter.unregister_session_registration_until_terminal_reporting_queued_inputs_if_current(
+            &registration,
+            UnregisterQueuedInputs::Requeue {
+                max_age: Duration::from_secs(90),
+            },
+        ),
+    );
+    assert!(
+        futures::poll!(shutdown.as_mut()).is_pending(),
+        "the shutdown waits for the pending attachment's mutation gate"
+    );
+    let (aborted, reported) = tokio::join!(pending.abort(), shutdown);
+    aborted.expect("the pending attachment aborts");
+    assert_eq!(
+        reported.expect("the shutdown completes"),
+        Some(UnregisterQueuedInputs::Stop),
+        "the stop the machine recorded, not the requeue the shutdown asked for"
+    );
+    assert!(!adapter.contains_session(&sid).await);
+}

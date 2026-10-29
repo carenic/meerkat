@@ -6822,10 +6822,10 @@ impl MachineUnregisterProgressSnapshot {
     }
 
     /// The max age, in whole milliseconds, of the queued inputs the
-    /// unregister keeps for the next start: `Some` when it began with the
-    /// requeue disposition, `None` for a stop or a keep. This is the
-    /// disposition that applies: a call that joined the unregister already
-    /// in progress kept the one it began with, whatever that call passed.
+    /// unregister keeps for the next start: `Some` when the machine recorded
+    /// requeue for it, `None` for a stop or a keep. This is the disposition
+    /// that applies: a call that joined the unregister already in progress
+    /// kept the one it began with, whatever that call passed.
     pub fn requeue_max_age_ms(&self) -> Option<u64> {
         self.requeue_max_age_ms
     }
@@ -6839,8 +6839,8 @@ impl MachineUnregisterProgressSnapshot {
         self
     }
 
-    /// Whether the unregister began with the keep disposition: every input
-    /// its registration recovered stays exactly as the store holds it. Like
+    /// Whether the machine recorded keep for the unregister: every input its
+    /// registration recovered stays exactly as the store holds it. Like
     /// [`Self::requeue_max_age_ms`], the disposition that applies, never a
     /// joining call's.
     pub fn keeps_recovered_inputs(&self) -> bool {
