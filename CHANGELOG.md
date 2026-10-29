@@ -35,6 +35,34 @@ them.
 
 ## [Unreleased]
 
+### Breaking
+
+- Behaviour-only (not measured by the gate): `meerkat-session`: the summary
+  request `DefaultCompactor` builds names each image it leaves out as
+  `[image (<media type>) omitted from this summary request]` and each video
+  as `[video (<media type>) omitted from this summary request]`, where it
+  wrote `[image: <media type>]` and `[video: <media type>]` before, and
+  `DefaultCompactor::compaction_prompt` gains a paragraph saying that these
+  placeholders stand for content omitted from the request and say nothing
+  about what the agent could see. A client or test that reads the
+  placeholder text must match the new form; the prompt still opens with
+  `CONTEXT COMPACTION`.
+
+### Fixed
+
+- `meerkat-session`: compaction summaries no longer treat image or video
+  placeholders as evidence that the agent could not see the media. The
+  summary request replaces each image and video with a bracketed
+  placeholder. It used to name only the media type, and summarizing models
+  read it as the agent having been unable to see the media: in a long run
+  with many screenshot tool results the summaries said so and told the
+  resumed work to stop, even where the agent had received the images, and
+  the resumed context inherited the claim. The placeholder now says only
+  that the content is omitted from the summary request, and the compaction
+  prompt says that such a placeholder tells nothing about what the agent
+  could see and must not be used to infer it. The rows a compaction keeps
+  carry their media unchanged, as before.
+
 ## [0.9.7] - 2026-10-28
 
 ### Breaking

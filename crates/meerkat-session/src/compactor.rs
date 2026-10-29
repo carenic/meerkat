@@ -23,6 +23,8 @@ Include:
 - Any critical data, file paths, examples, or references needed to continue
 - Tool call patterns that worked or failed
 
+Images and videos appear as bracketed placeholders because their content is omitted from this summary request. Their absence here says nothing about what the agent could see. Do not infer the agent's ability to see them from these placeholders, and do not invent their contents; keep what the surrounding recorded text says about them and any references needed to act on them.
+
 Be concise and structured. Prioritize information the next context needs to act, not narrate.";
 
 const RETAINED_HISTORY_BUDGET_DENOMINATOR: u64 = 2;
@@ -156,15 +158,19 @@ fn blob_images(message: &Message) -> usize {
 /// with providers/models that cannot consume every retained media payload. It
 /// must not be used for rebuilt active history, which preserves typed media/blob
 /// references verbatim.
+///
+/// A placeholder names the media type and says only that the content is
+/// omitted from this summary request. It says nothing about what the agent
+/// could see, and `COMPACTION_PROMPT` tells the summarizer so.
 fn project_media_for_summarization(blocks: &[ContentBlock]) -> Vec<ContentBlock> {
     blocks
         .iter()
         .map(|block| match block {
             ContentBlock::Image { media_type, .. } => ContentBlock::Text {
-                text: format!("[image: {media_type}]"),
+                text: format!("[image ({media_type}) omitted from this summary request]"),
             },
             ContentBlock::Video { media_type, .. } => ContentBlock::Text {
-                text: format!("[video: {media_type}]"),
+                text: format!("[video ({media_type}) omitted from this summary request]"),
             },
             other => other.clone(),
         })
@@ -2358,8 +2364,12 @@ mod tests {
         let result = project_media_for_summarization(&blocks);
         assert_eq!(result.len(), 4);
         assert!(matches!(&result[0], ContentBlock::Text { text } if text == "hello"));
-        assert!(matches!(&result[1], ContentBlock::Text { text } if text == "[image: image/png]"));
-        assert!(matches!(&result[2], ContentBlock::Text { text } if text == "[video: video/mp4]"));
+        assert!(
+            matches!(&result[1], ContentBlock::Text { text } if text == "[image (image/png) omitted from this summary request]")
+        );
+        assert!(
+            matches!(&result[2], ContentBlock::Text { text } if text == "[video (video/mp4) omitted from this summary request]")
+        );
         assert!(matches!(&result[3], ContentBlock::Text { text } if text == "world"));
     }
 
@@ -2370,7 +2380,9 @@ mod tests {
         let blocks = vec![inline_image_block("image/png", "base64data")];
         let result = project_media_for_summarization(&blocks);
         assert_eq!(result.len(), 1);
-        assert!(matches!(&result[0], ContentBlock::Text { text } if text == "[image: image/png]"));
+        assert!(
+            matches!(&result[0], ContentBlock::Text { text } if text == "[image (image/png) omitted from this summary request]")
+        );
         // Verify source_path is NOT in the output
         if let ContentBlock::Text { text } = &result[0] {
             assert!(
@@ -2501,10 +2513,10 @@ mod tests {
             assert_eq!(u.content.len(), 3);
             assert!(matches!(&u.content[0], ContentBlock::Text { text } if text == "Look at this"));
             assert!(
-                matches!(&u.content[1], ContentBlock::Text { text } if text == "[image: image/jpeg]")
+                matches!(&u.content[1], ContentBlock::Text { text } if text == "[image (image/jpeg) omitted from this summary request]")
             );
             assert!(
-                matches!(&u.content[2], ContentBlock::Text { text } if text == "[video: video/mp4]")
+                matches!(&u.content[2], ContentBlock::Text { text } if text == "[video (video/mp4) omitted from this summary request]")
             );
         } else {
             panic!("expected User message");
@@ -2518,10 +2530,10 @@ mod tests {
                 matches!(&results[0].content[0], ContentBlock::Text { text } if text == "screenshot captured")
             );
             assert!(
-                matches!(&results[0].content[1], ContentBlock::Text { text } if text == "[image: image/png]")
+                matches!(&results[0].content[1], ContentBlock::Text { text } if text == "[image (image/png) omitted from this summary request]")
             );
             assert!(
-                matches!(&results[0].content[2], ContentBlock::Text { text } if text == "[video: video/webm]")
+                matches!(&results[0].content[2], ContentBlock::Text { text } if text == "[video (video/webm) omitted from this summary request]")
             );
         } else {
             panic!("expected ToolResults message");
@@ -2674,10 +2686,10 @@ mod tests {
             Message::User(user) => {
                 assert_eq!(user.content.len(), 3);
                 assert!(
-                    matches!(&user.content[1], ContentBlock::Text { text } if text == "[image: image/png]")
+                    matches!(&user.content[1], ContentBlock::Text { text } if text == "[image (image/png) omitted from this summary request]")
                 );
                 assert!(
-                    matches!(&user.content[2], ContentBlock::Text { text } if text == "[video: video/webm]")
+                    matches!(&user.content[2], ContentBlock::Text { text } if text == "[video (video/webm) omitted from this summary request]")
                 );
             }
             other => panic!("expected projected user message, got {other:?}"),
@@ -2689,7 +2701,7 @@ mod tests {
                 assert_eq!(results[0].tool_use_id, "tool_1");
                 assert!(results[0].is_error);
                 assert!(
-                    matches!(&results[0].content[1], ContentBlock::Text { text } if text == "[image: image/jpeg]")
+                    matches!(&results[0].content[1], ContentBlock::Text { text } if text == "[image (image/jpeg) omitted from this summary request]")
                 );
             }
             other => panic!("expected projected tool results, got {other:?}"),
@@ -2947,7 +2959,7 @@ mod tests {
         }
 
         assert!(
-            !json.contains("[image:") && !json.contains("[video:"),
+            !json.contains("omitted from this summary request"),
             "retained transcript JSON must keep typed media blocks, not summary placeholders: {json}"
         );
     }
