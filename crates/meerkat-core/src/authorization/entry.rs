@@ -338,6 +338,15 @@ impl PreparedOperationCheck {
     pub fn same_check(&self, other: &Self) -> bool {
         Arc::ptr_eq(&self.0, &other.0)
     }
+
+    /// Whether this decision is one of exactly `other`'s binding under
+    /// exactly its work, by identity: what the canonical current/reprepare
+    /// path ([`Self::current`]) returns for `other`, whether or not it is
+    /// the same decision. Never an authorization decision itself.
+    pub(crate) fn same_operation_and_work(&self, other: &Self) -> bool {
+        self.0.binding.same_operation(&other.0.binding)
+            && self.0.context.same_context(&other.0.context)
+    }
 }
 
 impl fmt::Debug for PreparedOperationCheck {

@@ -4,7 +4,9 @@
 //! explicit attempt of the retained candidate enters exactly once, before
 //! its body counter. Caller text, ineligible approvers, copied references,
 //! new equal-looking calls, expired consent and revoked permission never
-//! enter, and a failure before entry keeps the consent spendable.
+//! enter, and a failure before entry keeps the consent spendable. An
+//! unrelated owner change keeps the consent; a related one needs fresh
+//! consent (ADR-001 D9).
 
 use meerkat_core::approval::consent::{
     AuthenticatedApprover, AuthenticatedConsentDecision, ConsentEligibility, ConsentIneligible,
@@ -958,15 +960,97 @@ async fn an_owner_change_before_r3_presentation_is_never_presented_or_reviewed()
     assert_eq!(w.work.review_context_calls(), 1, "read once, never again");
 }
 
+/// ADR-001 D9 with the native owners: an owner change that keeps every
+/// permission, tier and material (an unrelated one) while the consent is
+/// pending leaves it pending, and another after the approval makes the
+/// approved decision stale before the attempt's entry staging. The attempt
+/// re-adjudicates it and enters exactly once; nothing reviews or requests it
+/// again.
 #[tokio::test]
-async fn an_owner_change_before_a_consent_attempt_is_never_reviewed_again() {
+async fn an_unrelated_owner_change_keeps_the_consent_and_the_attempt_enters_once() {
+    let w = ConsentWorld::new();
+    w.work.set_review_material(ReviewMaterial::Held {
+        account: "team-utilities-checking".to_owned(),
+        mandate: "Pay the monthly electricity bill".to_owned(),
+    });
+    let approval_id = w.request("consented").await;
+
+    w.work.republish();
+    assert_eq!(
+        w.approvals.get(&approval_id).expect("record").status,
+        ApprovalStatus::Pending,
+        "an unrelated change keeps the pending consent"
+    );
+    w.approve(&approval_id);
+    w.work.republish();
+    w.attempt(&approval_id)
+        .await
+        .expect("the re-adjudicated consent enters");
+    assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
+    assert_eq!(
+        w.reviewer.0.load(Ordering::SeqCst),
+        0,
+        "never model-reviewed"
+    );
+    let notices = w.notices(&approval_id);
+    assert_eq!(
+        notices,
+        vec![
+            ConsentNoticeKind::Requested,
+            ConsentNoticeKind::Approved,
+            ConsentNoticeKind::Used,
+        ],
+        "no second consent request, never withdrawn"
+    );
+    let second = w.attempt(&approval_id).await;
+    assert!(
+        matches!(
+            second,
+            Err(ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::AlreadyConsumed,
+                ..
+            })
+        ),
+        "{second:?}"
+    );
+    assert_eq!(w.bodies().len(), 1, "a second attempt never enters");
+}
+
+/// ADR-001 D9: a related owner change refuses the attempt with zero entry
+/// and withdraws the consent, as `context_changed`. Pending, a changed
+/// review tier withdraws it on the next read; approved, changed review
+/// material refuses the attempt itself. Nothing reviews or requests it
+/// again.
+#[tokio::test]
+async fn a_related_owner_change_refuses_the_attempt_with_zero_entry() {
+    // Pending: the owners now resolve another review tier for it.
     let w = ConsentWorld::new();
     let approval_id = w.request("consented").await;
-    w.approve(&approval_id);
+    w.work.set_write_tier(OperationReviewTier::R2);
+    let record = w.approvals.get(&approval_id).expect("record");
+    assert_eq!(record.status, ApprovalStatus::Cancelled);
+    assert!(
+        matches!(
+            record.consent.and_then(|consent| consent.withdrawal),
+            Some(withdrawal) if withdrawal.reason
+                == meerkat_core::approval::ApprovalConsentWithdrawalReason::ContextChanged
+        ),
+        "withdrawn as context_changed"
+    );
+    assert_human_consent_required(w.attempt(&approval_id).await);
 
-    // The decision the human approved goes stale before the attempt's entry
-    // staging: fresh consent is required, and nothing reviews it again.
-    w.work.republish();
+    // Approved: the owners now present other review material.
+    let w = ConsentWorld::new();
+    w.work.set_review_material(ReviewMaterial::Held {
+        account: "account-a".to_owned(),
+        mandate: "mandate-a".to_owned(),
+    });
+    let approval_id = w.request("consented").await;
+    w.approve(&approval_id);
+    w.work.set_review_material(ReviewMaterial::Held {
+        account: "account-b".to_owned(),
+        mandate: "mandate-a".to_owned(),
+    });
     let refused = w.attempt(&approval_id).await;
     assert!(
         matches!(
@@ -994,6 +1078,8 @@ async fn an_owner_change_before_a_consent_attempt_is_never_reviewed_again() {
         1,
         "no second consent request: {notices:?}"
     );
+    assert_human_consent_required(w.attempt(&approval_id).await);
+    assert!(w.bodies().is_empty(), "fresh consent is required");
 }
 
 #[tokio::test]

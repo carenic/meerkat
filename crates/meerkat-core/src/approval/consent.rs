@@ -29,6 +29,16 @@
 //! delivery composition reads its native terminal and the consent is
 //! withdrawn, its cause naming the input.
 //!
+//! An owner publication change makes the retained decision stale without
+//! saying whether it concerns this candidate. Such a decision is
+//! re-adjudicated by the candidate's own owners, never withdrawn for the
+//! change alone (ADR-001 D9): the same binding is prepared afresh outside
+//! every owner lock, and the consent stands only while that decision has the
+//! same review tier and validity window and its owners read the same
+//! material the approval presented. Approval reads, a decision's
+//! publication and the spend apply one shared rule under the owner's
+//! reservation; a related change withdraws the consent as before.
+//!
 //! Not covered here: owner-attributed presentation of the native review
 //! context, a native approver-eligibility owner, remote authenticated
 //! decision ingress, delivery and wake of the owning session (the notice is a
@@ -44,8 +54,8 @@ use crate::tokio;
 
 use crate::ToolCallView;
 use crate::authorization::{
-    OperationAuthorizationError, OperationRefusalKind, PreparedOperationCheck,
-    WorkAuthorizationContext,
+    OperationAuthorizationError, OperationRefusalKind, OperationValidity, PreparedOperationCheck,
+    ReviewOperationContextResolution, WorkAuthorizationContext,
 };
 use crate::lifecycle::identifiers::RunId;
 use crate::{PrincipalRef, SurfaceMetadata, ToolCallId};
@@ -338,11 +348,23 @@ pub(crate) struct HumanConsent {
 }
 
 /// Process-local custody of one retained R3 candidate: its human attempt
-/// (bound to the exact operation and work by identity), the exact admitted
-/// decision and the validity deadline. Never persisted.
+/// (bound to the exact operation and work by identity), the exact decision
+/// it holds, the owner material its approval presented, and the validity
+/// deadline. Never persisted.
 pub(crate) struct ConsentCandidate {
     attempt: ReviewAttemptHandle,
-    admitted: PreparedOperationCheck,
+    /// The exact decision this custody holds: the admitted one, or a
+    /// decision of the same binding and work that a re-adjudication after
+    /// an owner publication change found unchanged (ADR-001 D9; see
+    /// [`Self::readjudicate`]). Replaced only under the owner's reservation
+    /// and only by such a decision, so every decision one custody ever holds
+    /// keeps its binding, review tier, validity window and presented
+    /// material.
+    retained: parking_lot::Mutex<PreparedOperationCheck>,
+    /// The owners' review material the approval presented, read once for
+    /// the request. A re-adjudication keeps the consent only while the
+    /// owners read exactly this.
+    material: ReviewOperationContextResolution,
     deadline: tokio::time::Instant,
     tool_call_id: Arc<str>,
     route: Arc<dyn HumanConsentRoute>,
@@ -361,9 +383,108 @@ impl fmt::Debug for ConsentCandidate {
     }
 }
 
+/// Re-adjudications of one stale retained decision that one owner step
+/// makes before an owner publication that keeps moving under them withdraws
+/// the consent (ADR-001 D9): as many as the free rebuilds of one operation
+/// after an owner change
+/// ([`crate::authorization::OWNER_CHANGE_FREE_REBUILDS`]).
+pub(crate) const CONSENT_READJUDICATION_BOUND: u8 = 3;
+
+/// What re-adjudicating a retained decision that went stale only because
+/// the owner publication moved found, outside every owner lock (ADR-001
+/// D9).
+#[derive(Debug)]
+pub(crate) enum Readjudication {
+    /// A decision of the same binding and work, at the same review tier and
+    /// validity window, whose owners read the same material the approval
+    /// presented: the consent stands for it once it is current under the
+    /// owner's reservation.
+    Unchanged(PreparedOperationCheck),
+    /// A related change: the owners decided the operation differently,
+    /// refused it, or no longer read the presented material. The consent is
+    /// withdrawn for this reason.
+    Changed(ReviewRetirementReason),
+    /// Another completed owner change met the re-adjudication: it is made
+    /// again, within [`CONSENT_READJUDICATION_BOUND`].
+    Moved,
+    /// Nothing can be decided now: an owner change is still in progress, or
+    /// the owners are unavailable. Nothing changes, and nothing spends the
+    /// stale decision.
+    Unsettled,
+}
+
 impl ConsentCandidate {
-    pub(crate) fn admitted(&self) -> &PreparedOperationCheck {
-        &self.admitted
+    /// The exact decision this custody holds now.
+    pub(crate) fn admitted(&self) -> PreparedOperationCheck {
+        self.retained.lock().clone()
+    }
+
+    /// Hold `fresh`, a decision a re-adjudication found unchanged and that
+    /// is current now. Only under the owner's reservation.
+    fn hold(&self, fresh: &PreparedOperationCheck) {
+        *self.retained.lock() = fresh.clone();
+    }
+
+    /// Re-adjudicate `retained`, a decision this custody held that is stale
+    /// only because the owner publication moved, outside every owner lock
+    /// (ADR-001 D9): against `fresh`, a decision of its binding the
+    /// canonical current/reprepare path already returned (a spend's
+    /// entering decision), or else against the decision that path returns
+    /// now. The consent stands only for a decision of the same binding and
+    /// work, at the same review tier and validity window, whose owners read
+    /// the material the approval presented.
+    fn readjudicate(
+        &self,
+        retained: &PreparedOperationCheck,
+        fresh: Option<PreparedOperationCheck>,
+    ) -> Readjudication {
+        let fresh = match fresh {
+            Some(fresh) => fresh,
+            None => match retained.current() {
+                Ok(fresh) => fresh,
+                Err(error) => {
+                    return readjudication_refused(
+                        retained,
+                        error,
+                        ReviewRetirementReason::AuthorityChanged,
+                    );
+                }
+            },
+        };
+        if !fresh.same_operation_and_work(retained)
+            || fresh.review_tier() != retained.review_tier()
+            || !same_validity(fresh.validity(), retained.validity())
+        {
+            return Readjudication::Changed(ReviewRetirementReason::ContextChanged);
+        }
+        let read = fresh
+            .work_authorization()
+            .authorization()
+            .review_operation_context(fresh.binding());
+        match read {
+            Ok(material) if material == self.material => Readjudication::Unchanged(fresh),
+            Ok(_) => Readjudication::Changed(ReviewRetirementReason::ContextChanged),
+            // Material the owners refuse to present now is not the material
+            // the approval presented.
+            Err(error) => {
+                readjudication_refused(retained, error, ReviewRetirementReason::ContextChanged)
+            }
+        }
+    }
+
+    /// The spend's re-adjudication of `entering` (ADR-001 D9): when it is
+    /// not the decision this custody holds but one of the same binding and
+    /// work (its staging prepared it afresh after an owner publication
+    /// change), it is re-adjudicated against the held one, outside every
+    /// lock. `None` otherwise: the spend settles the held decision itself,
+    /// or refuses another operation's.
+    pub(crate) fn readjudicate_entering(
+        &self,
+        entering: &PreparedOperationCheck,
+    ) -> Option<Readjudication> {
+        let retained = self.admitted();
+        (!entering.same_check(&retained) && entering.same_operation_and_work(&retained))
+            .then(|| self.readjudicate(&retained, Some(entering.clone())))
     }
 
     /// Custody of this candidate's attempt once its consent was spent at an
@@ -392,12 +513,13 @@ impl ConsentCandidate {
     /// This candidate's custody bound to a fresh decision of its exact
     /// original operation under `work`: moved into a resumed run, or rebound
     /// to the plan the session's agent this process rebuilt resolved afresh.
-    /// The same attempt (its id and generated status), validity, route and
-    /// observer.
+    /// The same attempt (its id and generated status), presented material,
+    /// validity, route and observer.
     fn rebound(&self, admitted: PreparedOperationCheck, work: WorkAuthorizationContext) -> Self {
         Self {
             attempt: self.attempt.rebound(admitted.binding().clone(), work),
-            admitted,
+            retained: parking_lot::Mutex::new(admitted),
+            material: self.material.clone(),
             deadline: self.deadline,
             tool_call_id: Arc::clone(&self.tool_call_id),
             route: Arc::clone(&self.route),
@@ -455,6 +577,73 @@ impl ConsentCandidate {
     }
 }
 
+/// A re-adjudication whose owners answered `error` instead of a decision or
+/// material: a refusal for a moved publication is made again, or decides
+/// nothing while that owner change is still in progress; a denial is
+/// `denied`; any other refusal changed the candidate's context; and owners
+/// that are unavailable decide nothing.
+fn readjudication_refused(
+    retained: &PreparedOperationCheck,
+    error: OperationAuthorizationError,
+    denied: ReviewRetirementReason,
+) -> Readjudication {
+    match error {
+        OperationAuthorizationError::Refused(refusal) => match refusal.kind() {
+            OperationRefusalKind::ReprepareRequired => {
+                if retained
+                    .work_authorization()
+                    .authorization()
+                    .owner_change_in_progress()
+                    .is_some()
+                {
+                    Readjudication::Unsettled
+                } else {
+                    Readjudication::Moved
+                }
+            }
+            OperationRefusalKind::Denied => Readjudication::Changed(denied),
+            OperationRefusalKind::MalformedFacts => {
+                Readjudication::Changed(ReviewRetirementReason::ContextChanged)
+            }
+        },
+        OperationAuthorizationError::Unavailable
+        | OperationAuthorizationError::ObservationUnavailable(_) => Readjudication::Unsettled,
+    }
+}
+
+/// Whether two decisions hold the same validity window: the same wall-clock
+/// window, or none. Each one's monotonic deadline is only that window as
+/// read by the observation that compiled it.
+fn same_validity(a: Option<OperationValidity>, b: Option<OperationValidity>) -> bool {
+    match (a, b) {
+        (Some(a), Some(b)) => {
+            a.not_before_ms == b.not_before_ms && a.expires_at_ms == b.expires_at_ms
+        }
+        (None, None) => true,
+        _ => false,
+    }
+}
+
+/// How the shared currentness rule left a live, unparked candidate
+/// ([`ApprovalService::current_consent_locked`]).
+#[derive(Debug)]
+enum ConsentCurrentness {
+    /// Its decision is current: the one it held, or the one a
+    /// re-adjudication found unchanged, which it holds from now on.
+    Current,
+    /// Stale only because the publication moved, and its re-adjudication
+    /// could not decide now: nothing changed.
+    Unsettled,
+    /// Stale only because the publication moved, with no re-adjudication
+    /// that settles it (none yet, or another change met it): the caller
+    /// re-adjudicates outside the lock and applies the rule again.
+    Readjudicate,
+    /// Withdrawn under this reservation. An authority change carries the
+    /// decision whose own check refused and that refusal, observed only once
+    /// every lock is released.
+    Withdrawn(Option<(PreparedOperationCheck, OperationAuthorizationError)>),
+}
+
 /// One decided consent a run can spend now: its approval and the original
 /// tool call its candidate retained (that call already holds its local
 /// result).
@@ -510,6 +699,8 @@ pub(crate) enum ConsentRebind {
 /// begins under the same reservation as the approval.
 pub(crate) struct ConsentCandidateParts {
     pub(crate) admitted: PreparedOperationCheck,
+    /// The owners' review material the approval presents with it.
+    pub(crate) material: ReviewOperationContextResolution,
     pub(crate) deadline: tokio::time::Instant,
     pub(crate) tool_call_id: Arc<str>,
     pub(crate) route: Arc<dyn HumanConsentRoute>,
@@ -600,7 +791,8 @@ pub(crate) enum ConsentRefusal {
     NoConsent,
     Denied,
     AlreadyConsumed,
-    /// The retained decision is no longer the current one.
+    /// The retained decision is no longer the current one, and a related
+    /// change (or another operation's decision) withdrew the consent.
     ContextChanged,
     /// The prepared owner's current check refused under the reservation; the
     /// failure is observed only once every lock is released.
@@ -613,7 +805,10 @@ pub(crate) enum ConsentRefusal {
     /// answer of a service that holds no custody for unspent, unwithdrawn
     /// consent it did not issue: that says only that this service cannot
     /// spend it, not that another owner is live or that the issuing process
-    /// stopped.
+    /// stopped. And the answer of a spend whose entering decision is not
+    /// current under its reservation and was not re-adjudicated for it (an
+    /// owner publication change after its staging): nothing is spent, and
+    /// the consent stays for its next re-adjudication (ADR-001 D9).
     OwnerUnavailable,
     /// Another owner of the store changed the approval first. The custody
     /// was retired; the row is reconciled before reuse.
@@ -815,7 +1010,8 @@ impl ApprovalService {
                 parts.admitted.binding().clone(),
                 parts.admitted.work_authorization().clone(),
             ),
-            admitted: parts.admitted,
+            retained: parking_lot::Mutex::new(parts.admitted),
+            material: parts.material,
             deadline: parts.deadline,
             tool_call_id: parts.tool_call_id,
             route: parts.route,
@@ -856,12 +1052,19 @@ impl ApprovalService {
     /// with no notice. An approval whose retained candidate this owner no
     /// longer holds (consumed, declined, expired, withdrawn, or lost on
     /// restart) needs fresh consent instead.
+    ///
+    /// A retained decision that an owner publication change made stale is
+    /// re-adjudicated before the decision and again before its allowance is
+    /// published (ADR-001 D9): an unrelated change leaves the candidate as
+    /// it was, and only a change of its binding, review tier, validity or
+    /// presented material withdraws it.
     pub fn decide_consent(
         &self,
         approval_id: &ApprovalId,
         decision: AuthenticatedConsentDecision,
     ) -> Result<ApprovalRecord, ApprovalError> {
         self.ensure_available()?;
+        self.readjudicate_consent(approval_id);
         self.reconcile_if_unreconciled(approval_id)?;
         let (record, candidate) = {
             let state = self.state.read();
@@ -931,6 +1134,10 @@ impl ApprovalService {
     /// between the final checks and the Approved notice. A committed decision
     /// stays history either way; a withdrawal that could not be recorded
     /// leaves the row to reconciliation (typed Unreconciled).
+    ///
+    /// A retained decision stale only because the owner publication moved is
+    /// re-adjudicated outside the reservation and every final check runs
+    /// again, at most [`CONSENT_READJUDICATION_BOUND`] times (ADR-001 D9).
     fn publish_allowance(
         &self,
         approval_id: &ApprovalId,
@@ -939,77 +1146,102 @@ impl ApprovalService {
         decided: ApprovalRecord,
         projections: &mut ConsentProjections,
     ) -> Result<ApprovalRecord, ApprovalError> {
-        let mut state = self.state.write();
-        let result = self.publish_allowance_locked(
-            &mut state,
-            approval_id,
-            candidate,
-            eligibility,
-            decided,
-            projections,
-        );
-        projections.absorb_reports(self.release_review_state(state));
-        result
+        let mut readjudication = None;
+        let mut rounds = 0;
+        loop {
+            let mut state = self.state.write();
+            let published = self.publish_allowance_locked(
+                &mut state,
+                approval_id,
+                candidate,
+                PublishChecks {
+                    eligibility,
+                    decided: &decided,
+                    readjudication: readjudication.as_ref(),
+                    exhausted: rounds >= CONSENT_READJUDICATION_BOUND,
+                },
+                projections,
+            );
+            projections.absorb_reports(self.release_review_state(state));
+            if let Some(result) = published {
+                return result;
+            }
+            rounds += 1;
+            readjudication = Some(candidate.readjudicate(&candidate.admitted(), None));
+        }
     }
 
+    /// One round of the decision's final checks; `None` when its retained
+    /// decision is to be re-adjudicated first, outside the reservation.
     fn publish_allowance_locked(
         &self,
         state: &mut ApprovalServiceState,
         approval_id: &ApprovalId,
         candidate: &Arc<ConsentCandidate>,
-        eligibility: &dyn ConsentEligibility,
-        decided: ApprovalRecord,
+        checks: PublishChecks<'_>,
         projections: &mut ConsentProjections,
-    ) -> Result<ApprovalRecord, ApprovalError> {
+    ) -> Option<Result<ApprovalRecord, ApprovalError>> {
         let current = |state: &ApprovalServiceState| {
             state.ensure_reconciled(approval_id).map(|()| {
                 state
                     .records
                     .get(approval_id)
                     .cloned()
-                    .unwrap_or(decided.clone())
+                    .unwrap_or_else(|| checks.decided.clone())
             })
         };
         // Withdrawn meanwhile (its run closed, it was abandoned): nothing to
         // publish; the committed decision and its withdrawal stand.
         if !is_live(state, approval_id, candidate) {
-            return current(state);
+            return Some(current(state));
         }
-        let record = current(state)?;
-        let parked = state.parked.contains(approval_id);
-        let stale = if eligibility.check_current().is_err() {
-            Some(ReviewRetirementReason::AuthorityChanged)
-        } else {
-            // A parked candidate's retained decision belongs to its closed run:
-            // only eligibility and validity decide here, and the allowance
-            // stays unspendable until a transfer publishes it for a resumed
-            // run.
-            match (!parked)
-                .then(|| retained_current_failure(&candidate.admitted))
-                .flatten()
-            {
-                Some(FinalCheckFailure::AuthorityChanged(_)) => {
-                    Some(ReviewRetirementReason::AuthorityChanged)
-                }
-                Some(_) => Some(ReviewRetirementReason::ContextChanged),
-                None if candidate.expired()
-                    || record
-                        .expires_at
-                        .is_some_and(|expires_at| expires_at <= self.now()) =>
-                {
-                    Some(ReviewRetirementReason::DeadlineExpired)
-                }
-                None => None,
-            }
+        let record = match current(state) {
+            Ok(record) => record,
+            Err(error) => return Some(Err(error)),
         };
-        if let Some(reason) = stale {
-            self.withdraw_consent_locked(state, approval_id, reason);
-            return current(state);
+        if checks.eligibility.check_current().is_err() {
+            self.withdraw_consent_locked(
+                state,
+                approval_id,
+                ReviewRetirementReason::AuthorityChanged,
+            );
+            return Some(current(state));
+        }
+        // A parked candidate's retained decision belongs to its closed run:
+        // only eligibility and validity decide here, and the allowance stays
+        // unspendable until a transfer publishes it for a resumed run. Any
+        // other candidate's decision follows the shared currentness rule: a
+        // decision the re-adjudication cannot settle now is published as it
+        // is, and its spend never enters on it.
+        if !state.parked.contains(approval_id) {
+            match self.current_consent_locked(
+                state,
+                approval_id,
+                candidate,
+                checks.readjudication,
+                checks.exhausted,
+            ) {
+                ConsentCurrentness::Current | ConsentCurrentness::Unsettled => {}
+                ConsentCurrentness::Readjudicate => return None,
+                ConsentCurrentness::Withdrawn(_) => return Some(current(state)),
+            }
+        }
+        if candidate.expired()
+            || record
+                .expires_at
+                .is_some_and(|expires_at| expires_at <= self.now())
+        {
+            self.withdraw_consent_locked(
+                state,
+                approval_id,
+                ReviewRetirementReason::DeadlineExpired,
+            );
+            return Some(current(state));
         }
         state.unpublished.remove(approval_id);
         projections.observe(candidate, ReviewAttemptStatus::Allowed, None);
         projections.notify(candidate, approval_id, ConsentNoticeKind::Approved);
-        Ok(record)
+        Some(Ok(record))
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1047,7 +1279,10 @@ impl ApprovalService {
         // Expiry first: the record's expiry or the attempt's deadline; then
         // the retained decision's currentness (its run may have closed; a
         // parked candidate's belongs to that closed run and is not checked).
-        // Either withdraws the candidate in this reservation.
+        // A decision that failed other than by a moved publication withdraws
+        // the candidate in this reservation; one stale only because the
+        // publication moved was re-adjudicated before it, and is again
+        // before the allowance is published (ADR-001 D9).
         self.observe_expiry_locked(state, approval_id, now, candidate.expired())?;
         if !is_live(state, approval_id, candidate) {
             return Err(
@@ -1197,7 +1432,8 @@ impl ApprovalService {
             }
             return Err(ConsentRefusal::without_custody(record.as_ref()));
         };
-        let binding = candidate.admitted.binding();
+        let admitted = candidate.admitted();
+        let binding = admitted.binding();
         if !candidate.attempt.bound_to(binding, work) || binding.facts().run_id.as_ref() != run_id {
             return Err(ConsentRefusal::NoConsent);
         }
@@ -1241,7 +1477,8 @@ impl ApprovalService {
             .iter()
             .filter_map(|approval_id| {
                 let candidate = state.consent.get(approval_id)?;
-                let binding = candidate.admitted.binding();
+                let admitted = candidate.admitted();
+                let binding = admitted.binding();
                 let record = state.records.get(approval_id);
                 let spendable = !state.unpublished.contains(approval_id)
                     && !state.parked.contains(approval_id)
@@ -1259,8 +1496,7 @@ impl ApprovalService {
                 spendable.then(|| DecidedConsent {
                     approval_id: approval_id.clone(),
                     tool_call_id: Arc::clone(&candidate.tool_call_id),
-                    tool_name: candidate
-                        .admitted
+                    tool_name: admitted
                         .tool_dispatch_parts()
                         .map(|(call, _)| call.name.to_owned()),
                     moved_from: record.and_then(moved_input),
@@ -1354,7 +1590,9 @@ impl ApprovalService {
         if self.ensure_available().is_err() {
             return ConsentRebind::Refused(ConsentRefusal::OwnerUnavailable);
         }
-        // 1. The live candidate exactly as this run's attempt admitted it.
+        // 1. The live candidate of exactly the operation this run's attempt
+        // admitted, whichever decision of it the custody holds now (a
+        // re-adjudication may have replaced it since: ADR-001 D9).
         let Some(state) = self.state.try_read() else {
             return ConsentRebind::NotReady;
         };
@@ -1364,7 +1602,7 @@ impl ApprovalService {
             .filter(|candidate| {
                 !state.parked.contains(approval_id)
                     && !state.unpublished.contains(approval_id)
-                    && candidate.admitted.same_check(old)
+                    && candidate.admitted().same_operation_and_work(old)
                     && candidate.attempt.bound_to(old.binding(), work)
                     && old.binding().facts().run_id.as_ref() == run_id
             })
@@ -1476,12 +1714,21 @@ impl ApprovalService {
     /// once (the caller). A proven no-commit (contention, a store that wrote
     /// nothing) leaves the consent spendable. A conflicting or uncertain
     /// commit retires the custody (no entry, no refund) and marks the row for
-    /// reconciliation. A changed decision or expiry withdraws the candidate
-    /// (fresh consent).
+    /// reconciliation. A related change, another operation's decision or
+    /// expiry withdraws the candidate (fresh consent).
+    ///
+    /// An entering decision that is not the retained one but its staging's
+    /// re-preparation of the same binding after an owner publication change
+    /// comes with its `readjudication`, made before the reservation, outside
+    /// every lock (ADR-001 D9): found unchanged and current under the
+    /// reservation, it is held and spent; found changed, the candidate is
+    /// withdrawn. An entering decision that is not current under the
+    /// reservation and was not settled so spends nothing, and the consent
+    /// stays for its next re-adjudication.
     ///
     /// Every store and owner-exit step (this spend's write, queued
     /// withdrawals the release records) completes before the final check:
-    /// the retained decision's callback-free current check and the deadline
+    /// the entered decision's callback-free current check and the deadline
     /// run again after the release, immediately before the effect handoff.
     /// A refusal there has zero effect; the committed spend stays spent, with
     /// no refund and no resend (`spent` is then true).
@@ -1493,6 +1740,7 @@ impl ApprovalService {
         approval_id: &ApprovalId,
         candidate: &Arc<ConsentCandidate>,
         entering: &PreparedOperationCheck,
+        readjudication: Option<&Readjudication>,
     ) -> (Result<(), ConsentRefusal>, bool, ConsentProjections) {
         let mut projections = ConsentProjections::default();
         if self.ensure_available().is_err() {
@@ -1503,28 +1751,32 @@ impl ApprovalService {
             return (Err(ConsentRefusal::OwnerUnavailable), false, projections);
         };
         self.count_review_lock();
-        let committed =
-            self.consume_consent_locked(&mut state, approval_id, candidate, entering, self.now());
+        let committed = self.consume_consent_locked(
+            &mut state,
+            approval_id,
+            candidate,
+            entering,
+            readjudication,
+            self.now(),
+        );
         projections.absorb_reports(self.release_state(state));
         let spent = committed.is_ok();
-        let result =
-            committed.and_then(
-                |expires_at| match retained_current_failure(&candidate.admitted) {
-                    Some(FinalCheckFailure::AuthorityChanged(error)) => {
-                        Err(ConsentRefusal::AuthorityChanged {
-                            check: candidate.admitted.clone(),
-                            error,
-                        })
-                    }
-                    Some(_) => Err(ConsentRefusal::ContextChanged),
-                    None if candidate.expired()
-                        || expires_at.is_some_and(|expires_at| expires_at <= self.now()) =>
-                    {
-                        Err(ConsentRefusal::NoConsent)
-                    }
-                    None => Ok(()),
-                },
-            );
+        // A committed spend held exactly the entering decision.
+        let result = committed.and_then(|expires_at| match retained_current_failure(entering) {
+            Some(FinalCheckFailure::AuthorityChanged(error)) => {
+                Err(ConsentRefusal::AuthorityChanged {
+                    check: entering.clone(),
+                    error,
+                })
+            }
+            Some(_) => Err(ConsentRefusal::ContextChanged),
+            None if candidate.expired()
+                || expires_at.is_some_and(|expires_at| expires_at <= self.now()) =>
+            {
+                Err(ConsentRefusal::NoConsent)
+            }
+            None => Ok(()),
+        });
         (result, spent, projections)
     }
 
@@ -1534,6 +1786,7 @@ impl ApprovalService {
         approval_id: &ApprovalId,
         candidate: &Arc<ConsentCandidate>,
         entering: &PreparedOperationCheck,
+        readjudication: Option<&Readjudication>,
         now: DateTime<Utc>,
     ) -> Result<Option<DateTime<Utc>>, ConsentRefusal> {
         if !is_live(state, approval_id, candidate) {
@@ -1547,11 +1800,11 @@ impl ApprovalService {
         if state.unpublished.contains(approval_id) || state.parked.contains(approval_id) {
             return Err(ConsentRefusal::NoConsent);
         }
-        // The entering decision is the exact retained one, still current by
-        // its prepared owner's coherent check alone: nothing here re-prepares
-        // or observes (its full current check ran at staging, outside every
-        // lock). A refusal withdraws the candidate under this reservation.
-        if !entering.same_check(&candidate.admitted) {
+        // The entering decision is the retained one, or one of its binding
+        // and work that its staging prepared afresh after an owner
+        // publication change. Any other decision is no longer the reviewed
+        // operation: the candidate is withdrawn under this reservation.
+        if !entering.same_operation_and_work(&candidate.admitted()) {
             self.withdraw_consent_locked(
                 state,
                 approval_id,
@@ -1559,27 +1812,26 @@ impl ApprovalService {
             );
             return Err(ConsentRefusal::ContextChanged);
         }
-        match retained_current_failure(&candidate.admitted) {
-            None => {}
-            Some(FinalCheckFailure::AuthorityChanged(error)) => {
-                self.withdraw_consent_locked(
-                    state,
-                    approval_id,
-                    ReviewRetirementReason::AuthorityChanged,
-                );
-                return Err(ConsentRefusal::AuthorityChanged {
-                    check: candidate.admitted.clone(),
-                    error,
-                });
+        // The shared currentness rule, by the prepared owners' coherent
+        // checks alone: nothing here re-prepares or observes (the entering
+        // decision's full current check ran at its staging, and its
+        // re-adjudication before this reservation, outside every lock).
+        match self.current_consent_locked(state, approval_id, candidate, readjudication, false) {
+            ConsentCurrentness::Current => {}
+            ConsentCurrentness::Withdrawn(Some((check, error))) => {
+                return Err(ConsentRefusal::AuthorityChanged { check, error });
             }
-            Some(_) => {
-                self.withdraw_consent_locked(
-                    state,
-                    approval_id,
-                    ReviewRetirementReason::ContextChanged,
-                );
-                return Err(ConsentRefusal::ContextChanged);
+            ConsentCurrentness::Withdrawn(None) => return Err(ConsentRefusal::ContextChanged),
+            // Stale, and not settled for this entry: nothing is spent, and
+            // the consent stays for its next re-adjudication.
+            ConsentCurrentness::Readjudicate | ConsentCurrentness::Unsettled => {
+                return Err(ConsentRefusal::OwnerUnavailable);
             }
+        }
+        // Spent only for the decision it enters with, which the rule above
+        // holds when it re-adjudicated it unchanged.
+        if !entering.same_check(&candidate.admitted()) {
+            return Err(ConsentRefusal::OwnerUnavailable);
         }
         let Some(record) = state.records.get(approval_id).cloned() else {
             return Err(ConsentRefusal::NoConsent);
@@ -1963,7 +2215,7 @@ impl ApprovalService {
             // operation afresh, outside every owner lock.
             let prepared = transfer
                 .candidate
-                .admitted
+                .admitted()
                 .prepare_for_resumed_run(transfer.run.work.clone(), &transfer.run.run_id);
             let mut state = self.state.write();
             self.count_review_lock();
@@ -2085,15 +2337,19 @@ impl ApprovalService {
     }
 
     /// Withdraw the live candidate of `approval_id` when its retained
-    /// decision is no longer current (its run closed, or its authority or
-    /// context changed). Callback-free: the prepared owner's coherent check
-    /// only.
+    /// decision failed other than by a moved owner publication (its run
+    /// closed, its validity ended, its owners became unavailable).
+    /// Callback-free: the shared currentness rule with no re-adjudication
+    /// under the lock, so a decision stale only because the publication moved
+    /// stays for its re-adjudication (ADR-001 D9), which approval reads and
+    /// decisions run before their reservation
+    /// ([`Self::readjudicate_consent`]).
     pub(super) fn withdraw_stale_consent_locked(
         &self,
         state: &mut ApprovalServiceState,
         approval_id: &ApprovalId,
     ) {
-        let Some(candidate) = state.consent.get(approval_id) else {
+        let Some(candidate) = state.consent.get(approval_id).cloned() else {
             return;
         };
         // A parked candidate's retained decision belongs to its closed run by
@@ -2119,14 +2375,135 @@ impl ApprovalService {
             }
             return;
         }
-        let reason = match retained_current_failure(&candidate.admitted) {
-            None => return,
-            Some(FinalCheckFailure::AuthorityChanged(_)) => {
-                ReviewRetirementReason::AuthorityChanged
+        // Every outcome settles here: a decision stale only because the
+        // publication moved is left for its re-adjudication.
+        let _ = self.current_consent_locked(state, approval_id, &candidate, None, false);
+    }
+
+    /// The one currentness rule of a live, unparked candidate, under the
+    /// owner's reservation (ADR-001 D9), shared by approval reads
+    /// ([`Self::withdraw_stale_consent_locked`],
+    /// [`Self::readjudicate_consent`]), a decision's publication and the
+    /// spend. Callback-free: the prepared owners' coherent checks only.
+    ///
+    /// A current decision stands. A decision that failed other than by a
+    /// moved publication is withdrawn as before. One stale only because the
+    /// owner publication moved is never withdrawn for that alone; its
+    /// `readjudication`, made outside the lock, decides it: a decision found
+    /// unchanged that is current now is held from now on, a related change
+    /// withdraws, and an unsettled one changes nothing. Without one, or when
+    /// another change met it, the caller re-adjudicates and applies the rule
+    /// again ([`ConsentCurrentness::Readjudicate`]) until `exhausted`, which
+    /// withdraws as `ContextChanged`.
+    fn current_consent_locked(
+        &self,
+        state: &mut ApprovalServiceState,
+        approval_id: &ApprovalId,
+        candidate: &ConsentCandidate,
+        readjudication: Option<&Readjudication>,
+        exhausted: bool,
+    ) -> ConsentCurrentness {
+        // A decision found unchanged that is current now is held. Every
+        // decision this custody ever held shares its binding, review tier,
+        // validity window and presented material, so it stands even if
+        // another re-adjudication replaced the held one meanwhile.
+        if let Some(Readjudication::Unchanged(fresh)) = readjudication {
+            match retained_current_failure(fresh) {
+                None => {
+                    candidate.hold(fresh);
+                    return ConsentCurrentness::Current;
+                }
+                Some(FinalCheckFailure::AuthorityChanged(error)) => {
+                    self.withdraw_consent_locked(
+                        state,
+                        approval_id,
+                        ReviewRetirementReason::AuthorityChanged,
+                    );
+                    return ConsentCurrentness::Withdrawn(Some((fresh.clone(), error)));
+                }
+                // Another change since: the held decision decides below.
+                Some(_) => {}
             }
-            Some(_) => ReviewRetirementReason::ContextChanged,
+        }
+        let retained = candidate.admitted();
+        let reason = match retained_current_failure(&retained) {
+            None => return ConsentCurrentness::Current,
+            Some(FinalCheckFailure::AuthorityChanged(error)) => {
+                self.withdraw_consent_locked(
+                    state,
+                    approval_id,
+                    ReviewRetirementReason::AuthorityChanged,
+                );
+                return ConsentCurrentness::Withdrawn(Some((retained, error)));
+            }
+            Some(_) => match readjudication {
+                Some(Readjudication::Changed(reason)) => *reason,
+                Some(Readjudication::Unsettled) => return ConsentCurrentness::Unsettled,
+                Some(Readjudication::Unchanged(_) | Readjudication::Moved) | None if !exhausted => {
+                    return ConsentCurrentness::Readjudicate;
+                }
+                Some(Readjudication::Unchanged(_) | Readjudication::Moved) | None => {
+                    ReviewRetirementReason::ContextChanged
+                }
+            },
         };
         self.withdraw_consent_locked(state, approval_id, reason);
+        ConsentCurrentness::Withdrawn(None)
+    }
+
+    /// Re-adjudicate the live, unparked candidate of `approval_id` before an
+    /// owner step reads or decides it, when its decision is stale only
+    /// because the owner publication moved (ADR-001 D9): its owners prepare
+    /// the same binding afresh and read its material outside every owner
+    /// lock, and the shared rule ([`Self::current_consent_locked`]) settles
+    /// it under the reservation. A change that keeps meeting the
+    /// re-adjudication withdraws it after [`CONSENT_READJUDICATION_BOUND`]
+    /// rounds. It never waits for an owner change: what it cannot decide now
+    /// stays as it is, and the owner step's own checks apply.
+    pub(super) fn readjudicate_consent(&self, approval_id: &ApprovalId) {
+        let candidate = {
+            let state = self.state.read();
+            state
+                .consent
+                .get(approval_id)
+                .filter(|_| !state.parked.contains(approval_id))
+                .cloned()
+        };
+        // A reader may have made a disposer's try-lock fail; settle after it.
+        self.settle_owner_now().run();
+        let Some(candidate) = candidate else {
+            return;
+        };
+        for round in 1..=CONSENT_READJUDICATION_BOUND {
+            let retained = candidate.admitted();
+            // Only a decision stale because the publication moved; any other
+            // failure is the owner step's own to settle.
+            if !matches!(
+                retained_current_failure(&retained),
+                Some(FinalCheckFailure::ContextChanged)
+            ) {
+                return;
+            }
+            let readjudication = candidate.readjudicate(&retained, None);
+            let mut state = self.state.write();
+            let settled = if is_live(&state, approval_id, &candidate)
+                && !state.parked.contains(approval_id)
+            {
+                Some(self.current_consent_locked(
+                    &mut state,
+                    approval_id,
+                    &candidate,
+                    Some(&readjudication),
+                    round == CONSENT_READJUDICATION_BOUND,
+                ))
+            } else {
+                None
+            };
+            self.release_state(state).run();
+            if !matches!(settled, Some(ConsentCurrentness::Readjudicate)) {
+                return;
+            }
+        }
     }
 
     /// Retire the custody of `approval_id` after a conflicting or uncertain
@@ -2922,6 +3299,18 @@ struct Resolved<'a> {
     eligibility: &'a dyn ConsentEligibility,
 }
 
+/// What one round of a decision's final checks checks against.
+struct PublishChecks<'a> {
+    eligibility: &'a dyn ConsentEligibility,
+    /// The committed decision: the answer when the row is gone meanwhile.
+    decided: &'a ApprovalRecord,
+    /// The retained decision's re-adjudication of the previous round.
+    readjudication: Option<&'a Readjudication>,
+    /// The re-adjudication bound is spent: a decision still stale only
+    /// because the publication moved is withdrawn.
+    exhausted: bool,
+}
+
 /// A run open now that resumes retained work through staged inputs.
 #[derive(Debug, Clone)]
 pub(super) struct ResumedRun {
@@ -3320,17 +3709,68 @@ mod tests {
         prepare_unavailable: AtomicBool,
         /// Arbitrary owner code run once inside the next preparation.
         on_prepare: parking_lot::Mutex<Option<Box<dyn FnOnce() + Send>>>,
+        /// Preparations so far.
+        prepares: AtomicUsize,
+        /// The next this many preparations each publish one completed owner
+        /// change right after preparing, so their decision is stale at once.
+        republish_after_prepare: AtomicUsize,
+        /// The same, right after each of the next this many material reads.
+        republish_after_material_read: AtomicUsize,
+        /// An owner change is in progress: preparations and material reads
+        /// refuse as stale, and the work names the change in progress.
+        in_progress: AtomicBool,
+        /// The owner's review material, its selected action account;
+        /// `None`: explicitly not applicable.
+        material: parking_lot::Mutex<Option<String>>,
+        /// The wall-clock end (ms) of the validity window decisions are
+        /// prepared with; 0: decisions carry no window.
+        expires_at_ms: AtomicU64,
+    }
+
+    impl Owner {
+        /// One completed owner change that keeps every permission, tier,
+        /// validity window and material: unrelated to every candidate.
+        fn republish(&self) {
+            self.sequence.fetch_add(1, Ordering::AcqRel);
+        }
+
+        /// Change the owner's review material, published as an owner change.
+        fn set_material(&self, material: Option<&str>) {
+            *self.material.lock() = material.map(str::to_owned);
+            self.republish();
+        }
+
+        /// Change the validity window decisions are prepared with, published
+        /// as an owner change.
+        fn set_expiry(&self, expires_at_ms: u64) {
+            self.expires_at_ms.store(expires_at_ms, Ordering::Release);
+            self.republish();
+        }
+    }
+
+    /// Take one of `budget`'s remaining uses, when one is left.
+    fn take_one(budget: &AtomicUsize) -> bool {
+        budget
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |left| {
+                left.checked_sub(1)
+            })
+            .is_ok()
     }
 
     struct Decision {
         owner: Arc<Owner>,
         sequence: u64,
         tier: OperationReviewTier,
+        validity: Option<crate::authorization::OperationValidity>,
     }
 
     impl PreparedOperationAuthorization for Decision {
         fn review_tier(&self) -> OperationReviewTier {
             self.tier
+        }
+
+        fn validity(&self) -> Option<crate::authorization::OperationValidity> {
+            self.validity
         }
 
         fn check_current(
@@ -3364,7 +3804,8 @@ mod tests {
     struct OwnerWork(Arc<Owner>);
 
     impl WorkAuthorization for OwnerWork {
-        /// This test owner has no review material: explicitly not applicable.
+        /// The owner's review material: its selected action account, or
+        /// explicitly not applicable (the default).
         fn review_operation_context(
             &self,
             _binding: &crate::authorization::PreparedAuthorizationBinding,
@@ -3372,7 +3813,21 @@ mod tests {
             crate::authorization::ReviewOperationContextResolution,
             crate::authorization::OperationAuthorizationError,
         > {
-            Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable)
+            if self.0.in_progress.load(Ordering::Acquire) {
+                return Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into());
+            }
+            let material = self.0.material.lock().clone();
+            if take_one(&self.0.republish_after_material_read) {
+                self.0.republish();
+            }
+            match material {
+                None => Ok(crate::authorization::ReviewOperationContextResolution::NotApplicable),
+                Some(account) => {
+                    crate::authorization::ReviewOperationContext::new(Some(account), None)
+                        .map(crate::authorization::ReviewOperationContextResolution::Material)
+                        .map_err(|_| OperationAuthorizationError::Unavailable)
+                }
+            }
         }
 
         fn prepare(
@@ -3383,13 +3838,18 @@ mod tests {
             if let Some(hook) = hook {
                 hook();
             }
+            self.0.prepares.fetch_add(1, Ordering::SeqCst);
+            if self.0.in_progress.load(Ordering::Acquire) {
+                return Err(OperationRefused::new(OperationRefusalKind::ReprepareRequired).into());
+            }
             if self.0.prepare_unavailable.load(Ordering::Acquire) {
                 return Err(OperationAuthorizationError::Unavailable);
             }
             if self.0.prepare_refused.load(Ordering::Acquire) {
                 return Err(OperationRefused::new(OperationRefusalKind::Denied).into());
             }
-            Ok(Arc::new(Decision {
+            let expires_at_ms = self.0.expires_at_ms.load(Ordering::Acquire);
+            let decision = Arc::new(Decision {
                 owner: Arc::clone(&self.0),
                 sequence: self.0.sequence.load(Ordering::Acquire),
                 tier: if self.0.r2.load(Ordering::Acquire) {
@@ -3397,7 +3857,24 @@ mod tests {
                 } else {
                     OperationReviewTier::R3
                 },
-            }))
+                // Each preparation reads the window on its own monotonic
+                // clock: equal windows, different deadlines.
+                validity: (expires_at_ms != 0).then(|| crate::authorization::OperationValidity {
+                    not_before_ms: 0,
+                    expires_at_ms,
+                    deadline: crate::time_compat::Instant::now() + Duration::from_secs(3600),
+                }),
+            });
+            if take_one(&self.0.republish_after_prepare) {
+                self.0.republish();
+            }
+            Ok(decision)
+        }
+
+        fn owner_change_in_progress(&self) -> Option<crate::authorization::OwnerChangeInProgress> {
+            self.0.in_progress.load(Ordering::Acquire).then_some(
+                crate::authorization::OwnerChangeInProgress::new(uuid::Uuid::nil(), 1),
+            )
         }
     }
 
@@ -3692,6 +4169,32 @@ mod tests {
             let spent = entry.consume(&admitted);
             guard.complete();
             spent
+        }
+
+        /// A fresh attempt that enters with the decision its staging
+        /// returns, as the fenced dispatch stages it: the canonical
+        /// current/reprepare path of the admitted decision, through the
+        /// check point, then the spend at its leaf.
+        fn spend_staged(&self, id: &ApprovalId) -> Result<(), crate::ToolError> {
+            let (entry, admitted) = self.attempt(id)?;
+            let entering = admitted.current().map_err(crate::ToolError::from)?;
+            let guard = ReviewDispatchGuard::new(entry.clone());
+            let spent = entry
+                .check(&entering)
+                .and_then(|()| entry.consume(&entering));
+            guard.complete();
+            spent
+        }
+
+        /// The decision `id`'s live custody holds now.
+        fn held(&self, id: &ApprovalId) -> PreparedOperationCheck {
+            self.approvals
+                .state
+                .read()
+                .consent
+                .get(id)
+                .expect("live custody")
+                .admitted()
         }
 
         fn notices(&self, id: &ApprovalId) -> Vec<ConsentNoticeKind> {
@@ -4095,26 +4598,58 @@ mod tests {
         );
     }
 
+    /// ADR-001 D9 at the spend. A decision that an unrelated owner change
+    /// made stale between the approval and the spend is re-adjudicated: the
+    /// attempt enters once, with the decision its staging prepared afresh. A
+    /// related change (here the review tier the owners now require) refuses
+    /// the spend with zero entry and withdraws the consent as
+    /// `ContextChanged`.
     #[tokio::test]
-    async fn a_changed_decision_needs_fresh_consent() {
+    async fn a_spend_re_adjudicates_a_decision_an_owner_change_made_stale() {
+        // Unrelated: the same tier, validity window and material.
         let w = world();
         let id = w.request(&w.check()).await;
         w.approvals
             .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
             .expect("approved");
-        let (entry, admitted) = w.attempt(&id).expect("resolved");
-
-        // The owner republishes between the decision and the entry.
-        w.owner.sequence.fetch_add(1, Ordering::AcqRel);
-        let guard = ReviewDispatchGuard::new(entry.clone());
+        let consented = w.held(&id);
+        w.owner.republish();
+        assert!(
+            consented.check_retained_current().is_err(),
+            "the consented decision is stale"
+        );
         assert_eq!(
-            entry.consume(&admitted),
+            w.spend_staged(&id),
+            Ok(()),
+            "spent against the re-prepared decision"
+        );
+        let consent = w.record(&id).consent.expect("consent history");
+        assert!(consent.consumed_at.is_some(), "spent once");
+        assert!(consent.withdrawal.is_none(), "never withdrawn");
+        assert_eq!(w.notices(&id).last(), Some(&ConsentNoticeKind::Used));
+        assert_eq!(
+            w.spend_staged(&id),
+            Err(crate::ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::AlreadyConsumed,
+                approval_id: None,
+            })
+        );
+
+        // Related: the owners now require R2 for the operation.
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        w.owner.r2.store(true, Ordering::Release);
+        w.owner.republish();
+        assert_eq!(
+            w.spend_staged(&id),
             Err(crate::ToolError::ReviewUnsatisfied {
                 kind: ReviewUnsatisfiedKind::ContextChanged,
                 approval_id: None,
             })
         );
-        guard.complete();
         assert_eq!(
             w.statuses().last(),
             Some(&(
@@ -4122,8 +4657,74 @@ mod tests {
                 Some(ReviewRetirementReason::ContextChanged)
             ))
         );
+        let record = w.record(&id);
+        assert!(
+            record
+                .consent
+                .as_ref()
+                .is_some_and(|consent| consent.consumed_at.is_none()),
+            "nothing spent"
+        );
+        assert_eq!(
+            withdrawal_reason(&record),
+            Some(ApprovalConsentWithdrawalReason::ContextChanged)
+        );
         assert_eq!(w.attempt(&id).err(), Some(human_consent_required()));
         assert!(!w.notices(&id).contains(&ConsentNoticeKind::Used));
+    }
+
+    /// ADR-001 D9: a spend never enters on a stale decision. An owner change
+    /// during the spend's own re-adjudication (right after its material
+    /// read), or after the entering decision's staging, enters nothing and
+    /// leaves the consent unspent and unwithdrawn for its next
+    /// re-adjudication; a later fresh attempt enters once.
+    #[tokio::test]
+    async fn a_change_during_a_spend_never_spends_a_stale_decision() {
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        let owner_unavailable = Err(crate::ToolError::ReviewUnavailable {
+            kind: ReviewUnavailableKind::OwnerUnavailable,
+        });
+        let kept = |w: &World, id: &ApprovalId| {
+            w.record(id).consent.is_some_and(|consent| {
+                consent.consumed_at.is_none() && consent.withdrawal.is_none()
+            })
+        };
+
+        // During the re-adjudication of the staging's fresh decision.
+        w.owner.republish();
+        w.owner
+            .republish_after_material_read
+            .store(1, Ordering::Release);
+        assert_eq!(w.spend_staged(&id), owner_unavailable);
+        assert!(kept(&w, &id), "unspent and unwithdrawn");
+
+        // After the entering decision's staging, before its spend.
+        let (entry, admitted) = w.attempt(&id).expect("resolved");
+        let entering = admitted.current().expect("staged afresh");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        assert_eq!(entry.check(&entering), Ok(()));
+        w.owner.republish();
+        assert_eq!(entry.consume(&entering), owner_unavailable);
+        guard.complete();
+        assert!(kept(&w, &id), "unspent and unwithdrawn");
+        let notices = w.notices(&id);
+        assert!(!notices.contains(&ConsentNoticeKind::Used), "{notices:?}");
+        assert!(
+            !notices.contains(&ConsentNoticeKind::Withdrawn),
+            "{notices:?}"
+        );
+
+        // A later fresh attempt re-adjudicates and enters once.
+        assert_eq!(w.spend_staged(&id), Ok(()));
+        assert!(
+            w.record(&id)
+                .consent
+                .is_some_and(|consent| consent.consumed_at.is_some())
+        );
     }
 
     #[tokio::test]
@@ -4335,6 +4936,161 @@ mod tests {
             crate::authorization::OperationRefusalDisposition::ToolResult
         );
         assert!(observation.operation_id().is_some());
+    }
+
+    /// One builtin tool whose leaf enters its effect through the reviewed
+    /// entry, which spends a consent there, and counts the bodies it runs
+    /// after that entry.
+    #[derive(Default)]
+    struct EnteringTool(AtomicUsize);
+
+    #[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+    #[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+    impl crate::AgentToolDispatcher for EnteringTool {
+        fn tools(&self) -> Arc<[Arc<crate::types::ToolDef>]> {
+            [Arc::new(
+                crate::types::ToolDef::new("read_file", "", serde_json::json!({"type": "object"}))
+                    .with_provenance(crate::types::ToolProvenance::new(
+                        crate::types::ToolSourceKind::Builtin,
+                        "fixture",
+                    )),
+            )]
+            .into()
+        }
+
+        fn review_entry_support(&self, _tool_name: &str) -> ReviewEntrySupport {
+            ReviewEntrySupport::ConsumesAtEntry
+        }
+
+        async fn dispatch(
+            &self,
+            call: ToolCallView<'_>,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            self.dispatch_with_context(call, &crate::ToolDispatchContext::default())
+                .await
+        }
+
+        async fn dispatch_with_context(
+            &self,
+            call: ToolCallView<'_>,
+            context: &crate::ToolDispatchContext,
+        ) -> Result<crate::ops::ToolDispatchOutcome, crate::ToolError> {
+            let _entered = context.enter_reviewed_effect(call, None)?;
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(crate::types::ToolResult::new(call.id.to_string(), "ran".to_string(), false).into())
+        }
+    }
+
+    /// The R3 call of `tool` through the real fenced entry, under `w`'s work
+    /// and review: it settles locally with one consent approval. Returns
+    /// that approval and the dispatch context a fresh attempt uses.
+    async fn fenced_consent(
+        w: &World,
+        tool: &Arc<EnteringTool>,
+    ) -> (ApprovalId, crate::ToolDispatchContext) {
+        let context = crate::ToolDispatchContext::default()
+            .with_work_authorization(Some(w.work.clone()))
+            .with_operation_review(Some(Arc::clone(&w.review)));
+        let args = serde_json::value::RawValue::from_string("{}".into()).expect("args");
+        let call = ToolCallView {
+            id: "call-1",
+            name: "read_file",
+            args: &args,
+        };
+        let resolution = crate::ToolExecutionResolutionContext::new(
+            crate::ToolDeadlineChain::new(vec![crate::ToolDeadlineContributor::finite(
+                crate::ToolDeadlineOwner::CoreToolDispatch,
+                Duration::from_secs(60),
+            )])
+            .expect("deadline chain"),
+        );
+        let plan = crate::resolve_tool_execution_plan_fenced(tool, call, &context, &resolution)
+            .expect("plan");
+        let first = crate::dispatch_tool_execution_plan_fenced(tool, call, &context, &plan).await;
+        let (id, kind) = w
+            .route
+            .notices
+            .lock()
+            .last()
+            .cloned()
+            .expect("requested notice");
+        assert_eq!(kind, ConsentNoticeKind::Requested);
+        assert_eq!(
+            first.err(),
+            Some(crate::ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::HumanConsentRequired,
+                approval_id: Some(id.clone()),
+            })
+        );
+        (id, context)
+    }
+
+    /// ADR-001 D9 through the real fenced entry. An unrelated owner change
+    /// while the consent is pending keeps it pending; after the human's
+    /// approval another unrelated change makes the approved decision stale,
+    /// and the fresh attempt's stagings prepare it afresh: its leaf spends
+    /// the consent against that decision and the operation enters exactly
+    /// once. A related change after the approval (the material the approval
+    /// presented) refuses the attempt with zero entry and withdraws it.
+    #[tokio::test]
+    async fn an_unrelated_change_keeps_the_consent_and_the_operation_enters_once() {
+        for related in [false, true] {
+            let w = world();
+            w.owner.set_material(Some("team-checking"));
+            let tool = Arc::new(EnteringTool::default());
+            let (id, context) = fenced_consent(&w, &tool).await;
+            w.owner.republish();
+            assert_eq!(
+                w.record(&id).status,
+                ApprovalStatus::Pending,
+                "related={related}"
+            );
+            w.approvals
+                .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+                .expect("approved");
+            if related {
+                w.owner.set_material(Some("team-savings"));
+            } else {
+                w.owner.republish();
+            }
+            let attempt = crate::dispatch_retained_consent_attempt(&tool, &context, &id).await;
+            let consent = w.record(&id).consent.expect("consent history");
+            if related {
+                assert!(
+                    matches!(
+                        attempt,
+                        Err(crate::ToolError::ReviewUnsatisfied {
+                            kind: ReviewUnsatisfiedKind::ContextChanged,
+                            ..
+                        })
+                    ),
+                    "{attempt:?}"
+                );
+                assert_eq!(tool.0.load(Ordering::SeqCst), 0, "zero entry");
+                assert!(consent.consumed_at.is_none(), "nothing spent");
+                assert_eq!(
+                    consent.withdrawal.map(|withdrawal| withdrawal.reason),
+                    Some(ApprovalConsentWithdrawalReason::ContextChanged)
+                );
+            } else {
+                assert!(attempt.is_ok(), "{attempt:?}");
+                assert_eq!(tool.0.load(Ordering::SeqCst), 1, "entered once");
+                assert!(consent.consumed_at.is_some(), "spent once");
+                assert_eq!(consent.withdrawal, None);
+                let again = crate::dispatch_retained_consent_attempt(&tool, &context, &id).await;
+                assert!(
+                    matches!(
+                        again,
+                        Err(crate::ToolError::ReviewUnsatisfied {
+                            kind: ReviewUnsatisfiedKind::AlreadyConsumed,
+                            ..
+                        })
+                    ),
+                    "{again:?}"
+                );
+                assert_eq!(tool.0.load(Ordering::SeqCst), 1, "never twice");
+            }
+        }
     }
 
     #[tokio::test]
@@ -4595,29 +5351,252 @@ mod tests {
         assert_eq!(other.spend(&unrelated), Ok(()));
     }
 
-    /// Backstop: a read finds a live candidate whose retained decision is no
-    /// longer current and withdraws it, so a late decision is refused.
+    /// ADR-001 D9 on approval reads: a pending consent whose decision an
+    /// unrelated owner change made stale is re-adjudicated by its owners
+    /// (once) and stays pending on get and list, its custody holding the
+    /// current decision; nothing is announced. A later decision approves it
+    /// and a fresh attempt spends it once.
     #[tokio::test]
-    async fn a_stale_candidate_is_withdrawn_on_read() {
+    async fn an_unrelated_owner_change_keeps_a_pending_consent() {
+        let w = world();
+        w.owner.set_material(Some("team-checking"));
+        w.owner.set_expiry(9_000_000_000_000);
+        let id = w.request(&w.check()).await;
+        let consented = w.held(&id);
+        let prepares = w.owner.prepares.load(Ordering::SeqCst);
+        w.owner.republish();
+        assert!(consented.check_retained_current().is_err());
+
+        let record = w.record(&id);
+        assert_eq!(record.status, ApprovalStatus::Pending);
+        assert_eq!(withdrawal_reason(&record), None);
+        assert!(
+            w.approvals
+                .list(ApprovalListFilter::default())
+                .expect("list")
+                .iter()
+                .any(|record| record.approval_id == id && record.status == ApprovalStatus::Pending)
+        );
+        assert_eq!(w.notices(&id), vec![ConsentNoticeKind::Requested]);
+        let held = w.held(&id);
+        assert!(
+            !held.same_check(&consented) && held.check_retained_current().is_ok(),
+            "the custody holds the re-adjudicated, current decision"
+        );
+        assert_eq!(
+            w.owner.prepares.load(Ordering::SeqCst),
+            prepares + 1,
+            "re-prepared once; the list found it current"
+        );
+
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        assert_eq!(
+            w.notices(&id),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Approved]
+        );
+        assert_eq!(w.spend(&id), Ok(()));
+        assert_eq!(w.notices(&id).last(), Some(&ConsentNoticeKind::Used));
+    }
+
+    /// ADR-001 D9: a related change while the consent is pending (the
+    /// review tier, the validity window, or the material the approval
+    /// presented) still withdraws it on its next read as `ContextChanged`,
+    /// and a later decision is refused. An entering decision of another
+    /// operation withdraws it at the attempt's check point.
+    #[tokio::test]
+    async fn a_related_owner_change_withdraws_a_pending_consent() {
+        for change in ["tier", "validity", "material"] {
+            let w = world();
+            w.owner.set_material(Some("team-checking"));
+            w.owner.set_expiry(9_000_000_000_000);
+            let id = w.request(&w.check()).await;
+            match change {
+                "tier" => {
+                    w.owner.r2.store(true, Ordering::Release);
+                    w.owner.republish();
+                }
+                "validity" => w.owner.set_expiry(9_000_000_000_001),
+                _ => w.owner.set_material(Some("team-savings")),
+            }
+            let record = w.record(&id);
+            assert_eq!(record.status, ApprovalStatus::Cancelled, "{change}");
+            assert_eq!(
+                withdrawal_reason(&record),
+                Some(ApprovalConsentWithdrawalReason::ContextChanged),
+                "{change}"
+            );
+            assert_eq!(
+                w.notices(&id),
+                vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn],
+                "{change}"
+            );
+            assert_eq!(
+                w.approvals
+                    .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1")),
+                Err(ApprovalError::ConsentUnavailable {
+                    approval_id: id.clone()
+                }),
+                "{change}"
+            );
+        }
+
+        // Another operation's decision at the attempt's check point.
         let w = world();
         let id = w.request(&w.check()).await;
-        w.owner.sequence.fetch_add(1, Ordering::AcqRel);
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        let (entry, _admitted) = w.attempt(&id).expect("resolved");
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        assert_eq!(
+            entry.check(&w.check()),
+            Err(crate::ToolError::ReviewUnsatisfied {
+                kind: ReviewUnsatisfiedKind::ContextChanged,
+                approval_id: None,
+            })
+        );
+        guard.complete();
+        assert_eq!(
+            withdrawal_reason(&w.record(&id)),
+            Some(ApprovalConsentWithdrawalReason::ContextChanged)
+        );
+        assert_eq!(w.attempt(&id).err(), Some(human_consent_required()));
+    }
+
+    /// ADR-001 D9, bounded. An owner change that meets a read's
+    /// re-adjudication (its fresh decision is stale again before the
+    /// reservation) is re-adjudicated again, within
+    /// `CONSENT_READJUDICATION_BOUND` rounds; a change that meets every
+    /// round withdraws the consent as `ContextChanged` after exactly that
+    /// many preparations. An owner change still in progress decides
+    /// nothing: the read keeps the consent after one round, and nothing
+    /// spends the stale decision meanwhile.
+    #[tokio::test]
+    async fn re_adjudication_is_bounded_and_settles_nothing_while_a_change_is_in_progress() {
+        let bound = usize::from(CONSENT_READJUDICATION_BOUND);
+
+        // Every round but the last meets another change: kept.
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.owner.republish();
+        w.owner
+            .republish_after_prepare
+            .store(bound - 1, Ordering::Release);
+        let prepares = w.owner.prepares.load(Ordering::SeqCst);
+        assert_eq!(w.record(&id).status, ApprovalStatus::Pending);
+        assert_eq!(w.owner.prepares.load(Ordering::SeqCst), prepares + bound);
+        assert!(w.held(&id).check_retained_current().is_ok());
+        assert_eq!(w.notices(&id), vec![ConsentNoticeKind::Requested]);
+
+        // Every round meets another change: withdrawn after the bound.
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.owner.republish();
+        w.owner
+            .republish_after_prepare
+            .store(usize::MAX, Ordering::Release);
+        let prepares = w.owner.prepares.load(Ordering::SeqCst);
         let record = w.record(&id);
         assert_eq!(record.status, ApprovalStatus::Cancelled);
         assert_eq!(
-            record
-                .consent
-                .and_then(|consent| consent.withdrawal)
-                .map(|w| w.reason),
+            withdrawal_reason(&record),
             Some(ApprovalConsentWithdrawalReason::ContextChanged)
         );
         assert_eq!(
-            w.approvals
-                .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1")),
-            Err(ApprovalError::ConsentUnavailable {
-                approval_id: id.clone()
-            })
+            w.owner.prepares.load(Ordering::SeqCst),
+            prepares + bound,
+            "bounded"
         );
+        assert_eq!(
+            w.notices(&id),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn]
+        );
+
+        // A change in progress: nothing decided, nothing spent, kept.
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.approvals
+            .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+            .expect("approved");
+        let (entry, admitted) = w.attempt(&id).expect("resolved");
+        w.owner.republish();
+        w.owner.in_progress.store(true, Ordering::Release);
+        let prepares = w.owner.prepares.load(Ordering::SeqCst);
+        let record = w.record(&id);
+        assert_eq!(record.status, ApprovalStatus::Approved);
+        assert_eq!(withdrawal_reason(&record), None);
+        assert_eq!(
+            w.owner.prepares.load(Ordering::SeqCst),
+            prepares + 1,
+            "one round, never retried while the change is in progress"
+        );
+        let guard = ReviewDispatchGuard::new(entry.clone());
+        assert_eq!(
+            entry.consume(&admitted),
+            Err(crate::ToolError::ReviewUnavailable {
+                kind: ReviewUnavailableKind::OwnerUnavailable,
+            }),
+            "the stale decision never enters"
+        );
+        guard.complete();
+        assert!(
+            w.record(&id)
+                .consent
+                .is_some_and(|consent| consent.consumed_at.is_none())
+        );
+        w.owner.in_progress.store(false, Ordering::Release);
+        assert_eq!(w.spend_staged(&id), Ok(()));
+    }
+
+    /// ADR-001 D9 at the decision's publication: an owner change during the
+    /// decision's own store write makes the retained decision stale before
+    /// the allowance is published. Unrelated, it is re-adjudicated and the
+    /// allowance published, and a fresh attempt spends it once; related
+    /// (the review tier), the consent is withdrawn and the decision stays
+    /// history.
+    #[tokio::test]
+    async fn a_decision_re_adjudicates_a_change_during_its_write() {
+        for related in [false, true] {
+            let store = Arc::new(FaultStore::default());
+            let w = world_with(ApprovalService::with_store(store.clone()).expect("service"));
+            let id = w.request(&w.check()).await;
+            let owner = Arc::clone(&w.owner);
+            *store.hook.lock() = Some(Box::new(move || {
+                if related {
+                    owner.r2.store(true, Ordering::Release);
+                }
+                owner.republish();
+            }));
+            let decided = w
+                .approvals
+                .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1"))
+                .expect("decision recorded");
+            assert_eq!(
+                decided.status,
+                ApprovalStatus::Approved,
+                "related={related}"
+            );
+            if related {
+                assert_eq!(
+                    withdrawal_reason(&decided),
+                    Some(ApprovalConsentWithdrawalReason::ContextChanged)
+                );
+                assert_eq!(
+                    w.notices(&id),
+                    vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn]
+                );
+                assert_eq!(w.attempt(&id).err(), Some(human_consent_required()));
+            } else {
+                assert_eq!(withdrawal_reason(&decided), None);
+                assert_eq!(
+                    w.notices(&id),
+                    vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Approved]
+                );
+                assert_eq!(w.spend(&id), Ok(()));
+            }
+        }
     }
 
     #[tokio::test]
@@ -5455,13 +6434,15 @@ mod tests {
     /// the generated owner's unlinked consent settlement cancels the
     /// approval in the same write that records the withdrawal, announced
     /// once. Every later read, past the deadline too, finds the durable row
-    /// and the generated owner both Cancelled.
+    /// and the generated owner both Cancelled. The change is a related one
+    /// (the owners now require R2): an unrelated one would keep the consent.
     #[tokio::test]
     async fn a_failed_stale_withdrawal_stops_the_read_and_reconciles() {
         let store = Arc::new(FaultStore::default());
         let w = world_with(ApprovalService::with_store(store.clone()).expect("service"));
         let id = w.request(&w.check()).await;
-        w.owner.sequence.fetch_add(1, Ordering::AcqRel);
+        w.owner.r2.store(true, Ordering::Release);
+        w.owner.republish();
         *store.fault.lock() = Some(Fault::BeforeWrite);
         assert_eq!(
             w.approvals.get(&id),

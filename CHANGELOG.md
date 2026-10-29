@@ -35,6 +35,31 @@ them.
 
 ## [Unreleased]
 
+### Fixed
+
+- `meerkat-core`: a pending or approved human consent (R3) is now kept
+  across unrelated authorization changes and withdrawn only when its
+  binding, validity or presented material changes. Before, any owner
+  publication change on the work's authorization made the consent's
+  retained decision stale, and the consent was withdrawn as
+  `context_changed` at the next approval read (`get`, `list`), at its
+  decision or at its spend, even when nothing about the operation had
+  changed. The consent's own owners now re-adjudicate such a decision:
+  they prepare the same operation again, outside every owner lock, and the
+  consent stands only while that decision has the same review tier and
+  validity window and the owners read the same material the approval
+  presented; a later attempt then spends it once, against that decision.
+  A changed tier, validity window or material, a refusal of the operation,
+  or another operation's decision withdraws it as before
+  (`ContextChanged`). An owner change still in progress decides nothing,
+  and a publication that keeps changing through three re-adjudications in
+  a row withdraws the consent as `ContextChanged`. A spend never enters on
+  a stale decision: one whose decision went stale after its own entry
+  staging refuses as `review_unavailable` (`owner_unavailable`) and keeps
+  the consent for its next re-adjudication. An approval read may now
+  re-prepare a pending consent's operation, which its audit records as a
+  preparation.
+
 ## [0.9.7] - 2026-10-28
 
 ### Breaking

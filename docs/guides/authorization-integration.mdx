@@ -469,7 +469,22 @@ the retained action, replay it, or change its requester.
 On a later explicit attempt, resolve the retained candidate and complete host
 validation, preparation, and cancellation checks before consumption. Recheck
 current authorization and conditionally consume consent at the physical-entry
-boundary. Changed or lost bindings need fresh consent. A retained call that a
+boundary. Changed or lost bindings need fresh consent. An owner change that
+leaves the candidate unchanged does not: the consent's own owners
+re-adjudicate a decision such a change made stale. They prepare the same
+operation again, outside every owner lock, and the consent, pending or
+approved, stands only while that decision keeps the same review tier and
+validity window and the owners read the same material the approval presented.
+Approval reads (`get`, `list`), the decision's publication and the attempt's
+spend apply this one rule; the attempt then spends the consent once, against
+the decision prepared again. A changed tier, validity window or material, a
+refusal of the operation, or a publication that keeps changing through three
+re-adjudications in a row withdraws the consent as `ContextChanged`. An owner
+change still in progress decides nothing and leaves the consent as it is, and
+nothing spends a stale decision: an attempt whose decision went stale after its
+own entry staging refuses as `owner_unavailable` and leaves the consent for a
+later attempt. An approval read can therefore re-prepare the operation, which
+the audit records as a preparation. A retained call that a
 dispatcher this process rebuilt resolves again keeps its consent only as the same
 durable execution: the same call, tool declaration, execution mode, operation
 targets and R3 decision. A failure known to precede the consumption commit leaves

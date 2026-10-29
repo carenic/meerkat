@@ -38,7 +38,8 @@ use crate::tokio;
 use crate::ToolCallView;
 use crate::approval::consent::{
     ConsentCandidate, ConsentCandidateParts, ConsentNoticeKind, ConsentPresentationCandidate,
-    ConsentProjections, ConsentRefusal, HumanConsent, HumanConsentRoute, consent_request,
+    ConsentProjections, ConsentRefusal, HumanConsent, HumanConsentRoute, Readjudication,
+    consent_request,
 };
 use crate::approval::{ApprovalId, RefusedReviewCommit, SettledReports};
 use crate::authorization::{
@@ -1394,6 +1395,7 @@ fn request_human_consent(
         request,
         ConsentCandidateParts {
             admitted: prepared.clone(),
+            material: operation_context.clone(),
             deadline,
             tool_call_id: Arc::from(call.id),
             route: Arc::clone(&consent.route),
@@ -1432,7 +1434,7 @@ pub(crate) fn admit_consent_attempt(
         .approvals
         .resolve_consent_attempt(approval_id, work, run_id)
         .map_err(ConsentRefusal::into_tool_error)?;
-    let admitted = candidate.admitted().clone();
+    let admitted = candidate.admitted();
     let retained = RetainedConsent {
         review: Arc::clone(review),
         approval_id: approval_id.clone(),
@@ -1616,10 +1618,16 @@ impl ReviewEntry {
     /// The spend, returning custody of the entered effect: while it is held
     /// the `Used` projection stays deferred, even after the admitting
     /// dispatch ended (a blocking worker outliving a cancelled dispatch).
+    ///
+    /// A consent attempt whose entering decision is its staging's
+    /// re-preparation of the consented one is re-adjudicated first, outside
+    /// this entry's lock and every owner lock, since that reads the owners'
+    /// material (ADR-001 D9).
     pub(crate) fn consume_held(
         &self,
         entering: &PreparedOperationCheck,
     ) -> Result<ReviewedEntryCustody, crate::ToolError> {
+        let readjudication = self.readjudicate_entering(entering);
         let (result, pending, review) = {
             let mut inner = self.0.lock();
             let review = inner.review.clone();
@@ -1630,7 +1638,8 @@ impl ReviewEntry {
             );
             // `used` carries the spend's `Used` projection and the reports its
             // reservation settled: both run after the effect.
-            let (next, result, pending, used) = consume_state(current, entering);
+            let (next, result, pending, used) =
+                consume_state(current, entering, readjudication.as_ref());
             inner.state = next;
             inner.deferred.extend(used);
             let result = result.map(|()| {
@@ -1649,6 +1658,18 @@ impl ReviewEntry {
         }
         // A refused authority is observed only now, with every lock released.
         result.map_err(EntryRefusal::resolve)
+    }
+
+    /// The spend's re-adjudication of `entering` when this entry holds a
+    /// consent attempt and `entering` is not the consented decision but one
+    /// of its binding and work (see
+    /// [`ConsentCandidate::readjudicate_entering`]); `None` otherwise.
+    fn readjudicate_entering(&self, entering: &PreparedOperationCheck) -> Option<Readjudication> {
+        let candidate = match &self.0.lock().state {
+            ReviewEntryState::Consent(consent) => Arc::clone(&consent.candidate),
+            _ => return None,
+        };
+        candidate.readjudicate_entering(entering)
     }
 
     fn release_custody(&self) {
@@ -1866,12 +1887,14 @@ type Transition = (
 fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> Transition {
     use ReviewEntryState::{Consent, Consumed, Entered, NotRequired, Retained, Settled};
     match (entering.review_tier(), current) {
-        // Identity, not tier: the consented decision is the entering one (an
-        // R3 candidate, or an R2 one a human took over).
-        (_, Consent(consent)) if entering.same_check(consent.admitted()) => {
+        // Identity, not tier: the entering decision is the consented one (an
+        // R3 candidate, or an R2 one a human took over), or one of its
+        // binding and work that the staging prepared afresh after an owner
+        // publication change, which the spend re-adjudicates (ADR-001 D9).
+        (_, Consent(consent)) if entering.same_operation_and_work(&consent.admitted()) => {
             (Consent(consent), Ok(()), PendingObservations::default())
         }
-        // The consented decision is no longer the entering one: fresh consent.
+        // The entering decision is another operation's: fresh consent.
         (_, Consent(consent)) => {
             let (error, pending) = consent.retire_changed();
             (Settled, Err(error.into()), pending)
@@ -1948,6 +1971,7 @@ fn check_state(current: ReviewEntryState, entering: &PreparedOperationCheck) -> 
 fn consume_state(
     current: ReviewEntryState,
     entering: &PreparedOperationCheck,
+    readjudication: Option<&Readjudication>,
 ) -> (
     ReviewEntryState,
     Result<(), EntryRefusal>,
@@ -1957,7 +1981,7 @@ fn consume_state(
     use ReviewEntryState::{Consent, Consumed, Entered, NotRequired, Retained, Settled};
     let none = PendingObservations::default;
     match current {
-        Consent(consent) => match consent.consume(entering) {
+        Consent(consent) => match consent.consume(entering, readjudication) {
             Ok((used, entered)) => (Entered(entered), Ok(()), none(), used),
             Err(refused) => (*refused).into_transition(),
         },
@@ -2014,12 +2038,14 @@ pub(crate) struct RetainedConsent {
 }
 
 impl RetainedConsent {
-    fn admitted(&self) -> &PreparedOperationCheck {
+    /// The decision the consent's custody holds now: the consented one, or
+    /// one a re-adjudication found unchanged since (ADR-001 D9).
+    fn admitted(&self) -> PreparedOperationCheck {
         self.candidate.admitted()
     }
 
-    /// The consented decision is no longer the entering one: retire the
-    /// candidate (fresh consent is required) and settle this attempt.
+    /// The entering decision is another operation's: retire the candidate
+    /// (fresh consent is required) and settle this attempt.
     fn retire_changed(&self) -> (crate::ToolError, PendingObservations) {
         let reports = self.review.approvals.try_retire_consent(
             &self.approval_id,
@@ -2032,18 +2058,22 @@ impl RetainedConsent {
         )
     }
 
-    /// Spend the decision once for the exact entering decision. Returns the
-    /// deferred `Used` projection and notice, which the caller must not
-    /// deliver before the effect, and the attempt the spend left registered
-    /// (`Used`) for the entered effect, until its dispatch ends.
+    /// Spend the decision once for the exact entering decision, with the
+    /// spend's `readjudication` of an entering decision its staging prepared
+    /// afresh. Returns the deferred `Used` projection and notice, which the
+    /// caller must not deliver before the effect, and the attempt the spend
+    /// left registered (`Used`) for the entered effect, until its dispatch
+    /// ends.
     fn consume(
         &self,
         entering: &PreparedOperationCheck,
+        readjudication: Option<&Readjudication>,
     ) -> Result<(PendingObservations, EnteredAttempt), Box<SpendRefused>> {
         let (entered, spent, mut projections) = self.review.approvals.consume_consent_for_entry(
             &self.approval_id,
             &self.candidate,
             entering,
+            readjudication,
         );
         if entered.is_ok() || spent {
             // The spend committed: `Used` is its truth. On success it is

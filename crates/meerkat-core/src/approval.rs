@@ -2079,6 +2079,10 @@ impl ApprovalService {
     }
 
     fn refresh_expiry(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
+        // A live consent candidate whose decision an owner publication change
+        // made stale is re-adjudicated first, outside the reservation
+        // (ADR-001 D9).
+        self.readjudicate_consent(approval_id);
         let now = self.now();
         let mut state = self.state.write();
         let result = self.refresh_expiry_locked(&mut state, approval_id, now);
@@ -2112,10 +2116,12 @@ impl ApprovalService {
         self.record_pending_withdrawals_locked(state);
         state.ensure_reconciled(approval_id)?;
         // Backstop for a run that closed without its eager withdrawal: a
-        // live candidate whose retained decision is no longer current is
-        // withdrawn here (callback-free check under the reservation). A
-        // withdrawal that could not be recorded stops this read: nothing is
-        // derived from the old record and the retired machine state.
+        // live candidate whose retained decision failed other than by a moved
+        // owner publication is withdrawn here (callback-free check under the
+        // reservation); one stale only because the publication moved stays
+        // for its re-adjudication (ADR-001 D9). A withdrawal that could not
+        // be recorded stops this read: nothing is derived from the old record
+        // and the retired machine state.
         self.withdraw_stale_consent_locked(state, approval_id);
         state.ensure_reconciled(approval_id)?;
         let Some(record) = state.records.get(approval_id).cloned() else {
