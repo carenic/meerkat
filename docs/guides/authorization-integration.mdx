@@ -625,7 +625,10 @@ Withdrawn notice is admitted as a resume of the run that issued the consent,
 and the approval records its receipt: `Admitted` for the input that carries
 it, or `Failed` for a notice that can never be admitted. Approved consent
 parked at that run's close moves into the resumed run its notice starts, and
-that run can spend it once; a `Failed` notice withdraws it. The governed
+that run can spend it once; a `Failed` notice withdraws it. A consent notice
+waits in the session's queue for its next turn: a graceful requeue stop of the
+session (`UnregisterQueuedInputs::Requeue`) keeps it, and with it the approval
+it carries, for the session's next start. The governed
 composition admits a resume only through its retained-resume owner: the stock
 governed composition installs one, and a custom composition supplies its own
 (`ScopedGrantComposition::with_retained_resume`). Without one, no notice is

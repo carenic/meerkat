@@ -197,6 +197,18 @@ them.
   owners take while it reads or decides approvals, and each re-preparation
   is audited as a preparation.
 
+- `meerkat`: a consent notice keeps the queue handling its delivery
+  declares. Before, it was admitted with steer handling, like a detached
+  job's completion record, so a graceful requeue stop of its session
+  (`UnregisterQueuedInputs::Requeue`) ended it as stopped, and the parked
+  approval it carried was then withdrawn as `NoticeInputEnded`. The notice
+  now waits in the queue lane for the session's next turn, a requeue stop
+  keeps it for the next start, and the resumed run it starts spends the
+  approval once. Fork_off and council notices keep steering. A
+  `PromptInput::detached_job_completed_with_handling` constructor in
+  `meerkat-runtime` admits a completion notice under its producer's
+  handling.
+
 ## [0.9.7] - 2026-10-28
 
 ### Breaking

@@ -167,7 +167,9 @@ pub enum ContinuationBody {
     },
     /// A durable system notice, admitted exactly as a detached job's
     /// completion record (`PromptInput::detached_job_completed`): fork_off
-    /// and council outcomes keep the transcript they always had. It holds
+    /// and council outcomes keep the transcript they always had, and steer.
+    /// A consent notice is the same record under the handling its delivery
+    /// declares (`Queue`), so a graceful requeue stop keeps it. It holds
     /// what the admitted append carries (kind, body, blocks) and no
     /// timestamp, so the same outcome is the same body however often it is
     /// submitted ([`ContinuationBody::notice`]).
@@ -2421,7 +2423,8 @@ async fn verify_committed_job(
 
 /// The exact input a continuation row is admitted as, under `admission_key`
 /// with `input_id`: a durable content input, or a notice admitted exactly as a
-/// detached job's completion record.
+/// detached job's completion record (a consent notice under the handling its
+/// delivery declares).
 fn continuation_prompt(
     delivery: &ContinuationDelivery,
     admission_key: &str,
@@ -2443,18 +2446,43 @@ fn continuation_prompt(
             body,
             blocks,
         } => {
-            let mut prompt = meerkat_runtime::PromptInput::detached_job_completed(
-                admission_key.to_string(),
-                meerkat_core::types::SystemNoticeMessage::with_blocks(
-                    *notice_kind,
-                    body.clone(),
-                    blocks.clone(),
-                ),
+            let notice = meerkat_core::types::SystemNoticeMessage::with_blocks(
+                *notice_kind,
+                body.clone(),
+                blocks.clone(),
             );
+            let mut prompt = if is_consent_notice(delivery) {
+                // A consent notice keeps the handling its delivery declares
+                // (`Queue`): it waits for the owner's next turn in the queue
+                // lane, where a graceful requeue stop keeps it, and with it
+                // the approval it carries, for the next start.
+                meerkat_runtime::PromptInput::detached_job_completed_with_handling(
+                    admission_key.to_string(),
+                    notice,
+                    handling,
+                )
+            } else {
+                // A fork_off or council outcome is a detached job's
+                // completion record, which steers.
+                meerkat_runtime::PromptInput::detached_job_completed(
+                    admission_key.to_string(),
+                    notice,
+                )
+            };
             prompt.header.id = input_id;
             prompt
         }
     }
+}
+
+/// Whether `delivery` is a consent notice: its producer is the namespace in
+/// which the issuing approval owner answers for its consent notices.
+fn is_consent_notice(delivery: &ContinuationDelivery) -> bool {
+    matches!(
+        &delivery.result.producer,
+        ContinuationProducer::Host { namespace }
+            if namespace.as_str() == meerkat_core::approval::consent::CONSENT_DELIVERY_NAMESPACE
+    )
 }
 
 /// Where a governed host original's refusal came from, for operators: the

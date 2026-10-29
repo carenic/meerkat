@@ -1116,6 +1116,75 @@ async fn a_notice_continuation_admits_exactly_the_live_completion_input() {
     );
 }
 
+/// A consent notice keeps the handling its delivery declares: it is
+/// admitted as the same notice record a detached job's completion carries,
+/// under `Queue`, so it waits for the owner's next turn in the queue lane,
+/// where a graceful requeue stop keeps it. A fork_off or council notice is
+/// admitted exactly as a detached job's completion record, which steers,
+/// whatever handling its delivery names.
+#[tokio::test]
+async fn a_consent_notice_keeps_its_queue_handling_and_job_notices_steer() {
+    let notice = meerkat_core::types::SystemNoticeMessage::new(
+        meerkat_core::types::SystemNoticeKind::Generic,
+        "Consent for approval approval-1 was approved.".to_string(),
+    );
+    for (key, producer, handling) in [
+        (
+            "fork_off:job-9",
+            ContinuationProducer::ForkOff,
+            meerkat_core::types::HandlingMode::Steer,
+        ),
+        (
+            "council:run-3",
+            ContinuationProducer::Council,
+            meerkat_core::types::HandlingMode::Steer,
+        ),
+        (
+            "consent:approval-1/approved",
+            meerkat::consent_notice_producer(),
+            meerkat_core::types::HandlingMode::Queue,
+        ),
+    ] {
+        let fixture = Fixture::new();
+        let sink = Arc::new(RecordingSink::default());
+        let owner = ContinuationOwner::Session {
+            session_id: SessionId::new(),
+        };
+        let mut continuation = delivery(key, producer);
+        assert_eq!(continuation.handling, ContinuationHandling::Queue);
+        continuation.body = meerkat::ContinuationBody::notice(notice.clone());
+        fixture
+            .continuations
+            .submit(&owner, continuation, 1)
+            .await
+            .expect("notice continuation");
+        let handle = fixture
+            .owner()
+            .arm(Host::new(Some(sink.clone())))
+            .expect("arm");
+        let mut passes = handle.subscribe_passes();
+        wait_for_status(&fixture, &owner, key, &mut passes, |status| {
+            matches!(status, ContinuationStatus::Applied { .. })
+        })
+        .await;
+
+        let inputs = sink.inputs.lock().expect("lock").clone();
+        let [admitted] = inputs.as_slice() else {
+            panic!("{key}: one input is admitted: {inputs:?}");
+        };
+        assert_eq!(admitted.handling_mode(), Some(handling), "{key}");
+        let meerkat_runtime::Input::Prompt(prompt) = admitted else {
+            panic!("{key}: a notice is admitted as a prompt: {admitted:?}");
+        };
+        let record = meerkat_runtime::PromptInput::detached_job_completed(key, notice.clone());
+        assert_eq!(
+            serde_json::to_value(&prompt.typed_turn_appends).expect("encode"),
+            serde_json::to_value(&record.typed_turn_appends).expect("encode"),
+            "{key}: the same notice record"
+        );
+    }
+}
+
 /// A row under the same live key that is not this delivery (another result,
 /// or an older admission with no recorded identity) is a conflict: the
 /// delivery stays pending and visible, is never applied by key, and nothing
