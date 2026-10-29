@@ -79,8 +79,10 @@ them.
   `context_changed`. An attempt whose held decision they change or refuse
   is refused at its admission, and the consent withdrawn there. A consent
   moving into a resumed run whose owners state another action account is
-  withdrawn at the move as `ContextChanged`, and one whose review material
-  they refuse is withdrawn there by the refusal's category.
+  withdrawn at the move as `ContextChanged`. A denial of the operation or
+  of its review material is the owners' refusal, at the move as in a run:
+  the consent is withdrawn as `AuthorityChanged` (facts they cannot read
+  withdraw it as `ContextChanged`).
 
 ### Added
 
@@ -118,7 +120,11 @@ them.
   publication asks again within its bound, and a spend keeps the consent
   (`owner_unavailable`). The default maps `eligibility`.
   `meerkat-authorization`: `PublishedConsentEligibility::observe_answer`
-  answers it from one coherent observation of a local publication.
+  answers it from one coherent observation of a local publication. A host
+  route that resolves eligibility with `PublishedConsentEligibility::observe`
+  and keeps the default `eligibility_answer` answers an owner change in
+  progress as a refusal, which withdraws an approved consent at its spend:
+  such a route should override `eligibility_answer` with `observe_answer`.
 
 ### Fixed
 
@@ -155,7 +161,13 @@ them.
   consent that moves into a resumed run keeps the action account its
   approval presented: the resumed run's owners' review material is taken
   over at the move for that account only, and another account withdraws
-  it. The approver's eligibility evidence is kept with the approved consent
+  it. A move into a resumed run, or a rebind for an agent this process
+  rebuilt, that meets an owner change in progress (as ordinary traffic on
+  a shared publication produces) no longer withdraws the consent as
+  `context_changed`: the consent stays parked, or spendable, and the
+  resumed run's boundaries move or rebind it afresh, without waiting; what
+  never moves is withdrawn at that run's close (`RunEnded`), as before.
+  The approver's eligibility evidence is kept with the approved consent
   and checked at the spend: evidence an owner change made stale, related
   or not, is resolved again for the same approver and the approval as
   they decided it, and they stay eligible unless revoked or forbidden by
@@ -165,9 +177,10 @@ them.
   unavailable owners, an eligibility owner that cannot say now, or a
   publication that keeps changing through three re-adjudications in a row
   decide nothing: reads return the consent unchanged, an approval records
-  nothing and answers a retryable `StoreUnavailable` (a decline is still
-  recorded), and an attempt refuses as `owner_unavailable` and keeps the
-  consent. Reads decide afresh only a decision an owner publication change
+  nothing and answers a retryable `StoreUnavailable` (so does a decline
+  while the eligibility owner cannot say, though it is recorded whatever
+  the retained decision's currentness), and an attempt refuses as
+  `owner_unavailable` and keeps the consent. Reads decide afresh only a decision an owner publication change
   made stale, and nothing calls the owners while a decision's own check
   answers that they are unavailable. Nothing enters on a decision that is
   not current: a spend whose decision or eligibility evidence went stale
