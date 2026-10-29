@@ -35,6 +35,17 @@ them.
 
 ## [Unreleased]
 
+### Added
+
+- `meerkat-runtime`: `MachineUnregisterProgressSnapshot::requeue_max_age_ms`
+  and `MachineUnregisterProgressSnapshot::keeps_recovered_inputs` are now
+  public. A call that joins an unregister already in progress keeps the
+  disposition that unregister began with, and returns no disposition
+  itself; a host now reads the disposition that applies from the session
+  runtime's lifecycle row while the unregister is in progress
+  (`RuntimeStore::observe_machine_lifecycle`, then
+  `DecodedMachineLifecycleObservation::unregister_progress`).
+
 ### Fixed
 
 - `meerkat-core`: a pending or approved human consent (R3) is now kept

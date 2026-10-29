@@ -728,3 +728,104 @@ async fn shell_notify_drain_exited_after_teardown_is_benign() {
          surface as a typed no-op, not an error: got {outcome:?}"
     );
 }
+
+/// A call that joins an unregister already in progress keeps the
+/// disposition that unregister began with, and a host reads the disposition
+/// that applies from the unregister's durable progress on the session
+/// runtime's lifecycle row: a requeue unregister, held open by the run in
+/// flight, still reports its requeue max age (and no keep) after a stop
+/// call joined it.
+#[tokio::test]
+async fn a_joined_unregister_reports_the_disposition_it_began_with() {
+    use meerkat_runtime::store::{MachineLifecycleObservation, RuntimeStore};
+    use meerkat_runtime::{
+        InMemoryRuntimeStore, LogicalRuntimeId, RuntimeSessionUnregisterAdmission,
+        UnregisterQueuedInputs,
+    };
+
+    let store = Arc::new(InMemoryRuntimeStore::new());
+    let adapter = Arc::new(
+        MeerkatMachine::persistent_without_blobs(Arc::clone(&store) as Arc<dyn RuntimeStore>)
+            .expect("persistent machine"),
+    );
+    let sid = CoreSessionId::new();
+    let entered = Arc::new(AtomicBool::new(false));
+    let release = Arc::new(Notify::new());
+    adapter
+        .register_session_with_executor(
+            sid.clone(),
+            Box::new(GatedExecutor {
+                entered: Arc::clone(&entered),
+                release: Arc::clone(&release),
+            }),
+        )
+        .await
+        .expect("register session with executor");
+    let (outcome, _completion) = adapter
+        .accept_input_with_completion(&sid, make_prompt("holds the unregister open"))
+        .await
+        .expect("accept input");
+    assert!(outcome.is_accepted());
+    wait_for_flag(&entered, "executor should enter apply").await;
+
+    let registration = adapter
+        .current_session_registration_witness(&sid)
+        .await
+        .expect("the session is registered");
+    let began = adapter
+        .observe_unregister_session_registration_with_queued_inputs_if_current(
+            &registration,
+            UnregisterQueuedInputs::Requeue {
+                max_age: Duration::from_secs(90),
+            },
+        )
+        .await
+        .expect("the requeue unregister begins");
+    assert!(
+        matches!(began, RuntimeSessionUnregisterAdmission::Pending(_)),
+        "the run in flight holds the requeue unregister open"
+    );
+    let joined = adapter
+        .observe_unregister_session_registration_with_queued_inputs_if_current(
+            &registration,
+            UnregisterQueuedInputs::Stop,
+        )
+        .await
+        .expect("the stop call joins it");
+    assert!(
+        matches!(joined, RuntimeSessionUnregisterAdmission::Pending(_)),
+        "the stop call joined the unregister in progress"
+    );
+
+    let runtime_id = LogicalRuntimeId::for_session(&sid);
+    let progress = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let MachineLifecycleObservation::Decoded { record, .. } = store
+                .observe_machine_lifecycle(&runtime_id)
+                .await
+                .expect("observe the lifecycle row")
+                && let Some(progress) = record.unregister_progress()
+            {
+                return progress.clone();
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .expect("the unregister's durable progress is on the lifecycle row");
+    assert_eq!(
+        progress.requeue_max_age_ms(),
+        Some(90_000),
+        "the requeue the unregister began with applies, not the joining stop"
+    );
+    assert!(!progress.keeps_recovered_inputs());
+
+    release.notify_one();
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while adapter.contains_session(&sid).await {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("the unregister completes once the run returns");
+}
