@@ -395,8 +395,13 @@ impl<T> fmt::Debug for ObservedAuthorizationResult<T> {
     }
 }
 
-/// Upper bound, in bytes, for each field of [`ReviewOperationContext`].
-pub const MAX_REVIEW_OPERATION_CONTEXT_BYTES: usize = 4 * 1024;
+/// Upper bound, in bytes, for each field of [`ReviewOperationContext`]. It
+/// leaves room for a composed mandate at realistic sizes: a work's mandate
+/// followed by the bounds its contributing originals narrow it to, or the
+/// listing of every input's own mandate for a multi-input work. A field over
+/// it is refused, never truncated, and its owner answers the material as
+/// unavailable.
+pub const MAX_REVIEW_OPERATION_CONTEXT_BYTES: usize = 64 * 1024;
 
 /// Passive owner material for one reviewed operation: the action account the
 /// operation owner actually selected and the current mandate the admitted-work
@@ -580,6 +585,31 @@ pub trait WorkAuthorization: Send + Sync {
         _prepared: Option<&OperationValidity>,
         _further: &(dyn std::any::Any + Send + Sync),
         _operation: &mut dyn FnMut(),
+    ) -> Result<(), OperationAuthorizationError> {
+        Err(OperationAuthorizationError::Unavailable)
+    }
+
+    /// As `run_if_current_within`, for a further step of an effect a
+    /// dispatch already entered (`crate::EnteredDispatchOperation`): the
+    /// complete current decision, computed inside this owner's own
+    /// non-waiting exclusion, may require no more review than
+    /// `entered_tier`, the review the dispatch actually entered (the rule
+    /// `issue_child_if_current_within` applies), and no review runs here.
+    /// `prepared` is the validity of the decision the dispatch entered (its
+    /// window and monotonic cutoff; `None` refuses). An implementor must
+    /// refuse a decision stricter than `entered_tier` under its own
+    /// exclusion, whatever its caller checked before. Wrappers check their
+    /// own custody and forward. The default is unavailable and never runs
+    /// `operation`: a wrapper that does not forward it refuses every entered
+    /// step as unavailable. `operation` runs at most once and must not
+    /// await.
+    fn run_entered_if_current_within(
+        &self,
+        _binding: &PreparedAuthorizationBinding,
+        _prepared: Option<&OperationValidity>,
+        _further: &(dyn std::any::Any + Send + Sync),
+        _operation: &mut dyn FnMut(),
+        _entered_tier: OperationReviewTier,
     ) -> Result<(), OperationAuthorizationError> {
         Err(OperationAuthorizationError::Unavailable)
     }

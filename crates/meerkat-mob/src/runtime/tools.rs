@@ -235,6 +235,199 @@ impl AgentToolDispatcher for NameFilteredDispatcher {
 }
 
 // ---------------------------------------------------------------------------
+// NameOrderedDispatcher
+// ---------------------------------------------------------------------------
+
+/// A host's per-spawn tools (a spawn customizer's or a spawn request's
+/// external tools) in one deterministic order: their tools and catalog
+/// entries sorted by name, as the MCP router orders an MCP server's tools. A
+/// host may return its tools in any order, and a member rebuilt by a wake or
+/// a reload asks the customizer again; without this the member's tools array
+/// could change across the rebuild, and the provider's prompt cache with it.
+/// Everything else, including how a tool executes, is the inner dispatcher's
+/// own.
+pub(crate) struct NameOrderedDispatcher {
+    inner: Arc<dyn AgentToolDispatcher>,
+}
+
+impl NameOrderedDispatcher {
+    pub(crate) fn new(inner: Arc<dyn AgentToolDispatcher>) -> Self {
+        Self { inner }
+    }
+}
+
+#[cfg_attr(target_arch = "wasm32", async_trait::async_trait(?Send))]
+#[cfg_attr(not(target_arch = "wasm32"), async_trait::async_trait)]
+impl AgentToolDispatcher for NameOrderedDispatcher {
+    async fn resolve_tool_application(
+        &self,
+        source_tool: &str,
+        request: &meerkat_core::ToolApplicationRequest,
+        invocation: &serde_json::Value,
+        context: &ToolDispatchContext,
+    ) -> Result<meerkat_core::tool_application::ToolApplicationResolution, ToolError> {
+        self.inner
+            .resolve_tool_application(source_tool, request, invocation, context)
+            .await
+    }
+
+    fn tools(&self) -> Arc<[Arc<ToolDef>]> {
+        let mut tools = self.inner.tools().to_vec();
+        tools.sort_by(|left, right| left.name.as_str().cmp(right.name.as_str()));
+        tools.into()
+    }
+
+    fn tool_catalog_capabilities(&self) -> meerkat_core::ToolCatalogCapabilities {
+        self.inner.tool_catalog_capabilities()
+    }
+
+    fn tool_catalog(&self) -> Arc<[meerkat_core::ToolCatalogEntry]> {
+        let mut entries = self.inner.tool_catalog().to_vec();
+        entries.sort_by(|left, right| left.tool.name.as_str().cmp(right.tool.name.as_str()));
+        entries.into()
+    }
+
+    fn tool_mutation_class(&self, tool_name: &str) -> meerkat_core::ToolMutationClass {
+        self.inner.tool_mutation_class(tool_name)
+    }
+
+    fn live_bridge_effect_kind(&self, tool_name: &str) -> meerkat_core::LiveBridgeEffectKind {
+        self.inner.live_bridge_effect_kind(tool_name)
+    }
+
+    fn review_entry_support(
+        &self,
+        tool_name: &str,
+    ) -> meerkat_core::approval::review::ReviewEntrySupport {
+        self.inner.review_entry_support(tool_name)
+    }
+
+    fn execution_binding_epoch(&self, tool_name: &str) -> u64 {
+        self.inner.execution_binding_epoch(tool_name)
+    }
+
+    fn execution_binding_fingerprint(
+        &self,
+        tool_name: &str,
+    ) -> Result<
+        meerkat_core::EphemeralToolBindingFingerprint,
+        meerkat_core::ToolExecutionResolutionError,
+    > {
+        self.inner.execution_binding_fingerprint(tool_name)
+    }
+
+    fn resolve_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        dispatch_context: &ToolDispatchContext,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+    ) -> Result<meerkat_core::ResolvedToolExecutionPlan, meerkat_core::ToolExecutionResolutionError>
+    {
+        self.inner
+            .resolve_execution_plan(call, dispatch_context, resolution_context)
+    }
+
+    fn validate_resolved_execution_plan(
+        &self,
+        call: ToolCallView<'_>,
+        resolution_context: &meerkat_core::ToolExecutionResolutionContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<(), meerkat_core::ToolExecutionResolutionError> {
+        self.inner
+            .validate_resolved_execution_plan(call, resolution_context, plan)
+    }
+
+    fn pending_catalog_sources(&self) -> Arc<[String]> {
+        self.inner.pending_catalog_sources()
+    }
+
+    async fn dispatch(
+        &self,
+        call: ToolCallView<'_>,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        self.inner.dispatch(call).await
+    }
+
+    async fn dispatch_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &ToolDispatchContext,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        self.inner.dispatch_with_context(call, context).await
+    }
+
+    async fn dispatch_resolved_with_context(
+        &self,
+        call: ToolCallView<'_>,
+        context: &ToolDispatchContext,
+        plan: &meerkat_core::ResolvedToolExecutionPlan,
+    ) -> Result<meerkat_core::ToolDispatchOutcome, ToolError> {
+        self.inner
+            .dispatch_resolved_with_context(call, context, plan)
+            .await
+    }
+
+    async fn poll_external_updates(&self) -> meerkat_core::ExternalToolUpdate {
+        self.inner.poll_external_updates().await
+    }
+
+    fn external_tool_surface_snapshot(&self) -> Option<meerkat_core::ExternalToolSurfaceSnapshot> {
+        self.inner.external_tool_surface_snapshot()
+    }
+
+    fn capabilities(&self) -> DispatcherCapabilities {
+        self.inner.capabilities()
+    }
+
+    fn bind_ops_lifecycle(
+        self: Arc<Self>,
+        registry: Arc<dyn OpsLifecycleRegistry>,
+        owner_bridge_session_id: SessionId,
+    ) -> Result<BindOutcome, OpsLifecycleBindError> {
+        let owned = Arc::try_unwrap(self).map_err(|_| OpsLifecycleBindError::SharedOwnership)?;
+        let outcome = owned
+            .inner
+            .bind_ops_lifecycle(registry, owner_bridge_session_id)?;
+        let bound = outcome.was_bound();
+        let wrapper = Arc::new(NameOrderedDispatcher {
+            inner: outcome.into_dispatcher(),
+        });
+        Ok(if bound {
+            BindOutcome::Bound(wrapper)
+        } else {
+            BindOutcome::Skipped(wrapper)
+        })
+    }
+
+    fn completion_enrichment(
+        &self,
+    ) -> Option<Arc<dyn meerkat_core::completion_feed::CompletionEnrichmentProvider>> {
+        self.inner.completion_enrichment()
+    }
+
+    fn bind_mcp_server_lifecycle_handle(
+        &self,
+        handle: Arc<dyn meerkat_core::handles::McpServerLifecycleHandle>,
+    ) {
+        self.inner.bind_mcp_server_lifecycle_handle(handle);
+    }
+
+    fn bind_external_tool_surface_handle(
+        &self,
+        handle: Arc<dyn meerkat_core::handles::ExternalToolSurfaceHandle>,
+    ) {
+        self.inner.bind_external_tool_surface_handle(handle);
+    }
+
+    fn bind_session_mob_tool_authority(
+        &self,
+        authority: Option<Arc<std::sync::RwLock<MobToolAuthorityContext>>>,
+    ) {
+        self.inner.bind_session_mob_tool_authority(authority);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // BundleProvenanceDispatcher
 // ---------------------------------------------------------------------------
 
@@ -911,6 +1104,9 @@ pub(super) fn compose_external_tools_for_profile(
     // registry that gets populated later via tools/register). Dropping it here
     // would permanently disconnect the session from late-registered tools.
     if let Some(ext) = per_spawn_external_tools {
+        // A host returns its tools in any order; the member lists them in
+        // name order, so a rebuild sends the tools array it sent before.
+        let ext: Arc<dyn AgentToolDispatcher> = Arc::new(NameOrderedDispatcher::new(ext));
         let profile_names: HashSet<String> = dispatchers
             .iter()
             .flat_map(|d| {

@@ -392,10 +392,55 @@ impl OrchestratorResumeNotification {
     /// orchestrator's turn: a local AutonomousHost notification is a queued
     /// injection. A local TurnDriven or placed notification runs the
     /// orchestrator's whole turn.
-    fn realizes_without_a_turn(&self) -> bool {
+    pub(super) fn realizes_without_a_turn(&self) -> bool {
         self.placed_turn_context.is_none()
             && self.runtime_mode == crate::MobRuntimeMode::AutonomousHost
     }
+}
+
+/// A resume notification that runs the orchestrator's turn, as the actor's
+/// lifecycle owner holds it (`MobActor::lifecycle_tasks`): no resume awaits
+/// it, since its model and tool work may need the very restore that resume
+/// is part of (a mob tool that spawns, wires, lists or restores). The owner
+/// joins it and surfaces its typed failure like every other orchestrator
+/// lifecycle delivery. A delivery failure is also recorded as a mob event
+/// naming the planned target, so a host observes it through the ordinary
+/// event channel after the resume has returned. The realization ends at the
+/// notification input's terminal, so the event is recorded once, after the
+/// runtime's bounded retries, and never for a notification a retry delivers.
+/// The cold resume and the explicit resume (the lift) both hand their turn
+/// notifications here.
+pub(super) async fn realize_orchestrator_resume_notification_turn(
+    plan: OrchestratorResumeNotification,
+    session_service: Arc<dyn MobSessionService>,
+    provisioner: Arc<dyn MobProvisioner>,
+    emitter: super::events::MobEventEmitter,
+) -> Result<(), MobError> {
+    let member_id = plan.member_id.clone();
+    let session_id = plan.bridge_session_id.clone();
+    let outcome = realize_planned_orchestrator_resume_notification(
+        plan,
+        session_service.as_ref(),
+        provisioner.as_ref(),
+    )
+    .await;
+    if let Err(error) = &outcome
+        && let Err(record_error) = emitter
+            .orchestrator_resume_notification_failed(
+                member_id.clone(),
+                session_id,
+                error.to_string(),
+            )
+            .await
+    {
+        tracing::warn!(
+            member_id = %member_id,
+            error = %error,
+            record_error = %record_error,
+            "orchestrator resume notification failure could not be recorded"
+        );
+    }
+    outcome
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -718,6 +763,9 @@ pub struct MobBuilder {
     /// [`MobBuilder::with_resume_restore_concurrency`].
     #[cfg(feature = "runtime-adapter")]
     resume_restore_concurrency: usize,
+    /// The host's member-residency inputs, the same on both start paths; see
+    /// [`MobBuilder::with_member_restore_policy`].
+    member_residency: super::boot_plan::MemberResidencyConfig,
 }
 
 enum BuilderMode {
@@ -1392,6 +1440,66 @@ pub(super) fn member_endpoint_defect(
         Some(durable) => Some(member_endpoint_mismatch_detail(observed, durable)),
         None => Some(missing.to_string()),
     }
+}
+
+/// The first registration of a member's endpoint at a start: a member that
+/// owes its endpoint (a seat on network comms whose first wake did not record
+/// it) registers the live one here. It is journaled, as a wake journals it,
+/// so every later start restores it from the journal, whatever wiring the
+/// member has by then. A journal refusal falls back to the spawned
+/// incarnation's endpoint recovery, which also admits a wired member. The
+/// error names why neither took the endpoint: the caller breaks this member
+/// alone.
+async fn record_first_seeded_member_endpoint(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    roster: &mut Roster,
+    tool_handle: &MobHandle,
+    mob_id: &MobId,
+    entry: &RosterEntry,
+    spec: &TrustedPeerDescriptor,
+) -> Result<(), String> {
+    let journaled = match entry.member_ref.bridge_session_id() {
+        Some(bridge_session_id) => append_recovered_session_binding(
+            authority,
+            &tool_handle.events,
+            mob_id,
+            entry,
+            bridge_session_id,
+            Some(spec.clone()),
+            "resume_record_first_member_peer_endpoint",
+        )
+        .await
+        .map_err(|error| error.to_string()),
+        None => Err("the member is not session-backed".to_string()),
+    };
+    let journal_error = match journaled {
+        Ok(event) => {
+            roster.apply(&event);
+            tool_handle.roster.write().await.apply_event(&event);
+            return Ok(());
+        }
+        Err(error) => error,
+    };
+    apply_seeded_mob_signal(
+        authority,
+        crate::machines::mob_machine::MobMachineSignal::RecoverSpawnedMemberPeerEndpoint {
+            agent_identity: crate::machines::mob_machine::AgentIdentity::from_domain(
+                &entry.agent_identity,
+            ),
+            agent_runtime_id: crate::machines::mob_machine::AgentRuntimeId::from_domain(
+                &entry.agent_runtime_id,
+            ),
+            fence_token: crate::machines::mob_machine::FenceToken::from_domain(entry.fence_token),
+            generation: crate::machines::mob_machine::Generation::from_domain(entry.generation),
+            peer_endpoint: crate::machines::mob_machine::MemberPeerEndpoint::from(spec),
+        },
+        "resume_register_spawned_member_peer_endpoint",
+    )
+    .map_err(|spawned_error| {
+        format!(
+            "its first endpoint could not be recorded ({journal_error}) nor registered on its spawned incarnation ({spawned_error})"
+        )
+    })
 }
 
 /// Cold-boot twin of explicit Resume's per-member endpoint isolation: record
@@ -2337,21 +2445,189 @@ pub(super) fn apply_seeded_member_session_binding(
     )
 }
 
+/// The open wake attempt of a Waking member: the attempt every resolution
+/// of its materialization is fenced by.
+pub(super) fn open_member_wake_attempt(
+    state: &crate::machines::mob_machine::MobMachineState,
+    identity: &crate::machines::mob_machine::AgentIdentity,
+) -> Result<u64, MobError> {
+    state
+        .member_wake_attempts
+        .get(identity)
+        .copied()
+        .ok_or_else(|| {
+            MobError::Internal(format!(
+                "MobMachine holds no open wake attempt for '{}', whose materialization is being resolved",
+                identity.0
+            ))
+        })
+}
+
+/// Resolve a restored member's open wake attempt as bound (the first step):
+/// the member stays Waking, and its routed runtime binding is requested.
+/// `ResolveMemberRevivalSucceeded` (Waking -> Live) follows once the member's
+/// readiness and topology settled.
 async fn resolve_seeded_member_runtime_restoration(
     authority: &mut crate::machines::mob_machine::MobMachineAuthority,
     agent_identity: &AgentIdentity,
     composition_binding: &super::composition::MobCompositionBinding,
 ) -> Result<(), MobError> {
+    let dsl_identity = mob_dsl::AgentIdentity::from_domain(agent_identity);
+    let attempt = open_member_wake_attempt(authority.state(), &dsl_identity)?;
     let transition = apply_seeded_mob_signal_transition(
         authority,
-        mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
-            agent_identity: mob_dsl::AgentIdentity::from_domain(agent_identity),
+        mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
+            agent_identity: dsl_identity.clone(),
+            attempt,
         },
-        "resume_resolve_member_materialization",
+        "resume_resolve_member_materialization_bound",
     )?;
+    if !super::boot_plan::wake_feedback_applied(transition.effects(), &dsl_identity, attempt) {
+        return Err(MobError::Internal(format!(
+            "the wake attempt {attempt} of '{agent_identity}' closed before its restored runtime was bound"
+        )));
+    }
     for effect in transition.effects().iter().cloned() {
         if let Some(effect) = super::composition::MobSeamEffect::routed(effect) {
             super::composition::dispatch_routed_effect(composition_binding, effect)
+                .await
+                .map_err(super::composition::dispatch_refusal_to_mob_error)?;
+        }
+    }
+    Ok(())
+}
+
+/// Resolve a restored member's open wake attempt as bound, as
+/// [`resolve_seeded_member_runtime_restoration`] does, unless the member's
+/// seat named a session no build had created: the session it was just
+/// restored on is then that session, created by an earlier attempt whose
+/// born row was lost, and it resolves through that creation
+/// ([`resolve_member_seat_session_created`]).
+#[cfg(feature = "runtime-adapter")]
+async fn resolve_restored_member_bound(
+    commit: &mut MemberRestoreCommit<'_>,
+    entry: &RosterEntry,
+    session_id: &SessionId,
+) -> Result<(), MobError> {
+    if super::boot_plan::domain_member_seat_session_unborn(
+        commit.authority.state(),
+        &entry.agent_identity,
+    ) {
+        return resolve_member_seat_session_created(commit, entry, session_id).await;
+    }
+    resolve_seeded_member_runtime_restoration(
+        commit.authority,
+        &entry.agent_identity,
+        commit.composition_binding,
+    )
+    .await
+}
+
+/// Resolve the open wake attempt of a member whose seat named `session_id`
+/// and no build had created it, now that it exists: the bound step of the
+/// attempt (its routed runtime binding is requested, the member stays
+/// Waking), and the member's seat session is born. MobMachine decides on a
+/// prepared authority; its born row is journaled before that authority is
+/// committed (nothing is journaled when the authority moved), so once the
+/// session exists it stays born across a restart, even if this wake then
+/// fails and its rollback archives the session.
+#[cfg(feature = "runtime-adapter")]
+async fn resolve_member_seat_session_created(
+    commit: &mut MemberRestoreCommit<'_>,
+    entry: &RosterEntry,
+    session_id: &SessionId,
+) -> Result<(), MobError> {
+    let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+    let attempt = open_member_wake_attempt(commit.authority.state(), &dsl_identity)?;
+    let mut prepared = commit.authority.prepare_authority();
+    let transition = prepared
+        .apply_signal(
+            mob_dsl::MobMachineSignal::ResolveMemberRevivalSessionCreated {
+                agent_identity: dsl_identity.clone(),
+                attempt,
+            },
+        )
+        .map_err(|error| {
+            MobError::Internal(format!(
+                "MobMachine refused the creation of the seat session '{session_id}' of '{}': {error}",
+                entry.agent_identity
+            ))
+        })?;
+    if !super::boot_plan::wake_feedback_applied(transition.effects(), &dsl_identity, attempt) {
+        return Err(MobError::Internal(format!(
+            "the wake attempt {attempt} of '{}' closed before its seat session was created",
+            entry.agent_identity
+        )));
+    }
+    // The born row realizes the transition's persistence effect: it names
+    // exactly the member, runtime and session that effect names.
+    let dsl_runtime_id = mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id);
+    let dsl_session_id = mob_dsl::SessionId::from_domain(session_id);
+    let born_effects = transition
+        .effects()
+        .iter()
+        .filter(|effect| {
+            matches!(
+                effect,
+                mob_dsl::MobMachineEffect::PersistMemberSeatSessionBorn { .. }
+            )
+        })
+        .collect::<Vec<_>>();
+    let [
+        mob_dsl::MobMachineEffect::PersistMemberSeatSessionBorn {
+            agent_identity: born_identity,
+            agent_runtime_id: born_runtime_id,
+            session_id: born_session_id,
+        },
+    ] = born_effects.as_slice()
+    else {
+        return Err(MobError::Internal(format!(
+            "MobMachine created the seat session of '{}' without exactly one born row to persist",
+            entry.agent_identity
+        )));
+    };
+    if born_identity != &dsl_identity
+        || born_runtime_id != &dsl_runtime_id
+        || born_session_id != &dsl_session_id
+    {
+        return Err(MobError::Internal(format!(
+            "MobMachine named another member, runtime or session for the born seat session '{session_id}' of '{}'",
+            entry.agent_identity
+        )));
+    }
+    let events = Arc::clone(&commit.tool_handle.events);
+    let born = crate::event::NewMobEvent {
+        mob_id: commit.tool_handle.mob_id().clone(),
+        timestamp: None,
+        kind: MobEventKind::MemberSessionBindingRecovered(
+            crate::event::MemberSessionBindingRecoveredEvent::seat_session_born(
+                entry.agent_identity.clone(),
+                entry.agent_runtime_id.clone(),
+                session_id.clone(),
+            ),
+        ),
+    };
+    let born = commit
+        .authority
+        .commit_prepared_authority_after(prepared, || async move {
+            events.append(born).await.map_err(MobError::from)
+        })
+        .await
+        .map_err(|error| match error {
+            mob_dsl::MobMachinePreparedCommitEffectError::Commit(error) => {
+                MobError::Internal(format!(
+                    "the authority changed before the seat session of '{}' was committed born: {error}",
+                    entry.agent_identity
+                ))
+            }
+            mob_dsl::MobMachinePreparedCommitEffectError::Effect(error) => error,
+        })?;
+    // The roster takes the born row as a replay does: the seat's build
+    // inputs are dropped with it.
+    commit.roster.apply(&born);
+    for effect in transition.effects().iter().cloned() {
+        if let Some(effect) = super::composition::MobSeamEffect::routed(effect) {
+            super::composition::dispatch_routed_effect(commit.composition_binding, effect)
                 .await
                 .map_err(super::composition::dispatch_refusal_to_mob_error)?;
         }
@@ -2478,6 +2754,55 @@ impl PersistedMemberSessionIndex {
         )>,
         MobError,
     > {
+        let Some(winner_session_id) = self
+            .best_successor_for_member(
+                session_service,
+                missing_session_id,
+                mob_id,
+                role,
+                agent_identity,
+                resume_from_role,
+            )
+            .await?
+        else {
+            return Ok(None);
+        };
+        // Operationally prepare and full-load ONLY the winner. A winner that
+        // vanishes between the metadata match and materialization reads as
+        // "no replacement" (`Ok(None)`): the caller records the member's
+        // restore failure exactly as if no candidate had matched.
+        let authorized = match session_service
+            .materialize_session_resume_verdict(&winner_session_id)
+            .await?
+        {
+            verdict @ super::session_service::SessionResumeVerdict::ResumeAuthorized { .. } => {
+                verdict.into_authorized().expect("authorized verdict")
+            }
+            super::session_service::SessionResumeVerdict::Rejected(rejection)
+                if rejection.kind == super::session_service::ResumeRejectionKind::Absent =>
+            {
+                return Ok(None);
+            }
+            super::session_service::SessionResumeVerdict::Rejected(rejection) => {
+                return Err(rejection.into_mob_error());
+            }
+        };
+        Ok(Some((winner_session_id, authorized)))
+    }
+
+    /// Select the canonical persisted successor for one member from the
+    /// index alone: read-only, it prepares, loads and claims nothing. A
+    /// candidate whose metadata read failed during the scan is read again
+    /// here, as the search considers it.
+    pub(super) async fn best_successor_for_member(
+        &self,
+        session_service: &dyn MobSessionService,
+        missing_session_id: &meerkat_core::types::SessionId,
+        mob_id: &crate::ids::MobId,
+        role: &crate::ids::ProfileName,
+        agent_identity: &crate::ids::AgentIdentity,
+        resume_from_role: Option<&crate::ids::ProfileName>,
+    ) -> Result<Option<meerkat_core::types::SessionId>, MobError> {
         let canonical_comms_name = super::actor::render_member_comms_name(
             mob_id.as_str(),
             role.as_str(),
@@ -2540,28 +2865,7 @@ impl PersistedMemberSessionIndex {
         let Some((_, _, winner_session_id)) = best else {
             return Ok(None);
         };
-        let winner_session_id = winner_session_id.clone();
-        // Operationally prepare and full-load ONLY the winner. A winner that
-        // vanishes between the metadata match and materialization reads as
-        // "no replacement" (`Ok(None)`): the caller records the member's
-        // restore failure exactly as if no candidate had matched.
-        let authorized = match session_service
-            .materialize_session_resume_verdict(&winner_session_id)
-            .await?
-        {
-            verdict @ super::session_service::SessionResumeVerdict::ResumeAuthorized { .. } => {
-                verdict.into_authorized().expect("authorized verdict")
-            }
-            super::session_service::SessionResumeVerdict::Rejected(rejection)
-                if rejection.kind == super::session_service::ResumeRejectionKind::Absent =>
-            {
-                return Ok(None);
-            }
-            super::session_service::SessionResumeVerdict::Rejected(rejection) => {
-                return Err(rejection.into_mob_error());
-            }
-        };
-        Ok(Some((winner_session_id, authorized)))
+        Ok(Some(winner_session_id.clone()))
     }
 }
 
@@ -3716,6 +4020,31 @@ async fn commit_placed_spawn_event_repairs(
     Ok(reloaded_plan)
 }
 
+/// Replay MobMachine's unborn-seat fact from the journal row that records it
+/// (`crate::event::SeatSessionRow`): the seat's row marks the session
+/// unborn, the row of its creation marks it born. The member binding history
+/// folds the same rows ([`crate::MemberBindingHistory::session_unborn`]).
+fn recover_seat_session_row(
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    row: crate::event::SeatSessionRow<'_>,
+) -> Result<(), MobError> {
+    use crate::machines::mob_machine as mob_dsl;
+
+    apply_seeded_mob_signal(
+        authority,
+        mob_dsl::MobMachineSignal::RecoverMemberSeatSession {
+            agent_identity: mob_dsl::AgentIdentity::from_domain(row.agent_identity),
+            agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(row.agent_runtime_id),
+            unborn: row.unborn,
+        },
+        if row.unborn {
+            "recover_member_seat_session_unborn"
+        } else {
+            "recover_member_seat_session_born"
+        },
+    )
+}
+
 fn seed_mob_authority_sync_from_events(
     authority: &mut crate::machines::mob_machine::MobMachineAuthority,
     events: &[crate::event::MobEvent],
@@ -3956,6 +4285,12 @@ fn seed_mob_authority_sync_from_events(
                     },
                     "recover_member_external_rebind_capability",
                 )?;
+                // A seat that created nothing: the member's session is
+                // unborn until its first wake creates it, whose own row
+                // (below) clears the fact durably.
+                if let Some(row) = event.kind.seat_session_row() {
+                    recover_seat_session_row(authority, row)?;
+                }
             }
             MobEventKind::MemberReset {
                 agent_identity,
@@ -4036,6 +4371,12 @@ fn seed_mob_authority_sync_from_events(
                         },
                         "recover_member_session_binding_peer_endpoint",
                     )?;
+                }
+                // The first wake of a seated member created its session
+                // under this binding: the unborn fact clears durably, so a
+                // session lost later is never recreated empty.
+                if let Some(row) = event.kind.seat_session_row() {
+                    recover_seat_session_row(authority, row)?;
                 }
             }
             // Retirement start is deliberately replayed in a second pass.
@@ -7196,6 +7537,17 @@ struct RuntimeWiring {
     /// the launched handle and the actor: the one its create minted, read
     /// back from the mob's creation record on resume.
     incarnation: meerkat_core::service::MobIncarnationId,
+    /// The host's member-residency inputs: the actor plans the clean-stop
+    /// lift and realizes member wakes with the same values this start used.
+    member_residency: super::boot_plan::MemberResidencyConfig,
+    /// What this start's member plan hands to the actor: the effects it
+    /// realizes before it admits any delivery (the wake-route rebuild), and
+    /// the boot set its startup readiness settles Live.
+    boot_plan: super::boot_plan::BootPlanOutcome,
+    /// Whether the latest member plan could not observe recovery work, shared
+    /// by the handles ([`MobHandle::boot_set_basis`]) and the actor (the
+    /// clean-stop lift plans again).
+    boot_set_basis: super::boot_plan::MobBootSetBasisCell,
 }
 
 /// Owns the supervisor bridge until actor publication succeeds. Builder
@@ -7303,6 +7655,7 @@ impl MobBuilder {
             provenance: None,
             #[cfg(feature = "runtime-adapter")]
             resume_restore_concurrency: DEFAULT_RESUME_RESTORE_CONCURRENCY,
+            member_residency: super::boot_plan::MemberResidencyConfig::default(),
         }
     }
 
@@ -7392,6 +7745,7 @@ impl MobBuilder {
             provenance: None,
             #[cfg(feature = "runtime-adapter")]
             resume_restore_concurrency: DEFAULT_RESUME_RESTORE_CONCURRENCY,
+            member_residency: super::boot_plan::MemberResidencyConfig::default(),
         }
     }
 
@@ -7526,7 +7880,8 @@ impl MobBuilder {
     }
 
     /// Restore up to `concurrency` members at once when [`Self::resume`]
-    /// restores a running mob's members. Default 16; `0` counts as `1`.
+    /// restores a running mob's members. Default 16; `0` counts as `1`, and a
+    /// value above tokio's `Semaphore::MAX_PERMITS` counts as that maximum.
     ///
     /// Restoring a member reads its session and provisions it, round trips to
     /// the session store that, one member at a time, make a resume grow with
@@ -7563,9 +7918,151 @@ impl MobBuilder {
     /// A resume dropped before it returns drops the restores in flight with
     /// it: up to `concurrency` members are left provisioned, or part way
     /// through their provision, without their release.
+    ///
+    /// The same bound holds for a lift of the mob once stopped
+    /// ([`MobHandle::resume`]): it starts the wakes of the dormant members
+    /// its plan materializes up to `concurrency` at once, the next one as an
+    /// earlier one finishes (a member it has not reached stays dormant, and a
+    /// delivery to it wakes it at once); it observes the live and durable
+    /// sessions of the members it rebuilds up to `concurrency` at once; and
+    /// its `OnDemandVerified` pass reads up to that many verdicts at once.
     #[cfg(feature = "runtime-adapter")]
     pub fn with_resume_restore_concurrency(mut self, concurrency: usize) -> Self {
-        self.resume_restore_concurrency = concurrency.max(1);
+        // The bound sizes semaphores, and a semaphore panics above its
+        // maximum: a larger value (`usize::MAX` for "no limit") counts as it.
+        self.resume_restore_concurrency = concurrency.clamp(1, tokio::sync::Semaphore::MAX_PERMITS);
+        self
+    }
+
+    /// How the mob materializes its seated members when it starts
+    /// ([`MemberRestorePolicy`], default [`MemberRestorePolicy::OnDemand`]).
+    ///
+    /// Both start paths apply it: a resume of a mob that was running, and the
+    /// lift of a stopped one ([`MobHandle::resume`]). Under every policy every
+    /// seated member is listed, addressable and reported active once the mob
+    /// is ready; a delivery to a member that is not materialized materializes
+    /// it first, and a read never does. The policy only decides how much the
+    /// start materializes up front. [`MemberRestorePolicy::OnDemandVerified`]
+    /// reads each member it leaves unmaterialized once, read-only, at most
+    /// [`Self::with_resume_restore_concurrency`] at a time; on a host store
+    /// (`meerkat_core::host_store`) each such read loads the member's stored
+    /// session rows, at every start, so prefer
+    /// [`MemberRestorePolicy::OnDemand`] there.
+    pub fn with_member_restore_policy(mut self, policy: super::MemberRestorePolicy) -> Self {
+        self.member_residency.restore_policy = policy;
+        self
+    }
+
+    /// Members the host needs materialized when the mob starts, whatever the
+    /// restore policy (for example members it must embody before its own
+    /// start completes). Members that are not seated are ignored.
+    pub fn with_host_required_members(
+        mut self,
+        members: impl IntoIterator<Item = AgentIdentity>,
+    ) -> Self {
+        self.member_residency.host_required.extend(members);
+        self
+    }
+
+    /// Members the host must prepare before any of their work may run (for
+    /// example identities whose first-boot carry-out is still pending). The
+    /// start never materializes them, and every wake of one is refused
+    /// retryable until the host's seat step for it
+    /// ([`MobHandle::seat_dormant_members`], [`MobHandle::rotate_member`])
+    /// clears the mark, durably, in the same step.
+    ///
+    /// A host whose rotation a crash interrupted passes the identity here:
+    /// the start then holds the interrupted retirement open (it does not end
+    /// it as a plain retirement) until the host calls
+    /// [`MobHandle::rotate_member`] again, which finishes the rotation on the
+    /// same session.
+    pub fn with_host_pending_members(
+        mut self,
+        members: impl IntoIterator<Item = AgentIdentity>,
+    ) -> Self {
+        self.member_residency.host_pending.extend(members);
+        self
+    }
+
+    /// The root of the members' session-scoped comms identities, for
+    /// members on inproc comms (the default transport): pass the root the
+    /// session service's agent factory uses,
+    /// `meerkat::canonical_session_comms_identity_root(user_config_root)`. A
+    /// dormant seat ([`MobHandle::seat_dormant_members`],
+    /// [`MobHandle::rotate_member`]) reads a member's key there, one local
+    /// read with no session load, and records the inproc endpoint the
+    /// member's woken runtime reports. Without this or
+    /// [`Self::with_network_member_comms`], every seat is refused typed and
+    /// nothing is written.
+    pub fn with_member_comms_identity_root(
+        mut self,
+        identity_root: impl Into<std::path::PathBuf>,
+    ) -> Self {
+        self.member_residency.seat_endpoints = Some(
+            super::dormant_seat::MemberSeatEndpointSource::SessionScopedInproc {
+                identity_root: identity_root.into(),
+            },
+        );
+        self
+    }
+
+    /// The members run on network comms (Tcp or Uds), whose key belongs to
+    /// the realm rather than to a member's session. A dormant seat then
+    /// records no endpoint: the member is seated with its endpoint owed, and
+    /// its boot wake registers the endpoint (a network member is in the boot
+    /// set anyway).
+    pub fn with_network_member_comms(mut self) -> Self {
+        self.member_residency.seat_endpoints =
+            Some(super::dormant_seat::MemberSeatEndpointSource::Network);
+        self
+    }
+
+    /// Whether this composition of the mob may act on the mob's shared store
+    /// (default [`super::MobCompositionAuthority::Authoritative`]). A
+    /// non-authoritative composition reads only: it materializes no member
+    /// at start, refuses every member wake with a typed refusal and seats
+    /// nothing, so a candidate started beside the authoritative mob over the
+    /// same directory never writes it.
+    pub fn with_composition_authority(mut self, authority: super::MobCompositionAuthority) -> Self {
+        self.member_residency.composition_authority = authority;
+        self
+    }
+
+    /// Bound on one member wake: the cold restore of a dormant member through
+    /// its readiness and topology. Past it MobMachine resolves the attempt
+    /// retryable (the member is Dormant again and the next delivery wakes it
+    /// again) and every caller still waiting gets a typed wake timeout;
+    /// nothing was delivered, so a retry is safe. A peer sender's own patience
+    /// is its `CommsConfig::ack_timeout_secs`, one bound for the whole send; it
+    /// sees whichever bound ends first.
+    pub fn with_member_wake_timeout(mut self, timeout: std::time::Duration) -> Self {
+        self.member_residency.wake_timeout = timeout;
+        self
+    }
+
+    /// Backoff of the retry that wakes a member whose boot work is still
+    /// owed after its boot wake was refused retryably (an unavailable resume
+    /// gate, a host that asked to retry its build preparation, the wake
+    /// bound): the mob wakes it again after `initial`, doubling up to `max`,
+    /// until it is live, its restore fails for good, or its obligation is
+    /// gone. A delivery to the member meanwhile wakes it at once.
+    pub fn with_member_wake_retry_backoff(
+        mut self,
+        initial: std::time::Duration,
+        max: std::time::Duration,
+    ) -> Self {
+        self.member_residency.owed_wake_retry = super::MemberWakeRetryBackoff { initial, max };
+        self
+    }
+
+    /// The host's per-member build preparation, run before a member's
+    /// provision whenever it is materialized (at start or on a wake).
+    #[cfg(feature = "runtime-adapter")]
+    pub fn with_member_build_preparer(
+        mut self,
+        preparer: Arc<dyn super::MemberBuildPreparer>,
+    ) -> Self {
+        self.member_residency.build_preparer = Some(preparer);
         self
     }
 
@@ -7757,7 +8254,27 @@ impl MobBuilder {
     /// Create the mob: emit MobCreated event, start the actor, return handle.
     #[cfg(feature = "runtime-adapter")]
     pub async fn create(self) -> Result<MobHandle, MobError> {
+        #[cfg(test)]
+        self.bind_member_comms_identity_root_for_test();
         Self::create_boxed(self).await
+    }
+
+    /// Test seam: hand the members' session-scoped comms identity root to
+    /// the session service before anything is built, so a test double keys
+    /// its members' comms runtimes where the seats read their keys.
+    #[cfg(test)]
+    fn bind_member_comms_identity_root_for_test(&self) {
+        if let (
+            Some(session_service),
+            Some(super::dormant_seat::MemberSeatEndpointSource::SessionScopedInproc {
+                identity_root,
+            }),
+        ) = (
+            self.session_service.as_ref(),
+            self.member_residency.seat_endpoints.as_ref(),
+        ) {
+            session_service.bind_member_comms_identity_root_for_test(identity_root);
+        }
     }
 
     // Keep the concrete create future out of callers such as agent-tool
@@ -7800,10 +8317,18 @@ impl MobBuilder {
                 start_destroy_admission: _,
                 callback_claim_verifier,
                 provenance,
-                // A created mob restores no members.
+                // A created mob restores no members; a later lift of it
+                // wakes its plan, observes the members it rebuilds and
+                // verifies at this concurrency.
                 #[cfg(feature = "runtime-adapter")]
-                    resume_restore_concurrency: _,
+                resume_restore_concurrency,
+                member_residency,
             } = builder;
+            #[cfg(feature = "runtime-adapter")]
+            let member_residency = super::boot_plan::MemberResidencyConfig {
+                verify_concurrency: resume_restore_concurrency,
+                ..member_residency
+            };
             #[cfg(not(feature = "runtime-adapter"))]
             let runtime_adapter: RuntimeAdapterOption = None;
 
@@ -7880,6 +8405,11 @@ impl MobBuilder {
             }
 
             let mut dsl_authority = Box::new(seed_mob_authority());
+            super::boot_plan::seed_member_residency(
+                &mut dsl_authority,
+                &member_residency,
+                "create_seed_member_residency",
+            )?;
             let owner_bridge_event = match owner_bridge_session_create_authority.as_ref() {
                 Some(binding) => bind_owner_bridge_session_authority_for_create(
                     &mut dsl_authority,
@@ -8030,6 +8560,7 @@ impl MobBuilder {
                     controlling_acceptor,
                     member_live_host,
                     before_activation,
+                    member_residency,
                 )
                 .await;
                 #[cfg(not(target_arch = "wasm32"))]
@@ -8115,6 +8646,8 @@ impl MobBuilder {
     /// startup task.
     #[cfg(feature = "runtime-adapter")]
     pub async fn resume(self) -> Result<MobHandle, MobError> {
+        #[cfg(test)]
+        self.bind_member_comms_identity_root_for_test();
         let MobBuilder {
             mode,
             before_activation,
@@ -8148,7 +8681,16 @@ impl MobBuilder {
             provenance: _,
             #[cfg(feature = "runtime-adapter")]
             resume_restore_concurrency,
+            member_residency,
         } = self;
+        // The verified pass reads at the restore concurrency on both start
+        // paths: this resume, and a later lift of the mob, which also wakes
+        // its plan and observes the members it rebuilds at that bound.
+        #[cfg(feature = "runtime-adapter")]
+        let member_residency = super::boot_plan::MemberResidencyConfig {
+            verify_concurrency: resume_restore_concurrency,
+            ..member_residency
+        };
         #[cfg(not(feature = "runtime-adapter"))]
         let runtime_adapter: RuntimeAdapterOption = None;
 
@@ -8268,6 +8810,13 @@ impl MobBuilder {
             );
         }
         let mut initial_dsl_authority = Box::new(seed_mob_authority());
+        // The host's member-residency inputs are machine state before any
+        // replay: the plan, every wake and every seat read them there.
+        super::boot_plan::seed_member_residency(
+            &mut initial_dsl_authority,
+            &member_residency,
+            "resume_seed_member_residency",
+        )?;
         recover_definition_epoch_from_history(&mut initial_dsl_authority, &mob_events)?;
         recover_owner_bridge_session_authority_from_history(
             &mut initial_dsl_authority,
@@ -8616,6 +9165,9 @@ impl MobBuilder {
                 composition_binding,
                 // The incarnation the mob was created at: a resume keeps it.
                 incarnation,
+                member_residency,
+                boot_plan: super::boot_plan::BootPlanOutcome::none(),
+                boot_set_basis: super::boot_plan::MobBootSetBasisCell::default(),
             };
             let per_spawn_external_tools: super::handle::PerSpawnExternalTools = Arc::default();
             let preview_handle = MobHandle {
@@ -8629,6 +9181,7 @@ impl MobBuilder {
                 definition: definition.clone(),
                 events: storage.events.clone(),
                 identity_member: storage.identity_member.clone(),
+                member_binding_fold: Arc::default(),
                 run_store: storage.runs.clone(),
                 runtime_metadata: storage.runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -8658,6 +9211,7 @@ impl MobBuilder {
                 incarnation: wiring.incarnation,
                 registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
                 realm_profile_store: storage.realm_profiles.clone(),
+                boot_set_basis: wiring.boot_set_basis.clone(),
             };
             // session_service is still live here (not consumed until start_runtime_with_components)
             if let Some(hook) = before_activation {
@@ -8704,6 +9258,7 @@ impl MobBuilder {
             let mut per_spawn_external_tools_seed = super::fork_build::RetainedOverlays::default();
             let mut recovered_direct_member_adoption_pending = false;
             let mut deferred_orchestrator_resume_notifications = Vec::new();
+            let mut boot_plan_outcome = super::boot_plan::BootPlanOutcome::none();
             // A resume that only tears the mob down reconciles no member: its
             // destroy is admitted before the actor starts any work.
             if resumed_state == MobState::Running
@@ -8714,6 +9269,7 @@ impl MobBuilder {
                 (
                     recovered_direct_member_adoption_pending,
                     deferred_orchestrator_resume_notifications,
+                    boot_plan_outcome,
                 ) = Self::reconcile_resume(
                     &definition,
                     repaired_epoch_events,
@@ -8736,6 +9292,8 @@ impl MobBuilder {
                     storage.runtime_metadata.clone(),
                     &mut per_spawn_external_tools_seed,
                     resume_restore_concurrency,
+                    &wiring.member_residency,
+                    wiring.incarnation,
                 )
                 .await?;
                 // T3 (ADJ-P4-1): re-derive cross-host route-install obligations
@@ -8857,6 +9415,8 @@ impl MobBuilder {
                         .await?;
                 }
             }
+            wiring.boot_set_basis.set(boot_plan_outcome.basis);
+            wiring.boot_plan = boot_plan_outcome;
 
             let restore_diagnostics_snapshot =
                 preview_handle.restore_diagnostics.read().await.clone();
@@ -8910,7 +9470,7 @@ impl MobBuilder {
                 storage.runs.clone(),
                 session_service,
                 runtime_adapter,
-                Arc::clone(&runtime_provisioner) as Arc<dyn MobProvisioner>,
+                Arc::clone(&runtime_provisioner),
                 runtime_provisioner.session_ops_adapter(),
                 tool_bundles,
                 default_llm_client,
@@ -9461,7 +10021,16 @@ impl MobBuilder {
         runtime_metadata: Arc<dyn crate::store::MobRuntimeMetadataStore>,
         per_spawn_external_tools_seed: &mut super::fork_build::RetainedOverlays,
         restore_concurrency: usize,
-    ) -> Result<(bool, Vec<OrchestratorResumeNotification>), MobError> {
+        member_residency: &super::boot_plan::MemberResidencyConfig,
+        incarnation: meerkat_core::service::MobIncarnationId,
+    ) -> Result<
+        (
+            bool,
+            Vec<OrchestratorResumeNotification>,
+            super::boot_plan::BootPlanOutcome,
+        ),
+        MobError,
+    > {
         let recovered_direct_member_adoption_pending = runtime_metadata
             .list_external_binding_overlays(&definition.id)
             .await?
@@ -9556,13 +10125,43 @@ impl MobBuilder {
                 return Err(error.into());
             }
         }
-        // Recreate missing sessions referenced by MemberSpawned events: the
-        // members this resume restores, each member's reads and provision
-        // running alongside other members' (at most `restore_concurrency` at
-        // a time) and every write applied in roster order. See
-        // `restore_resumed_members`.
-        let restore_set =
-            resume_restore_set(&roster_entries, dsl_authority.state(), &definition.id);
+        // This start's member plan: MobMachine decides, from its typed facts
+        // and one store-wide runtime obligation scan, which seated members
+        // are materialized now (the boot set). Every other member stays
+        // Dormant: no session read, no provision, no registration.
+        let obligations = super::boot_plan::scan_boot_obligations(
+            runtime_adapter.as_ref(),
+            dsl_authority.state(),
+            &definition.id,
+            incarnation,
+        )
+        .await?;
+        let notified_orchestrators = super::boot_plan::notified_orchestrators(
+            definition,
+            notify_orchestrator_on_resume,
+            dsl_authority.state(),
+        );
+        let boot_plan = super::boot_plan::apply_boot_materialization_plan(
+            dsl_authority,
+            member_residency,
+            &obligations,
+            &notified_orchestrators,
+            "resume_plan_boot_materialization",
+        )?;
+        // Recreate the sessions of the boot set: each member's reads and
+        // provision running alongside other members' (at most
+        // `restore_concurrency` at a time) and every write applied in roster
+        // order. See `restore_resumed_members`.
+        let restore_set = resume_restore_set(
+            &roster_entries,
+            roster,
+            dsl_authority.state(),
+            &definition.id,
+            &boot_plan.materialize,
+        );
+        // The host's build preparer reads through this restore's own handle,
+        // the launch's owner authority, as every wake's preparation does.
+        let host_read_handle = tool_handle.read_handle();
         let restore_context = ResumeMemberRestoreContext {
             definition,
             session_service,
@@ -9576,6 +10175,9 @@ impl MobBuilder {
             realm_profile_store: realm_profile_store.as_ref(),
             default_llm_client: default_llm_client.as_ref(),
             tool_consequence_policy_registry,
+            member_build_preparer: member_residency.build_preparer.as_ref(),
+            host_read_handle: &host_read_handle,
+            unreadable_view_is_retryable: false,
         };
         restore_resumed_members(
             &restore_context,
@@ -9595,6 +10197,26 @@ impl MobBuilder {
                 index: &mut successor_index,
                 recovered_without_endpoint: &mut new_recovered_session_bindings_without_endpoint,
             },
+        )
+        .await?;
+        // `on_demand_verified`: one read-only durable verdict for each member
+        // the plan leaves Dormant, before the mob reports ready. A member whose
+        // durable session cannot be resumed is Broken through the machine, as
+        // an eager restore would leave it, with nothing materialized.
+        verify_planned_dormant_members(
+            &boot_plan,
+            &roster_entries,
+            dsl_authority,
+            tool_handle,
+            &super::boot_plan::VerifiedPassContext {
+                mob_id: &definition.id,
+                session_service,
+                listed_sessions: &listed_sessions,
+                member_bound_sessions: &member_bound_sessions,
+                concurrency: restore_concurrency,
+                progress: None,
+            },
+            &mut successor_index,
         )
         .await?;
 
@@ -9660,6 +10282,15 @@ impl MobBuilder {
             }
             if broken_members.contains(&entry.agent_identity) {
                 let _ = roster.set_comms_identity(&entry.agent_identity, None, None);
+                continue;
+            }
+            // A Dormant member has no comms runtime in this process: its
+            // durable endpoint stands (the topology reconcile projects it),
+            // and its wake checks the endpoint it materializes against it.
+            if super::boot_plan::domain_member_is_dormant(
+                dsl_authority.state(),
+                &entry.agent_identity,
+            ) {
                 continue;
             }
             if let Some(comms_a) = provisioner.comms_runtime(&entry.member_ref).await {
@@ -9747,8 +10378,15 @@ impl MobBuilder {
                         .write()
                         .await
                         .apply_event(&recovered_event);
-                } else {
-                    register_seeded_member_peer(
+                } else if dsl_authority
+                    .state()
+                    .member_peer_endpoints
+                    .contains_key(&dsl_identity)
+                {
+                    // The durable endpoint equals the live one (checked
+                    // above): this incarnation re-admits it. A refusal
+                    // breaks this member alone.
+                    if let Err(error) = register_seeded_member_peer(
                         dsl_authority,
                         &entry.agent_identity,
                         &entry.agent_runtime_id,
@@ -9756,7 +10394,36 @@ impl MobBuilder {
                         entry.fence_token,
                         &spec,
                         "resume_register_member_peer",
-                    )?;
+                    ) {
+                        record_seeded_member_endpoint_broken(
+                            dsl_authority,
+                            roster,
+                            &tool_handle.restore_diagnostics,
+                            entry,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        continue;
+                    }
+                } else if let Err(detail) = record_first_seeded_member_endpoint(
+                    dsl_authority,
+                    roster,
+                    tool_handle,
+                    &definition.id,
+                    entry,
+                    &spec,
+                )
+                .await
+                {
+                    record_seeded_member_endpoint_broken(
+                        dsl_authority,
+                        roster,
+                        &tool_handle.restore_diagnostics,
+                        entry,
+                        &detail,
+                    )
+                    .await?;
+                    continue;
                 }
             } else if let MemberRef::BackendPeer {
                 peer_id,
@@ -9807,6 +10474,25 @@ impl MobBuilder {
             &tool_handle.restore_diagnostics,
         )
         .await?;
+        // The boot set settled (each member is bound or Broken) and every
+        // legacy member's endpoint is recovered: seal the plan. From here on
+        // every Dormant or Waking member has a durable endpoint or owes one,
+        // so every one is peer-wakeable; the seal rebuilds the wake routes.
+        // A refused seal fails no start: the mob runs with the plan unsealed,
+        // and the actor rebuilds every wake route from machine state when it
+        // starts, as it does after every seal.
+        let mut boot_plan = boot_plan;
+        match super::boot_plan::seal_boot_materialization_plan(
+            dsl_authority,
+            "resume_seal_boot_materialization_plan",
+        ) {
+            Ok(effects) => boot_plan.residency_effects.extend(effects),
+            Err(error) => tracing::warn!(
+                mob_id = %definition.id,
+                %error,
+                "MobMachine refused to seal the boot materialization plan; the mob starts with it unsealed"
+            ),
+        }
         let mut deferred_orchestrator_resume_notifications = Vec::new();
         if notify_orchestrator_on_resume && let Some(orchestrator) = &definition.orchestrator {
             let orchestrator_entries = dsl_authority
@@ -9854,6 +10540,14 @@ impl MobBuilder {
         Ok((
             recovered_direct_member_adoption_pending,
             deferred_orchestrator_resume_notifications,
+            super::boot_plan::BootPlanOutcome {
+                awaiting_ready: super::boot_plan::BootPlanOutcome::awaiting_ready_of(
+                    dsl_authority.state(),
+                    &boot_plan.materialize,
+                ),
+                residency_effects: boot_plan.residency_effects,
+                basis: obligations.basis,
+            },
         ))
     }
 
@@ -9896,6 +10590,7 @@ impl MobBuilder {
         controlling_acceptor: Option<ControllingAcceptorConfig>,
         member_live_host: Option<Arc<dyn meerkat_runtime::member_live::MemberLiveHost>>,
         before_activation: Option<MobBeforeActivation>,
+        member_residency: super::boot_plan::MemberResidencyConfig,
     ) -> RuntimeStartFuture {
         Box::pin(async move {
             // Row #320 seed: the orphan budget is machine state, seeded once from the
@@ -9938,7 +10633,6 @@ impl MobBuilder {
                 None => provisioner,
             });
             let session_ops_adapter = provisioner.session_ops_adapter();
-            let provisioner: Arc<dyn MobProvisioner> = provisioner;
             let roster = Arc::new(RwLock::new(RosterAuthority::from_roster(initial_roster)));
             let restore_diagnostics = Arc::new(RwLock::new(HashMap::new()));
             let wiring = RuntimeWiring {
@@ -9962,6 +10656,10 @@ impl MobBuilder {
                 command_rx,
                 composition_binding,
                 incarnation,
+                member_residency,
+                // A created mob has no member to plan.
+                boot_plan: super::boot_plan::BootPlanOutcome::none(),
+                boot_set_basis: super::boot_plan::MobBootSetBasisCell::default(),
             };
             let flow_target_provisioner = Arc::new(std::sync::RwLock::new(None));
             let explicit_resume_operations =
@@ -10025,7 +10723,7 @@ impl MobBuilder {
         run_store: Arc<dyn MobRunStore>,
         session_service: Arc<dyn MobSessionService>,
         runtime_adapter: RuntimeAdapterOption,
-        provisioner: Arc<dyn MobProvisioner>,
+        provisioner: Arc<MultiBackendProvisioner>,
         session_ops_adapter: Arc<super::ops_adapter::MobOpsAdapter>,
         tool_bundles: BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
         default_llm_client: Option<Arc<dyn LlmClient>>,
@@ -10067,6 +10765,10 @@ impl MobBuilder {
         )>,
     ) -> RuntimeStartFuture {
         Box::pin(async move {
+            // The member wake path runs the cold restore recipe, which needs
+            // the concrete provisioner; everything else holds the trait.
+            let member_wake_provisioner = Arc::clone(&provisioner);
+            let provisioner: Arc<dyn MobProvisioner> = provisioner;
             // Recover the actor-local idempotency index from durable public events
             // before spawning any runtime-owned tasks. Private remote-turn custody
             // is then overlaid below from the validated recovery material.
@@ -10101,6 +10803,9 @@ impl MobBuilder {
                 command_rx,
                 composition_binding,
                 incarnation,
+                member_residency,
+                boot_plan,
+                boot_set_basis,
             } = wiring;
             let handle_session_service = session_service.clone();
             let wiring_public_phase = seeded_mob_public_phase(dsl_authority.state());
@@ -10127,6 +10832,7 @@ impl MobBuilder {
                 definition: definition.clone(),
                 events: events.clone(),
                 identity_member: identity_member.clone(),
+                member_binding_fold: Arc::default(),
                 run_store: run_store.clone(),
                 runtime_metadata: runtime_metadata.clone(),
                 flow_streams: Arc::new(tokio::sync::Mutex::new(BTreeMap::new())),
@@ -10151,6 +10857,7 @@ impl MobBuilder {
                 incarnation,
                 registered_tool_bundles: Arc::new(tool_bundles.keys().cloned().collect()),
                 realm_profile_store: realm_profile_store.clone(),
+                boot_set_basis: boot_set_basis.clone(),
             };
             if let Some(hook) = before_activation {
                 hook(handle.read_handle()).await?;
@@ -10278,6 +10985,18 @@ impl MobBuilder {
                     super::actor::member_status_wall_clock_ms()?,
                 )?;
 
+            let member_wakes = super::actor::member_wake::MemberWakes::new(
+                member_wake_provisioner,
+                &definition.id,
+                command_tx.clone(),
+                machine_state_watch_tx.subscribe(),
+                admission_closed_tx.subscribe(),
+                &durable_events,
+                // The host's build preparer reads through the launch's own
+                // handle on every wake, as the preactivation hook above and
+                // a boot restore do.
+                handle.read_handle(),
+            )?;
             let mut actor = MobActor {
                 definition,
                 incarnation: handle.live_incarnation(),
@@ -10290,6 +11009,9 @@ impl MobBuilder {
                 flow_engine,
                 has_orchestrator,
                 notify_orchestrator_on_resume,
+                member_residency,
+                boot_set_basis,
+                startup_boot_attempts: boot_plan.awaiting_ready,
                 run_tasks: BTreeMap::new(),
                 run_cancel_tokens: BTreeMap::new(),
                 flow_exact_operations: BTreeMap::new(),
@@ -10363,6 +11085,7 @@ impl MobBuilder {
                 member_effect_inflight: super::actor::member_effect_lane::ActorCustody::new(
                     BTreeMap::new(),
                 ),
+                member_wake_effects: tokio::sync::watch::Sender::new(BTreeSet::new()),
                 next_member_effect_ticket: 0,
                 retirements: BTreeMap::new(),
                 stuck_retirements: BTreeMap::new(),
@@ -10408,6 +11131,7 @@ impl MobBuilder {
                 lifecycle_observations,
                 inline_step_watchdog: super::actor::ActorInlineStepWatchdog::new(),
                 pending_resume_lifecycle: None,
+                explicit_resume_boot_dispatch: None,
                 pending_resume_controls: std::collections::VecDeque::new(),
                 retained_resume_cleanup: Vec::new(),
                 unproven_resume_cleanup: Vec::new(),
@@ -10421,6 +11145,7 @@ impl MobBuilder {
                 runtime_metadata,
                 identity,
                 identity_member,
+                member_binding_fold: handle.member_binding_fold.clone(),
                 identity_status,
                 #[cfg(not(target_arch = "wasm32"))]
                 identity_status_projection_order,
@@ -10436,7 +11161,7 @@ impl MobBuilder {
                 ),
                 #[cfg(feature = "runtime-adapter")]
                 startup_member_recoveries: BTreeMap::new(),
-                member_live_revivals_in_flight: BTreeMap::new(),
+                member_wakes,
                 identity_reconcile_parked: BTreeMap::new(),
                 spawn_panic_log_ledger: Arc::new(
                     super::panic_capture::SpawnPanicLogLedger::default(),
@@ -10502,6 +11227,11 @@ impl MobBuilder {
             // handle escapes: nothing is spawned into it, and no owner lease
             // is granted, before the destroy's retry runs.
             actor.close_admission_if_destroy_admitted();
+            // The seated members' wake routes, from this start's member plan,
+            // before the actor admits any delivery: a peer send to a member
+            // that is not materialized then reaches the actor, never
+            // not-found.
+            actor.realize_member_residency_effects(&boot_plan.residency_effects);
             // A17 recovery trigger (DEC-P6E-11): obligations survive via event
             // replay, subscriptions do not — re-derive pending remote-turn
             // obligations from recovered machine state and keep their members'
@@ -10764,48 +11494,20 @@ impl MobBuilder {
             }
             // Resume notifications that run an orchestrator turn, planned by
             // the resume reconcile: the actor's lifecycle owner holds each one
-            // from here, joins it, and surfaces its typed failure like every
-            // other orchestrator lifecycle delivery.
-            // A delivery failure is also recorded as a mob event naming the
-            // planned target, so a host observes it through the ordinary
-            // event channel after the resume has returned. The realization
-            // ends at the notification input's terminal, so the event is
-            // recorded once, after the runtime's bounded retries, and never
-            // for a notification a retry delivers.
+            // from here (`realize_orchestrator_resume_notification_turn`).
             for plan in deferred_orchestrator_resume_notifications {
-                let session_service = Arc::clone(&actor.session_service);
-                let provisioner = Arc::clone(&actor.provisioner);
                 let emitter = super::events::MobEventEmitter::new(
                     Arc::clone(&actor.events),
                     actor.definition.id.clone(),
                 );
-                actor.lifecycle_tasks.spawn(async move {
-                    let member_id = plan.member_id.clone();
-                    let session_id = plan.bridge_session_id.clone();
-                    let outcome = realize_planned_orchestrator_resume_notification(
+                actor
+                    .lifecycle_tasks
+                    .spawn(realize_orchestrator_resume_notification_turn(
                         plan,
-                        session_service.as_ref(),
-                        provisioner.as_ref(),
-                    )
-                    .await;
-                    if let Err(error) = &outcome
-                        && let Err(record_error) = emitter
-                            .orchestrator_resume_notification_failed(
-                                member_id.clone(),
-                                session_id,
-                                error.to_string(),
-                            )
-                            .await
-                    {
-                        tracing::warn!(
-                            member_id = %member_id,
-                            error = %error,
-                            record_error = %record_error,
-                            "orchestrator resume notification failure could not be recorded"
-                        );
-                    }
-                    outcome
-                });
+                        Arc::clone(&actor.session_service),
+                        Arc::clone(&actor.provisioner),
+                        emitter,
+                    ));
             }
             let actor_task_end = ActorTaskEndGuard {
                 observations: Some(Arc::clone(&handle.lifecycle_observations)),
@@ -10850,34 +11552,47 @@ const DEFAULT_RESUME_RESTORE_CONCURRENCY: usize = 16;
 /// A member a cold resume restores, with the session MobMachine's recovered
 /// state binds it to.
 #[cfg(feature = "runtime-adapter")]
-struct ResumeRestoreCandidate {
-    entry: RosterEntry,
-    machine_session_id: crate::machines::mob_machine::SessionId,
+pub(super) struct ResumeRestoreCandidate {
+    pub(super) entry: RosterEntry,
+    pub(super) machine_session_id: crate::machines::mob_machine::SessionId,
     /// The member is restored entirely in its own turn, after every member
     /// before it: a fork of an in-mob source, whose restore follows its
     /// source's, or a member bound to the session an earlier member is bound
     /// to.
-    in_turn: bool,
+    pub(super) in_turn: bool,
+    /// What the member's seat carries to the first build of its unborn
+    /// session ([`super::SeatBuild`]), set on its restore request before the
+    /// customizer is asked. `None` for a member whose session a build
+    /// created.
+    pub(super) seat_build: Option<Arc<super::SeatBuild>>,
 }
 
 /// The members a cold resume restores, in `entries`' order (every in-mob
-/// fork source before its forks): each member MobMachine binds to a session
-/// this controller hosts.
+/// fork source before its forks): each member of `boot_set` that MobMachine
+/// binds to a session this controller hosts.
 ///
-/// The set is decided once, from the recovered machine state, before any
-/// member is restored. No member's restore writes another member's
-/// placement or session binding, so this is the check the restore of each
-/// member made in its turn.
+/// `boot_set` is exactly the set the start's `PlanBootMaterialization`
+/// emitted (`MaterializeMember`, cause Boot): no shell predicate chooses a
+/// member. The set is decided once, from the recovered machine state,
+/// before any member is restored. No member's restore writes another
+/// member's placement or session binding, so this is the check the restore
+/// of each member made in its turn.
 #[cfg(feature = "runtime-adapter")]
 fn resume_restore_set(
     entries: &[RosterEntry],
+    roster: &Roster,
     machine_state: &crate::machines::mob_machine::MobMachineState,
     mob_id: &MobId,
+    boot_set: &BTreeSet<AgentIdentity>,
 ) -> Vec<ResumeRestoreCandidate> {
     let mut bound_sessions = BTreeSet::new();
     entries
         .iter()
         .filter_map(|entry| {
+            if !boot_set.contains(&entry.agent_identity) {
+                // Dormant: materialized by its first delivery, never here.
+                return None;
+            }
             let dsl_identity =
                 crate::machines::mob_machine::AgentIdentity::from_domain(&entry.agent_identity);
             // §19.L5 placement gate (gotcha 12): HostMaterialized members
@@ -10895,68 +11610,135 @@ fn resume_restore_set(
                 entry: entry.clone(),
                 machine_session_id: machine_session_id.clone(),
                 in_turn: shares_session || member_restore_follows_in_mob_source(entry, mob_id),
+                seat_build: roster.seat_build(&entry.agent_identity),
             })
         })
         .collect()
 }
 
+/// The `on_demand_verified` pass of one start: the read-only durable verdict
+/// of every member the plan verified (`VerifyMember`), applied to the mob's
+/// authority in roster order. A member whose durable session cannot be
+/// resumed is recorded Broken through the machine, with the diagnostic its
+/// cold wake would record; every other member stays Dormant. Nothing is
+/// provisioned or registered.
+#[cfg(feature = "runtime-adapter")]
+async fn verify_planned_dormant_members(
+    boot_plan: &super::boot_plan::BootMaterializationPlan,
+    entries: &[RosterEntry],
+    authority: &mut crate::machines::mob_machine::MobMachineAuthority,
+    tool_handle: &MobHandle,
+    ctx: &super::boot_plan::VerifiedPassContext<'_>,
+    successor_index: &mut Option<PersistedMemberSessionIndex>,
+) -> Result<(), MobError> {
+    if boot_plan.verify.is_empty() {
+        return Ok(());
+    }
+    let targets = entries
+        .iter()
+        .filter(|entry| boot_plan.verify.contains(&entry.agent_identity))
+        .filter_map(|entry| {
+            let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+            let session = authority.state().member_session_bindings.get(&identity)?;
+            Some(
+                SessionId::parse(&session.0)
+                    .map_err(|error| {
+                        MobError::Internal(format!(
+                            "the verified boot pass found an invalid session binding '{}' for '{}': {error}",
+                            session.0, entry.agent_identity
+                        ))
+                    })
+                    .map(|session_id| super::boot_plan::VerifiedMemberTarget {
+                        entry: entry.clone(),
+                        session_id,
+                    }),
+            )
+        })
+        .collect::<Result<Vec<_>, MobError>>()?;
+    let verdicts = super::boot_plan::verify_dormant_members(ctx, targets, successor_index).await?;
+    for (target, verdict) in &verdicts {
+        if let Some(diagnostic) =
+            super::boot_plan::apply_verified_member_verdict(authority, target, verdict)?
+        {
+            record_member_restore_failure(tool_handle, &target.entry, diagnostic).await;
+        }
+    }
+    Ok(())
+}
+
 /// What every member's restore reads and nothing in the restore writes.
 #[cfg(feature = "runtime-adapter")]
-struct ResumeMemberRestoreContext<'a> {
-    definition: &'a Arc<MobDefinition>,
-    session_service: &'a Arc<dyn MobSessionService>,
-    provisioner: &'a MultiBackendProvisioner,
+pub(super) struct ResumeMemberRestoreContext<'a> {
+    pub(super) definition: &'a Arc<MobDefinition>,
+    pub(super) session_service: &'a Arc<dyn MobSessionService>,
+    pub(super) provisioner: &'a MultiBackendProvisioner,
     /// The sessions with a live actor when the resume began.
-    active_ids: &'a HashSet<SessionId>,
-    recorded_continuity: &'a RecordedContinuity,
-    spawn_member_customizer: &'a Option<Arc<dyn super::SpawnMemberCustomizer>>,
-    tool_bundles: &'a BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
-    tool_handle: &'a MobHandle,
-    default_external_tools_provider: &'a Option<crate::ExternalToolsProvider>,
-    realm_profile_store: Option<&'a Arc<dyn crate::store::RealmProfileStore>>,
-    default_llm_client: Option<&'a Arc<dyn LlmClient>>,
-    tool_consequence_policy_registry: Option<&'a Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
+    pub(super) active_ids: &'a HashSet<SessionId>,
+    pub(super) recorded_continuity: &'a RecordedContinuity,
+    pub(super) spawn_member_customizer: &'a Option<Arc<dyn super::SpawnMemberCustomizer>>,
+    pub(super) tool_bundles: &'a BTreeMap<String, Arc<dyn AgentToolDispatcher>>,
+    pub(super) tool_handle: &'a MobHandle,
+    pub(super) default_external_tools_provider: &'a Option<crate::ExternalToolsProvider>,
+    pub(super) realm_profile_store: Option<&'a Arc<dyn crate::store::RealmProfileStore>>,
+    pub(super) default_llm_client: Option<&'a Arc<dyn LlmClient>>,
+    pub(super) tool_consequence_policy_registry:
+        Option<&'a Arc<meerkat_core::ToolConsequencePolicyRegistry>>,
+    /// The host's build preparation, asked once per member restore before
+    /// its provision (every boot-set restore and every wake).
+    pub(super) member_build_preparer: Option<&'a Arc<dyn super::MemberBuildPreparer>>,
+    /// The read-only view the host's build preparer receives: the mob's own
+    /// handle as its launch minted it (the owner's authority), on a boot
+    /// restore and on a wake alike. Never `tool_handle` on a wake, whose
+    /// authority is the member tools' agent lane: the preparer is the host's
+    /// callback, and a read handle issues no actor command.
+    pub(super) host_read_handle: &'a super::MobReadHandle,
+    /// Whether a member view the store cannot serve now ends the restore
+    /// with its typed error ([`restore_error_is_retryable`]): a wake, which
+    /// then ends retryable. A start's restore pass fails only that member
+    /// with the read failure as its diagnostic (the boot rule).
+    pub(super) unreadable_view_is_retryable: bool,
 }
 
 /// Everything a member's restore writes, applied in the member's turn.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreCommit<'a> {
-    authority: &'a mut crate::machines::mob_machine::MobMachineAuthority,
-    roster: &'a mut Roster,
-    per_spawn_external_tools_seed: &'a mut super::fork_build::RetainedOverlays,
+pub(super) struct MemberRestoreCommit<'a> {
+    pub(super) authority: &'a mut crate::machines::mob_machine::MobMachineAuthority,
+    pub(super) roster: &'a mut Roster,
+    pub(super) per_spawn_external_tools_seed: &'a mut super::fork_build::RetainedOverlays,
     /// The per-spawn overlay each member was restored with in this pass,
     /// keyed by member: what a fork of that member is restored with.
-    restored_overlays: &'a mut BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
-    tool_handle: &'a MobHandle,
-    composition_binding: &'a super::composition::MobCompositionBinding,
+    pub(super) restored_overlays:
+        &'a mut BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    pub(super) tool_handle: &'a MobHandle,
+    pub(super) composition_binding: &'a super::composition::MobCompositionBinding,
 }
 
 /// The successor search for members whose bound session is absent, run in
 /// those members' turns.
 #[cfg(feature = "runtime-adapter")]
-struct MemberSuccessorSearch<'a> {
-    listed_sessions: &'a [meerkat_core::service::SessionSummary],
-    member_bound_sessions: &'a HashSet<SessionId>,
+pub(super) struct MemberSuccessorSearch<'a> {
+    pub(super) listed_sessions: &'a [meerkat_core::service::SessionSummary],
+    pub(super) member_bound_sessions: &'a HashSet<SessionId>,
     /// Successor search scans the realm at most once for all members.
-    index: &'a mut Option<PersistedMemberSessionIndex>,
+    pub(super) index: &'a mut Option<PersistedMemberSessionIndex>,
     /// Members repointed to a successor whose endpoint was not recovered.
-    recovered_without_endpoint: &'a mut HashSet<AgentIdentity>,
+    pub(super) recovered_without_endpoint: &'a mut HashSet<AgentIdentity>,
 }
 
 /// A member's restore request, settled before its session is resumed.
 #[cfg(feature = "runtime-adapter")]
-struct SeatedMemberRestore {
-    restore_spec: super::handle::SpawnMemberSpec,
-    restore_resume_from_role: Option<ProfileName>,
+pub(super) struct SeatedMemberRestore {
+    pub(super) restore_spec: super::handle::SpawnMemberSpec,
+    pub(super) restore_resume_from_role: Option<ProfileName>,
     /// The per-spawn overlay the member is restored with.
-    restore_overlay: Option<Arc<dyn AgentToolDispatcher>>,
+    pub(super) restore_overlay: Option<Arc<dyn AgentToolDispatcher>>,
 }
 
 /// What a member's restore writes once its request is settled, whatever
 /// happens to its session after: the overlay it is restored with and its
 /// roster entry's effective overrides.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreSeating {
+pub(super) struct MemberRestoreSeating {
     overlay: Option<Arc<dyn AgentToolDispatcher>>,
     overlay_origin: super::fork_build::RetainedOverlayOrigin,
     profile_override: Option<crate::profile::Profile>,
@@ -10965,7 +11747,7 @@ struct MemberRestoreSeating {
 
 /// How far a member's restore got before its turn, and what its turn writes.
 #[cfg(feature = "runtime-adapter")]
-enum MemberRestorePlan {
+pub(super) enum MemberRestorePlan {
     /// The member's live actor serves its bound session: nothing is
     /// restored and nothing is written.
     Kept,
@@ -10978,7 +11760,7 @@ enum MemberRestorePlan {
 }
 
 #[cfg(feature = "runtime-adapter")]
-enum SeatedMemberRestoreOutcome {
+pub(super) enum SeatedMemberRestoreOutcome {
     /// The member's bound session refused its resume without being absent.
     Refused(super::handle::RestoreFailureDiagnostic),
     /// The member's bound session is absent: its turn searches for a
@@ -10995,28 +11777,160 @@ enum SeatedMemberRestoreOutcome {
 /// which the member's turn authorizes on the mob's authority, and how the
 /// provision went.
 #[cfg(feature = "runtime-adapter")]
-struct MemberRestoreProvision {
-    profile: crate::profile::Profile,
-    profile_context: &'static str,
-    outcome: MemberRestoreProvisionOutcome,
+pub(super) struct MemberRestoreProvision {
+    pub(super) profile: crate::profile::Profile,
+    pub(super) profile_context: &'static str,
+    pub(super) outcome: MemberRestoreProvisionOutcome,
 }
 
 #[cfg(feature = "runtime-adapter")]
-enum MemberRestoreProvisionOutcome {
+pub(super) enum MemberRestoreProvisionOutcome {
     /// The member's restore failed after its profile was authorized.
     Failed(super::handle::RestoreFailureDiagnostic),
+    /// The member's restore is to be retried later (`cause`): nothing was
+    /// provisioned, and the member is left dormant.
+    Retryable {
+        reason: String,
+        cause: RetryableRestoreCause,
+    },
     /// The member's durable session was resumed.
     Durable {
         bridge_session_id: SessionId,
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
     },
-    /// A nonpersistent service recreated the member's session.
+    /// Another materialization of the member made its session live while
+    /// this provision built it (the build answered the session identity
+    /// already active, and the session is live): nothing was provisioned,
+    /// and the member is kept on the registration that live session holds,
+    /// as a warm revival keeps it. Defensive: unreachable while each member
+    /// has one open wake attempt and its effect lane holds a new restore
+    /// behind the member's earlier wake, reload and retirement steps; kept
+    /// so that a session live on its own registration is adopted, not
+    /// rebuilt, should that change.
+    AlreadyLive { bridge_session_id: SessionId },
+    /// The member's session was created fresh: a nonpersistent service
+    /// recreated it, or (`seat_session`) the member's first materialization
+    /// created the session its seat named.
     Fresh {
         admitted_bridge_session_id: SessionId,
         receipt: super::handle::MemberSpawnReceipt,
         created_bridge_session_id: SessionId,
+        seat_session: bool,
     },
+}
+
+/// Why a member's restore ended retryable, with nothing provisioned.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum RetryableRestoreCause {
+    /// The host asked to retry the member's build preparation later
+    /// ([`super::MemberBuildPreparationRefusal::Retryable`]).
+    BuildPreparation,
+    /// A seat's first create met a session store, runtime authority or
+    /// hosting claim that is unavailable for now
+    /// ([`seat_create_failure_is_retryable`]): the member stays Dormant
+    /// with its session unborn, and a later delivery wakes it again.
+    SeatCreateUnavailable,
+    /// The restore met work still in flight on the member's session, or a
+    /// store that could not serve it now ([`restore_error_is_retryable`]):
+    /// the member stays Dormant with its boot obligation owed, and its retry
+    /// joins the work still in flight.
+    RestoreUnavailable,
+}
+
+#[cfg(feature = "runtime-adapter")]
+impl RetryableRestoreCause {
+    /// The cause as MobMachine's retryable wake feedback names it.
+    pub(super) fn wake_kind(self) -> mob_dsl::MemberWakeRetryableKind {
+        match self {
+            Self::BuildPreparation => mob_dsl::MemberWakeRetryableKind::BuildPreparationRefused,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                mob_dsl::MemberWakeRetryableKind::ResumeGateUnavailable
+            }
+        }
+    }
+
+    /// The typed refusal a caller waiting on the wake gets.
+    pub(super) fn wake_refusal(self) -> crate::MemberWakeRefusal {
+        match self {
+            Self::BuildPreparation => crate::MemberWakeRefusal::HostPreparationPending,
+            Self::SeatCreateUnavailable | Self::RestoreUnavailable => {
+                crate::MemberWakeRefusal::ResumeGateUnavailable
+            }
+        }
+    }
+}
+
+/// Whether a member's restore failed for a cause that clears on its own,
+/// with its authority kept: a lifecycle operation on the member's session
+/// (the takeover of its exact attachment) still in flight past the caller's
+/// budget or not yet admitted, whose retry joins it, or a session service
+/// that cannot serve the member now ([`session_error_is_retryable`]). Such a
+/// restore never breaks the member: it ends retryable, and the member stays
+/// Dormant with its boot obligation owed. Any other cause breaks only that
+/// member, with its typed reason.
+pub(super) fn restore_error_is_retryable(error: &MobError) -> bool {
+    match error {
+        MobError::LifecycleOperationPending { .. }
+        | MobError::LifecycleOperationAdmissionPending { .. } => true,
+        MobError::SharedLifecycleFailure(inner) => restore_error_is_retryable(inner),
+        MobError::SessionError(error) => session_error_is_retryable(error),
+        _ => false,
+    }
+}
+
+/// Whether a session service failure clears on its own: the store could not
+/// serve the request now
+/// ([`super::actor::SessionStoreFailureClass::Unavailable`]), the session was
+/// busy, its runtime authority was unavailable, another runtime owner holds
+/// its hosting claim (or the claim cannot be taken now), or its external
+/// write authority could not be checked without waiting. A malformed or
+/// refusing persisted state, a durable tail held for or refused by its
+/// recovery (a hold is reported with the member Broken, so its host sees it),
+/// quarantined or diverged durable evidence (which needs its sanctioned
+/// repair), an agent fault and every other typed cause are terminal. The
+/// settlement diagnostics a failure carries never change its class.
+pub(super) fn session_error_is_retryable(error: &meerkat_core::service::SessionError) -> bool {
+    use meerkat_core::service::SessionError;
+
+    match error {
+        SessionError::WithSettlementFailures { error, .. } => session_error_is_retryable(error),
+        SessionError::Store(source) => {
+            super::actor::session_store_failure_class(source.as_ref())
+                == super::actor::SessionStoreFailureClass::Unavailable
+        }
+        SessionError::RuntimeUnavailable { .. }
+        | SessionError::Busy { .. }
+        | SessionError::ServedElsewhere { .. }
+        | SessionError::HostingUnavailable { .. }
+        | SessionError::ExternalWriteFenceBackoff { .. } => true,
+        SessionError::NotFound { .. }
+        | SessionError::PersistenceDisabled
+        | SessionError::CompactionDisabled
+        | SessionError::NotRunning { .. }
+        | SessionError::DurableTailHeldForRecovery { .. }
+        | SessionError::DurableTailRecoveryRefused { .. }
+        | SessionError::DurableEvidenceQuarantined { .. }
+        | SessionError::WholeBlobAuditedEndpointDivergence { .. }
+        | SessionError::Agent(_)
+        | SessionError::FailedWithData { .. }
+        | SessionError::CapabilityUnavailable(_)
+        | SessionError::Unsupported(_)
+        | SessionError::ExternalWriteFenceConflict { .. }
+        | SessionError::ForkInstructionRefused(_) => false,
+    }
+}
+
+/// Whether a seat's first create failed for a cause that clears on its own
+/// ([`session_error_is_retryable`]): the store could not serve the write
+/// now, the session was busy, its runtime authority was unavailable, or
+/// another runtime owner held its hosting claim. Any other cause (a build the
+/// host or the factory refuses, a malformed or refusing persisted state, an
+/// internal fault) breaks the member.
+#[cfg(feature = "runtime-adapter")]
+fn seat_create_failure_is_retryable(error: &MobError) -> bool {
+    matches!(error, MobError::SessionError(error) if session_error_is_retryable(error))
 }
 
 #[cfg(feature = "runtime-adapter")]
@@ -11054,7 +11968,7 @@ const RESUME_RECREATE_MEMBER_PROFILE_AUTHORITY: &str = "resume_recreate_member_p
 /// The diagnostic of a member restore that failed for `reason`, naming the
 /// member's session.
 #[cfg(feature = "runtime-adapter")]
-fn member_restore_failure(
+pub(super) fn member_restore_failure(
     bridge_session_id: &SessionId,
     reason: String,
 ) -> super::handle::RestoreFailureDiagnostic {
@@ -11093,19 +12007,20 @@ fn member_restore_follows_in_mob_source(entry: &RosterEntry, mob_id: &MobId) -> 
         .is_some()
 }
 
-/// The seeded inputs that admit a durable member's restoration on
-/// `authority`, after its session provision owner: its addressability and
-/// the cold restore's materialization verdict.
+/// The seeded input that admits a durable member's restoration on
+/// `authority`, after its session provision owner: its addressability,
+/// refreshed from the current profile.
+///
+/// The member is already Waking under the attempt that authorized this
+/// materialization: the start's `PlanBootMaterialization`, a `WakeMember`,
+/// or the explicit resume's reservation. Only the attempt-fenced resolution
+/// in the member's turn rebinds the placement tuple.
 #[cfg(feature = "runtime-adapter")]
 fn authorize_durable_member_restoration(
     authority: &mut crate::machines::mob_machine::MobMachineAuthority,
     entry: &RosterEntry,
     external_addressable: bool,
 ) -> Result<(), MobError> {
-    // A cold durable restore is the same missing-live materialization
-    // handoff as post-discard revival. Local preparation restores the actor,
-    // not the member placement; only the generated success effect may rebind
-    // that tuple.
     apply_seeded_member_addressability(
         authority,
         &entry.agent_identity,
@@ -11116,18 +12031,6 @@ fn authorize_durable_member_restoration(
         external_addressable,
         "resume_recovered_member_addressability",
     )
-    .and_then(|()| {
-        apply_seeded_mob_signal(
-            authority,
-            mob_dsl::MobMachineSignal::ClassifyMemberLiveMaterialization {
-                agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
-                observation:
-                    mob_dsl::MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
-                reason: "cold resume is restoring the durable member session".to_string(),
-            },
-            "resume_classify_member_materialization",
-        )
-    })
 }
 
 /// A seeded restore input applied again, in the member's turn, to the mob's
@@ -11271,6 +12174,7 @@ async fn restore_resumed_members(
                         base,
                         super::fork_build::ForkOverlayRule::Own,
                         no_restored_overlays,
+                        None,
                     )
                     .await
                     .map(MemberRestoreStep::Planned)
@@ -11360,7 +12264,10 @@ async fn release_unapplied_member_restore(
     let receipt = match &provision.outcome {
         MemberRestoreProvisionOutcome::Durable { receipt, .. }
         | MemberRestoreProvisionOutcome::Fresh { receipt, .. } => receipt,
-        MemberRestoreProvisionOutcome::Failed(_) => return,
+        // Nothing was provisioned.
+        MemberRestoreProvisionOutcome::Failed(_)
+        | MemberRestoreProvisionOutcome::Retryable { .. }
+        | MemberRestoreProvisionOutcome::AlreadyLive { .. } => return,
     };
     let released = match receipt.session_origin {
         super::provisioner::ProvisionSessionOrigin::Fresh => {
@@ -11631,6 +12538,7 @@ async fn apply_member_restore_step(
                 commit.authority,
                 fork_rule,
                 commit.restored_overlays,
+                None,
             ))
             .await?
         }
@@ -11644,14 +12552,22 @@ async fn apply_member_restore_step(
 ///
 /// `fork_rule` is the member's overlay rule, and `restored_overlays` the
 /// overlays the members restored before it in this pass were restored with,
-/// which a rule that follows the member's source reads.
+/// which a rule that follows the member's source reads. `retained` is the
+/// overlay this process last built the member with (a wake of a member it
+/// built before), which the member keeps, as its warm revival does, unless
+/// its source is gone. That holds for a member's own overlay too: an
+/// in-process wake leaves its tools as they were while it was live, as a
+/// member that stayed live keeps them until a respawn or a restart, and the
+/// customizer is not asked for them again. A restore of members this process
+/// never built passes `None`.
 #[cfg(feature = "runtime-adapter")]
-async fn restore_resumed_member(
+pub(super) async fn restore_resumed_member(
     ctx: &ResumeMemberRestoreContext<'_>,
     candidate: &ResumeRestoreCandidate,
     base: &crate::machines::mob_machine::MobMachineAuthority,
     fork_rule: super::fork_build::ForkOverlayRule,
     restored_overlays: &BTreeMap<AgentIdentity, Option<Arc<dyn AgentToolDispatcher>>>,
+    retained: Option<&super::fork_build::RetainedMemberOverlay>,
 ) -> Result<MemberRestorePlan, MobError> {
     let entry = &candidate.entry;
     let definition = ctx.definition;
@@ -11679,7 +12595,13 @@ async fn restore_resumed_member(
     } else {
         false
     };
-    if ctx.active_ids.contains(&bridge_session_id) && !replaced_for_explicit_resume {
+    // A live actor this restore would keep: kept as before when no host spec
+    // names a binding for the member (a fork-derived member, or no
+    // customizer); otherwise kept only once the spec below is known and the
+    // actor runs its binding.
+    let keeps_live_actor =
+        ctx.active_ids.contains(&bridge_session_id) && !replaced_for_explicit_resume;
+    if keeps_live_actor && (entry.fork_source.is_some() || spawn_member_customizer.is_none()) {
         return Ok(MemberRestorePlan::Kept);
     }
 
@@ -11688,7 +12610,9 @@ async fn restore_resumed_member(
     // first build (see `fork_build`). What the bound session holds, read
     // once, for the customizer's resume view (an ordinary member only; a
     // fork-derived member's rebuild is not customized). A failed read fails
-    // this member's restore, like any other per-member restore failure.
+    // this member's restore, like any other per-member restore failure; on a
+    // wake, a read the store cannot serve now ends the restore with its typed
+    // error instead, and the wake ends retryable.
     let restore_view = if entry.fork_source.is_none() && spawn_member_customizer.is_some() {
         match super::fork_build::load_resumed_member_view(
             session_service.as_ref(),
@@ -11697,6 +12621,11 @@ async fn restore_resumed_member(
         .await
         {
             Ok(view) => view,
+            Err(error)
+                if ctx.unreadable_view_is_retryable && restore_error_is_retryable(&error) =>
+            {
+                return Err(error);
+            }
             Err(error) => {
                 return Ok(MemberRestorePlan::Unseated(member_restore_failure(
                     &bridge_session_id,
@@ -11711,11 +12640,14 @@ async fn restore_resumed_member(
     // this member's restore with the refusal as its diagnostic; the rest of
     // the mob still comes up, and the member is restored once the customizer
     // admits it.
-    let restore_spec = match super::fork_build::rebuild_resume_spec(
+    // A seat's build inputs are set on the request before the customizer,
+    // as a spawn's caller sets a spawn's: the customizer runs over them.
+    let restore_spec = match super::fork_build::rebuild_seat_resume_spec(
         &definition.id,
         spawn_member_customizer.as_ref(),
         entry,
         &restore_view,
+        candidate.seat_build.as_deref(),
     ) {
         Ok(spec) => spec,
         Err(error) => {
@@ -11753,6 +12685,32 @@ async fn restore_resumed_member(
             entry.agent_identity, bridge_session_id, customized_session_id
         )));
     }
+    if keeps_live_actor {
+        // The live actor runs the binding the spec names, or it is not
+        // reused: this member's restore fails, typed, nothing is built, and
+        // the live actor is retired so no surface reaches the old binding.
+        if let Some(requested) = restore_spec.auth_binding.as_ref()
+            && let Err(conflict) = super::live_actor_binding::verify_live_actor_auth_binding(
+                session_service.as_ref(),
+                &entry.agent_identity,
+                &bridge_session_id,
+                requested,
+            )
+            .await
+        {
+            let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+                session_service.as_ref(),
+                &bridge_session_id,
+                &conflict,
+            )
+            .await;
+            return Ok(MemberRestorePlan::Unseated(member_restore_failure(
+                &bridge_session_id,
+                reason,
+            )));
+        }
+        return Ok(MemberRestorePlan::Kept);
+    }
     let restore_resume_from_role = restore_resume_from_role.clone();
     // The overlay this member is restored with: the customizer's overlay for
     // its own identity, except for a fork-derived member seated with its
@@ -11769,42 +12727,59 @@ async fn restore_resumed_member(
         )
     };
     let mut restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Own;
-    let restore_overlay = match fork_rule {
-        super::fork_build::ForkOverlayRule::Own => own_overlay()?,
-        super::fork_build::ForkOverlayRule::Caller => {
-            let own = own_overlay()?;
-            if own.is_none() {
-                super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
-            }
-            own
-        }
-        super::fork_build::ForkOverlayRule::FollowSource(source) => {
-            match restored_overlays.get(&source).cloned() {
-                Some(source_overlay) => {
-                    restore_overlay_origin = super::fork_build::RetainedOverlayOrigin::Inherited;
-                    source_overlay
+    // A member this process built before keeps the overlay it was built
+    // with, as its warm revival does (`fork_build`): the customizer is asked
+    // only for a member nothing is retained for. A fork whose source is gone
+    // or replaced is the exception: it takes the overlay for its own
+    // identity, below.
+    let retained = retained.filter(|_| {
+        !matches!(
+            fork_rule,
+            super::fork_build::ForkOverlayRule::SourceUnavailable(_)
+        )
+    });
+    let restore_overlay = if let Some(retained) = retained {
+        restore_overlay_origin = retained.origin;
+        Some(Arc::clone(&retained.overlay))
+    } else {
+        match fork_rule {
+            super::fork_build::ForkOverlayRule::Own => own_overlay()?,
+            super::fork_build::ForkOverlayRule::Caller => {
+                let own = own_overlay()?;
+                if own.is_none() {
+                    super::fork_build::warn_caller_overlay_not_resupplied(&definition.id, entry);
                 }
-                None => {
-                    let own = own_overlay()?;
-                    super::fork_build::warn_fork_source_unavailable(
-                        &definition.id,
-                        entry,
-                        &super::fork_build::ForkSourceUnavailable::NotRebuilt,
-                        own.is_some(),
-                    );
-                    own
+                own
+            }
+            super::fork_build::ForkOverlayRule::FollowSource(source) => {
+                match restored_overlays.get(&source).cloned() {
+                    Some(source_overlay) => {
+                        restore_overlay_origin =
+                            super::fork_build::RetainedOverlayOrigin::Inherited;
+                        source_overlay
+                    }
+                    None => {
+                        let own = own_overlay()?;
+                        super::fork_build::warn_fork_source_unavailable(
+                            &definition.id,
+                            entry,
+                            &super::fork_build::ForkSourceUnavailable::NotRebuilt,
+                            own.is_some(),
+                        );
+                        own
+                    }
                 }
             }
-        }
-        super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
-            let own = own_overlay()?;
-            super::fork_build::warn_fork_source_unavailable(
-                &definition.id,
-                entry,
-                &reason,
-                own.is_some(),
-            );
-            own
+            super::fork_build::ForkOverlayRule::SourceUnavailable(reason) => {
+                let own = own_overlay()?;
+                super::fork_build::warn_fork_source_unavailable(
+                    &definition.id,
+                    entry,
+                    &reason,
+                    own.is_some(),
+                );
+                own
+            }
         }
     };
     // The member's turn seeds the actor's retention map with the overlay
@@ -11823,12 +12798,18 @@ async fn restore_resumed_member(
         restore_overlay,
     };
 
+    // A seat that built nothing named a session no build has created yet:
+    // its first materialization creates that session, as a spawn creates
+    // its own, under the id the seat named.
+    let seat_session_unborn =
+        super::boot_plan::domain_member_seat_session_unborn(base.state(), &entry.agent_identity);
     let outcome = if matches!(entry.member_ref, MemberRef::Session { .. })
         && session_service.supports_persistent_sessions()
     {
         // Typed observation FIRST: Active and Revivable both flow into the
         // resumed provisioning/revival transaction below; only a genuinely
-        // ABSENT session may trigger the replacement search;
+        // ABSENT session may trigger the replacement search, or the create
+        // of a seat's unborn session;
         // archived-but-not-revivable is a typed refusal (the transcript is
         // intact on disk; rotating to a replacement session would silently
         // abandon it).
@@ -11872,9 +12853,23 @@ async fn restore_resumed_member(
             super::session_service::SessionResumeVerdict::Rejected(rejection)
                 if rejection.kind != super::session_service::ResumeRejectionKind::Absent =>
             {
-                SeatedMemberRestoreOutcome::Refused(member_restore_failure(
-                    &bridge_session_id,
-                    rejection.detail,
+                let hold = rejection.durable_resume_hold();
+                SeatedMemberRestoreOutcome::Refused(super::handle::RestoreFailureDiagnostic {
+                    hold,
+                    ..member_restore_failure(&bridge_session_id, rejection.detail)
+                })
+            }
+            super::session_service::SessionResumeVerdict::Rejected(_) if seat_session_unborn => {
+                SeatedMemberRestoreOutcome::Provision(Box::new(
+                    provision_fresh_member_restore(
+                        ctx,
+                        entry,
+                        &seated,
+                        &bridge_session_id,
+                        base,
+                        FreshRestoreSession::UnbornSeat,
+                    )
+                    .await?,
                 ))
             }
             super::session_service::SessionResumeVerdict::Rejected(_) => {
@@ -11885,18 +12880,99 @@ async fn restore_resumed_member(
             }
         }
     } else {
-        // Ephemeral services can still fall back to fresh-create.
+        // Ephemeral services can still fall back to fresh-create; a seat's
+        // unborn session is created under the id the seat named.
+        let session = if seat_session_unborn {
+            FreshRestoreSession::UnbornSeat
+        } else {
+            FreshRestoreSession::New
+        };
         SeatedMemberRestoreOutcome::Provision(Box::new(
-            provision_fresh_member_restore(ctx, entry, &seated, &bridge_session_id, base).await?,
+            provision_fresh_member_restore(ctx, entry, &seated, &bridge_session_id, base, session)
+                .await?,
         ))
     };
     Ok(MemberRestorePlan::Seated { seating, outcome })
 }
 
+/// Remove the run-start hold the host's build preparation staged for the
+/// member's next registration (`HoldUntilReleased`) once the provision it
+/// was staged for failed: no registration will apply it, and the member's
+/// next build is prepared again. Nothing happens without a preparer.
+#[cfg(feature = "runtime-adapter")]
+async fn unstage_member_build_hold(ctx: &ResumeMemberRestoreContext<'_>, session_id: &SessionId) {
+    if ctx.member_build_preparer.is_none() {
+        return;
+    }
+    if let Err(error) = ctx
+        .provisioner
+        .unstage_member_registration_run_start_hold(
+            &MemberRef::from_bridge_session_id(session_id.clone()),
+            meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+        )
+        .await
+    {
+        tracing::warn!(
+            session_id = %session_id,
+            %error,
+            "a failed provision's staged run-start hold could not be removed"
+        );
+    }
+}
+
+/// Ask the host's build preparer, when one is configured, before a member's
+/// provision. `Ok(None)` proceeds (a requested hold is staged on the member's
+/// next registration first); `Ok(Some(outcome))` is the provision outcome a
+/// refusal ends the member's restore with.
+#[cfg(feature = "runtime-adapter")]
+async fn prepare_member_build_before_provision(
+    ctx: &ResumeMemberRestoreContext<'_>,
+    entry: &RosterEntry,
+    bridge_session_id: &SessionId,
+    authority: &crate::machines::mob_machine::MobMachineAuthority,
+) -> Result<Option<MemberRestoreProvisionOutcome>, MobError> {
+    let Some(preparer) = ctx.member_build_preparer else {
+        return Ok(None);
+    };
+    let request = super::member_build_preparer::MemberBuildPreparation {
+        agent_identity: entry.agent_identity.clone(),
+        session_id: bridge_session_id.clone(),
+        handle: ctx.host_read_handle.clone(),
+        wired_peers: super::member_build_preparer::member_build_wired_peers(
+            authority.state(),
+            &entry.agent_identity,
+        ),
+    };
+    match preparer.prepare_member_build(request).await {
+        Ok(super::MemberBuildPrepared::Prepared) => Ok(None),
+        Ok(super::MemberBuildPrepared::HoldUntilReleased) => {
+            ctx.provisioner
+                .stage_member_registration_run_start_hold_only(
+                    &MemberRef::from_bridge_session_id(bridge_session_id.clone()),
+                    meerkat_runtime::RunStartHoldReason::ToolsNotPublished,
+                )
+                .await?;
+            Ok(None)
+        }
+        Err(super::MemberBuildPreparationRefusal::Retryable { reason }) => {
+            Ok(Some(MemberRestoreProvisionOutcome::Retryable {
+                reason,
+                cause: RetryableRestoreCause::BuildPreparation,
+            }))
+        }
+        Err(super::MemberBuildPreparationRefusal::Final { reason }) => Ok(Some(
+            MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                bridge_session_id,
+                format!("the host refused to prepare the member's build: {reason}"),
+            )),
+        )),
+    }
+}
+
 /// Resume `entry`'s durable session `bridge_session_id`, as
 /// `authorized_resume` admits it, on the member's own fork of `base`.
 #[cfg(feature = "runtime-adapter")]
-async fn provision_durable_member_restore(
+pub(super) async fn provision_durable_member_restore(
     ctx: &ResumeMemberRestoreContext<'_>,
     entry: &RosterEntry,
     seated: &SeatedMemberRestore,
@@ -11963,7 +13039,7 @@ async fn provision_durable_member_restore(
                 seated.restore_overlay.clone(),
                 None,
             )?,
-            compaction_curator_override: None,
+            compaction_curator_override: restore_spec.compaction_curator_override.clone(),
             context: restore_spec.context.clone(),
             labels: Some(restore_labels.clone()),
             additional_instructions: restore_spec.additional_instructions.clone(),
@@ -11993,6 +13069,7 @@ async fn provision_durable_member_restore(
         &mut resumed_config,
         super::tools::resolve_profile_bundle_tools(&profile, ctx.tool_bundles),
     );
+    apply_restore_spec_build_inputs(&mut resumed_config, restore_spec);
     resumed_config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
     // A fork-derived member is rebuilt with its persisted lineage.
     resumed_config.fork_source = entry.fork_source.clone();
@@ -12015,7 +13092,8 @@ async fn provision_durable_member_restore(
         "You have been spawned as '{}' (role: {}) in mob '{}'.",
         entry.agent_identity, entry.role, definition.id
     );
-    let req = build::to_create_session_request(&resumed_config, prompt.into());
+    let mut req = build::to_create_session_request(&resumed_config, prompt.into());
+    apply_restore_spec_budget_limits(&mut req, restore_spec);
     let peer_name = match super::actor::render_member_comms_name(
         definition.id.as_str(),
         entry.role.as_str(),
@@ -12082,6 +13160,16 @@ async fn provision_durable_member_restore(
             ));
         }
     };
+    // The host prepares the member's build before its provision.
+    if let Some(outcome) =
+        prepare_member_build_before_provision(ctx, entry, bridge_session_id, &authority).await?
+    {
+        return Ok(MemberRestoreProvision {
+            profile,
+            profile_context: PROFILE_CONTEXT,
+            outcome,
+        });
+    }
     let outcome = match ctx
         .provisioner
         .provision_member(super::provisioner::ProvisionMemberRequest {
@@ -12118,20 +13206,82 @@ async fn provision_durable_member_restore(
             }
         }
         Err(error) => {
-            // The provision's refusal slot is the only source of this typed
-            // refusal; the seed records its code, and the transaction's own
-            // rollback already removed the registration the host was asked
-            // about.
-            let registration_refusal = match &error {
-                MobError::MemberRegistrationRefused { call, .. } => Some(*call),
-                _ => None,
-            };
-            MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
-                bridge_session_id: Some(bridge_session_id.clone()),
-                reason: format!("failed to restore durable session '{bridge_session_id}': {error}"),
-                hold: None,
-                registration_refusal,
-            })
+            // The build found the member's session identity already active
+            // and the session is live: another materialization of the member
+            // made it live meanwhile, and it is kept, as a warm revival keeps
+            // it, on the binding the restore spec names only, as every reuse
+            // of a live actor (`live_actor_binding`).
+            let identity_in_use = matches!(
+                &error,
+                MobError::SessionError(meerkat_core::service::SessionError::Agent(
+                    meerkat_core::error::AgentError::SessionIdentityInUse(session_id),
+                )) if session_id == bridge_session_id
+            );
+            let already_live = identity_in_use
+                && matches!(
+                    ctx.session_service
+                        .has_live_session(bridge_session_id)
+                        .await,
+                    Ok(true)
+                );
+            unstage_member_build_hold(ctx, bridge_session_id).await;
+            if already_live {
+                // A live actor on another binding is never adopted: the
+                // member's restore fails with the conflict, and the actor is
+                // retired so no surface reaches the old binding.
+                let conflict = match restore_spec.auth_binding.as_ref() {
+                    Some(requested) => super::live_actor_binding::verify_live_actor_auth_binding(
+                        ctx.session_service.as_ref(),
+                        &entry.agent_identity,
+                        bridge_session_id,
+                        requested,
+                    )
+                    .await
+                    .err(),
+                    None => None,
+                };
+                match conflict {
+                    Some(conflict) => {
+                        let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+                            ctx.session_service.as_ref(),
+                            bridge_session_id,
+                            &conflict,
+                        )
+                        .await;
+                        MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                            bridge_session_id,
+                            reason,
+                        ))
+                    }
+                    None => MemberRestoreProvisionOutcome::AlreadyLive {
+                        bridge_session_id: bridge_session_id.clone(),
+                    },
+                }
+            } else {
+                // The provision's refusal slot is the only source of this
+                // typed refusal; the seed records its code, and the
+                // transaction's own rollback already removed the registration
+                // the host was asked about. The member's record keeps the
+                // host's own reason: a later answer of the recorded refusal
+                // (the member's wake, an `ensure_member_live`) is the refusal
+                // its host gave, not that refusal nested in this restore's
+                // diagnostic.
+                let (registration_refusal, reason) = match &error {
+                    MobError::MemberRegistrationRefused { call, reason, .. } => {
+                        (Some(*call), reason.clone())
+                    }
+                    _ => (
+                        None,
+                        format!("failed to restore durable session '{bridge_session_id}': {error}"),
+                    ),
+                };
+                MemberRestoreProvisionOutcome::Failed(super::handle::RestoreFailureDiagnostic {
+                    bridge_session_id: Some(bridge_session_id.clone()),
+                    reason,
+                    hold: None,
+                    registration_refusal,
+                })
+            }
         }
     };
     Ok(MemberRestoreProvision {
@@ -12141,8 +13291,54 @@ async fn provision_durable_member_restore(
     })
 }
 
-/// Recreate `entry`'s session with a fresh one on a nonpersistent service,
-/// on the member's own fork of `base`.
+/// The restore spec's build inputs a spawn's build takes and the restore's
+/// build parameters do not carry: the tool dispatch admission and the web
+/// search override. For an unborn seat they are the seat's (see
+/// `fork_build::rebuild_seat_resume_spec`); for any member the customizer's
+/// resume request may set them, as a spawn's caller does.
+#[cfg(feature = "runtime-adapter")]
+fn apply_restore_spec_build_inputs(
+    config: &mut meerkat::AgentBuildConfig,
+    restore_spec: &super::handle::SpawnMemberSpec,
+) {
+    config
+        .tool_dispatch_admission
+        .clone_from(&restore_spec.tool_dispatch_admission);
+    config.override_web_search = restore_spec.tool_category_overrides.web_search;
+}
+
+/// The restore spec's budget limits on the build of `req`, as a spawn sets
+/// its own; none leaves the build's limits as they are.
+#[cfg(feature = "runtime-adapter")]
+fn apply_restore_spec_budget_limits(
+    req: &mut meerkat_core::service::CreateSessionRequest,
+    restore_spec: &super::handle::SpawnMemberSpec,
+) {
+    if let Some(limits) = restore_spec.budget_limits.clone() {
+        req.build
+            .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
+            .budget_limits = Some(limits);
+    }
+}
+
+/// The session a fresh restore creates.
+#[cfg(feature = "runtime-adapter")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FreshRestoreSession {
+    /// A new session under a new id, which the member is then bound to: a
+    /// session service that keeps no durable sessions lost the bound one.
+    New,
+    /// The session the member's seat named and no build has created yet,
+    /// under the id the seat named: the member's binding, its journal row
+    /// and its stored comms key already name it.
+    UnbornSeat,
+}
+
+/// Create `entry`'s session fresh, on the member's own fork of `base`: a new
+/// one on a service that keeps no durable sessions, or the one its seat
+/// named and no build created yet (`session`). Either way the provision is
+/// a spawn's: the host's build preparation first, then the registration the
+/// host may refuse, typed.
 #[cfg(feature = "runtime-adapter")]
 async fn provision_fresh_member_restore(
     ctx: &ResumeMemberRestoreContext<'_>,
@@ -12150,6 +13346,7 @@ async fn provision_fresh_member_restore(
     seated: &SeatedMemberRestore,
     bridge_session_id: &SessionId,
     base: &crate::machines::mob_machine::MobMachineAuthority,
+    session: FreshRestoreSession,
 ) -> Result<MemberRestoreProvision, MobError> {
     const PROFILE_CONTEXT: &str = RESUME_RECREATE_MEMBER_PROFILE_AUTHORITY;
     let definition = ctx.definition;
@@ -12177,6 +13374,68 @@ async fn provision_fresh_member_restore(
     if restore_spec.inherited_tool_filter.is_some() && restore_profile_override.is_none() {
         build::open_profile_tool_categories_for_inherited_filter(&mut profile);
     }
+    let outcome = match provision_fresh_member_session(
+        ctx,
+        entry,
+        seated,
+        bridge_session_id,
+        base,
+        session,
+        &profile,
+        restore_labels,
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        // A seat's first create ends only its own member's restore, whatever
+        // refused it: a start or a wake goes on with every other member. A
+        // cause that clears on its own leaves the member Dormant with its
+        // session unborn, for a later delivery to wake; any other breaks it.
+        Err(error) if session == FreshRestoreSession::UnbornSeat => {
+            let reason = format!(
+                "failed to create the session of member '{}': {error}",
+                entry.agent_identity
+            );
+            if seat_create_failure_is_retryable(&error) {
+                MemberRestoreProvisionOutcome::Retryable {
+                    reason,
+                    cause: RetryableRestoreCause::SeatCreateUnavailable,
+                }
+            } else {
+                MemberRestoreProvisionOutcome::Failed(member_restore_failure(
+                    bridge_session_id,
+                    reason,
+                ))
+            }
+        }
+        Err(error) => return Err(error),
+    };
+    Ok(MemberRestoreProvision {
+        profile,
+        profile_context: PROFILE_CONTEXT,
+        outcome,
+    })
+}
+
+/// The create of [`provision_fresh_member_restore`] once the member's
+/// profile is resolved: its build, its preparation by the host and its
+/// provision. A refusal the outcome carries ends the member's restore; an
+/// error is the caller's to classify.
+#[cfg(feature = "runtime-adapter")]
+#[allow(clippy::too_many_arguments)]
+async fn provision_fresh_member_session(
+    ctx: &ResumeMemberRestoreContext<'_>,
+    entry: &RosterEntry,
+    seated: &SeatedMemberRestore,
+    bridge_session_id: &SessionId,
+    base: &crate::machines::mob_machine::MobMachineAuthority,
+    session: FreshRestoreSession,
+    profile: &crate::profile::Profile,
+    restore_labels: BTreeMap<String, String>,
+) -> Result<MemberRestoreProvisionOutcome, MobError> {
+    const PROFILE_CONTEXT: &str = RESUME_RECREATE_MEMBER_PROFILE_AUTHORITY;
+    let definition = ctx.definition;
+    let restore_spec = &seated.restore_spec;
     // The member's own fork of the recovered authority stands in for the
     // provision authority: its turn applies the same inputs to the mob's.
     let mut authority = base.fork();
@@ -12184,7 +13443,7 @@ async fn provision_fresh_member_restore(
         &mut authority,
         &entry.agent_identity,
         &entry.role,
-        &profile,
+        profile,
         None,
         PROFILE_CONTEXT,
     )?;
@@ -12196,20 +13455,20 @@ async fn provision_fresh_member_restore(
         mob_id: &definition.id,
         profile_name: &entry.role,
         agent_identity: &entry.agent_identity,
-        profile: &profile,
+        profile,
         definition,
         realm_profile_store: ctx.realm_profile_store,
         external_tools: compose_external_tools_for_profile(
-            &profile,
+            profile,
             ctx.tool_bundles,
             ctx.tool_handle.clone(),
             default_ext_fresh,
             seated.restore_overlay.clone(),
             None,
         )?,
-        compaction_curator_override: None,
+        compaction_curator_override: restore_spec.compaction_curator_override.clone(),
         context: restore_spec.context.clone(),
-        labels: Some(restore_labels.clone()),
+        labels: Some(restore_labels),
         additional_instructions: restore_spec.additional_instructions.clone(),
         shell_env: restore_spec.shell_env.clone(),
         mob_tool_authority_context: None,
@@ -12221,8 +13480,9 @@ async fn provision_fresh_member_restore(
     .await?;
     super::tools::attach_declared_bundle_tools(
         &mut config,
-        super::tools::resolve_profile_bundle_tools(&profile, ctx.tool_bundles),
+        super::tools::resolve_profile_bundle_tools(profile, ctx.tool_bundles),
     );
+    apply_restore_spec_build_inputs(&mut config, restore_spec);
     config.keep_alive = entry.runtime_mode == crate::MobRuntimeMode::AutonomousHost;
     config.fork_source = entry.fork_source.clone();
     if let Some(ref auth_binding) = restore_spec.auth_binding {
@@ -12244,7 +13504,8 @@ async fn provision_fresh_member_restore(
         "You have been spawned as '{}' (role: {}) in mob '{}'.",
         entry.agent_identity, entry.role, definition.id
     );
-    let req = build::to_create_session_request(&config, prompt.into());
+    let mut req = build::to_create_session_request(&config, prompt.into());
+    apply_restore_spec_budget_limits(&mut req, restore_spec);
     let peer_name = super::actor::render_member_comms_name(
         definition.id.as_str(),
         entry.role.as_str(),
@@ -12253,9 +13514,7 @@ async fn provision_fresh_member_restore(
     let continuity_intent = match entry_continuity_intent(ctx.recorded_continuity, entry) {
         Ok(intent) => intent,
         Err(reason) => {
-            return Ok(MemberRestoreProvision::failed(
-                profile,
-                PROFILE_CONTEXT,
+            return Ok(MemberRestoreProvisionOutcome::Failed(
                 member_restore_failure(bridge_session_id, reason),
             ));
         }
@@ -12276,6 +13535,13 @@ async fn provision_fresh_member_restore(
         held_bound: None,
         continuity_intent,
     };
+    if session == FreshRestoreSession::UnbornSeat {
+        provision_request
+            .create_session
+            .build
+            .get_or_insert_with(meerkat_core::service::SessionBuildOptions::default)
+            .mint_session_with_id(bridge_session_id.clone());
+    }
     let admitted_bridge_session_id =
         super::actor::admit_bridge_session_for_spawn(&mut provision_request.create_session);
     provision_request.generated_self_owned_operation_owner =
@@ -12286,25 +13552,36 @@ async fn provision_fresh_member_restore(
             &admitted_bridge_session_id,
             "resume_fresh_member_session_provision_owner",
         )?);
+    // The host prepares the member's build before its provision.
+    if let Some(outcome) =
+        prepare_member_build_before_provision(ctx, entry, &admitted_bridge_session_id, &authority)
+            .await?
+    {
+        return Ok(outcome);
+    }
     let receipt = match ctx.provisioner.provision_member(provision_request).await {
         Ok(receipt) => receipt,
         Err(error) => {
+            unstage_member_build_hold(ctx, &admitted_bridge_session_id).await;
             // A host refusal of this member's registration breaks only this
             // member, as on the durable arm: the seed records the refusal's
             // code, and the transaction's own rollback already removed the
-            // registration the host was asked about. Any other failure still
-            // fails the resume.
+            // registration the host was asked about. Any other failure is
+            // the caller's to classify (a seat's first create breaks only its
+            // member; a recreation fails the resume).
             let registration_refusal = match &error {
                 MobError::MemberRegistrationRefused { call, .. } => *call,
                 _ => return Err(error),
             };
-            return Ok(MemberRestoreProvision::failed(
-                profile,
-                PROFILE_CONTEXT,
+            let created = match session {
+                FreshRestoreSession::New => "recreate",
+                FreshRestoreSession::UnbornSeat => "create",
+            };
+            return Ok(MemberRestoreProvisionOutcome::Failed(
                 super::handle::RestoreFailureDiagnostic {
                     bridge_session_id: Some(bridge_session_id.clone()),
                     reason: format!(
-                        "failed to recreate the session of member '{}': {error}",
+                        "failed to {created} the session of member '{}': {error}",
                         entry.agent_identity
                     ),
                     hold: None,
@@ -12324,20 +13601,17 @@ async fn provision_fresh_member_restore(
                     entry.agent_identity
                 ))
             })?;
-    Ok(MemberRestoreProvision {
-        profile,
-        profile_context: PROFILE_CONTEXT,
-        outcome: MemberRestoreProvisionOutcome::Fresh {
-            admitted_bridge_session_id,
-            receipt,
-            created_bridge_session_id,
-        },
+    Ok(MemberRestoreProvisionOutcome::Fresh {
+        admitted_bridge_session_id,
+        receipt,
+        created_bridge_session_id,
+        seat_session: session == FreshRestoreSession::UnbornSeat,
     })
 }
 
 /// Apply, in `entry`'s turn, what its restore writes.
 #[cfg(feature = "runtime-adapter")]
-async fn apply_member_restore_plan(
+pub(super) async fn apply_member_restore_plan(
     ctx: &ResumeMemberRestoreContext<'_>,
     commit: &mut MemberRestoreCommit<'_>,
     successors: &mut MemberSuccessorSearch<'_>,
@@ -12345,7 +13619,20 @@ async fn apply_member_restore_plan(
     plan: MemberRestorePlan,
 ) -> Result<(), MobError> {
     let (seating, outcome) = match plan {
-        MemberRestorePlan::Kept => return Ok(()),
+        // The member's live actor serves its bound session: nothing is
+        // provisioned, and the attempt that authorized this materialization
+        // resolves bound on the registration the actor already holds.
+        MemberRestorePlan::Kept => {
+            let Some(session_id) = entry.member_ref.bridge_session_id().cloned() else {
+                return resolve_seeded_member_runtime_restoration(
+                    commit.authority,
+                    &entry.agent_identity,
+                    commit.composition_binding,
+                )
+                .await;
+            };
+            return resolve_restored_member_bound(commit, entry, &session_id).await;
+        }
         MemberRestorePlan::Unseated(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
             return Ok(());
@@ -12451,6 +13738,33 @@ async fn restore_member_on_successor(
         .await?;
     let reuse_active_replacement =
         ctx.active_ids.contains(&replacement_session_id) && !replacement_rebuilt;
+    // A live successor is kept only when it runs the binding the member's
+    // spec names; otherwise this member's restore fails, typed, before
+    // anything is repointed, and the live actor is not reused.
+    if reuse_active_replacement
+        && let Some(requested) = seated.restore_spec.auth_binding.as_ref()
+        && let Err(conflict) = super::live_actor_binding::verify_live_actor_auth_binding(
+            session_service.as_ref(),
+            &entry.agent_identity,
+            &replacement_session_id,
+            requested,
+        )
+        .await
+    {
+        let reason = super::live_actor_binding::refuse_conflicting_live_actor(
+            session_service.as_ref(),
+            &replacement_session_id,
+            &conflict,
+        )
+        .await;
+        record_member_restore_failure(
+            commit.tool_handle,
+            entry,
+            member_restore_failure(&replacement_session_id, reason),
+        )
+        .await;
+        return Ok(None);
+    }
     let recovered_endpoint = if reuse_active_replacement {
         let member_ref = MemberRef::from_bridge_session_id(replacement_session_id.clone());
         let fallback_name = super::actor::render_member_comms_name(
@@ -12575,6 +13889,60 @@ async fn apply_member_restore_provision(
         MemberRestoreProvisionOutcome::Failed(diagnostic) => {
             record_member_restore_failure(commit.tool_handle, entry, diagnostic).await;
         }
+        // Nothing was provisioned: the member's attempt resolves bound on the
+        // registration its live session already holds, as a kept live actor
+        // does.
+        MemberRestoreProvisionOutcome::AlreadyLive { bridge_session_id } => {
+            if let Err(error) =
+                resolve_restored_member_bound(commit, entry, &bridge_session_id).await
+            {
+                record_member_restore_failure(
+                    commit.tool_handle,
+                    entry,
+                    member_restore_failure(
+                        &bridge_session_id,
+                        format!("failed to restore member runtime binding: {error}"),
+                    ),
+                )
+                .await;
+                return Ok(());
+            }
+            commit
+                .tool_handle
+                .restore_diagnostics
+                .write()
+                .await
+                .remove(&entry.agent_identity);
+        }
+        MemberRestoreProvisionOutcome::Retryable { reason, cause } => {
+            // Nothing was provisioned: the member's open wake attempt ends
+            // retryable (Waking -> Dormant), and a later delivery, or the
+            // owed-boot retry, wakes it again.
+            let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+            if let Some(attempt) = commit
+                .authority
+                .state()
+                .member_wake_attempts
+                .get(&dsl_identity)
+                .copied()
+            {
+                apply_seeded_mob_signal(
+                    commit.authority,
+                    mob_dsl::MobMachineSignal::ResolveMemberRevivalRetryable {
+                        agent_identity: dsl_identity,
+                        attempt,
+                        kind: cause.wake_kind(),
+                    },
+                    "resume_member_restore_retryable",
+                )?;
+            }
+            tracing::info!(
+                member = %entry.agent_identity,
+                ?cause,
+                %reason,
+                "the member's restore is to be retried; the member stays dormant"
+            );
+        }
         MemberRestoreProvisionOutcome::Durable {
             bridge_session_id,
             receipt,
@@ -12618,12 +13986,8 @@ async fn apply_member_restore_provision(
                 .await;
                 return Ok(());
             }
-            if let Err(error) = resolve_seeded_member_runtime_restoration(
-                commit.authority,
-                &entry.agent_identity,
-                commit.composition_binding,
-            )
-            .await
+            if let Err(error) =
+                resolve_restored_member_bound(commit, entry, &created_bridge_session_id).await
             {
                 record_member_restore_failure(
                     commit.tool_handle,
@@ -12651,6 +14015,7 @@ async fn apply_member_restore_provision(
             admitted_bridge_session_id,
             receipt,
             created_bridge_session_id,
+            ..
         } => {
             member_restore_reapplied(
                 entry,
@@ -12679,26 +14044,60 @@ async fn apply_member_restore_provision(
                 &created_bridge_session_id,
                 "resume_fresh_member_session_binding",
             )?;
-            // Fresh recreation has no durable snapshot revival verdict. Feed
-            // the successful receipt back to the existing member authority
-            // so it emits the exact runtime binding before startup
-            // readiness.
-            let transition = apply_seeded_mob_signal_transition(
-                commit.authority,
-                mob_dsl::MobMachineSignal::ResolveRecreatedMemberSessionSucceeded {
-                    agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
-                    agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&entry.agent_runtime_id),
-                    fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
-                    generation: mob_dsl::Generation::from_domain(entry.generation),
-                    bridge_session_id: mob_dsl::SessionId::from_domain(&created_bridge_session_id),
-                },
-                "resume_resolve_recreated_member_session",
-            )?;
-            for effect in transition.effects().iter().cloned() {
-                if let Some(effect) = super::composition::MobSeamEffect::routed(effect) {
-                    super::composition::dispatch_routed_effect(commit.composition_binding, effect)
+            if super::boot_plan::domain_member_seat_session_unborn(
+                commit.authority.state(),
+                &entry.agent_identity,
+            ) {
+                // The session the member's seat named was created now: its
+                // open wake attempt resolves through that creation, never as
+                // a recreation.
+                resolve_member_seat_session_created(commit, entry, &created_bridge_session_id)
+                    .await?;
+            } else {
+                // Fresh recreation has no durable snapshot revival verdict.
+                // Feed the successful receipt back to the existing member
+                // authority so it emits the exact runtime binding before
+                // startup readiness.
+                // The recreated session is the Bound step of the member's
+                // open wake attempt; its Ready follows readiness.
+                let dsl_identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+                let attempt = commit
+                    .authority
+                    .state()
+                    .member_wake_attempts
+                    .get(&dsl_identity)
+                    .copied()
+                    .ok_or_else(|| {
+                        MobError::Internal(format!(
+                            "the recreated session of '{}' has no open wake attempt",
+                            entry.agent_identity
+                        ))
+                    })?;
+                let transition = apply_seeded_mob_signal_transition(
+                    commit.authority,
+                    mob_dsl::MobMachineSignal::ResolveRecreatedMemberSessionSucceeded {
+                        agent_identity: dsl_identity,
+                        agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(
+                            &entry.agent_runtime_id,
+                        ),
+                        fence_token: mob_dsl::FenceToken::from_domain(entry.fence_token),
+                        generation: mob_dsl::Generation::from_domain(entry.generation),
+                        bridge_session_id: mob_dsl::SessionId::from_domain(
+                            &created_bridge_session_id,
+                        ),
+                        attempt,
+                    },
+                    "resume_resolve_recreated_member_session",
+                )?;
+                for effect in transition.effects().iter().cloned() {
+                    if let Some(effect) = super::composition::MobSeamEffect::routed(effect) {
+                        super::composition::dispatch_routed_effect(
+                            commit.composition_binding,
+                            effect,
+                        )
                         .await
                         .map_err(super::composition::dispatch_refusal_to_mob_error)?;
+                    }
                 }
             }
             let _ = commit
@@ -12870,6 +14269,18 @@ mod tests {
             durable: false,
         };
         let mut recovered = mob_dsl::MobMachineAuthority::new();
+        // Every member is planned for materialization before any restore
+        // begins: under the eager policy each is Waking with its own attempt.
+        let residency = super::super::boot_plan::MemberResidencyConfig {
+            restore_policy: super::super::MemberRestorePolicy::Eager,
+            ..super::super::boot_plan::MemberResidencyConfig::default()
+        };
+        super::super::boot_plan::seed_member_residency(
+            &mut recovered,
+            &residency,
+            "test_seed_member_residency",
+        )
+        .expect("seed the member residency");
         let mut events = Vec::new();
         let mut restored_onto = BTreeMap::new();
         for index in 0..6_u64 {
@@ -12887,6 +14298,33 @@ mod tests {
                 "test_recover_member",
             )
             .expect("recover the member");
+            // Each member's durable endpoint, recovered from its spawn as a
+            // replay recovers it. A member the boot plan wakes without one is
+            // owed its endpoint, and its wake closes Live only once the
+            // endpoint is registered.
+            let mut pubkey = [0_u8; 32];
+            pubkey[0] = index as u8 + 1;
+            pubkey[31] = pubkey[0].wrapping_mul(7);
+            let name = format!("restore-mob/worker/{identity}");
+            let endpoint = TrustedPeerDescriptor::unsigned_with_pubkey(
+                name.clone(),
+                PeerId::from_ed25519_pubkey(&pubkey).to_string(),
+                pubkey,
+                format!("inproc://{name}"),
+            )
+            .expect("the member's durable endpoint");
+            apply_seeded_mob_signal(
+                &mut recovered,
+                mob_dsl::MobMachineSignal::RecoverSpawnedMemberPeerEndpoint {
+                    agent_identity: mob_dsl::AgentIdentity::from_domain(&identity),
+                    agent_runtime_id: mob_dsl::AgentRuntimeId::from_domain(&runtime_id),
+                    fence_token: mob_dsl::FenceToken::from_domain(crate::ids::FenceToken::new(1)),
+                    generation: mob_dsl::Generation::from_domain(Generation::new(0)),
+                    peer_endpoint: mob_dsl::MemberPeerEndpoint::from(&endpoint),
+                },
+                "test_recover_member_peer_endpoint",
+            )
+            .expect("recover the member's durable endpoint");
             apply_seeded_member_session_binding(
                 &mut recovered,
                 &identity,
@@ -12923,6 +14361,19 @@ mod tests {
         }
         let entries = Roster::project(&events).list().cloned().collect::<Vec<_>>();
         assert_eq!(entries.len(), 6, "{entries:?}");
+        let plan = super::super::boot_plan::apply_boot_materialization_plan(
+            &mut recovered,
+            &residency,
+            &super::super::boot_plan::BootObligations::none(),
+            &BTreeSet::new(),
+            "test_plan_boot_materialization",
+        )
+        .expect("plan the boot materialization");
+        assert_eq!(
+            plan.materialize.len(),
+            6,
+            "the eager plan wakes every member"
+        );
         let bound = |entry: &RosterEntry| {
             entry
                 .member_ref
@@ -12930,14 +14381,26 @@ mod tests {
                 .cloned()
                 .expect("a session-bound member")
         };
+        // The open attempt resolves bound, then (readiness settled) Live.
         let resolve_revival = |authority: &mut mob_dsl::MobMachineAuthority,
                                entry: &RosterEntry| {
+            let identity = mob_dsl::AgentIdentity::from_domain(&entry.agent_identity);
+            let attempt = open_member_wake_attempt(authority.state(), &identity)?;
+            apply_seeded_mob_signal(
+                authority,
+                mob_dsl::MobMachineSignal::ResolveMemberRevivalBound {
+                    agent_identity: identity.clone(),
+                    attempt,
+                },
+                "resume_resolve_member_materialization_bound",
+            )?;
             apply_seeded_mob_signal(
                 authority,
                 mob_dsl::MobMachineSignal::ResolveMemberRevivalSucceeded {
-                    agent_identity: mob_dsl::AgentIdentity::from_domain(&entry.agent_identity),
+                    agent_identity: identity,
+                    attempt,
                 },
-                "resume_resolve_member_materialization",
+                "resume_resolve_member_materialization_ready",
             )
         };
 
@@ -13061,6 +14524,16 @@ mod tests {
             let identity = AgentIdentity::from("cold-member");
             let runtime_id = crate::ids::AgentRuntimeId::new(identity.clone(), Generation::new(0));
             let mut authority = mob_dsl::MobMachineAuthority::new();
+            let residency = super::super::super::boot_plan::MemberResidencyConfig {
+                restore_policy: super::super::super::MemberRestorePolicy::Eager,
+                ..super::super::super::boot_plan::MemberResidencyConfig::default()
+            };
+            super::super::super::boot_plan::seed_member_residency(
+                &mut authority,
+                &residency,
+                "test_seed_member_residency",
+            )
+            .expect("seed the member residency");
             apply_seeded_member_addressability(
                 &mut authority,
                 &identity,
@@ -13080,17 +14553,17 @@ mod tests {
                 "test_recover_member_session",
             )
             .expect("recover session binding");
-            apply_seeded_mob_signal(
+            // The cold durable member is planned for materialization: Waking
+            // with the attempt its restoration resolves.
+            let plan = super::super::super::boot_plan::apply_boot_materialization_plan(
                 &mut authority,
-                mob_dsl::MobMachineSignal::ClassifyMemberLiveMaterialization {
-                    agent_identity: mob_dsl::AgentIdentity::from_domain(&identity),
-                    observation:
-                        mob_dsl::MemberLiveMaterializationObservationKind::DurableSnapshotPresent,
-                    reason: "cold durable member".to_string(),
-                },
-                "test_classify_cold_member",
+                &residency,
+                &super::super::super::boot_plan::BootObligations::none(),
+                &BTreeSet::new(),
+                "test_plan_cold_member",
             )
             .expect("authorize revival");
+            assert!(plan.materialize.contains(&identity));
             (authority, identity)
         }
 
@@ -13985,12 +15458,12 @@ mod tests {
             record.phase = crate::store::PlacedSpawnCarrierPhase::Committed(
                 crate::store::PlacedSpawnCommitRecord {
                     member_session_id: meerkat_core::SessionId::new(),
-                    member_peer_endpoint: mob_dsl::MemberPeerEndpoint {
-                        name: mob_dsl::PeerName(name),
-                        peer_id: mob_dsl::PeerId(peer_id),
-                        address: mob_dsl::PeerAddress("tcp://127.0.0.1:4711".to_string()),
-                        signing_key: mob_dsl::PeerSigningKey(signing_key),
-                    },
+                    member_peer_endpoint: mob_dsl::MemberPeerEndpoint::new(
+                        mob_dsl::PeerName(name),
+                        mob_dsl::PeerId(peer_id),
+                        mob_dsl::PeerAddress("tcp://127.0.0.1:4711".to_string()),
+                        mob_dsl::PeerSigningKey(signing_key),
+                    ),
                     ack_engine_version: "placed-recovery-test-engine".to_string(),
                     adopted_first_turn_started: false,
                 },
@@ -15348,12 +16821,12 @@ mod tests {
                 host_id: host.clone(),
                 host_binding_generation: 1,
                 member_session_id: mob_dsl::SessionId(member_session_id.to_string()),
-                member_peer_endpoint: mob_dsl::MemberPeerEndpoint {
-                    name: mob_dsl::PeerName(format!("placed-{}", identity.as_str())),
-                    peer_id: mob_dsl::PeerId(peer_id),
-                    address: mob_dsl::PeerAddress(format!("tcp://members/{}", identity.as_str())),
-                    signing_key: mob_dsl::PeerSigningKey(signing_key),
-                },
+                member_peer_endpoint: mob_dsl::MemberPeerEndpoint::new(
+                    mob_dsl::PeerName(format!("placed-{}", identity.as_str())),
+                    mob_dsl::PeerId(peer_id),
+                    mob_dsl::PeerAddress(format!("tcp://members/{}", identity.as_str())),
+                    mob_dsl::PeerSigningKey(signing_key),
+                ),
                 profile_name: "worker".to_string(),
                 runtime_mode: mob_dsl::SpawnPolicyRuntimeMode::TurnDriven,
                 external_addressable: true,
@@ -17750,14 +19223,14 @@ mod member_endpoint_defect_tests {
 
     fn endpoint(seed: u8, address: &str) -> mob_dsl::MemberPeerEndpoint {
         let signing_key = [seed; 32];
-        mob_dsl::MemberPeerEndpoint {
-            name: mob_dsl::PeerName("mob/worker/member".to_string()),
-            peer_id: mob_dsl::PeerId(
+        mob_dsl::MemberPeerEndpoint::new(
+            mob_dsl::PeerName("mob/worker/member".to_string()),
+            mob_dsl::PeerId(
                 meerkat_core::comms::PeerId::from_ed25519_pubkey(&signing_key).to_string(),
             ),
-            address: mob_dsl::PeerAddress(address.to_string()),
-            signing_key: mob_dsl::PeerSigningKey(signing_key),
-        }
+            mob_dsl::PeerAddress(address.to_string()),
+            mob_dsl::PeerSigningKey(signing_key),
+        )
     }
 
     #[test]
