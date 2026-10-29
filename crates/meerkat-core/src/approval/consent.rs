@@ -579,8 +579,11 @@ fn held_check(retained: &PreparedOperationCheck, step: ReadjudicationStep) -> He
             OperationAuthorizationError::Unavailable
             | OperationAuthorizationError::ObservationUnavailable(_),
         )) => HeldCheck::Leave,
-        Some(_) if step == ReadjudicationStep::Decision => HeldCheck::Readjudicate,
-        Some(_) => HeldCheck::Leave,
+        // Its own check refuses it.
+        Some(_) => match step {
+            ReadjudicationStep::Decision => HeldCheck::Readjudicate,
+            ReadjudicationStep::Read => HeldCheck::Leave,
+        },
     }
 }
 
@@ -1258,13 +1261,14 @@ impl ApprovalService {
     /// the live candidate, the exact resolved record and expiry. Evidence an
     /// owner change made stale since (related or not: it stamps the owner's
     /// whole publication) is resolved afresh outside the reservation, within
-    /// [`CONSENT_READJUDICATION_BOUND`] rounds: an approver the eligibility
-    /// owner now refuses (a revocation in between) is not eligible and leaves
-    /// the approval pending, with no notice, while an eligibility owner that
-    /// cannot say now, or a publication that keeps changing, records nothing
-    /// and answers a retryable `StoreUnavailable`. An approval whose retained
-    /// candidate this owner no longer holds (consumed, declined, expired,
-    /// withdrawn, or lost on restart) needs fresh consent instead.
+    /// three rounds (the consent re-adjudication bound): an approver the
+    /// eligibility owner now refuses (a revocation in between) is not
+    /// eligible and leaves the approval pending, with no notice, while an
+    /// eligibility owner that cannot say now, or a publication that keeps
+    /// changing, records nothing and answers a retryable `StoreUnavailable`.
+    /// An approval whose retained candidate this owner no longer holds
+    /// (consumed, declined, expired, withdrawn, or lost on restart) needs
+    /// fresh consent instead.
     ///
     /// For an approval, a retained decision that is no longer current (an
     /// owner publication change made it stale, or its own check refuses it,
