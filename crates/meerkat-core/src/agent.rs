@@ -3308,17 +3308,22 @@ async fn fenced_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
 /// that identity: a hybrid tool that selects another mode after the rebuild
 /// is a mismatch. A resolution that is not ready yet (the tool not published
 /// again, or its owner unavailable now) refuses here with zero entry and
-/// leaves the consent spendable; a run's own attempt then counts as not
-/// made, and the run's next boundary attempts it again.
+/// leaves the consent spendable, as does an admission or a spend the
+/// approval owner could not settle now (`owner_unavailable`, the consent
+/// kept); a run's own attempt then counts as not made, and the run's next
+/// boundary attempts it again. The admission settles the held decision
+/// first (ADR-001 D9): one that is not current is decided afresh by its
+/// owners, and the attempt goes on only with a current one, while a related
+/// change or their refusal withdraws the consent and refuses the attempt
+/// with zero entry.
 pub async fn dispatch_retained_consent_attempt<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
 ) -> Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError> {
-    let (result, retained_call, _not_ready) =
-        attempt_retained_consent(dispatcher, context, approval_id).await;
-    observe_retained_consent_refusal(context, &result, retained_call);
-    result
+    let ended = attempt_retained_consent(dispatcher, context, approval_id).await;
+    observe_retained_consent_refusal(context, &ended.result, ended.trace.call);
+    ended.result
 }
 
 /// How one run's retained consent attempt ended.
@@ -3326,51 +3331,85 @@ pub(crate) enum RetainedConsentAttempt {
     /// It ran to its outcome: the dispatcher's own result, or a refusal with
     /// zero entry.
     Settled(Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>),
-    /// The session's rebuilt agent could not resolve the retained call yet:
-    /// nothing entered, the consent stays spendable, and the attempt counts
-    /// as not made.
+    /// The session's rebuilt agent could not resolve the retained call yet,
+    /// or the approval owner could not settle the attempt now and kept the
+    /// consent (`owner_unavailable`: held, or the decision or the approver's
+    /// eligibility not current and not settled for this attempt) while the
+    /// attempt spent nothing: nothing entered, the consent stays spendable,
+    /// and the attempt counts as not made.
     NotReady,
 }
 
 /// [`dispatch_retained_consent_attempt`] for a run's own attempt, which
-/// tells a resolution that is not ready yet apart from a refusal.
+/// tells a resolution or a spend that is not ready yet apart from a refusal.
+/// An `owner_unavailable` answer counts as not made only when the attempt's
+/// own review entry spent nothing (or it was refused at its admission,
+/// before it had one): an entered effect's own result is its outcome,
+/// whatever its kind.
 pub(crate) async fn dispatch_retained_consent_in_run<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
 ) -> RetainedConsentAttempt {
-    let (result, retained_call, not_ready) =
-        attempt_retained_consent(dispatcher, context, approval_id).await;
-    if not_ready && result.is_err() {
+    let ended = attempt_retained_consent(dispatcher, context, approval_id).await;
+    let owner_unavailable = matches!(
+        ended.result,
+        Err(crate::error::ToolError::ReviewUnavailable {
+            kind: crate::approval::review::ReviewUnavailableKind::OwnerUnavailable,
+        })
+    );
+    if ended.result.is_err()
+        && (ended.trace.not_ready || (owner_unavailable && ended.spent_nothing))
+    {
         return RetainedConsentAttempt::NotReady;
     }
-    observe_retained_consent_refusal(context, &result, retained_call);
-    RetainedConsentAttempt::Settled(result)
+    observe_retained_consent_refusal(context, &ended.result, ended.trace.call);
+    RetainedConsentAttempt::Settled(ended.result)
 }
 
-/// One retained attempt through its certification boundary, with the
-/// retained call it resolved and whether it found its resolution not ready.
+/// What one retained attempt learned on its way to its outcome.
+#[derive(Default)]
+struct RetainedAttemptTrace {
+    /// The retained call's id and operation id, once the candidate resolved:
+    /// the call the attempt's refusal is reported for.
+    call: Option<(String, crate::OperationId)>,
+    /// The rebuilt agent could not resolve the retained call yet.
+    not_ready: bool,
+    /// The review entry the attempt was admitted with, once it had one.
+    entry: Option<crate::approval::review::ReviewEntry>,
+}
+
+/// One retained attempt through its certification boundary.
+struct RetainedAttemptEnd {
+    result: Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>,
+    trace: RetainedAttemptTrace,
+    /// No spend of the attempt's own review entry committed (or it never had
+    /// one), read once its dispatch ended.
+    spent_nothing: bool,
+}
+
+/// One retained attempt through its certification boundary, with what it
+/// learned on its way.
 async fn attempt_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
-) -> (
-    Result<crate::ops::ToolDispatchOutcome, crate::error::ToolError>,
-    Option<(String, crate::OperationId)>,
-    bool,
-) {
-    let mut retained_call = None;
-    let mut not_ready = false;
-    let result = retained_consent_dispatch(
-        dispatcher,
-        context,
-        approval_id,
-        &mut retained_call,
-        &mut not_ready,
-    )
-    .await
-    .unwrap_or_else(|refused| Err(refused.not_dispatched()));
-    (result, retained_call, not_ready)
+) -> RetainedAttemptEnd {
+    let mut trace = RetainedAttemptTrace::default();
+    let result = retained_consent_dispatch(dispatcher, context, approval_id, &mut trace)
+        .await
+        .unwrap_or_else(|refused| Err(refused.not_dispatched()));
+    // The entry is read, not kept, once its dispatch ended.
+    let spent_nothing = trace
+        .entry
+        .take()
+        .as_ref()
+        .is_none_or(crate::approval::review::ReviewEntry::spent_nothing);
+    RetainedAttemptEnd {
+        result,
+        trace,
+        spent_nothing,
+    }
 }
 
 /// Report a retained attempt's refusal to the host's refusal observer.
@@ -3385,16 +3424,16 @@ fn observe_retained_consent_refusal(
 }
 
 /// [`dispatch_retained_consent_attempt`] before its certification boundary
-/// ([`FencedOutcome`]). Once the retained candidate resolves, its call id and
-/// operation id are left in `retained_call`, for the attempt's refusal
-/// report; `not_ready` is set when it refuses because the rebuilt agent
-/// could not resolve the retained call yet.
+/// ([`FencedOutcome`]), leaving what it learned in `trace`: once the retained
+/// candidate resolves (even when its admission then refuses), its call id
+/// and operation id, for the attempt's refusal report; whether it refuses
+/// because the rebuilt agent could not resolve the retained call yet; and
+/// the review entry it is admitted with.
 async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
     approval_id: &crate::ApprovalId,
-    retained_call: &mut Option<(String, crate::OperationId)>,
-    not_ready: &mut bool,
+    trace: &mut RetainedAttemptTrace,
 ) -> FencedOutcome {
     let malformed = || crate::ToolError::AuthorizationRefused {
         refusal: crate::authorization::OperationRefused::new(
@@ -3404,40 +3443,29 @@ async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     let Some(work) = context.work_authorization() else {
         return Err(malformed());
     };
-    let (mut review_entry, mut retained) = crate::approval::review::admit_consent_attempt(
-        context.operation_review(),
-        approval_id,
-        work,
-        context.run_id(),
-    )?;
-    let (call, plan) = retained.tool_dispatch_parts().ok_or_else(malformed)?;
-    *retained_call = Some((
-        call.id.to_owned(),
-        retained.binding().facts().operation_id.clone(),
-    ));
+    let (mut review_entry, mut retained) =
+        admit_retained_consent(context, work, approval_id, trace)?;
     // This process rebuilt the session's agent after the retained plan was
     // resolved: its root allocation is gone, and only a fresh resolution the
     // approval owner accepts as the same durable execution goes on.
+    let (call, plan) = retained.tool_dispatch_parts().ok_or_else(malformed)?;
     if matches!(
         plan.validate_root_dispatch(dispatcher, call),
         Err(crate::ToolExecutionResolutionError::RootDispatcherChanged { .. })
     ) {
         match rebind_retained_consent(dispatcher, context, work, approval_id, &retained) {
             RetainedRebind::Rebound => {
-                (review_entry, retained) = crate::approval::review::admit_consent_attempt(
-                    context.operation_review(),
-                    approval_id,
-                    work,
-                    context.run_id(),
-                )?;
+                (review_entry, retained) =
+                    admit_retained_consent(context, work, approval_id, trace)?;
             }
             RetainedRebind::NotReady(error) => {
-                *not_ready = true;
+                trace.not_ready = true;
                 return Err(error);
             }
             RetainedRebind::Refused(error) => return Err(error),
         }
     }
+    trace.entry = Some(review_entry.clone());
     let (call, plan) = retained.tool_dispatch_parts().ok_or_else(malformed)?;
     if dispatcher.review_entry_support(call.name)
         != crate::approval::review::ReviewEntrySupport::ConsumesAtEntry
@@ -3478,6 +3506,45 @@ async fn retained_consent_dispatch<T: AgentToolDispatcher + ?Sized + 'static>(
     }
 }
 
+/// Admit a fresh attempt of the retained candidate `approval_id` for
+/// `context`. Once the candidate first resolves (even when its admission
+/// then refuses: its held decision could not be settled), its call id and
+/// operation id are left in `trace`, for the attempt's refusal report.
+fn admit_retained_consent(
+    context: &ToolDispatchContext,
+    work: &crate::WorkAuthorizationContext,
+    approval_id: &crate::ApprovalId,
+    trace: &mut RetainedAttemptTrace,
+) -> Result<
+    (
+        crate::approval::review::ReviewEntry,
+        crate::authorization::PreparedOperationCheck,
+    ),
+    crate::error::ToolError,
+> {
+    let retained_call = |retained: &crate::authorization::PreparedOperationCheck| {
+        retained.tool_dispatch_parts().map(|(call, _)| {
+            (
+                call.id.to_owned(),
+                retained.binding().facts().operation_id.clone(),
+            )
+        })
+    };
+    let admitted = crate::approval::review::admit_consent_attempt_reporting(
+        context.operation_review(),
+        approval_id,
+        work,
+        context.run_id(),
+    );
+    if trace.call.is_none() {
+        trace.call = match &admitted {
+            Ok((_, retained)) => retained_call(retained),
+            Err(refused) => refused.retained.as_ref().and_then(retained_call),
+        };
+    }
+    admitted.map_err(|refused| refused.error)
+}
+
 /// What re-resolving a retained consent attempt for a rebuilt agent did.
 enum RetainedRebind {
     /// The approval owner rebound the custody to the fresh plan.
@@ -3495,8 +3562,9 @@ enum RetainedRebind {
 /// ([`AgentToolDispatcher::validate_resolved_execution_plan`]: the caller's
 /// deadline chain, the tool published and callable, its mode within the live
 /// catalog contract). A tool the rebuilt agent has not published yet, or one
-/// unavailable now, is not ready, as is an approval owner that is held now;
-/// any other resolution or validation failure refuses.
+/// unavailable now, is not ready, as is an approval owner that is held now
+/// or a fresh decision its owners cannot make now (unavailable, or an owner
+/// change in progress); any other resolution or validation failure refuses.
 fn rebind_retained_consent<T: AgentToolDispatcher + ?Sized + 'static>(
     dispatcher: &Arc<T>,
     context: &ToolDispatchContext,
@@ -4826,16 +4894,29 @@ impl RunLifecyclePublication {
 /// notice inputs moved into it, and which of it the run already attempted.
 /// Scheduling and notice suppression only: at most one in-run attempt per
 /// decision per run (an attempt the session's rebuilt agent could not
-/// resolve yet does not count), and only the run's own requests and the
-/// consent moved into it are examined. Spend and withdrawal authority stays
-/// with the approval owner. Reset with each work-authorized run scope.
+/// resolve yet does not count), only the run's own requests and the
+/// consent moved into it are examined, and the consent left parked for a
+/// resumed run is moved again at most once per boundary. Spend and
+/// withdrawal authority stays with the approval owner. Reset with each
+/// work-authorized run scope.
 #[derive(Debug, Default)]
 pub(crate) struct RunConsentAttempts {
     requested: BTreeSet<crate::ApprovalId>,
     attempted: BTreeSet<crate::ApprovalId>,
+    /// The run's model operation sequence at the boundary that last tried
+    /// again to move the consent left parked for this run.
+    moves_retried_at: Option<u64>,
 }
 
 impl RunConsentAttempts {
+    /// Whether this is the first poll of the boundary after the run's model
+    /// operation `sequence`, recording it: only that poll tries again to
+    /// move the consent left parked for this run (ADR-001 D9), and a repoll
+    /// of the same boundary while a gate defers calls no owner again.
+    pub(crate) fn first_poll_of_boundary(&mut self, sequence: u64) -> bool {
+        self.moves_retried_at.replace(sequence) != Some(sequence)
+    }
+
     /// The run's own dispatch committed a consent request for one call.
     pub(crate) fn requested(&mut self, approval_id: &crate::ApprovalId) {
         self.requested.insert(approval_id.clone());

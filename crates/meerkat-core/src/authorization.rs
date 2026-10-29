@@ -515,11 +515,16 @@ pub trait WorkAuthorization: Send + Sync {
     }
 
     /// Passive review material for this exact prepared operation, read once
-    /// after R1 is ruled out and before reviewer transport or human
-    /// presentation. Synchronous and without I/O. A wrapper must forward it.
-    /// Fail closed: an owner that does not implement this is `Unavailable`,
-    /// so R2/R3 review settles as context unavailable. Only an owner that
-    /// knows the material is genuinely inapplicable answers `NotApplicable`.
+    /// per review attempt after R1 is ruled out and before reviewer transport
+    /// or human presentation, and read again whenever a retained human
+    /// consent is re-adjudicated (ADR-001 D9): on an approval read (`get`,
+    /// `list`), a decision, its publication, an attempt or a spend, on the
+    /// caller's thread, outside the approval owner's locks. An owner must
+    /// therefore not take a lock its host holds while reading approvals.
+    /// Synchronous and without I/O. A wrapper must forward it. Fail closed:
+    /// an owner that does not implement this is `Unavailable`, so R2/R3
+    /// review settles as context unavailable. Only an owner that knows the
+    /// material is genuinely inapplicable answers `NotApplicable`.
     fn review_operation_context(
         &self,
         _binding: &PreparedAuthorizationBinding,
@@ -534,6 +539,14 @@ pub trait WorkAuthorization: Send + Sync {
         None
     }
 
+    /// Decide one exact operation now. Besides every dispatch, a retained
+    /// human consent's decision that is no longer current (an owner
+    /// publication change made it stale, or its own check refuses it) is
+    /// prepared again on an approval read (`get`, `list`), a decision, its
+    /// publication or an attempt (ADR-001 D9), on the caller's thread and
+    /// outside the approval owner's locks, so an owner must not take a lock
+    /// its host holds while reading approvals; each such preparation is
+    /// audited as one.
     fn prepare(
         &self,
         binding: &PreparedAuthorizationBinding,
