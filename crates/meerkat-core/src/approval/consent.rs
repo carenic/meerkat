@@ -5465,6 +5465,49 @@ mod tests {
         assert_eq!(w.attempt(&id).err(), Some(human_consent_required()));
     }
 
+    /// ADR-001 D9: what a re-adjudication's owners answer instead of a
+    /// decision. Owners that are unavailable decide nothing: the read keeps
+    /// the pending consent. Owners that now refuse the operation (a
+    /// permission an owner change revoked) withdraw it on the next read as
+    /// `AuthorityChanged`, the reason a refusing current check gives, and a
+    /// later decision is refused.
+    #[tokio::test]
+    async fn a_refusal_found_by_a_re_adjudication_withdraws_as_authority_changed() {
+        let w = world();
+        let id = w.request(&w.check()).await;
+        w.owner.prepare_unavailable.store(true, Ordering::Release);
+        w.owner.republish();
+        let record = w.record(&id);
+        assert_eq!(
+            record.status,
+            ApprovalStatus::Pending,
+            "unavailable owners decide nothing"
+        );
+        assert_eq!(withdrawal_reason(&record), None);
+        assert_eq!(w.notices(&id), vec![ConsentNoticeKind::Requested]);
+
+        w.owner.prepare_unavailable.store(false, Ordering::Release);
+        w.owner.prepare_refused.store(true, Ordering::Release);
+        w.owner.republish();
+        let record = w.record(&id);
+        assert_eq!(record.status, ApprovalStatus::Cancelled);
+        assert_eq!(
+            withdrawal_reason(&record),
+            Some(ApprovalConsentWithdrawalReason::AuthorityChanged)
+        );
+        assert_eq!(
+            w.notices(&id),
+            vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Withdrawn]
+        );
+        assert_eq!(
+            w.approvals
+                .decide_consent(&id, decision(ApprovalDecision::Approve, "lead-1")),
+            Err(ApprovalError::ConsentUnavailable {
+                approval_id: id.clone()
+            })
+        );
+    }
+
     /// ADR-001 D9, bounded. An owner change that meets a read's
     /// re-adjudication (its fresh decision is stale again before the
     /// reservation) is re-adjudicated again, within

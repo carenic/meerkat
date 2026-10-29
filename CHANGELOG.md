@@ -60,14 +60,17 @@ them.
   consent stands only while that decision has the same review tier and
   validity window and the owners read the same material the approval
   presented; a later attempt then spends it once, against that decision.
-  A changed tier, validity window or material, a refusal of the operation,
-  or another operation's decision withdraws it as before
-  (`ContextChanged`). An owner change still in progress decides nothing,
-  and a publication that keeps changing through three re-adjudications in
-  a row withdraws the consent as `ContextChanged`. A spend never enters on
-  a stale decision: one whose decision went stale after its own entry
-  staging refuses as `review_unavailable` (`owner_unavailable`) and keeps
-  the consent for its next re-adjudication. An approval read may now
+  A changed tier, validity window or material, or another operation's
+  decision withdraws it as before (`ContextChanged`). Owners that now
+  refuse the operation withdraw it as `AuthorityChanged`, the reason a
+  refusing current check already gave (a refusal that came with an owner
+  change was `context_changed` before). An owner change still in progress
+  decides nothing, and a publication that keeps changing through three
+  re-adjudications in a row withdraws the consent as `ContextChanged`. A
+  spend never enters on a stale decision: one whose decision went stale
+  after its own entry staging refuses as `review_unavailable`
+  (`owner_unavailable`) and keeps the consent for its next
+  re-adjudication. An approval read may now
   re-prepare a pending consent's operation, which its audit records as a
   preparation.
 
