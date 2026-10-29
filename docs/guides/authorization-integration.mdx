@@ -484,12 +484,12 @@ publication change made stale, so polling never calls the owners for one whose
 own check refuses it, and nothing calls them while that check answers that
 they are unavailable. An attempt is handed only a current decision and spends
 the consent once with it. A changed tier or material withdraws the consent as
-`ContextChanged`; owners that now refuse the operation withdraw it as
-`AuthorityChanged`; at an attempt's admission either one also refuses the
-attempt, with zero entry. A consent that moves into a resumed run keeps the
-action account its approval presented: the resumed run's owners' review
-material is taken over at the move for that account only (its mandate may
-name the run's own requester), another account withdraws it as
+`ContextChanged`; owners that now refuse the operation or its review material
+withdraw it as `AuthorityChanged`; at an attempt's admission either one also
+refuses the attempt, with zero entry. A consent that moves into a resumed run
+keeps the action account its approval presented: the resumed run's owners'
+review material is taken over at the move for that account only (its mandate
+may name the run's own requester), another account withdraws it as
 `ContextChanged`, their denial of the operation or of its material withdraws
 it as `AuthorityChanged`, and owners that cannot answer now (unavailable, or
 an owner change in progress) leave it parked: the resumed run's boundaries
