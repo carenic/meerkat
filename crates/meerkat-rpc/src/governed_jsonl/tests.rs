@@ -4417,6 +4417,8 @@ struct R3Realm {
     /// route, so every host on the realm reuses it (each fixture client
     /// carries its own auth binding, and with it its own route).
     client: Arc<dyn LlmClient>,
+    /// The grant the agent's selection names for the granted server.
+    installation_grant: Option<GrantLineageRef>,
 }
 
 /// One running stock host of an [`R3Realm`]: its pipe and the session it
@@ -4464,7 +4466,7 @@ impl R3Realm {
         let granted =
             r3_granted_server(&calls, account, issuer.as_ref().map(|issuer| issuer.base()));
         let realm = RealmId::parse(R3_REALM).unwrap();
-        let this = Self {
+        let mut this = Self {
             root: tempfile::tempdir().unwrap(),
             principals: StockPrincipals::for_user(&realm, 4243).unwrap(),
             realm,
@@ -4474,6 +4476,7 @@ impl R3Realm {
             issuer,
             assurance: assurance.to_owned(),
             client: http_client_in(http, R3_REALM),
+            installation_grant: None,
         };
         drop(this.open(RealmGovernance::Ungoverned).await.unwrap());
         meerkat_core::McpRealmPersistTarget::new(&this.config_runtime())
@@ -4517,7 +4520,7 @@ impl R3Realm {
                 operations: McpOperations::Exact(["read".to_string()].into()),
             },
         ] {
-            grant_stock_agent(
+            let issued = grant_stock_agent(
                 this.root.path(),
                 R3_REALM,
                 &this.principals,
@@ -4528,7 +4531,10 @@ impl R3Realm {
                 },
             )
             .await
-            .expect("issued and selected");
+            .expect("issued and selected")
+            .issued;
+            // The last grant is the granted server's.
+            this.installation_grant = Some(issued);
         }
         this
     }
@@ -5214,6 +5220,76 @@ async fn stock_r3_an_approved_consent_never_enters_once_its_pipe_retired() {
     let outcome = r3_bounded(async {
         let record = stock_r3_spend_in_the_requesting_run(&http, &mut host, |host| {
             host.consent.retire();
+        })
+        .await;
+        assert_eq!(record.status, meerkat_core::ApprovalStatus::Approved);
+        assert_eq!(
+            record
+                .consent
+                .as_ref()
+                .and_then(|consent| consent.withdrawal.as_ref())
+                .map(|withdrawal| withdrawal.reason.clone()),
+            Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged),
+            "{record:?}"
+        );
+        assert!(
+            record
+                .consent
+                .as_ref()
+                .is_some_and(|consent| consent.consumed_at.is_none()),
+            "nothing spent"
+        );
+        assert!(!realm.calls.exists(), "zero entry");
+    })
+    .await;
+    let mut failures = host.close().await;
+    http.join_receiver(&mut failures).await;
+    finish_scenario(outcome, failures);
+}
+
+/// No controller work holds the grant a test revokes live.
+#[cfg(feature = "mcp")]
+struct NoControllerWork;
+
+#[cfg(feature = "mcp")]
+impl meerkat_authorization_contracts::grant_mutation::ControllerGrantMutationCustody
+    for NoControllerWork
+{
+    fn with_unreferenced_controller_grant<T, E>(
+        &mut self,
+        _: &GrantLineageRef,
+        mutate: impl FnOnce() -> Result<T, E>,
+    ) -> Result<
+        Result<T, E>,
+        meerkat_authorization_contracts::grant_mutation::ControllerCustodyRefusal,
+    > {
+        Ok(mutate())
+    }
+}
+
+/// ADR-001 D9 on the stdio stock host: a policy change between the decision
+/// and the spend withdraws the approved consent. The operator revokes the
+/// granted server's grant on the open composition's own grant owner; the
+/// spend's owners, asked afresh, refuse the operation, so the consent is
+/// withdrawn as `AuthorityChanged`, with zero entry.
+#[cfg(feature = "mcp")]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stock_r3_an_approved_consent_never_enters_once_its_grant_is_revoked() {
+    let mut http = Server::start().await;
+    let realm = R3Realm::new(&http, R3Account::DeclaredNone, "device_trusted").await;
+    let grant = realm
+        .installation_grant
+        .clone()
+        .expect("the granted server's grant");
+    let operator = realm.principals.operator.clone();
+    let mut host = realm.start_host(&http).await;
+    let outcome = r3_bounded(async {
+        let record = stock_r3_spend_in_the_requesting_run(&http, &mut host, |host| {
+            host.governance
+                .composed_grant_owner_for_test()
+                .expect("the open composition's grant owner")
+                .revoke(&operator, &grant, &mut NoControllerWork)
+                .expect("revoked while the realm is open");
         })
         .await;
         assert_eq!(record.status, meerkat_core::ApprovalStatus::Approved);
