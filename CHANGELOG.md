@@ -38,30 +38,32 @@ them.
 ### Breaking
 
 - Behaviour-only (not measured by the gate): `meerkat-session`: the summary
-  request `DefaultCompactor` builds names each image it leaves out as
-  `[image (<media type>) omitted from this summary request]` and each video
-  as `[video (<media type>) omitted from this summary request]`, where it
+  request `DefaultCompactor` builds names each image or video in a user row
+  or tool result as `[image (<media type>) omitted from this summary request]`
+  or `[video (<media type>) omitted from this summary request]`, where it
   wrote `[image: <media type>]` and `[video: <media type>]` before, and
   `DefaultCompactor::compaction_prompt` gains a paragraph saying that these
   placeholders stand for content omitted from the request and say nothing
   about what the agent could see. A client or test that reads the
-  placeholder text must match the new form; the prompt still opens with
+  placeholder text must match the new form; the prompt still contains
   `CONTEXT COMPACTION`.
 
 ### Fixed
 
-- `meerkat-session`: compaction summaries no longer treat image or video
-  placeholders as evidence that the agent could not see the media. The
-  summary request replaces each image and video with a bracketed
-  placeholder. It used to name only the media type, and summarizing models
-  read it as the agent having been unable to see the media: in a long run
-  with many screenshot tool results the summaries said so and told the
-  resumed work to stop, even where the agent had received the images, and
-  the resumed context inherited the claim. The placeholder now says only
-  that the content is omitted from the summary request, and the compaction
-  prompt says that such a placeholder tells nothing about what the agent
-  could see and must not be used to infer it. The rows a compaction keeps
-  carry their media unchanged, as before.
+- `meerkat-session`: the compaction summary request no longer presents
+  omitted media in a form a summarizer reads as the agent having been unable
+  to see it. The summary request replaces each image or video in a user row
+  or tool result with a bracketed placeholder. It used to name only the
+  media type, and summarizing models read it as the agent having been unable
+  to see the media: in a long run with many screenshot tool results the
+  summaries said so and told the resumed work to stop, and the resumed
+  context inherited the claim. The placeholder now says only that the
+  content is omitted from the summary request, and the compaction prompt
+  says that such a placeholder tells nothing about what the agent could see
+  and must not be used to infer it. The rows a compaction keeps carry their
+  media unchanged, as before. Summaries written before this fix keep their
+  wording: an earlier summary is part of the next summary request, so what
+  it says can carry into later summaries.
 
 ## [0.9.7] - 2026-10-28
 

@@ -23,7 +23,7 @@ Include:
 - Any critical data, file paths, examples, or references needed to continue
 - Tool call patterns that worked or failed
 
-Images and videos appear as bracketed placeholders because their content is omitted from this summary request. Their absence here says nothing about what the agent could see. Do not infer the agent's ability to see them from these placeholders, and do not invent their contents; keep what the surrounding recorded text says about them and any references needed to act on them.
+Images and videos shown as bracketed placeholders have their content omitted from this summary request. Their absence here says nothing about what the agent could see. Do not infer the agent's ability to see them from these placeholders, and do not invent their contents; keep what the surrounding recorded text says about them and any references needed to act on them.
 
 Be concise and structured. Prioritize information the next context needs to act, not narrate.";
 
@@ -2789,7 +2789,7 @@ mod tests {
         }
         let prompt = c.compaction_prompt();
         for instruction in [
-            "their content is omitted from this summary request",
+            "have their content omitted from this summary request",
             "Their absence here says nothing about what the agent could see.",
             "Do not infer the agent's ability to see them from these placeholders",
         ] {
