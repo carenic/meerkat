@@ -438,6 +438,29 @@ impl PublishedConsentEligibility {
             Ok((false, _)) | Err(_) => Err(meerkat_core::approval::consent::ConsentIneligible),
         }
     }
+
+    /// [`Self::observe`] as the eligibility owner's answer, for
+    /// [`meerkat_core::approval::consent::HumanConsentRoute::eligibility_answer`]:
+    /// `Eligible` with this evidence when `eligible` reads the owner's facts
+    /// as eligible, `Refused` when it reads them as not eligible, and
+    /// `Unsettled` when there is no coherent read of them now (an owner
+    /// change in progress, or one published during the observation, or a
+    /// poisoned publication, which stays so until its owners are
+    /// reconstructed). Nothing is decided on an unsettled answer: the
+    /// approval owner asks again.
+    pub fn observe_answer(
+        publication: &LocalAuthorizationPublication,
+        eligible: impl FnOnce() -> bool,
+    ) -> meerkat_core::approval::consent::ConsentEligibilityAnswer {
+        use meerkat_core::approval::consent::ConsentEligibilityAnswer;
+        match publication.observe(eligible) {
+            Ok((true, stamp)) => ConsentEligibilityAnswer::Eligible(Arc::new(Self { stamp })),
+            Ok((false, _)) => ConsentEligibilityAnswer::Refused,
+            Err(PublicationError::Changed | PublicationError::Unavailable) => {
+                ConsentEligibilityAnswer::Unsettled
+            }
+        }
+    }
 }
 
 impl fmt::Debug for PublishedConsentEligibility {
@@ -922,5 +945,51 @@ mod tests {
         );
         drop(later);
         assert_eq!(publication.change_in_progress(), None);
+    }
+
+    #[test]
+    fn an_eligibility_answer_tells_a_refusal_from_an_owner_that_cannot_say() {
+        use meerkat_core::approval::consent::ConsentEligibilityAnswer;
+        let publication = LocalAuthorizationPublication::new();
+        let evidence = match PublishedConsentEligibility::observe_answer(&publication, || true) {
+            ConsentEligibilityAnswer::Eligible(evidence) => Some(evidence),
+            _ => None,
+        }
+        .expect("eligible facts answer with evidence");
+        assert!(evidence.check_current().is_ok());
+        assert!(matches!(
+            PublishedConsentEligibility::observe_answer(&publication, || false),
+            ConsentEligibilityAnswer::Refused
+        ));
+
+        // An owner change in progress: no coherent read, so no answer
+        // either way.
+        let change = publication.begin_owner_change().expect("owner change");
+        assert!(matches!(
+            PublishedConsentEligibility::observe_answer(&publication, || true),
+            ConsentEligibilityAnswer::Unsettled
+        ));
+        assert!(matches!(
+            PublishedConsentEligibility::observe_answer(&publication, || false),
+            ConsentEligibilityAnswer::Unsettled
+        ));
+        drop(change);
+        assert!(
+            evidence.check_current().is_err(),
+            "the completed change made the earlier evidence stale"
+        );
+
+        // A change published during the observation.
+        let answer = PublishedConsentEligibility::observe_answer(&publication, || {
+            drop(publication.begin_owner_change().expect("owner change"));
+            true
+        });
+        assert!(matches!(answer, ConsentEligibilityAnswer::Unsettled));
+
+        publication.poison();
+        assert!(matches!(
+            PublishedConsentEligibility::observe_answer(&publication, || true),
+            ConsentEligibilityAnswer::Unsettled
+        ));
     }
 }

@@ -9,9 +9,9 @@
 //! consent (ADR-001 D9).
 
 use meerkat_core::approval::consent::{
-    AuthenticatedApprover, AuthenticatedConsentDecision, ConsentEligibility, ConsentIneligible,
-    ConsentNotice, ConsentNoticeKind, ConsentPresentation, ConsentRouteUnavailable,
-    HumanConsentRoute,
+    AuthenticatedApprover, AuthenticatedConsentDecision, ConsentEligibility,
+    ConsentEligibilityAnswer, ConsentIneligible, ConsentNotice, ConsentNoticeKind,
+    ConsentPresentation, ConsentRouteUnavailable, HumanConsentRoute,
 };
 
 use crate::publication::{LocalAuthorizationPublication, PublishedConsentEligibility};
@@ -226,19 +226,35 @@ impl HumanConsentRoute for Route {
         approver: &AuthenticatedApprover,
         approval: &ApprovalRecord,
     ) -> Result<Arc<dyn ConsentEligibility>, ConsentIneligible> {
+        match self.eligibility_answer(approver, approval) {
+            ConsentEligibilityAnswer::Eligible(evidence) => Ok(evidence),
+            _ => Err(ConsentIneligible),
+        }
+    }
+
+    /// The eligibility owner's answer from a coherent observation of its
+    /// publication: an owner change in progress, or one published during
+    /// the read, is `Unsettled`.
+    fn eligibility_answer(
+        &self,
+        approver: &AuthenticatedApprover,
+        approval: &ApprovalRecord,
+    ) -> ConsentEligibilityAnswer {
         let id = approver.principal().id.as_str().to_owned();
         let requester = approval.requester.as_str() == id;
-        let evidence = PublishedConsentEligibility::observe(&self.publication, || {
+        let answer = PublishedConsentEligibility::observe_answer(&self.publication, || {
             if requester {
                 self.self_approval.load(Ordering::SeqCst)
             } else {
                 self.eligible.lock().expect("eligible").contains(&id)
             }
-        })?;
-        if self.revoke_after_resolve.swap(false, Ordering::SeqCst) {
+        });
+        if matches!(answer, ConsentEligibilityAnswer::Eligible(_))
+            && self.revoke_after_resolve.swap(false, Ordering::SeqCst)
+        {
             self.change_eligibility(|eligible| eligible.retain(|eligible| *eligible != id));
         }
-        Ok(evidence)
+        answer
     }
 
     fn notice(&self, notice: ConsentNotice) {
@@ -1328,10 +1344,12 @@ async fn a_sliding_owner_window_never_counts_as_a_change() {
 /// ADR-001 D9: a re-adjudication asks the owners afresh and takes their
 /// answer; it never synthesizes a window or carries the old one forward. An
 /// owner whose deadline for the operation is fixed refuses the fresh
-/// preparation once that deadline passed while the consent was pending: the
-/// consent is withdrawn as `AuthorityChanged` and the attempt enters nothing.
-/// Beside it, an owner whose allowance slides keeps the consent past the same
-/// moment, and its attempt enters once.
+/// preparation once that deadline passed while the consent was pending: a
+/// read leaves the consent as it is (reads decide afresh only what an owner
+/// publication change made stale), and the approval withdraws it as
+/// `AuthorityChanged`, so the attempt enters nothing. Beside it, an owner
+/// whose allowance slides keeps the consent past the same moment, and its
+/// attempt enters once.
 #[tokio::test]
 async fn a_fixed_owner_deadline_withdraws_where_a_sliding_window_keeps() {
     for sliding in [false, true] {
@@ -1351,7 +1369,22 @@ async fn a_fixed_owner_deadline_withdraws_where_a_sliding_window_keeps() {
             w.attempt(&approval_id).await.expect("enters");
             assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
         } else {
-            assert_eq!(record.status, ApprovalStatus::Cancelled);
+            assert_eq!(
+                record.status,
+                ApprovalStatus::Pending,
+                "a read decides nothing"
+            );
+            assert_eq!(
+                w.approvals
+                    .decide_consent(&approval_id, decision(ApprovalDecision::Approve, "lead-1")),
+                Err(ApprovalError::ConsentUnavailable {
+                    approval_id: approval_id.clone()
+                })
+            );
+            assert_eq!(
+                w.approvals.get(&approval_id).expect("record").status,
+                ApprovalStatus::Cancelled
+            );
             assert_eq!(
                 consent_withdrawal(&w, &approval_id),
                 Some(meerkat_core::approval::ApprovalConsentWithdrawalReason::AuthorityChanged)
@@ -1366,7 +1399,8 @@ async fn a_fixed_owner_deadline_withdraws_where_a_sliding_window_keeps() {
 /// takes longer than the 60 s an owner grants a decision). Approved after the
 /// window ended, its decision is decided afresh and published, and the
 /// attempt, after that window ended too, enters exactly once. A relevant
-/// change found after the window (here the review material) withdraws it as
+/// change after the window (here the review material) is left by reads to
+/// the approval, which finds it and withdraws the consent as
 /// `context_changed`, with zero entry.
 #[tokio::test]
 async fn a_consent_outlives_its_decision_window() {
@@ -1402,6 +1436,18 @@ async fn a_consent_outlives_its_decision_window() {
         account: "account-b".to_owned(),
         mandate: "mandate-a".to_owned(),
     });
+    assert_eq!(
+        w.approvals.get(&approval_id).expect("record").status,
+        ApprovalStatus::Pending,
+        "a read leaves a decision its own check refuses as it is"
+    );
+    assert_eq!(
+        w.approvals
+            .decide_consent(&approval_id, decision(ApprovalDecision::Approve, "lead-1")),
+        Err(ApprovalError::ConsentUnavailable {
+            approval_id: approval_id.clone()
+        })
+    );
     assert_eq!(
         w.approvals.get(&approval_id).expect("record").status,
         ApprovalStatus::Cancelled
@@ -1472,5 +1518,50 @@ async fn an_approved_consent_follows_its_approvers_eligibility() {
         vec![ConsentNoticeKind::Requested, ConsentNoticeKind::Approved]
     );
     w.attempt(&approval_id).await.expect("enters");
+    assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
+}
+
+/// ADR-001 D9: an eligibility owner change still in progress when the spend
+/// asks the eligibility owner afresh decides nothing (the owner cannot say
+/// now): the attempt enters nothing and the consent is kept, and once the
+/// change completed the next attempt enters once.
+#[tokio::test]
+async fn an_eligibility_change_in_progress_at_the_spend_keeps_the_consent() {
+    let w = ConsentWorld::new();
+    let approval_id = w.request("consented").await;
+    w.approve(&approval_id);
+    // An unrelated change made the evidence stale; another is in progress.
+    w.route
+        .change_eligibility(|eligible| eligible.push("lead-2".to_string()));
+    let publication = w.route.publication.clone();
+    let (began, in_progress) = std::sync::mpsc::channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let holder = std::thread::spawn(move || {
+        let change = publication.begin_owner_change().expect("owner publication");
+        began.send(()).expect("change began");
+        let _ = released.recv_timeout(Duration::from_secs(30));
+        drop(change);
+    });
+    in_progress
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the change is in progress");
+    let refused = w.attempt(&approval_id).await;
+    let _ = release.send(());
+    holder.join().expect("holder thread");
+    assert_eq!(
+        refused.err(),
+        Some(ToolError::ReviewUnavailable {
+            kind: meerkat_core::ReviewUnavailableKind::OwnerUnavailable,
+        })
+    );
+    assert!(w.bodies().is_empty(), "nothing entered");
+    assert_eq!(
+        consent_withdrawal(&w, &approval_id),
+        None,
+        "the consent is kept"
+    );
+    w.attempt(&approval_id)
+        .await
+        .expect("enters once the change completed");
     assert_eq!(w.bodies(), vec!["consented".to_string()], "exactly once");
 }

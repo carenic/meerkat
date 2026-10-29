@@ -38,8 +38,7 @@ use crate::tokio;
 use crate::ToolCallView;
 use crate::approval::consent::{
     ConsentCandidate, ConsentCandidateParts, ConsentNoticeKind, ConsentPresentationCandidate,
-    ConsentProjections, ConsentRefusal, HumanConsent, HumanConsentRoute, SpendRechecks,
-    consent_request,
+    ConsentProjections, HumanConsent, HumanConsentRoute, SpendRechecks, consent_request,
 };
 use crate::approval::{ApprovalId, RefusedReviewCommit, SettledReports};
 use crate::authorization::{
@@ -1353,7 +1352,7 @@ fn material(resolution: &ReviewOperationContextResolution) -> Option<&ReviewOper
 /// approval for this exact candidate and retain its human attempt, then
 /// settle locally with
 /// action-required feedback. The decision never executes the action; a fresh
-/// explicit attempt does ([`admit_consent_attempt`]).
+/// explicit attempt does ([`admit_consent_attempt_reporting`]).
 fn request_human_consent(
     review: &Arc<BoundOperationReview>,
     consent: &HumanConsent,
@@ -1421,27 +1420,67 @@ fn request_human_consent(
 /// candidate only for the presenting context's own admitted work and run, and
 /// returns its exact retained decision: the caller dispatches the retained
 /// binding-owned call through the common fenced tail, whose leaf spends the
-/// decision once at entry.
+/// decision once at entry. The dispatch itself admits through
+/// [`admit_consent_attempt_reporting`].
+#[cfg(any(test, feature = "test-support"))]
 pub(crate) fn admit_consent_attempt(
     review: Option<&Arc<BoundOperationReview>>,
     approval_id: &ApprovalId,
     work: &WorkAuthorizationContext,
     run_id: Option<&RunId>,
 ) -> Result<(ReviewEntry, PreparedOperationCheck), crate::ToolError> {
+    admit_consent_attempt_reporting(review, approval_id, work, run_id)
+        .map_err(|refused| refused.error)
+}
+
+/// A fresh attempt of one retained R3 candidate that its admission refused,
+/// with zero entry.
+pub(crate) struct ConsentAttemptRefusal {
+    pub(crate) error: crate::ToolError,
+    /// The candidate's held decision when the candidate resolved before the
+    /// refusal: its retained call is the one the refusal is reported for.
+    pub(crate) retained: Option<PreparedOperationCheck>,
+}
+
+/// Admission of a fresh explicit attempt of one retained R3 candidate, as
+/// the retained dispatch admits it: a refusal after the candidate resolved
+/// names the retained call it belongs to. The held decision is settled before
+/// the attempt is handed it (ADR-001 D9;
+/// [`super::ApprovalService::settle_consent_for_attempt`]): one that is not
+/// current is decided afresh by its owners, and the attempt goes on only
+/// with a current decision. A related change or the owners' refusal
+/// withdraws the consent and refuses the attempt (`ContextChanged`, or that
+/// refusal); while nothing can be settled now the attempt refuses as
+/// `owner_unavailable` and the consent is kept.
+pub(crate) fn admit_consent_attempt_reporting(
+    review: Option<&Arc<BoundOperationReview>>,
+    approval_id: &ApprovalId,
+    work: &WorkAuthorizationContext,
+    run_id: Option<&RunId>,
+) -> Result<(ReviewEntry, PreparedOperationCheck), ConsentAttemptRefusal> {
+    let unresolved = |error| ConsentAttemptRefusal {
+        error,
+        retained: None,
+    };
     let Some(review) = review.filter(|review| review.human_consent.is_some()) else {
-        return Err(unsatisfied(ReviewUnsatisfiedKind::HumanConsentRequired));
+        return Err(unresolved(unsatisfied(
+            ReviewUnsatisfiedKind::HumanConsentRequired,
+        )));
     };
     let candidate = review
         .approvals
         .resolve_consent_attempt(approval_id, work, run_id)
-        .map_err(ConsentRefusal::into_tool_error)?;
-    // A held decision that is no longer current (stale, or refused by its
-    // own check, as when its owner's validity window for it ended while the
-    // human decided) is decided afresh by its owners first, so the attempt
-    // is handed a current one when they find it unchanged (ADR-001 D9).
-    review
+        .map_err(|refusal| unresolved(refusal.into_tool_error()))?;
+    if let Err(refusal) = review
         .approvals
-        .refresh_consent_decision(approval_id, &candidate);
+        .settle_consent_for_attempt(approval_id, &candidate)
+    {
+        // Every owner lock is released: a refused authority is observed now.
+        return Err(ConsentAttemptRefusal {
+            retained: Some(candidate.admitted()),
+            error: refusal.into_tool_error(),
+        });
+    }
     let admitted = candidate.admitted();
     let retained = RetainedConsent {
         review: Arc::clone(review),
@@ -1565,6 +1604,17 @@ impl ReviewEntry {
             ReviewEntryState::Retained(_) | ReviewEntryState::Consent(_) => EnteredBasis::NotSpent,
             ReviewEntryState::Consumed | ReviewEntryState::Settled => EnteredBasis::Ended,
         }
+    }
+
+    /// Whether no spend of this entry committed: nothing entered on it and,
+    /// for a consent attempt, its consent was not spent here (a spend that
+    /// committed leaves the entry entered, then consumed). Reads the entry
+    /// only.
+    pub(crate) fn spent_nothing(&self) -> bool {
+        !matches!(
+            self.0.lock().state,
+            ReviewEntryState::Entered(_) | ReviewEntryState::Consumed
+        )
     }
 
     /// Reports settled by a later step of the entered effect, deferred with

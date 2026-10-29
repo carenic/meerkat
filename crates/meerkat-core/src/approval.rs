@@ -637,7 +637,11 @@ pub enum ApprovalError {
     InvalidMetadata(#[from] crate::SurfaceMetadataError),
     /// The store committed nothing (unavailable, contended or failed before
     /// any write). An explicitly attempted retry through fresh checks is
-    /// valid; nothing is resent automatically.
+    /// valid; nothing is resent automatically. Also the answer of a consent
+    /// approval that recorded nothing because its candidate's authorization
+    /// or its approver's eligibility could not be settled now (an owner
+    /// change in progress, owners that are unavailable, or a publication
+    /// that kept changing; ADR-001 D9): the same retry is valid.
     #[error("approval store unavailable: {0}")]
     StoreUnavailable(String),
     /// Another owner of the backing changed the row first. Nothing of this
@@ -2079,11 +2083,13 @@ impl ApprovalService {
     }
 
     fn refresh_expiry(&self, approval_id: &ApprovalId) -> Result<(), ApprovalError> {
-        // A live consent candidate whose decision is no longer current (an
-        // owner publication change made it stale, or its own check refuses
-        // it) is re-adjudicated first, outside the reservation, on this
-        // caller's thread (ADR-001 D9). A read reports what it left.
-        let _ = self.readjudicate_consent(approval_id);
+        // A live consent candidate whose decision an owner publication change
+        // made stale is re-adjudicated first, outside the reservation, on
+        // this caller's thread (ADR-001 D9). One its own check refuses, or
+        // answers that its owners are unavailable, is left for an approval
+        // or an attempt: a polling read never calls its owners for it. A
+        // read reports what it left.
+        let _ = self.readjudicate_consent(approval_id, consent::ReadjudicationStep::Read);
         let now = self.now();
         let mut state = self.state.write();
         let result = self.refresh_expiry_locked(&mut state, approval_id, now);
@@ -2118,12 +2124,11 @@ impl ApprovalService {
         state.ensure_reconciled(approval_id)?;
         // An approved parked candidate past its deadline is withdrawn here
         // (callback-free, under the reservation). A live candidate whose
-        // decision is no longer current (its run closed, its owners refuse
-        // it, or the owner publication moved) was re-adjudicated before this
-        // reservation, and its owners' refusal withdrew it there (ADR-001
-        // D9). A withdrawal that could not be recorded stops this read:
-        // nothing is derived from the old record and the retired machine
-        // state.
+        // decision is no longer current was re-adjudicated before this
+        // reservation as its caller's step allows (ADR-001 D9), and its
+        // owners' refusal withdrew it there. A withdrawal that could not be
+        // recorded stops this read: nothing is derived from the old record
+        // and the retired machine state.
         self.withdraw_stale_consent_locked(state, approval_id);
         state.ensure_reconciled(approval_id)?;
         let Some(record) = state.records.get(approval_id).cloned() else {
